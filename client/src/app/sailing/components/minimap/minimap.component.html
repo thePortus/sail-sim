@@ -1,0 +1,20 @@
+<div class="minimap-wrapper"
+     [class.minimap-wrapper--expanded]="expanded()"
+     (click)="toggleExpand()">
+
+  <canvas #canvas
+          [width]="expanded() ? 600 : 200"
+          [height]="expanded() ? 600 : 200"
+          class="minimap-canvas">
+  </canvas>
+
+  <!-- Expand/collapse hint -->
+  <div class="minimap-hint">
+    {{ expanded() ? '✕ M or click to collapse' : 'M or click to expand' }}
+  </div>
+
+  <!-- Island name tooltip overlay (expanded only) -->
+  @if (expanded()) {
+    <div class="minimap-title">Archipelago of Ignis</div>
+  }
+</div>

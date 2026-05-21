@@ -1,0 +1,102 @@
+name: Build & publish glyphs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/jesuit-catalogs-glyphs:latest
+      FONT_URL: https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install apt build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3-dev pkg-config git curl \
+            libcairo2-dev libjpeg-dev libpng-dev libfreetype6-dev \
+            libharfbuzz-dev libfontconfig1-dev zlib1g-dev libicu-dev clang
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install node build helpers & node-fontnik
+        run: |
+          set -eux
+
+          # ensure npm globals are visible during git install
+          NPM_ROOT="$(npm root -g)"
+          echo "[glyphs] npm global root: $NPM_ROOT"
+          export NODE_PATH="$NPM_ROOT"
+          echo "[glyphs] NODE_PATH=$NODE_PATH"
+
+          # install helper tools globally
+          npm install -g --unsafe-perm node-gyp node-gyp-build prebuild-install @mapbox/node-pre-gyp node-addon-api || true
+
+          # Prevent treating warnings as errors during the native build
+          # (some compilers or dependencies enable -Werror and this causes CI builds to fail).
+          export CXXFLAGS="${CXXFLAGS:-} -Wno-error"
+          export CFLAGS="${CFLAGS:-}"
+          export CPPFLAGS="${CPPFLAGS:-}"
+          export CC=gcc
+          export CXX=g++
+
+          # Force npm to build from source (avoid prebuild mismatch), then install node-fontnik from GitHub
+          npm_config_build_from_source=true npm install -g --unsafe-perm git+https://github.com/mapbox/node-fontnik.git
+
+      - name: Generate glyph PBFs
+        run: |
+          set -eux
+          mkdir -p tiles/fonts/NotoSans
+          curl -fSL -o /tmp/NotoSans-Regular.ttf "$FONT_URL"
+          for start in $(seq 0 256 65280); do
+            end=$((start+255))
+            out="tiles/fonts/NotoSans/${start}-${end}.pbf"
+            echo "writing $out"
+            fontnik /tmp/NotoSans-Regular.ttf "$start" "$end" "$out"
+          done
+          ls -l tiles/fonts/NotoSans | head -n 10
+
+      - name: Create minimal Dockerfile for glyph image
+        run: |
+          cat > glyphs.Dockerfile <<'EOF'
+          FROM alpine:3.18
+          RUN apk add --no-cache ca-certificates
+          COPY tiles/fonts /fonts
+          LABEL org.opencontainers.image.title="jesuit-catalogs-glyphs"
+          CMD ["/bin/sh", "-c", "ls -1 /fonts || true"]
+          EOF
+          sed -n '1,120p' glyphs.Dockerfile
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # fallback: create PAT as CR_PAT and use that if needed
+
+      - name: Build & push glyph image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./glyphs.Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_NAME }}
+          platforms: linux/amd64
+
+      - name: Upload glyphs as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: glyphs
+          path: tiles/fonts

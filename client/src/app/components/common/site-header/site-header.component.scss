@@ -1,0 +1,61 @@
+@use 'sass:map';
+@use '../../../../_theme-colors' as theme-colors;
+
+::ng-deep .mat-toolbar {
+    background-color: map.get(theme-colors.$primary-palette, 70) !important;
+    color: map.get(theme-colors.$primary-palette, 98) !important;
+}
+
+// If the screen size is 1280px wide or more, set for large screen
+@media screen and (min-width: 1024px) {
+    :host .site-logo {
+        height: 86px;
+        width: auto;
+    }
+
+    :host .iajs-wordmark {
+        height: 19px;
+        width: auto;
+    }
+
+    :host .portal-wordmark {
+        height: 19px;
+        width: auto;
+    }
+}
+
+// If the screen size is 1024px wide or less and more than 640px, set for medium screen
+@media screen and (max-width: 1024px) and (min-width: 640px) {
+    :host .site-logo {
+        height: 45px;
+        width: auto;
+    }
+
+    :host .iajs-wordmark {
+        height: 12px;
+        width: auto;
+    }
+
+    :host .portal-wordmark {
+        height: 12px;
+        width: auto;
+    }
+}
+
+// If the screen size is 640px wide or less, set for mobile
+@media screen and (max-width: 640px){
+    :host .site-logo {
+        height: 32px;
+        width: auto;
+    }
+
+    :host .iajs-wordmark {
+        height: 14px;
+        width: auto;
+    }
+
+    :host .portal-wordmark {
+        height: 14px;
+        width: auto;
+    }
+}

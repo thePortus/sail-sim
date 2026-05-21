@@ -1,0 +1,22 @@
+<header class="flex flex-col justify-start items-center w-full">
+  <div class="w-full flex flex-row justify-start items-center px-10 py-2">
+    <img [src]="imgs['iajsWordmark']" alt="Wordmark for the Institute for Advanced Jesuit Studies" class="iajs-wordmark"/>
+    <span class="mx-2">|</span>
+    <img [src]="imgs['portalWordmark']" alt="Wordmark for the Jesuit Studies Portal" class="portal-wordmark"/>
+  </div>
+  <div class="mat-elevation-z8 flex flex-row justify-center items-center mat-toolbar py-4 px-10 w-full">
+    <!-- Site Header Info -->
+    <div class="justify-center items-start flex flex-col grow" (click)="navigate('home')" routerLink="">
+      <!--<h1>{{ settings.siteName }}</h1>-->
+      <img matTooltip="Click to go to site home page" [src]="imgs.title" alt="Site Logo" class="site-logo"/>
+    </div>
+    
+    <!-- Nav Menu -->
+    <div>
+      <!-- button for nav menu -->
+      <button matTooltip="Navigation menu" mat-raised-button color="accent" (click)="toggleNav()" aria-label="Navigation Menu">
+        <mat-icon>menu</mat-icon>
+      </button>
+    </div>
+  </div>
+</header>

@@ -1,0 +1,48 @@
+
+  <!-- loading and error indicators -->
+  <div *ngIf="loading" class="flex justify-center items-center h-full">
+    <div *ngIf="!loadingError" class="flex flex-col justify-center items-center">
+      <mat-spinner></mat-spinner>
+      <p>Loading</p>
+    </div>
+    <div *ngIf="loadingError" class="flex flex-col justify-center items-center">
+      <mat-icon class="red-text">error</mat-icon>
+      <p class="red-text">Error: problem connecting to server</p>
+    </div>
+  </div>
+  <div *ngIf="this.loading == false" class="profile-wrapper flex flex-col justify-start items-center">
+      <mat-card class="profile-container mt-5">
+        <div class="flex flex-col justify-center items-center">
+          <mat-card-header>
+            <mat-card-title>Profile</mat-card-title>
+          </mat-card-header>
+          <mat-card-content>
+            <!-- basic user infomation -->
+            <div class="flex flex-col justify-center items-center">
+              <table>
+                <tbody>
+                    <tr><td>Username: </td><td>{{ this.protectedData.username }}</td></tr>
+                    <tr><td>Email: </td><td>{{ this.protectedData.email }}</td></tr>
+                    <tr><td>Role: </td><td>{{ this.protectedData.role }}</td></tr>
+                </tbody>
+              </table>
+              <button class="m-2" matTooltip="Update your password" mat-raised-button routerLink="/profile/update" color="primary" aria-label="Update">Update Password</button>
+            </div>
+          </mat-card-content>
+          <!-- logout button -->
+          <mat-card-actions>
+            <div class="flex flex-row justify-center items-center">
+              <button class="m-2" matTooltip="Go to the site home page" mat-raised-button routerLink="/" color="primary" aria-label="Home">Home</button>
+              <button class="m-2" matTooltip="Logout from the site" mat-raised-button type="submit" color="primary" (click)="logout()" aria-label="Logout">Logout</button>
+            </div>
+          </mat-card-actions>
+          <!-- privacy policy -->
+          <div class="policy-links">
+            <div class="flex flex-col justify-center items-center">
+              <span><small><a matTooltip="View site site privacy policy" routerLink='/privacy-policy'>View Privacy Policy</a></small></span>
+            </div>
+          </div>
+        </div>
+      </mat-card>
+  </div>
+  

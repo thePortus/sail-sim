@@ -1,0 +1,12 @@
+@use './../../../../styles-settings' as settings;
+
+:host mat-form-field {
+  width: 100%;
+}
+
+:host .error-msgs {
+  background-color: settings.$error-msg-bg-color;
+  color: settings.$error-msg-color;
+  margin: 5px;
+  padding: 5px;
+}

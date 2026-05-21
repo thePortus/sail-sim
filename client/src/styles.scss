@@ -1,0 +1,353 @@
+// import style settings
+@use 'sass:map';
+@use 'styles-settings' as settings;
+@use '_theme-colors' as theme-colors;
+/* tailwind directives */
+@use "tailwindcss";
+
+// include angular material styles
+@use '@angular/material' as mat;
+@include mat.core();
+
+// import google material icons
+@import 'https://fonts.googleapis.com/icon?family=Material+Icons';
+
+/* start of Angular Material color and font theming */
+
+html, body { height: 100%; }
+body { margin: 0; }
+
+$custom-color: (
+    primary: theme-colors.$primary-palette,
+    tertiary: theme-colors.$tertiary-palette,
+);
+
+$custom-typography: (
+    plain-family: settings.$body-typography-family,
+    brand-family: settings.$title-typography-family,
+    bold-weight: 900,
+    medium-weight: 400,
+    regular-weight: 300
+);
+
+$custom-theme: (
+    color: $custom-color,
+    typography: $custom-typography,
+    density: 0
+);
+
+html {
+    color-scheme: light; //dark;
+    font-family: settings.$body-typography-family;
+    @include mat.theme($custom-theme);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 10px 0px 0px 0px;
+    font-family: settings.$title-typography-family;
+}
+
+p {
+    margin: 2px 0px 2px 0px;;
+}
+
+.light-field-background {
+    background-color: map.get(theme-colors.$primary-palette, 98) !important;
+}
+
+.popover {
+  z-index: 1000;
+  background: white;
+  border: 1px solid #ccc;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  padding: 16px;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sailing simulator — global UI styles
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── HUD overlay ──────────────────────────────────────────────────────────────
+
+.hud-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.hud-panel {
+  position: absolute;
+  background: rgba(8, 17, 30, 0.72);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 14px 16px;
+  color: white;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+
+  &.top-left    { top: 1.25rem; left: 1.25rem; min-width: 220px; }
+  &.top-right   { top: 1.25rem; right: 1.25rem; min-width: 160px; }
+  &.bottom-left { bottom: 1.25rem; left: 1.25rem; }
+  &.bottom-center {
+    bottom: 1.25rem;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 8px 20px;
+  }
+}
+
+// ── Sail buttons ──────────────────────────────────────────────────────────────
+
+.sail-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: #94a3b8;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  pointer-events: auto;
+
+  &:hover { background: rgba(255,255,255,0.1); color: white; }
+
+  &--active {
+    background: rgba(59, 130, 246, 0.25);
+    border-color: rgba(59, 130, 246, 0.5);
+    color: #93c5fd;
+  }
+}
+
+.sail-icon { font-size: 14px; width: 22px; text-align: center; }
+.sail-key  { font-size: 11px; color: rgba(255,255,255,0.3); padding: 1px 5px;
+             border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; }
+
+.exit-btn {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: transparent;
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.15s ease;
+  pointer-events: auto;
+
+  &:hover {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+  }
+}
+
+kbd {
+  font-family: inherit;
+  font-size: 10px;
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: rgba(255,255,255,0.7);
+}
+
+// ── Aground overlay ───────────────────────────────────────────────────────────
+
+.aground-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(3px);
+  z-index: 50;
+}
+
+.aground-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  background: rgba(8, 17, 30, 0.90);
+  border: 1px solid rgba(239, 68, 68, 0.40);
+  border-radius: 16px;
+  padding: 32px 40px;
+  max-width: 340px;
+  text-align: center;
+  box-shadow: 0 0 60px rgba(239, 68, 68, 0.15), 0 8px 32px rgba(0,0,0,0.6);
+}
+
+.aground-icon  { font-size: 2.5rem; line-height: 1; }
+
+.aground-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+  color: #f87171;
+  letter-spacing: 0.05em;
+}
+
+.aground-msg {
+  font-size: 0.85rem;
+  color: #94a3b8;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+  line-height: 1.55;
+}
+
+.refloat-btn {
+  margin-top: 8px;
+  padding: 10px 28px;
+  border-radius: 10px;
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.18);
+  color: #93c5fd;
+  font-size: 1rem;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+
+  &:hover {
+    background: rgba(59, 130, 246, 0.35);
+    border-color: rgba(59, 130, 246, 0.8);
+    color: #fff;
+  }
+}
+
+// ── Minimap ───────────────────────────────────────────────────────────────────
+
+.minimap-wrapper {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+
+  &:hover { transform: scale(1.02); box-shadow: 0 6px 32px rgba(0,0,0,0.6); }
+  &--expanded { border-radius: 14px; }
+}
+
+.minimap-canvas { display: block; }
+
+.minimap-hint {
+  position: absolute;
+  bottom: 4px;
+  left: 0; right: 0;
+  text-align: center;
+  font-size: 9px;
+  font-family: ui-monospace, monospace;
+  color: rgba(255, 255, 255, 0.3);
+  pointer-events: none;
+  padding-bottom: 2px;
+}
+
+.minimap-title {
+  position: absolute;
+  top: 8px;
+  left: 0; right: 0;
+  text-align: center;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.08em;
+  pointer-events: none;
+}
+
+// ── Vessel selector screen ────────────────────────────────────────────────────
+
+.selector-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(ellipse at 50% 60%, #0d2a45 0%, #06101c 65%);
+  z-index: 100;
+}
+
+.selector-card {
+  background: rgba(10, 20, 36, 0.92);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  padding: 2.5rem;
+  width: 100%;
+  max-width: 480px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+
+.vessel-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+  transition: all 0.15s ease;
+
+  &:hover { background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.15); }
+
+  &--selected {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.4);
+  }
+}
+
+.vessel-card__icon {
+  font-size: 2rem;
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.callsign-input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: white;
+  font-family: ui-monospace, monospace;
+  font-size: 14px;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+
+  &:focus { border-color: rgba(59, 130, 246, 0.5); }
+  &::placeholder { color: rgba(255,255,255,0.25); }
+}
+
+.set-sail-btn {
+  width: 100%;
+  padding: 14px;
+  border-radius: 12px;
+  border: none;
+  background: linear-gradient(135deg, #1e40af, #1d4ed8);
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 20px rgba(29, 78, 216, 0.4);
+
+  &:hover:not(:disabled) {
+    background: linear-gradient(135deg, #2563eb, #3b82f6);
+    box-shadow: 0 6px 28px rgba(59, 130, 246, 0.5);
+    transform: translateY(-1px);
+  }
+
+  &:disabled { opacity: 0.4; cursor: not-allowed; }
+}

@@ -1,0 +1,296 @@
+const app = require('../../app.js');
+const supertest = require('supertest');
+const requestWithSupertest = supertest(app);
+
+describe('CurrencyEntry Create Endpoints', () => {
+
+  let ownerToken = '';
+  let adminToken = '';
+  let editorToken = '';
+  let userToken = '';
+  let createdId = '';
+  let relatedIds = {};
+
+  beforeAll(async () => {
+    const ownerResponse = await supertest(app).post('/api/user/login')
+      .send({
+        username: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+        password: process.env.OWNER_PASSWORD || 'password'
+      });
+    ownerToken = ownerResponse.body.token;
+    const adminResponse = await supertest(app).post('/api/user/login')
+      .send({
+        username: 'testAdmin',
+        password: 'password'
+      });
+    adminToken = adminResponse.body.token;
+    const editorResponse = await supertest(app).post('/api/user/login')
+      .send({
+        username: 'testEditor',
+        password: 'password'
+      });
+    editorToken = editorResponse.body.token;
+    const userResponse = await supertest(app).post('/api/user/login')
+      .send({
+        username: 'testUser',
+        password: 'password'
+      });
+    userToken = userResponse.body.token;
+    const currencyResponse = await requestWithSupertest
+      .post('/api/currencies')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Currency',
+      });
+    relatedIds.currency = currencyResponse.body.id;
+    const monetaryColumnResponse = await requestWithSupertest
+      .post('/api/monetary-columns')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Monetary Column',
+      });
+    relatedIds.monetaryColumn = monetaryColumnResponse.body.id;
+    const communityResponse = await requestWithSupertest
+      .post('/api/communities')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Community',
+        type: 'Test Type'
+      });
+    relatedIds.community = communityResponse.body.id;
+    const communityLocationResponse = await requestWithSupertest
+      .post('/api/community-locations')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Location',
+        assistancy: 'Test Assistancy',
+        province: 'Test Province',
+        city: 'Test City',
+        latitude: 1,
+        longitude: 1,
+        isPrecise: true
+      });
+    relatedIds.communityLocation = communityLocationResponse.body.id;
+    const communityAtLocationResponse = await requestWithSupertest
+      .post('/api/communities-at-locations')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        communityId: relatedIds.community,
+        communityLocationId: relatedIds.communityLocation,
+        startYear: 2000,
+        startMonth: 1,
+        startDay: 1,
+        endYear: 2020,
+        endMonth: 1,
+        endDay: 1
+      });
+    relatedIds.communityAtLocation = communityAtLocationResponse.body.id;
+    const sourceResponse = await requestWithSupertest
+      .post('/api/sources')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Source',
+        volume: 'Test Volume',
+        page: '1',
+        url: 'http://example.com',
+        idBox: '1',
+        archive: 'ARSI'
+      });
+    relatedIds.source = sourceResponse.body.id;
+    const thirdCatalogResponse = await requestWithSupertest
+      .post('/api/third-catalogs')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        communityAtLocationId: relatedIds.communityAtLocation,
+        catalogYear: 2015,
+        year: 2015,
+        month: 1,
+        day: 1,
+        sourceId: relatedIds.source
+      });
+    relatedIds.thirdCatalog = thirdCatalogResponse.body.id;
+    const monetaryEntryResponse = await requestWithSupertest
+      .post('/api/monetary-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        title: 'Test Monetary Entry',
+        monetaryColumnId: relatedIds.monetaryColumn,
+        thirdCatalogId: relatedIds.thirdCatalog,
+        description: 'Test description'
+      });
+    relatedIds.monetaryEntry = monetaryEntryResponse.body.id;
+  });
+
+  afterEach(async () => {
+    const res = await requestWithSupertest
+      .delete(`/api/currency-entries/${createdId}`)
+      .set('Authorization', `${ownerToken}`);
+  });
+
+  afterAll(async () => {
+    await requestWithSupertest
+      .delete('/api/currencies/' + relatedIds.currency)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/monetary-entries/' + relatedIds.monetaryEntry)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/monetary-columns/' + relatedIds.monetaryColumn)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/third-catalogs/' + relatedIds.thirdCatalog)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/sources/' + relatedIds.source)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/communities-at-locations/' + relatedIds.communityAtLocation)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/community-locations/' + relatedIds.communityLocation)
+      .set('Authorization', `${ownerToken}`);
+    await requestWithSupertest
+      .delete('/api/communities/' + relatedIds.community)
+      .set('Authorization', `${ownerToken}`);
+  });
+
+  it('CREATE /api/currency-entries should accept valid data from an owner', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    expect(res.status).toEqual(200);
+    expect(res.type).toEqual(expect.stringContaining('json'));
+    expect(res.body).toHaveProperty('id');
+    expect(res.body).toHaveProperty('amount', 100);
+    expect(res.body).toHaveProperty('notes');
+    createdId = res.body.id;
+  });
+
+  it('CREATE /api/currency-entries should accept valid data from an admin', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${adminToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    expect(res.status).toEqual(200);
+    expect(res.type).toEqual(expect.stringContaining('json'));
+    expect(res.body).toHaveProperty('id');
+    expect(res.body).toHaveProperty('notes');
+    createdId = res.body.id;
+  });
+
+  it('CREATE /api/currency-entries should reject request from editor', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${editorToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    expect(res.status).toEqual(200);
+    expect(res.type).toEqual(expect.stringContaining('json'));
+    expect(res.body).toHaveProperty('id');
+    expect(res.body).toHaveProperty('amount', 100);
+    expect(res.body).toHaveProperty('notes');
+    createdId = res.body.id;
+  });
+
+  it('CREATE /api/currency-entries should reject request without proper authorization', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    expect(res.status).toEqual(401);
+  });
+
+  it('CREATE /api/currency-entries should reject request from regular users with no privileges', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${userToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    expect(res.status).toEqual(401);
+  });
+
+  it('CREATE /api/currency-entries should reject items without amount', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        notes: ''
+      });
+    expect(res.status).toEqual(500);
+    expect(res.body).toHaveProperty('message', ['Must contain a \'amount\' field!']);
+  });
+
+  it('CREATE /api/currency-entries should reject items with amounts that are not numbers', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: '100',
+        notes: ''
+      });
+    expect(res.status).toEqual(500);
+    expect(res.body).toHaveProperty('message', ['\'amount\' must be of type \'number\'!']);
+  });
+
+  it('CREATE /api/currency-entries should reject items with notes that are not strings', async () => {
+    const res = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: 123
+      });
+    expect(res.status).toEqual(500);
+    expect(res.body).toHaveProperty('message', ['\'notes\' must be of type \'string\'!']);
+  });
+
+  // test for change logs
+  it('CREATE /api/currency-entries should log a change', async () => {
+    const itemRes = await requestWithSupertest
+      .post('/api/currency-entries')
+      .set('Authorization', `${ownerToken}`)
+      .send({
+        monetaryEntryId: relatedIds.monetaryEntry,
+        currencyId: relatedIds.currency,
+        amount: 100,
+        notes: ''
+      });
+    const changeRes = await requestWithSupertest
+      .get(`/api/changes?page=0&size=5&table=CurrencyEntries&action=Create&itemId=${itemRes.body.id}`)
+      .set('Authorization', `${ownerToken}`);
+    expect(changeRes.status).toEqual(200);
+    expect(changeRes.type).toEqual(expect.stringContaining('json'));
+    expect(changeRes.body.rows.length).toBeGreaterThanOrEqual(1);
+    createdId = itemRes.body.id;
+  });
+
+});

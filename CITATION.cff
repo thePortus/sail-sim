@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Casalini
+    given-names: Cristiano
+  - family-names: Alessandro
+    given-names: Corsi
+  - family-names: Thomas
+    given-names: David
+    orcid: https://orcid.org/0000-0001-5494-6297
+title: "Jesuit Catalogs - Server"
+abstract: "Server API for the Jesuit Catalogs Project, from the Institute for Advanced Jesuit Studies, Boston College"
+version: 0.0.1
+date-released: "2024-4-4"
+license: "CC-BY-NC-SA-4.0"
+repository-code: "https://github.com/BCDigSchol/jesuit-catalogs-server"

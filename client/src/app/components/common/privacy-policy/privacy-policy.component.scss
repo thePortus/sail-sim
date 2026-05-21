@@ -1,0 +1,18 @@
+:host .privacy-wrapper {
+    height: 100%;
+    width: 100%;
+  }
+  
+  // If the screen size is 601px wide or more, set for large screen
+  @media screen and (min-width: 601px) {
+    :host .privacy-container {
+      width: 800px;
+    }
+  }
+  
+  // If the screen size is 600px wide or less, set for mobile
+  @media screen and (max-width: 600px) {
+    :host .privacy-container {
+      width: 350px;
+    }
+  }

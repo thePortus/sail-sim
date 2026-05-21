@@ -1,0 +1,34 @@
+<div class="page-container">
+  <div class="auth-card" *ngIf="!user?.loggedIn">
+    <h1>Flight Simulator</h1>
+    <p class="subtitle">Sign in to your account</p>
+
+    <form #myform="ngForm" (ngSubmit)="onSubmit(myform)" class="auth-form">
+      <div class="field-group">
+        <label for="username">Username</label>
+        <input id="username" type="text" name="username" placeholder="Enter username" ngModel autocomplete="username">
+      </div>
+      <div class="field-group">
+        <label for="password">Password</label>
+        <input id="password" type="password" name="password" placeholder="Enter password" ngModel autocomplete="current-password">
+      </div>
+
+      <div class="error-box" *ngIf="errorMsgs.length > 0">
+        <span *ngFor="let msg of errorMsgs">{{ msg }}</span>
+      </div>
+
+      <button type="submit" class="btn-primary">Sign In</button>
+    </form>
+
+    <div class="auth-switch">
+      No account? <a routerLink="/register">Create one</a>
+    </div>
+  </div>
+
+  <div class="auth-card" *ngIf="user?.loggedIn">
+    <h1>Flight Simulator</h1>
+    <p class="subtitle">You are signed in as <strong>{{ user?.username }}</strong></p>
+    <a routerLink="/" class="btn-primary" style="text-align:center;">Go to Home</a>
+    <button class="btn-secondary" (click)="logout()">Sign Out</button>
+  </div>
+</div>

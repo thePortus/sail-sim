@@ -1,0 +1,44 @@
+<div class="auth-wrapper flex flex-col justify-center items-center">
+    <!-- only displayed if not logged in -->
+    <form #myform="ngForm" (ngSubmit)="onSubmit(myform)" *ngIf="this.user.loggedIn">
+      <mat-card class="auth-container">
+        <mat-card-title>Update Password</mat-card-title>
+        <mat-card-content>
+          <div class="flex flex-col justify-center items-center">
+            <!-- old password -->
+            <div *ngIf="userToUpdate == ''">
+                <mat-form-field appearance="fill">
+                    <mat-label>Old Password</mat-label>
+                    <input matInput type="password" name="oldPassword" placeholder="Enter Password" ngModel>
+                </mat-form-field>
+            </div>
+            <!-- new password -->
+            <div>
+              <mat-form-field appearance="fill">
+                <mat-label>New Password</mat-label>
+                <input matInput type="password" name="newPassword" placeholder="Enter Password" ngModel>
+              </mat-form-field>
+            </div>
+            <!-- password confirm -->
+            <div>
+              <mat-form-field appearance="fill">
+                <mat-label>New Password (confirm)</mat-label>
+                <input matInput type="password" name="newPasswordConfirm" placeholder="Enter Password" ngModel>
+              </mat-form-field>
+            </div>
+          </div>
+        </mat-card-content>
+        <!-- error messages -->
+        <div *ngIf="errorMsgs.length > 0" class="error-msgs flex flex-col justify-center items-start">
+          <div *ngFor="let errorMsg of errorMsgs">Error: {{ errorMsg }}</div>
+        </div>
+        <!-- login button -->
+        <mat-card-actions>
+          <div class="w-full flex flex-col justify-center items-center">
+            <button mat-raised-button type="submit" color="primary" aria-label="Login Button">Update Password</button>
+          </div>
+        </mat-card-actions>
+      </mat-card>
+    </form>
+  </div>
+    

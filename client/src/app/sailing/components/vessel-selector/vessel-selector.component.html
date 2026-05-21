@@ -1,0 +1,82 @@
+<div class="selector-backdrop">
+  <div class="selector-card">
+
+    <!-- Header -->
+    <div class="text-center mb-8 relative">
+      <div class="text-5xl mb-3">⛵</div>
+      <h1 class="text-3xl font-bold text-white tracking-wide">Archipelago of Ignis</h1>
+      <p class="text-slate-400 mt-2 text-sm">A volcanic island chain lost in the open ocean</p>
+      <!-- Logout link — top-right of header -->
+      <button
+        (click)="logout()"
+        class="absolute top-0 right-0 text-xs text-slate-500 hover:text-red-400
+               transition-colors font-mono cursor-pointer bg-transparent border-none
+               underline underline-offset-2 p-1">
+        Logout
+      </button>
+    </div>
+
+    @if (loading()) {
+      <div class="text-center text-slate-400 py-8">
+        <div class="inline-block w-6 h-6 border-2 border-blue-400 border-t-transparent rounded-full animate-spin mb-2"></div>
+        <div class="text-sm">Loading vessels…</div>
+      </div>
+    } @else {
+
+      <!-- Vessel list -->
+      <div class="mb-6">
+        <label class="text-xs font-mono text-slate-400 uppercase tracking-widest mb-3 block">
+          Choose your vessel
+        </label>
+        <div class="flex flex-col gap-3">
+          @for (v of vessels(); track v.id) {
+            <div class="vessel-card"
+                 [class.vessel-card--selected]="selected()?.id === v.id"
+                 (click)="select(v)">
+              <div class="vessel-card__icon">⛵</div>
+              <div class="flex-1">
+                <div class="text-white font-semibold">{{ v.name }}</div>
+                <div class="text-slate-400 text-sm mt-0.5">{{ v.description }}</div>
+              </div>
+              @if (selected()?.id === v.id) {
+                <div class="text-blue-400 text-lg">✓</div>
+              }
+            </div>
+          }
+        </div>
+      </div>
+
+      <!-- Callsign -->
+      <div class="mb-6">
+        <label class="text-xs font-mono text-slate-400 uppercase tracking-widest mb-2 block">
+          Callsign
+        </label>
+        <input
+          type="text"
+          class="callsign-input"
+          [value]="callsign()"
+          (input)="onCallsignInput($event)"
+          placeholder="Your name at sea…"
+          maxlength="16"
+        />
+      </div>
+
+      <!-- Sailing tips -->
+      <div class="bg-white/5 rounded-lg p-4 mb-6 text-xs text-slate-400 space-y-1.5">
+        <div class="text-slate-300 font-semibold mb-2 text-sm">Sailing basics</div>
+        <div><span class="text-white font-mono">A / D</span> — Steer port / starboard</div>
+        <div><span class="text-white font-mono">1</span> — Furl all sails &nbsp; <span class="text-white font-mono">2</span> — Reduce sails &nbsp; <span class="text-white font-mono">3</span> — Full canvas</div>
+        <div class="text-amber-400 mt-2">⚠ Sail too close to the wind and you'll be blown back.</div>
+        <div class="text-blue-300">✦ Broad reach (120° off wind) is your fastest point of sail.</div>
+      </div>
+
+      <!-- Set sail button -->
+      <button
+        class="set-sail-btn"
+        [disabled]="!selected()"
+        (click)="setSail()">
+        Set Sail
+      </button>
+    }
+  </div>
+</div>

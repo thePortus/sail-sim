@@ -1,0 +1,47 @@
+<div class="home-container">
+  <div class="home-card">
+
+    <div class="home-title">
+      <div class="home-icon">⛵</div>
+      <h1>Archipelago of Ignis</h1>
+      <p class="subtitle">Multiplayer sailing — open early access</p>
+    </div>
+
+    <!-- Set Sail button -->
+    <button class="btn btn-primary" (click)="setSail()" [disabled]="sailingCheck">
+      {{ sailingCheck ? 'Checking…' : 'Set Sail' }}
+    </button>
+
+    <div class="fly-error" *ngIf="sailError">{{ sailError }}</div>
+
+    <div class="auth-links" *ngIf="!user?.loggedIn">
+      <a routerLink="/login">Login</a>
+      <span>·</span>
+      <a routerLink="/register">Register</a>
+    </div>
+
+    <div class="auth-links" *ngIf="user?.loggedIn">
+      <span>{{ user?.username }}</span>
+      <span>·</span>
+      <a routerLink="/profile">Profile</a>
+      <span>·</span>
+      <button (click)="logout()">Logout</button>
+    </div>
+
+    <div class="controls-preview">
+      <h3>Sailing Controls</h3>
+      <table>
+        <tr><td>A / ←</td><td>Turn to port (left)</td></tr>
+        <tr><td>D / →</td><td>Turn to starboard (right)</td></tr>
+        <tr><td>1</td><td>Furl sails (stop)</td></tr>
+        <tr><td>2</td><td>Reduced sail (half speed)</td></tr>
+        <tr><td>3</td><td>Full canvas (full speed)</td></tr>
+      </table>
+      <p class="controls-hint">
+        Sail within 38° of the wind and you'll be blown backward.<br>
+        Best speed: broad reach (120–145° off wind).
+      </p>
+    </div>
+
+  </div>
+</div>

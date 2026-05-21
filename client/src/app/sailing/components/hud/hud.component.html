@@ -1,0 +1,209 @@
+<div class="hud-overlay pointer-events-none select-none">
+
+  <!-- ── Wind & speed panel (top-left) ──────────────────────────────────── -->
+  <div class="hud-panel top-left">
+
+    <!-- Wind compass -->
+    <div class="flex items-center gap-3">
+      <svg viewBox="0 0 80 80" class="w-20 h-20 flex-shrink-0">
+
+        <!--
+          Rotating compass card — spins so the ship's forward direction is always "up".
+          Everything inside (ring, labels, wind arrow) rotates by -heading.
+          The wind arrow has its absolute bearing applied on top, so
+          net rotation = windFromDeg - heading = relative wind direction.
+        -->
+        <g [style.transform]="'rotate(' + (-vessel().heading) + 'deg)'"
+           style="transform-origin: 40px 40px; transition: transform 0.1s ease;">
+
+          <!-- Outer ring -->
+          <circle cx="40" cy="40" r="36" fill="rgba(0,0,0,0.4)"
+                  stroke="rgba(255,255,255,0.2)" stroke-width="1.5"/>
+
+          <!-- Cardinal ticks — N is orange and longer -->
+          <line x1="40" y1="5"  x2="40" y2="14" stroke="#f97316" stroke-width="2.5"/>
+          <line x1="75" y1="40" x2="69" y2="40" stroke="rgba(255,255,255,0.3)" stroke-width="1"/>
+          <line x1="40" y1="75" x2="40" y2="67" stroke="rgba(255,255,255,0.3)" stroke-width="1.5"/>
+          <line x1="5"  y1="40" x2="11" y2="40" stroke="rgba(255,255,255,0.3)" stroke-width="1"/>
+          <!-- Intercardinal ticks -->
+          <line x1="65.5" y1="14.5" x2="62.5" y2="17.5" stroke="rgba(255,255,255,0.18)" stroke-width="0.8"/>
+          <line x1="65.5" y1="65.5" x2="62.5" y2="62.5" stroke="rgba(255,255,255,0.18)" stroke-width="0.8"/>
+          <line x1="14.5" y1="65.5" x2="17.5" y2="62.5" stroke="rgba(255,255,255,0.18)" stroke-width="0.8"/>
+          <line x1="14.5" y1="14.5" x2="17.5" y2="17.5" stroke="rgba(255,255,255,0.18)" stroke-width="0.8"/>
+
+          <!--
+            Cardinal labels — counter-rotated via SVG attr so the glyphs stay upright
+            as they travel around the ring (like a real ship's compass card).
+            rotate(+heading, label_x, label_y) cancels the parent -heading.
+          -->
+          <text [attr.transform]="'rotate(' + vessel().heading + ', 40, 21)'"
+                x="40" y="21" text-anchor="middle" dominant-baseline="central"
+                fill="#fb923c" font-size="8" font-family="monospace" font-weight="bold">N</text>
+          <text [attr.transform]="'rotate(' + vessel().heading + ', 60, 44)'"
+                x="60" y="44" text-anchor="middle" dominant-baseline="central"
+                fill="rgba(255,255,255,0.4)" font-size="7" font-family="monospace">E</text>
+          <text [attr.transform]="'rotate(' + vessel().heading + ', 40, 62)'"
+                x="40" y="62" text-anchor="middle" dominant-baseline="central"
+                fill="rgba(255,255,255,0.4)" font-size="7" font-family="monospace">S</text>
+          <text [attr.transform]="'rotate(' + vessel().heading + ', 20, 44)'"
+                x="20" y="44" text-anchor="middle" dominant-baseline="central"
+                fill="rgba(255,255,255,0.4)" font-size="7" font-family="monospace">W</text>
+
+          <!-- Wind arrow — absolute bearing applied here; net = windFromDeg - heading = relative wind -->
+          <g [style.transform]="'rotate(' + windFromDeg() + 'deg)'"
+             style="transform-origin: 40px 40px; transition: transform 0.8s ease;">
+            <polygon points="40,8 36,18 44,18" fill="#60a5fa"/>
+            <line x1="40" y1="18" x2="40" y2="55" stroke="#60a5fa" stroke-width="3" stroke-linecap="round"/>
+            <line x1="36" y1="55" x2="40" y2="65" stroke="rgba(96,165,250,0.4)" stroke-width="1.5"/>
+            <line x1="44" y1="55" x2="40" y2="65" stroke="rgba(96,165,250,0.4)" stroke-width="1.5"/>
+          </g>
+        </g>
+
+        <!-- Fixed bow indicator — always points up, represents ship's forward direction -->
+        <polygon points="40,13 37,24 43,24" fill="rgba(255,255,255,0.9)"/>
+        <line x1="40" y1="24" x2="40" y2="38"
+              stroke="rgba(255,255,255,0.55)" stroke-width="1.5" stroke-linecap="round"/>
+        <circle cx="40" cy="40" r="2" fill="rgba(255,255,255,0.35)"/>
+      </svg>
+
+      <!-- Wind stats -->
+      <div class="text-left">
+        <div class="text-blue-300 text-xs font-mono uppercase tracking-wider mb-1">Wind</div>
+        <div class="text-white text-2xl font-bold font-mono leading-none">{{ windKnots() }}</div>
+        <div class="text-blue-200 text-xs font-mono">kn · Bft {{ weather()?.wind?.beaufort ?? '--' }}</div>
+        <div class="text-blue-300 text-sm font-mono mt-1">
+          From {{ weather()?.wind?.cardinalDir ?? '--' }}
+        </div>
+        @if (weather()?.description) {
+          <div class="text-slate-300 text-xs mt-1 italic">{{ weather()?.description }}</div>
+        }
+      </div>
+    </div>
+
+    <!-- Wave height indicator -->
+    @if (weather()?.sea) {
+      <div class="mt-2 pt-2 border-t border-white/10 flex items-center gap-2">
+        <div class="text-slate-400 text-xs font-mono">Swell</div>
+        <div class="flex-1 h-1.5 bg-white/10 rounded-full overflow-hidden">
+          <div class="h-full bg-blue-400 rounded-full transition-all duration-1000"
+               [style.width]="((weather()?.sea?.choppiness ?? 0) * 100) + '%'"></div>
+        </div>
+        <div class="text-slate-300 text-xs font-mono">{{ weather()?.sea?.waveHeight?.toFixed(1) }}m</div>
+      </div>
+    }
+
+    <!-- Time of day -->
+    <div class="mt-2 pt-2 border-t border-white/10 flex items-center gap-2">
+      <span class="text-base leading-none">{{ dayPhaseIcon() }}</span>
+      <span class="text-white font-mono font-bold text-sm">{{ gameTimeStr() }}</span>
+    </div>
+  </div>
+
+  <!-- ── Sail state selector (top-right) ────────────────────────────────── -->
+  <div class="hud-panel top-right pointer-events-auto">
+    <div class="text-slate-400 text-xs font-mono uppercase tracking-wider mb-2">Sails</div>
+
+    <div class="flex flex-col gap-1.5">
+      @for (opt of [{state: 'reefed', label: 'Furled', icon: '▼▼', key: '1'},
+                    {state: 'topsails', label: 'Reduced', icon: '▽▲', key: '2'},
+                    {state: 'full', label: 'Full', icon: '▲▲', key: '3'}]; track opt.state) {
+        <button
+          (click)="setSail($any(opt.state))"
+          [class]="'sail-btn ' + (vessel().sailState === opt.state ? 'sail-btn--active' : '')">
+          <span class="sail-icon">{{ opt.icon }}</span>
+          <span class="flex-1 text-left">{{ opt.label }}</span>
+          <span class="sail-key">{{ opt.key }}</span>
+        </button>
+      }
+    </div>
+
+    <!-- Current point of sail -->
+    <div class="mt-3 pt-2 border-t border-white/10 text-center">
+      <div class="text-xs font-mono"
+           [class]="vessel().windAngle < 32 ? 'text-red-400' : 'text-green-300'">
+        {{ pointOfSail() }}
+      </div>
+      <div class="text-slate-500 text-xs mt-0.5 font-mono">{{ vessel().windAngle | number:'1.0-0' }}° off wind</div>
+    </div>
+
+    <!-- Exit to menu -->
+    <div class="mt-3 pt-2 border-t border-white/10">
+      <button class="exit-btn" (click)="exit()">← Return to harbour</button>
+    </div>
+  </div>
+
+  <!-- ── Speed & heading (bottom-left) ──────────────────────────────────── -->
+  <div class="hud-panel bottom-left">
+    <div class="flex gap-5 items-end">
+
+      <!-- Speed -->
+      <div>
+        <div class="text-slate-400 text-xs font-mono uppercase tracking-wider">Speed</div>
+        <div class="flex items-end gap-1">
+          <span class="text-white font-bold font-mono"
+                [class]="vessel().speed < 0 ? 'text-3xl text-red-400' : 'text-3xl'">
+            {{ speedKnots() }}
+          </span>
+          <span class="text-slate-400 text-sm font-mono pb-0.5">kn</span>
+        </div>
+        @if (vessel().speed < 0) {
+          <div class="text-red-400 text-xs font-mono">⚠ Sternway</div>
+        }
+      </div>
+
+      <!-- Heading -->
+      <div>
+        <div class="text-slate-400 text-xs font-mono uppercase tracking-wider">Heading</div>
+        <div class="text-white text-3xl font-bold font-mono">
+          {{ vessel().heading | number:'1.0-0' }}°
+        </div>
+        <div class="text-slate-300 text-sm font-mono">{{ headingCardinal() }}</div>
+      </div>
+
+      <!-- Tack -->
+      <div>
+        <div class="text-slate-400 text-xs font-mono uppercase tracking-wider">Tack</div>
+        <div class="text-lg font-bold font-mono"
+             [class]="vessel().isPortTack ? 'text-red-400' : 'text-green-400'">
+          {{ vessel().isPortTack ? 'Port' : 'Stbd' }}
+        </div>
+        <div class="text-slate-500 text-xs font-mono">
+          {{ vessel().sailState }}
+        </div>
+      </div>
+    </div>
+
+    <!-- Position -->
+    <div class="mt-2 pt-2 border-t border-white/10 text-xs font-mono text-slate-500">
+      {{ vessel().x | number:'1.0-0' }}, {{ vessel().z | number:'1.0-0' }}
+    </div>
+  </div>
+
+  <!-- ── Controls reminder (bottom-center) ─────────────────────────────── -->
+  <div class="hud-panel bottom-center pointer-events-none">
+    <div class="text-slate-500 text-xs font-mono flex gap-4">
+      <span><kbd>A</kbd>/<kbd>D</kbd> Steer</span>
+      <span><kbd>W</kbd>/<kbd>S</kbd> Sail ±</span>
+      <span><kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> Sail preset</span>
+      <span><kbd>M</kbd> Map</span>
+    </div>
+  </div>
+
+  <!-- ── Aground overlay ────────────────────────────────────────────────── -->
+  @if (grounded()) {
+    <div class="aground-overlay pointer-events-auto">
+      <div class="aground-panel">
+        <div class="aground-icon">⚓</div>
+        <div class="aground-title">Aground!</div>
+        <div class="aground-msg">
+          Your vessel has run aground on the shore.<br>
+          Furl your sails — or refloat to the nearest harbour.
+        </div>
+        <button class="refloat-btn" (click)="refloat()">
+          ⛵ &nbsp;Refloat
+        </button>
+      </div>
+    </div>
+  }
+
+</div>

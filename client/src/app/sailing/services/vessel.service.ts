@@ -1,16 +1,18 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  MeshBuilder, Vector3, Color3, StandardMaterial, Mesh,
-  TransformNode, VertexBuffer, Scene, PointerEventTypes, PointLight,
+  MeshBuilder, Vector3, Color3, Color4, StandardMaterial, Mesh,
+  TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { IslandService } from './island.service';
+import { OceanService }  from './ocean.service';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
   private sceneService  = inject(SceneService);
   private islandService = inject(IslandService);
+  private oceanService  = inject(OceanService);
   private zone          = inject(NgZone);
 
   // ── Public reactive state ─────────────────────────────────────────────────
@@ -70,24 +72,25 @@ export class VesselService {
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
   private readonly TRAVEL_SCALE = 5.0;
 
-  // ── Wake trail ────────────────────────────────────────────────────────────
-  // A fixed-size ring buffer of past positions drives a single updatable ribbon
-  // mesh in world space (not parented to root).  Vertex count never changes, so
-  // BabylonJS can update geometry in-place without reallocating.
+  // ── Wake / hull-wash particle systems ────────────────────────────────────
+  // Four ParticleSystems share one foam texture and use plain Vector3 emitters
+  // that are repositioned every physics tick to follow the hull.  Particles are
+  // emitted into world space, so they stay put while the boat moves away from
+  // them — this naturally builds up a V-shaped foam trail behind the vessel.
 
-  private readonly WAKE_POINTS     = 80;    // ring-buffer size (fixed vertex count)
-  private readonly WAKE_MIN_DIST   = 5.0;   // min world-unit gap between samples
-  private readonly WAKE_WIDTH_NEAR = 1.8;   // half-width (wu) right behind the stern
-  private readonly WAKE_WIDTH_FAR  = 9.5;   // half-width at the tail of the trail
-  private readonly WAKE_Y          = 0.70;  // above max WaterMaterial wave displacement (~0.5)
+  private readonly WAKE_Y = 0.30;          // at the waterline — slightly above wave trough
 
-  private wakeRing:    { x: number; z: number; hdg: number }[] = [];
-  private wakeMesh:    Mesh | null  = null;
-  private wakePort:    Vector3[]    = [];   // reusable geometry arrays (no GC pressure)
-  private wakeStbd:    Vector3[]    = [];
-  private wakeColBuf:  Float32Array = new Float32Array(0);
-  private lastWakeX  = 0;
-  private lastWakeZ  = 0;
+  private wakeTex!:   DynamicTexture;
+  private bowSpray!:  ParticleSystem;      // bow-wave V pushing water sideways
+  private sternFoam!: ParticleSystem;      // long-life foam forming the wake V-trail
+  private portFroth!: ParticleSystem;      // hull wash along port side
+  private stbdFroth!: ParticleSystem;      // hull wash along stbd side
+
+  // Emitter positions — updated every tick, referenced (not copied) by the systems
+  private bowEmit   = new Vector3(0, this.WAKE_Y, 0);
+  private sternEmit = new Vector3(0, this.WAKE_Y, 0);
+  private portEmit  = new Vector3(0, this.WAKE_Y, 0);
+  private stbdEmit  = new Vector3(0, this.WAKE_Y, 0);
 
   // ─────────────────────────────────────────────────────────────────────────
   init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): void {
@@ -123,6 +126,13 @@ export class VesselService {
 
     // Build wake trail (world-space, not parented to root)
     this.buildWake(scene);
+
+    // Register every hull / rig / sail mesh with the WaterMaterial so it appears
+    // in both the reflection RTT (mirror of the above-water hull in the surface)
+    // and the refraction RTT (the submerged hull visible through the water).
+    for (const mesh of this.root.getChildMeshes()) {
+      this.oceanService.addToRenderList(mesh);
+    }
   }
 
   private createPart(part: VesselPart, scene: Scene): Mesh {
@@ -469,9 +479,11 @@ export class VesselService {
     this.root.position.z = this.z;
     this.root.rotation.y = this.heading * Math.PI / 180;
 
-    // Dynamic float: hull bottom is at local Y = -0.8; water crests peak at ~0.5 units.
-    // Add choppiness offset so the boat rides visibly higher in rough seas.
-    const FLOAT_Y = 1.6 + sea.choppiness * 0.4;   // calm≈1.64  storm≈2.0
+    // Sit the hull realistically in the water.
+    // hull_main local bottom = −0.8 → at FLOAT_Y −0.4 the bottom is at world Y −1.2
+    // (clearly submerged), deck at world Y ≈ +0.72, waterline stripe at +0.42.
+    // In storm, rise slightly so wave crests don't swamp the deck.
+    const FLOAT_Y = -0.4 + sea.choppiness * 0.2;  // calm ≈ −0.40  storm ≈ −0.20
 
     // Wave bobbing — keep amplitude modest so hull never dips back into waves.
     const t        = this.simTime;
@@ -525,7 +537,7 @@ export class VesselService {
     const elevRad = this.camElevation * Math.PI / 180;
 
     const targetX = this.x;
-    const targetY = 2.5;
+    const targetY = 1.2;   // aim at cabin/lower-mast level — hull is now lower in the water
     const targetZ = this.z;
 
     const desiredX = targetX - Math.cos(elevRad) * Math.sin(azRad) * this.camDist;
@@ -613,98 +625,184 @@ export class VesselService {
     window.addEventListener('keyup',   this.keyUpHandler);
   }
 
-  // ── Wake trail ────────────────────────────────────────────────────────────
-  // Ring buffer of past samples drives a single updatable ribbon in world space.
-  // Vertex count is fixed (2 × WAKE_POINTS) so geometry can be updated in-place.
+  // ── Wake / hull-wash particle systems ────────────────────────────────────
 
   private buildWake(scene: Scene): void {
-    const N = this.WAKE_POINTS;
+    // Shared foam texture: soft radial gradient, slightly wider than tall
+    this.wakeTex = new DynamicTexture('wakeFoamTex', { width: 128, height: 128 }, scene, false);
+    const ctx    = this.wakeTex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, 128, 128);
+    const grd = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grd.addColorStop(0.00, 'rgba(255,255,255,1.00)');
+    grd.addColorStop(0.30, 'rgba(235,248,255,0.82)');
+    grd.addColorStop(0.65, 'rgba(210,235,255,0.28)');
+    grd.addColorStop(1.00, 'rgba(255,255,255,0.00)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, 128, 128);
+    this.wakeTex.update();
+    this.wakeTex.hasAlpha = true;
 
-    // Pre-fill ring with spawn position so vertex count is fixed immediately
-    this.wakeRing   = Array.from({ length: N }, () => ({ x: this.x, z: this.z, hdg: this.heading }));
-    this.lastWakeX  = this.x;
-    this.lastWakeZ  = this.z;
+    // ── Bow spray ──────────────────────────────────────────────────────────
+    // Emits from the bow, particles pushed sideways to form the bow wave.
+    this.bowSpray = new ParticleSystem('bowSpray', 220, scene);
+    this.bowSpray.particleTexture = this.wakeTex;
+    this.bowSpray.emitter    = this.bowEmit;
+    this.bowSpray.minEmitBox = new Vector3(-0.4, 0, -0.4);
+    this.bowSpray.maxEmitBox = new Vector3( 0.4, 0,  0.4);
+    this.bowSpray.color1     = new Color4(1.00, 1.00, 1.00, 0.72);
+    this.bowSpray.color2     = new Color4(0.88, 0.95, 1.00, 0.50);
+    this.bowSpray.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
+    this.bowSpray.minSize     = 0.06; this.bowSpray.maxSize     = 0.20;
+    this.bowSpray.minLifeTime = 0.4;  this.bowSpray.maxLifeTime = 1.2;
+    this.bowSpray.minEmitPower = 2;   this.bowSpray.maxEmitPower = 6;
+    this.bowSpray.updateSpeed  = 0.016;
+    // direction1/direction2 are heading-dependent — set in updateWake each tick
+    this.bowSpray.direction1 = new Vector3(-1, 0.2, 0);
+    this.bowSpray.direction2 = new Vector3( 1, 0.2, 0);
+    this.bowSpray.gravity    = new Vector3(0, -0.5, 0);
+    this.bowSpray.blendMode  = ParticleSystem.BLENDMODE_ADD;
+    this.bowSpray.emitRate   = 0;
+    this.bowSpray.start();
 
-    // Pre-allocate reusable Vector3 arrays — mutated each frame, never reallocated
-    this.wakePort   = Array.from({ length: N }, () => new Vector3(this.x, this.WAKE_Y, this.z));
-    this.wakeStbd   = Array.from({ length: N }, () => new Vector3(this.x, this.WAKE_Y, this.z));
-    this.wakeColBuf = new Float32Array(N * 2 * 4);  // RGBA for each of 2×N vertices
+    // ── Stern foam (long-life wake V-trail) ────────────────────────────────
+    // Low velocity so particles stay roughly where spawned; the moving boat
+    // leaves them behind, naturally building a long V-shaped foam trail.
+    this.sternFoam = new ParticleSystem('sternFoam', 600, scene);
+    this.sternFoam.particleTexture = this.wakeTex;
+    this.sternFoam.emitter    = this.sternEmit;
+    this.sternFoam.minEmitBox = new Vector3(-1.0, 0, -0.5);
+    this.sternFoam.maxEmitBox = new Vector3( 1.0, 0,  0.5);
+    this.sternFoam.color1     = new Color4(1.00, 1.00, 1.00, 0.60);
+    this.sternFoam.color2     = new Color4(0.85, 0.94, 1.00, 0.38);
+    this.sternFoam.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
+    this.sternFoam.minSize     = 0.12; this.sternFoam.maxSize     = 0.38;
+    this.sternFoam.minLifeTime = 4.0;  this.sternFoam.maxLifeTime = 9.0;
+    this.sternFoam.minEmitPower = 0.5; this.sternFoam.maxEmitPower = 2.5;
+    this.sternFoam.updateSpeed  = 0.016;
+    this.sternFoam.direction1 = new Vector3(-1, 0, -1);
+    this.sternFoam.direction2 = new Vector3( 1, 0,  1);
+    this.sternFoam.gravity    = Vector3.Zero();
+    this.sternFoam.blendMode  = ParticleSystem.BLENDMODE_ADD;
+    this.sternFoam.emitRate   = 0;
+    this.sternFoam.start();
 
-    // Create ribbon — updatable, not parented (lives in world space)
-    this.wakeMesh = MeshBuilder.CreateRibbon('wake_trail', {
-      pathArray:       [this.wakePort, this.wakeStbd],
-      updatable:       true,
-      sideOrientation: Mesh.DOUBLESIDE,
-    }, scene);
-    this.wakeMesh.setVerticesData(VertexBuffer.ColorKind, this.wakeColBuf, true);
-    this.wakeMesh.hasVertexAlpha = true;
-    this.wakeMesh.isPickable     = false;
+    // ── Port hull froth ────────────────────────────────────────────────────
+    this.portFroth = new ParticleSystem('portFroth', 160, scene);
+    this.portFroth.particleTexture = this.wakeTex;
+    this.portFroth.emitter    = this.portEmit;
+    this.portFroth.minEmitBox = new Vector3(-0.3, 0, -1.5);
+    this.portFroth.maxEmitBox = new Vector3( 0.3, 0,  1.5);
+    this.portFroth.color1     = new Color4(1.00, 1.00, 1.00, 0.55);
+    this.portFroth.color2     = new Color4(0.90, 0.96, 1.00, 0.30);
+    this.portFroth.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
+    this.portFroth.minSize     = 0.04; this.portFroth.maxSize     = 0.14;
+    this.portFroth.minLifeTime = 0.4;  this.portFroth.maxLifeTime = 1.4;
+    this.portFroth.minEmitPower = 1;   this.portFroth.maxEmitPower = 4;
+    this.portFroth.updateSpeed  = 0.016;
+    this.portFroth.direction1 = new Vector3(-1, 0.1, 0);
+    this.portFroth.direction2 = new Vector3(-3, 0.2, 0);
+    this.portFroth.gravity    = new Vector3(0, -0.3, 0);
+    this.portFroth.blendMode  = ParticleSystem.BLENDMODE_ADD;
+    this.portFroth.emitRate   = 0;
+    this.portFroth.start();
 
-    const mat = new StandardMaterial('wake_mat', scene);
-    // disableLighting keeps the foam bright white day and night; vertex alpha fades the tail.
-    mat.disableLighting = true;
-    mat.emissiveColor   = new Color3(0.88, 0.94, 1.0);  // soft blue-white foam
-    mat.backFaceCulling = false;
-    this.wakeMesh.material = mat;
+    // ── Stbd hull froth ────────────────────────────────────────────────────
+    this.stbdFroth = new ParticleSystem('stbdFroth', 160, scene);
+    this.stbdFroth.particleTexture = this.wakeTex;
+    this.stbdFroth.emitter    = this.stbdEmit;
+    this.stbdFroth.minEmitBox = new Vector3(-0.3, 0, -1.5);
+    this.stbdFroth.maxEmitBox = new Vector3( 0.3, 0,  1.5);
+    this.stbdFroth.color1     = new Color4(1.00, 1.00, 1.00, 0.55);
+    this.stbdFroth.color2     = new Color4(0.90, 0.96, 1.00, 0.30);
+    this.stbdFroth.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
+    this.stbdFroth.minSize     = 0.04; this.stbdFroth.maxSize     = 0.14;
+    this.stbdFroth.minLifeTime = 0.4;  this.stbdFroth.maxLifeTime = 1.4;
+    this.stbdFroth.minEmitPower = 1;   this.stbdFroth.maxEmitPower = 4;
+    this.stbdFroth.updateSpeed  = 0.016;
+    this.stbdFroth.direction1 = new Vector3(1, 0.1, 0);
+    this.stbdFroth.direction2 = new Vector3(3, 0.2, 0);
+    this.stbdFroth.gravity    = new Vector3(0, -0.3, 0);
+    this.stbdFroth.blendMode  = ParticleSystem.BLENDMODE_ADD;
+    this.stbdFroth.emitRate   = 0;
+    this.stbdFroth.start();
   }
 
   private resetWake(): void {
-    const N = this.WAKE_POINTS;
-    for (let i = 0; i < N; i++) this.wakeRing[i] = { x: this.x, z: this.z, hdg: this.heading };
-    this.lastWakeX = this.x;
-    this.lastWakeZ = this.z;
-    this.updateWake();   // flush geometry so trail doesn't stretch across the map
+    // Snap emitters to current position so old particles don't linger in the wrong place
+    this.updateWake();
   }
 
   private updateWake(): void {
-    if (!this.wakeMesh) return;
-    const N = this.WAKE_POINTS;
+    const absSpeed = Math.abs(this.speed);
+    const hdgR     = this.heading * Math.PI / 180;
 
-    // Add a new sample when the vessel has moved far enough
-    const dx   = this.x - this.lastWakeX;
-    const dz   = this.z - this.lastWakeZ;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist >= this.WAKE_MIN_DIST && Math.abs(this.speed) > 0.01) {
-      this.wakeRing.unshift({ x: this.x, z: this.z, hdg: this.heading });
-      this.wakeRing.length = N;   // drop oldest without allocating
-      this.lastWakeX = this.x;
-      this.lastWakeZ = this.z;
-    }
+    // Forward unit vector (direction the bow points)
+    const fwdX =  Math.sin(hdgR);
+    const fwdZ =  Math.cos(hdgR);
+    // Right unit vector (starboard side)
+    const rgtX =  Math.cos(hdgR);
+    const rgtZ = -Math.sin(hdgR);
 
-    // Rebuild port/stbd geometry and colour buffer in-place (no allocations)
-    for (let i = 0; i < N; i++) {
-      const pt   = this.wakeRing[i];
-      const t    = i / (N - 1);                 // 0 = newest (stern), 1 = oldest (tail)
-      const hw   = this.WAKE_WIDTH_NEAR + t * (this.WAKE_WIDTH_FAR - this.WAKE_WIDTH_NEAR);
-      const hdgR = pt.hdg * Math.PI / 180;
-      // Perpendicular vector to vessel heading: right = (cos θ, −sin θ) in XZ
-      const px   = Math.cos(hdgR);
-      const pz   = -Math.sin(hdgR);
+    // Approximate hull geometry (world units)
+    const halfLen = 7.0;   // bow/stern offset from vessel centre
+    const halfBm  = 2.2;   // half-beam (port/stbd offset)
+    const Y       = this.WAKE_Y;
 
-      this.wakePort[i].set(pt.x - px * hw, this.WAKE_Y, pt.z - pz * hw);
-      this.wakeStbd[i].set(pt.x + px * hw, this.WAKE_Y, pt.z + pz * hw);
+    // ── Reposition emitters ──────────────────────────────────────────────
+    this.bowEmit.set(
+      this.x + fwdX * halfLen,
+      Y,
+      this.z + fwdZ * halfLen,
+    );
+    this.sternEmit.set(
+      this.x - fwdX * halfLen,
+      Y,
+      this.z - fwdZ * halfLen,
+    );
+    this.portEmit.set(
+      this.x - rgtX * halfBm,
+      Y,
+      this.z - rgtZ * halfBm,
+    );
+    this.stbdEmit.set(
+      this.x + rgtX * halfBm,
+      Y,
+      this.z + rgtZ * halfBm,
+    );
 
-      // Alpha: quadratic fade toward tail — bright near stern, fades to nothing at tail
-      const alpha = (1 - t * t) * 0.92;
-      // BabylonJS ribbon stores ALL of path0 first, then ALL of path1 (path-by-path,
-      // NOT interleaved).  Correct offsets: path0[i] = i*4, path1[i] = (N+i)*4.
-      const b0 = i * 4;
-      const b1 = (N + i) * 4;
-      // Vertex colour (1,1,1) × emissiveColor in shader = the foam tint we want.
-      // Only the alpha channel varies — controls the fade along the trail.
-      this.wakeColBuf[b0]     = 1.0; this.wakeColBuf[b0 + 1] = 1.0;
-      this.wakeColBuf[b0 + 2] = 1.0; this.wakeColBuf[b0 + 3] = alpha;
-      this.wakeColBuf[b1]     = 1.0; this.wakeColBuf[b1 + 1] = 1.0;
-      this.wakeColBuf[b1 + 2] = 1.0; this.wakeColBuf[b1 + 3] = alpha;
-    }
+    // ── Heading-dependent direction vectors ───────────────────────────────
+    // Bow: spray sideways away from the prow (port and stbd plumes)
+    this.bowSpray.direction1.set(-rgtX * 4 - fwdX, 0.3, -rgtZ * 4 - fwdZ);
+    this.bowSpray.direction2.set( rgtX * 4 - fwdX, 0.3,  rgtZ * 4 - fwdZ);
 
-    // Push geometry update to GPU.  Ribbon positions are updated via instance,
-    // colour buffer is patched in-place with updateVerticesData (no reallocation).
-    MeshBuilder.CreateRibbon('wake_trail', {
-      pathArray: [this.wakePort, this.wakeStbd],
-      instance:  this.wakeMesh,
-    });
-    this.wakeMesh.updateVerticesData(VertexBuffer.ColorKind, this.wakeColBuf);
+    // Stern: spread sideways and slightly aft; long-lifetime particles form the V
+    this.sternFoam.direction1.set(-fwdX * 2 - rgtX * 4, 0, -fwdZ * 2 - rgtZ * 4);
+    this.sternFoam.direction2.set(-fwdX * 2 + rgtX * 4, 0, -fwdZ * 2 + rgtZ * 4);
+
+    // Port: pushed outward to port side
+    this.portFroth.direction1.set(-rgtX * 2 - fwdX * 0.5, 0.15, -rgtZ * 2 - fwdZ * 0.5);
+    this.portFroth.direction2.set(-rgtX * 4 - fwdX * 0.5, 0.25, -rgtZ * 4 - fwdZ * 0.5);
+
+    // Stbd: pushed outward to starboard side
+    this.stbdFroth.direction1.set( rgtX * 2 - fwdX * 0.5, 0.15,  rgtZ * 2 - fwdZ * 0.5);
+    this.stbdFroth.direction2.set( rgtX * 4 - fwdX * 0.5, 0.25,  rgtZ * 4 - fwdZ * 0.5);
+
+    // ── Emit rates — scale with speed, cut off below threshold ───────────
+    const moving = absSpeed > 0.3;
+    const sf     = moving ? Math.min(1, absSpeed / this.physics.maxSpeed) : 0;
+
+    this.bowSpray.emitRate  = Math.round(sf * 60);
+    this.sternFoam.emitRate = Math.round(sf * 45);
+    this.portFroth.emitRate = Math.round(sf * 35);
+    this.stbdFroth.emitRate = Math.round(sf * 35);
+
+    // ── Size scales modestly with speed ───────────────────────────────────
+    const sizeBoost = sf * 0.08;
+    this.bowSpray.maxSize  = 0.20 + sizeBoost;
+    this.sternFoam.maxSize = 0.38 + sizeBoost;
+
+    // ── Inform ocean service so wake plane shader knows boat position ──────
+    this.oceanService.setBoatTransform(this.x, this.z, hdgR, this.speed);
   }
 
   getPosition(): { x: number; z: number } {
@@ -724,6 +822,9 @@ export class VesselService {
     for (const light of this.torchLights) light.dispose();
     this.torchLights    = [];
     this.torchFlameMats = [];
-    if (this.wakeMesh) { this.wakeMesh.material?.dispose(); this.wakeMesh.dispose(); this.wakeMesh = null; }
+    for (const ps of [this.bowSpray, this.sternFoam, this.portFroth, this.stbdFroth]) {
+      ps?.stop(); ps?.dispose();
+    }
+    this.wakeTex?.dispose();
   }
 }

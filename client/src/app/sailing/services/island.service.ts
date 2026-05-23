@@ -226,6 +226,7 @@ export class IslandService {
 
     const mat = new StandardMaterial('islandMat_' + island.id, scene);
     mat.specularColor = new Color3(0.04, 0.04, 0.04);
+    mat.zOffset       = 4;   // depth bias so ocean wins z-fights at the waterline
     mesh.material     = mat;
 
     // Add island to ocean render list for reflections

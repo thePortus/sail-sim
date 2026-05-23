@@ -1,0 +1,65 @@
+@if (visible()) {
+  <div class="admin-panel" role="dialog" aria-label="Admin controls">
+
+    <div class="panel-header">
+      <span class="panel-title">&#9881; Admin Controls</span>
+      <button class="close-btn" (click)="hide()" title="Close (`)">&#10005;</button>
+    </div>
+
+    <!-- ── Weather section ─────────────────────────────── -->
+    <section class="panel-section">
+      <h3 class="section-title">
+        Weather
+        @if (weatherOverrideActive()) {
+          <span class="badge badge--active">OVERRIDE ON</span>
+        }
+      </h3>
+
+      <label class="field-label">
+        Wind Speed &nbsp;<span class="value-tag">{{ windSpeed() | number:'1.0-0' }} m/s
+          &nbsp;(Bf&nbsp;{{ beaufort() }})</span>
+      </label>
+      <input type="range" class="slider" min="0" max="30" step="0.5"
+             [value]="windSpeed()"
+             (input)="windSpeed.set(+$any($event.target).value)" />
+
+      <label class="field-label">
+        Wind Direction &nbsp;<span class="value-tag">{{ windBearing() | number:'1.0-0' }}°
+          FROM &nbsp;{{ cardinalDir() }}</span>
+      </label>
+      <input type="range" class="slider" min="0" max="359" step="1"
+             [value]="windBearing()"
+             (input)="windBearing.set(+$any($event.target).value)" />
+
+      <div class="btn-row">
+        <button class="btn btn--apply" (click)="applyWeather()">Apply</button>
+        <button class="btn btn--clear" (click)="clearWeather()"
+                [disabled]="!weatherOverrideActive()">Clear</button>
+      </div>
+    </section>
+
+    <!-- ── Time of day section ─────────────────────────── -->
+    <section class="panel-section">
+      <h3 class="section-title">
+        Time of Day
+        @if (timeOverrideActive()) {
+          <span class="badge badge--active">OVERRIDE ON</span>
+        }
+      </h3>
+
+      <label class="field-label">
+        Game Time &nbsp;<span class="value-tag">{{ timeLabel() }}</span>
+      </label>
+      <input type="range" class="slider" min="0" max="23.75" step="0.25"
+             [value]="targetHour()"
+             (input)="targetHour.set(+$any($event.target).value)" />
+
+      <div class="btn-row">
+        <button class="btn btn--apply" (click)="applyTime()">Apply</button>
+        <button class="btn btn--clear" (click)="clearTime()"
+                [disabled]="!timeOverrideActive()">Clear</button>
+      </div>
+    </section>
+
+  </div>
+}

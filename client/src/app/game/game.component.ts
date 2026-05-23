@@ -20,6 +20,7 @@ import { AuthService }        from '../services/auth.service';
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
 import { VesselSelectorComponent } from '../sailing/components/vessel-selector/vessel-selector.component';
+import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -29,7 +30,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent],
   template: `
     <div class="game-root">
       <!-- BabylonJS canvas -->
@@ -59,6 +60,10 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <div class="minimap-anchor">
           <app-minimap />
         </div>
+        @if (isAdmin) {
+          <app-admin-panel #adminPanel />
+          <div class="admin-hint">Press <kbd>&#96;</kbd> for admin controls</div>
+        }
       }
     </div>
   `,
@@ -71,6 +76,15 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                         align-items: center; justify-content: center;
                         background: radial-gradient(ellipse at center, #0d2240 0%, #08111e 70%); }
     .minimap-anchor { position: absolute; bottom: 1.5rem; right: 1.5rem; z-index: 50; }
+    .admin-hint {
+      position: absolute; bottom: 1.5rem; left: 1.5rem; z-index: 50;
+      font-family: monospace; font-size: 10px; color: rgba(255,255,255,0.22);
+      pointer-events: none; letter-spacing: 0.04em;
+    }
+    .admin-hint kbd {
+      display: inline-block; padding: 0 4px; border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.35);
+    }
   `],
 })
 export class GameComponent implements AfterViewInit, OnDestroy {
@@ -90,12 +104,25 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   phase      = signal<GamePhase>('selecting');
   loadingMsg = signal('Charting the archipelago…');
 
+  /** True if the logged-in user has admin or owner role — controls admin panel visibility. */
+  isAdmin = false;
+
   private selectedSlug = '';
   private callsign     = '';
   private saveInterval: ReturnType<typeof setInterval> | null = null;
 
   // Wire weather → ocean + vessel
   constructor() {
+    // Resolve admin role from localStorage (inject() context is live here)
+    try {
+      const raw = this.authService.getUserDetails();
+      if (raw) {
+        const data = JSON.parse(raw);
+        const role = (data?.role ?? '').toLowerCase();
+        this.isAdmin = role === 'admin' || role === 'owner';
+      }
+    } catch { /* malformed userData — leave isAdmin false */ }
+
     effect(() => {
       const w = this.weatherService.weather();
       if (!w) return;
@@ -138,12 +165,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
-    // 1. Boot BabylonJS scene
+    // 1. Boot BabylonJS scene (WebGPU — async device acquisition)
     this.loadingMsg.set('Preparing the ocean…');
-    this.sceneService.init(this.canvasRef.nativeElement);
+    await this.sceneService.initAsync(this.canvasRef.nativeElement);
 
     // 2. Build ocean + atmosphere
-    this.oceanService.init();
+    await this.oceanService.init();
     this.cloudService.init();
 
     // 3. Load islands

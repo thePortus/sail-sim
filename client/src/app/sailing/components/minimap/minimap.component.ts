@@ -1,6 +1,6 @@
 import {
   Component, ElementRef, ViewChild, AfterViewInit, OnInit,
-  OnDestroy, computed, effect, inject, signal,
+  OnDestroy, effect, inject, signal,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { IslandService } from '../../services/island.service';
@@ -30,6 +30,15 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private precomputedIslands: { polygon: [number, number][]; color: string }[] = [];
   private keyHandler = (e: KeyboardEvent) => { if (e.code === 'KeyM') this.toggleExpand(); };
 
+  constructor() {
+    // effect() must run inside an injection context (constructor / field initializer).
+    // Angular 19 throws NG0203 if called from ngAfterViewInit or later lifecycle hooks.
+    effect(() => {
+      this.islandService.islands();   // reactive dependency
+      this.precomputeIslandPolygons();
+    });
+  }
+
   ngOnInit(): void {
     window.addEventListener('keydown', this.keyHandler);
   }
@@ -37,12 +46,6 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   ngAfterViewInit(): void {
     this.precomputeIslandPolygons();
     this.renderLoop();
-
-    // Re-precompute when island list changes
-    effect(() => {
-      this.islandService.islands();
-      this.precomputeIslandPolygons();
-    });
   }
 
   ngOnDestroy(): void {

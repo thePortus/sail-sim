@@ -5,6 +5,7 @@ import {
   Mesh, Scene, DynamicTexture,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
+import { WeatherService } from './weather.service';
 import { OtherPlayer, SailState } from '../models';
 import { Settings } from '../../app.settings';
 import { firstValueFrom } from 'rxjs';
@@ -27,9 +28,10 @@ interface RemotePart {
 
 @Injectable({ providedIn: 'root' })
 export class MultiplayerService {
-  private sceneService = inject(SceneService);
-  private zone         = inject(NgZone);
-  private http         = inject(HttpClient);
+  private sceneService  = inject(SceneService);
+  private weatherService = inject(WeatherService);
+  private zone          = inject(NgZone);
+  private http          = inject(HttpClient);
 
   otherPlayers = signal<OtherPlayer[]>([]);
 
@@ -120,6 +122,10 @@ export class MultiplayerService {
 
     } else if (msg.type === 'leave') {
       this.removePlayer(msg.id);
+
+    } else if (msg.type === 'wave_state') {
+      // Server-authoritative weather: sync all clients to the same sea state.
+      this.weatherService.receiveServerState(msg.windBearing, msg.windSpeed);
     }
   }
 

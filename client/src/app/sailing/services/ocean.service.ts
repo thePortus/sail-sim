@@ -1,15 +1,29 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  MeshBuilder, Vector3, Mesh, ShaderMaterial, Scene,
-  DefaultRenderingPipeline, DirectionalLight,
+  MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
+  DirectionalLight, MirrorTexture, Plane,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
+import { OceanFFTEngine } from './ocean-fft-engine.service';
 import { SeaConditions, Wind } from '../models';
 
 // ── Vertex shader ─────────────────────────────────────────────────────────────
-// Flat pass-through — all wave detail is computed analytically in the fragment
-// shader via fBm gradient normals.  No vertex displacement means no periodic
-// shadow bands or sine-wave stripe artefacts.
+//
+// Procedural wave displacement (Babylon NME model — simplified for WebGPU).
+//
+// Three-component model:
+//   1. 2D Voronoi F1 × 2  — organic swell crests drifting downwind
+//   2. 3-octave value-noise fBm — medium-frequency chop
+//   3. Directional sine swell   — primary long-wavelength swell
+//
+// Deliberately uses only:
+//   • smoothNoise() — 1 helper (_h), simple trilinear value noise
+//   • voronoi2D()   — 9-iteration 2D cellular noise
+// Avoids the full Simplex3D + 3D-Voronoi (27 iterations) that overwhelmed
+// Babylon's GLSL→WGSL transpiler.
+//
+// FFT normal textures are still sampled in the fragment shader for micro-detail.
+
 const OCEAN_VERT = `
 precision highp float;
 
@@ -19,178 +33,303 @@ attribute vec2 uv;
 uniform mat4 worldViewProjection;
 uniform mat4 world;
 
-varying vec3 v_worldPos;
-varying vec2 v_uv;
+uniform vec2  u_WorldOffset;
+uniform float u_MeshHalfSize;
+uniform float u_DisplaceScale;
+uniform float u_DomainC0;
+uniform float u_DomainC1;
+uniform float u_DomainC2;
+uniform float u_Time;
+uniform vec2  u_Direction;    // normalised wind direction (XZ)
+uniform float u_WindSpeed;    // m/s — scales all amplitudes
+
+varying vec3  v_worldPos;
+varying float v_waveHeight;   // raw metres, used for colour gradient + dFdx normals
+varying vec2  v_uv_c0;
+varying vec2  v_uv_c1;
+varying vec2  v_uv_c2;
+varying vec4  v_projPos;
+
+// ── Value noise (3D trilinear, C1-smooth) ─────────────────────────────────────
+// Single helper, no overloads, no vec3(vec2,float) constructors.
+float _h(float ax, float ay, float az) {
+  return fract(sin(ax * 127.1 + ay * 311.7 + az * 74.7) * 43758.5453);
+}
+float smoothNoise(float px, float py, float pz) {
+  float ix = floor(px);  float fx = fract(px);  fx = fx*fx*(3.0-2.0*fx);
+  float iy = floor(py);  float fy = fract(py);  fy = fy*fy*(3.0-2.0*fy);
+  float iz = floor(pz);  float fz = fract(pz);  fz = fz*fz*(3.0-2.0*fz);
+  return mix(
+    mix(mix(_h(ix,   iy,   iz), _h(ix+1.0, iy,   iz  ), fx),
+        mix(_h(ix,   iy+1.0,iz), _h(ix+1.0, iy+1.0,iz  ), fx), fy),
+    mix(mix(_h(ix,   iy,   iz+1.0), _h(ix+1.0, iy,   iz+1.0), fx),
+        mix(_h(ix,   iy+1.0,iz+1.0), _h(ix+1.0, iy+1.0,iz+1.0), fx), fy),
+    fz) * 2.0 - 1.0;
+}
+
+// ── 2D Voronoi F1 ─────────────────────────────────────────────────────────────
+// Cells drift in wind direction → simulates forward-travelling wave trains.
+// 9 neighbour iterations (no vec4 operations, no sin of large values).
+float voronoi2D(float px, float py, float jitter) {
+  float ix = floor(px);  float fx = fract(px);
+  float iy = floor(py);  float fy = fract(py);
+  float d = 8.0;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      float cx  = float(i);  float cy = float(j);
+      float rx  = fract(sin((ix+cx)*127.1 + (iy+cy)*311.7) * 43758.5453);
+      float ry  = fract(sin((ix+cx)*269.5 + (iy+cy)*183.3) * 43758.5453);
+      float dx  = cx + rx * jitter - fx;
+      float dy  = cy + ry * jitter - fy;
+      d = min(d, dx*dx + dy*dy);
+    }
+  }
+  return sqrt(d);
+}
+
+// ── Composite wave height (Babylon NME model) ─────────────────────────────────
+float waveHeight(float wx, float wz) {
+  float ws = max(u_WindSpeed, 1.0);
+  float t  = u_Time;
+  float dx = u_Direction.x;
+  float dz = u_Direction.y;   // y component of Direction is Z in world-space
+  float cx = -dz;             // cross-wind direction
+  float cz =  dx;
+
+  // — Voronoi 1: primary downwind swell (~360 m cells) —
+  float vs   = 0.0028;
+  float vspd = 0.60;
+  float vU1  = wx * vs + dx * t * vspd;
+  float vV1  = wz * vs + dz * t * vspd;
+  float v1   = voronoi2D(vU1, vV1, 0.85);
+  float hV1  = max(0.0, 1.0 - v1 * 1.4) * ws * 0.090;
+
+  // — Voronoi 2: cross-wind secondary swell (crossing seas) —
+  float vU2  = wx * vs * 0.77 + (dx * 0.55 + cx * 0.45) * t * vspd * 0.68;
+  float vV2  = wz * vs * 0.77 + (dz * 0.55 + cz * 0.45) * t * vspd * 0.68;
+  float v2   = voronoi2D(vU2, vV2, 0.90);
+  float hV2  = max(0.0, 1.0 - v2 * 1.4) * ws * 0.030;
+
+  // — 3-octave value noise fBm (wind-drifted) —
+  // Octave 4 omitted: at 3 m vertex spacing, its period (~20 m) is below
+  // the 8-vertices-per-wavelength threshold for smooth appearance.
+  float ps   = 0.0055;
+  float pspd = 0.28;
+  float drx  = dx * t * pspd;
+  float drz  = dz * t * pspd;
+  float n1   = smoothNoise(wx*ps         + drx,        wz*ps         + drz,        t*0.09);
+  float n2   = smoothNoise(wx*ps*2.10    + drx*1.9,    wz*ps*2.10    + drz*1.9,    t*0.19) * 0.50;
+  float n3   = smoothNoise(wx*ps*4.37    + drx*2.8,    wz*ps*4.37    + drz*2.8,    t*0.39) * 0.25;
+  float hN   = (n1 + n2 + n3) * ws * 0.048;
+
+  // — Directional sine swell —
+  float swellLen = clamp(200.0 / ws, 25.0, 280.0);
+  float swellH   = ws * 0.040;
+  float hS       = sin((wx * dx + wz * dz) / swellLen - t * 0.70) * swellH;
+
+  return hV1 + hV2 + hN + hS;
+}
 
 void main() {
-    v_uv       = uv;
-    v_worldPos = (world * vec4(position, 1.0)).xyz;
-    gl_Position = worldViewProjection * vec4(position, 1.0);
+  float wx = position.x + u_WorldOffset.x;
+  float wz = position.z + u_WorldOffset.y;
+
+  // Edge-fade: blend displacement to zero near mesh boundary to hide seam.
+  float d    = max(abs(position.x), abs(position.z));
+  float fade = u_DisplaceScale * (1.0 - smoothstep(
+    u_MeshHalfSize * 0.80,
+    u_MeshHalfSize * 0.97,
+    d
+  ));
+
+  // Per-cascade tiling UVs for FFT normal sampling in fragment shader.
+  float u0 = fract(wx / u_DomainC0);  float v0 = fract(wz / u_DomainC0);
+  float u1 = fract(wx / u_DomainC1);  float v1 = fract(wz / u_DomainC1);
+  float u2 = fract(wx / u_DomainC2);  float v2 = fract(wz / u_DomainC2);
+
+  vec3  pos = position;
+  float h   = 0.0;
+
+  if (fade > 0.001) {
+    h      = waveHeight(wx, wz);
+    pos.y += h * fade;
+  }
+
+  v_worldPos   = (world * vec4(pos, 1.0)).xyz;
+  v_waveHeight = h;
+  v_uv_c0      = vec2(u0, v0);
+  v_uv_c1      = vec2(u1, v1);
+  v_uv_c2      = vec2(u2, v2);
+  gl_Position  = worldViewProjection * vec4(pos, 1.0);
+  v_projPos    = gl_Position;
 }
 `;
 
 // ── Fragment shader ───────────────────────────────────────────────────────────
-// Normal generation: 5-octave analytical fBm value-noise gradients.
-//   • Each octave scrolls in a unique compass direction at a unique speed so
-//     no two octaves share phase → non-repeating surface detail at any angle.
-//   • Non-integer lacunarity (2.07) prevents frequency-resonance moiré stripes.
-//   • Distance fade decays normals to (0,1,0) beyond 18 km, eliminating the
-//     Gerstner phase-aliasing that renders distant ocean as solid-blue patches.
-// Lighting: Fresnel (F0 = 0.02, IOR 1.33) + narrow GGX specular.  Specular is
-// intentionally > 1 so post-process bloom turns it into wide sparkle.
-// Foam: 3-layer procedural value-noise — no external textures required.
+//
+// Lighting pipeline:
+//   1. FFT cascade normals  — micro-detail ripple from compute textures
+//   2. Macro normals        — dFdx/dFdy(v_waveHeight) matches actual geometry
+//   3. NME colour gradient  — trough navy → mid ocean blue → cyan crest
+//   4. Schlick Fresnel      — F0 = 0.020 (water n ≈ 1.33)
+//   5. SSS back-scatter     — teal glow through wave crests
+//   6. GGX specular         — tight lobe (r=0.028), properly BRDF-normalised
+//   7. RTT reflection       — screen-space mirror + analytical sky fallback
+//   8. Height-threshold foam + Beaufort whitecaps
+//   9. Horizon haze
+
 const OCEAN_FRAG = `
 precision highp float;
 
-uniform float u_Time;
-uniform float u_speed;
-uniform float u_choppiness;
-uniform vec3  u_cameraPosition;
-uniform vec3  u_sunDir;
-uniform vec3  u_sunColor;
-uniform vec3  u_skyColorA;
-uniform vec3  u_skyColorB;
-uniform float u_FoamSpeed;
+uniform float     u_Time;
+uniform float     u_choppiness;
+uniform float     u_DisplaceScale;
+uniform float     u_Beaufort;
+uniform float     u_MaxCascade;
+uniform float     u_WindSpeed;
+uniform vec3      u_cameraPosition;
+uniform vec3      u_sunDir;
+uniform vec3      u_sunColor;
+uniform vec3      u_skyColorA;
+uniform vec3      u_skyColorB;
+uniform sampler2D u_norm0;
+uniform sampler2D u_norm1;
+uniform sampler2D u_norm2;
+uniform sampler2D u_reflectionSampler;
 
-varying vec3 v_worldPos;
-varying vec2 v_uv;
+varying vec3  v_worldPos;
+varying float v_waveHeight;
+varying vec2  v_uv_c0;
+varying vec2  v_uv_c1;
+varying vec2  v_uv_c2;
+varying vec4  v_projPos;
 
-// ── Hash — uniform pseudo-random scalar in [0,1] ──────────────────────────────
-float hashF(vec2 p) {
-    p  = fract(p * vec2(127.1, 311.7));
-    p += dot(p, p + 43.21);
-    return fract(p.x * p.y);
-}
-
-// ── Value noise with analytical gradient ─────────────────────────────────────
-// Returns vec3(dv/dp.x, dv/dp.y, v) with v in [0,1].
-// Gradient is the exact analytical derivative of the smoothstep-interpolated
-// bilinear hash — no finite differences, no aliasing.
-vec3 valueNoiseD(vec2 p) {
-    vec2 i  = floor(p);
-    vec2 f  = fract(p);
-    vec2 u  = f * f * (3.0 - 2.0 * f);      // smoothstep kernel
-    vec2 du = 6.0 * f * (1.0 - f);           // d(kernel)/df
-
-    float a    = hashF(i);
-    float b    = hashF(i + vec2(1.0, 0.0));
-    float c    = hashF(i + vec2(0.0, 1.0));
-    float d    = hashF(i + vec2(1.0, 1.0));
-    float abcd = a - b - c + d;
-
-    return vec3(
-        du.x * (b - a + abcd * u.y),                    // dv/dp.x
-        du.y * (c - a + abcd * u.x),                    // dv/dp.y
-        a + (b - a)*u.x + (c - a)*u.y + abcd*u.x*u.y   // value
-    );
-}
-
-// ── GGX microfacet distribution (normalised) ─────────────────────────────────
-float ggxD(float NdotH, float roughness) {
-    float a2 = roughness * roughness * roughness * roughness;
-    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
-    return a2 / (3.14159265 * d * d + 1e-6);
+float ggx(float NdotH, float rough) {
+  float a  = rough * rough;
+  float a2 = a * a;
+  float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159265 * d * d + 1e-7);
 }
 
 void main() {
-    vec3  viewDir = normalize(u_cameraPosition - v_worldPos);
-    float camDist = length(u_cameraPosition - v_worldPos);
-    vec2  wx      = v_worldPos.xz;
+  vec3  V    = normalize(u_cameraPosition - v_worldPos);
+  vec3  L    = normalize(u_sunDir);
+  float dist = length(u_cameraPosition - v_worldPos);
 
-    // ── Distance-based normal fade ────────────────────────────────────────────
-    // Quadratic rolloff: full normals near camera → flat at 18 km.
-    // This replaces the aliased Gerstner phase-cancellation that produced
-    // solid-blue patches at large world-position values.
-    float distAmp   = clamp(1.0 - camDist / 18000.0, 0.0, 1.0);
-    distAmp         = distAmp * distAmp;
-    float normalStr = (0.30 + u_choppiness * 1.20) * distAmp;
+  // ── Micro-detail normals from FFT cascade textures ────────────────────────
+  // sampler2D may not be passed as a function argument in Vulkan GLSL — inlined.
+  vec2  _nxz0 = texture2D(u_norm0, v_uv_c0).xy;
+  vec3  N     = normalize(vec3(_nxz0.x, sqrt(max(0.0, 1.0 - dot(_nxz0, _nxz0))), _nxz0.y));
 
-    // ── Analytical fBm gradient normals — 5 octaves ───────────────────────────
-    // Frequencies: 1, 2.07, 4.28, 8.87, 18.36  (geometric, ratio 2.07)
-    // Wavelengths: ~1100, ~530, ~257, ~124, ~60 m   (BASE = 0.00091)
-    // Each octave has a unique scroll direction and a unique phase speed.
-    // Scroll time-scale: u_speed = 0.38 → ~3.3 m/s apparent celerity.
-    float t = u_Time * u_speed * 0.008;
+  if (u_MaxCascade >= 1.0) {
+    float w1    = 1.0 - smoothstep(800.0, 2000.0, dist);
+    vec2  _nxz1 = texture2D(u_norm1, v_uv_c1).xy;
+    vec3  _sn1  = normalize(vec3(_nxz1.x, sqrt(max(0.0, 1.0 - dot(_nxz1, _nxz1))), _nxz1.y));
+    N = normalize(N + _sn1 * w1);
+  }
+  if (u_MaxCascade >= 2.0) {
+    float w2    = 1.0 - smoothstep(200.0, 600.0, dist);
+    vec2  _nxz2 = texture2D(u_norm2, v_uv_c2).xy;
+    vec3  _sn2  = normalize(vec3(_nxz2.x, sqrt(max(0.0, 1.0 - dot(_nxz2, _nxz2))), _nxz2.y));
+    N = normalize(N + _sn2 * w2);
+  }
 
-    vec3 nd0 = valueNoiseD(wx * 1.000  * 0.00091 + vec2( 0.600,  0.800) * t * 1.000);
-    vec3 nd1 = valueNoiseD(wx * 2.070  * 0.00091 + vec2(-0.800,  0.600) * t * 1.280);
-    vec3 nd2 = valueNoiseD(wx * 4.285  * 0.00091 + vec2( 0.300, -0.954) * t * 1.620);
-    vec3 nd3 = valueNoiseD(wx * 8.870  * 0.00091 + vec2(-0.707, -0.707) * t * 2.060);
-    vec3 nd4 = valueNoiseD(wx * 18.360 * 0.00091 + vec2( 0.924, -0.383) * t * 2.570);
+  // ── Macro wave normals from procedural wave slope ─────────────────────────
+  // dFdx/dFdy of the interpolated v_waveHeight gives the surface tilt that
+  // matches actual vertex geometry — GGX glints will land on the correct face.
+  // u_choppiness scales how sharply the large-scale waves tilt under lighting.
+  {
+    float dhx      = dFdx(v_waveHeight);
+    float dhz      = dFdy(v_waveHeight);
+    float macroStr = clamp(1.0 - dist / 3000.0, 0.0, 1.0);
+    float amp      = 3.5 + macroStr * 2.0 + u_choppiness * 2.0;
+    vec3  waveN    = normalize(vec3(-dhx * amp, 1.0, -dhz * amp));
+    N = normalize(N + waveN * (0.8 + macroStr * 1.4));
+  }
 
-    // Amplitude: geometric series, gain = 0.5.
-    // Gradient does NOT scale with frequency — keeps swell-face shapes smooth
-    // rather than dominated by the highest, noisiest octave.
-    float gx   = nd0.x*1.000 + nd1.x*0.500 + nd2.x*0.250 + nd3.x*0.125 + nd4.x*0.0625;
-    float gy   = nd0.y*1.000 + nd1.y*0.500 + nd2.y*0.250 + nd3.y*0.125 + nd4.y*0.0625;
-    float hsum = nd0.z*1.000 + nd1.z*0.500 + nd2.z*0.250 + nd3.z*0.125 + nd4.z*0.0625;
-    float invA = 1.0 / 1.9375;
-    gx   *= invA;
-    gy   *= invA;
-    hsum *= invA;   // 0..1 — used as height proxy for colour and foam
+  vec3  H     = normalize(L + V);
+  float NdotL = max(dot(N, L), 0.0);
+  float NdotH = max(dot(N, H), 0.0);
 
-    // World-space normal (Y is vertical in BabylonJS).
-    // Surface slope (gx, gy) → N = normalize(-gx, 1, -gy) scaled by normalStr.
-    vec3 normalW = normalize(vec3(-gx * normalStr, 1.0, -gy * normalStr));
+  // ── Schlick Fresnel (F0=0.020, water n≈1.33) ──────────────────────────────
+  float cosV   = clamp(dot(N, V), 0.0, 1.0);
+  float fresnel = 0.020 + 0.980 * pow(1.0 - cosV, 5.0);
 
-    // ── Ocean colour — deep navy to rich teal ─────────────────────────────────
-    float hp       = clamp(hsum * 0.80 + 0.10, 0.0, 1.0);
-    vec3 deepColor = vec3(0.006, 0.090, 0.200);
-    vec3 midColor  = vec3(0.015, 0.180, 0.340);
-    vec3 oceanColor = mix(deepColor, midColor, hp);
+  // ── NME height-gradient colour (trough → crest) ───────────────────────────
+  // hNorm: 0 = mean trough, 1 = crest peak (scaled by wind amplitude).
+  float wamp  = max(u_WindSpeed * 0.16, 0.5);
+  float hNorm = clamp((v_waveHeight + wamp) / (wamp * 2.0), 0.0, 1.0);
 
-    // ── Lighting ──────────────────────────────────────────────────────────────
-    float NdotV = max(0.001, dot(normalW, viewDir));
-    float NdotL = max(0.0,   dot(normalW, u_sunDir));
-    vec3  halfV = normalize(u_sunDir + viewDir);
-    float NdotH = max(0.0,   dot(normalW, halfV));
+  vec3 deepCol  = vec3(0.020, 0.212, 0.329);   // deep navy
+  vec3 midCol   = vec3(0.090, 0.376, 0.494);   // ocean blue
+  vec3 crestCol = vec3(0.655, 0.906, 0.976);   // cyan crest
 
-    // Fresnel — water F0 = 0.02 (IOR 1.33)
-    float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
-    fresnel = clamp(fresnel, 0.0, 0.95);
+  vec3 waterBody = hNorm < 0.5
+    ? mix(deepCol,  midCol,   hNorm * 2.0)
+    : mix(midCol,   crestCol, (hNorm - 0.5) * 2.0);
+  waterBody *= (1.0 - fresnel) * 0.85 + 0.15;
 
-    // Sky colour along the reflection vector
-    vec3  reflDir = reflect(-viewDir, normalW);
-    float skyT    = clamp(reflDir.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3  skyRefl = mix(u_skyColorA, u_skyColorB, skyT);
+  // ── Ambient sky fill ──────────────────────────────────────────────────────
+  float upFace = N.y * 0.5 + 0.5;
+  vec3  ambient = mix(u_skyColorB, u_skyColorA, upFace) * 0.12;
 
-    // Ambient + diffuse
-    vec3 ambient = oceanColor * u_skyColorA * 0.22;
-    vec3 diffuse = oceanColor * u_sunColor  * NdotL * 0.55;
+  // ── Diffuse ───────────────────────────────────────────────────────────────
+  vec3 diffuse = waterBody * u_sunColor * NdotL * 0.22;
 
-    // GGX specular — values > 1 rely on post-process bloom for wide sparkle
-    float roughness = 0.018 + u_choppiness * 0.068;
-    float D         = ggxD(NdotH, roughness);
-    vec3  specular  = u_sunColor * D * fresnel * 1.8;
+  // ── SSS crest back-scatter ("green glass through wave") ───────────────────
+  float crestSignal = smoothstep(0.62, 1.0, hNorm);
+  float backLit     = max(dot(-L, N), 0.0) * crestSignal;
+  float viewThru    = max(dot(V, -L), 0.0);
+  float sssStr      = backLit * (0.45 + viewThru * 0.55);
+  vec3  sssGlow     = vec3(0.06, 0.42, 0.26) * u_sunColor * sssStr * 0.70;
 
-    // ── Compose ───────────────────────────────────────────────────────────────
-    vec3 waterColor = mix(ambient + diffuse, skyRefl, fresnel) + specular;
+  // ── GGX specular (BRDF-normalised, tight lobe r=0.028) ───────────────────
+  // Dividing by 4·NdotV·NdotL keeps the peak physically bounded (no blobs).
+  float NdotV_s = max(dot(N, V), 0.05);
+  float D       = ggx(NdotH, 0.028) * NdotL;
+  float brdf    = D / (4.0 * NdotV_s * max(NdotL, 0.001) + 0.001);
+  vec3  specular = u_sunColor * brdf * (fresnel * 1.4 + 0.04) * 1.6;
 
-    // ── Procedural foam — 3-layer value noise ─────────────────────────────────
-    // Foam concentrates on crests (hsum → 1) and dissolves in troughs.
-    float ft  = u_Time * u_FoamSpeed * 0.10;   // ×0.10 → ~2.8 m/s drift
-    vec2  fb  = wx * 0.0050;
-    float fm0 = valueNoiseD(fb * 1.00 + vec2( ft * 0.70,  ft * 0.30)).z;
-    float fm1 = valueNoiseD(fb * 1.80 + vec2(-ft * 0.45,  ft * 0.60)).z;
-    float fm2 = valueNoiseD(fb * 3.30 + vec2( ft * 0.50, -ft * 0.55)).z;
-    float rawFoam   = fm0 * 0.50 + fm1 * 0.30 + fm2 * 0.20;
-    float crestMask = smoothstep(0.60, 0.90, hsum);
-    float foamMask  = clamp(rawFoam * (crestMask + 0.03*(1.0 + u_choppiness)), 0.0, 1.0);
+  // ── Sky reflection fallback ───────────────────────────────────────────────
+  vec3  R    = reflect(-V, N);
+  float skyT = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3  skyR = mix(u_skyColorB, u_skyColorA, skyT);
 
-    waterColor = mix(waterColor, vec3(0.94, 0.97, 1.00), foamMask * 0.90);
+  // ── RTT screen-space reflection ───────────────────────────────────────────
+  vec2 screenUV = (v_projPos.xy / v_projPos.w) * 0.5 + 0.5;
+  screenUV.y    = 1.0 - screenUV.y;
+  screenUV     += N.xz * 0.028;
+  screenUV      = clamp(screenUV, 0.001, 0.999);
+  vec3 rttRefl  = texture2D(u_reflectionSampler, screenUV).rgb;
+  vec3 refl     = mix(skyR, rttRefl, 0.80);
 
-    gl_FragColor = vec4(waterColor, 1.0);
+  // ── Combine — Fresnel drives reflection vs. refracted water ───────────────
+  vec3 waterColor = mix(ambient + diffuse + sssGlow, refl, max(fresnel, 0.06)) + specular;
+
+  // ── Foam (height-threshold + Beaufort whitecaps) ──────────────────────────
+  float jacFoam = smoothstep(0.72, 1.0, hNorm) * u_DisplaceScale;
+  float bftT    = clamp((u_Beaufort - 4.0) / 6.0, 0.0, 1.0);
+  float ambFoam = bftT * bftT * clamp(N.y, 0.0, 1.0) * 0.18;
+  float foamMask = clamp(jacFoam + ambFoam, 0.0, 1.0);
+  waterColor = mix(waterColor, vec3(0.94, 0.97, 1.00), foamMask * 0.88);
+
+  // ── Horizon haze ──────────────────────────────────────────────────────────
+  float fogT = clamp((dist - 3000.0) / 9000.0, 0.0, 1.0);
+  fogT = fogT * fogT;
+  vec3  fogColor = mix(u_skyColorA * 0.9, u_skyColorB * 1.1, 0.55);
+  waterColor = mix(waterColor, fogColor, fogT * 0.88);
+
+  gl_FragColor = vec4(waterColor, 1.0);
 }
 `;
 
-// ── Kelvin wake (unchanged) ───────────────────────────────────────────────────
+// ── Kelvin wake shaders (unchanged) ──────────────────────────────────────────
 const WAKE_VERT = `
 precision highp float;
-attribute vec3 position;
-attribute vec2 uv;
+attribute vec3 position; attribute vec2 uv;
 varying vec2 vUV;
 uniform mat4 worldViewProjection;
-void main(){ vUV=uv; gl_Position=worldViewProjection*vec4(position,1.0); }
+void main(){ vUV = uv; gl_Position = worldViewProjection * vec4(position, 1.0); }
 `;
 
 const WAKE_FRAG = `
@@ -198,19 +337,20 @@ precision highp float;
 varying vec2 vUV;
 uniform float time; uniform float speed; uniform float planeW; uniform float planeL;
 void main(){
-    float lx=(vUV.x-0.5)*planeW; float lz=(1.0-vUV.y)*planeL;
-    if(lz<1.0){gl_FragColor=vec4(0.0);return;}
-    float kelvinArm=abs(lx)-lz*0.354;
-    float lengthFade=exp(-lz*0.0045);
-    float armFoam=exp(-kelvinArm*kelvinArm*0.016)*lengthFade;
-    float tPhase=lz*0.09-time*1.7;
-    float trans=(sin(tPhase)*0.5+0.5)*exp(-lz*0.006)*exp(-lx*lx*0.0005);
-    float dPhase=kelvinArm*0.13-time*1.1;
-    float diverg=(sin(dPhase)*0.5+0.5)*armFoam;
-    float r=sqrt(lx*lx+lz*lz);
-    float centre=exp(-r*0.035)*(1.0-exp(-r*0.22))*exp(-lx*lx*0.07);
-    float foam=clamp(armFoam*0.52+trans*0.20+diverg*0.12+centre*0.36,0.0,1.0)*speed;
-    gl_FragColor=vec4(1.0,1.0,1.0,foam*0.80);
+  float lx = (vUV.x - 0.5) * planeW;
+  float lz = (1.0 - vUV.y) * planeL;
+  if (lz < 1.0) { gl_FragColor = vec4(0.0); return; }
+  float kelvinArm  = abs(lx) - lz * 0.354;
+  float lengthFade = exp(-lz * 0.0045);
+  float armFoam    = exp(-kelvinArm * kelvinArm * 0.016) * lengthFade;
+  float tPhase  = lz * 0.09 - time * 1.7;
+  float trans   = (sin(tPhase) * 0.5 + 0.5) * exp(-lz * 0.006) * exp(-lx * lx * 0.0005);
+  float dPhase  = kelvinArm * 0.13 - time * 1.1;
+  float diverg  = (sin(dPhase) * 0.5 + 0.5) * armFoam;
+  float r       = sqrt(lx * lx + lz * lz);
+  float centre  = exp(-r * 0.035) * (1.0 - exp(-r * 0.22)) * exp(-lx * lx * 0.07);
+  float foam    = clamp(armFoam * 0.52 + trans * 0.20 + diverg * 0.12 + centre * 0.36, 0.0, 1.0) * speed;
+  gl_FragColor  = vec4(1.0, 1.0, 1.0, foam * 0.80);
 }
 `;
 
@@ -219,116 +359,167 @@ void main(){
 @Injectable({ providedIn: 'root' })
 export class OceanService {
   private sceneService = inject(SceneService);
+  private fftEngine    = inject(OceanFFTEngine);
 
-  private oceanMesh!: Mesh;
-  private oceanMat!:  ShaderMaterial;
+  private oceanMesh0!:   Mesh;
+  private oceanMesh1!:   Mesh;
+  private oceanMeshFar!: Mesh;
+  private oceanMat0!:    ShaderMaterial;
+  private oceanMat1!:    ShaderMaterial;
+  private oceanMatFar!:  ShaderMaterial;
+
   private wakePlane!: Mesh;
   private wakeMat!:   ShaderMaterial;
 
-  private elapsed   = 0;
-  private boatX     = 0;
-  private boatZ     = 0;
-  private boatHdgR  = 0;
-  private boatSpeed = 0;
+  private reflectionRTT!: MirrorTexture;
 
-  private readonly OCEAN_SIZE  = 200_000;
+  private elapsed    = 0;
+  private boatX      = 0;
+  private boatZ      = 0;
+  private boatHdgR   = 0;
+  private boatSpeed  = 0;
+
+  // Wind state — updated by updateWeather(), used for per-frame uniform upload.
+  private windSpeed = 8.0;
+  private windDirX  = 0.0;
+  private windDirZ  = 1.0;
+
+  // ── LOD geometry constants ─────────────────────────────────────────────────
+  // LOD0 bump from 256→512 subs: vertex spacing 3.1 m → 1.56 m.
+  // This resolves the shortest fBm octave (~45 m period) with 29 verts/wave
+  // instead of the previous 14, eliminating the blocky/faceted appearance
+  // close to the ship.
+  private readonly LOD0_SIZE = 800;
+  private readonly LOD0_SUB  = 512;   // was 256 — doubled for smooth close-up
+  private readonly LOD1_SIZE = 4_000;
+  private readonly LOD1_SUB  = 128;
+  private readonly FAR_SIZE  = 200_000;
+  private readonly FAR_SUB   = 32;
+
   private readonly WAKE_W      = 180;
   private readonly WAKE_L      = 320;
   private readonly BOAT_HALF_L =   7.0;
 
-  init(): void {
+  // ── Init ──────────────────────────────────────────────────────────────────
+
+  async init(): Promise<void> {
+    await this.fftEngine.init();
+
     const { scene } = this.sceneService;
-    this.buildOceanMesh(scene);
-    this.buildOceanMaterial(scene);
+    this.buildReflectionRTT(scene);
+    this.buildLodFar(scene);
+    this.buildLod1(scene);
+    this.buildLod0(scene);
     this.buildWakePlane(scene);
     this.registerRenderLoop(scene);
-    this.setupPostProcessing(scene);
   }
 
-  // ── Ground mesh ────────────────────────────────────────────────────────────
-  // Flat plane — no vertex displacement.  256 subdivisions retained for smooth
-  // horizon edge interpolation; subdivision density is irrelevant to wave
-  // appearance since all detail is computed per-fragment.
+  // ── Reflection RTT ────────────────────────────────────────────────────────
 
-  private buildOceanMesh(scene: Scene): void {
-    this.oceanMesh = MeshBuilder.CreateGround('ocean', {
-      width:        this.OCEAN_SIZE,
-      height:       this.OCEAN_SIZE,
-      subdivisions: 256,
+  private buildReflectionRTT(scene: Scene): void {
+    this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
+    this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
+    this.reflectionRTT.renderList  = [];
+
+    const skybox = scene.getMeshByName('skybox');
+    if (skybox) this.reflectionRTT.renderList.push(skybox);
+  }
+
+  // ── LOD meshes ─────────────────────────────────────────────────────────────
+
+  private buildLodFar(scene: Scene): void {
+    this.oceanMeshFar = MeshBuilder.CreateGround('ocean_far', {
+      width: this.FAR_SIZE, height: this.FAR_SIZE, subdivisions: this.FAR_SUB,
     }, scene);
+    this.oceanMeshFar.renderingGroupId = 0;
+    this.oceanMatFar = this.buildOceanMaterial(scene, 'oceanMatFar', 0.0, this.FAR_SIZE / 2, -1);
+    this.oceanMeshFar.material = this.oceanMatFar;
   }
 
-  // ── Ocean ShaderMaterial ────────────────────────────────────────────────────
+  private buildLod1(scene: Scene): void {
+    this.oceanMesh1 = MeshBuilder.CreateGround('ocean_lod1', {
+      width: this.LOD1_SIZE, height: this.LOD1_SIZE, subdivisions: this.LOD1_SUB,
+    }, scene);
+    this.oceanMesh1.renderingGroupId = 1;
+    this.oceanMesh1.position.y       = 0.002;
+    this.oceanMat1 = this.buildOceanMaterial(scene, 'oceanMat1', 1.0, this.LOD1_SIZE / 2, 1);
+    this.oceanMesh1.material = this.oceanMat1;
+  }
 
-  private buildOceanMaterial(scene: Scene): void {
-    this.oceanMat = new ShaderMaterial('oceanNME', scene,
+  private buildLod0(scene: Scene): void {
+    this.oceanMesh0 = MeshBuilder.CreateGround('ocean_lod0', {
+      width: this.LOD0_SIZE, height: this.LOD0_SIZE, subdivisions: this.LOD0_SUB,
+    }, scene);
+    this.oceanMesh0.renderingGroupId = 2;
+    this.oceanMesh0.position.y       = 0.004;
+    this.oceanMat0 = this.buildOceanMaterial(scene, 'oceanMat0', 1.0, this.LOD0_SIZE / 2, 2);
+    this.oceanMesh0.material = this.oceanMat0;
+  }
+
+  // ── Ocean ShaderMaterial factory ──────────────────────────────────────────
+
+  private buildOceanMaterial(
+    scene:         Scene,
+    name:          string,
+    displaceScale: number,
+    meshHalfSize:  number,
+    maxCascade:    number,
+  ): ShaderMaterial {
+    const mat = new ShaderMaterial(name, scene,
       { vertexSource: OCEAN_VERT, fragmentSource: OCEAN_FRAG },
       {
-        attributes: ['position', 'uv'],   // 'normal' not needed: flat plane + analytic normals
+        attributes: ['position', 'uv'],
         uniforms: [
           'world', 'worldViewProjection',
-          'u_Time', 'u_cameraPosition',
-          'u_speed', 'u_choppiness', 'u_FoamSpeed',
+          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale', 'u_MaxCascade',
+          'u_DomainC0', 'u_DomainC1', 'u_DomainC2',
+          'u_Time', 'u_choppiness', 'u_Beaufort',
+          'u_Direction', 'u_WindSpeed',
+          'u_cameraPosition',
           'u_sunDir', 'u_sunColor', 'u_skyColorA', 'u_skyColorB',
+        ],
+        samplers: [
+          // FFT normals only — procedural vertex displacement no longer reads disp textures.
+          'u_norm0', 'u_norm1', 'u_norm2',
+          'u_reflectionSampler',
         ],
         needAlphaBlending: false,
       },
     );
 
-    // Wave motion
-    this.oceanMat.setFloat('u_speed',      0.38);   // scroll speed → ~3.3 m/s primary swell
-    this.oceanMat.setFloat('u_choppiness', 0.20);   // 0 = glassy, 1 = rough sea
-    this.oceanMat.setFloat('u_FoamSpeed',  0.20);   // whitecap drift speed
+    mat.setFloat('u_DisplaceScale', displaceScale);
+    mat.setFloat('u_MeshHalfSize',  meshHalfSize);
+    mat.setFloat('u_MaxCascade',    maxCascade);
+    mat.setFloat('u_DomainC0', this.fftEngine.getDomain(0));
+    mat.setFloat('u_DomainC1', this.fftEngine.getDomain(1));
+    mat.setFloat('u_DomainC2', this.fftEngine.getDomain(2));
 
-    // Lighting defaults (noon sun, tropical palette)
-    this.oceanMat.setVector3('u_sunDir',    new Vector3(0.5, 0.85, 0.2).normalize());
-    this.oceanMat.setVector3('u_sunColor',  new Vector3(1.00, 0.95, 0.80));
-    // Rich, saturated sky tones — prevents Fresnel reflection looking grey
-    this.oceanMat.setVector3('u_skyColorA', new Vector3(0.22, 0.48, 0.72)); // horizon
-    this.oceanMat.setVector3('u_skyColorB', new Vector3(0.08, 0.28, 0.58)); // zenith
+    mat.setFloat('u_choppiness', 0.40);
+    mat.setFloat('u_Beaufort',    1.0);
+    mat.setFloat('u_WindSpeed',   this.windSpeed);
+    mat.setVector2('u_Direction', new Vector2(this.windDirX, this.windDirZ));
 
-    // Per-frame uniforms (updated every tick in registerRenderLoop)
-    this.oceanMat.setFloat('u_Time', 0);
-    this.oceanMat.setVector3('u_cameraPosition', Vector3.Zero());
+    mat.setVector3('u_sunDir',    new Vector3(0.5, 0.85, 0.2).normalize());
+    mat.setVector3('u_sunColor',  new Vector3(1.00, 0.95, 0.80));
+    mat.setVector3('u_skyColorA', new Vector3(0.22, 0.48, 0.72));
+    mat.setVector3('u_skyColorB', new Vector3(0.08, 0.28, 0.58));
 
-    this.oceanMesh.material = this.oceanMat;
+    mat.setFloat('u_Time', 0);
+    mat.setVector3('u_cameraPosition', Vector3.Zero());
+    mat.setVector2('u_WorldOffset',    new Vector2(0, 0));
+
+    mat.setTexture('u_reflectionSampler', this.reflectionRTT);
+    this.uploadFFTTextures(mat);
+
+    return mat;
   }
 
-  // ── Post-processing pipeline ───────────────────────────────────────────────
-  // Matches the playground's DefaultRenderingPipeline:
-  //   bloom  — hot GGX specular pixels radiate into wide sparkle
-  //   grain  — prevents the plastic "too perfect" look
-  //   CA     — subtle lens character
-  //   sharpen — pops fine-ripple detail
+  // ── Upload FFT normal textures ────────────────────────────────────────────
 
-  private setupPostProcessing(scene: Scene): void {
-    scene.onAfterRenderObservable.addOnce(() => {
-      const camera = scene.activeCamera;
-      if (!camera) return;
-      try {
-        const pipeline = new DefaultRenderingPipeline(
-          'oceanPipeline', false, scene, [camera],
-        );
-        pipeline.bloomEnabled   = true;
-        pipeline.bloomThreshold = 0.25;
-        pipeline.bloomKernel    = 64;
-        pipeline.bloomScale     = 0.50;
-        pipeline.bloomWeight    = 0.18;
-
-        pipeline.grainEnabled       = true;
-        pipeline.grain.intensity    = 7;
-        pipeline.grain.animated     = true;
-
-        pipeline.chromaticAberrationEnabled           = true;
-        pipeline.chromaticAberration.aberrationAmount = 14;
-        pipeline.chromaticAberration.radialIntensity  = 1.5;
-
-        pipeline.sharpenEnabled       = true;
-        pipeline.sharpen.edgeAmount   = 0.12;
-      } catch {
-        // Pipeline already exists — leave it.
-      }
-    });
+  private uploadFFTTextures(mat: ShaderMaterial): void {
+    mat.setTexture('u_norm0', this.fftEngine.getNormalsTex(0));
+    mat.setTexture('u_norm1', this.fftEngine.getNormalsTex(1));
+    mat.setTexture('u_norm2', this.fftEngine.getNormalsTex(2));
   }
 
   // ── Kelvin wake plane ──────────────────────────────────────────────────────
@@ -337,14 +528,14 @@ export class OceanService {
     this.wakePlane = MeshBuilder.CreateGround('wakePlane', {
       width: this.WAKE_W, height: this.WAKE_L, subdivisions: 1,
     }, scene);
-    this.wakePlane.isPickable = false;
-    this.wakePlane.position.y = 0.10;
+    this.wakePlane.isPickable    = false;
+    this.wakePlane.renderingGroupId = 2;
 
     this.wakeMat = new ShaderMaterial('wakeMat', scene,
       { vertexSource: WAKE_VERT, fragmentSource: WAKE_FRAG },
       {
-        attributes:        ['position', 'uv'],
-        uniforms:          ['worldViewProjection', 'time', 'speed', 'planeW', 'planeL'],
+        attributes: ['position', 'uv'],
+        uniforms:   ['worldViewProjection', 'time', 'speed', 'planeW', 'planeL'],
         needAlphaBlending: true,
       },
     );
@@ -363,32 +554,71 @@ export class OceanService {
       const dt = scene.getEngine().getDeltaTime() * 0.001;
       this.elapsed += dt;
 
-      // Ocean
-      this.oceanMat.setFloat('u_Time', this.elapsed);
-      const cam = scene.activeCamera;
-      if (cam) this.oceanMat.setVector3('u_cameraPosition', cam.position);
+      this.fftEngine.tick(dt);
 
-      // Sync sun from scene's DirectionalLight (direction points toward ground → negate)
-      const dl = scene.lights.find(l => l instanceof DirectionalLight) as DirectionalLight | undefined;
-      if (dl) {
-        this.oceanMat.setVector3('u_sunDir',
-          dl.direction.negate().normalize());
-        this.oceanMat.setVector3('u_sunColor',
-          new Vector3(dl.diffuse.r, dl.diffuse.g, dl.diffuse.b));
+      const cam = scene.activeCamera;
+      const t   = this.elapsed;
+
+      if (cam) {
+        const cx   = cam.position.x;
+        const cz   = cam.position.z;
+        const wOff = new Vector2(cx, cz);
+        const camV = cam.position;
+
+        this.oceanMesh0.position.x = cx; this.oceanMesh0.position.z = cz;
+        this.oceanMat0.setVector2('u_WorldOffset',    wOff);
+        this.oceanMat0.setVector3('u_cameraPosition', camV);
+
+        this.oceanMesh1.position.x = cx; this.oceanMesh1.position.z = cz;
+        this.oceanMat1.setVector2('u_WorldOffset',    wOff);
+        this.oceanMat1.setVector3('u_cameraPosition', camV);
+
+        this.oceanMeshFar.position.x = cx; this.oceanMeshFar.position.z = cz;
+        this.oceanMatFar.setVector2('u_WorldOffset',    wOff);
+        this.oceanMatFar.setVector3('u_cameraPosition', camV);
       }
 
-      // Wake
-      this.wakeMat.setFloat('time',  this.elapsed);
-      this.wakeMat.setFloat('speed', Math.min(1, Math.abs(this.boatSpeed) / 8));
+      const beaufortV = this.fftEngine.beaufort;
+      const windDir   = new Vector2(this.windDirX, this.windDirZ);
+      const allMats   = [this.oceanMat0, this.oceanMat1, this.oceanMatFar];
 
+      for (const mat of allMats) {
+        mat.setFloat('u_Time',      t);
+        mat.setFloat('u_Beaufort',  beaufortV);
+        mat.setFloat('u_WindSpeed', this.windSpeed);
+        mat.setVector2('u_Direction', windDir);
+      }
+
+      const dl = scene.lights.find(l => l instanceof DirectionalLight) as DirectionalLight | undefined;
+      if (dl) {
+        const sunDir = dl.direction.negate().normalize();
+        const sunCol = new Vector3(dl.diffuse.r, dl.diffuse.g, dl.diffuse.b);
+        const elev   = Math.max(0, sunDir.y);
+        const skyA   = new Vector3(0.18 + elev * 0.48, 0.36 + elev * 0.38, 0.76 + elev * 0.22);
+        const skyB   = new Vector3(0.06 + elev * 0.22, 0.18 + elev * 0.26, 0.58 + elev * 0.26);
+        for (const mat of allMats) {
+          mat.setVector3('u_sunDir',    sunDir);
+          mat.setVector3('u_sunColor',  sunCol);
+          mat.setVector3('u_skyColorA', skyA);
+          mat.setVector3('u_skyColorB', skyB);
+        }
+      }
+
+      this.wakeMat.setFloat('time',  t);
+      this.wakeMat.setFloat('speed', Math.min(1, Math.abs(this.boatSpeed) / 8));
       const shift = this.WAKE_L / 2 - this.BOAT_HALF_L;
       this.wakePlane.position.x = this.boatX - Math.sin(this.boatHdgR) * shift;
       this.wakePlane.position.z = this.boatZ - Math.cos(this.boatHdgR) * shift;
       this.wakePlane.rotation.y = this.boatHdgR;
+      this.wakePlane.position.y = this.fftEngine.getHeightAt(this.boatX, this.boatZ, t) + 0.12;
     });
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
+
+  getWaveHeightAt(wx: number, wz: number, t: number): number {
+    return this.fftEngine.getHeightAt(wx, wz, t);
+  }
 
   setBoatTransform(x: number, z: number, hdgRad: number, speed: number): void {
     this.boatX     = x;
@@ -398,19 +628,22 @@ export class OceanService {
   }
 
   updateWeather(wind: Wind, sea: SeaConditions): void {
-    if (!this.oceanMat) return;
-    // Choppiness scales normal perturbation strength and foam density.
-    // Speed scales wave celerity (all five octave scroll speeds scale together).
-    this.oceanMat.setFloat('u_choppiness', sea.choppiness);
-    this.oceanMat.setFloat('u_speed',      0.38 + sea.choppiness * 0.50);
-    // Wind direction is not currently wired into the hardcoded octave scroll
-    // vectors.  All five octaves have well-separated compass bearings so the
-    // ocean reads as wind-from-multiple-directions regardless of actual wind.
-    void wind;
+    this.fftEngine.updateWeather(wind, sea);
+
+    this.windSpeed = wind.speed;
+    const hdgRad   = wind.fromBearingDeg * Math.PI / 180;
+    this.windDirX  = Math.sin(hdgRad);
+    this.windDirZ  = Math.cos(hdgRad);
+
+    const chop = sea.choppiness;
+    for (const mat of [this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
+      if (mat) mat.setFloat('u_choppiness', chop);
+    }
   }
 
-  /** No-op — kept for API compatibility with IslandService / VesselService. */
-  addToRenderList(_mesh: any): void {}
+  addToRenderList(mesh: AbstractMesh): void {
+    this.reflectionRTT?.renderList?.push(mesh);
+  }
 
-  getOceanMesh(): Mesh { return this.oceanMesh; }
+  getOceanMesh(): Mesh { return this.oceanMesh0; }
 }

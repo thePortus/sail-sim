@@ -34,6 +34,10 @@ export class WeatherService {
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
 
+  // ── Admin override ────────────────────────────────────────────────────────
+  // When active the tick still fires (keeps the signal fresh) but skips lerp.
+  private adminOverride = false;
+
   // ─────────────────────────────────────────────────────────────────────────
   start(): void {
     // Randomise starting wind so each session feels different
@@ -58,10 +62,37 @@ export class WeatherService {
     }
   }
 
+  // ── Admin overrides (weather + freeze) ───────────────────────────────────
+
+  /**
+   * Immediately jump wind to specified values and hold them.
+   * Bypasses the gradual lerp until clearAdminOverride() is called.
+   */
+  setAdminOverride(windBearing: number, windSpeed: number): void {
+    this.adminOverride  = true;
+    this.windBearing    = ((windBearing % 360) + 360) % 360;
+    this.windSpeed      = Math.max(0, Math.min(30, windSpeed));
+    this.targetBearing  = this.windBearing;
+    this.targetSpeed    = this.windSpeed;
+    this.zone.run(() => this.weather.set(this.buildWeather()));
+  }
+
+  /** Resume natural weather evolution from current values. */
+  clearAdminOverride(): void {
+    this.adminOverride = false;
+    // targetBearing/Speed already equal current, so evolution resumes gradually.
+  }
+
   // ── Internal tick (1 s) ───────────────────────────────────────────────────
 
   private tick(): void {
     this.timeSec++;
+
+    // Admin override: hold current values, skip lerp + target changes
+    if (this.adminOverride) {
+      this.weather.set(this.buildWeather());
+      return;
+    }
 
     // Occasionally choose a new target
     if (this.timeSec >= this.nextTargetSec) {
@@ -166,5 +197,18 @@ export class WeatherService {
       precipitation: speed > 20 ? 'rain' : 'none',
       description,
     };
+  }
+
+  /**
+   * Called by MultiplayerService when the server broadcasts a `wave_state` message.
+   * Overrides the local wind target so all connected clients share the same sea state.
+   * The existing 1-Hz tick still applies rate limiting so the transition is smooth.
+   *
+   * If no server message arrives for > 30 s (e.g. solo play) the independent
+   * local weather evolution continues as before — this is a soft override only.
+   */
+  receiveServerState(windBearing: number, windSpeed: number): void {
+    this.targetBearing = ((windBearing % 360) + 360) % 360;
+    this.targetSpeed   = Math.max(2, Math.min(22, windSpeed));
   }
 }

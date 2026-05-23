@@ -6,14 +6,16 @@ import {
 import { SceneService } from './scene.service';
 import { IslandService } from './island.service';
 import { OceanService }  from './ocean.service';
+import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
-  private sceneService  = inject(SceneService);
-  private islandService = inject(IslandService);
-  private oceanService  = inject(OceanService);
-  private zone          = inject(NgZone);
+  private sceneService     = inject(SceneService);
+  private islandService    = inject(IslandService);
+  private oceanService     = inject(OceanService);
+  private buoyancyService  = inject(VesselBuoyancyService);
+  private zone             = inject(NgZone);
 
   // ── Public reactive state ─────────────────────────────────────────────────
   grounded = signal<boolean>(false);
@@ -100,6 +102,9 @@ export class VesselService {
     if (vessel.physics) Object.assign(this.physics, vessel.physics);
 
     const { scene } = this.sceneService;
+    // Group 2 renders after ocean (groups 0+1) but keeps the ocean's depth values
+    // so the wave surface correctly occludes submerged hull geometry.
+    scene.setRenderingAutoClearDepthStencil(2, false);
     this.buildMesh(vessel, scene);
     this.setupInput();
     this.setupCameraInput();
@@ -165,7 +170,8 @@ export class VesselService {
       }, scene);
     }
 
-    mesh.parent   = this.root;
+    mesh.parent           = this.root;
+    mesh.renderingGroupId = 2;   // render after ocean (groups 0+1) so hull is always visible
     mesh.position = new Vector3(part.position.x, part.position.y, part.position.z);
     if (part.rotation) {
       mesh.rotation = new Vector3(part.rotation.x, part.rotation.y, part.rotation.z);
@@ -201,7 +207,8 @@ export class VesselService {
       const sconce = MeshBuilder.CreateCylinder(`torch_sconce_${i}`, {
         diameter: 0.12, height: 0.32, tessellation: 8,
       }, scene);
-      sconce.parent   = this.root;
+      sconce.parent           = this.root;
+      sconce.renderingGroupId = 2;
       sconce.position = new Vector3(pos.x, pos.y, pos.z);
       const sconceMat = new StandardMaterial(`torch_sconce_mat_${i}`, scene);
       sconceMat.diffuseColor  = new Color3(0.16, 0.12, 0.10);
@@ -212,7 +219,8 @@ export class VesselService {
       const flame = MeshBuilder.CreateSphere(`torch_flame_${i}`, {
         diameter: 0.22, segments: 7,
       }, scene);
-      flame.parent   = this.root;
+      flame.parent           = this.root;
+      flame.renderingGroupId = 2;
       flame.position = new Vector3(pos.x, pos.y + 0.30, pos.z);
       const flameMat = new StandardMaterial(`torch_flame_mat_${i}`, scene);
       flameMat.diffuseColor   = new Color3(1.0, 0.55, 0.05);
@@ -261,7 +269,8 @@ export class VesselService {
       sideOrientation:  Mesh.DOUBLESIDE,
       updatable:        true,
     }, scene);
-    this.mainSailMesh.parent = this.mainSailPivot;
+    this.mainSailMesh.parent           = this.mainSailPivot;
+    this.mainSailMesh.renderingGroupId = 2;
 
     const sailMat = new StandardMaterial('mainsail_mat', scene);
     sailMat.diffuseColor  = new Color3(0.98, 0.97, 0.90);
@@ -295,7 +304,8 @@ export class VesselService {
       sideOrientation: Mesh.DOUBLESIDE,
       updatable:       true,
     }, scene);
-    this.jibMesh.parent = this.jibPivot;
+    this.jibMesh.parent           = this.jibPivot;
+    this.jibMesh.renderingGroupId = 2;
 
     const jibMat = new StandardMaterial('jib_mat', scene);
     jibMat.diffuseColor   = new Color3(0.97, 0.96, 0.88);
@@ -425,7 +435,6 @@ export class VesselService {
 
   private physicsStep(dt: number): void {
     const wind = this.currentWind;
-    const sea  = this.currentSea;
 
     // Angle from wind: 0 = into wind, 180 = before wind
     let diff = this.heading - wind.fromBearingDeg;
@@ -434,8 +443,9 @@ export class VesselService {
     const isPortTack    = diff <= 180;
 
     const eff    = this.sailEfficiency(angleFromWind);
-    const target = Math.max(-1.5, Math.min(this.physics.maxSpeed, wind.speed * eff * this.physics.sailAreaFactor));
-    this.speed  += (target - this.speed) * this.physics.accelerationRate * dt;
+    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, wind.speed * eff * this.physics.sailAreaFactor));
+    // speedModifier applied below after buoyancy is computed
+    this.speed  += (baseTarget - this.speed) * this.physics.accelerationRate * dt;
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
 
     // Steering
@@ -470,7 +480,7 @@ export class VesselService {
     // Wake trail
     this.updateWake();
 
-    // Heel angle (leeward lean)
+    // Heel angle (leeward lean from wind pressure on sails)
     const heelMagnitude = Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
     const heelAngle     = (isPortTack ? 1 : -1) * heelMagnitude;
 
@@ -479,21 +489,30 @@ export class VesselService {
     this.root.position.z = this.z;
     this.root.rotation.y = this.heading * Math.PI / 180;
 
-    // Sit the hull realistically in the water.
-    // hull_main local bottom = −0.8 → at FLOAT_Y −0.4 the bottom is at world Y −1.2
-    // (clearly submerged), deck at world Y ≈ +0.72, waterline stripe at +0.42.
-    // In storm, rise slightly so wave crests don't swamp the deck.
-    const FLOAT_Y = -0.4 + sea.choppiness * 0.2;  // calm ≈ −0.40  storm ≈ −0.20
+    // ── Buoyancy: 8-point hull sampling + wave slope physics ──────────────────
+    // VesselBuoyancyService samples the same Gerstner CPU math used by the GPU
+    // vertex shader, so the visual and the physics are always in sync.
+    const t    = this.simTime;
+    const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt);
 
-    // Wave bobbing — keep amplitude modest so hull never dips back into waves.
-    const t        = this.simTime;
-    const bobAmp   = 0.12 + sea.choppiness * 0.22;  // 0.14 calm → 0.34 storm
-    const pitchAmp = 0.8  + sea.choppiness * 1.5;   // °
-    const rollAmp  = 1.5  + sea.choppiness * 2.5;   // °
+    // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
+    // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.
+    const modTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed,
+      baseTarget * (1 + buoy.speedModifier),
+    ));
+    this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
 
-    this.root.position.y = FLOAT_Y + Math.sin(t * 1.2) * bobAmp;
-    this.root.rotation.z = (heelAngle + Math.sin(t * 1.6) * rollAmp) * Math.PI / 180;
-    this.root.rotation.x = Math.sin(t * 0.9 + 1.3) * pitchAmp * Math.PI / 180;
+    // Cross-wave broaching bias: only active when player is not steering.
+    if (!this.keys.left && !this.keys.right) {
+      this.heading = ((this.heading + buoy.steeringBias * dt) + 360) % 360;
+    }
+
+    const FLOAT_DRAFT = -0.4;
+    this.root.position.y = FLOAT_DRAFT + buoy.heave;
+
+    // Combine sailing heel (wind-induced lean) with wave-induced roll.
+    this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);
+    this.root.rotation.x = buoy.pitchRad;
 
     // Sail rotation
     const swingDeg = this.sailSwingAngle(angleFromWind);
@@ -644,7 +663,7 @@ export class VesselService {
 
     // ── Bow spray ──────────────────────────────────────────────────────────
     // Emits from the bow, particles pushed sideways to form the bow wave.
-    this.bowSpray = new ParticleSystem('bowSpray', 220, scene);
+    this.bowSpray = new ParticleSystem('bowSpray', 400, scene);
     this.bowSpray.particleTexture = this.wakeTex;
     this.bowSpray.emitter    = this.bowEmit;
     this.bowSpray.minEmitBox = new Vector3(-0.4, 0, -0.4);
@@ -652,14 +671,14 @@ export class VesselService {
     this.bowSpray.color1     = new Color4(1.00, 1.00, 1.00, 0.72);
     this.bowSpray.color2     = new Color4(0.88, 0.95, 1.00, 0.50);
     this.bowSpray.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
-    this.bowSpray.minSize     = 0.06; this.bowSpray.maxSize     = 0.20;
-    this.bowSpray.minLifeTime = 0.4;  this.bowSpray.maxLifeTime = 1.2;
-    this.bowSpray.minEmitPower = 2;   this.bowSpray.maxEmitPower = 6;
+    this.bowSpray.minSize     = 0.5;  this.bowSpray.maxSize     = 2.0;
+    this.bowSpray.minLifeTime = 0.5;  this.bowSpray.maxLifeTime = 2.0;
+    this.bowSpray.minEmitPower = 3;   this.bowSpray.maxEmitPower = 9;
     this.bowSpray.updateSpeed  = 0.016;
     // direction1/direction2 are heading-dependent — set in updateWake each tick
-    this.bowSpray.direction1 = new Vector3(-1, 0.2, 0);
-    this.bowSpray.direction2 = new Vector3( 1, 0.2, 0);
-    this.bowSpray.gravity    = new Vector3(0, -0.5, 0);
+    this.bowSpray.direction1 = new Vector3(-1, 0.6, 0);
+    this.bowSpray.direction2 = new Vector3( 1, 0.6, 0);
+    this.bowSpray.gravity    = new Vector3(0, -2.0, 0);
     this.bowSpray.blendMode  = ParticleSystem.BLENDMODE_ADD;
     this.bowSpray.emitRate   = 0;
     this.bowSpray.start();
@@ -667,7 +686,7 @@ export class VesselService {
     // ── Stern foam (long-life wake V-trail) ────────────────────────────────
     // Low velocity so particles stay roughly where spawned; the moving boat
     // leaves them behind, naturally building a long V-shaped foam trail.
-    this.sternFoam = new ParticleSystem('sternFoam', 600, scene);
+    this.sternFoam = new ParticleSystem('sternFoam', 900, scene);
     this.sternFoam.particleTexture = this.wakeTex;
     this.sternFoam.emitter    = this.sternEmit;
     this.sternFoam.minEmitBox = new Vector3(-1.0, 0, -0.5);
@@ -675,9 +694,9 @@ export class VesselService {
     this.sternFoam.color1     = new Color4(1.00, 1.00, 1.00, 0.60);
     this.sternFoam.color2     = new Color4(0.85, 0.94, 1.00, 0.38);
     this.sternFoam.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
-    this.sternFoam.minSize     = 0.12; this.sternFoam.maxSize     = 0.38;
-    this.sternFoam.minLifeTime = 4.0;  this.sternFoam.maxLifeTime = 9.0;
-    this.sternFoam.minEmitPower = 0.5; this.sternFoam.maxEmitPower = 2.5;
+    this.sternFoam.minSize     = 1.0;  this.sternFoam.maxSize     = 3.5;
+    this.sternFoam.minLifeTime = 5.0;  this.sternFoam.maxLifeTime = 14.0;
+    this.sternFoam.minEmitPower = 1.0; this.sternFoam.maxEmitPower = 4.0;
     this.sternFoam.updateSpeed  = 0.016;
     this.sternFoam.direction1 = new Vector3(-1, 0, -1);
     this.sternFoam.direction2 = new Vector3( 1, 0,  1);
@@ -687,7 +706,7 @@ export class VesselService {
     this.sternFoam.start();
 
     // ── Port hull froth ────────────────────────────────────────────────────
-    this.portFroth = new ParticleSystem('portFroth', 160, scene);
+    this.portFroth = new ParticleSystem('portFroth', 300, scene);
     this.portFroth.particleTexture = this.wakeTex;
     this.portFroth.emitter    = this.portEmit;
     this.portFroth.minEmitBox = new Vector3(-0.3, 0, -1.5);
@@ -695,9 +714,9 @@ export class VesselService {
     this.portFroth.color1     = new Color4(1.00, 1.00, 1.00, 0.55);
     this.portFroth.color2     = new Color4(0.90, 0.96, 1.00, 0.30);
     this.portFroth.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
-    this.portFroth.minSize     = 0.04; this.portFroth.maxSize     = 0.14;
-    this.portFroth.minLifeTime = 0.4;  this.portFroth.maxLifeTime = 1.4;
-    this.portFroth.minEmitPower = 1;   this.portFroth.maxEmitPower = 4;
+    this.portFroth.minSize     = 0.3;  this.portFroth.maxSize     = 1.2;
+    this.portFroth.minLifeTime = 0.5;  this.portFroth.maxLifeTime = 2.5;
+    this.portFroth.minEmitPower = 2;   this.portFroth.maxEmitPower = 6;
     this.portFroth.updateSpeed  = 0.016;
     this.portFroth.direction1 = new Vector3(-1, 0.1, 0);
     this.portFroth.direction2 = new Vector3(-3, 0.2, 0);
@@ -707,7 +726,7 @@ export class VesselService {
     this.portFroth.start();
 
     // ── Stbd hull froth ────────────────────────────────────────────────────
-    this.stbdFroth = new ParticleSystem('stbdFroth', 160, scene);
+    this.stbdFroth = new ParticleSystem('stbdFroth', 300, scene);
     this.stbdFroth.particleTexture = this.wakeTex;
     this.stbdFroth.emitter    = this.stbdEmit;
     this.stbdFroth.minEmitBox = new Vector3(-0.3, 0, -1.5);
@@ -715,9 +734,9 @@ export class VesselService {
     this.stbdFroth.color1     = new Color4(1.00, 1.00, 1.00, 0.55);
     this.stbdFroth.color2     = new Color4(0.90, 0.96, 1.00, 0.30);
     this.stbdFroth.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
-    this.stbdFroth.minSize     = 0.04; this.stbdFroth.maxSize     = 0.14;
-    this.stbdFroth.minLifeTime = 0.4;  this.stbdFroth.maxLifeTime = 1.4;
-    this.stbdFroth.minEmitPower = 1;   this.stbdFroth.maxEmitPower = 4;
+    this.stbdFroth.minSize     = 0.3;  this.stbdFroth.maxSize     = 1.2;
+    this.stbdFroth.minLifeTime = 0.5;  this.stbdFroth.maxLifeTime = 2.5;
+    this.stbdFroth.minEmitPower = 2;   this.stbdFroth.maxEmitPower = 6;
     this.stbdFroth.updateSpeed  = 0.016;
     this.stbdFroth.direction1 = new Vector3(1, 0.1, 0);
     this.stbdFroth.direction2 = new Vector3(3, 0.2, 0);
@@ -770,10 +789,15 @@ export class VesselService {
       this.z + rgtZ * halfBm,
     );
 
+    // ── Speed fraction — drives emit rates, sizes, and vertical spray height ─
+    const moving = absSpeed > 0.3;
+    const sf     = moving ? Math.min(1, absSpeed / this.physics.maxSpeed) : 0;
+
     // ── Heading-dependent direction vectors ───────────────────────────────
-    // Bow: spray sideways away from the prow (port and stbd plumes)
-    this.bowSpray.direction1.set(-rgtX * 4 - fwdX, 0.3, -rgtZ * 4 - fwdZ);
-    this.bowSpray.direction2.set( rgtX * 4 - fwdX, 0.3,  rgtZ * 4 - fwdZ);
+    // Bow: spray sideways + upward — Y scales with speed for dramatic high-speed plumes
+    const bowY = 0.5 + sf * 0.9;
+    this.bowSpray.direction1.set(-rgtX * 4 - fwdX, bowY, -rgtZ * 4 - fwdZ);
+    this.bowSpray.direction2.set( rgtX * 4 - fwdX, bowY,  rgtZ * 4 - fwdZ);
 
     // Stern: spread sideways and slightly aft; long-lifetime particles form the V
     this.sternFoam.direction1.set(-fwdX * 2 - rgtX * 4, 0, -fwdZ * 2 - rgtZ * 4);
@@ -788,18 +812,16 @@ export class VesselService {
     this.stbdFroth.direction2.set( rgtX * 4 - fwdX * 0.5, 0.25,  rgtZ * 4 - fwdZ * 0.5);
 
     // ── Emit rates — scale with speed, cut off below threshold ───────────
-    const moving = absSpeed > 0.3;
-    const sf     = moving ? Math.min(1, absSpeed / this.physics.maxSpeed) : 0;
 
-    this.bowSpray.emitRate  = Math.round(sf * 60);
-    this.sternFoam.emitRate = Math.round(sf * 45);
-    this.portFroth.emitRate = Math.round(sf * 35);
-    this.stbdFroth.emitRate = Math.round(sf * 35);
+    this.bowSpray.emitRate  = Math.round(sf * 100);
+    this.sternFoam.emitRate = Math.round(sf * 70);
+    this.portFroth.emitRate = Math.round(sf * 55);
+    this.stbdFroth.emitRate = Math.round(sf * 55);
 
     // ── Size scales modestly with speed ───────────────────────────────────
-    const sizeBoost = sf * 0.08;
-    this.bowSpray.maxSize  = 0.20 + sizeBoost;
-    this.sternFoam.maxSize = 0.38 + sizeBoost;
+    const sizeBoost = sf * 0.6;
+    this.bowSpray.maxSize  = 2.0 + sizeBoost;
+    this.sternFoam.maxSize = 3.5 + sizeBoost;
 
     // ── Inform ocean service so wake plane shader knows boat position ──────
     this.oceanService.setBoatTransform(this.x, this.z, hdgR, this.speed);

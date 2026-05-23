@@ -1,6 +1,6 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  Engine, Scene, Color3, Color4, Vector3,
+  WebGPUEngine, Scene, Color3, Color4, Vector3,
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
   DefaultRenderingPipeline,
@@ -11,7 +11,7 @@ import { SkyMaterial } from '@babylonjs/materials';
 export class SceneService {
   private zone = inject(NgZone);
 
-  engine!: Engine;
+  engine!: WebGPUEngine;
   scene!:  Scene;
   camera!: FreeCamera;
 
@@ -32,12 +32,32 @@ export class SceneService {
   private gameHours = 10.5;
   private readonly SECS_PER_GAME_HOUR = 60;
 
-  init(canvas: HTMLCanvasElement): void {
-    this.zone.runOutsideAngular(() => {
-      this.engine = new Engine(canvas, true, {
-        preserveDrawingBuffer: true,
-        stencil: true,
+  // Admin time offset: added to the wall clock so the sky can be forced to any hour.
+  private timeOffsetSecs = 0;
+
+  /** Pin the sky to a specific game-hour by computing the required epoch offset. */
+  setTimeOffset(targetHours: number): void {
+    const cycleSecs   = this.SECS_PER_GAME_HOUR * 24;
+    const nowNorm     = (Date.now() / 1000) % cycleSecs;
+    const targetSecs  = targetHours * this.SECS_PER_GAME_HOUR;
+    this.timeOffsetSecs = ((targetSecs - nowNorm) + cycleSecs) % cycleSecs;
+  }
+
+  clearTimeOffset(): void {
+    this.timeOffsetSecs = 0;
+  }
+
+  async initAsync(canvas: HTMLCanvasElement): Promise<void> {
+    await this.zone.runOutsideAngular(async () => {
+      this.engine = await WebGPUEngine.CreateAsync(canvas, {
         antialias: true,
+        // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
+        // textures per stage.  The WebGPU default minimum is 4; the adapter
+        // supports 8.  We must declare this in requiredLimits at device creation
+        // time — it cannot be patched later without recreating the device.
+        deviceDescriptor: {
+          requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
+        },
       });
 
       this.scene = new Scene(this.engine);
@@ -176,7 +196,7 @@ export class SceneService {
     // sees the same sky.  One full day/night cycle = SECS_PER_GAME_HOUR × 24
     // real seconds (default 60 s/hr → 24-minute cycle).
     const cycleSecs  = this.SECS_PER_GAME_HOUR * 24;
-    this.gameHours   = ((Date.now() / 1000) % cycleSecs) / this.SECS_PER_GAME_HOUR;
+    this.gameHours   = (((Date.now() / 1000) + this.timeOffsetSecs) % cycleSecs) / this.SECS_PER_GAME_HOUR;
     this.gameTime.set(this.gameHours);
 
     const dir     = this.computeSunDir();

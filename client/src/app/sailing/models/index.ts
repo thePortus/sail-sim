@@ -19,7 +19,10 @@ export interface Weather {
   sea:           SeaConditions;
   turbulence:    number;
   fog:           { density: number };
-  precipitation: 'rain' | 'none';
+  /** 0 = crystal-clear blue sky → 1 = pitch-dark storm.
+   *  Drives cloud overcast level, fog, and precipitation independently of wind. */
+  cloudiness:    number;
+  precipitation: 'none' | 'drizzle' | 'rain' | 'storm';
   description:   string;
 }
 
@@ -74,12 +77,15 @@ export interface VesselPartParams {
 }
 
 export interface VesselPart {
-  id:       string;
-  shape:    'box' | 'cylinder' | 'plane' | 'sphere' | 'torus';
-  params:   VesselPartParams;
-  position: { x: number; y: number; z: number };
-  rotation?: { x: number; y: number; z: number };
-  material: { color: string; specular?: string; alpha?: number; emissive?: string };
+  id:           string;
+  shape:        'box' | 'cylinder' | 'plane' | 'sphere' | 'torus';
+  params:       VesselPartParams;
+  position:     { x: number; y: number; z: number };
+  rotation?:    { x: number; y: number; z: number };
+  /** PBR material preset key. When present, overrides the flat StandardMaterial
+   *  that was previously derived from `material.color` / `material.specular`. */
+  materialType?: string;
+  material:     { color: string; specular?: string; alpha?: number; emissive?: string };
 }
 
 export interface Vessel {
@@ -109,6 +115,8 @@ export interface VesselState {
   windAngle:   number;    // 0=into wind, 180=before wind
   isPortTack:  boolean;   // wind from port side
   heelAngle:   number;    // lean angle (degrees, positive=starboard)
+  sheetAngle:  number;    // sail sheet angle 5–88° (5=close-hauled, 88=fully eased)
+  trimQuality: number;    // 0–1 how well the sail is trimmed for the current wind angle
 }
 
 export interface OtherPlayer {

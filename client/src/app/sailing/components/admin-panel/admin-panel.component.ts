@@ -95,8 +95,9 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
   visible = signal(false);
 
   // ── Weather controls ──────────────────────────────────────────────────────
-  windSpeed   = signal(10);   // m/s
-  windBearing = signal(0);    // degrees FROM
+  windSpeed   = signal(10);    // m/s
+  windBearing = signal(0);     // degrees FROM
+  cloudiness  = signal(0.25);  // 0 = clear → 1 = storm
 
   weatherOverrideActive = signal(false);
 
@@ -104,6 +105,15 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
   cardinalDir = computed(() =>
     CARDINALS[Math.round(this.windBearing() / 22.5) % 16]
   );
+  skyConditionLabel = computed(() => {
+    const c = this.cloudiness();
+    if (c > 0.94) return 'Storm';
+    if (c > 0.82) return 'Rain';
+    if (c > 0.68) return 'Drizzle';
+    if (c > 0.50) return 'Overcast';
+    if (c > 0.28) return 'Partly Cloudy';
+    return 'Clear';
+  });
 
   // ── Time controls ─────────────────────────────────────────────────────────
   targetHour = signal(12.0);   // 0–24
@@ -128,6 +138,7 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
     if (w) {
       this.windSpeed.set(w.wind.speed);
       this.windBearing.set(w.wind.fromBearingDeg);
+      this.cloudiness.set(parseFloat(w.cloudiness.toFixed(2)));
     }
     // Pre-fill time from scene
     this.targetHour.set(parseFloat(this.sceneService.gameTime().toFixed(2)));
@@ -143,11 +154,12 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
   // ── Weather actions ───────────────────────────────────────────────────────
 
   applyWeather(): void {
-    const bearing = this.windBearing();
-    const speed   = this.windSpeed();
+    const bearing    = this.windBearing();
+    const speed      = this.windSpeed();
+    const cloudiness = this.cloudiness();
 
     // Apply locally (immediate visual feedback — no server round-trip delay)
-    this.weatherService.setAdminOverride(bearing, speed);
+    this.weatherService.setAdminOverride(bearing, speed, cloudiness);
 
     // Persist to server so other connected clients get it via WebSocket
     this.adminService.setWeatherOverride(speed, bearing).subscribe({

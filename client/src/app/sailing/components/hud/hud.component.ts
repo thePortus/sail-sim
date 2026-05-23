@@ -38,7 +38,44 @@ export class HudComponent {
     return w ? (w.speed * 1.94).toFixed(1) : '--';
   });
 
-  // Point-of-sail label — thresholds mirror sailEfficiency() in vessel.service
+  // ── Sheet / trim helpers ──────────────────────────────────────────────────
+
+  /** Same table as vessel.service optimalSheetAngle() — duplicated for HUD. */
+  private optimalSheet(a: number): number {
+    if (a < 38)  return 5;
+    if (a < 60)  return 18;
+    if (a < 90)  return 35;
+    if (a < 115) return 52;
+    if (a < 145) return 68;
+    if (a < 165) return 82;
+    return 88;
+  }
+
+  /** 0–100 fill for the sheet gauge bar (5°=0%, 88°=100%). */
+  sheetFill = computed(() => ((this.vessel().sheetAngle - 5) / 83) * 100);
+
+  /** Marker position for the optimal angle on the gauge. */
+  optimalFill = computed(() =>
+    ((this.optimalSheet(this.vessel().windAngle) - 5) / 83) * 100);
+
+  /** 0–100 trim quality percentage. */
+  trimPct = computed(() => Math.round((this.vessel().trimQuality ?? 1) * 100));
+
+  trimColor = computed(() => {
+    const q = this.vessel().trimQuality ?? 1;
+    if (q > 0.75) return 'text-green-400';
+    if (q > 0.40) return 'text-yellow-400';
+    return 'text-red-400';
+  });
+
+  trimBarColor = computed(() => {
+    const q = this.vessel().trimQuality ?? 1;
+    if (q > 0.75) return 'bg-green-500';
+    if (q > 0.40) return 'bg-yellow-400';
+    return 'bg-red-500';
+  });
+
+  // ── Point-of-sail label — thresholds mirror sailEfficiency() ─────────────
   pointOfSail = computed(() => {
     const a = this.vessel().windAngle;
     if (a < 32)  return 'In Irons';

@@ -1,7 +1,8 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  MeshBuilder, Vector3, Color3, Color4, StandardMaterial, Mesh,
+  MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh,
   TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
+  VertexBuffer,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { IslandService } from './island.service';
@@ -23,6 +24,7 @@ export class VesselService {
   state = signal<VesselState>({
     x: 7200, z: 0, heading: 270, speed: 0,
     sailState: 'reefed', windAngle: 90, isPortTack: false, heelAngle: 0,
+    sheetAngle: 30, trimQuality: 1,
   });
 
   // ── Physics ────────────────────────────────────────────────────────────────
@@ -44,12 +46,24 @@ export class VesselService {
   private mainSailMesh:  Mesh | null = null;
   private jibMesh:       Mesh | null = null;
 
+  // ── PBR material / texture pools ─────────────────────────────────────────
+  private matPool         = new Map<string, PBRMaterial>();
+  private texPool         = new Map<string, DynamicTexture>();
+
   // ── Torches ───────────────────────────────────────────────────────────────
   private torchLights:    PointLight[]         = [];
   private torchFlameMats: StandardMaterial[]   = [];
+  private torchSconceMats: StandardMaterial[]  = [];
+
+  // ── Sheet (sail trim) ─────────────────────────────────────────────────────
+  // sheetAngleDeg: degrees from the boat's centreline the boom swings out.
+  //   5 = close-hauled (sail sheeted hard in)
+  //  88 = fully eased (sail right out, running downwind)
+  // The player adjusts with Q (ease) / E (haul in).
+  private sheetAngleDeg = 30;    // sensible default for a reaching start
 
   // ── Input ─────────────────────────────────────────────────────────────────
-  private keys = { left: false, right: false };
+  private keys = { left: false, right: false, sheetIn: false, sheetOut: false };
   private keyHandler!:    (e: KeyboardEvent) => void;
   private keyUpHandler!:  (e: KeyboardEvent) => void;
   private wheelHandler!:  (e: WheelEvent) => void;
@@ -66,7 +80,8 @@ export class VesselService {
   // ── Weather ────────────────────────────────────────────────────────────────
   private currentWind: Wind = { x: 5, z: 3, speed: 6, fromBearingDeg: 330, cardinalDir: 'NNW', beaufort: 2 };
   private currentSea: SeaConditions = { waveHeight: 0.5, choppiness: 0.1 };
-  private simTime = 0;
+  private simTime   = 0;
+  private gustPhase = 0;   // independent phase for gust oscillation
 
   // ── World-scale travel multiplier ─────────────────────────────────────────
   // The HUD displays physics speed (realistic knots), but world position advances
@@ -177,15 +192,7 @@ export class VesselService {
       mesh.rotation = new Vector3(part.rotation.x, part.rotation.y, part.rotation.z);
     }
 
-    const mat = new StandardMaterial(part.id + '_mat', scene);
-    mat.diffuseColor  = Color3.FromHexString(part.material.color);
-    mat.specularColor = Color3.FromHexString(part.material.specular ?? '#222222');
-    if (part.material.alpha    !== undefined) mat.alpha = part.material.alpha;
-    if (part.material.emissive !== undefined) {
-      mat.emissiveColor  = Color3.FromHexString(part.material.emissive);
-      mat.disableLighting = false;  // keep diffuse but add emissive glow
-    }
-    mesh.material = mat;
+    mesh.material = this.buildVesselMat(part, scene);
 
     return mesh;
   }
@@ -214,6 +221,7 @@ export class VesselService {
       sconceMat.diffuseColor  = new Color3(0.16, 0.12, 0.10);
       sconceMat.specularColor = new Color3(0.25, 0.20, 0.15);
       sconce.material = sconceMat;
+      this.torchSconceMats.push(sconceMat);
 
       // Flame sphere (emissive orange ball at the top of the sconce)
       const flame = MeshBuilder.CreateSphere(`torch_flame_${i}`, {
@@ -241,78 +249,141 @@ export class VesselService {
   }
 
   private buildSails(scene: Scene): void {
-    const mastX = 0, mastZ = 1.5;
-    const mastTopY = 15.1;     // top of mast
-    const boomY    = 1.7;      // boom height
-    const boomLen  = 7.8;      // how far boom extends aft of mast
+    const mastX   = 0,   mastZ   = 1.5;
+    const mastTopY = 15.1;
+    const boomY    = 1.76;   // matches gooseneck height in vessel data
+    const boomLen  = 7.8;    // boom cylinder height (mast to end)
 
-    // ── Main sail (pivot at mast base) ────────────────────────────────────
+    // ── Main sail pivot ───────────────────────────────────────────────────
     this.mainSailPivot = new TransformNode('main_sail_pivot', scene);
     this.mainSailPivot.parent   = this.root;
     this.mainSailPivot.position = new Vector3(mastX, 0, mastZ);
 
-    // Ribbon: luff (mast edge) and leech (free edge), 12 horizontal strips
-    const segments = 12;
-    const luff: Vector3[] = [];
-    const leech: Vector3[] = [];
-    for (let i = 0; i <= segments; i++) {
-      const t = i / segments;
-      const y = boomY + t * (mastTopY - boomY);
-      luff.push(new Vector3(0, y, 0));
-      // Leech tapers: full boom length at foot, ~20% shorter at head
-      const zOff = -(boomLen * (1 - t * 0.22));
-      leech.push(new Vector3(0, y, zOff));
+    // ── Boom assembly — parented to pivot so it swings with the sail ─────
+    // All positions in pivot-local space (subtract pivot world offset z=1.5 from
+    // any root-local z, since the pivot is at root-local (0,0,1.5)).
+    {
+      const sparMat  = this.buildVesselMat(
+        { id:'boom_dyn', shape:'cylinder', params:{}, position:{x:0,y:0,z:0},
+          materialType:'wood_spar', material:{color:'#D8D5C8'} }, scene);
+      const steelMat = this.buildVesselMat(
+        { id:'steel_boom', shape:'torus', params:{}, position:{x:0,y:0,z:0},
+          materialType:'steel', material:{color:'#AAAAAA'} }, scene);
+      const brassMat = this.buildVesselMat(
+        { id:'brass_gooseneck', shape:'cylinder', params:{}, position:{x:0,y:0,z:0},
+          materialType:'brass', material:{color:'#C8962A'} }, scene);
+
+      // Gooseneck — at pivot origin (z_local=0 = z_world=1.5=mast)
+      const gooseneck = MeshBuilder.CreateCylinder('gooseneck_dyn',
+        { diameter:0.30, height:0.26, tessellation:12 }, scene);
+      gooseneck.parent = this.mainSailPivot;
+      gooseneck.position = new Vector3(0, boomY, 0);
+      gooseneck.rotation = new Vector3(Math.PI / 2, 0, 0);
+      gooseneck.renderingGroupId = 2;
+      gooseneck.material = brassMat;
+
+      // Boom cylinder — z_local = -2.4 - 1.5 = -3.9 (centre of 7.8m cylinder)
+      const boom = MeshBuilder.CreateCylinder('boom_dyn',
+        { diameter:0.13, height:boomLen, tessellation:8 }, scene);
+      boom.parent = this.mainSailPivot;
+      boom.position = new Vector3(0, boomY, -3.9);
+      boom.rotation = new Vector3(Math.PI / 2, 0, 0);
+      boom.renderingGroupId = 2;
+      boom.material = sparMat;
+
+      // Boom end cap — z_local = -6.32 - 1.5 = -7.82
+      const boomEnd = MeshBuilder.CreateSphere('boom_end_dyn',
+        { diameter:0.22, segments:10 }, scene);
+      boomEnd.parent = this.mainSailPivot;
+      boomEnd.position = new Vector3(0, boomY, -7.82);
+      boomEnd.renderingGroupId = 2;
+      boomEnd.material = sparMat;
+
+      // Mainsheet block — z_local = -6.28 - 1.5 = -7.78
+      const boomBlock = MeshBuilder.CreateTorus('boom_block_dyn',
+        { diameter:0.24, thickness:0.05, tessellation:12 }, scene);
+      boomBlock.parent = this.mainSailPivot;
+      boomBlock.position = new Vector3(0, boomY - 0.18, -7.78);
+      boomBlock.renderingGroupId = 2;
+      boomBlock.material = steelMat;
+    }
+
+    // ── Multi-path mainsail (5 chord stations, 24 height segs) ───────────
+    // Paths run foot→head; 5 paths sweep luff(mast)→leech(free edge).
+    // Parabolic belly: sin(u·π) profile across chord, sin(t·π) scaling
+    // along span — fullest in mid-sail, tapers at foot and head.
+    const CHORD  = 5;
+    const SEGS   = 24;
+    const DRAFT  = 0.11;   // max belly as fraction of local chord width
+
+    const mainPaths: Vector3[][] = [];
+    for (let ci = 0; ci < CHORD; ci++) {
+      const u    = ci / (CHORD - 1);   // 0 = luff, 1 = leech
+      const path: Vector3[] = [];
+      for (let i = 0; i <= SEGS; i++) {
+        const t      = i / SEGS;
+        const y      = boomY + t * (mastTopY - boomY);
+        const zLeech = -(boomLen * (1 - t * 0.22));   // leech z at this height
+        const z      = u * zLeech;                     // chord-station z
+        const chord  = Math.abs(zLeech);
+        // Belly: parabolic across chord, sinusoidal along span
+        const bellyCross = Math.sin(u * Math.PI);
+        const bellySpan  = 0.55 + 0.45 * Math.sin(t * Math.PI);
+        const x          = bellyCross * bellySpan * chord * DRAFT;
+        path.push(new Vector3(x, y, z));
+      }
+      mainPaths.push(path);
     }
 
     this.mainSailMesh = MeshBuilder.CreateRibbon('mainsail', {
-      pathArray:        [luff, leech],
-      sideOrientation:  Mesh.DOUBLESIDE,
-      updatable:        true,
+      pathArray: mainPaths, sideOrientation: Mesh.DOUBLESIDE, updatable: true,
     }, scene);
     this.mainSailMesh.parent           = this.mainSailPivot;
     this.mainSailMesh.renderingGroupId = 2;
+    // Bake UVs by path/vertex index so threads scale physically uniformly.
+    // 3 tiles luff→leech × 5 tiles foot→head keeps canvas threads near-square.
+    this.bakeRibbonUVs(this.mainSailMesh, CHORD, SEGS, 3, 5);
+    this.mainSailMesh.material = this.buildCanvasMat(scene);
 
-    const sailMat = new StandardMaterial('mainsail_mat', scene);
-    sailMat.diffuseColor  = new Color3(0.98, 0.97, 0.90);
-    sailMat.specularColor = new Color3(0.05, 0.05, 0.05);
-    sailMat.alpha         = 0.92;
-    sailMat.backFaceCulling = false;
-    this.mainSailMesh.material = sailMat;
-
-    // ── Jib (pivot at forestay attachment near bow) ───────────────────────
-    const jibBaseZ = 7.0;    // near bow
+    // ── Jib (pivot at forestay tack near bow) ─────────────────────────────
+    const jibBaseZ = 7.0;
     const jibTopY  = mastTopY - 1.0;
     this.jibPivot  = new TransformNode('jib_pivot', scene);
     this.jibPivot.parent   = this.root;
     this.jibPivot.position = new Vector3(0, 0, jibBaseZ);
 
-    const jLuff:  Vector3[] = [];
-    const jLeech: Vector3[] = [];
-    const jSegs = 10;
-    for (let i = 0; i <= jSegs; i++) {
-      const t = i / jSegs;
-      // luff runs from foot (bow) up to hank at masthead
-      const y  = 1.5 + t * (jibTopY - 1.5);
-      const dz = -t * (jibBaseZ - mastZ) - (1 - t) * 0;  // tracks forestay
-      jLuff.push(new Vector3(0, y, dz));
-      // leech: from clew (near mast base) to head (masthead)
-      jLeech.push(new Vector3(0, y, -(jibBaseZ - mastZ) * t + dz * 0.3));
+    // 4 chord paths × 16 height segs — gentler belly than mainsail
+    const J_CHORD = 4;
+    const J_SEGS  = 16;
+    const J_DRAFT = 0.09;
+    const span     = jibBaseZ - mastZ;   // = 5.5 units (forestay length projected)
+
+    const jibPaths: Vector3[][] = [];
+    for (let ci = 0; ci < J_CHORD; ci++) {
+      const u    = ci / (J_CHORD - 1);
+      const path: Vector3[] = [];
+      for (let i = 0; i <= J_SEGS; i++) {
+        const t    = i / J_SEGS;
+        const y    = 1.5 + t * (jibTopY - 1.5);
+        const zL   = -t * span;                          // luff z (along forestay)
+        const zLe  = -span * t + zL * 0.3;              // leech z
+        const z    = zL + u * (zLe - zL);               // interpolated z
+        const chord = Math.abs(zLe - zL);
+        const bellyCross = Math.sin(u * Math.PI);
+        const bellySpan  = 0.45 + 0.55 * Math.sin(t * Math.PI);
+        const x    = bellyCross * bellySpan * chord * J_DRAFT;
+        path.push(new Vector3(x, y, z));
+      }
+      jibPaths.push(path);
     }
 
     this.jibMesh = MeshBuilder.CreateRibbon('jib', {
-      pathArray:       [jLuff, jLeech],
-      sideOrientation: Mesh.DOUBLESIDE,
-      updatable:       true,
+      pathArray: jibPaths, sideOrientation: Mesh.DOUBLESIDE, updatable: true,
     }, scene);
     this.jibMesh.parent           = this.jibPivot;
     this.jibMesh.renderingGroupId = 2;
-
-    const jibMat = new StandardMaterial('jib_mat', scene);
-    jibMat.diffuseColor   = new Color3(0.97, 0.96, 0.88);
-    jibMat.specularColor  = new Color3(0.04, 0.04, 0.04);
-    jibMat.alpha          = 0.90;
-    jibMat.backFaceCulling = false;
-    this.jibMesh.material = jibMat;
+    this.bakeRibbonUVs(this.jibMesh, J_CHORD, J_SEGS, 2, 3);
+    this.jibMesh.material = this.buildCanvasMat(scene);
   }
 
   // ── Sail state ────────────────────────────────────────────────────────────
@@ -350,15 +421,18 @@ export class VesselService {
     if (!this.mainSailMesh || !this.jibMesh) return;
     switch (this.sailState) {
       case 'reefed':
-        this.mainSailMesh.scaling.y = 0.08;
+        // Hide both sails completely — a squished mesh looks wrong at the mast foot
+        this.mainSailMesh.setEnabled(false);
         this.jibMesh.setEnabled(false);
         break;
       case 'topsails':
+        this.mainSailMesh.setEnabled(true);
         this.mainSailMesh.scaling.y = 0.5;
         this.jibMesh.setEnabled(true);
         this.jibMesh.scaling.y = 0.5;
         break;
       case 'full':
+        this.mainSailMesh.setEnabled(true);
         this.mainSailMesh.scaling.y = 1.0;
         this.jibMesh.setEnabled(true);
         this.jibMesh.scaling.y = 1.0;
@@ -370,13 +444,44 @@ export class VesselService {
   // Redesigned to make close-hauled sailing viable (~52 % eff at minTackAngle).
   // minTackAngle = 32° (set in vessel physics), so the "in irons" zone is tighter.
 
+  /**
+   * Return the ideal sheet angle (° from centreline) for a given wind angle.
+   * Close-hauled = sail in tight; running = sail fully eased.
+   */
+  private optimalSheetAngle(absAngleFromWind: number): number {
+    if (absAngleFromWind < 38)  return 5;
+    if (absAngleFromWind < 60)  return 18;
+    if (absAngleFromWind < 90)  return 35;
+    if (absAngleFromWind < 115) return 52;
+    if (absAngleFromWind < 145) return 68;
+    if (absAngleFromWind < 165) return 82;
+    return 88;
+  }
+
+  /**
+   * 0–1 trim quality based on how close the player-set sheet angle is to optimal.
+   * Over-sheeted (sail too tight) drops off fast; under-sheeted drops more gently.
+   */
+  private trimFactor(absAngleFromWind: number): number {
+    const optimal  = this.optimalSheetAngle(absAngleFromWind);
+    const mismatch = this.sheetAngleDeg - optimal;
+    if (mismatch < 0) {
+      // Over-sheeted: sail stalls quickly — 30° over = fully stalled
+      return Math.max(0, 1 + mismatch / 30);
+    } else {
+      // Under-sheeted: sail luffs more gently — 50° under = fully luffing
+      return Math.max(0, 1 - mismatch / 50);
+    }
+  }
+
   private sailEfficiency(angleFromWind: number): number {
-    const sailMult = this.sailState === 'reefed' ? 0 : this.sailState === 'topsails' ? 0.5 : 1.0;
+    if (this.sailState === 'reefed') return 0;
+    const sailMult = this.sailState === 'topsails' ? 0.5 : 1.0;
     const a = Math.abs(angleFromWind);
     let eff: number;
 
     if      (a < this.physics.minTackAngle) eff = -0.30;  // in irons: gentle pushback
-    else if (a < 45)  eff = 0.52;  // close-hauled: was 0.15, now usable
+    else if (a < 45)  eff = 0.52;  // close-hauled
     else if (a < 60)  eff = 0.72;  // close reach
     else if (a < 90)  eff = 0.86;  // beam reach
     else if (a < 115) eff = 0.95;  // broad reach approach
@@ -384,7 +489,9 @@ export class VesselService {
     else if (a < 165) eff = 0.88;  // running
     else              eff = 0.72;  // dead downwind (blanketed jib)
 
-    return eff * sailMult;
+    // Trim penalty: even a perfect point of sail underperforms with a mis-set sheet
+    const trim = (a < this.physics.minTackAngle) ? 1 : this.trimFactor(a);
+    return eff * sailMult * trim;
   }
 
   // ── Turn rate (speed-dependent) ───────────────────────────────────────────
@@ -401,16 +508,8 @@ export class VesselService {
     return Math.max(4, Math.min(30, rate));
   }
 
-  // ── Sail angle for visual rotation ────────────────────────────────────────
-
-  private sailSwingAngle(angleFromWind: number): number {
-    const a = Math.abs(angleFromWind);
-    if (a < 35)  return 6;
-    if (a < 65)  return 14 + (a - 35) * 0.8;
-    if (a < 120) return 38 + (a - 65) * 0.7;
-    if (a < 165) return 76 + (a - 120) * 0.3;
-    return 89;
-  }
+  // ── Sheet adjustment rate ─────────────────────────────────────────────────
+  private readonly SHEET_RATE = 28;   // degrees per second while Q/E is held
 
   // ── Update weather from outside ───────────────────────────────────────────
 
@@ -436,6 +535,19 @@ export class VesselService {
   private physicsStep(dt: number): void {
     const wind = this.currentWind;
 
+    // ── Sheet adjustment (Q = ease out, E = haul in) ──────────────────────
+    if (this.keys.sheetOut) this.sheetAngleDeg = Math.min(88, this.sheetAngleDeg + this.SHEET_RATE * dt);
+    if (this.keys.sheetIn)  this.sheetAngleDeg = Math.max( 5, this.sheetAngleDeg - this.SHEET_RATE * dt);
+
+    // ── Gust simulation ─────────────────────────────────────────────────────
+    // Two incommensurate sine waves create irregular, non-repeating gusts.
+    // ±15 % amplitude feels authentic without being sim-racing extreme.
+    this.gustPhase += dt;
+    const gustMult   = 1.0
+      + 0.10 * Math.sin(this.gustPhase * 2.73)
+      + 0.05 * Math.sin(this.gustPhase * 1.31 + 1.7);
+    const gustSpeed  = wind.speed * gustMult;
+
     // Angle from wind: 0 = into wind, 180 = before wind
     let diff = this.heading - wind.fromBearingDeg;
     diff = ((diff + 360) % 360);
@@ -443,7 +555,7 @@ export class VesselService {
     const isPortTack    = diff <= 180;
 
     const eff    = this.sailEfficiency(angleFromWind);
-    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, wind.speed * eff * this.physics.sailAreaFactor));
+    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor));
     // speedModifier applied below after buoyancy is computed
     this.speed  += (baseTarget - this.speed) * this.physics.accelerationRate * dt;
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
@@ -454,11 +566,22 @@ export class VesselService {
       this.heading = ((this.heading + dir * this.turnRate(this.speed) * dt) + 360) % 360;
     }
 
-    // Position update — world moves faster than physics speed implies
-    // (TRAVEL_SCALE compresses map distances while keeping knots realistic)
-    const hr   = this.heading * Math.PI / 180;
-    const newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE;
-    const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE;
+    // ── Position update ──────────────────────────────────────────────────────
+    // TRAVEL_SCALE compresses map distances while keeping knot values realistic.
+    const hr = this.heading * Math.PI / 180;
+
+    // Leeway: sailing boats slip sideways (leeward) under sail pressure.
+    // Proportional to heel angle — more heel = more sideways drift.
+    // On port tack the wind pushes to starboard (+cos/−sin in world space).
+    const heelMag     = Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
+    const leewayDeg   = heelMag * 0.28;        // max ~3.4° leeway at full speed/heel
+    const leewayRad   = leewayDeg * Math.PI / 180;
+    const leewaySign  = isPortTack ? 1 : -1;   // push to starboard on port tack
+    const lwyX = Math.cos(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
+    const lwyZ = -Math.sin(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
+
+    const newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyX;
+    const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
 
     if (this.islandService.isOnLand(newX, newZ)) {
       // Block movement, halt the vessel, and mark as aground
@@ -481,8 +604,8 @@ export class VesselService {
     this.updateWake();
 
     // Heel angle (leeward lean from wind pressure on sails)
-    const heelMagnitude = Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
-    const heelAngle     = (isPortTack ? 1 : -1) * heelMagnitude;
+    // heelMag was already computed above for leeway — reuse it.
+    const heelAngle = (isPortTack ? 1 : -1) * heelMag;
 
     // Update root transform
     this.root.position.x = this.x;
@@ -507,15 +630,18 @@ export class VesselService {
       this.heading = ((this.heading + buoy.steeringBias * dt) + 360) % 360;
     }
 
-    const FLOAT_DRAFT = -0.4;
+    // FLOAT_DRAFT: negative = sits deeper, positive = more freeboard.
+    // -0.4 put the deck only 0.2 m above the waterline, getting swamped in chop.
+    // 0.05 gives ~0.6 m of freeboard while keeping keel and bilge fully submerged.
+    const FLOAT_DRAFT = 0.05;
     this.root.position.y = FLOAT_DRAFT + buoy.heave;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);
     this.root.rotation.x = buoy.pitchRad;
 
-    // Sail rotation
-    const swingDeg = this.sailSwingAngle(angleFromWind);
+    // Sail rotation — driven by the player-controlled sheet angle
+    const swingDeg  = this.sheetAngleDeg;
     const swingSide = isPortTack ? -1 : 1;
     if (this.mainSailPivot) this.mainSailPivot.rotation.y = swingSide * swingDeg * Math.PI / 180;
     if (this.jibPivot)      this.jibPivot.rotation.y      = swingSide * swingDeg * 0.7 * Math.PI / 180;
@@ -541,8 +667,12 @@ export class VesselService {
 
     // Publish state
     this.zone.run(() => {
-      this.state.set({ x: this.x, z: this.z, heading: this.heading, speed: this.speed,
-        sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle });
+      this.state.set({
+        x: this.x, z: this.z, heading: this.heading, speed: this.speed,
+        sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
+        sheetAngle:  Math.round(this.sheetAngleDeg),
+        trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),
+      });
     });
   }
 
@@ -625,10 +755,18 @@ export class VesselService {
   private setupInput(): void {
     this.keyHandler = (e: KeyboardEvent) => {
       switch (e.code) {
-        case 'ArrowLeft':  case 'KeyA': this.keys.left  = true; break;
-        case 'ArrowRight': case 'KeyD': this.keys.right = true; break;
+        case 'ArrowLeft':  case 'KeyA': this.keys.left     = true; break;
+        case 'ArrowRight': case 'KeyD': this.keys.right    = true; break;
+        case 'KeyQ': this.keys.sheetOut = true;  break;   // ease sheet (sail swings out)
+        case 'KeyE': this.keys.sheetIn  = true;  break;   // haul in sheet (sail comes in)
         case 'KeyW': this.stepSail(1);  break;   // step sail up
         case 'KeyS': this.stepSail(-1); break;   // step sail down
+        case 'KeyT': {                            // auto-trim: jump to optimal sheet angle
+          const curState = this.state();
+          const optimal  = this.optimalSheetAngle(Math.abs(curState.windAngle));
+          this.sheetAngleDeg = optimal;
+          break;
+        }
         case 'Digit1': this.setSailState('reefed');   break;
         case 'Digit2': this.setSailState('topsails'); break;
         case 'Digit3': this.setSailState('full');     break;
@@ -636,8 +774,10 @@ export class VesselService {
     };
     this.keyUpHandler = (e: KeyboardEvent) => {
       switch (e.code) {
-        case 'ArrowLeft':  case 'KeyA': this.keys.left  = false; break;
-        case 'ArrowRight': case 'KeyD': this.keys.right = false; break;
+        case 'ArrowLeft':  case 'KeyA': this.keys.left     = false; break;
+        case 'ArrowRight': case 'KeyD': this.keys.right    = false; break;
+        case 'KeyQ': this.keys.sheetOut = false; break;
+        case 'KeyE': this.keys.sheetIn  = false; break;
       }
     };
     window.addEventListener('keydown', this.keyHandler);
@@ -827,6 +967,446 @@ export class VesselService {
     this.oceanService.setBoatTransform(this.x, this.z, hdgR, this.speed);
   }
 
+  // ── PBR material & texture helpers ────────────────────────────────────────
+
+  private getTex(
+    scene: Scene,
+    key: string,
+    factory: () => DynamicTexture,
+  ): DynamicTexture {
+    if (!this.texPool.has(key)) this.texPool.set(key, factory());
+    return this.texPool.get(key)!;
+  }
+
+  /** Minimal seeded LCG — deterministic per texture name so grain is stable across reloads. */
+  private makeRng(seed: number): () => number {
+    let s = seed >>> 0;
+    return () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 0xffffffff;
+    };
+  }
+
+  /**
+   * Procedural wood-grain albedo texture (256 × 256).
+   * Uses bezier curves for bold plank lines plus a fine-grain overlay.
+   */
+  private makeWoodAlbedo(
+    scene: Scene,
+    name: string,
+    baseRgb: [number, number, number],
+    darkRgb: [number, number, number],
+    grainCount: number,
+  ): DynamicTexture {
+    const SZ  = 256;
+    const tex = new DynamicTexture(name, { width: SZ, height: SZ }, scene, true);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    const [br, bg, bb] = baseRgb;
+    const [dr, dg, db] = darkRgb;
+
+    ctx.fillStyle = `rgb(${br},${bg},${bb})`;
+    ctx.fillRect(0, 0, SZ, SZ);
+
+    const rng = this.makeRng(name.charCodeAt(0) * 37 + grainCount);
+
+    // Bold grain lines — bezier curves spanning the full texture height
+    for (let g = 0; g < grainCount; g++) {
+      const x0   = rng() * SZ;
+      const x1   = x0 + (rng() - 0.5) * 40;
+      const cp1x = x0 + (rng() - 0.5) * 30;
+      const cp2x = x1 + (rng() - 0.5) * 30;
+      ctx.beginPath();
+      ctx.moveTo(x0, 0);
+      ctx.bezierCurveTo(cp1x, SZ * 0.33, cp2x, SZ * 0.67, x1, SZ);
+      ctx.strokeStyle = `rgba(${dr},${dg},${db},${(0.4 + rng() * 0.4).toFixed(2)})`;
+      ctx.lineWidth   = 0.5 + rng() * 1.5;
+      ctx.stroke();
+    }
+
+    // Fine-grain overlay — many thin, subtle lines for close-up richness
+    for (let g = 0; g < grainCount * 3; g++) {
+      const x0 = rng() * SZ;
+      ctx.beginPath();
+      ctx.moveTo(x0, 0);
+      ctx.lineTo(x0 + (rng() - 0.5) * 20, SZ);
+      ctx.strokeStyle = `rgba(${dr},${dg},${db},${(0.08 + rng() * 0.12).toFixed(2)})`;
+      ctx.lineWidth   = 0.3 + rng() * 0.5;
+      ctx.stroke();
+    }
+
+    tex.update();
+    return tex;
+  }
+
+  /**
+   * Procedural wood-grain normal map (256 × 256).
+   * Encodes groove cross-section profiles as tangent-space normals:
+   *   R=128 (X=0), G varies across groove slope, B reduced at groove center.
+   */
+  private makeWoodNormal(
+    scene: Scene,
+    name: string,
+    grainCount: number,
+  ): DynamicTexture {
+    const SZ  = 256;
+    const tex = new DynamicTexture(name + '_nrm', { width: SZ, height: SZ }, scene, false);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    const img = ctx.createImageData(SZ, SZ);
+    const px  = img.data;
+
+    // Seed with flat tangent-space normal: R=128(X=0), G=128(Y=0), B=255(Z=+1)
+    for (let i = 0; i < SZ * SZ; i++) {
+      px[i * 4 + 0] = 128;
+      px[i * 4 + 1] = 128;
+      px[i * 4 + 2] = 255;
+      px[i * 4 + 3] = 255;
+    }
+
+    const rng = this.makeRng(name.charCodeAt(0) * 53 + grainCount + 7);
+    for (let g = 0; g < grainCount; g++) {
+      const cx   = (rng() * SZ) | 0;
+      const half = 1 + Math.round(rng() * 2);   // groove half-width: 1–3 px
+      for (let y = 0; y < SZ; y++) {
+        const drift = Math.round((rng() - 0.5) * 3);   // slight meander per row
+        for (let w = -half; w <= half; w++) {
+          const x   = ((cx + drift + w) + SZ) % SZ;
+          const t   = w / half;                             // -1 to +1 across groove
+          // G encodes cross-groove slope (left wall tilts one way, right the other)
+          const gV  = Math.round(128 + 26 * t) & 0xff;
+          // B slightly reduced at the groove center (concave shadow)
+          const bV  = Math.round(230 + 25 * (t * t)) & 0xff;
+          const idx = (y * SZ + x) * 4;
+          px[idx + 1] = gV;
+          px[idx + 2] = bV;
+        }
+      }
+    }
+
+    ctx.putImageData(img, 0, 0);
+    tex.update();
+    return tex;
+  }
+
+  /**
+   * Procedural canvas-weave albedo (128 × 128).
+   * Alternating warp/weft threads using a cosine cross-section profile.
+   */
+  private makeCanvasAlbedo(scene: Scene, name: string): DynamicTexture {
+    const SZ  = 128;
+    const S   = 8;   // thread pitch in pixels
+    const tex = new DynamicTexture(name, { width: SZ, height: SZ }, scene, true);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    const img = ctx.createImageData(SZ, SZ);
+    const px  = img.data;
+
+    for (let y = 0; y < SZ; y++) {
+      const rowPhase = Math.floor(y / S) % 2;
+      for (let x = 0; x < SZ; x++) {
+        const colPhase = Math.floor(x / S) % 2;
+        const ty   = (y % S) / S;
+        const tx   = (x % S) / S;
+        const over = (colPhase === rowPhase);   // this thread is on top
+        // Cosine cross-section: raised in the centre, tapered at edges
+        const prof = over
+          ? 0.5 + 0.5 * Math.cos((tx - 0.5) * Math.PI * 2)
+          : 0.3 + 0.4 * Math.cos((ty - 0.5) * Math.PI * 2);
+        const base = over ? 230 : 215;
+        const val  = Math.round(base - prof * 30);
+        const idx  = (y * SZ + x) * 4;
+        px[idx + 0] = Math.min(255, val + 15);   // warm off-white
+        px[idx + 1] = Math.min(255, val + 8);
+        px[idx + 2] = Math.max(0,   val - 10);
+        px[idx + 3] = 255;
+      }
+    }
+
+    ctx.putImageData(img, 0, 0);
+    tex.update();
+    return tex;
+  }
+
+  /**
+   * Procedural canvas-weave normal map (128 × 128).
+   * Each thread arc contributes a normal that slopes toward its apex.
+   */
+  private makeCanvasNormal(scene: Scene, name: string): DynamicTexture {
+    const SZ  = 128;
+    const S   = 8;
+    const tex = new DynamicTexture(name + '_nrm', { width: SZ, height: SZ }, scene, false);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    const img = ctx.createImageData(SZ, SZ);
+    const px  = img.data;
+
+    for (let y = 0; y < SZ; y++) {
+      const rowPhase = Math.floor(y / S) % 2;
+      for (let x = 0; x < SZ; x++) {
+        const colPhase = Math.floor(x / S) % 2;
+        const ty   = (y % S) / S;
+        const tx   = (x % S) / S;
+        const over = (colPhase === rowPhase);
+        // Top thread: normal curves left-right (R channel)
+        // Under thread: normal curves up-down (G channel)
+        const nx = over ? Math.round(128 + 48 * Math.sin((tx - 0.5) * Math.PI)) : 128;
+        const ny = over ? 128 : Math.round(128 + 48 * Math.sin((ty - 0.5) * Math.PI));
+        const idx = (y * SZ + x) * 4;
+        px[idx + 0] = nx;
+        px[idx + 1] = ny;
+        px[idx + 2] = 220;   // slightly reduced Z — threads are rounded, not flat
+        px[idx + 3] = 255;
+      }
+    }
+
+    ctx.putImageData(img, 0, 0);
+    tex.update();
+    return tex;
+  }
+
+  /**
+   * Replace BabylonJS ribbon auto-UVs with world-space UVs so the canvas-weave
+   * texture tiles at a consistent physical size regardless of sail taper.
+   *
+   * BabylonJS CreateRibbon maps U 0→1 across the full width and V 0→1 along the
+   * full height, which stretches the texture to match the sail's aspect ratio.
+   * Instead we derive U from the local-space z-position and V from the y-position,
+   * then scale by tilesAcross / tilesUp so the texture repeats at the chosen rate.
+   *
+   * physWidth  — maximum z-extent of the sail in pivot-local space (boom length)
+   * physHeight — y-extent of the sail (boom to masthead)
+   * yBase      — local y at the foot of the sail (V = 0 origin)
+   */
+  private fixRibbonUVs(
+    mesh: Mesh,
+    physWidth: number,
+    physHeight: number,
+    yBase: number,
+    tilesAcross: number,
+    tilesUp: number,
+  ): void {
+    const pos = mesh.getVerticesData(VertexBuffer.PositionKind);
+    const raw = mesh.getVerticesData(VertexBuffer.UVKind);
+    if (!pos || !raw) return;
+
+    // Work on a mutable Float32Array copy — getVerticesData may return a view
+    const uvs = new Float32Array(raw.length);
+    const n   = pos.length / 3;
+    for (let i = 0; i < n; i++) {
+      const py = pos[i * 3 + 1];   // y → V (0 at foot, 1 at head)
+      const pz = pos[i * 3 + 2];   // z → U (0 at luff/mast, negative toward leech)
+      uvs[i * 2 + 0] = (-pz  / physWidth)  * tilesAcross;
+      uvs[i * 2 + 1] = ((py - yBase) / physHeight) * tilesUp;
+    }
+    mesh.updateVerticesData(VertexBuffer.UVKind, uvs);
+  }
+
+  /**
+   * Bake UV coordinates for a multi-path ribbon by path/vertex index.
+   *
+   * BabylonJS ribbon vertex ordering: all vertices of path 0, then path 1, etc.
+   * Within each path, vertices go from first to last (foot→head for our sails).
+   *
+   * U = pathIndex / (numPaths−1)  →  0=luff, 1=leech
+   * V = vertIndex / numSegs       →  0=foot, 1=head
+   *
+   * tilesAcross/tilesUp scale so canvas-weave threads have near-square physical size.
+   */
+  private bakeRibbonUVs(
+    mesh:        Mesh,
+    numPaths:    number,
+    numSegs:     number,
+    tilesAcross: number,
+    tilesUp:     number,
+  ): void {
+    const raw = mesh.getVerticesData(VertexBuffer.UVKind);
+    if (!raw) return;
+    const uvs        = new Float32Array(raw.length);
+    const vertsPerPath = numSegs + 1;
+    const n          = uvs.length / 2;
+    for (let k = 0; k < n; k++) {
+      const pathIdx = Math.floor(k / vertsPerPath);
+      const vertIdx = k % vertsPerPath;
+      uvs[k * 2 + 0] = (pathIdx / (numPaths - 1)) * tilesAcross;
+      uvs[k * 2 + 1] = (vertIdx / numSegs)         * tilesUp;
+    }
+    mesh.updateVerticesData(VertexBuffer.UVKind, uvs);
+  }
+
+  /**
+   * Build (or retrieve from cache) the PBR material for a vessel part.
+   * Dispatches on `part.materialType`; falls back to a flat-colour PBR for
+   * any part that has no materialType annotation.
+   */
+  private buildVesselMat(part: VesselPart, scene: Scene): PBRMaterial {
+    const key = part.materialType ?? ('_hex_' + part.material.color);
+    if (this.matPool.has(key)) return this.matPool.get(key)!;
+
+    const m = new PBRMaterial(key + '_mat', scene);
+    m.metallic  = 0;
+    m.roughness = 0.6;
+
+    switch (part.materialType) {
+
+      case 'wood_hull': {
+        const alb = this.getTex(scene, 'wood_hull_alb', () =>
+          this.makeWoodAlbedo(scene, 'wood_hull_alb', [59, 34, 18], [26, 10, 5], 14));
+        const nrm = this.getTex(scene, 'wood_hull_nrm', () =>
+          this.makeWoodNormal(scene, 'wood_hull', 14));
+        alb.uScale = 3; alb.vScale = 3;
+        nrm.uScale = 3; nrm.vScale = 3;
+        nrm.level  = 0.55;   // subtle plank grooves — not deep carving
+        m.albedoTexture = alb;
+        m.bumpTexture   = nrm;
+        m.roughness     = 0.88;
+        break;
+      }
+
+      case 'wood_teak': {
+        const alb = this.getTex(scene, 'wood_teak_alb', () =>
+          this.makeWoodAlbedo(scene, 'wood_teak_alb', [155, 120, 32], [94, 62, 10], 10));
+        const nrm = this.getTex(scene, 'wood_teak_nrm', () =>
+          this.makeWoodNormal(scene, 'wood_teak', 10));
+        alb.uScale = 4; alb.vScale = 4;
+        nrm.uScale = 4; nrm.vScale = 4;
+        nrm.level  = 0.50;
+        m.albedoTexture = alb;
+        m.bumpTexture   = nrm;
+        m.roughness     = 0.78;
+        break;
+      }
+
+      case 'wood_spar': {
+        const alb = this.getTex(scene, 'wood_spar_alb', () =>
+          this.makeWoodAlbedo(scene, 'wood_spar_alb', [216, 213, 200], [174, 171, 158], 20));
+        const nrm = this.getTex(scene, 'wood_spar_nrm', () =>
+          this.makeWoodNormal(scene, 'wood_spar', 20));
+        alb.uScale = 2; alb.vScale = 6;
+        nrm.uScale = 2; nrm.vScale = 6;
+        nrm.level  = 0.45;   // fine grain — varnished spar, not rough plank
+        m.albedoTexture = alb;
+        m.bumpTexture   = nrm;
+        m.roughness     = 0.55;
+        break;
+      }
+
+      case 'brass':
+        m.albedoColor = new Color3(0.78, 0.59, 0.16);
+        m.metallic    = 0.80;
+        m.roughness   = 0.38;
+        break;
+
+      case 'steel':
+        m.albedoColor = new Color3(0.78, 0.80, 0.82);
+        m.metallic    = 1.0;
+        m.roughness   = 0.22;
+        break;
+
+      case 'black_metal':
+        m.albedoColor = new Color3(0.08, 0.08, 0.08);
+        m.metallic    = 0.65;
+        m.roughness   = 0.52;
+        break;
+
+      case 'paint_white':
+        m.albedoColor = new Color3(0.91, 0.91, 0.88);
+        m.roughness   = 0.50;
+        break;
+
+      case 'paint_cream':
+        m.albedoColor = new Color3(0.94, 0.93, 0.85);
+        m.roughness   = 0.52;
+        break;
+
+      case 'paint_navy':
+        m.albedoColor = new Color3(0.10, 0.17, 0.24);
+        m.roughness   = 0.45;
+        break;
+
+      case 'rubber':
+        m.albedoColor = new Color3(0.16, 0.16, 0.16);
+        m.roughness   = 0.95;
+        break;
+
+      case 'glass':
+        m.albedoColor      = new Color3(0.12, 0.14, 0.18);
+        m.metallic         = 0.05;
+        m.roughness        = 0.04;
+        m.alpha            = 0.55;
+        m.transparencyMode = PBRMaterial.PBRMATERIAL_ALPHABLEND;
+        break;
+
+      case 'rope':
+        m.albedoColor = new Color3(0.78, 0.66, 0.42);
+        m.roughness   = 0.92;
+        break;
+
+      case 'nav_red':
+        m.albedoColor       = new Color3(0.85, 0.08, 0.05);
+        m.emissiveColor     = new Color3(0.80, 0.04, 0.02);
+        m.emissiveIntensity = 2.0;
+        m.roughness         = 0.30;
+        break;
+
+      case 'nav_green':
+        m.albedoColor       = new Color3(0.05, 0.75, 0.25);
+        m.emissiveColor     = new Color3(0.02, 0.50, 0.10);
+        m.emissiveIntensity = 2.0;
+        m.roughness         = 0.30;
+        break;
+
+      case 'nav_white':
+        m.albedoColor       = new Color3(1.0, 1.0, 0.94);
+        m.emissiveColor     = new Color3(1.0, 1.0, 0.90);
+        m.emissiveIntensity = 1.5;
+        m.roughness         = 0.30;
+        break;
+
+      default:
+        // Fallback: read flat colour from part.material (legacy / un-annotated parts)
+        m.albedoColor = Color3.FromHexString(part.material.color);
+        if (part.material.alpha !== undefined) {
+          m.alpha            = part.material.alpha;
+          m.transparencyMode = PBRMaterial.PBRMATERIAL_ALPHABLEND;
+        }
+        if (part.material.emissive !== undefined) {
+          m.emissiveColor     = Color3.FromHexString(part.material.emissive);
+          m.emissiveIntensity = 1.5;
+        }
+        break;
+    }
+
+    this.matPool.set(key, m);
+    return m;
+  }
+
+  /**
+   * PBR canvas-weave material shared by all sails.
+   * Semi-transparent (alpha 0.92), double-sided, with woven albedo + normal map.
+   */
+  private buildCanvasMat(scene: Scene): PBRMaterial {
+    const key = 'canvas_sail';
+    if (this.matPool.has(key)) return this.matPool.get(key)!;
+
+    const alb = this.getTex(scene, 'canvas_alb', () => this.makeCanvasAlbedo(scene, 'canvas_alb'));
+    const nrm = this.getTex(scene, 'canvas_nrm', () => this.makeCanvasNormal(scene, 'canvas'));
+    // UV tiling is baked per-mesh via fixRibbonUVs — keep scale at 1 here
+    // so both mainsail and jib can have independent physical tile counts.
+    alb.uScale = 1; alb.vScale = 1;
+    nrm.uScale = 1; nrm.vScale = 1;
+    nrm.level  = 0.45;
+
+    const m = new PBRMaterial('canvas_sail_mat', scene);
+    m.albedoTexture    = alb;
+    m.bumpTexture      = nrm;
+    m.roughness        = 0.82;
+    m.metallic         = 0;
+    m.alpha            = 0.92;
+    m.transparencyMode = PBRMaterial.PBRMATERIAL_ALPHABLEND;
+    m.backFaceCulling  = false;
+    m.twoSidedLighting = true;
+
+    this.matPool.set(key, m);
+    return m;
+  }
+
   getPosition(): { x: number; z: number } {
     return { x: this.x, z: this.z };
   }
@@ -842,11 +1422,22 @@ export class VesselService {
       canvas.removeEventListener('wheel', this.wheelHandler as EventListener);
     }
     for (const light of this.torchLights) light.dispose();
-    this.torchLights    = [];
-    this.torchFlameMats = [];
+    this.torchLights     = [];
+    this.torchFlameMats  = [];
+    this.torchSconceMats = [];
     for (const ps of [this.bowSpray, this.sternFoam, this.portFroth, this.stbdFroth]) {
       ps?.stop(); ps?.dispose();
     }
     this.wakeTex?.dispose();
+
+    // Drain PBR pools before disposing the root so meshes don't try to
+    // auto-dispose shared materials a second time via root.dispose(false, false).
+    this.matPool.forEach(mat => mat.dispose());
+    this.matPool.clear();
+    this.texPool.forEach(tex => tex.dispose());
+    this.texPool.clear();
+
+    // Dispose all child meshes/lights; skip material auto-dispose (done above).
+    this.root?.dispose(false, false);
   }
 }

@@ -361,9 +361,11 @@ export class OceanService {
   private sceneService = inject(SceneService);
   private fftEngine    = inject(OceanFFTEngine);
 
+  private oceanMeshNear!: Mesh;          // ultra-close LOD centered on boat
   private oceanMesh0!:   Mesh;
   private oceanMesh1!:   Mesh;
   private oceanMeshFar!: Mesh;
+  private oceanMatNear!: ShaderMaterial;
   private oceanMat0!:    ShaderMaterial;
   private oceanMat1!:    ShaderMaterial;
   private oceanMatFar!:  ShaderMaterial;
@@ -385,10 +387,13 @@ export class OceanService {
   private windDirZ  = 1.0;
 
   // ── LOD geometry constants ─────────────────────────────────────────────────
-  // LOD0 bump from 256→512 subs: vertex spacing 3.1 m → 1.56 m.
-  // This resolves the shortest fBm octave (~45 m period) with 29 verts/wave
-  // instead of the previous 14, eliminating the blocky/faceted appearance
-  // close to the ship.
+  // LOD hierarchy (vertex spacing):
+  //   NEAR  80 m ×  80 m, 256 subs →  0.31 m/vert — hull precision (boat-centred)
+  //   LOD0 800 m × 800 m, 512 subs →  1.56 m/vert — smooth close-up (camera-centred)
+  //   LOD1  4 km ×  4 km, 128 subs → 31.25 m/vert — mid-range swell
+  //   FAR 200 km ×200 km,  32 subs →  flat        — horizon fill, no displacement
+  private readonly NEAR_SIZE = 80;
+  private readonly NEAR_SUB  = 256;
   private readonly LOD0_SIZE = 800;
   private readonly LOD0_SUB  = 512;   // was 256 — doubled for smooth close-up
   private readonly LOD1_SIZE = 4_000;
@@ -410,6 +415,7 @@ export class OceanService {
     this.buildLodFar(scene);
     this.buildLod1(scene);
     this.buildLod0(scene);
+    this.buildLodNear(scene);
     this.buildWakePlane(scene);
     this.registerRenderLoop(scene);
   }
@@ -454,6 +460,25 @@ export class OceanService {
     this.oceanMesh0.position.y       = 0.004;
     this.oceanMat0 = this.buildOceanMaterial(scene, 'oceanMat0', 1.0, this.LOD0_SIZE / 2, 2);
     this.oceanMesh0.material = this.oceanMat0;
+  }
+
+  /**
+   * Ultra-close near-boat LOD — 0.31 m vertex spacing for wave resolution
+   * directly under the hull.  Centred on the boat (not the camera) so it
+   * stays precisely aligned with the physics-sampled wave surface.
+   * Rendered in group 2 at y+0.006 — just above LOD0 (+0.004) so depth-testing
+   * always keeps the denser near surface visible through the coarser one.
+   * The shader's edge-fade smoothstep (80 %–97 % of halfSize = 32–39 m from
+   * boat centre) blends the displacement gracefully to zero at the seam.
+   */
+  private buildLodNear(scene: Scene): void {
+    this.oceanMeshNear = MeshBuilder.CreateGround('ocean_near', {
+      width: this.NEAR_SIZE, height: this.NEAR_SIZE, subdivisions: this.NEAR_SUB,
+    }, scene);
+    this.oceanMeshNear.renderingGroupId = 2;
+    this.oceanMeshNear.position.y       = 0.006;   // above LOD0 (0.004) — wins depth test
+    this.oceanMatNear = this.buildOceanMaterial(scene, 'oceanMatNear', 1.0, this.NEAR_SIZE / 2, 2);
+    this.oceanMeshNear.material = this.oceanMatNear;
   }
 
   // ── Ocean ShaderMaterial factory ──────────────────────────────────────────
@@ -565,6 +590,14 @@ export class OceanService {
         const wOff = new Vector2(cx, cz);
         const camV = cam.position;
 
+        // Near mesh — centre on the boat, not the camera, for hull-precision waves.
+        // WorldOffset must match mesh centre so the shader computes correct world coords.
+        const nearOff = new Vector2(this.boatX, this.boatZ);
+        this.oceanMeshNear.position.x = this.boatX;
+        this.oceanMeshNear.position.z = this.boatZ;
+        this.oceanMatNear.setVector2('u_WorldOffset',    nearOff);
+        this.oceanMatNear.setVector3('u_cameraPosition', camV);
+
         this.oceanMesh0.position.x = cx; this.oceanMesh0.position.z = cz;
         this.oceanMat0.setVector2('u_WorldOffset',    wOff);
         this.oceanMat0.setVector3('u_cameraPosition', camV);
@@ -580,7 +613,7 @@ export class OceanService {
 
       const beaufortV = this.fftEngine.beaufort;
       const windDir   = new Vector2(this.windDirX, this.windDirZ);
-      const allMats   = [this.oceanMat0, this.oceanMat1, this.oceanMatFar];
+      const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
 
       for (const mat of allMats) {
         mat.setFloat('u_Time',      t);
@@ -636,7 +669,7 @@ export class OceanService {
     this.windDirZ  = Math.cos(hdgRad);
 
     const chop = sea.choppiness;
-    for (const mat of [this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
+    for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
       if (mat) mat.setFloat('u_choppiness', chop);
     }
   }

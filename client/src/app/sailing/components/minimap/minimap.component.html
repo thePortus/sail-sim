@@ -5,7 +5,9 @@
   <canvas #canvas
           [width]="expanded() ? 600 : 200"
           [height]="expanded() ? 600 : 200"
-          class="minimap-canvas">
+          class="minimap-canvas"
+          (mousemove)="onMouseMove($event)"
+          (mouseleave)="onMouseLeave()">
   </canvas>
 
   <!-- Expand/collapse hint -->
@@ -13,8 +15,19 @@
     {{ expanded() ? '✕ M or click to collapse' : 'M or click to expand' }}
   </div>
 
-  <!-- Island name tooltip overlay (expanded only) -->
+  <!-- Island name label (expanded only) -->
   @if (expanded()) {
     <div class="minimap-title">Archipelago of Ignis</div>
   }
 </div>
+
+<!-- Island tooltip — fixed-positioned so it is never clipped by the minimap container -->
+@if (hoveredIsland()) {
+  <div class="island-tooltip"
+       [style.left.px]="tooltipX()"
+       [style.top.px]="tooltipY()">
+    <div class="island-tooltip__name">{{ hoveredIsland()!.name }}</div>
+    <div class="island-tooltip__type">{{ typeLabel(hoveredIsland()!.type) }}</div>
+    <div class="island-tooltip__desc">{{ hoveredIsland()!.description }}</div>
+  </div>
+}

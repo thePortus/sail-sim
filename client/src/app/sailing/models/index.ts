@@ -49,7 +49,7 @@ export interface Island {
   peakElevation: number;
   coastline:     CoastlinePoint[];
   peaks:         IslandPeak[];
-  type:          'volcanic' | 'atoll' | 'ridge';
+  type:          'volcanic' | 'atoll' | 'ridge' | 'crescent' | 'stack' | 'bay';
   description:   string;
   spawnX:        number;
   spawnZ:        number;

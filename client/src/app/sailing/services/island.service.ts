@@ -125,8 +125,20 @@ export class IslandService {
     const coastlineRadius = this.interpolateRadius(angleDeg, island.coastline);
     const normalizedR = Math.min(1, distFromCenter / coastlineRadius);
 
-    // Steep volcanic cone profile
-    const profile = Math.pow(Math.max(0, 1 - normalizedR), 1.35);
+    // Elevation profile — shape depends on island type:
+    //   volcanic  →  steep cone   (^1.35, peaks sharply at centre)
+    //   ridge     →  long back    (^1.20, gentler peak)
+    //   crescent  →  same as ridge (the polygon already gives the shape)
+    //   bay       →  same as ridge
+    //   stack     →  near-vertical walls, sharp pinnacle (^0.65)
+    //   atoll     →  flat disc, barely above sea level (^0.30)
+    let profileExp = 1.35;
+    if      (island.type === 'atoll')              profileExp = 0.30;
+    else if (island.type === 'stack')              profileExp = 0.65;
+    else if (island.type === 'ridge'  ||
+             island.type === 'crescent' ||
+             island.type === 'bay')                profileExp = 1.20;
+    const profile  = Math.pow(Math.max(0, 1 - normalizedR), profileExp);
     let elevation = island.peakElevation * profile;
 
     // Multi-octave terrain noise for natural texture
@@ -223,6 +235,9 @@ export class IslandService {
     mesh.updateVerticesData(VertexBuffer.PositionKind, positions, false);
     mesh.setVerticesData(VertexBuffer.ColorKind, colors, false);
     mesh.createNormals(true);
+    // After modifying vertex Y positions (elevation), refresh the bounding
+    // volume so CPU ray casts (sun occlusion, collision) use accurate bounds.
+    mesh.refreshBoundingInfo();
 
     const mat = new StandardMaterial('islandMat_' + island.id, scene);
     mat.specularColor = new Color3(0.04, 0.04, 0.04);

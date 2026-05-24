@@ -1,10 +1,12 @@
 import { Injectable, inject } from '@angular/core';
 import { WaveEngine } from './wave-engine';
+import { OceanService } from './ocean.service';
 
 // ── Public state produced each physics tick ────────────────────────────────────
 
 export interface BuoyancyState {
   heave:         number;   // vertical offset of hull centre (metres, smoothed)
+  heaveFloor:    number;   // minimum heave so no hull corner goes below its wave — anti-sink floor
   pitchRad:      number;   // rotation.x — positive = bow up
   rollRad:       number;   // rotation.z — positive = stbd down (lean to starboard)
   speedModifier: number;   // multiply target speed by (1 + speedModifier)
@@ -43,24 +45,36 @@ const HULL_POINTS: { fwd: number; rgt: number }[] = [
 ];
 
 // Low-pass filter time constant for heave (seconds).
-// 0.8 s smooths out short-wavelength chop while still following swell.
-const HEAVE_TAU = 0.8;
+// 1.5 s gives a long, rolling response that follows the swell envelope without
+// snapping to individual chop crests.  The anti-sink floor catches any lag-
+// induced submersion, so a long tau is safe.
+const HEAVE_TAU = 1.5;
+
+// Pitch/roll sensitivity scale for Voronoi waves.
+// The torque-normalisation formula (pitchTorq / armFwd2) was designed for
+// smooth sinusoidal waves.  Voronoi crests are sharp and tall, so the raw
+// value reaches ≈1.5 rad (90°) in heavy seas — wildly unrealistic.
+// PITCH_SCALE = 0.20 reduces a raw 1.5 rad result to ≈0.30 rad (17°),
+// which is dramatic but physically plausible for a 10 m sloop in B6–B7.
+const PITCH_SCALE = 0.20;
 
 // Scaling constants — tuned for "arcade with dramatic feel"
 const SURF_SCALE    = 0.30;   // max ±30 % speed change from wave slope
 const BROACH_SCALE  = 1.80;   // degrees/s per unit of lateral orbital velocity
-const PITCH_SMOOTH  = 0.05;   // lerp factor per frame for pitch/roll (lower = smoother)
+const PITCH_SMOOTH  = 0.028;  // lerp factor per frame for pitch/roll (lower = smoother)
 const MAX_BEAUFORT  = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Injectable({ providedIn: 'root' })
 export class VesselBuoyancyService {
-  private waveEngine = inject(WaveEngine);
+  private waveEngine   = inject(WaveEngine);
+  private oceanService = inject(OceanService);
 
-  private heaveFiltered = 0;
-  private pitchFiltered = 0;
-  private rollFiltered  = 0;
+  private heaveFiltered      = 0;
+  private heaveFloorFiltered = 0;
+  private pitchFiltered      = 0;
+  private rollFiltered       = 0;
 
   /**
    * Evaluate wave-hull interaction for one physics tick.
@@ -82,12 +96,17 @@ export class VesselBuoyancyService {
     let armFwd2   = 0;
     let armRgt2   = 0;
 
-    for (const pt of HULL_POINTS) {
+    // Store per-point heights for the anti-sink floor calculation below.
+    const waveH = new Array<number>(HULL_POINTS.length);
+
+    for (let i = 0; i < HULL_POINTS.length; i++) {
+      const pt  = HULL_POINTS[i];
       // Transform local hull point to world XZ
       const pwx = wx + pt.fwd * sinH + pt.rgt * cosH;
       const pwz = wz + pt.fwd * cosH - pt.rgt * sinH;
 
-      const h = this.waveEngine.getHeightAt(pwx, pwz, t);
+      const h   = this.oceanService.getVisualHeightAt(pwx, pwz, t);
+      waveH[i]   = h;
       sumH      += h;
       pitchTorq += h * pt.fwd;
       rollTorq  += h * pt.rgt;
@@ -97,8 +116,9 @@ export class VesselBuoyancyService {
 
     const N = HULL_POINTS.length;
     const meanH     = sumH / N;
-    const pitchRaw  = pitchTorq / (armFwd2 / N);  // radians ≈ atan2(height, lever)
-    const rollRaw   = rollTorq  / (armRgt2 / N);
+    // PITCH_SCALE damps the raw torque-normalised angle for Voronoi crests.
+    const pitchRaw  = pitchTorq / (armFwd2 / N) * PITCH_SCALE;
+    const rollRaw   = rollTorq  / (armRgt2 / N) * PITCH_SCALE;
 
     // ── Smooth heave with exponential filter ──────────────────────────────
     const alpha = 1 - Math.exp(-dt / HEAVE_TAU);
@@ -110,17 +130,47 @@ export class VesselBuoyancyService {
     this.pitchFiltered += (pitchRaw - this.pitchFiltered) * pAlpha;
     this.rollFiltered  += (rollRaw  - this.rollFiltered)  * pAlpha;
 
+    // ── Anti-sink floor ────────────────────────────────────────────────────
+    // The smoothed heave always lags the instantaneous wave, and pitch/roll
+    // tilt the bow/stern corners further up or down.  Without a floor the lag
+    // + tilt can push a corner below its wave surface.
+    //
+    // For hull point i at lever arms (fwd, rgt), the world-Y of the hull's
+    // local-Y=0 plane at that corner is approximately:
+    //
+    //   Y_corner ≈ heave + fwd·pitch + rgt·roll   (small-angle)
+    //
+    // For no corner to go below its wave:
+    //   heave ≥ waveH[i] − fwd·pitch − rgt·roll   ∀ i
+    //
+    // heaveFloor is the tightest (maximum) such constraint across all points.
+    // ANTI_SINK_TOLERANCE: minor spray over a corner is visually fine and
+    // nautically realistic — we only floor against *significant* submersion.
+    // 0.55 m gives generous lee-way before the floor activates.  A lower value
+    // locks the boat to whichever corner sits on the highest crest, pulling the
+    // whole hull up into an unrealistically elevated "bouncing" position.
+    const ANTI_SINK_TOLERANCE = 0.55;   // metres of submersion before floor activates
+    let heaveFloor = -Infinity;
+    for (let i = 0; i < HULL_POINTS.length; i++) {
+      const pt    = HULL_POINTS[i];
+      const floor = waveH[i] - ANTI_SINK_TOLERANCE
+        - pt.fwd * this.pitchFiltered
+        - pt.rgt * this.rollFiltered;
+      if (floor > heaveFloor) heaveFloor = floor;
+    }
+
+    // Smooth the floor with a 0.25 s time constant — fast enough to prevent
+    // hull corners from going underwater in sharp chop, but slow enough to
+    // eliminate the instantaneous snap-upward that raw heaveFloor caused.
+    const floorAlpha = 1 - Math.exp(-dt / 0.25);
+    this.heaveFloorFiltered += (heaveFloor - this.heaveFloorFiltered) * floorAlpha;
+
     // ── Wave slope → speed modifier ───────────────────────────────────────
-    // Positive slope (climbing) slows the boat; negative slope (descending)
-    // provides a mild speed boost — the "surfing down the face" feeling.
-    // Effect scales with sea state so it's imperceptible at B0–2.
     const slope       = this.waveEngine.getWaveSlopeInHeading(wx, wz, headingRad, t);
     const beaufortT   = Math.min(1, this.waveEngine.beaufort / MAX_BEAUFORT);
     const speedMod    = Math.max(-0.30, Math.min(0.20, -slope * SURF_SCALE * beaufortT));
 
     // ── Lateral orbital velocity → steering bias ──────────────────────────
-    // Cross-wave push creates broaching tendency in following seas at B6+.
-    // Capped to ±6 °/s so it feels dramatic but doesn't instantly spin the boat.
     const lateralV    = this.waveEngine.getLateralOrbitalVelocity(wx, wz, headingRad, t);
     const steeringBias = Math.max(-6, Math.min(6,
       lateralV * BROACH_SCALE * beaufortT,
@@ -128,6 +178,7 @@ export class VesselBuoyancyService {
 
     return {
       heave:         this.heaveFiltered,
+      heaveFloor:    this.heaveFloorFiltered,
       pitchRad:      this.pitchFiltered,
       rollRad:       this.rollFiltered,
       speedModifier: speedMod,
@@ -137,8 +188,9 @@ export class VesselBuoyancyService {
 
   /** Reset smoothing accumulators (call on refloat / spawn). */
   reset(): void {
-    this.heaveFiltered = 0;
-    this.pitchFiltered = 0;
-    this.rollFiltered  = 0;
+    this.heaveFiltered      = 0;
+    this.heaveFloorFiltered = 0;
+    this.pitchFiltered      = 0;
+    this.rollFiltered       = 0;
   }
 }

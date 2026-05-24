@@ -296,8 +296,11 @@ void main() {
   vec3  skyR = mix(u_skyColorB, u_skyColorA, skyT);
 
   // ── RTT screen-space reflection ───────────────────────────────────────────
+  // MirrorTexture already renders from the mirrored camera (below the plane),
+  // so the reflected scene is stored right-way-up in the texture.  Do NOT
+  // flip Y here — a second flip would cancel the mirror and show the
+  // unreflected scene instead of the reflection.
   vec2 screenUV = (v_projPos.xy / v_projPos.w) * 0.5 + 0.5;
-  screenUV.y    = 1.0 - screenUV.y;
   screenUV     += N.xz * 0.028;
   screenUV      = clamp(screenUV, 0.001, 0.999);
   vec3 rttRefl  = texture2D(u_reflectionSampler, screenUV).rgb;
@@ -353,6 +356,51 @@ void main(){
   gl_FragColor  = vec4(1.0, 1.0, 1.0, foam * 0.80);
 }
 `;
+
+// ── CPU port of GPU waveHeight() ─────────────────────────────────────────────
+//
+// Mirrors the GLSL `waveHeight(wx, wz)` in OCEAN_VERT exactly so that the CPU
+// buoyancy sampler sees the same surface height as the rendered ocean vertex.
+// Called 8× per physics tick (once per hull point) — fast enough on the CPU.
+
+function _fract(x: number): number { return x - Math.floor(x); }
+function _mix(a: number, b: number, t: number): number { return a + (b - a) * t; }
+
+/** GLSL _h() — seeded pseudo-random from three floats */
+function _h(ax: number, ay: number, az: number): number {
+  return _fract(Math.sin(ax * 127.1 + ay * 311.7 + az * 74.7) * 43758.5453);
+}
+
+/** Trilinear C1-smooth value noise — exact port of GLSL smoothNoise() */
+function _smoothNoise(px: number, py: number, pz: number): number {
+  const ix = Math.floor(px); let fx = _fract(px); fx = fx * fx * (3 - 2 * fx);
+  const iy = Math.floor(py); let fy = _fract(py); fy = fy * fy * (3 - 2 * fy);
+  const iz = Math.floor(pz); let fz = _fract(pz); fz = fz * fz * (3 - 2 * fz);
+  return _mix(
+    _mix(_mix(_h(ix,   iy,   iz  ), _h(ix + 1, iy,     iz    ), fx),
+         _mix(_h(ix,   iy + 1, iz), _h(ix + 1, iy + 1, iz    ), fx), fy),
+    _mix(_mix(_h(ix,   iy,   iz + 1), _h(ix + 1, iy,     iz + 1), fx),
+         _mix(_h(ix,   iy + 1, iz + 1), _h(ix + 1, iy + 1, iz + 1), fx), fy),
+    fz,
+  ) * 2 - 1;
+}
+
+/** 2D Voronoi F1 distance — exact port of GLSL voronoi2D() */
+function _voronoi2D(px: number, py: number, jitter: number): number {
+  const ix = Math.floor(px); const fx = _fract(px);
+  const iy = Math.floor(py); const fy = _fract(py);
+  let d = 8.0;
+  for (let jj = -1; jj <= 1; jj++) {
+    for (let ii = -1; ii <= 1; ii++) {
+      const rx = _fract(Math.sin((ix + ii) * 127.1 + (iy + jj) * 311.7) * 43758.5453);
+      const ry = _fract(Math.sin((ix + ii) * 269.5 + (iy + jj) * 183.3) * 43758.5453);
+      const ddx = ii + rx * jitter - fx;
+      const ddy = jj + ry * jitter - fy;
+      d = Math.min(d, ddx * ddx + ddy * ddy);
+    }
+  }
+  return Math.sqrt(d);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -423,12 +471,30 @@ export class OceanService {
   // ── Reflection RTT ────────────────────────────────────────────────────────
 
   private buildReflectionRTT(scene: Scene): void {
-    this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
+    // 1024 px gives crisp, close-up reflections; 512 looks blurry at hull range.
+    this.reflectionRTT = new MirrorTexture('oceanReflection', 1024, scene, true);
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
 
+    // Seed with the sky — always present and covers the whole horizon.
     const skybox = scene.getMeshByName('skybox');
-    if (skybox) this.reflectionRTT.renderList.push(skybox);
+    if (skybox) this.reflectionRTT.renderList!.push(skybox);
+
+    // CRITICAL: register as a custom render target so BabylonJS renders it
+    // every frame.  Without this entry the ShaderMaterial sampler receives a
+    // blank texture — BabylonJS only auto-renders RTTs that are wired through
+    // StandardMaterial / PBRMaterial reflection slots, not ShaderMaterial.
+    scene.customRenderTargets.push(this.reflectionRTT);
+
+    // Island meshes arrive asynchronously (HTTP load).  Auto-enroll them so
+    // we don't need a separate manual call after each island is built.
+    // Vessel parts are enrolled via the explicit addToRenderList() calls in
+    // vessel.service.ts (which run after the vessel mesh is created).
+    scene.onNewMeshAddedObservable.add((mesh) => {
+      if (mesh.name.startsWith('island_')) {
+        this.addToRenderList(mesh);
+      }
+    });
   }
 
   // ── LOD meshes ─────────────────────────────────────────────────────────────
@@ -653,6 +719,56 @@ export class OceanService {
     return this.fftEngine.getHeightAt(wx, wz, t);
   }
 
+  /**
+   * CPU port of the GPU vertex shader's `waveHeight(wx, wz)`.
+   *
+   * Produces the same wave height as the rendered ocean surface for a given
+   * world position and simulation time.  Use this (rather than
+   * WaveEngine.getHeightAt) whenever the CPU height must match the visual
+   * surface — e.g. hull buoyancy sampling in VesselBuoyancyService.
+   *
+   * The shader reads `u_WindSpeed`, `u_Direction`, and `u_Time`; the CPU
+   * equivalents (windSpeed, windDirX/Z) are kept in sync by updateWeather().
+   */
+  getVisualHeightAt(wx: number, wz: number, t: number): number {
+    const ws  = Math.max(this.windSpeed, 1.0);
+    const dx  = this.windDirX;
+    const dz  = this.windDirZ;
+    const cx  = -dz;   // cross-wind direction x
+    const cz  =  dx;   // cross-wind direction z
+
+    // — Voronoi 1: primary downwind swell (~360 m cells) —
+    const vs   = 0.0028;
+    const vspd = 0.60;
+    const vU1  = wx * vs + dx * t * vspd;
+    const vV1  = wz * vs + dz * t * vspd;
+    const v1   = _voronoi2D(vU1, vV1, 0.85);
+    const hV1  = Math.max(0, 1 - v1 * 1.4) * ws * 0.090;
+
+    // — Voronoi 2: cross-wind secondary swell —
+    const vU2  = wx * vs * 0.77 + (dx * 0.55 + cx * 0.45) * t * vspd * 0.68;
+    const vV2  = wz * vs * 0.77 + (dz * 0.55 + cz * 0.45) * t * vspd * 0.68;
+    const v2   = _voronoi2D(vU2, vV2, 0.90);
+    const hV2  = Math.max(0, 1 - v2 * 1.4) * ws * 0.030;
+
+    // — 3-octave value-noise fBm (wind-drifted) —
+    const ps   = 0.0055;
+    const pspd = 0.28;
+    const drx  = dx * t * pspd;
+    const drz  = dz * t * pspd;
+    const n1   = _smoothNoise(wx * ps          + drx,       wz * ps          + drz,       t * 0.09);
+    const n2   = _smoothNoise(wx * ps * 2.10   + drx * 1.9, wz * ps * 2.10   + drz * 1.9, t * 0.19) * 0.50;
+    const n3   = _smoothNoise(wx * ps * 4.37   + drx * 2.8, wz * ps * 4.37   + drz * 2.8, t * 0.39) * 0.25;
+    const hN   = (n1 + n2 + n3) * ws * 0.048;
+
+    // — Directional sine swell —
+    const swellLen = Math.max(25, Math.min(280, 200 / ws));
+    const swellH   = ws * 0.040;
+    const hS       = Math.sin((wx * dx + wz * dz) / swellLen - t * 0.70) * swellH;
+
+    return hV1 + hV2 + hN + hS;
+  }
+
   setBoatTransform(x: number, z: number, hdgRad: number, speed: number): void {
     this.boatX     = x;
     this.boatZ     = z;
@@ -675,7 +791,9 @@ export class OceanService {
   }
 
   addToRenderList(mesh: AbstractMesh): void {
-    this.reflectionRTT?.renderList?.push(mesh);
+    if (this.reflectionRTT?.renderList && !this.reflectionRTT.renderList.includes(mesh)) {
+      this.reflectionRTT.renderList.push(mesh);
+    }
   }
 
   getOceanMesh(): Mesh { return this.oceanMesh0; }

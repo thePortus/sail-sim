@@ -1,6 +1,6 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  WebGPUEngine, Scene, Color3, Color4, Vector3,
+  WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
   DefaultRenderingPipeline,
@@ -27,6 +27,10 @@ export class SceneService {
 
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
+
+  // Sun glare occlusion: 0 = fully blocked by terrain, 1 = fully visible.
+  // Smoothly interpolated to avoid a hard pop when the sun crosses a ridgeline.
+  private sunOcclusionT = 1.0;
 
   // 1 real second = 1 game minute → full day/night cycle every 24 real minutes.
   private gameHours = 10.5;
@@ -182,6 +186,27 @@ export class SceneService {
 
   // ── Time of day ──────────────────────────────────────────────────────────────
 
+  /**
+   * CPU ray-cast: is any island terrain mesh blocking the camera→sun ray?
+   *
+   * Only tests meshes named `island_*` (created by IslandService.buildIslandMesh).
+   * This avoids testing ocean, sky, clouds, or vessel geometry.
+   * One call per render frame; at 100 islands each with ~500 triangles the
+   * scene.pickWithRay cost is <0.5 ms and is imperceptible at 60 fps.
+   */
+  private isSunOccluded(sunDir: Vector3): boolean {
+    if (!this.camera) return false;
+    // Cast from camera toward sun — islands are within 30 km, sun is at 65 km.
+    // The ray length of 50 000 m ensures all islands are tested without reaching
+    // the sun disc itself (which has isPickable = false anyway).
+    const ray = new Ray(this.camera.position, sunDir, 50_000);
+    const hit = this.scene.pickWithRay(
+      ray,
+      (mesh) => mesh.isPickable && mesh.name.startsWith('island_'),
+    );
+    return !!hit?.pickedMesh;
+  }
+
   // Returns a unit vector pointing FROM the scene origin TOWARD the sun.
   private computeSunDir(): Vector3 {
     // Smooth sine arc: h=6 sunrise, h=12 noon, h=18 sunset.
@@ -225,21 +250,43 @@ export class SceneService {
     this.sunMesh.setEnabled(h > -0.06);
     this.moonMesh.setEnabled(h < 0.14);   // overlap briefly at dawn/dusk
 
+    // ── Sun terrain occlusion ──────────────────────────────────────────────────
+    // The GlowLayer renders the sun mesh to a separate texture that has no depth
+    // context — the glow bleeds through volcanic mountains without this check.
+    // Ray-cast toward the sun once per frame; smoothly fade the occlusion factor
+    // so the glare disappears gracefully behind ridgelines rather than popping.
+    if (h > -0.06) {
+      const blocked   = this.isSunOccluded(dir);
+      const occTarget = blocked ? 0.0 : 1.0;
+      // 0.50 lerp factor: ~2-frame fade-in/out at 60 fps — fast enough to
+      // track a mountain edge without popping, slow enough to look smooth.
+      this.sunOcclusionT += (occTarget - this.sunOcclusionT) * 0.50;
+    } else {
+      this.sunOcclusionT = 1.0;  // below horizon — occlusion logic not needed
+    }
+    const occT = this.sunOcclusionT;
+
     // Sun colour: deep crimson-scarlet at horizon → blazing white at zenith.
+    // Both emissiveColor and mesh visibility are driven by occT so (a) the glow
+    // layer loses its source mesh input and (b) depth-buffer precision failures
+    // at 65 km can't let the disc bleed through a mountain.
     const sunMat = this.sunMesh.material as StandardMaterial;
     sunMat.emissiveColor = new Color3(
-      1.0,
-      Math.min(1, 0.20 + above * 0.78),   // deep amber-red at horizon
-      Math.min(1, 0.03 + above * 0.91),   // nearly zero blue near horizon
+      1.0                                  * occT,
+      Math.min(1, 0.20 + above * 0.78)    * occT,   // deep amber-red at horizon
+      Math.min(1, 0.03 + above * 0.91)    * occT,   // nearly zero blue near horizon
     );
+    this.sunMesh.visibility = occT;
     // Atmospheric refraction: sun appears enlarged when close to the horizon.
     const sunScale = 1.0 + Math.max(0, 0.88 - above) * 3.2;
     this.sunMesh.scaling.setAll(sunScale);
 
     // Glow: erupts dramatically at sunrise/sunset, steady midday, dim moonlit at night.
-    this.glowLayer.intensity = h > 0
+    // Multiplied by occT so glare disappears when the sun is behind terrain.
+    const baseGlow = h > 0
       ? 0.40 + horizon * 5.5 + above * 0.15
       : 0.22;  // soft moonlit glow
+    this.glowLayer.intensity = baseGlow * occT;
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
     if (this.pipeline) {

@@ -1,13 +1,12 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  Scene, MeshBuilder, ShaderMaterial, Mesh, Vector2, Vector3,
-  Color4, ParticleSystem, DynamicTexture,
+  Scene, MeshBuilder, ShaderMaterial, StandardMaterial, Mesh, Vector2, Vector3,
+  Color3, Color4, ParticleSystem, DynamicTexture, SolidParticleSystem, SolidParticle,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { Weather } from '../models';
 
-// ── Shared noise helpers (prepended to both shaders) ─────────────────────────
-// Rules: no WGSL reserved names, no overloads, scalar args only.
+// ── Shared noise helpers (prepended to cirrus shader) ────────────────────────
 const NOISE_HELPERS = `
 float _nh(float ax, float ay, float az) {
   return fract(sin(ax * 127.1 + ay * 311.7 + az * 74.7) * 43758.5453);
@@ -24,30 +23,12 @@ float vNoise(float px, float py, float pz) {
   return mix(mix(v00, v10, fy), mix(v01, v11, fy), fz);
 }
 
-// 4-octave FBM — unrolled (no loop) for WGSL transpiler safety
 float cloudFBM(float px, float py, float pz) {
   float v  = vNoise(px,       py,       pz      ) * 0.5000;
   v       += vNoise(px*2.03,  py*2.03,  pz*2.03 ) * 0.2500;
   v       += vNoise(px*4.09,  py*4.09,  pz*4.09 ) * 0.1250;
   v       += vNoise(px*8.17,  py*8.17,  pz*8.17 ) * 0.0625;
   return v;
-}
-
-// 2D Voronoi F1 — 9-cell unrolled; returns distance to nearest cell seed (0..~0.7)
-float cloudVor(float px, float pz) {
-  float ix = floor(px); float fx = fract(px);
-  float iz = floor(pz); float fz = fract(pz);
-  float bd = 8.0; float rx, rz, ddx, ddz;
-  rx=fract(sin((ix-1.0)*127.1+(iz-1.0)*311.7)*43758.5); rz=fract(sin((ix-1.0)*269.5+(iz-1.0)*183.3)*43758.5); ddx=-1.0+rx*0.88-fx; ddz=-1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix    )*127.1+(iz-1.0)*311.7)*43758.5); rz=fract(sin((ix    )*269.5+(iz-1.0)*183.3)*43758.5); ddx= 0.0+rx*0.88-fx; ddz=-1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix+1.0)*127.1+(iz-1.0)*311.7)*43758.5); rz=fract(sin((ix+1.0)*269.5+(iz-1.0)*183.3)*43758.5); ddx= 1.0+rx*0.88-fx; ddz=-1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix-1.0)*127.1+(iz    )*311.7)*43758.5); rz=fract(sin((ix-1.0)*269.5+(iz    )*183.3)*43758.5); ddx=-1.0+rx*0.88-fx; ddz= 0.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix    )*127.1+(iz    )*311.7)*43758.5); rz=fract(sin((ix    )*269.5+(iz    )*183.3)*43758.5); ddx= 0.0+rx*0.88-fx; ddz= 0.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix+1.0)*127.1+(iz    )*311.7)*43758.5); rz=fract(sin((ix+1.0)*269.5+(iz    )*183.3)*43758.5); ddx= 1.0+rx*0.88-fx; ddz= 0.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix-1.0)*127.1+(iz+1.0)*311.7)*43758.5); rz=fract(sin((ix-1.0)*269.5+(iz+1.0)*183.3)*43758.5); ddx=-1.0+rx*0.88-fx; ddz= 1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix    )*127.1+(iz+1.0)*311.7)*43758.5); rz=fract(sin((ix    )*269.5+(iz+1.0)*183.3)*43758.5); ddx= 0.0+rx*0.88-fx; ddz= 1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  rx=fract(sin((ix+1.0)*127.1+(iz+1.0)*311.7)*43758.5); rz=fract(sin((ix+1.0)*269.5+(iz+1.0)*183.3)*43758.5); ddx= 1.0+rx*0.88-fx; ddz= 1.0+rz*0.88-fz; bd=min(bd,ddx*ddx+ddz*ddz);
-  return sqrt(bd);
 }
 `;
 
@@ -64,107 +45,7 @@ void main() {
 }
 `;
 
-// ── Cumulus (stacked layer) fragment shader ───────────────────────────────────
-//
-// Each horizontal plane sits at a different altitude within the cloud layer.
-// The fragment samples:
-//   1. Voronoi at 6 km scale → discrete cloud clusters with clear gaps.
-//   2. 4-octave FBM at 2 km scale → organic, billowing detail.
-//   3. Height gradient → flat base, rounded puffy tops.
-// The three combine into a density value, thresholded to alpha.
-//
-// Lighting: altitude-based shading (bright top, shadowed base) + scatter noise
-// breaks up uniformity and creates the illusion of volumetric depth.
-const CUMULUS_FRAG = `
-precision highp float;
-` + NOISE_HELPERS + `
-uniform float u_Time;
-uniform vec2  u_WindDir;     // normalised (X, Z) wind direction
-uniform float u_WindSpeed;
-uniform float u_CloudBase;   // world-Y of cloud base
-uniform float u_CloudTop;    // world-Y of cloud top
-uniform float u_Overcast;    // 0 = scattered  →  1 = fully overcast
-uniform float u_DayFactor;   // 0 = midnight   →  1 = noon
-uniform float u_HorizonGlow; // 0 = midday      →  1 = golden hour
-uniform float u_StormFactor; // 0 = calm        →  1 = severe storm
-
-varying vec3 v_wpos;
-
-void main() {
-  // ── Wind drift in noise space ─────────────────────────────────────────────
-  float tt    = mod(u_Time, 1200.0);
-  float dftX  = u_WindDir.x * u_WindSpeed * tt * 0.003;
-  float dftZ  = u_WindDir.y * u_WindSpeed * tt * 0.003;
-
-  // ── Altitude normalised within cloud layer ────────────────────────────────
-  float altN  = clamp((v_wpos.y - u_CloudBase) / (u_CloudTop - u_CloudBase), 0.0, 1.0);
-
-  // ── Large-scale cloud grouping (Voronoi) ──────────────────────────────────
-  // Voronoi at ~5 500 m scale: sparse → 0.0 cell-edge gap, 1.0 cloud interior.
-  // Overcast shrinks the gaps so more of the sky fills with cloud.
-  float gx       = v_wpos.x / 5500.0 + dftX * 0.08;
-  float gz       = v_wpos.z / 5500.0 + dftZ * 0.08;
-  float cellDist = cloudVor(gx, gz);
-  // thresh: radius of cloud existence within each Voronoi cell.
-  // Clear sky → very small (only cell-center wisps or nothing).
-  // Full overcast → large enough to fill nearly the whole cell.
-  float thresh   = u_Overcast * 0.65 - 0.15;   // -0.15 clear → 0.50 overcast
-  float grpMask  = smoothstep(thresh + 0.18, thresh, cellDist);
-  grpMask       *= smoothstep(0.0, 0.12, u_Overcast);   // zero out on clear sky
-  if (grpMask < 0.03) { discard; }
-
-  // ── Height gradient: flat base, rounded puffy tops ────────────────────────
-  float baseRamp = smoothstep(0.0,  0.18, altN);
-  float topRamp  = smoothstep(1.0,  0.62, altN);
-  float hGrad    = baseRamp * topRamp;
-
-  // ── FBM cloud detail ──────────────────────────────────────────────────────
-  float nx  = v_wpos.x / 2200.0 + dftX;
-  float ny  = altN * 2.5;
-  float nz  = v_wpos.z / 2200.0 + dftZ;
-  float dtl = cloudFBM(nx, ny, nz);   // 0..~0.94
-
-  // ── Combined density ──────────────────────────────────────────────────────
-  float dens  = grpMask * hGrad * (dtl * 1.90 - 0.28);
-  dens        = clamp(dens, 0.0, 1.0);
-  float cAlpha = smoothstep(0.10, 0.66, dens) * 0.90;
-  if (cAlpha < 0.01) { discard; }
-
-  // ── Lighting ─────────────────────────────────────────────────────────────
-  // Altitude shading: sun lights from above → bright tops, shadowed bases.
-  float litF = mix(0.50, 1.00, altN);
-
-  // Scatter noise breaks up flat uniform brightness and gives depth cue.
-  float sctN = cloudFBM(nx * 0.52, ny * 0.38, nz * 0.52);
-  litF      *= mix(0.78, 1.00, sctN);
-
-  // Storm darkens the whole cloud mass toward grey nimbostratus.
-  litF *= 1.0 - u_StormFactor * 0.48;
-
-  // ── Colour ───────────────────────────────────────────────────────────────
-  vec3 litCol    = vec3(0.97, 0.98, 1.00);
-  vec3 shadCol   = mix(vec3(0.52, 0.57, 0.68), vec3(0.25, 0.28, 0.34), u_StormFactor * 0.70);
-
-  // Warm tint on lit faces at golden hour (sunrise / sunset)
-  litCol += vec3(0.28, 0.10, -0.12) * u_HorizonGlow * 0.55;
-  litCol  = clamp(litCol, 0.0, 1.0);
-
-  vec3 cCol = mix(shadCol, litCol, litF);
-
-  // Night dimming — keep a faint moonlit silhouette (6 % at midnight)
-  float nightD = mix(0.06, 1.0, u_DayFactor);
-  cCol   *= nightD;
-  cAlpha *= mix(0.20, 1.0, u_DayFactor);
-
-  gl_FragColor = vec4(cCol, cAlpha);
-}
-`;
-
 // ── Cirrus fragment shader ────────────────────────────────────────────────────
-//
-// High-altitude ice-crystal sheets at 7 000–9 500 m.
-// Anisotropic noise: stretched along the wind direction to produce long fibrous
-// filaments (the characteristic "mare's tails" look of real cirrus).
 const CIRRUS_FRAG = `
 precision highp float;
 ` + NOISE_HELPERS + `
@@ -173,13 +54,11 @@ uniform vec2  u_WindDir;
 uniform float u_WindSpeed;
 uniform float u_DayFactor;
 uniform float u_HorizonGlow;
-uniform float u_Overcast;    // shared with cumulus — 0 = clear, 1 = storm
+uniform float u_Overcast;
 
 varying vec3 v_wpos;
 
 void main() {
-  // Cirrus fades out on clear days — no wispy high cloud at cloudiness = 0.
-  // Start appearing around 0.10 overcast; fully present at 0.30+.
   float cirrusPresence = smoothstep(0.05, 0.30, u_Overcast);
   if (cirrusPresence < 0.01) { discard; }
 
@@ -187,7 +66,6 @@ void main() {
   float dftX = u_WindDir.x * u_WindSpeed * tt * 0.003;
   float dftZ = u_WindDir.y * u_WindSpeed * tt * 0.003;
 
-  // Axes: along wind for long axis, cross-wind for fine transverse detail
   float wx =  u_WindDir.x;
   float wz =  u_WindDir.y;
   float cx = -wz;
@@ -196,21 +74,18 @@ void main() {
   float alng  = (v_wpos.x * wx + v_wpos.z * wz) / 18000.0 + dftX * 0.35;
   float crss  = (v_wpos.x * cx + v_wpos.z * cz) / 2000.0  + dftZ * 0.05;
 
-  // Wispy filament: value noise at three cross-wind frequencies
   float fibre = vNoise(alng,       0.5, crss * 2.5) * 0.500
               + vNoise(alng * 2.8, 0.5, crss * 5.5) * 0.300
               + vNoise(alng * 6.5, 0.5, crss * 9.8) * 0.150;
 
-  // Large-scale sheet mask: prevents uniform grey ceiling, creates gaps
   float sheetMask = cloudFBM(alng * 0.28, 0.5, crss * 0.38) * 1.35 - 0.20;
   sheetMask = clamp(sheetMask, 0.0, 1.0);
 
-  float dens = sheetMask * (fibre * 1.55 - 0.30);
+  float dens   = sheetMask * (fibre * 1.55 - 0.30);
   float cAlpha = smoothstep(0.08, 0.55, clamp(dens, 0.0, 1.0)) * 0.50;
   cAlpha *= cirrusPresence;
   if (cAlpha < 0.02) { discard; }
 
-  // Ice crystals: brilliant white with warm golden-hour tint
   vec3 cCol = mix(vec3(1.0, 1.0, 1.0), vec3(1.0, 0.82, 0.60), u_HorizonGlow * 0.45);
   cCol   *= mix(0.05, 1.0, u_DayFactor);
   cAlpha *= mix(0.12, 1.0, u_DayFactor);
@@ -221,48 +96,50 @@ void main() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CUMULUS_ALTS = [1100, 1350, 1600, 1850, 2100, 2350, 2600, 2850];
-const CIRRUS_ALTS  = [7000, 7500, 8000, 8500, 9000, 9500];
-const CLOUD_BASE   = 1100;
-const CLOUD_TOP    = 2850;
-const PLANE_SIZE   = 90_000;
+const CIRRUS_ALTS       = [7000, 7500, 8000, 8500, 9000, 9500];
+const CIRRUS_PLANE_SIZE = 90_000;
+
+// Cloud particle parameters
+const CLOUD_BASE_ALT    = 1100;    // m — lowest puff altitude
+const CLOUD_TOP_ALT     = 2850;    // m — highest puff altitude
+const CLUSTER_COUNT     = 55;      // number of cloud clusters
+const PUFFS_PER_CLUSTER = 16;      // billboard puffs per cluster
+const CLOUD_AREA_RADIUS = 13_000;  // cluster spread radius (world units)
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 @Injectable({ providedIn: 'root' })
 export class CloudService {
   private sceneService = inject(SceneService);
 
-  private cumulusMat!: ShaderMaterial;
+  // Cirrus — procedural GLSL horizontal planes (kept as-is; look great)
   private cirrusMat!:  ShaderMaterial;
-  private cumulusPlanes: Mesh[] = [];
-  private cirrusPlanes:  Mesh[] = [];
+  private cirrusPlanes: Mesh[] = [];
 
+  // Cumulus — replaced with SolidParticleSystem cloud puffs
+  private cloudSPS!: SolidParticleSystem;
+  private cloudPuffAlpha  = 0.0;   // 0=clear sky  →  1=fully overcast
+  private cloudBrightness = 1.0;   // 0=night       →  1=noon
+  private readonly puffBaseAlphas = new Float32Array(CLUSTER_COUNT * PUFFS_PER_CLUSTER);
+
+  // Rain particle system
   private rainSystem: ParticleSystem | null = null;
   private rainPos = new Vector3(0, 30, 0);
 
-  // ── Weather state ──────────────────────────────────────────────────────────
-  private elapsed    = 0;
-  private windDirX   = 0.0;
-  private windDirZ   = 1.0;
-  private windSpeed  = 8.0;
-  private stormFactor = 0.0;
-  private overcast    = 0.2;
-  private cloudBase   = CLOUD_BASE;
-  private cloudTop    = CLOUD_TOP;
+  // Weather state
+  private elapsed   = 0;
+  private windDirX  = 0.0;
+  private windDirZ  = 1.0;
+  private windSpeed = 8.0;
+  private overcast  = 0.2;
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
   init(): void {
     const scene = this.sceneService.scene;
-
-    // Cloud planes render in group 0 — before ocean (groups 1–2) and vessel (group 2).
-    // Because transparent sails don't write to the depth buffer, any group rendered
-    // AFTER group 2 can bleed through the sails.  Being in group 0 means the vessel
-    // always composites on top of any cloud colour, regardless of sail transparency.
-
-    this.buildCumulusMaterial(scene);
     this.buildCirrusMaterial(scene);
-    this.buildCumulusLayer(scene);
     this.buildCirrusLayer(scene);
+    this.buildCloudParticles(scene);
     this.buildRainSystem(scene);
 
     scene.registerBeforeRender(() => {
@@ -271,25 +148,135 @@ export class CloudService {
     });
   }
 
-  // ── Material builders ──────────────────────────────────────────────────────
+  // ── Cloud puff SPS ────────────────────────────────────────────────────────
 
-  private buildCumulusMaterial(scene: Scene): void {
-    this.cumulusMat = new ShaderMaterial('cumulusMat', scene,
-      { vertexSource: CLOUD_VERT, fragmentSource: CUMULUS_FRAG },
-      {
-        attributes: ['position'],
-        uniforms: [
-          'worldViewProjection', 'world',
-          'u_Time', 'u_WindDir', 'u_WindSpeed',
-          'u_CloudBase', 'u_CloudTop', 'u_Overcast', 'u_StormFactor',
-          'u_DayFactor', 'u_HorizonGlow',
-        ],
-        needAlphaBlending: true,
-      },
-    );
-    this.cumulusMat.backFaceCulling  = false;
-    this.cumulusMat.disableDepthWrite = true;
+  /**
+   * Builds a 128×128 soft radial-gradient texture for cloud puffs.
+   * Centre is opaque white; edge fades to transparent — gives a round,
+   * volumetric-looking puff when many are overlaid.
+   */
+  private buildCloudPuffTexture(scene: Scene): DynamicTexture {
+    const SZ  = 128;
+    const tex = new DynamicTexture('cloudPuffTex', { width: SZ, height: SZ }, scene, false);
+    tex.hasAlpha = true;
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, SZ, SZ);
+    const cx  = SZ / 2;
+    const grd = ctx.createRadialGradient(cx, cx, 0, cx, cx, cx);
+    grd.addColorStop(0.00, 'rgba(255,255,255,1.00)');
+    grd.addColorStop(0.35, 'rgba(255,255,255,0.96)');
+    grd.addColorStop(0.62, 'rgba(248,252,255,0.60)');
+    grd.addColorStop(0.84, 'rgba(240,245,255,0.16)');
+    grd.addColorStop(1.00, 'rgba(235,242,255,0.00)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, SZ, SZ);
+    tex.update();
+    return tex;
   }
+
+  /**
+   * Creates CLUSTER_COUNT × PUFFS_PER_CLUSTER billboard cloud puffs using a
+   * SolidParticleSystem.  Clusters are positioned using a golden-angle spiral
+   * so they spread naturally across the sky without rows or gaps.
+   *
+   * updateParticle() is called every frame by setParticles() and handles:
+   *   — Face-camera billboarding (per-particle atan2)
+   *   — Weather alpha (overcast × per-puff variety)
+   *   — Day/night brightness
+   */
+  private buildCloudParticles(scene: Scene): void {
+    const puffTex = this.buildCloudPuffTexture(scene);
+
+    // Template mesh: unit plane.  SPS duplicates this shape N times.
+    const template = MeshBuilder.CreatePlane('_cldTpl', { size: 1 }, scene);
+    const mat = new StandardMaterial('cloudPuffMat', scene);
+    mat.diffuseTexture = puffTex;
+    // Emissive tint = white so clouds are self-lit (no BabylonJS lighting on puffs)
+    mat.emissiveColor  = Color3.White();
+    (mat.diffuseTexture as DynamicTexture).hasAlpha = true;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.backFaceCulling = false;
+    template.material   = mat;
+    template.isVisible  = false;
+
+    const total = CLUSTER_COUNT * PUFFS_PER_CLUSTER;
+
+    this.cloudSPS = new SolidParticleSystem('cloudSPS', scene, {
+      updatable:       true,
+      useModelMaterial: true,
+      enableDepthSort: true,   // back-to-front for correct alpha blending
+    });
+
+    // Deterministic seeded random using golden-ratio hashing: sr(seed) ∈ [0,1)
+    const sr = (s: number) => (((s * 0.6180339887) % 1) + 1) % 1;
+
+    this.cloudSPS.addShape(template, total, {
+      positionFunction: (particle: any, idx: number) => {
+        const ci   = Math.floor(idx / PUFFS_PER_CLUSTER);   // cluster index 0..54
+        const norm = ci / CLUSTER_COUNT;                     // 0..1
+
+        // Golden-angle spiral → uniform distribution with no rows
+        const cRad   = 800 + Math.sqrt(norm) * (CLOUD_AREA_RADIUS - 800);
+        const cAngle = ci * 2.39996322;   // golden angle ≈ 137.5°
+        const cx     = Math.cos(cAngle) * cRad;
+        const cz     = Math.sin(cAngle) * cRad;
+        // Cluster altitude — varies so there's depth variation in the cloud layer
+        const cy     = CLOUD_BASE_ALT + sr(ci * 7 + 3) * (CLOUD_TOP_ALT - CLOUD_BASE_ALT) * 0.8;
+
+        // Cluster footprint: puffs spread within an ellipse (wider than tall)
+        const hSprd  = 220 + norm * 360;
+        const vSprd  = 50  + sr(ci * 13 + 1) * 55;
+
+        particle.position.x = cx + (sr(idx * 17 + 5)  - 0.5) * 2 * hSprd;
+        particle.position.y = cy + (sr(idx * 31 + 7)  - 0.5) * 2 * vSprd;
+        particle.position.z = cz + (sr(idx * 23 + 11) - 0.5) * 2 * hSprd;
+
+        // Puff scaling — larger puffs toward the world edge (perspective compensation)
+        const w = 180 + norm * 260 + sr(idx * 37 + 2) * 200;
+        particle.scaling.x = w;
+        particle.scaling.y = w * (0.55 + sr(idx * 41 + 6) * 0.30);
+        particle.scaling.z = 1;
+
+        // Store per-puff base alpha for variety; colour set on first setParticles()
+        this.puffBaseAlphas[idx] = 0.50 + sr(idx * 53 + 9) * 0.40;
+        particle.color = new Color4(1, 1, 1, 0);   // invisible until first tick
+      },
+    });
+
+    this.cloudSPS.buildMesh();
+    template.dispose();
+
+    // Render before ocean (group 0) so clouds sit behind any spray/UI
+    this.cloudSPS.mesh.renderingGroupId = 0;
+    this.cloudSPS.mesh.alphaIndex       = 50;
+    this.cloudSPS.isAlwaysVisible       = true;   // skip frustum cull (sky dome)
+
+    // Per-particle update — called by setParticles() each frame
+    this.cloudSPS.updateParticle = (particle: SolidParticle): SolidParticle => {
+      // ── Billboard: rotate plane to face the active camera ─────────────────
+      const cam = scene.activeCamera;
+      if (cam) {
+        const dx = cam.position.x - particle.position.x;
+        const dy = cam.position.y - particle.position.y;
+        const dz = cam.position.z - particle.position.z;
+        const hd = Math.sqrt(dx * dx + dz * dz) || 1;
+        particle.rotation.y = Math.atan2(dx, dz);
+        particle.rotation.x = -Math.atan2(dy, hd);
+        particle.rotation.z = 0;
+      }
+      // ── Color: brightness for day/night + alpha for weather ───────────────
+      const b = this.cloudBrightness;
+      if (particle.color) {
+        particle.color.r = b;
+        particle.color.g = b;
+        particle.color.b = b + 0.04 * b;   // faint blue at midday
+        particle.color.a = this.puffBaseAlphas[particle.idx] * this.cloudPuffAlpha;
+      }
+      return particle;
+    };
+  }
+
+  // ── Cirrus material / layer (unchanged) ───────────────────────────────────
 
   private buildCirrusMaterial(scene: Scene): void {
     this.cirrusMat = new ShaderMaterial('cirrusMat', scene,
@@ -304,34 +291,15 @@ export class CloudService {
         needAlphaBlending: true,
       },
     );
-    this.cirrusMat.backFaceCulling  = false;
+    this.cirrusMat.backFaceCulling   = false;
     this.cirrusMat.disableDepthWrite = true;
-  }
-
-  // ── Geometry ───────────────────────────────────────────────────────────────
-
-  private buildCumulusLayer(scene: Scene): void {
-    for (let i = 0; i < CUMULUS_ALTS.length; i++) {
-      const alt = CUMULUS_ALTS[i];
-      const plane = MeshBuilder.CreateGround(`cumulus_${alt}`, {
-        width: PLANE_SIZE, height: PLANE_SIZE, subdivisions: 1,
-      }, scene);
-      plane.position.y      = alt;
-      plane.material        = this.cumulusMat;
-      plane.isPickable      = false;
-      plane.renderingGroupId = 0;
-      // alphaIndex: higher = rendered last (on top). Lowest altitude plane
-      // is closest to camera → renders last → appears on top.
-      plane.alphaIndex = CUMULUS_ALTS.length - i;
-      this.cumulusPlanes.push(plane);
-    }
   }
 
   private buildCirrusLayer(scene: Scene): void {
     for (let i = 0; i < CIRRUS_ALTS.length; i++) {
-      const alt = CIRRUS_ALTS[i];
+      const alt   = CIRRUS_ALTS[i];
       const plane = MeshBuilder.CreateGround(`cirrus_${alt}`, {
-        width: PLANE_SIZE, height: PLANE_SIZE, subdivisions: 1,
+        width: CIRRUS_PLANE_SIZE, height: CIRRUS_PLANE_SIZE, subdivisions: 1,
       }, scene);
       plane.position.y       = alt;
       plane.material         = this.cirrusMat;
@@ -342,10 +310,9 @@ export class CloudService {
     }
   }
 
-  // ── Rain particle system ───────────────────────────────────────────────────
+  // ── Rain particle system (unchanged) ──────────────────────────────────────
 
   private buildRainSystem(scene: Scene): void {
-    // 4×32 streak texture — thin vertical gradient, bright centre, transparent caps.
     const rainTex = new DynamicTexture('rainTex', { width: 4, height: 32 }, scene, false);
     const rCtx    = rainTex.getContext() as CanvasRenderingContext2D;
     const rGrd    = rCtx.createLinearGradient(0, 0, 0, 32);
@@ -366,9 +333,6 @@ export class CloudService {
     this.rainSystem.color1    = new Color4(0.78, 0.88, 1.0, 0.55);
     this.rainSystem.color2    = new Color4(0.72, 0.82, 1.0, 0.35);
     this.rainSystem.colorDead = new Color4(0.72, 0.82, 1.0, 0.00);
-    // BILLBOARDMODE_ALL: fully faces camera — reliable in WebGPU.
-    // The 4×32 texture is already a narrow vertical streak, so it reads as
-    // a rain drop regardless of camera angle.
     this.rainSystem.billboardMode = ParticleSystem.BILLBOARDMODE_ALL;
     this.rainSystem.minScaleX  = 0.10;  this.rainSystem.maxScaleX  = 0.18;
     this.rainSystem.minScaleY  = 1.8;   this.rainSystem.maxScaleY  = 3.5;
@@ -388,42 +352,40 @@ export class CloudService {
   private tick(dt: number): void {
     this.elapsed += dt;
 
-    // ── Compute sky properties from game time ─────────────────────────────────
-    const gameH   = this.sceneService.gameTime();
-    const elev    = Math.sin(((gameH - 6) / 12) * Math.PI);   // -1 midnight → +1 noon
-    const dayF    = Math.max(0, elev);                          // 0 at/below horizon
-    const horizG  = Math.max(0, 1 - Math.abs(elev) / 0.22);   // golden-hour spike
+    // Compute sky properties from game time (same formula as SceneService)
+    const gameH  = this.sceneService.gameTime();
+    const elev   = Math.sin(((gameH - 6) / 12) * Math.PI);
+    const dayF   = Math.max(0, elev);
+    const horizG = Math.max(0, 1 - Math.abs(elev) / 0.22);
 
-    // Sun direction (same formula as SceneService, kept in sync)
-    const az   = (gameH / 24) * Math.PI * 2 - Math.PI;
-    const horiz = Math.sqrt(Math.max(0, 1 - elev * elev));
-    const sunX = horiz * Math.sin(az);
-    const sunZ = horiz * Math.cos(az);
-
-    // ── Upload cumulus uniforms ───────────────────────────────────────────────
-    this.cumulusMat.setFloat('u_Time',        this.elapsed);
-    this.cumulusMat.setVector2('u_WindDir',   new Vector2(this.windDirX, this.windDirZ));
-    this.cumulusMat.setFloat('u_WindSpeed',   this.windSpeed);
-    this.cumulusMat.setFloat('u_CloudBase',   this.cloudBase);
-    this.cumulusMat.setFloat('u_CloudTop',    this.cloudTop);
-    this.cumulusMat.setFloat('u_Overcast',    this.overcast);
-    this.cumulusMat.setFloat('u_StormFactor', this.stormFactor);
-    this.cumulusMat.setFloat('u_DayFactor',   dayF);
-    this.cumulusMat.setFloat('u_HorizonGlow', horizG);
-
-    // ── Upload cirrus uniforms ────────────────────────────────────────────────
-    this.cirrusMat.setFloat('u_Time',        this.elapsed * 0.35);   // cirrus drifts slower
+    // ── Cirrus uniforms ───────────────────────────────────────────────────────
+    this.cirrusMat.setFloat('u_Time',        this.elapsed * 0.35);
     this.cirrusMat.setVector2('u_WindDir',   new Vector2(this.windDirX, this.windDirZ));
     this.cirrusMat.setFloat('u_WindSpeed',   this.windSpeed);
     this.cirrusMat.setFloat('u_DayFactor',   dayF);
     this.cirrusMat.setFloat('u_HorizonGlow', horizG);
     this.cirrusMat.setFloat('u_Overcast',    this.overcast);
 
+    // ── Cloud puff alpha & brightness ─────────────────────────────────────────
+    // Mirrors the GLSL cumulus shader logic:
+    //   nightD    = mix(0.06, 1.0, dayFactor)   — brightness at night is 6%
+    //   cAlpha   *= mix(0.20, 1.0, dayFactor)   — alpha at night is 20%
+    // overcast threshold: no puffs below overcast 0.04.
+    // Storm darkening: clouds fade from white toward dark charcoal as overcast rises
+    // above 0.3.  At overcast=1.0 brightness is 35% of the day value.
+    const stormDark      = 1.0 - Math.max(0, (this.overcast - 0.3) / 0.7) * 0.65;
+    this.cloudBrightness = (0.06 + dayF * 0.94) * stormDark;
+    const nightAlphaMod  = 0.20 + dayF * 0.80;
+    this.cloudPuffAlpha  = Math.max(0, (this.overcast - 0.04) / 0.96) * nightAlphaMod;
+
+    // ── Update cloud puff SPS (billboard + color per-particle) ────────────────
+    if (this.cloudSPS) {
+      this.cloudSPS.setParticles();
+    }
+
     // ── Rain emitter tracks camera ────────────────────────────────────────────
     const cam = this.sceneService.camera;
     if (cam && this.rainSystem) {
-      // Emitter 30 units above camera — particles fall 50–65 units in their
-      // lifetime, so rain passes cleanly through the camera's field of view.
       this.rainPos.set(cam.position.x, cam.position.y + 30, cam.position.z);
     }
   }
@@ -431,36 +393,18 @@ export class CloudService {
   // ── Weather response ──────────────────────────────────────────────────────
 
   updateWeather(weather: Weather): void {
-    const spd = Math.max(0.5, weather.wind.speed);
-    this.windDirX  = weather.wind.x / spd;
-    this.windDirZ  = weather.wind.z / spd;
-    this.windSpeed = spd;
+    const spd       = Math.max(0.5, weather.wind.speed);
+    this.windDirX   = weather.wind.x / spd;
+    this.windDirZ   = weather.wind.z / spd;
+    this.windSpeed  = spd;
+    this.overcast   = weather.cloudiness;
 
-    // Cloudiness (0..1) directly drives overcast level and visual cloud darkness.
-    // stormFactor uses a non-linear curve so light clouds stay bright white and
-    // only heavy overcast pulls the base colour toward dark grey nimbostratus.
-    this.overcast    = weather.cloudiness;
-    this.stormFactor = Math.pow(weather.cloudiness, 1.5);
-
-    // Clouds descend as overcast builds; ceiling drops from 2 850 m → 1 200 m at full storm
-    const stormDrop   = this.stormFactor * 0.72;
-    this.cloudBase    = CLOUD_BASE + stormDrop * 200;
-    this.cloudTop     = CLOUD_TOP  - stormDrop * (CLOUD_TOP - CLOUD_BASE) * 0.55;
-
-    // Reposition cloud planes to match the evolved base/top
-    for (let i = 0; i < this.cumulusPlanes.length; i++) {
-      const t = i / (this.cumulusPlanes.length - 1);   // 0 = base, 1 = top
-      this.cumulusPlanes[i].position.y = this.cloudBase + t * (this.cloudTop - this.cloudBase);
-    }
-
-    // ── Rain ──────────────────────────────────────────────────────────────────
-    // Direction follows wind; intensity and drop size scale with precipitation level.
+    // Rain system
     if (this.rainSystem) {
       const wx = this.windDirX;
       const wz = this.windDirZ;
 
-      let emitRate  = 0;
-      let windBlast = 5;
+      let emitRate = 0, windBlast = 5;
       switch (weather.precipitation) {
         case 'drizzle': emitRate = 400;  windBlast = 3; break;
         case 'rain':    emitRate = 2200; windBlast = 5; break;
@@ -469,7 +413,6 @@ export class CloudService {
       }
       this.rainSystem.emitRate = emitRate;
 
-      // Drizzle → fine, short streaks; rain/storm → long driving streaks
       if (weather.precipitation === 'drizzle') {
         this.rainSystem.minScaleX = 0.05; this.rainSystem.maxScaleX = 0.09;
         this.rainSystem.minScaleY = 0.8;  this.rainSystem.maxScaleY = 1.6;
@@ -488,11 +431,9 @@ export class CloudService {
   dispose(): void {
     this.rainSystem?.stop();
     this.rainSystem?.dispose();
-    for (const p of this.cumulusPlanes)  p.dispose();
-    for (const p of this.cirrusPlanes)   p.dispose();
-    this.cumulusMat?.dispose();
+    this.cloudSPS?.dispose();
+    for (const p of this.cirrusPlanes) p.dispose();
     this.cirrusMat?.dispose();
-    this.cumulusPlanes = [];
-    this.cirrusPlanes  = [];
+    this.cirrusPlanes = [];
   }
 }

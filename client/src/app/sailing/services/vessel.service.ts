@@ -39,6 +39,15 @@ export class VesselService {
     maxSpeed: 8, accelerationRate: 0.25, minTackAngle: 38, sailAreaFactor: 0.32, weight: 2800,
   };
 
+  /**
+   * Seconds the vessel has been continuously blocked by land.
+   * The aground signal only fires once this exceeds GROUNDED_DELAY,
+   * so glancing contacts (headland scrape, tight manoeuvre) don't
+   * trigger the overlay — only a genuine, sustained grounding does.
+   */
+  private groundedTime  = 0;
+  private readonly GROUNDED_DELAY = 5.0;   // seconds of continuous blocking → aground
+
   // ── Mesh handles ──────────────────────────────────────────────────────────
   private root!:         TransformNode;
   private mainSailPivot: TransformNode | null = null;
@@ -98,7 +107,7 @@ export class VesselService {
   // The HUD displays physics speed (realistic knots), but world position advances
   // at TRAVEL_SCALE × that rate — a classic video-game map-compression trick.
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
-  private readonly TRAVEL_SCALE = 5.0;
+  private readonly TRAVEL_SCALE = 10.0;
 
   // ── Wake / hull-wash particle systems ────────────────────────────────────
   // Four ParticleSystems share one foam texture and use plain Vector3 emitters
@@ -423,7 +432,8 @@ export class VesselService {
       this.root.rotation.y = this.heading * Math.PI / 180;
     }
 
-    this.isGrounded = false;
+    this.isGrounded   = false;
+    this.groundedTime = 0;
     this.grounded.set(false);
     this.resetWake();
   }
@@ -595,16 +605,22 @@ export class VesselService {
     const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
 
     if (this.islandService.isOnLand(newX, newZ)) {
-      // Block movement, halt the vessel, and mark as aground
+      // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
-      if (!this.isGrounded) {
+
+      // Accumulate contact time.  Only declare "aground" once the ship has
+      // been pinned for GROUNDED_DELAY seconds — this lets players scrape a
+      // headland or back off a beach without triggering the overlay.
+      this.groundedTime += dt;
+      if (!this.isGrounded && this.groundedTime >= this.GROUNDED_DELAY) {
         this.isGrounded = true;
         this.grounded.set(true);
       }
     } else {
       this.x = newX;
       this.z = newZ;
-      // Clear grounded if we managed to drift/back off the shore
+      // Any free movement resets the contact timer and clears the aground flag.
+      this.groundedTime = 0;
       if (this.isGrounded) {
         this.isGrounded = false;
         this.grounded.set(false);
@@ -624,8 +640,9 @@ export class VesselService {
     this.root.rotation.y = this.heading * Math.PI / 180;
 
     // ── Buoyancy: 8-point hull sampling + wave slope physics ──────────────────
-    // VesselBuoyancyService samples the same Gerstner CPU math used by the GPU
-    // vertex shader, so the visual and the physics are always in sync.
+    // VesselBuoyancyService samples OceanService.getVisualHeightAt() — a CPU
+    // port of the GPU vertex shader's waveHeight() — so the physics height
+    // matches the rendered surface exactly.
     const t    = this.simTime;
     const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt);
 
@@ -641,9 +658,8 @@ export class VesselService {
       this.heading = ((this.heading + buoy.steeringBias * dt) + 360) % 360;
     }
 
-    // FLOAT_DRAFT: negative = sits deeper, positive = more freeboard.
-    // -0.4 put the deck only 0.2 m above the waterline, getting swamped in chop.
-    // 0.05 gives ~0.6 m of freeboard while keeping keel and bilge fully submerged.
+    // FLOAT_DRAFT: small fixed freeboard so the waterline sits at deck level in
+    // perfectly flat water (corrects for any systematic offset in the wave model).
     const FLOAT_DRAFT = 0.05;
 
     // Cannon recoil: brief decaying heave + pitch oscillation after a broadside.
@@ -656,7 +672,13 @@ export class VesselService {
       recoilPitchR = env * osc * 0.038;     // ±2.2° fore-aft pitch
     }
 
-    this.root.position.y = FLOAT_DRAFT + buoy.heave + recoilY;
+    // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess
+    // rather than a hard snap-to.  The 0.55 m tolerance already absorbs most
+    // momentary corner submersion, so a light blend is enough to prevent the
+    // hull from going dramatically underwater without launching it into the air.
+    const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
+    const heaveApplied = buoy.heave + floorLift * 0.15;
+    this.root.position.y = FLOAT_DRAFT + heaveApplied + recoilY;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);

@@ -13,6 +13,38 @@ import { Island } from '../../models';
   standalone: true,
   imports: [CommonModule],
   templateUrl: './minimap.component.html',
+  styles: [`
+    .island-tooltip {
+      position: fixed;
+      background: rgba(8, 16, 28, 0.96);
+      border: 1px solid rgba(190, 150, 60, 0.70);
+      border-radius: 3px;
+      padding: 8px 12px;
+      pointer-events: none;
+      z-index: 9999;
+      max-width: 230px;
+      box-shadow: 0 3px 14px rgba(0,0,0,0.65);
+    }
+    .island-tooltip__name {
+      color: #e8c96a;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      margin-bottom: 2px;
+    }
+    .island-tooltip__type {
+      color: rgba(190, 150, 60, 0.75);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 5px;
+    }
+    .island-tooltip__desc {
+      color: rgba(205, 193, 165, 0.88);
+      font-size: 11px;
+      line-height: 1.55;
+    }
+  `],
 })
 export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
@@ -21,7 +53,10 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private multiplayerService = inject(MultiplayerService);
 
-  expanded = signal(false);
+  expanded      = signal(false);
+  hoveredIsland = signal<Island | null>(null);
+  tooltipX      = signal(0);
+  tooltipY      = signal(0);
 
   // World bounds for map projection
   private readonly WORLD_RANGE = 25000; // ±25 000 units shown on full map
@@ -55,6 +90,49 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
 
   toggleExpand(): void {
     this.expanded.update(v => !v);
+  }
+
+  onMouseMove(event: MouseEvent): void {
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) return;
+
+    const rect   = canvas.getBoundingClientRect();
+    const canvasX = event.clientX - rect.left;
+    const canvasY = event.clientY - rect.top;
+    const W = canvas.width;
+    const H = canvas.height;
+    const range = this.WORLD_RANGE;
+
+    // Canvas pixels → world coordinates
+    const worldX = (canvasX / W) * (range * 2) - range;
+    const worldZ = range - (canvasY / H) * (range * 2);
+
+    const islands = this.islandService.islands();
+    let found: Island | null = null;
+    for (let i = 0; i < this.precomputedIslands.length; i++) {
+      if (this.pointInPolygon(worldX, worldZ, this.precomputedIslands[i].polygon)) {
+        found = islands[i];
+        break;
+      }
+    }
+    this.hoveredIsland.set(found);
+
+    // Position tooltip to the right of (and slightly above) the cursor.
+    // Clamp so it doesn't overflow the right edge of the viewport.
+    const TW = 246; // max-width + padding
+    const left = event.clientX + 18 + TW > window.innerWidth
+      ? event.clientX - TW - 8
+      : event.clientX + 18;
+    this.tooltipX.set(left);
+    this.tooltipY.set(event.clientY - 6);
+  }
+
+  onMouseLeave(): void {
+    this.hoveredIsland.set(null);
+  }
+
+  typeLabel(type: string): string {
+    return type.charAt(0).toUpperCase() + type.slice(1);
   }
 
   // ── Island pre-computation ────────────────────────────────────────────────
@@ -91,6 +169,21 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     }
     return sorted[0].radius;
+  }
+
+  private pointInPolygon(px: number, pz: number, poly: [number, number][]): boolean {
+    let inside = false;
+    const n = poly.length;
+    let j = n - 1;
+    for (let i = 0; i < n; i++) {
+      const xi = poly[i][0], zi = poly[i][1];
+      const xj = poly[j][0], zj = poly[j][1];
+      if ((zi > pz) !== (zj > pz) && px < (xj - xi) * (pz - zi) / (zj - zi) + xi) {
+        inside = !inside;
+      }
+      j = i;
+    }
+    return inside;
   }
 
   // ── Render loop ───────────────────────────────────────────────────────────

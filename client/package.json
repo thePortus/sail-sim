@@ -22,7 +22,9 @@
     "@angular/router": "^19.0.0",
     "@babylonjs/core": "^7.0.0",
     "@babylonjs/materials": "^7.54.3",
+    "@tonejs/midi": "^2.0.28",
     "rxjs": "~7.8.0",
+    "tone": "^15.1.22",
     "tslib": "^2.3.0",
     "zone.js": "~0.15.0"
   },

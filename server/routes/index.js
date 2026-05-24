@@ -5,4 +5,5 @@ module.exports = app => {
   require('./islands.routes')(app);
   require('./vessels.routes')(app);
   require('./player-location.routes')(app);
+  require('./music.routes')(app);
 };

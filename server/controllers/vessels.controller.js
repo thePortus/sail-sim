@@ -467,6 +467,135 @@ const VESSELS = [
         materialType: 'rope',
         material: { color: '#C8A86A', specular: '#666633' } },
 
+      // ── Cannons ───────────────────────────────────────────────────────────────
+      // Two bronze 9-pounders, one per side, amidships.  The barrel lies along
+      // the X axis so the muzzle clears the bulwark outer edge (x ≈ ±1.79).
+      // Muzzle tip used by CannonService for ballistic origin: x ≈ ±2.73, y 1.48.
+
+      // Port cannon ─────────────────────────────────────────────────────────────
+      { id: 'cannon_port_carriage',
+        shape: 'box', params: { width: 0.44, height: 0.22, depth: 0.70 },
+        position: { x: -1.45, y: 1.28, z: 0.0 },
+        materialType: 'wood_hull',
+        material: { color: '#2A1A0A' } },
+
+      { id: 'cannon_port_barrel',
+        shape: 'cylinder', params: { diameter: 0.155, height: 1.26, tessellation: 10 },
+        position: { x: -2.10, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'black_metal',
+        material: { color: '#111111' } },
+
+      { id: 'cannon_port_band_breech',
+        shape: 'torus', params: { diameter: 0.200, thickness: 0.030, tessellation: 14 },
+        position: { x: -1.86, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_port_band_mid',
+        shape: 'torus', params: { diameter: 0.192, thickness: 0.026, tessellation: 14 },
+        position: { x: -2.28, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_port_muzzle_ring',
+        shape: 'torus', params: { diameter: 0.222, thickness: 0.038, tessellation: 16 },
+        position: { x: -2.67, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_port_cascabel',
+        shape: 'sphere', params: { diameter: 0.188, tessellation: 10 },
+        position: { x: -1.52, y: 1.48, z: 0.0 },
+        materialType: 'black_metal',
+        material: { color: '#111111' } },
+
+      { id: 'cannon_port_wheel_fwd',
+        shape: 'torus', params: { diameter: 0.315, thickness: 0.058, tessellation: 18 },
+        position: { x: -1.45, y: 1.28, z:  0.34 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'black_metal',
+        material: { color: '#1A1A1A' } },
+
+      { id: 'cannon_port_wheel_aft',
+        shape: 'torus', params: { diameter: 0.315, thickness: 0.058, tessellation: 18 },
+        position: { x: -1.45, y: 1.28, z: -0.34 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'black_metal',
+        material: { color: '#1A1A1A' } },
+
+      { id: 'cannon_port_axle',
+        shape: 'cylinder', params: { diameter: 0.055, height: 0.74, tessellation: 8 },
+        position: { x: -1.45, y: 1.28, z: 0.0 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'steel',
+        material: { color: '#888888' } },
+
+      // Starboard cannon (mirror: negate all x positions) ───────────────────────
+      { id: 'cannon_stbd_carriage',
+        shape: 'box', params: { width: 0.44, height: 0.22, depth: 0.70 },
+        position: { x: 1.45, y: 1.28, z: 0.0 },
+        materialType: 'wood_hull',
+        material: { color: '#2A1A0A' } },
+
+      { id: 'cannon_stbd_barrel',
+        shape: 'cylinder', params: { diameter: 0.155, height: 1.26, tessellation: 10 },
+        position: { x: 2.10, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'black_metal',
+        material: { color: '#111111' } },
+
+      { id: 'cannon_stbd_band_breech',
+        shape: 'torus', params: { diameter: 0.200, thickness: 0.030, tessellation: 14 },
+        position: { x: 1.86, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_stbd_band_mid',
+        shape: 'torus', params: { diameter: 0.192, thickness: 0.026, tessellation: 14 },
+        position: { x: 2.28, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_stbd_muzzle_ring',
+        shape: 'torus', params: { diameter: 0.222, thickness: 0.038, tessellation: 16 },
+        position: { x: 2.67, y: 1.48, z: 0.0 },
+        rotation: { x: 0, y: 0, z: PI_2 },
+        materialType: 'brass',
+        material: { color: '#C8962A' } },
+
+      { id: 'cannon_stbd_cascabel',
+        shape: 'sphere', params: { diameter: 0.188, tessellation: 10 },
+        position: { x: 1.52, y: 1.48, z: 0.0 },
+        materialType: 'black_metal',
+        material: { color: '#111111' } },
+
+      { id: 'cannon_stbd_wheel_fwd',
+        shape: 'torus', params: { diameter: 0.315, thickness: 0.058, tessellation: 18 },
+        position: { x: 1.45, y: 1.28, z:  0.34 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'black_metal',
+        material: { color: '#1A1A1A' } },
+
+      { id: 'cannon_stbd_wheel_aft',
+        shape: 'torus', params: { diameter: 0.315, thickness: 0.058, tessellation: 18 },
+        position: { x: 1.45, y: 1.28, z: -0.34 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'black_metal',
+        material: { color: '#1A1A1A' } },
+
+      { id: 'cannon_stbd_axle',
+        shape: 'cylinder', params: { diameter: 0.055, height: 0.74, tessellation: 8 },
+        position: { x: 1.45, y: 1.28, z: 0.0 },
+        rotation: { x: PI_2, y: 0, z: 0 },
+        materialType: 'steel',
+        material: { color: '#888888' } },
+
       // ── Navigation lights ─────────────────────────────────────────────────────
 
       { id: 'nav_red',

@@ -1,6 +1,7 @@
 import {
   Component, ElementRef, ViewChild,
-  AfterViewInit, OnDestroy, inject, signal, effect,
+  AfterViewInit, OnDestroy, inject, signal, effect, computed,
+  HostListener,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
@@ -15,12 +16,15 @@ import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
+import { CannonService }      from '../sailing/services/cannon.service';
+import { MusicService }       from '../sailing/services/music.service';
 import { AuthService }        from '../services/auth.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
 import { VesselSelectorComponent } from '../sailing/components/vessel-selector/vessel-selector.component';
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
+import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -30,7 +34,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent],
   template: `
     <div class="game-root">
       <!-- BabylonJS canvas -->
@@ -57,9 +61,30 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       <!-- In-game HUD -->
       @if (phase() === 'sailing') {
         <app-hud (exitGame)="onExitGame()" />
+
+        <!-- Pause menu — shown when Esc is pressed -->
+        @if (paused()) {
+          <app-pause-menu (resume)="onResume()" (quit)="onExitGame()" />
+        }
         <div class="minimap-anchor">
           <app-minimap />
         </div>
+
+        <!-- Cannon charge indicator — visible while Space is held -->
+        @if (cannonService.isCharging()) {
+          <div class="cannon-charge-hud">
+            <div class="cannon-charge-label">⚫ CHARGING</div>
+            <div class="cannon-charge-track">
+              <div class="cannon-charge-fill"
+                   [style.width.%]="cannonService.chargeLevel() * 100"
+                   [class.cannon-charge-full]="cannonService.chargeLevel() >= 0.98"></div>
+            </div>
+            <div class="cannon-charge-range">
+              {{ chargeRangeLabel() }}
+            </div>
+          </div>
+        }
+
         @if (isAdmin) {
           <app-admin-panel #adminPanel />
           <div class="admin-hint">Press <kbd>&#96;</kbd> for admin controls</div>
@@ -85,6 +110,37 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       display: inline-block; padding: 0 4px; border-radius: 3px;
       border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.35);
     }
+    /* ── Cannon charge HUD ────────────────────────────────────────────── */
+    .cannon-charge-hud {
+      position: absolute; bottom: 5.5rem; left: 50%; transform: translateX(-50%);
+      z-index: 60; pointer-events: none;
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      background: rgba(8, 16, 28, 0.75);
+      border: 1px solid rgba(255, 200, 50, 0.35);
+      border-radius: 8px; padding: 8px 16px;
+      backdrop-filter: blur(6px);
+    }
+    .cannon-charge-label {
+      font-family: monospace; font-size: 11px; font-weight: bold;
+      color: rgba(255, 200, 50, 0.90); letter-spacing: 0.12em;
+    }
+    .cannon-charge-track {
+      width: 180px; height: 6px;
+      background: rgba(255,255,255,0.10); border-radius: 3px; overflow: hidden;
+    }
+    .cannon-charge-fill {
+      height: 100%; border-radius: 3px;
+      background: linear-gradient(90deg, #f97316, #facc15);
+      transition: width 0.05s linear, background 0.2s;
+    }
+    .cannon-charge-fill.cannon-charge-full {
+      background: linear-gradient(90deg, #ef4444, #f97316);
+      animation: charge-pulse 0.25s ease-in-out infinite alternate;
+    }
+    @keyframes charge-pulse { from { opacity: 0.85; } to { opacity: 1.0; } }
+    .cannon-charge-range {
+      font-family: monospace; font-size: 10px; color: rgba(255,220,100,0.65);
+    }
   `],
 })
 export class GameComponent implements AfterViewInit, OnDestroy {
@@ -100,9 +156,26 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
   private multiplayerService = inject(MultiplayerService);
+  readonly cannonService     = inject(CannonService);    // public: template reads signals
+  readonly musicService      = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
+  paused     = signal<boolean>(false);
   loadingMsg = signal('Charting the archipelago…');
+
+  @HostListener('window:keydown.escape')
+  onEscKey(): void {
+    if (this.phase() === 'sailing') {
+      this.paused.update(v => !v);
+    }
+  }
+
+  /** Display the approximate range in the charge bar (20 m … 80 m). */
+  chargeRangeLabel = computed(() => {
+    const c = this.cannonService.chargeLevel();
+    const range = Math.round((20 + c * 60) / 5) * 5;   // snap to 5 m grid
+    return `~${range} m range`;
+  });
 
   /** True if the logged-in user has admin or owner role — controls admin panel visibility. */
   isAdmin = false;
@@ -203,6 +276,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
 
     this.vesselService.init(vessel, spawnX, spawnZ, spawnHeading);
 
+    // 5b. Arm the cannons (must be after vessel + scene are ready)
+    this.cannonService.init();
+
+    // 5c. Start music (requires a prior user gesture — vessel selection click counts)
+    this.musicService.init(Settings.apiUrl);
+
     // 6. Weather
     this.loadingMsg.set('Reading the wind…');
     this.weatherService.start();
@@ -234,13 +313,21 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     if (this.saveInterval) { clearInterval(this.saveInterval); this.saveInterval = null; }
     this.weatherService.stop();
     this.multiplayerService.disconnect();
+    this.cannonService.dispose();
+    this.musicService.dispose();
     this.cloudService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();
   }
 
-  /** Called by the HUD exit button — tears down the scene and returns to vessel selection. */
+  /** Called by the pause menu Resume button or Esc toggle. */
+  onResume(): void {
+    this.paused.set(false);
+  }
+
+  /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */
   onExitGame(): void {
+    this.paused.set(false);
     this.teardown();
     this.selectedSlug = '';
     this.callsign     = '';

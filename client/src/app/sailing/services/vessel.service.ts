@@ -55,6 +55,17 @@ export class VesselService {
   private torchFlameMats: StandardMaterial[]   = [];
   private torchSconceMats: StandardMaterial[]  = [];
 
+  // ── Cannon recoil ────────────────────────────────────────────────────────
+  // addCannonRecoil() is called by CannonService on every broadside.
+  // A decaying sinusoidal impulse is added to the vessel's heave and pitch
+  // for RECOIL_DUR seconds, giving the "ship kicks back" feel.
+  private recoilRemaining = 0;
+  private readonly RECOIL_DUR = 1.8;   // seconds of oscillation
+
+  addCannonRecoil(): void {
+    this.recoilRemaining = this.RECOIL_DUR;
+  }
+
   // ── Sheet (sail trim) ─────────────────────────────────────────────────────
   // sheetAngleDeg: degrees from the boat's centreline the boom swings out.
   //   5 = close-hauled (sail sheeted hard in)
@@ -634,11 +645,22 @@ export class VesselService {
     // -0.4 put the deck only 0.2 m above the waterline, getting swamped in chop.
     // 0.05 gives ~0.6 m of freeboard while keeping keel and bilge fully submerged.
     const FLOAT_DRAFT = 0.05;
-    this.root.position.y = FLOAT_DRAFT + buoy.heave;
+
+    // Cannon recoil: brief decaying heave + pitch oscillation after a broadside.
+    let recoilY = 0, recoilPitchR = 0;
+    if (this.recoilRemaining > 0) {
+      this.recoilRemaining = Math.max(0, this.recoilRemaining - dt);
+      const env  = this.recoilRemaining / this.RECOIL_DUR;          // 1 → 0
+      const osc  = Math.sin(env * this.RECOIL_DUR * Math.PI * 3.5); // ~3 oscillations
+      recoilY      = env * osc * 0.20;      // ±20 cm heave
+      recoilPitchR = env * osc * 0.038;     // ±2.2° fore-aft pitch
+    }
+
+    this.root.position.y = FLOAT_DRAFT + buoy.heave + recoilY;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);
-    this.root.rotation.x = buoy.pitchRad;
+    this.root.rotation.x = buoy.pitchRad + recoilPitchR;
 
     // Sail rotation — driven by the player-controlled sheet angle
     const swingDeg  = this.sheetAngleDeg;

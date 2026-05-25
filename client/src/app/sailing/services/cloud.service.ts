@@ -127,11 +127,12 @@ export class CloudService {
   private rainPos = new Vector3(0, 30, 0);
 
   // Weather state
-  private elapsed   = 0;
-  private windDirX  = 0.0;
-  private windDirZ  = 1.0;
-  private windSpeed = 8.0;
-  private overcast  = 0.2;
+  private elapsed      = 0;
+  private windDirX     = 0.0;
+  private windDirZ     = 1.0;
+  private windSpeed    = 8.0;
+  private overcast     = 0.2;
+  private spsFrameTick = 0;   // throttle counter for setParticles()
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -175,70 +176,102 @@ export class CloudService {
   }
 
   /**
-   * Creates CLUSTER_COUNT × PUFFS_PER_CLUSTER billboard cloud puffs using a
-   * SolidParticleSystem.  Clusters are positioned using a golden-angle spiral
-   * so they spread naturally across the sky without rows or gaps.
+   * Creates CLUSTER_COUNT × PUFFS_PER_CLUSTER volumetric cloud puffs using a
+   * SolidParticleSystem.  Each puff is THREE crossed vertical planes (at 0°,
+   * 60°, 120° Y-rotation) merged into one mesh.  From any horizontal viewing
+   * angle at least 2 planes overlap, making the puff read as a 3-D volume
+   * rather than a flat billboard.  No per-frame camera-facing rotation is
+   * needed — the symmetry of the cross handles all azimuths automatically.
    *
-   * updateParticle() is called every frame by setParticles() and handles:
-   *   — Face-camera billboarding (per-particle atan2)
-   *   — Weather alpha (overcast × per-puff variety)
-   *   — Day/night brightness
+   * Clusters are placed on a golden-angle spiral for gap-free sky coverage.
+   * updateParticle() only handles color/alpha; rotation is fixed at build time.
    */
   private buildCloudParticles(scene: Scene): void {
     const puffTex = this.buildCloudPuffTexture(scene);
 
-    // Template mesh: unit plane.  SPS duplicates this shape N times.
-    const template = MeshBuilder.CreatePlane('_cldTpl', { size: 1 }, scene);
+    // Material — shared across all three planes of the cross.
     const mat = new StandardMaterial('cloudPuffMat', scene);
-    mat.diffuseTexture = puffTex;
-    // Emissive tint = white so clouds are self-lit (no BabylonJS lighting on puffs)
-    mat.emissiveColor  = Color3.White();
+    mat.diffuseTexture              = puffTex;
+    mat.emissiveColor               = Color3.White();    // self-lit (no scene lighting on clouds)
     (mat.diffuseTexture as DynamicTexture).hasAlpha = true;
-    mat.useAlphaFromDiffuseTexture = true;
-    mat.backFaceCulling = false;
-    template.material   = mat;
-    template.isVisible  = false;
+    mat.useAlphaFromDiffuseTexture  = true;
+    mat.backFaceCulling             = false;             // render both sides of every plane
+
+    // ── Build the stacked-disc template ───────────────────────────────────────
+    // Five horizontal discs at increasing Y offsets and decreasing radii model
+    // a classic cumulus tower.  Viewed from sea level (always looking upward at
+    // 10–60°) the overlapping translucent circles read as a soft, layered volume.
+    // Vertical crossed planes look flat from below — horizontal discs do not.
+    //
+    // CreateDisc() produces a disc in the XY plane (upright); rotation.x = -π/2
+    // lays it flat, then bakeCurrentTransformIntoVertices() commits the rotation
+    // so MergeMeshes receives geometry already in world-horizontal orientation.
+    const makeDisc = (yOff: number, r: number): Mesh => {
+      const d = MeshBuilder.CreateDisc('_hd', { radius: r, tessellation: 16 }, scene);
+      d.material   = mat;
+      d.rotation.x = -Math.PI / 2;
+      d.position.y = yOff;
+      d.bakeCurrentTransformIntoVertices();
+      return d;
+    };
+
+    const slabs = [
+      makeDisc(0.00, 0.50),   // base — widest
+      makeDisc(0.18, 0.48),
+      makeDisc(0.36, 0.42),
+      makeDisc(0.54, 0.30),
+      makeDisc(0.68, 0.16),   // apex — narrowest
+    ];
+    const template = Mesh.MergeMeshes(slabs, true, true, undefined, false, false)!;
+    template.material  = mat;
+    template.isVisible = false;
 
     const total = CLUSTER_COUNT * PUFFS_PER_CLUSTER;
 
     this.cloudSPS = new SolidParticleSystem('cloudSPS', scene, {
-      updatable:       true,
+      updatable:        true,
       useModelMaterial: true,
-      enableDepthSort: true,   // back-to-front for correct alpha blending
+      // enableDepthSort intentionally omitted: sorting 880 particles + reordering
+      // a 3× larger vertex buffer every frame was the primary frame-rate killer.
+      // Slight back-to-front artefacts in cloud-on-cloud overlap are imperceptible
+      // at cumulus distances (1–13 km) and outweighed by the perf saving.
     });
 
-    // Deterministic seeded random using golden-ratio hashing: sr(seed) ∈ [0,1)
+    // Deterministic seeded random: sr(seed) ∈ [0, 1)
     const sr = (s: number) => (((s * 0.6180339887) % 1) + 1) % 1;
 
     this.cloudSPS.addShape(template, total, {
       positionFunction: (particle: any, idx: number) => {
-        const ci   = Math.floor(idx / PUFFS_PER_CLUSTER);   // cluster index 0..54
-        const norm = ci / CLUSTER_COUNT;                     // 0..1
+        const ci   = Math.floor(idx / PUFFS_PER_CLUSTER);   // cluster 0 … 54
+        const norm = ci / CLUSTER_COUNT;
 
-        // Golden-angle spiral → uniform distribution with no rows
+        // Golden-angle spiral → gap-free sky coverage
         const cRad   = 800 + Math.sqrt(norm) * (CLOUD_AREA_RADIUS - 800);
-        const cAngle = ci * 2.39996322;   // golden angle ≈ 137.5°
+        const cAngle = ci * 2.39996322;   // ≈ 137.5° (golden angle)
         const cx     = Math.cos(cAngle) * cRad;
         const cz     = Math.sin(cAngle) * cRad;
-        // Cluster altitude — varies so there's depth variation in the cloud layer
         const cy     = CLOUD_BASE_ALT + sr(ci * 7 + 3) * (CLOUD_TOP_ALT - CLOUD_BASE_ALT) * 0.8;
 
-        // Cluster footprint: puffs spread within an ellipse (wider than tall)
-        const hSprd  = 220 + norm * 360;
-        const vSprd  = 50  + sr(ci * 13 + 1) * 55;
+        // Puff spread within the cluster — generous vertical range for 3-D depth
+        const hSprd = 220 + norm * 360;
+        const vSprd = 80  + sr(ci * 13 + 1) * 90;   // taller than before for volume
 
         particle.position.x = cx + (sr(idx * 17 + 5)  - 0.5) * 2 * hSprd;
         particle.position.y = cy + (sr(idx * 31 + 7)  - 0.5) * 2 * vSprd;
         particle.position.z = cz + (sr(idx * 23 + 11) - 0.5) * 2 * hSprd;
 
-        // Puff scaling — larger puffs toward the world edge (perspective compensation)
-        const w = 180 + norm * 260 + sr(idx * 37 + 2) * 200;
-        particle.scaling.x = w;
-        particle.scaling.y = w * (0.55 + sr(idx * 41 + 6) * 0.30);
-        particle.scaling.z = 1;
+        // Horizontal puffs: wide in X/Z, shorter in Y (cumulus are wider than tall).
+        // Random Y-rotation varies the disc orientations so clusters don't look uniform.
+        const w = 160 + norm * 240 + sr(idx * 37 + 2) * 180;
+        particle.scaling.x  = w;
+        particle.scaling.y  = w * (0.38 + sr(idx * 41 + 6) * 0.22);  // height ≈ 40–60% of width
+        particle.scaling.z  = w;
 
-        // Store per-puff base alpha for variety; colour set on first setParticles()
-        this.puffBaseAlphas[idx] = 0.50 + sr(idx * 53 + 9) * 0.40;
+        particle.rotation.y = sr(idx * 11 + 3) * Math.PI * 2;
+        particle.rotation.x = 0;
+        particle.rotation.z = 0;
+
+        this.puffBaseAlphas[idx] = 0.38 + sr(idx * 53 + 9) * 0.32;
         particle.color = new Color4(1, 1, 1, 0);   // invisible until first tick
       },
     });
@@ -246,30 +279,24 @@ export class CloudService {
     this.cloudSPS.buildMesh();
     template.dispose();
 
-    // Render before ocean (group 0) so clouds sit behind any spray/UI
+    // Particle rotations and UVs are set once at build time and never change —
+    // tell the SPS to skip those recomputation passes inside setParticles().
+    // Only colour updates remain, which is the cheapest path.
+    this.cloudSPS.computeParticleRotation = false;
+    this.cloudSPS.computeParticleTexture  = false;
+
     this.cloudSPS.mesh.renderingGroupId = 0;
     this.cloudSPS.mesh.alphaIndex       = 50;
-    this.cloudSPS.isAlwaysVisible       = true;   // skip frustum cull (sky dome)
+    this.cloudSPS.isAlwaysVisible       = true;
 
-    // Per-particle update — called by setParticles() each frame
+    // Per-frame update: only color/alpha — rotation is fixed at init time.
+    // The three-plane cross is view-invariant so no camera-facing transform needed.
     this.cloudSPS.updateParticle = (particle: SolidParticle): SolidParticle => {
-      // ── Billboard: rotate plane to face the active camera ─────────────────
-      const cam = scene.activeCamera;
-      if (cam) {
-        const dx = cam.position.x - particle.position.x;
-        const dy = cam.position.y - particle.position.y;
-        const dz = cam.position.z - particle.position.z;
-        const hd = Math.sqrt(dx * dx + dz * dz) || 1;
-        particle.rotation.y = Math.atan2(dx, dz);
-        particle.rotation.x = -Math.atan2(dy, hd);
-        particle.rotation.z = 0;
-      }
-      // ── Color: brightness for day/night + alpha for weather ───────────────
       const b = this.cloudBrightness;
       if (particle.color) {
         particle.color.r = b;
         particle.color.g = b;
-        particle.color.b = b + 0.04 * b;   // faint blue at midday
+        particle.color.b = b + 0.04 * b;
         particle.color.a = this.puffBaseAlphas[particle.idx] * this.cloudPuffAlpha;
       }
       return particle;
@@ -378,8 +405,11 @@ export class CloudService {
     const nightAlphaMod  = 0.20 + dayF * 0.80;
     this.cloudPuffAlpha  = Math.max(0, (this.overcast - 0.04) / 0.96) * nightAlphaMod;
 
-    // ── Update cloud puff SPS (billboard + color per-particle) ────────────────
-    if (this.cloudSPS) {
+    // ── Update cloud puff SPS — throttled to every 6 frames ──────────────────
+    // Colours transition over seconds (day/night, weather), so updating every
+    // 6th render frame (~10 Hz at 60 fps) is indistinguishable from every frame.
+    // This eliminates 5/6 of the vertex-buffer upload cost.
+    if (this.cloudSPS && ++this.spsFrameTick % 6 === 0) {
       this.cloudSPS.setParticles();
     }
 

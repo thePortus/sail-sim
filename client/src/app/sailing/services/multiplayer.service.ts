@@ -54,6 +54,17 @@ export class MultiplayerService {
   private readonly LABEL_HEIGHT = 0.9;
   private readonly LABEL_Y      = 20;     // above vessel root (above masthead)
 
+  // ── Cannon shot callbacks ─────────────────────────────────────────────────
+  // Set by CannonService.init() to avoid a circular injection.
+  onRemoteShot: ((ox: number, oy: number, oz: number,
+                  vx: number, vy: number, vz: number) => void) | null = null;
+
+  broadcastShot(ox: number, oy: number, oz: number,
+                vx: number, vy: number, vz: number): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz }));
+  }
+
   // Current local state — kept updated by updateLocalState()
   private localState: Omit<OtherPlayer, 'id'> = {
     x: 0, z: 0, heading: 0, speed: 0,
@@ -126,6 +137,10 @@ export class MultiplayerService {
     } else if (msg.type === 'wave_state') {
       // Server-authoritative weather: sync all clients to the same sea state.
       this.weatherService.receiveServerState(msg.windBearing, msg.windSpeed);
+
+    } else if (msg.type === 'cannon_shot') {
+      if (msg.id === this.myId) return;   // ignore our own echo
+      this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
     }
   }
 

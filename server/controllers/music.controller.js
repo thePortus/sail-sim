@@ -3,7 +3,7 @@
 const path = require('path');
 const fs   = require('fs');
 
-const ASSETS_DIR = path.join(__dirname, '..', 'assets');
+const ASSETS_DIR = path.join(__dirname, '..', 'assets', 'music');
 
 /** Derive a human-friendly title from a filename like "drunken_sailor.mid" → "Drunken Sailor" */
 function titleFromFilename(filename) {
@@ -14,7 +14,7 @@ function titleFromFilename(filename) {
 }
 
 // ── GET /music ────────────────────────────────────────────────────────────────
-// Returns [{filename, name, url}, …] for every .mid file in assets/
+// Returns [{filename, name, url}, …] for every .mid file in assets/music/
 
 exports.listTracks = (req, res) => {
   let files;

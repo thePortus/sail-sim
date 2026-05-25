@@ -75,6 +75,9 @@ export class VesselService {
     this.recoilRemaining = this.RECOIL_DUR;
   }
 
+  /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
+  getRoot(): TransformNode { return this.root; }
+
   // ── Sheet (sail trim) ─────────────────────────────────────────────────────
   // sheetAngleDeg: degrees from the boat's centreline the boom swings out.
   //   5 = close-hauled (sail sheeted hard in)
@@ -107,7 +110,7 @@ export class VesselService {
   // The HUD displays physics speed (realistic knots), but world position advances
   // at TRAVEL_SCALE × that rate — a classic video-game map-compression trick.
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
-  private readonly TRAVEL_SCALE = 10.0;
+  private readonly TRAVEL_SCALE = 5.0;
 
   // ── Wake / hull-wash particle systems ────────────────────────────────────
   // Four ParticleSystems share one foam texture and use plain Vector3 emitters

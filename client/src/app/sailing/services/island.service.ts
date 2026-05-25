@@ -19,8 +19,16 @@ export class IslandService {
 
   islands = signal<Island[]>([]);
 
-  // Cached coastline polygons keyed by island id — built once during mesh creation
-  private polygonCache = new Map<string, { x: number; z: number }[]>();
+  // Cached coastline polygons keyed by island id — built once during mesh creation.
+  // polygonCache    — full-resolution polygon used for elevation / mesh generation.
+  // collisionCache  — shrunk polygon (80 % of coastline radii) used for vessel grounding.
+  //   The elevation formula already smooths terrain to zero between normalizedR 0.82→1.0,
+  //   so the polygon edge is the outer beach/waterline, not visible land.  Using 0.80
+  //   puts the collision boundary well inside the shoreline where the island clearly
+  //   pokes above water, preventing grounding in what looks like open sea.
+  private polygonCache   = new Map<string, { x: number; z: number }[]>();
+  private collisionCache = new Map<string, { x: number; z: number }[]>();
+  private readonly COLLISION_SHRINK = 0.80;
 
   async load(): Promise<void> {
     const data = await firstValueFrom(
@@ -38,7 +46,7 @@ export class IslandService {
 
   isOnLand(wx: number, wz: number): boolean {
     for (const island of this.islands()) {
-      const poly = this.polygonCache.get(island.id);
+      const poly = this.collisionCache.get(island.id);
       if (!poly) continue;
       if (this.pointInPolygon(wx, wz, poly)) return true;
     }
@@ -59,6 +67,27 @@ export class IslandService {
       if (d < bestDist) { bestDist = d; best = island; }
     }
     return { spawnX: best.spawnX, spawnZ: best.spawnZ };
+  }
+
+  // ── Public elevation / containment API (used by IslandBiomeService) ────────
+
+  /**
+   * Returns the terrain elevation (metres) at world position (wx, wz) for the
+   * given island.  Returns 0 if the point is outside the island's polygon.
+   * The polygon must have been built already (call after load()).
+   */
+  getElevation(wx: number, wz: number, island: Island): number {
+    const polygon = this.polygonCache.get(island.id);
+    if (!polygon) return 0;
+    return this.computeElevation(wx, wz, island, polygon);
+  }
+
+  /**
+   * Returns true if (wx, wz) is inside the island's coastline polygon.
+   */
+  isInsideIsland(wx: number, wz: number, island: Island): boolean {
+    const poly = this.polygonCache.get(island.id);
+    return poly ? this.pointInPolygon(wx, wz, poly) : false;
   }
 
   // ── Coastline helpers ──────────────────────────────────────────────────────
@@ -83,6 +112,22 @@ export class IslandService {
     for (let i = 0; i < N; i++) {
       const angleDeg = (i / N) * 360;
       const r = this.interpolateRadius(angleDeg, island.coastline);
+      const rad = angleDeg * Math.PI / 180;
+      pts.push({
+        x: island.centerX + Math.sin(rad) * r,
+        z: island.centerZ + Math.cos(rad) * r,
+      });
+    }
+    return pts;
+  }
+
+  /** Collision polygon — same shape as the coastline but scaled inward by COLLISION_SHRINK. */
+  private buildCollisionPolygon(island: Island): { x: number; z: number }[] {
+    const pts: { x: number; z: number }[] = [];
+    const N = 64;
+    for (let i = 0; i < N; i++) {
+      const angleDeg = (i / N) * 360;
+      const r = this.interpolateRadius(angleDeg, island.coastline) * this.COLLISION_SHRINK;
       const rad = angleDeg * Math.PI / 180;
       pts.push({
         x: island.centerX + Math.sin(rad) * r,
@@ -200,7 +245,10 @@ export class IslandService {
   private buildIslandMesh(island: Island): void {
     const { scene } = this.sceneService;
     const polygon   = this.buildCoastlinePolygon(island);
-    this.polygonCache.set(island.id, polygon);   // cache for collision checks
+    this.polygonCache.set(island.id, polygon);
+
+    const collisionPoly = this.buildCollisionPolygon(island);
+    this.collisionCache.set(island.id, collisionPoly);
 
     const gridRes  = island.maxRadius > 3000 ? 80 : island.maxRadius > 1000 ? 56 : 36;
     const worldSize = island.maxRadius * 2.3;
@@ -224,7 +272,26 @@ export class IslandService {
       const wx = island.centerX + localX;
       const wz = island.centerZ + localZ;
       const elevation = this.computeElevation(wx, wz, island, polygon);
-      positions[i * 3 + 1] = elevation;
+
+      // ── Underwater skirt for reflection gap fix ──────────────────────────
+      // Vertices outside the island polygon are placed below y = 0 so the
+      // MirrorTexture has geometry to reflect right at the shoreline.
+      // The slope is intentionally very steep (reaches -2.5 within just 20 m)
+      // so the island has near-vertical underwater cliffs rather than a broad
+      // shallow shelf that would be visible through the water surface and make
+      // the island appear larger than it is for collision purposes.
+      let finalY = elevation;
+      if (elevation <= 0) {
+        const dx = wx - island.centerX;
+        const dz = wz - island.centerZ;
+        const distFromCenter = Math.sqrt(dx * dx + dz * dz);
+        const angleDeg = ((Math.atan2(dx, dz) * 180 / Math.PI) + 360) % 360;
+        const coastlineRadius = this.interpolateRadius(angleDeg, island.coastline);
+        const overshoot = Math.max(0, distFromCenter - coastlineRadius);
+        finalY = -2.5 * Math.min(1, overshoot / 20);   // steep cliff: 20 m to full depth
+      }
+
+      positions[i * 3 + 1] = finalY;
 
       const [r, g, b] = elevation > 0
         ? this.elevationColor(elevation, island.peakElevation)

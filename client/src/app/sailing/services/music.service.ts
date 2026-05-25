@@ -12,8 +12,8 @@ export interface TrackMeta {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const LS_KEY       = 'ignis_music_enabled';
-const LOOP_GAP_SEC = 1.5;   // silence between loop repetitions
+const LS_KEY        = 'ignis_music_enabled';
+const TRACK_GAP_SEC = 1.5;   // silence at end of a track before advancing to the next
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
@@ -35,8 +35,13 @@ export class MusicService {
   // ── Private state ──────────────────────────────────────────────────────────
   private apiUrl = '';
 
-  private synth!:  Tone.PolySynth;
+  // Shared reverb bus — all per-track synths connect to this.
   private reverb!: Tone.Reverb;
+
+  // One PolySynth per active MIDI track, created in startCurrentTrack() and
+  // disposed by stopPlayback(). Per-track synths keep voice pools separate so
+  // a dense bass line can never steal voices from the melody.
+  private trackSynths: Tone.PolySynth[] = [];
 
   /**
    * Parsed MIDI objects keyed by filename.
@@ -50,7 +55,7 @@ export class MusicService {
 
   /**
    * Call once after the user's first gesture (vessel selection click).
-   * Builds the synth chain, fetches the track list, preloads all MIDI files,
+   * Builds the reverb bus, fetches the track list, preloads all MIDI files,
    * and starts playback if the preference is enabled.
    */
   async init(apiUrl: string): Promise<void> {
@@ -58,19 +63,11 @@ export class MusicService {
     this.initialized = true;
     this.apiUrl = apiUrl;
 
-    // ── Build synth chain ──────────────────────────────────────────────────
+    // ── Build shared reverb bus ────────────────────────────────────────────
     // Reverb must be generated (async IR build) before connecting audio.
     this.reverb = new Tone.Reverb({ decay: 3.5, wet: 0.35 });
     await this.reverb.generate();    // ← REQUIRED: without this the IR buffer is empty
     this.reverb.toDestination();
-
-    this.synth = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: 'triangle' },
-      envelope:   { attack: 0.04, decay: 0.1, sustain: 0.7, release: 1.2 },
-      volume:     -14,
-    }).connect(this.reverb);
-    // Raise polyphony ceiling so dense MIDI tracks don't drop notes
-    this.synth.maxPolyphony = 32;
 
     // ── Fetch track list ───────────────────────────────────────────────────
     try {
@@ -83,6 +80,9 @@ export class MusicService {
     }
 
     if (!this.trackList().length) return;
+
+    // Start on a random track so every session feels fresh
+    this.trackIndex.set(Math.floor(Math.random() * this.trackList().length));
 
     // ── Preload all MIDI files in the background ───────────────────────────
     // This fills midiCache so the first play (and every subsequent one) is
@@ -123,8 +123,7 @@ export class MusicService {
 
   /** Full teardown — call in GameComponent.teardown(). */
   dispose(): void {
-    this.stopPlayback();
-    this.synth?.dispose();
+    this.stopPlayback();   // disposes trackSynths
     this.reverb?.dispose();
     this.midiCache.clear();
     this.initialized = false;
@@ -141,11 +140,20 @@ export class MusicService {
     }
   }
 
-  /** Stop Transport, cancel all events, reset to position 0. */
+  /**
+   * Stop Transport, cancel all scheduled events, dispose per-track synths,
+   * and rewind to position 0.
+   */
   private stopPlayback(): void {
     Tone.Transport.stop();
     Tone.Transport.cancel();           // remove all scheduled events
     Tone.Transport.position = 0;       // rewind so next start begins at the top
+
+    // Dispose the synths that were created for the previous song.
+    // Each call to startCurrentTrack() creates a fresh set.
+    for (const s of this.trackSynths) s.dispose();
+    this.trackSynths = [];
+
     this.isPlaying.set(false);
   }
 
@@ -165,14 +173,113 @@ export class MusicService {
   }
 
   /**
-   * Schedule all notes from the current track onto the Transport timeline
+   * Build a PolySynth whose timbre is matched to a MIDI instrument family.
+   *
+   * General MIDI instrument families (from @tonejs/midi track.instrument.family):
+   *   "piano" | "chromatic percussion" | "organ" | "guitar" | "bass" |
+   *   "strings" | "ensemble" | "brass" | "reed" | "pipe" |
+   *   "synth lead" | "synth pad" | ...
+   *
+   * Each synth gets its own 32-voice pool so tracks never compete for voices.
+   * All synths connect to the shared reverb bus.
+   */
+  private makeSynthForTrack(track: { instrument: { family: string } }): Tone.PolySynth {
+    const family = (track.instrument?.family ?? '').toLowerCase();
+
+    // Defaults (melody / unknown)
+    let osc:     Tone.ToneOscillatorType = 'triangle';
+    let attack   = 0.04;
+    let decay    = 0.10;
+    let sustain  = 0.70;
+    let release  = 1.20;
+    let volume   = -14;
+
+    if (family.includes('bass')) {
+      // Deep, punchy low-end
+      osc     = 'sawtooth';
+      attack  = 0.02;
+      decay   = 0.15;
+      sustain = 0.60;
+      release = 0.80;
+      volume  = -11;
+    } else if (family.includes('brass') || family.includes('reed')) {
+      // Bright, slightly buzzy horn/woodwind
+      osc     = 'sawtooth';
+      attack  = 0.08;
+      decay   = 0.12;
+      sustain = 0.80;
+      release = 0.60;
+    } else if (family.includes('strings') || family.includes('ensemble')) {
+      // Slow bowed attack, long tail
+      osc     = 'triangle';
+      attack  = 0.14;
+      decay   = 0.20;
+      sustain = 0.75;
+      release = 2.00;
+      volume  = -15;
+    } else if (family.includes('organ')) {
+      // Immediate organ — no attack swell, sustained
+      osc     = 'square';
+      attack  = 0.01;
+      decay   = 0.05;
+      sustain = 0.90;
+      release = 0.25;
+    } else if (family.includes('guitar') || family.includes('plucked')) {
+      // Sharp pluck, fast decay
+      osc     = 'sawtooth';
+      attack  = 0.01;
+      decay   = 0.35;
+      sustain = 0.20;
+      release = 0.50;
+    } else if (family.includes('pipe')) {
+      // Flute-like — soft attack, steady tone
+      osc     = 'triangle';
+      attack  = 0.10;
+      decay   = 0.08;
+      sustain = 0.85;
+      release = 0.40;
+    } else if (family.includes('synth lead')) {
+      osc     = 'sawtooth';
+      attack  = 0.02;
+      release = 0.80;
+    } else if (family.includes('synth pad')) {
+      osc     = 'triangle';
+      attack  = 0.20;
+      decay   = 0.30;
+      sustain = 0.65;
+      release = 2.50;
+      volume  = -16;
+    } else if (family.includes('piano') || family.includes('chromatic')) {
+      // Piano-ish: fast attack, decaying sustain
+      osc     = 'triangle';
+      attack  = 0.01;
+      decay   = 0.30;
+      sustain = 0.45;
+      release = 1.00;
+    }
+
+    const synth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: osc },
+      envelope:   { attack, decay, sustain, release },
+      volume,
+    }).connect(this.reverb);
+
+    // 32 voices per track is plenty — the pools are now independent.
+    synth.maxPolyphony = 32;
+    return synth;
+  }
+
+  /**
+   * Schedule all notes from the current MIDI file onto the Transport timeline
    * and start playing.
    *
-   * Key correctness rule:
+   * Each MIDI track gets its own PolySynth so voice pools are independent.
+   * Percussion tracks (channel 10) are skipped — they have no pitched notes.
+   *
+   * Scheduling correctness:
    *   Tone.Transport.schedule(cb, time) expects `time` in Transport-seconds
    *   (i.e. seconds from the start of the piece), NOT AudioContext time.
-   *   note.time from @tonejs/midi is already in Transport-seconds, so we use
-   *   it directly — never add Tone.now() to it.
+   *   note.time from @tonejs/midi is already in Transport-seconds.
    */
   private async startCurrentTrack(): Promise<void> {
     const list = this.trackList();
@@ -191,12 +298,18 @@ export class MusicService {
       return;
     }
 
-    // ── Schedule every note at its Transport-relative time ─────────────────
+    // ── One synth per active MIDI track ───────────────────────────────────
     for (const track of midi.tracks) {
+      if (!track.notes.length) continue;            // empty / tempo / meta tracks
+      if (track.instrument?.percussion) continue;   // skip drums — no pitched notes
+
+      const synth = this.makeSynthForTrack(track);
+      this.trackSynths.push(synth);
+
+      // Capture synth reference for each closure (const in loop is safe)
       for (const note of track.notes) {
-        // `note.time` is seconds from piece start — exactly what Transport.schedule wants.
         Tone.Transport.schedule((audioTime) => {
-          this.synth.triggerAttackRelease(
+          synth.triggerAttackRelease(
             note.name,
             note.duration,
             audioTime,       // Web Audio API absolute time (supplied by Transport)
@@ -206,10 +319,15 @@ export class MusicService {
       }
     }
 
-    // ── Configure looping via Transport (avoids reschedule on every loop) ──
-    Tone.Transport.loop      = true;
-    Tone.Transport.loopStart = 0;
-    Tone.Transport.loopEnd   = midi.duration + LOOP_GAP_SEC;
+    // Don't loop — advance to the next track when this one ends.
+    Tone.Transport.loop = false;
+
+    // Schedule the auto-advance at Transport time = track end + gap.
+    // The callback runs inside the audio render quantum so we defer it
+    // via setTimeout to get back onto the normal JS task queue.
+    Tone.Transport.schedule(() => {
+      setTimeout(() => this.next());
+    }, midi.duration + TRACK_GAP_SEC);
 
     // Small ahead-of-time offset so the scheduling queue is settled
     // before the first note fires.

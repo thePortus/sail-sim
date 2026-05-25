@@ -16,8 +16,8 @@ import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
-import { CannonService }      from '../sailing/services/cannon.service';
-import { MusicService }       from '../sailing/services/music.service';
+import { CannonService }       from '../sailing/services/cannon.service';
+import { MusicService }        from '../sailing/services/music.service';
 import { AuthService }        from '../services/auth.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
@@ -70,10 +70,10 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-minimap />
         </div>
 
-        <!-- Cannon charge indicator — visible while Space is held -->
+        <!-- Cannon charge indicator — visible while right-click is held -->
         @if (cannonService.isCharging()) {
           <div class="cannon-charge-hud">
-            <div class="cannon-charge-label">⚫ CHARGING</div>
+            <div class="cannon-charge-label">⚫ {{ cannonService.activeSide() === 'port' ? 'PORT' : 'STBD' }} CANNON</div>
             <div class="cannon-charge-track">
               <div class="cannon-charge-fill"
                    [style.width.%]="cannonService.chargeLevel() * 100"
@@ -156,8 +156,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
   private multiplayerService = inject(MultiplayerService);
-  readonly cannonService     = inject(CannonService);    // public: template reads signals
-  readonly musicService      = inject(MusicService);    // public: PauseMenuComponent also injects it
+  readonly cannonService      = inject(CannonService);    // public: template reads signals
+  readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
   paused     = signal<boolean>(false);
@@ -246,10 +246,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     await this.oceanService.init();
     this.cloudService.init();
 
-    // 3. Load islands
+    // 3. Load islands + scatter biome vegetation
     this.loadingMsg.set('Raising the islands…');
     await this.islandService.load();
-
     // 4. Fetch vessel definition
     this.loadingMsg.set('Rigging your vessel…');
     const vessel = await firstValueFrom(

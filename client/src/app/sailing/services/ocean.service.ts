@@ -790,8 +790,14 @@ export class OceanService {
     }
   }
 
+  // O(1) dedup — island meshes arrive via both the onNewMeshAdded observable and
+  // explicit addToRenderList() calls; vegetation instances arrive only via the
+  // direct call.  The Set avoids O(n) Array.includes() on a potentially large list.
+  private renderListSet = new Set<AbstractMesh>();
+
   addToRenderList(mesh: AbstractMesh): void {
-    if (this.reflectionRTT?.renderList && !this.reflectionRTT.renderList.includes(mesh)) {
+    if (this.reflectionRTT?.renderList && !this.renderListSet.has(mesh)) {
+      this.renderListSet.add(mesh);
       this.reflectionRTT.renderList.push(mesh);
     }
   }

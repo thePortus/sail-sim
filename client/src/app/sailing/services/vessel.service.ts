@@ -2,7 +2,7 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh,
   TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  SceneLoader, Quaternion,
+  SceneLoader, Quaternion, DirectionalLight,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
@@ -63,6 +63,10 @@ export class VesselService {
   // ── Procedural running rigging (Option B) ─────────────────────────────────
   private rigLineMainsheet: Mesh | null = null;
   private rigLineVang:      Mesh | null = null;
+
+  // Water-contact shadow projected beneath the hull.
+  private waterShadow: Mesh | null = null;
+  private waterShadowMat: StandardMaterial | null = null;
 
   // ── Shared spar geometry constants (buildSails + rigging update) ──────────
   private readonly MAST_Z       = 1.5;
@@ -184,6 +188,9 @@ export class VesselService {
     // Build wake trail (world-space, not parented to root)
     this.buildWake(scene);
 
+    // Projected hull shadow on the water surface.
+    this.buildWaterShadow(scene);
+
     // Load GLB geometry parts (hull, mast, flag, sails, cannons)
     await this.buildGLBMeshes(scene);
 
@@ -293,6 +300,33 @@ export class VesselService {
     };
     this.rigLineMainsheet = mk('rig_mainsheet');
     this.rigLineVang      = mk('rig_vang');
+  }
+
+  private buildWaterShadow(scene: Scene): void {
+    const tex = new DynamicTexture('hullShadowTex', { width: 128, height: 128 }, scene, false);
+    tex.hasAlpha = true;
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    const grd = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grd.addColorStop(0.0, 'rgba(0,0,0,0.92)');
+    grd.addColorStop(0.45, 'rgba(0,0,0,0.55)');
+    grd.addColorStop(1.0, 'rgba(0,0,0,0.0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, 128, 128);
+    tex.update();
+
+    this.waterShadowMat = new StandardMaterial('hullShadowMat', scene);
+    this.waterShadowMat.diffuseTexture = tex;
+    this.waterShadowMat.opacityTexture = tex;
+    this.waterShadowMat.emissiveColor = new Color3(0, 0, 0);
+    this.waterShadowMat.disableLighting = true;
+    this.waterShadowMat.backFaceCulling = false;
+    this.waterShadowMat.alpha = 0.90;
+
+    this.waterShadow = MeshBuilder.CreateDisc('hullShadow', { radius: 16, tessellation: 32 }, scene);
+    this.waterShadow.material = this.waterShadowMat;
+    this.waterShadow.renderingGroupId = 2;
+    this.waterShadow.isPickable = false;
+    this.waterShadow.rotation.x = Math.PI / 2;
   }
 
   // Aligns a unit-height (+Y axis) cylinder between two root-local points.
@@ -629,6 +663,8 @@ export class VesselService {
     this.root.position.z = this.z;
     this.root.rotation.y = this.heading * Math.PI / 180;
 
+    this.updateWaterShadow();
+
     // ── Buoyancy: 8-point hull sampling + wave slope physics ──────────────────
     // VesselBuoyancyService samples OceanService.getVisualHeightAt() — a CPU
     // port of the GPU vertex shader's waveHeight() — so the physics height
@@ -733,6 +769,32 @@ export class VesselService {
         trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),
       });
     });
+  }
+
+  private updateWaterShadow(): void {
+    if (!this.waterShadow) return;
+
+    const sun = this.sceneService.scene.lights.find(l => l instanceof DirectionalLight && l.name === 'sun') as DirectionalLight | undefined;
+    if (!sun || sun.direction.y >= -0.01) {
+      this.waterShadow.setEnabled(false);
+      return;
+    }
+
+    const sunDir = sun.direction.negate().normalize();
+    const shadowDirX = -sunDir.x;
+    const shadowDirZ = -sunDir.z;
+    const stretch = 1.8 + Math.min(3.5, (1 - Math.max(0, sunDir.y)) * 4.5);
+    const offset = 1.5 + Math.min(10, (1 - Math.max(0, sunDir.y)) * 9.0);
+
+    this.waterShadow.setEnabled(true);
+    this.waterShadow.position.x = this.x + shadowDirX * offset;
+    this.waterShadow.position.z = this.z + shadowDirZ * offset;
+    this.waterShadow.position.y = 0.012;
+    this.waterShadow.scaling.x = stretch * 1.65;
+    this.waterShadow.scaling.y = 1.0;
+    this.waterShadow.scaling.z = stretch * 1.10;
+    this.waterShadow.rotation.y = Math.atan2(shadowDirX, shadowDirZ);
+    this.waterShadow.visibility = 0.22 + (1 - Math.max(0, sunDir.y)) * 0.50;
   }
 
   private updateCamera(): void {

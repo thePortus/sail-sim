@@ -201,6 +201,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       if (!w) return;
       this.oceanService.updateWeather(w.wind, w.sea);
       this.vesselService.updateWeather(w.wind, w.sea);
+      this.sceneService.updateSkyFromWeather(w);
       this.sceneService.updateFogDensity(w.fog.density);
       this.cloudService.updateWeather(w);
     });

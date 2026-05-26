@@ -39,6 +39,15 @@ export class WeatherService {
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
 
+  // Publish gating: we simulate every second, but only publish when coarse
+  // weather state changes enough to matter visually/gameplay-wise.
+  private lastPublishedKey = '';
+  private lastPublishedAtSec = -1_000_000;
+  private readonly MIN_PUBLISH_INTERVAL_SEC = 60;
+  private readonly PUB_WIND_SPEED_BUCKET = 1.0;      // m/s
+  private readonly PUB_WIND_DIR_BUCKET = 12.0;       // degrees
+  private readonly PUB_CLOUD_BUCKET = 0.08;          // 0..1
+
   // ── Admin override ────────────────────────────────────────────────────────
   private adminOverride = false;
 
@@ -51,7 +60,12 @@ export class WeatherService {
     this.targetSpeed      = this.windSpeed;
     this.targetCloudiness = this.cloudiness;
 
-    this.zone.run(() => this.weather.set(this.buildWeather()));
+    this.zone.run(() => {
+      const w = this.buildWeather();
+      this.weather.set(w);
+      this.lastPublishedKey = this.makePublishKey(w);
+      this.lastPublishedAtSec = this.timeSec;
+    });
 
     this.intervalId = setInterval(() => {
       this.zone.run(() => this.tick());
@@ -95,7 +109,7 @@ export class WeatherService {
     this.timeSec++;
 
     if (this.adminOverride) {
-      this.weather.set(this.buildWeather());
+      this.publishIfChanged(true);
       return;
     }
 
@@ -121,7 +135,30 @@ export class WeatherService {
       this.cloudiness + Math.sign(cloudDiff) * Math.min(Math.abs(cloudDiff), 0.012),
     ));
 
-    this.weather.set(this.buildWeather());
+    this.publishIfChanged();
+  }
+
+  private publishIfChanged(force = false): void {
+    const w = this.buildWeather();
+    const key = this.makePublishKey(w);
+
+    if (!force && (this.timeSec - this.lastPublishedAtSec) < this.MIN_PUBLISH_INTERVAL_SEC) {
+      return;
+    }
+
+    if (key === this.lastPublishedKey) return;
+    this.lastPublishedKey = key;
+    this.lastPublishedAtSec = this.timeSec;
+    this.weather.set(w);
+  }
+
+  private makePublishKey(w: Weather): string {
+    const speedB = Math.round(w.wind.speed / this.PUB_WIND_SPEED_BUCKET);
+    const dirDeg = ((w.wind.fromBearingDeg % 360) + 360) % 360;
+    const dirB = Math.round(dirDeg / this.PUB_WIND_DIR_BUCKET);
+    const cloudB = Math.round(w.cloudiness / this.PUB_CLOUD_BUCKET);
+    const precip = w.precipitation;
+    return `${speedB}|${dirB}|${cloudB}|${precip}`;
   }
 
   // ── Target selection ──────────────────────────────────────────────────────

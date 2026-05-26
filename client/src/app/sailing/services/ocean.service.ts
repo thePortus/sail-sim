@@ -1,10 +1,9 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  DirectionalLight, MirrorTexture, Plane,
+  DirectionalLight, MirrorTexture, Plane, RawTexture, Constants,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
-import { OceanFFTEngine } from './ocean-fft-engine.service';
 import { SeaConditions, Wind } from '../models';
 
 // ── Vertex shader ─────────────────────────────────────────────────────────────
@@ -405,7 +404,6 @@ function _getWaves(px0: number, py0: number, t: number, windSpeed: number, dragM
 @Injectable({ providedIn: 'root' })
 export class OceanService {
   private sceneService = inject(SceneService);
-  private fftEngine    = inject(OceanFFTEngine);
 
   private oceanMeshNear!: Mesh;          // ultra-close LOD centered on boat
   private oceanMesh0!:   Mesh;
@@ -420,6 +418,7 @@ export class OceanService {
   private wakeMat!:   ShaderMaterial;
 
   private reflectionRTT!: MirrorTexture;
+  private flatNormalTex: RawTexture | null = null;
 
   private elapsed    = 0;
   private boatX      = 0;
@@ -462,8 +461,6 @@ export class OceanService {
   // ── Init ──────────────────────────────────────────────────────────────────
 
   async init(): Promise<void> {
-    await this.fftEngine.init();
-
     const { scene } = this.sceneService;
     this.buildReflectionRTT(scene);
     this.buildLodFar(scene);
@@ -585,10 +582,9 @@ export class OceanService {
       },
     );
 
-    // When the FFT engine is inactive (WebGL fallback), cap cascade usage at 0
-    // so the fragment shader only samples the dummy 1×1 flat-normal texture once
-    // rather than three times.  Procedural vertex displacement still runs fine.
-    const effectiveCascade = this.fftEngine.isActive ? maxCascade : Math.min(maxCascade, 0);
+    // FFT normal blending is disabled for now; keep the ocean on the procedural
+    // wave path only and sample a static flat normal texture.
+    const effectiveCascade = 0;
     const waveDepth = maxCascade >= 2 ? this.WAVE_DEPTH_NEAR : maxCascade >= 1 ? this.WAVE_DEPTH_MID : this.WAVE_DEPTH_FAR;
     const iterationCount = maxCascade >= 2 ? 24 : maxCascade >= 1 ? 16 : 9;
     const normEpsilon = maxCascade >= 2 ? 0.010 : maxCascade >= 1 ? 0.018 : 0.032;
@@ -596,9 +592,9 @@ export class OceanService {
     mat.setFloat('u_DisplaceScale', displaceScale);
     mat.setFloat('u_MeshHalfSize',  meshHalfSize);
     mat.setFloat('u_MaxCascade',    effectiveCascade);
-    mat.setFloat('u_DomainC0', this.fftEngine.getDomain(0));
-    mat.setFloat('u_DomainC1', this.fftEngine.getDomain(1));
-    mat.setFloat('u_DomainC2', this.fftEngine.getDomain(2));
+    mat.setFloat('u_DomainC0', 1000);
+    mat.setFloat('u_DomainC1', 200);
+    mat.setFloat('u_DomainC2', 25);
 
     mat.setFloat('u_choppiness', 0.40);
     mat.setFloat('u_Beaufort',    1.0);
@@ -620,17 +616,28 @@ export class OceanService {
     mat.setVector2('u_WorldOffset',    new Vector2(0, 0));
 
     mat.setTexture('u_reflectionSampler', this.reflectionRTT);
-    this.uploadFFTTextures(mat);
+    this.uploadFlatNormalTextures(scene, mat);
 
     return mat;
   }
 
-  // ── Upload FFT normal textures ────────────────────────────────────────────
+  // ── Flat normal texture ──────────────────────────────────────────────────
 
-  private uploadFFTTextures(mat: ShaderMaterial): void {
-    mat.setTexture('u_norm0', this.fftEngine.getNormalsTex(0));
-    mat.setTexture('u_norm1', this.fftEngine.getNormalsTex(1));
-    mat.setTexture('u_norm2', this.fftEngine.getNormalsTex(2));
+  private uploadFlatNormalTextures(scene: Scene, mat: ShaderMaterial): void {
+    if (!this.flatNormalTex) {
+      this.flatNormalTex = new RawTexture(
+        new Float32Array([0, 0, 0, 1]),
+        1, 1,
+        Constants.TEXTUREFORMAT_RGBA,
+        scene,
+        false, false,
+        Constants.TEXTURE_NEAREST_SAMPLINGMODE,
+        Constants.TEXTURETYPE_FLOAT,
+      );
+    }
+    mat.setTexture('u_norm0', this.flatNormalTex);
+    mat.setTexture('u_norm1', this.flatNormalTex);
+    mat.setTexture('u_norm2', this.flatNormalTex);
   }
 
   // ── Kelvin wake plane ──────────────────────────────────────────────────────
@@ -665,8 +672,6 @@ export class OceanService {
       const dt = scene.getEngine().getDeltaTime() * 0.001;
       this.elapsed += dt;
 
-      this.fftEngine.tick(dt);
-
       const cam = scene.activeCamera;
       const t   = this.elapsed;
 
@@ -697,7 +702,7 @@ export class OceanService {
         this.oceanMatFar.setVector3('u_cameraPosition', camV);
       }
 
-      const beaufortV = this.fftEngine.beaufort;
+      const beaufortV = Math.max(0, Math.min(12, this.windSpeed * 0.75));
       const windDir   = new Vector2(this.windDirX, this.windDirZ);
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
 
@@ -729,14 +734,14 @@ export class OceanService {
       this.wakePlane.position.x = this.boatX - Math.sin(this.boatHdgR) * shift;
       this.wakePlane.position.z = this.boatZ - Math.cos(this.boatHdgR) * shift;
       this.wakePlane.rotation.y = this.boatHdgR;
-      this.wakePlane.position.y = this.fftEngine.getHeightAt(this.boatX, this.boatZ, t) + 0.12;
+      this.wakePlane.position.y = this.getVisualHeightAt(this.boatX, this.boatZ, t) + 0.12;
     });
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
   getWaveHeightAt(wx: number, wz: number, t: number): number {
-    return this.fftEngine.getHeightAt(wx, wz, t);
+    return this.getVisualHeightAt(wx, wz, t);
   }
 
   /**
@@ -765,8 +770,6 @@ export class OceanService {
   }
 
   updateWeather(wind: Wind, sea: SeaConditions): void {
-    this.fftEngine.updateWeather(wind, sea);
-
     this.windSpeed = wind.speed;
     const hdgRad   = wind.fromBearingDeg * Math.PI / 180;
     this.windDirX  = Math.sin(hdgRad);

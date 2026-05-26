@@ -7,6 +7,7 @@ import {
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
+import { Weather } from '../models';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -25,7 +26,6 @@ export class SceneService {
   private moonLight!: DirectionalLight;
   private ambient!:   HemisphericLight;
   private sunMesh!:   Mesh;
-  private moonMesh!:  Mesh;
   private glowLayer!: GlowLayer;
 
   // Shadow generator — attached to the sun DirectionalLight and exposed so that
@@ -37,18 +37,14 @@ export class SceneService {
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
 
-  // Sun glare occlusion: 0 = fully blocked by terrain, 1 = fully visible.
-  // Smoothly interpolated to avoid a hard pop when the sun crosses a ridgeline.
-  private sunOcclusionT = 1.0;
+  // Weather-driven cloudiness proxy used to shape SkyMaterial haze/brightness.
+  private skyCloudiness = 0.25;
+  private targetSkyCloudiness = 0.25;
 
-  // Occlusion ray-cast throttle.  At midday the upward ray misses island
-  // bounding boxes almost immediately.  At dawn/dusk the nearly-horizontal
-  // 50 km ray intersects EVERY island bounding box in the scene, which
-  // escalates to a full mesh triangle test for each one — millions of
-  // triangle-ray intersection tests per frame on the CPU.  Firing every 6th
-  // frame costs nothing perceptible because sunOcclusionT is lerped each frame.
-  private sunOcclusionFrame  = 0;
-  private lastSunOccluded    = false;
+  // Sun glare occlusion: 0 = fully blocked by terrain, 1 = fully visible.
+  private sunOcclusionT = 1.0;
+  private sunOcclusionFrame = 0;
+  private lastSunOccluded = false;
 
   // ── Post-processing setter cache ────────────────────────────────────────────
   // BabylonJS ImageProcessingConfiguration setters have NO equality guard:
@@ -66,12 +62,6 @@ export class SceneService {
   private _cachedExposure = 1.0;
   private _cachedContrast = 1.10;
   private _cachedBloomW   = 0.28;   // bloomWeight cache (setter fires per-call with no guard)
-
-  // sun / moon enabled-state cache — avoids calling setEnabled(true/false) on
-  // every single frame tick when the state hasn't changed.
-  // Initialised to true to match BabylonJS's default (all created meshes start enabled).
-  private _sunEnabled  = true;
-  private _moonEnabled = true;
 
   // 1 real second = 1 game minute → full day/night cycle every 24 real minutes.
   private gameHours = 10.5;
@@ -154,6 +144,8 @@ export class SceneService {
     const skybox = MeshBuilder.CreateBox('skybox', { size: 150000 }, this.scene);
     skybox.material         = this.skyMat;
     skybox.infiniteDistance = true;
+    skybox.renderingGroupId = 0;
+    skybox.isPickable       = false;
     this.skyMesh = skybox;
   }
 
@@ -190,37 +182,23 @@ export class SceneService {
     this.moonLight.intensity = 0;   // off during daytime — animated in tick
   }
 
-  // ── Sun / moon disks with glow ────────────────────────────────────────────────
-
   private buildCelestialBodies(): void {
     this.glowLayer = new GlowLayer('glow', this.scene, {
       mainTextureFixedSize: 512,
-      // 64 → internally halved to 32 taps per axis per pass, vs 128 → 64 taps.
-      // 2× cheaper blur with no perceptible quality loss on a soft glow effect.
       blurKernelSize: 64,
     });
 
-    // Sun — large emissive plane, always faces camera (billboard), glow-only mesh.
     const sunMat = new StandardMaterial('sunMat', this.scene);
     sunMat.disableLighting = true;
-    sunMat.emissiveColor   = new Color3(1, 0.95, 0.65);
+    sunMat.emissiveColor = new Color3(1.0, 0.95, 0.68);
+    sunMat.specularColor = Color3.Black();
 
     this.sunMesh = MeshBuilder.CreatePlane('sunDisk', { size: 2200 }, this.scene);
-    this.sunMesh.material      = sunMat;
+    this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    this.sunMesh.isPickable    = false;
+    this.sunMesh.isPickable = false;
+    this.sunMesh.renderingGroupId = 2;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
-
-    // Moon — smaller, cool silver-blue tone.
-    const moonMat = new StandardMaterial('moonMat', this.scene);
-    moonMat.disableLighting = true;
-    moonMat.emissiveColor   = new Color3(0.80, 0.85, 0.97);
-
-    this.moonMesh = MeshBuilder.CreatePlane('moonDisk', { size: 850 }, this.scene);
-    this.moonMesh.material      = moonMat;
-    this.moonMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    this.moonMesh.isPickable    = false;
-    this.glowLayer.addIncludedOnlyMesh(this.moonMesh);
   }
 
   // ── Camera ───────────────────────────────────────────────────────────────────
@@ -302,81 +280,11 @@ export class SceneService {
     if (this.scene) this.scene.fogDensity = density;
   }
 
-  // ── Time of day ──────────────────────────────────────────────────────────────
-
-  /**
-   * CPU ray-cast: is any island terrain mesh blocking the camera→sun ray?
-   *
-   * ── Why the original implementation was slow at dawn/dusk ───────────────
-   * scene.pickWithRay iterates every mesh, applies the predicate, then for
-   * every island that passes runs:
-   *   1. Bounding-box test  (O(1) per island)
-   *   2. Triangle intersection  (O(triangles) per island that passes #1)
-   *
-   * At midday the ray points steeply upward and misses all bounding boxes
-   * immediately — O(1) total cost.
-   *
-   * At dawn/dusk the ray is nearly horizontal at y ≈ 12 m, sweeping a 50 km
-   * corridor.  Every island bounding box intersects this ray, so ALL 100
-   * islands advance to triangle-testing: 100 × 5 000 tris × 100 ns ≈ 50 ms
-   * per cast.  Even throttled to 1-in-6 frames, a 50 ms spike every 6th
-   * frame causes severe visible jitter.
-   *
-   * ── Fix: three combined optimisations ──────────────────────────────────
-   *
-   * 1. Skip entirely when the sun is at or below h = 0.02 — the glow is too
-   *    dim and atmospheric for occlusion to be perceptible.
-   *
-   * 2. Adaptive ray length: no island beyond (800 m / sunDir.y) can physically
-   *    block the sun (800 m = tallest volcanic peak).  This shrinks the test
-   *    corridor from 50 km down to ~16 km at 3°, ~6 km at 7°, etc.
-   *
-   * 3. Bounding-info-only (O(1) per island) when the sun is below 12°.  At
-   *    those angles the ray is still nearly horizontal and triangle counts are
-   *    large.  The visual effect of occlusion is subtle enough near the horizon
-   *    that a conservative bounding-volume answer is indistinguishable.  Above
-   *    12° the ray is steep, very few bounding boxes are hit, and full triangle
-   *    accuracy is cheap.
-   *
-   * Result: dawn/dusk cost drops from ~50 ms/cast to < 0.2 ms/cast.
-   */
-  private isSunOccluded(sunDir: Vector3): boolean {
-    if (!this.camera) return false;
-
-    // (1) Near-horizon skip.
-    if (sunDir.y < 0.02) { this.lastSunOccluded = false; return false; }
-
-    // Throttle: run the actual test every 8th frame.
-    // sunOcclusionT lerp (0.50/frame) fully converges within 2-3 frames,
-    // so results stay visually smooth regardless of throttle interval.
-    this.sunOcclusionFrame = (this.sunOcclusionFrame + 1) % 8;
-    if (this.sunOcclusionFrame !== 0) return this.lastSunOccluded;
-
-    // (2) Adaptive ray length.
-    const rayLen = Math.min(25_000, 800 / sunDir.y);
-    const ray    = new Ray(this.camera.position, sunDir, rayLen);
-    const rl2    = rayLen * rayLen;
-    const cx     = this.camera.position.x;
-    const cz     = this.camera.position.z;
-
-    // (3) Bounding-info-only at low sun angles; full triangles when steep.
-    const onlyBB = sunDir.y < 0.12;
-
-    for (const mesh of this.scene.meshes) {
-      if (!mesh.isPickable || !mesh.name.startsWith('island_')) continue;
-      // Distance pre-filter: skip islands outside the adaptive ray range.
-      const dx = mesh.position.x - cx;
-      const dz = mesh.position.z - cz;
-      if (dx * dx + dz * dz > rl2) continue;
-      if (ray.intersectsMesh(mesh, false, undefined, onlyBB).hit) {
-        this.lastSunOccluded = true;
-        return true;
-      }
-    }
-
-    this.lastSunOccluded = false;
-    return false;
+  updateSkyFromWeather(weather: Weather): void {
+    this.targetSkyCloudiness = Math.max(0, Math.min(1, weather.cloudiness));
   }
+
+  // ── Time of day ──────────────────────────────────────────────────────────────
 
   // Returns a unit vector pointing FROM the scene origin TOWARD the sun.
   private computeSunDir(): Vector3 {
@@ -402,79 +310,52 @@ export class SceneService {
     const horizon = Math.max(0, 1 - Math.abs(h) / 0.22);
 
     // ── SkyMaterial ───────────────────────────────────────────────────────────
+    this.skyCloudiness += (this.targetSkyCloudiness - this.skyCloudiness) * Math.min(1, dt * 0.35);
+    const cloud = this.skyCloudiness;
+
     // inclination: 0 = at horizon, 0.45 ≈ high noon, negative = below horizon.
-    this.skyMat.inclination     = h * 0.45;
-    this.skyMat.azimuth         = (this.gameHours / 24 * 0.5 + 0.1) % 1;
-    // Dense atmospheric haze near the horizon for thick, glaring sunsets.
-    // Turbidity is capped at 10: the Preetham model's Mie scattering term has
-    // cos(zenithAngle) in a denominator that approaches 0 at the horizon, so
-    // with turbidity=18 the GPU shader can produce near-infinite or NaN luminance
-    // values, which propagate into the bloom and MirrorTexture passes and can
-    // cause GPU stalls or precision-mode switches on some hardware.
-    this.skyMat.turbidity       = 2.0 + horizon * 8.0;    // cap 10, was 2+horizon*16=18
-    this.skyMat.mieCoefficient  = 0.005 + horizon * 0.025; // cap 0.030, was 0.050
-    this.skyMat.mieDirectionalG = 0.97 - horizon * 0.08;
+    this.skyMat.inclination = h * 0.45;
+    this.skyMat.azimuth = (this.gameHours / 24 * 0.5 + 0.1) % 1;
 
-    // ── Celestial disk positions ───────────────────────────────────────────────
-    // Place them at a large distance from the camera so they never clip.
+    // Blend time-of-day haze with weather cloudiness to emulate overcast skies.
+    this.skyMat.turbidity = Math.min(10, 2.0 + horizon * 4.0 + cloud * 4.0);
+    this.skyMat.mieCoefficient = Math.min(0.03, 0.005 + horizon * 0.01 + cloud * 0.02);
+    this.skyMat.mieDirectionalG = 0.97 - horizon * 0.07;
+    this.skyMat.rayleigh = Math.max(0.5, 2.2 - cloud * 1.2);
+    this.skyMat.luminance = Math.max(0.35, 1.0 - cloud * 0.35);
+
     if (this.camera) {
-      const base = this.camera.position;
-      this.sunMesh.position  = base.add(dir.scale(65000));
-      this.moonMesh.position = base.add(dir.negate().scale(65000));
+      const sunPos = this.camera.position.add(dir.scale(65000));
+      this.sunMesh.position.copyFrom(sunPos);
+
+      const sunShouldBeOn = h > -0.06;
+      let occT = 1.0;
+      if (sunShouldBeOn) {
+        const blocked = this.isSunOccluded(dir);
+        const target = blocked ? 0.0 : 1.0;
+        this.sunOcclusionT += (target - this.sunOcclusionT) * 0.50;
+      } else {
+        this.sunOcclusionT = 1.0;
+      }
+      occT = this.sunOcclusionT;
+
+      this.sunMesh.scaling.setAll((1.0 + Math.max(0, 0.88 - above) * 3.0) * occT);
+      this.sunMesh.visibility = Math.max(0.0, above) * occT;
+
+      const sunMat = this.sunMesh.material as StandardMaterial;
+      sunMat.emissiveColor = new Color3(
+        1.0 * occT,
+        Math.min(1, 0.28 + above * 0.72) * occT,
+        Math.min(1, 0.10 + above * 0.82) * occT,
+      );
+      this.glowLayer.intensity = Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT);
     }
-
-    // Only call setEnabled when the state actually changes — calling it every
-    // frame on an already-enabled mesh can invalidate WebGPU render state.
-    const sunShouldBeOn  = h > -0.06;
-    const moonShouldBeOn = h < 0.14;
-    if (sunShouldBeOn  !== this._sunEnabled)  { this.sunMesh.setEnabled(sunShouldBeOn);   this._sunEnabled  = sunShouldBeOn; }
-    if (moonShouldBeOn !== this._moonEnabled) { this.moonMesh.setEnabled(moonShouldBeOn); this._moonEnabled = moonShouldBeOn; }
-
-    // ── Sun terrain occlusion ──────────────────────────────────────────────────
-    // The GlowLayer renders the sun mesh to a separate texture that has no depth
-    // context — the glow bleeds through volcanic mountains without this check.
-    // Ray-cast toward the sun once per frame; smoothly fade the occlusion factor
-    // so the glare disappears gracefully behind ridgelines rather than popping.
-    if (h > -0.06) {
-      const blocked   = this.isSunOccluded(dir);
-      const occTarget = blocked ? 0.0 : 1.0;
-      // 0.50 lerp factor: ~2-frame fade-in/out at 60 fps — fast enough to
-      // track a mountain edge without popping, slow enough to look smooth.
-      this.sunOcclusionT += (occTarget - this.sunOcclusionT) * 0.50;
-    } else {
-      this.sunOcclusionT = 1.0;  // below horizon — occlusion logic not needed
-    }
-    const occT = this.sunOcclusionT;
-
-    // Sun colour: deep crimson-scarlet at horizon → blazing white at zenith.
-    // Both emissiveColor and mesh visibility are driven by occT so (a) the glow
-    // layer loses its source mesh input and (b) depth-buffer precision failures
-    // at 65 km can't let the disc bleed through a mountain.
-    const sunMat = this.sunMesh.material as StandardMaterial;
-    sunMat.emissiveColor = new Color3(
-      1.0                                  * occT,
-      Math.min(1, 0.20 + above * 0.78)    * occT,   // deep amber-red at horizon
-      Math.min(1, 0.03 + above * 0.91)    * occT,   // nearly zero blue near horizon
-    );
-    this.sunMesh.visibility = occT;
-    // Atmospheric refraction: sun appears enlarged when close to the horizon.
-    const sunScale = 1.0 + Math.max(0, 0.88 - above) * 3.2;
-    this.sunMesh.scaling.setAll(sunScale);
-
-    // Glow: erupts dramatically at sunrise/sunset, steady midday, dim moonlit at night.
-    // Multiplied by occT so glare disappears when the sun is behind terrain.
-    // Cap at 1.5 — the original ~5.9 peak was visually extreme and added no
-    // perceptible quality beyond 2.0 while keeping the GPU glow composite busy.
-    const baseGlow = h > 0
-      ? 0.40 + horizon * 2.5 + above * 0.15   // peak ≈ 2.9 (was 5.9)
-      : 0.22;  // soft moonlit glow
-    this.glowLayer.intensity = Math.min(1.5, baseGlow * occT);
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
     if (this.pipeline) {
       // bloomWeight: throttle like exposure/contrast — the DefaultRenderingPipeline
       // setter chain fires internal observers on every write.
-      const newBloomW = 0.28 + horizon * 0.68;
+      const newBloomW = Math.max(0.12, 0.26 + horizon * 0.58 - cloud * 0.30);
       if (Math.abs(newBloomW - this._cachedBloomW) > this.PIPELINE_EPS) {
         this.pipeline.bloomWeight = newBloomW;
         this._cachedBloomW = newBloomW;
@@ -486,8 +367,8 @@ export class SceneService {
       // WebGPU bind-group recreation stall during dawn/dusk.  Only push a new
       // value when it has changed by more than PIPELINE_EPS (≈ every 0.5 s
       // real-time during the transition window, invisible at the rate the sky moves).
-      const newExposure = 1.0  + horizon * 0.48;
-      const newContrast = 1.10 + horizon * 0.14;
+      const newExposure = Math.max(0.85, 1.0 + horizon * 0.40 - cloud * 0.16);
+      const newContrast = Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
       if (Math.abs(newExposure - this._cachedExposure) > this.PIPELINE_EPS) {
         this.pipeline.imageProcessing.exposure = newExposure;
         this._cachedExposure = newExposure;
@@ -500,7 +381,7 @@ export class SceneService {
 
     // ── Directional (sun) light ────────────────────────────────────────────────
     this.sun.direction = dir.negate();
-    this.sun.intensity = above * 1.35;
+    this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
     this.sun.diffuse   = new Color3(
       1.0,
       Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
@@ -512,11 +393,11 @@ export class SceneService {
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.
     // Smooth transition: full moon feel with cool blue-white tones.
     this.moonLight.direction = dir;               // toward-sun = away-from-sun's direction
-    this.moonLight.intensity = Math.max(0, -h * 0.35);
+    this.moonLight.intensity = Math.max(0, -h * 0.35) * (1 - cloud * 0.40);
 
     // ── Hemisphere (ambient sky fill) ─────────────────────────────────────────
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
-    this.ambient.intensity = 0.10 + above * 0.38;
+    this.ambient.intensity = 0.10 + above * 0.38 + cloud * 0.06;
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
     const warmAmbient = new Color3(1.0, 0.68, 0.30);
@@ -540,8 +421,40 @@ export class SceneService {
       fog = new Color3(0.01, 0.02, 0.07);                                    // night
     }
 
+    fog = Color3.Lerp(fog, new Color3(0.60, 0.65, 0.72), cloud * 0.45);
+
     this.scene.fogColor   = fog;
-    this.scene.clearColor = new Color4(fog.r * 0.22, fog.g * 0.22, fog.b * 0.32, 1);
+    this.scene.clearColor = new Color4(fog.r * 0.20, fog.g * 0.20, fog.b * 0.30, 1);
+  }
+
+  /**
+   * CPU ray-cast: is any island terrain mesh blocking the camera→sun ray?
+   */
+  private isSunOccluded(sunDir: Vector3): boolean {
+    if (!this.camera) return false;
+
+    if (sunDir.y < 0.02) {
+      this.lastSunOccluded = false;
+      return false;
+    }
+
+    this.sunOcclusionFrame = (this.sunOcclusionFrame + 1) % 8;
+    if (this.sunOcclusionFrame !== 0) return this.lastSunOccluded;
+
+    const rayLen = Math.min(25_000, 800 / sunDir.y);
+    const ray = new Ray(this.camera.position, sunDir, rayLen);
+    const onlyBB = sunDir.y < 0.12;
+
+    for (const mesh of this.scene.meshes) {
+      if (!mesh.isEnabled() || !mesh.name.startsWith('island_')) continue;
+      if (ray.intersectsMesh(mesh, false, undefined, onlyBB).hit) {
+        this.lastSunOccluded = true;
+        return true;
+      }
+    }
+
+    this.lastSunOccluded = false;
+    return false;
   }
 
   // ── Render loop ───────────────────────────────────────────────────────────────

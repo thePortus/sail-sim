@@ -133,23 +133,78 @@ function attachMultiplayer(server) {
     ws.on('message', (raw) => {
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
-      if (msg.type !== 'update') return;
 
-      const state = {
-        x:          +msg.x          || 0,
-        z:          +msg.z          || 0,
-        heading:    +msg.heading    || 0,
-        speed:      +msg.speed      || 0,
-        sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
-        vesselName: String(msg.vesselName ?? '').slice(0, 64),
-        vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
-        callsign:   String(msg.callsign   ?? '').slice(0, 32),
-      };
-      players.get(id).state = state;
+      if (msg.type === 'update') {
+        const state = {
+          x:          +msg.x          || 0,
+          z:          +msg.z          || 0,
+          heading:    +msg.heading    || 0,
+          speed:      +msg.speed      || 0,
+          sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
+          vesselName: String(msg.vesselName ?? '').slice(0, 64),
+          vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
+          callsign:   String(msg.callsign   ?? '').slice(0, 32),
+        };
+        players.get(id).state = state;
 
-      const broadcast = JSON.stringify({ type: 'update', id, ...state });
-      for (const [pid, p] of players) {
-        if (pid !== id && p.ws.readyState === 1) p.ws.send(broadcast);
+        const broadcast = JSON.stringify({ type: 'update', id, ...state });
+        for (const [pid, p] of players) {
+          if (pid !== id && p.ws.readyState === 1) p.ws.send(broadcast);
+        }
+
+      } else if (msg.type === 'cannon_shot') {
+        const shot = JSON.stringify({
+          type: 'cannon_shot', id,
+          ox: +msg.ox || 0, oy: +msg.oy || 0, oz: +msg.oz || 0,
+          vx: +msg.vx || 0, vy: +msg.vy || 0, vz: +msg.vz || 0,
+        });
+        let forwarded = 0;
+        for (const [pid, p] of players) {
+          if (pid !== id && p.ws.readyState === 1) { p.ws.send(shot); forwarded++; }
+        }
+        console.log(`[WS] cannon_shot from ${id} forwarded to ${forwarded} player(s)`);
+
+      } else if (msg.type === 'chat') {
+        const text = String(msg.text ?? '').slice(0, 512).trim();
+        if (!text) return;
+
+        const senderCallsign = players.get(id)?.state?.callsign ?? 'Unknown';
+
+        if (text.startsWith('/t ')) {
+          // DM: /t <callsign> <message>
+          const rest = text.slice(3).trim();
+          const spaceIdx = rest.indexOf(' ');
+          if (spaceIdx === -1) return;
+          const targetCallsign = rest.slice(0, spaceIdx).trim();
+          const dmText         = rest.slice(spaceIdx + 1).trim();
+          if (!dmText || !targetCallsign) return;
+
+          const dmMsg = JSON.stringify({
+            type: 'chat', chatType: 'dm',
+            from: senderCallsign, to: targetCallsign, text: dmText,
+          });
+
+          // Deliver to target
+          for (const [, p] of players) {
+            if (p.state?.callsign === targetCallsign && p.ws.readyState === 1) {
+              p.ws.send(dmMsg);
+              break;
+            }
+          }
+          // Echo back to sender so they see it in their DM tab
+          const senderEntry = players.get(id);
+          if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg);
+
+        } else {
+          // Global broadcast
+          const globalMsg = JSON.stringify({
+            type: 'chat', chatType: 'global',
+            from: senderCallsign, text,
+          });
+          for (const [, p] of players) {
+            if (p.ws.readyState === 1) p.ws.send(globalMsg);
+          }
+        }
       }
     });
 

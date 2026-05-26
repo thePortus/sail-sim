@@ -46,19 +46,12 @@
         </div>
       </div>
 
-      <!-- Callsign -->
+      <!-- Callsign (permanent — set during registration) -->
       <div class="mb-6">
         <label class="text-xs font-mono text-slate-400 uppercase tracking-widest mb-2 block">
           Callsign
         </label>
-        <input
-          type="text"
-          class="callsign-input"
-          [value]="callsign()"
-          (input)="onCallsignInput($event)"
-          placeholder="Your name at sea…"
-          maxlength="16"
-        />
+        <div class="callsign-display">{{ callsign() }}</div>
       </div>
 
       <!-- Sailing tips -->

@@ -4,11 +4,12 @@ import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
 import { SceneService } from '../../services/scene.service';
 import { SailState } from '../../models';
+import { ChatComponent } from '../chat/chat.component';
 
 @Component({
   selector: 'app-hud',
   standalone: true,
-  imports: [CommonModule],
+  imports: [CommonModule, ChatComponent],
   templateUrl: './hud.component.html',
 })
 export class HudComponent {

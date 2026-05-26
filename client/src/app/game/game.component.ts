@@ -218,9 +218,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     // Scene initialises only after vessel selection (canvas not yet visible)
   }
 
-  async onVesselSelected(event: { slug: string; callsign: string }): Promise<void> {
+  async onVesselSelected(event: { slug: string }): Promise<void> {
     this.selectedSlug = event.slug;
-    this.callsign     = (event.callsign || 'Sailor').trim();
+    // Read the permanent callsign from stored credentials
+    try {
+      const raw = this.authService.getUserDetails();
+      this.callsign = raw ? (JSON.parse(raw)?.callsign || 'Sailor').trim() : 'Sailor';
+    } catch {
+      this.callsign = 'Sailor';
+    }
     this.phase.set('initializing');
 
     // ── 0. Verify the JWT is still accepted by this server instance ───────────

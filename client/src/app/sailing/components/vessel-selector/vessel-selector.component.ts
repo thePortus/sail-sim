@@ -1,7 +1,8 @@
-import { Component, OnInit, output, inject, signal } from '@angular/core';
+import { Component, OnInit, output, inject, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { Router } from '@angular/router';
+import { toSignal } from '@angular/core/rxjs-interop';
 import { VesselSummary } from '../../models';
 import { Settings } from '../../../app.settings';
 import { UserService } from '../../../services/user.service';
@@ -17,12 +18,16 @@ export class VesselSelectorComponent implements OnInit {
   private router      = inject(Router);
   private userService = inject(UserService);
 
-  vesselSelected = output<{ slug: string; callsign: string }>();
+  vesselSelected = output<{ slug: string }>();
 
   vessels  = signal<VesselSummary[]>([]);
   selected = signal<VesselSummary | null>(null);
-  callsign = signal('Sailor');
   loading  = signal(true);
+
+  private user = toSignal(this.userService.user$, {
+    initialValue: { username: '', callsign: '', role: '', token: '', loggedIn: false },
+  });
+  callsign = computed(() => this.user()?.callsign || 'Sailor');
 
   ngOnInit(): void {
     this.http.get<VesselSummary[]>(`${Settings.apiUrl}vessels`).subscribe({
@@ -39,13 +44,9 @@ export class VesselSelectorComponent implements OnInit {
     this.selected.set(v);
   }
 
-  onCallsignInput(e: Event): void {
-    this.callsign.set((e.target as HTMLInputElement).value.slice(0, 16) || 'Sailor');
-  }
-
   setSail(): void {
     const slug = this.selected()?.slug;
-    if (slug) this.vesselSelected.emit({ slug, callsign: this.callsign() });
+    if (slug) this.vesselSelected.emit({ slug });
   }
 
   logout(): void {

@@ -130,3 +130,12 @@ export interface OtherPlayer {
   vesselSlug:  string;
   callsign:    string;
 }
+
+export interface ChatMessage {
+  id:       string;
+  from:     string;
+  to?:      string;
+  text:     string;
+  timestamp: Date;
+  chatType: 'global' | 'dm';
+}

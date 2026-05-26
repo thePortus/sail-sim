@@ -90,6 +90,16 @@ export class CannonService {
   private smokeStbdEmit  = new Vector3(0, 0, 0);
   private smokeCutoffT   = -1;
 
+  // Remote shot effects — dedicated systems so they never conflict with local fire
+  private flashRemote!:       PointLight;
+  private flashRemoteEndT   = -1;
+  private remoteFlamePS!:    ParticleSystem;
+  private remoteSmokePS!:    ParticleSystem;
+  private remoteFlameEmit    = new Vector3(0, 0, 0);
+  private remoteSmokeEmit    = new Vector3(0, 0, 0);
+  private remoteFlameCutoffT = -1;
+  private remoteSmokeCutoffT = -1;
+
   // Impact particle systems
   private splashPS!:     ParticleSystem;
   private dirtPS!:       ParticleSystem;
@@ -139,7 +149,9 @@ export class CannonService {
 
     // Wire remote-shot callback (avoids circular injection with MultiplayerService)
     this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz) => {
+      console.log('[Cannon] fireRemoteEffect called', ox, oy, oz, vx, vy, vz);
       this.launchBall(ox, oy, oz, vx, vy, vz);
+      this.fireRemoteEffect(ox, oy, oz, vx, vz);
     };
 
     this.scene.registerBeforeRender(() => {
@@ -168,9 +180,10 @@ export class CannonService {
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
     this.flashStbd?.dispose();
+    this.flashRemote?.dispose();
     for (const ps of [
-      this.flamePortPS, this.flameStbdPS,
-      this.smokePortPS, this.smokeStbdPS,
+      this.flamePortPS, this.flameStbdPS, this.remoteFlamePS,
+      this.smokePortPS, this.smokeStbdPS, this.remoteSmokePS,
       this.splashPS, this.dirtPS,
     ]) { ps?.stop(); ps?.dispose(); }
     this.sfxCtx?.close().catch(() => {});
@@ -258,8 +271,9 @@ export class CannonService {
       l.range     = 10;
       return l;
     };
-    this.flashPort = make('cannonFlashPort');
-    this.flashStbd = make('cannonFlashStbd');
+    this.flashPort   = make('cannonFlashPort');
+    this.flashStbd   = make('cannonFlashStbd');
+    this.flashRemote = make('cannonFlashRemote');
   }
 
   // ── Muzzle blast (flame) particle systems ─────────────────────────────────
@@ -287,8 +301,9 @@ export class CannonService {
       ps.start();
       return ps;
     };
-    this.flamePortPS = makeFlame('flamePort', this.flamePortEmit);
-    this.flameStbdPS = makeFlame('flameStbd', this.flameStbdEmit);
+    this.flamePortPS  = makeFlame('flamePort',   this.flamePortEmit);
+    this.flameStbdPS  = makeFlame('flameStbd',   this.flameStbdEmit);
+    this.remoteFlamePS = makeFlame('flameRemote', this.remoteFlameEmit);
   }
 
   // ── Smoke particle systems ────────────────────────────────────────────────
@@ -316,8 +331,9 @@ export class CannonService {
       ps.start();
       return ps;
     };
-    this.smokePortPS = makeSmoke('smokePort', this.smokePortEmit);
-    this.smokeStbdPS = makeSmoke('smokeStbd', this.smokeStbdEmit);
+    this.smokePortPS  = makeSmoke('smokePort',   this.smokePortEmit);
+    this.smokeStbdPS  = makeSmoke('smokeStbd',   this.smokeStbdEmit);
+    this.remoteSmokePS = makeSmoke('smokeRemote', this.remoteSmokeEmit);
   }
 
   // ── Impact particle systems ───────────────────────────────────────────────
@@ -594,8 +610,9 @@ export class CannonService {
     }
 
     // ── Muzzle flash lights decay ─────────────────────────────────────────────
-    this.decayFlash(this.flashPort, this.flashPortEndT);
-    this.decayFlash(this.flashStbd, this.flashStbdEndT);
+    this.decayFlash(this.flashPort,   this.flashPortEndT);
+    this.decayFlash(this.flashStbd,   this.flashStbdEndT);
+    this.decayFlash(this.flashRemote, this.flashRemoteEndT);
 
     // ── Particle burst cutoffs ────────────────────────────────────────────────
     if (this.flameCutoffT > 0 && this.elapsed >= this.flameCutoffT) {
@@ -615,6 +632,14 @@ export class CannonService {
     if (this.dirtCutoffT > 0 && this.elapsed >= this.dirtCutoffT) {
       this.dirtPS.emitRate = 0;
       this.dirtCutoffT = -1;
+    }
+    if (this.remoteFlameCutoffT > 0 && this.elapsed >= this.remoteFlameCutoffT) {
+      this.remoteFlamePS.emitRate = 0;
+      this.remoteFlameCutoffT = -1;
+    }
+    if (this.remoteSmokeCutoffT > 0 && this.elapsed >= this.remoteSmokeCutoffT) {
+      this.remoteSmokePS.emitRate = 0;
+      this.remoteSmokeCutoffT = -1;
     }
   }
 
@@ -683,6 +708,44 @@ export class CannonService {
     this.playCannonSound();
   }
 
+  private fireRemoteEffect(
+    ox: number, oy: number, oz: number, vx: number, vz: number,
+  ): void {
+    const hLen = Math.sqrt(vx * vx + vz * vz);
+    if (hLen < 0.001) return;
+    const dx = vx / hLen;
+    const dz = vz / hLen;
+
+    // Muzzle flash
+    this.flashRemote.position.set(ox, oy, oz);
+    this.flashRemoteEndT = this.elapsed + 0.45;
+
+    // Flame particles directed along shot vector
+    const fSpread = 0.18;
+    this.remoteFlamePS.direction1.set(dx - fSpread, 0.06, dz - fSpread);
+    this.remoteFlamePS.direction2.set(dx + fSpread, 0.32, dz + fSpread);
+    this.remoteFlameEmit.set(ox, oy, oz);
+    this.remoteFlamePS.emitRate = 450;
+    this.remoteFlameCutoffT = this.elapsed + 0.18;
+
+    // Smoke particles
+    const sSpread = 0.40;
+    this.remoteSmokePS.direction1.set(dx - sSpread, 0.18, dz - sSpread);
+    this.remoteSmokePS.direction2.set(dx + sSpread, 1.10, dz + sSpread);
+    this.remoteSmokeEmit.set(ox, oy, oz);
+    this.remoteSmokePS.emitRate = 110;
+    this.remoteSmokeCutoffT = this.elapsed + 1.4;
+
+    // Recoil on the firing vessel
+    this.multiplayerService.applyRemoteRecoil(ox, oz);
+
+    // Distance-attenuated cannon sound
+    const vs     = this.vesselService.state();
+    const distSq = (ox - vs.x) ** 2 + (oz - vs.z) ** 2;
+    const vol    = Math.max(0, 1 - Math.sqrt(distSq) / 800);
+    if (vol > 0.01) this.playCannonSound(vol);
+  }
+
   launchBall(
     ox: number, oy: number, oz: number,
     vx: number, vy: number, vz: number,
@@ -697,7 +760,7 @@ export class CannonService {
 
   // ── Sound effects ─────────────────────────────────────────────────────────
 
-  private playCannonSound(): void {
+  private playCannonSound(vol = 1.0): void {
     const ctx = this.sfxCtx;
     if (!ctx) return;
     if (ctx.state === 'suspended') ctx.resume();
@@ -709,7 +772,7 @@ export class CannonService {
     const crack = ctx.createBufferSource(); crack.buffer = crackBuf;
     const crackHpf = ctx.createBiquadFilter(); crackHpf.type = 'highpass'; crackHpf.frequency.value = 1200;
     const crackGain = ctx.createGain();
-    crackGain.gain.setValueAtTime(1.4, t); crackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    crackGain.gain.setValueAtTime(1.4 * vol, t); crackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
     crack.connect(crackHpf); crackHpf.connect(crackGain); crackGain.connect(ctx.destination);
     crack.start(t); crack.stop(t + 0.13);
 
@@ -720,14 +783,14 @@ export class CannonService {
     const boomLpf = ctx.createBiquadFilter(); boomLpf.type = 'lowpass';
     boomLpf.frequency.setValueAtTime(600, t); boomLpf.frequency.exponentialRampToValueAtTime(55, t + 0.5);
     const boomGain = ctx.createGain();
-    boomGain.gain.setValueAtTime(1.1, t); boomGain.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
+    boomGain.gain.setValueAtTime(1.1 * vol, t); boomGain.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
     boom.connect(boomLpf); boomLpf.connect(boomGain); boomGain.connect(ctx.destination);
     boom.start(t); boom.stop(t + 1.2);
 
     const osc = ctx.createOscillator(); osc.type = 'sine';
     osc.frequency.setValueAtTime(72, t); osc.frequency.exponentialRampToValueAtTime(22, t + 0.55);
     const oscGain = ctx.createGain();
-    oscGain.gain.setValueAtTime(0.70, t); oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+    oscGain.gain.setValueAtTime(0.70 * vol, t); oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
     osc.connect(oscGain); oscGain.connect(ctx.destination);
     osc.start(t); osc.stop(t + 0.56);
   }

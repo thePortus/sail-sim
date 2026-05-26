@@ -745,7 +745,7 @@ export class VesselService {
     const elevRad = this.camElevation * Math.PI / 180;
 
     const targetX = this.x;
-    const targetY = 1.2;   // aim at cabin/lower-mast level — hull is now lower in the water
+    const targetY = 2.5;   // aim at lower-mast level
     const targetZ = this.z;
 
     const desiredX = targetX - Math.cos(elevRad) * Math.sin(azRad) * this.camDist;
@@ -783,7 +783,7 @@ export class VesselService {
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
             this.camAzimuth   += dx * 0.45;
-            this.camElevation  = Math.max(4, Math.min(85, this.camElevation - dy * 0.3));
+            this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3));
           }
           break;
         case PointerEventTypes.POINTERUP:
@@ -813,6 +813,8 @@ export class VesselService {
 
   private setupInput(): void {
     this.keyHandler = (e: KeyboardEvent) => {
+      if (document.activeElement instanceof HTMLInputElement ||
+          document.activeElement instanceof HTMLTextAreaElement) return;
       switch (e.code) {
         case 'ArrowLeft':  case 'KeyA': this.keys.left     = true; break;
         case 'ArrowRight': case 'KeyD': this.keys.right    = true; break;
@@ -832,6 +834,8 @@ export class VesselService {
       }
     };
     this.keyUpHandler = (e: KeyboardEvent) => {
+      if (document.activeElement instanceof HTMLInputElement ||
+          document.activeElement instanceof HTMLTextAreaElement) return;
       switch (e.code) {
         case 'ArrowLeft':  case 'KeyA': this.keys.left     = false; break;
         case 'ArrowRight': case 'KeyD': this.keys.right    = false; break;

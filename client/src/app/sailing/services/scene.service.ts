@@ -4,7 +4,7 @@ import {
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
-  SSAO2RenderingPipeline,
+  SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
 
@@ -240,12 +240,39 @@ export class SceneService {
     // FXAA smooths aliased edges on the ocean and cloud geometry.
     this.pipeline.fxaaEnabled = true;
 
-    // Image processing: subtle vignette and contrast lift.
-    this.pipeline.imageProcessingEnabled = true;
-    this.pipeline.imageProcessing.vignetteEnabled = true;
-    this.pipeline.imageProcessing.vignetteWeight  = 0.60;
-    this.pipeline.imageProcessing.contrast        = 1.10;
-    this.pipeline.imageProcessing.exposure        = 1.0;
+    // Sharpening — counteracts the softening from FXAA and SSAO's bilateral blur,
+    // keeping hull edges, rigging, and deck detail crisp.
+    this.pipeline.sharpenEnabled         = true;
+    this.pipeline.sharpen.edgeAmount     = 0.25;
+    this.pipeline.sharpen.colorAmount    = 1.0;
+
+    // Film grain — breaks up the uniform "CG plastic" look on flat surfaces
+    // (deck planks, sails, hull paint).  Animated so it reads as surface
+    // texture/life rather than static noise.
+    this.pipeline.grainEnabled       = true;
+    this.pipeline.grain.intensity    = 12;
+    this.pipeline.grain.animated     = true;
+
+    // Depth of field — keeps the player vessel sharp while softening the horizon
+    // and distant ships, mimicking a real camera lens.
+    // focusDistance is in millimetres internally (1000 mm ≈ 1 world unit here).
+    this.pipeline.depthOfFieldEnabled        = true;
+    this.pipeline.depthOfFieldBlurLevel      = DepthOfFieldEffectBlurLevel.Medium;
+    this.pipeline.depthOfField.fStop         = 2.8;    // aperture — lower = shallower DOF
+    this.pipeline.depthOfField.focalLength   = 85;     // mm — telephoto compresses depth nicely
+    this.pipeline.depthOfField.focusDistance = 8000;   // mm (~8 world units) — focused on ship
+    this.pipeline.depthOfField.lensSize      = 50;     // physical lens diameter in mm
+
+    // Image processing: ACES tone mapping + vignette + contrast.
+    // ACES remaps how bright highlights clip — prevents blown-out whites and
+    // gives a photographic, non-linear colour response (type 2 = ACES).
+    this.pipeline.imageProcessingEnabled                   = true;
+    this.pipeline.imageProcessing.toneMappingEnabled       = true;
+    this.pipeline.imageProcessing.toneMappingType          = 2;     // ACES filmic
+    this.pipeline.imageProcessing.vignetteEnabled          = true;
+    this.pipeline.imageProcessing.vignetteWeight           = 0.60;
+    this.pipeline.imageProcessing.contrast                 = 1.10;
+    this.pipeline.imageProcessing.exposure                 = 1.0;
   }
 
   getSkyMesh(): any { return this.skyMesh; }

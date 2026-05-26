@@ -42,7 +42,7 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 'password',
-        email: 'sample@gmail.com'
+        callsign: userId
       });
     userId = res.body.data.username;
   });

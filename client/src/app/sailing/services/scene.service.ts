@@ -3,7 +3,8 @@ import {
   WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
-  DefaultRenderingPipeline,
+  DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
+  SSAO2RenderingPipeline,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
 
@@ -23,6 +24,11 @@ export class SceneService {
   private sunMesh!:   Mesh;
   private moonMesh!:  Mesh;
   private glowLayer!: GlowLayer;
+
+  // Shadow generator — attached to the sun DirectionalLight and exposed so that
+  // VesselService, IslandService, CannonService, and MultiplayerService can
+  // register their meshes as casters / receivers.
+  shadowGenerator!: ShadowGenerator;
   private pipeline!: DefaultRenderingPipeline;
 
   // Public signal so the HUD can display the current game time.
@@ -138,6 +144,23 @@ export class SceneService {
     this.sun          = new DirectionalLight('sun', new Vector3(-0.4, -1, 0.6), this.scene);
     this.sun.position = new Vector3(8000, 12000, -4000);
 
+    // CascadedShadowGenerator splits the camera frustum into distance bands so
+    // nearby geometry gets crisp shadows without forcing a giant ortho frustum
+    // over the full 50 000-unit world.
+    //   Cascade 0 (~0–30 u)  : vessel hull, cannonballs — high resolution
+    //   Cascade 1 (~30–150 u): island self-shadowing, vessel-on-island
+    //   Cascade 2 (~150–400 u): distant terrain — low resolution
+    const csg = new CascadedShadowGenerator(1024, this.sun);
+    csg.numCascades        = 3;
+    csg.stabilizeCascades  = true;   // reduces shimmering as camera pans
+    csg.lambda             = 0.75;   // 0 = uniform splits, 1 = logarithmic
+    csg.shadowMaxZ         = 400;    // shadows discarded beyond 400 units
+    csg.bias               = 0.001;
+    csg.normalBias         = 0.02;
+    csg.darkness           = 0.05;   // 0 = fully opaque shadow, 1 = invisible
+    csg.transparencyShadow = true;   // sails/flag cloth casts transparent shadows
+    this.shadowGenerator   = csg;
+
     // Cool blue-white directional light simulating moonlight.
     // Direction is updated each frame (opposite the sun). Intensity peaks at midnight.
     this.moonLight         = new DirectionalLight('moonLight', new Vector3(0, -1, 0), this.scene);
@@ -200,6 +223,19 @@ export class SceneService {
     this.pipeline.bloomWeight    = 0.28;
     this.pipeline.bloomKernel    = 128;
     this.pipeline.bloomScale     = 0.5;
+
+    // SSAO — bakes contact shadows into corners and crevices of nearby geometry
+    // (mast base, under the boom, beneath deck railings, etc.).  maxZ = 100
+    // zeroes the AO term for any fragment beyond 100 world units from the camera,
+    // so distant islands and ocean are unaffected.  The 0.75 ratio renders the
+    // occlusion buffer at 75 % of screen resolution for a good quality/perf trade.
+    const ssao            = new SSAO2RenderingPipeline('ssao2', this.scene, 0.75, [this.camera]);
+    ssao.radius           = 2.0;   // world-space sample radius — tuned to ship-deck scale
+    ssao.totalStrength    = 1.8;   // amplification on the AO term (raise for darker corners)
+    ssao.base             = 0.0;   // 0 = fully dark in 100 %-occluded spots
+    ssao.samples          = 16;    // 16 gives clean results on modern GPUs
+    ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
+    ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
 
     // FXAA smooths aliased edges on the ocean and cloud geometry.
     this.pipeline.fxaaEnabled = true;
@@ -432,7 +468,7 @@ export class SceneService {
 
     // ── Hemisphere (ambient sky fill) ─────────────────────────────────────────
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
-    this.ambient.intensity = 0.14 + above * 0.54;
+    this.ambient.intensity = 0.10 + above * 0.38;
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
     const warmAmbient = new Color3(1.0, 0.68, 0.30);

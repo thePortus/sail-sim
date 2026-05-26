@@ -41,7 +41,7 @@ export class RegisterComponent implements OnInit {
   isUserLogin() {
     if (this._auth.getUserDetails() != null) {
       const d = JSON.parse(this._auth.getUserDetails()!);
-      this._user.login({ username: d.username, email: d.email, role: d.role, token: d.token });
+      this._user.login({ username: d.username, callsign: d.callsign, role: d.role, token: d.token });
     }
   }
 
@@ -68,7 +68,7 @@ export class RegisterComponent implements OnInit {
             this._auth.setDataInLocalStorage('token', loginRes.token);
             this._user.login({
               username: loginRes.username,
-              email:    loginRes.email,
+              callsign:    loginRes.callsign,
               role:     loginRes.role,
               token:    loginRes.token,
             });

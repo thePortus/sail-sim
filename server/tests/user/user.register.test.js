@@ -26,7 +26,7 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 'password',
-        email: 'sample2@gmail.com'
+        callsign: userId
       });
     expect(res.status).toEqual(200);
     expect(res.type).toEqual(expect.stringContaining('json'));
@@ -36,7 +36,7 @@ describe('User Endpoints', () => {
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         password: 'password',
-        email: 'sample2@gmail.com'
+        callsign: 'sample2@gmail.com'
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
@@ -47,14 +47,14 @@ describe('User Endpoints', () => {
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         username: userId,
-        email: 'sample2@gmail.com'
+        callsign: userId
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
     expect(res.body).toHaveProperty('message', ['Must contain a \'password\' field!']);
   });
 
-  it('POST /api/user/register should reject a request without a email', async () => {
+  it('POST /api/user/register should reject a request without a callsign', async () => {
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         username: userId,
@@ -62,43 +62,43 @@ describe('User Endpoints', () => {
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
-    expect(res.body).toHaveProperty('message', ['Must contain a \'email\' field!']);
+    expect(res.body).toHaveProperty('message', ['Must contain a \'callsign\' field!']);
   });
 
   it('POST /api/user/register should reject a request with a duplicate username', async () => {
     await requestWithSupertest.post('/api/user/register')
       .send({
         username: userId,
-        email: 'sample@gmail.com',
+        callsign: userId,
         password: 'password'
       });
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         username: userId,
-        email: 'sample2@gmail.com',
+        callsign: userId,
         password: 'password'
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
-    expect(res.body).toHaveProperty('message', ['Username or email already exists.']);
+    expect(res.body).toHaveProperty('message', ['Username or callsign already exists.']);
   });
 
-  it('POST /api/user/register should reject a request with a duplicate email', async () => {
+  it('POST /api/user/register should reject a request with a duplicate callsign', async () => {
     await requestWithSupertest.post('/api/user/register')
       .send({
         username: 'TestingUser',
-        email: 'sample@gmail.com',
+        callsign: 'sample@gmail.com',
         password: 'password'
       });
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         username: 'TestingUser2',
-        email: 'sample@gmail.com',
+        callsign: 'sample@gmail.com',
         password: 'password'
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
-    expect(res.body).toHaveProperty('message', ['Username or email already exists.']);
+    expect(res.body).toHaveProperty('message', ['Username or callsign already exists.']);
   });
 
   it('POST /api/user/register should reject a request with a non-string for username', async () => {
@@ -106,7 +106,7 @@ describe('User Endpoints', () => {
       .send({
         username: 1,
         password: 'password',
-        email: 'sample2@gmail.com'
+        callsign: 'sample2@gmail.com'
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
@@ -118,23 +118,23 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 1,
-        email: 'test@test.com'
+        callsign: 'test@test.com'
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
     expect(res.body).toHaveProperty('message', ['\'password\' must be of type \'string\'!']);
   });
 
-  it('POST /api/user/register should reject a request with a non-string for email', async () => {
+  it('POST /api/user/register should reject a request with a non-string for callsign', async () => {
     const res = await requestWithSupertest.post('/api/user/register')
       .send({
         username: userId,
         password: 'password',
-        email: 1
+        callsign: 1
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
-    expect(res.body).toHaveProperty('message', ['\'email\' must be of type \'string\'!']);
+    expect(res.body).toHaveProperty('message', ['\'callsign\' must be of type \'string\'!']);
   });
 
   it('POST /api/user/register should reject a request with a non-string for theme', async () => {
@@ -142,7 +142,7 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 'password',
-        email: 'sample2@gmail.com',
+        callsign: 'sample2@gmail.com',
         theme: 1
       });
     expect(res.status).toEqual(500);
@@ -155,7 +155,7 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 'password',
-        email: 'sample@gmail.com',
+        callsign: 'sample@gmail.com',
         role: 1
       });
     expect(res.status).toEqual(500);

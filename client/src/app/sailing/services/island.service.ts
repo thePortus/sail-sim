@@ -313,5 +313,10 @@ export class IslandService {
 
     // Add island to ocean render list for reflections
     this.oceanService.addToRenderList(mesh);
+
+    // Shadow: island terrain casts shadows (e.g., onto the ocean surface and
+    // visiting vessels) and receives shadows (vessel hull shadow on the beach).
+    this.sceneService.shadowGenerator?.addShadowCaster(mesh, true);
+    mesh.receiveShadows = true;
   }
 }

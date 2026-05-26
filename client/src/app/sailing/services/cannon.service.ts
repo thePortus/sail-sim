@@ -242,6 +242,7 @@ export class CannonService {
       m.renderingGroupId = 2;
       m.isPickable       = false;
       m.setEnabled(false);
+      this.sceneService.shadowGenerator?.addShadowCaster(m);
       this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false });
     }
   }

@@ -13,7 +13,7 @@ module.exports = {
       {
         username:  config.OWNER_USERNAME,
         password:  md5(config.OWNER_PASSWORD),
-        email:     config.OWNER_EMAIL,
+        callsign:     config.OWNER_USERNAME,
         role:      'Owner',
         createdAt: new Date(),
         updatedAt: new Date(),

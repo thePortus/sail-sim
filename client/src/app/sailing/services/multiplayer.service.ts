@@ -265,6 +265,16 @@ export class MultiplayerService {
 
     // Attach all to the entry so they can be disposed later
     entry.meshes.push(...meshes);
+
+    // Shadow: remote vessel hull/sails cast and receive shadows.
+    // Skip the last mesh (callsign billboard — disableLighting=true, would look wrong).
+    const sg = this.sceneService.shadowGenerator;
+    if (sg) {
+      for (const m of meshes.slice(0, -1)) {
+        sg.addShadowCaster(m, true);
+        m.receiveShadows = true;
+      }
+    }
   }
 
   // ── Per-part mesh creation (mirrors VesselService.createPart) ────────────

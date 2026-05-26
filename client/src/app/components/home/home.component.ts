@@ -32,7 +32,7 @@ export class HomeComponent implements OnInit {
       const details = JSON.parse(this._auth.getUserDetails()!);
       this._user.login({
         username: details.username,
-        email:    details.email,
+        callsign:    details.callsign,
         role:     details.role,
         token:    details.token,
       });

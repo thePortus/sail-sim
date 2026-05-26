@@ -42,7 +42,7 @@ describe('User Endpoints', () => {
       .send({
         username: userId,
         password: 'password',
-        email: 'sample@gmail.com'
+        callsign: 'sample@gmail.com'
       });
   });
 
@@ -51,11 +51,11 @@ describe('User Endpoints', () => {
       .set('Authorization', `${ownerToken}`);
   });
 
-  it('PUT /api/user/update/:username should update a user\'s email', async () => {
+  it('PUT /api/user/update/:username should update a user\'s callsign', async () => {
     const res = await requestWithSupertest.put(`/api/user/update/${userId}`)
       .set('Authorization', `${ownerToken}`)
       .send({
-        email: 'updated_sample@gmail.com'
+        callsign: 'updated_sample@gmail.com'
       });
     expect(res.status).toEqual(200);
     expect(res.type).toEqual(expect.stringContaining('json'));
@@ -116,15 +116,15 @@ describe('User Endpoints', () => {
     expect(res.body).toHaveProperty('message', ['\'password\' must be of type \'string\'!']);
   });
 
-  it('PUT /api/user/:username should reject a request with a non-string for email', async () => {
+  it('PUT /api/user/:username should reject a request with a non-string for callsign', async () => {
     const res = await requestWithSupertest.put(`/api/user/update/${userId}`)
       .set('Authorization', `${ownerToken}`)
       .send({
-        email: 1,
+        callsign: 1,
       });
     expect(res.status).toEqual(500);
     expect(res.type).toEqual(expect.stringContaining('json'));
-    expect(res.body).toHaveProperty('message', ['\'email\' must be of type \'string\'!']);
+    expect(res.body).toHaveProperty('message', ['\'callsign\' must be of type \'string\'!']);
   });
 
   it('PUT /api/user/:username should reject a request with a non-string for theme', async () => {
@@ -174,7 +174,7 @@ describe('User Endpoints', () => {
   it('PUT /api/user/:username should reject unauthorized request', async () => {
     const res = await requestWithSupertest.put(`/api/user/update/${userId}`)
       .send({
-        email: 'updated_sample@gmail.com'
+        callsign: 'updated_sample@gmail.com'
       });
     expect(res.status).toEqual(401);
     expect(res.type).toEqual(expect.stringContaining('json'));

@@ -3,7 +3,7 @@ import { BehaviorSubject } from 'rxjs';
 
 export interface User {
   username: string,
-  email: string,
+  callsign: string,
   role: string,
   token: string,
   loggedIn: boolean
@@ -16,7 +16,7 @@ export class UserService {
 
   private _user = new BehaviorSubject<User>({
     username: '',
-    email: '',
+    callsign: '',
     role: '',
     token: '',
     loggedIn: false
@@ -24,7 +24,7 @@ export class UserService {
   readonly user$ = this._user.asObservable();
   private user = {
     username: '',
-    email: '',
+    callsign: '',
     role: '',
     token: '',
     loggedIn: false
@@ -38,7 +38,7 @@ export class UserService {
    */
   login(userDetails: any) {
     this.user.username = userDetails.username;
-    this.user.email = userDetails.email;
+    this.user.callsign = userDetails.callsign;
     this.user.role = userDetails.role;
     this.user.token = userDetails.token;
     this.user.loggedIn = true;
@@ -54,7 +54,7 @@ export class UserService {
    */
   logout() {
     this.user.username = '';
-    this.user.email = '';
+    this.user.callsign = '';
     this.user.role = '';
     this.user.token = '';
     this.user.loggedIn = false;

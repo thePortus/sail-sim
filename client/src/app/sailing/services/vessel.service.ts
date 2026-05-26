@@ -193,6 +193,16 @@ export class VesselService {
     for (const mesh of this.root.getChildMeshes()) {
       this.oceanService.addToRenderList(mesh);
     }
+
+    // Shadow: all vessel child meshes cast shadows (hull onto water, sails onto
+    // deck) and receive shadows (island shadow falling on the hull/deck).
+    const sg = this.sceneService.shadowGenerator;
+    if (sg) {
+      for (const mesh of this.root.getChildMeshes()) {
+        sg.addShadowCaster(mesh, true);
+        mesh.receiveShadows = true;
+      }
+    }
   }
 
   // ── GLB geometry loading ──────────────────────────────────────────────────
@@ -240,9 +250,11 @@ export class VesselService {
     // Flag — pivot at masthead; rotation.y driven each frame in physicsStep
     this.flagPivot          = new TransformNode('flag_pivot', scene);
     this.flagPivot.parent   = this.root;
-    // GLB geometry is in vessel-relative space (same convention as sloop-hull.glb),
-    // so the pivot lives at the vessel origin — no masthead offset needed here.
-    this.flagPivot.position = Vector3.Zero();
+    // Pivot at (0, 0, MAST_Z): the Y-rotation axis passes through the mast so
+    // the flag sweeps cleanly around the flagstaff as wind direction changes.
+    // GLB geometry is in vessel-relative space, so Y=0 is correct — the mesh's
+    // own Y position (≈15) places it at the masthead.
+    this.flagPivot.position = new Vector3(0, 0, this.MAST_Z);
     await loadGLB('sloop-flag.glb', this.flagPivot);
 
     // Cannons — root node renamed so CannonService.setupCannonPivots() can find them

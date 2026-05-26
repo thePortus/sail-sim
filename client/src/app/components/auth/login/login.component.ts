@@ -43,7 +43,7 @@ export class LoginComponent implements OnInit {
         this._auth.setDataInLocalStorage('token', res.token);
         this._user.login({
           username: res.username,
-          email:    res.email,
+          callsign:    res.callsign,
           role:     res.role,
           token:    res.token,
         });
@@ -65,7 +65,7 @@ export class LoginComponent implements OnInit {
   isUserLogin() {
     if (this._auth.getUserDetails() != null) {
       const d = JSON.parse(this._auth.getUserDetails()!);
-      this._user.login({ username: d.username, email: d.email, role: d.role, token: d.token });
+      this._user.login({ username: d.username, callsign: d.callsign, role: d.role, token: d.token });
     }
   }
 

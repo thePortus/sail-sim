@@ -53,7 +53,7 @@ export class NavMenuComponent implements OnInit {
       const userDetails = JSON.parse(this._auth.getUserDetails()!);
       this._user.login({
         username: userDetails.username,
-        email: userDetails.email,
+        callsign: userDetails.callsign,
         role: userDetails.role,
         token: userDetails.token
       });

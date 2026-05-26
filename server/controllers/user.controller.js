@@ -14,21 +14,21 @@ exports.login = (req, res) => {
         return res.status(401).send({ message: 'Invalid password.' });
 
       const token = jwt.sign(
-        { data: { id: user.id, username: user.username, email: user.email, role: user.role } },
+        { data: { id: user.id, username: user.username, callsign: user.callsign, role: user.role } },
         config.JWT_SECRET,
         { expiresIn: '24h' }
       );
-      res.send({ id: user.id, username: user.username, email: user.email, role: user.role, token });
+      res.send({ id: user.id, username: user.username, callsign: user.callsign, role: user.role, token });
     })
     .catch(err => res.status(500).send({ message: err.message }));
 };
 
 exports.register = (req, res) => {
-  const { username, email, password } = req.body;
-  User.create({ username, email, password: md5(password), role: 'Viewer' })
+  const { username, callsign, password } = req.body;
+  User.create({ username, callsign, password: md5(password), role: 'Viewer' })
     .then(user => res.status(201).send({
       message: 'Registered successfully.',
-      user: { id: user.id, username: user.username, email: user.email }
+      user: { id: user.id, username: user.username, callsign: user.callsign }
     }))
     .catch(err => res.status(500).send({ message: err.message }));
 };
@@ -47,7 +47,7 @@ exports.findOne = (req, res) => {
 
 exports.update = (req, res) => {
   const updates = {};
-  if (req.body.email)    updates.email    = req.body.email;
+  if (req.body.callsign)    updates.callsign    = req.body.callsign;
   if (req.body.password) updates.password = md5(req.body.password);
   User.update(updates, { where: { username: req.params.username } })
     .then(() => res.send({ message: 'Updated successfully.' }))

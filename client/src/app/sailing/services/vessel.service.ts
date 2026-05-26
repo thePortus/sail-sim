@@ -84,14 +84,20 @@ export class VesselService {
   private torchSconceMats: StandardMaterial[]  = [];
 
   // ── Cannon recoil ────────────────────────────────────────────────────────
-  // addCannonRecoil() is called by CannonService on every broadside.
-  // A decaying sinusoidal impulse is added to the vessel's heave and pitch
-  // for RECOIL_DUR seconds, giving the "ship kicks back" feel.
-  private recoilRemaining = 0;
-  private readonly RECOIL_DUR = 1.8;   // seconds of oscillation
+  // Shot-triggered lateral roll impulse model (spring + damper):
+  //   shot applies angular-velocity impulse away from firing side,
+  //   then hull naturally returns with heavy naval damping.
+  private recoilRoll = 0;
+  private recoilRollVel = 0;
+  private readonly RECOIL_SPRING = 7.2;
+  private readonly RECOIL_DAMPING = 5.8;
+  private readonly RECOIL_IMPULSE = 0.46;   // rad/s
+  private readonly RECOIL_MAX_ROLL = 0.12;  // ~6.9° hard safety cap
 
-  addCannonRecoil(): void {
-    this.recoilRemaining = this.RECOIL_DUR;
+  addCannonRecoil(side: 'port' | 'stbd'): void {
+    // Port broadside should initially roll starboard (+Z roll), and vice versa.
+    const dir = side === 'port' ? 1 : -1;
+    this.recoilRollVel += dir * this.RECOIL_IMPULSE;
   }
 
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
@@ -324,9 +330,10 @@ export class VesselService {
 
     this.waterShadow = MeshBuilder.CreateDisc('hullShadow', { radius: 16, tessellation: 32 }, scene);
     this.waterShadow.material = this.waterShadowMat;
-    this.waterShadow.renderingGroupId = 2;
+    this.waterShadow.renderingGroupId = 3;
     this.waterShadow.isPickable = false;
     this.waterShadow.rotation.x = Math.PI / 2;
+    this.waterShadow.alwaysSelectAsActiveMesh = true;
   }
 
   // Aligns a unit-height (+Y axis) cylinder between two root-local points.
@@ -688,14 +695,15 @@ export class VesselService {
     // Negative = lower the vessel (increase draft visible below waterline).
     const FLOAT_DRAFT = -0.75;
 
-    // Cannon recoil: brief decaying heave + pitch oscillation after a broadside.
-    let recoilY = 0, recoilPitchR = 0;
-    if (this.recoilRemaining > 0) {
-      this.recoilRemaining = Math.max(0, this.recoilRemaining - dt);
-      const env  = this.recoilRemaining / this.RECOIL_DUR;          // 1 → 0
-      const osc  = Math.sin(env * this.RECOIL_DUR * Math.PI * 3.5); // ~3 oscillations
-      recoilY      = env * osc * 0.20;      // ±20 cm heave
-      recoilPitchR = env * osc * 0.038;     // ±2.2° fore-aft pitch
+    // Cannon recoil: damped lateral roll response driven only by fire impulses.
+    const recoilAcc = -this.RECOIL_SPRING * this.recoilRoll - this.RECOIL_DAMPING * this.recoilRollVel;
+    this.recoilRollVel += recoilAcc * dt;
+    this.recoilRoll += this.recoilRollVel * dt;
+    if (this.recoilRoll > this.RECOIL_MAX_ROLL) this.recoilRoll = this.RECOIL_MAX_ROLL;
+    if (this.recoilRoll < -this.RECOIL_MAX_ROLL) this.recoilRoll = -this.RECOIL_MAX_ROLL;
+    if (Math.abs(this.recoilRoll) < 0.0002 && Math.abs(this.recoilRollVel) < 0.0002) {
+      this.recoilRoll = 0;
+      this.recoilRollVel = 0;
     }
 
     // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess
@@ -704,11 +712,11 @@ export class VesselService {
     // hull from going dramatically underwater without launching it into the air.
     const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
     const heaveApplied = buoy.heave + floorLift * 0.15;
-    this.root.position.y = FLOAT_DRAFT + heaveApplied + recoilY;
+    this.root.position.y = FLOAT_DRAFT + heaveApplied;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
-    this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);
-    this.root.rotation.x = buoy.pitchRad + recoilPitchR;
+    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll;
+    this.root.rotation.x = buoy.pitchRad;
 
     // Sail rotation — driven by the player-controlled sheet angle.
     // Square rig: boom is forward (0°) when running downwind and sweeps toward
@@ -789,12 +797,12 @@ export class VesselService {
     this.waterShadow.setEnabled(true);
     this.waterShadow.position.x = this.x + shadowDirX * offset;
     this.waterShadow.position.z = this.z + shadowDirZ * offset;
-    this.waterShadow.position.y = 0.012;
+    this.waterShadow.position.y = this.oceanService.getWaveHeightAt(this.x, this.z, this.simTime) + 0.06;
     this.waterShadow.scaling.x = stretch * 1.65;
     this.waterShadow.scaling.y = 1.0;
     this.waterShadow.scaling.z = stretch * 1.10;
     this.waterShadow.rotation.y = Math.atan2(shadowDirX, shadowDirZ);
-    this.waterShadow.visibility = 0.22 + (1 - Math.max(0, sunDir.y)) * 0.50;
+    this.waterShadow.visibility = 0.34 + (1 - Math.max(0, sunDir.y)) * 0.48;
   }
 
   private updateCamera(): void {

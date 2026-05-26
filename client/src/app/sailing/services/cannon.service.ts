@@ -78,12 +78,6 @@ export class CannonService {
   private flashPortEndT = -1;
   private flashStbdEndT = -1;
 
-  // Explicit flash meshes for a visible muzzle burst.
-  private flashPortMesh!: Mesh;
-  private flashStbdMesh!: Mesh;
-  private flashRemoteMesh!: Mesh;
-  private flashMeshMat!: StandardMaterial;
-
   // Muzzle blast particle systems — direction baked at fire() time from heading
   private flamePortPS!:  ParticleSystem;
   private flameStbdPS!:  ParticleSystem;
@@ -272,26 +266,6 @@ export class CannonService {
   // ── Flash lights ──────────────────────────────────────────────────────────
 
   private buildFlashLights(): void {
-    this.flashMeshMat = new StandardMaterial('cannonFlashMat', this.scene);
-    this.flashMeshMat.disableLighting = true;
-    this.flashMeshMat.backFaceCulling = false;
-    this.flashMeshMat.emissiveColor = new Color3(1.0, 0.88, 0.35);
-    this.flashMeshMat.alpha = 0.95;
-
-    const makeMesh = (name: string) => {
-      const mesh = MeshBuilder.CreateDisc(name, { radius: 0.65, tessellation: 16 }, this.scene);
-      mesh.material = this.flashMeshMat;
-      mesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
-      mesh.renderingGroupId = 2;
-      mesh.isPickable = false;
-      mesh.setEnabled(false);
-      return mesh;
-    };
-
-    this.flashPortMesh = makeMesh('cannonFlashPortMesh');
-    this.flashStbdMesh = makeMesh('cannonFlashStbdMesh');
-    this.flashRemoteMesh = makeMesh('cannonFlashRemoteMesh');
-
     const make = (name: string) => {
       const l = new PointLight(name, Vector3.Zero(), this.scene);
       l.diffuse   = new Color3(1.0, 0.72, 0.22);
@@ -675,9 +649,6 @@ export class CannonService {
   private decayFlash(light: PointLight, endT: number): void {
     if (!light || endT < 0 || this.elapsed >= endT) {
       if (light) light.intensity = 0;
-      if (light === this.flashPort) this.flashPortMesh?.setEnabled(false);
-      if (light === this.flashStbd) this.flashStbdMesh?.setEnabled(false);
-      if (light === this.flashRemote) this.flashRemoteMesh?.setEnabled(false);
       return;
     }
     const env = (endT - this.elapsed) / 0.45;
@@ -721,11 +692,6 @@ export class CannonService {
     const sEmit   = isPort ? this.smokePortEmit : this.smokeStbdEmit;
 
     flash.position.set(mwx, mwy, mwz);
-    const flashMesh = isPort ? this.flashPortMesh : this.flashStbdMesh;
-    flashMesh.position.set(mwx, mwy, mwz);
-    flashMesh.scaling.setAll(1.0 + clamp * 1.2);
-    flashMesh.rotation.y = hRad;
-    flashMesh.setEnabled(true);
     if (isPort) this.flashPortEndT = this.elapsed + 0.45;
     else        this.flashStbdEndT = this.elapsed + 0.45;
 
@@ -741,7 +707,7 @@ export class CannonService {
     this.flameCutoffT = this.elapsed + 0.18;
     this.smokeCutoffT = this.elapsed + 1.4;
 
-    this.vesselService.addCannonRecoil();
+    this.vesselService.addCannonRecoil(isPort ? 'port' : 'stbd');
     this.playCannonSound();
   }
 
@@ -755,10 +721,6 @@ export class CannonService {
 
     // Muzzle flash
     this.flashRemote.position.set(ox, oy, oz);
-    this.flashRemoteMesh.position.set(ox, oy, oz);
-    this.flashRemoteMesh.scaling.setAll(1.15);
-    this.flashRemoteMesh.rotation.y = Math.atan2(dx, dz);
-    this.flashRemoteMesh.setEnabled(true);
     this.flashRemoteEndT = this.elapsed + 0.45;
 
     // Flame particles directed along shot vector

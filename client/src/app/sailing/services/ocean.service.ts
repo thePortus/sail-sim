@@ -1,57 +1,35 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  DirectionalLight, MirrorTexture, Plane, RawTexture, Constants,
+  MirrorTexture, Plane,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { SeaConditions, Wind } from '../models';
-
-// ── Vertex shader ─────────────────────────────────────────────────────────────
-//
-// Procedural wave displacement (Babylon NME model — simplified for WebGPU).
-//
-// Three-component model:
-//   1. 2D Voronoi F1 × 2  — organic swell crests drifting downwind
-//   2. 3-octave value-noise fBm — medium-frequency chop
-//   3. Directional sine swell   — primary long-wavelength swell
-//
-// Deliberately uses only:
-//   • smoothNoise() — 1 helper (_h), simple trilinear value noise
-//   • voronoi2D()   — 9-iteration 2D cellular noise
-// Avoids the full Simplex3D + 3D-Voronoi (27 iterations) that overwhelmed
-// Babylon's GLSL→WGSL transpiler.
-//
-// FFT normal textures are still sampled in the fragment shader for micro-detail.
 
 const OCEAN_VERT = `
 precision highp float;
 
 attribute vec3 position;
-attribute vec2 uv;
 
 uniform mat4 worldViewProjection;
 uniform mat4 world;
 
+uniform float u_Time;
 uniform vec2  u_WorldOffset;
 uniform float u_MeshHalfSize;
 uniform float u_DisplaceScale;
-uniform float u_DomainC0;
-uniform float u_DomainC1;
-uniform float u_DomainC2;
-uniform float u_Time;
-uniform vec2  u_Direction;
-uniform float u_WindSpeed;
 uniform float u_WaveDepth;
 uniform float u_WaveFreq;
-uniform float u_DragMult;
-uniform float u_Iterations;
+uniform vec2  u_BoatPos;
+uniform vec2  u_BoatDir;
+uniform float u_BoatSpeed;
 
 varying vec3  v_worldPos;
-varying float v_waveHeight;
-varying vec2  v_uv_c0;
-varying vec2  v_uv_c1;
-varying vec2  v_uv_c2;
 varying vec4  v_projPos;
+varying float v_wakeMask;
+
+#define DRAG_MULT 0.38
+#define ITERATIONS 24
 
 vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   float x = dot(direction, position) * frequency + timeshift;
@@ -60,7 +38,7 @@ vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   return vec2(wave, -dx);
 }
 
-float getwaves(vec2 position, float t) {
+float getwaves(vec2 position) {
   float wavePhaseShift = length(position) * 0.1;
   float iter = 0.0;
   float frequency = 1.0;
@@ -68,13 +46,11 @@ float getwaves(vec2 position, float t) {
   float weight = 1.0;
   float sum = 0.0;
   float sumW = 0.0;
-  float timeScale = 0.55 + max(u_WindSpeed, 1.0) * 0.045;
 
-  for (int i = 0; i < 24; i++) {
-    if (float(i) >= u_Iterations) break;
+  for (int i = 0; i < ITERATIONS; i++) {
     vec2 p = vec2(sin(iter), cos(iter));
-    vec2 res = wavedx(position, p, frequency, t * timeMultiplier * timeScale + wavePhaseShift);
-    position += p * res.y * weight * u_DragMult;
+    vec2 res = wavedx(position, p, frequency, u_Time * timeMultiplier + wavePhaseShift);
+    position += p * res.y * weight * DRAG_MULT;
     sum += res.x * weight;
     sumW += weight;
     weight = mix(weight, 0.0, 0.2);
@@ -83,6 +59,41 @@ float getwaves(vec2 position, float t) {
     iter += 1232.399963;
   }
   return sum / max(sumW, 1e-5);
+}
+
+float wakeDisplacement(vec2 worldPos) {
+  vec2 rel = worldPos - u_BoatPos;
+  float along = dot(rel, -u_BoatDir);
+  if (along <= 0.0) return 0.0;
+
+  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
+  float lateral = dot(rel, right);
+
+  float width = 4.8 + min(10.0, u_BoatSpeed * 0.42);
+  float depth = 0.36 + min(1.05, u_BoatSpeed * 0.060);
+  float build = 1.0 - exp(-along * 0.030);
+  float trail = exp(-along * 0.0082);
+
+  float trench = exp(-(lateral * lateral) / (width * width));
+  float shoulderOffset = abs(lateral) - width * 1.55;
+  float shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
+
+  float ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
+  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+}
+
+float wakeMask(vec2 worldPos) {
+  vec2 rel = worldPos - u_BoatPos;
+  float along = dot(rel, -u_BoatDir);
+  if (along <= 0.0) return 0.0;
+
+  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
+  float lateral = dot(rel, right);
+  float width = 12.0 + min(18.0, u_BoatSpeed * 1.10);
+  float spread = exp(-(lateral * lateral) / (width * width));
+  float trail = exp(-along * 0.0068);
+  float build = 1.0 - exp(-along * 0.026);
+  return clamp(spread * trail * build, 0.0, 1.0);
 }
 
 void main() {
@@ -97,76 +108,37 @@ void main() {
     d
   ));
 
-  // Per-cascade tiling UVs for FFT normal sampling in fragment shader.
-  float u0 = fract(wx / u_DomainC0);  float v0 = fract(wz / u_DomainC0);
-  float u1 = fract(wx / u_DomainC1);  float v1 = fract(wz / u_DomainC1);
-  float u2 = fract(wx / u_DomainC2);  float v2 = fract(wz / u_DomainC2);
-
   vec3  pos = position;
-  float h   = 0.0;
 
   if (fade > 0.001) {
-    vec2 wavePos = vec2(
-      wx * u_Direction.x + wz * u_Direction.y,
-      -wx * u_Direction.y + wz * u_Direction.x
-    ) * u_WaveFreq;
-    h      = (getwaves(wavePos, u_Time) - 0.5) * u_WaveDepth;
+    vec2 wavePos = vec2(wx, wz) * u_WaveFreq;
+    float h = (getwaves(wavePos) - 0.5) * u_WaveDepth;
+    h += wakeDisplacement(vec2(wx, wz));
     pos.y += h * fade;
   }
 
+  v_wakeMask  = wakeMask(vec2(wx, wz));
   v_worldPos   = (world * vec4(pos, 1.0)).xyz;
-  v_waveHeight = h;
-  v_uv_c0      = vec2(u0, v0);
-  v_uv_c1      = vec2(u1, v1);
-  v_uv_c2      = vec2(u2, v2);
   gl_Position  = worldViewProjection * vec4(pos, 1.0);
   v_projPos    = gl_Position;
 }
 `;
 
-// ── Fragment shader ───────────────────────────────────────────────────────────
-//
-// Lighting pipeline:
-//   1. FFT cascade normals  — micro-detail ripple from compute textures
-//   2. Macro normals        — dFdx/dFdy(v_waveHeight) matches actual geometry
-//   3. NME colour gradient  — trough navy → mid ocean blue → cyan crest
-//   4. Schlick Fresnel      — F0 = 0.020 (water n ≈ 1.33)
-//   5. SSS back-scatter     — teal glow through wave crests
-//   6. GGX specular         — tight lobe (r=0.028), properly BRDF-normalised
-//   7. RTT reflection       — screen-space mirror + analytical sky fallback
-//   8. Height-threshold foam + Beaufort whitecaps
-//   9. Horizon haze
-
 const OCEAN_FRAG = `
 precision highp float;
 
-uniform float     u_Time;
-uniform float     u_choppiness;
-uniform float     u_DisplaceScale;
-uniform float     u_Beaufort;
-uniform float     u_MaxCascade;
-uniform float     u_WindSpeed;
-uniform float     u_WaveDepth;
-uniform float     u_WaveFreq;
-uniform float     u_DragMult;
-uniform float     u_Iterations;
-uniform float     u_NormEpsilon;
-uniform vec3      u_cameraPosition;
-uniform vec3      u_sunDir;
-uniform vec3      u_sunColor;
-uniform vec3      u_skyColorA;
-uniform vec3      u_skyColorB;
-uniform sampler2D u_norm0;
-uniform sampler2D u_norm1;
-uniform sampler2D u_norm2;
+uniform vec3  u_cameraPosition;
+uniform float u_Time;
+uniform float u_WaveDepth;
+uniform float u_WaveFreq;
 uniform sampler2D u_reflectionSampler;
 
-varying vec3  v_worldPos;
-varying float v_waveHeight;
-varying vec2  v_uv_c0;
-varying vec2  v_uv_c1;
-varying vec2  v_uv_c2;
-varying vec4  v_projPos;
+varying vec3 v_worldPos;
+varying vec4 v_projPos;
+varying float v_wakeMask;
+
+#define DRAG_MULT 0.38
+#define ITERATIONS 24
 
 vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   float x = dot(direction, position) * frequency + timeshift;
@@ -175,7 +147,7 @@ vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   return vec2(wave, -dx);
 }
 
-float getwaves(vec2 position, float t) {
+float getwaves(vec2 position) {
   float wavePhaseShift = length(position) * 0.1;
   float iter = 0.0;
   float frequency = 1.0;
@@ -183,13 +155,11 @@ float getwaves(vec2 position, float t) {
   float weight = 1.0;
   float sum = 0.0;
   float sumW = 0.0;
-  float timeScale = 0.55 + max(u_WindSpeed, 1.0) * 0.045;
 
-  for (int i = 0; i < 24; i++) {
-    if (float(i) >= u_Iterations) break;
+  for (int i = 0; i < ITERATIONS; i++) {
     vec2 p = vec2(sin(iter), cos(iter));
-    vec2 res = wavedx(position, p, frequency, t * timeMultiplier * timeScale + wavePhaseShift);
-    position += p * res.y * weight * u_DragMult;
+    vec2 res = wavedx(position, p, frequency, u_Time * timeMultiplier + wavePhaseShift);
+    position += p * res.y * weight * DRAG_MULT;
     sum += res.x * weight;
     sumW += weight;
     weight = mix(weight, 0.0, 0.2);
@@ -200,16 +170,59 @@ float getwaves(vec2 position, float t) {
   return sum / max(sumW, 1e-5);
 }
 
-vec3 waveNormal(vec2 pos, float e, float depth, float t) {
+float wakeDisplacement(vec2 worldPos) {
+  vec2 rel = worldPos - u_BoatPos;
+  float along = dot(rel, -u_BoatDir);
+  if (along <= 0.0) return 0.0;
+
+  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
+  float lateral = dot(rel, right);
+
+  float width = 4.8 + min(10.0, u_BoatSpeed * 0.42);
+  float depth = 0.36 + min(1.05, u_BoatSpeed * 0.060);
+  float build = 1.0 - exp(-along * 0.030);
+  float trail = exp(-along * 0.0082);
+
+  float trench = exp(-(lateral * lateral) / (width * width));
+  float shoulderOffset = abs(lateral) - width * 1.55;
+  float shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
+  float ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
+
+  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+}
+
+float wakeMask(vec2 worldPos) {
+  vec2 rel = worldPos - u_BoatPos;
+  float along = dot(rel, -u_BoatDir);
+  if (along <= 0.0) return 0.0;
+
+  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
+  float lateral = dot(rel, right);
+  float width = 12.0 + min(18.0, u_BoatSpeed * 1.10);
+  float spread = exp(-(lateral * lateral) / (width * width));
+  float trail = exp(-along * 0.0068);
+  float build = 1.0 - exp(-along * 0.026);
+  return clamp(spread * trail * build, 0.0, 1.0);
+}
+
+float waveHeightWithWake(vec2 worldPos, float depth) {
+  return (getwaves(worldPos * u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos);
+}
+
+vec3 normal(vec2 worldPos, float e, float depth) {
   vec2 ex = vec2(e, 0.0);
-  float H = getwaves(pos, t) * depth;
-  vec3 a = vec3(pos.x, H, pos.y);
+  float H = waveHeightWithWake(worldPos, depth);
+  vec3 a = vec3(worldPos.x, H, worldPos.y);
   return normalize(
     cross(
-      a - vec3(pos.x - e, getwaves(pos - ex, t) * depth, pos.y),
-      a - vec3(pos.x, getwaves(pos + ex.yx, t) * depth, pos.y + e)
+      a - vec3(worldPos.x - e, waveHeightWithWake(worldPos - ex, depth), worldPos.y),
+      a - vec3(worldPos.x, waveHeightWithWake(worldPos + ex.yx, depth), worldPos.y + e)
     )
   );
+}
+
+vec3 getSunDirection() {
+  return normalize(vec3(-0.07735, 0.5 + sin(u_Time * 0.2 + 2.6) * 0.45, 0.57735));
 }
 
 vec3 extra_cheap_atmosphere(vec3 raydir, vec3 sundir) {
@@ -228,12 +241,11 @@ vec3 extra_cheap_atmosphere(vec3 raydir, vec3 sundir) {
 }
 
 vec3 getAtmosphere(vec3 dir) {
-  return extra_cheap_atmosphere(dir, normalize(u_sunDir)) * 0.5;
+  return extra_cheap_atmosphere(dir, getSunDirection()) * 0.5;
 }
 
-vec3 getSun(vec3 dir) {
-  float sunN = pow(max(0.0, dot(dir, normalize(u_sunDir))), 720.0) * 210.0;
-  return u_sunColor * sunN;
+float getSun(vec3 dir) {
+  return pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0;
 }
 
 vec3 aces_tonemap(vec3 color) {
@@ -254,68 +266,33 @@ vec3 aces_tonemap(vec3 color) {
 }
 
 void main() {
-  float t = u_Time;
-  float depth = u_WaveDepth * u_DisplaceScale;
-  float dist = length(v_worldPos - u_cameraPosition);
-  vec2 wavePos = vec2(
-    v_worldPos.x * u_Direction.x + v_worldPos.z * u_Direction.y,
-    -v_worldPos.x * u_Direction.y + v_worldPos.z * u_Direction.x
-  ) * u_WaveFreq;
+  float depth = u_WaveDepth;
+  vec2 worldXZ = v_worldPos.xz;
 
   vec3 ray = normalize(v_worldPos - u_cameraPosition);
-  vec3 N = waveNormal(wavePos, u_NormEpsilon, depth, t);
+  vec3 N = normal(worldXZ, 0.55, depth);
 
-  // Distance flattening mirrors the playground approach and helps avoid
-  // high-frequency shimmer on far LODs.
   N = mix(
     N,
     vec3(0.0, 1.0, 0.0),
-    0.8 * min(1.0, sqrt(dist * 0.01) * 1.1)
+    0.8 * min(1.0, sqrt(length(v_worldPos - u_cameraPosition) * 0.01) * 1.1)
   );
-
-  // Blend in FFT micro-normals so near-field ripple detail is preserved.
-  vec2 n0 = texture2D(u_norm0, v_uv_c0).xy;
-  vec3 fftN = normalize(vec3(n0.x, sqrt(max(0.0, 1.0 - dot(n0, n0))), n0.y));
-  if (u_MaxCascade >= 1.0) {
-    vec2 n1 = texture2D(u_norm1, v_uv_c1).xy;
-    vec3 f1 = normalize(vec3(n1.x, sqrt(max(0.0, 1.0 - dot(n1, n1))), n1.y));
-    fftN = normalize(fftN + f1 * (1.0 - smoothstep(900.0, 2200.0, dist)));
-  }
-  if (u_MaxCascade >= 2.0) {
-    vec2 n2 = texture2D(u_norm2, v_uv_c2).xy;
-    vec3 f2 = normalize(vec3(n2.x, sqrt(max(0.0, 1.0 - dot(n2, n2))), n2.y));
-    fftN = normalize(fftN + f2 * (1.0 - smoothstep(280.0, 700.0, dist)));
-  }
-  float fftBlend = clamp(0.15 + u_choppiness * 0.35, 0.0, 0.5);
-  N = normalize(mix(N, fftN, fftBlend));
 
   float fresnel = 0.04 + (1.0 - 0.04) * pow(1.0 - max(0.0, dot(-N, ray)), 5.0);
 
   vec3 R = normalize(reflect(ray, N));
   R.y = abs(R.y);
-  vec3 analyticRefl = getAtmosphere(R) + getSun(R);
-
+  vec3 reflectionAnalytic = getAtmosphere(R) + getSun(R);
   vec2 screenUV = (v_projPos.xy / v_projPos.w) * 0.5 + 0.5;
-  screenUV += N.xz * 0.022;
+  screenUV += N.xz * 0.020;
   screenUV = clamp(screenUV, 0.001, 0.999);
-  vec3 rttRefl = texture2D(u_reflectionSampler, screenUV).rgb;
-  vec3 reflection = mix(analyticRefl, rttRefl, 0.80);
-
-  // Mild body scattering keeps wave troughs from becoming pitch black.
-  float hNorm = clamp(v_waveHeight / max(u_WaveDepth, 0.001) + 0.5, 0.0, 1.0);
-  vec3 deepCol  = vec3(0.0293, 0.0698, 0.1717) * 0.24;
-  vec3 crestCol = vec3(0.08, 0.28, 0.38) * 0.35;
-  vec3 scattering = mix(deepCol, crestCol, hNorm);
-
-  float bftT = clamp((u_Beaufort - 4.0) / 6.0, 0.0, 1.0);
-  float foam = smoothstep(0.70, 1.0, hNorm) * (0.20 + bftT * bftT * 0.55);
-
+  vec3 reflectionRTT = texture2D(u_reflectionSampler, screenUV).rgb;
+  vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80);
+  float wakeT = max(v_wakeMask, wakeMask(worldXZ));
+  vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
   vec3 color = fresnel * reflection + scattering;
-  color = mix(color, vec3(0.93, 0.96, 0.99), foam * u_DisplaceScale);
-
-  float fogT = clamp((dist - 2600.0) / 9000.0, 0.0, 1.0);
-  vec3 fogColor = mix(u_skyColorA * 0.92, u_skyColorB * 1.06, 0.55);
-  color = mix(color, fogColor, fogT * fogT * 0.82);
+  float wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
+  color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
 
   gl_FragColor = vec4(aces_tonemap(color * 2.0), 1.0);
 }
@@ -369,11 +346,10 @@ function _wavedx(px: number, py: number, dx: number, dy: number, frequency: numb
 }
 
 /** CPU port of playground getwaves() — used by buoyancy parity path. */
-function _getWaves(px0: number, py0: number, t: number, windSpeed: number, dragMult: number, iterations: number): number {
+function _getWaves(px0: number, py0: number, t: number): number {
   let px = px0;
   let py = py0;
   const wavePhaseShift = Math.hypot(px, py) * 0.1;
-  const timeScale = 0.55 + Math.max(windSpeed, 1.0) * 0.045;
   let iter = 0.0;
   let frequency = 1.0;
   let timeMultiplier = 2.0;
@@ -381,13 +357,12 @@ function _getWaves(px0: number, py0: number, t: number, windSpeed: number, dragM
   let sum = 0.0;
   let sumW = 0.0;
 
-  const n = Math.max(1, Math.min(24, Math.floor(iterations)));
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < 24; i++) {
     const dx = Math.sin(iter);
     const dy = Math.cos(iter);
-    const [wave, negDx] = _wavedx(px, py, dx, dy, frequency, t * timeMultiplier * timeScale + wavePhaseShift);
-    px += dx * negDx * weight * dragMult;
-    py += dy * negDx * weight * dragMult;
+    const [wave, negDx] = _wavedx(px, py, dx, dy, frequency, t * timeMultiplier + wavePhaseShift);
+    px += dx * negDx * weight * 0.38;
+    py += dy * negDx * weight * 0.38;
     sum += wave * weight;
     sumW += weight;
     weight *= 0.8;
@@ -418,7 +393,6 @@ export class OceanService {
   private wakeMat!:   ShaderMaterial;
 
   private reflectionRTT!: MirrorTexture;
-  private flatNormalTex: RawTexture | null = null;
 
   private elapsed    = 0;
   private boatX      = 0;
@@ -426,10 +400,8 @@ export class OceanService {
   private boatHdgR   = 0;
   private boatSpeed  = 0;
 
-  // Wind state — updated by updateWeather(), used for per-frame uniform upload.
-  private windSpeed = 8.0;
-  private windDirX  = 0.0;
-  private windDirZ  = 1.0;
+  // Small weather coupling: stormy seas slightly amplify wave depth.
+  private waveDepthScale = 1.0;
 
   // ── LOD geometry constants ─────────────────────────────────────────────────
   // LOD hierarchy (vertex spacing):
@@ -453,7 +425,6 @@ export class OceanService {
   // Playground-style wave tuning. Near and LOD0 use full quality;
   // LOD1/FAR are reduced for performance.
   private readonly WAVE_FREQ = 0.18;
-  private readonly WAVE_DRAG = 0.38;
   private readonly WAVE_DEPTH_NEAR = 3.0;
   private readonly WAVE_DEPTH_MID  = 2.3;
   private readonly WAVE_DEPTH_FAR  = 1.5;
@@ -562,82 +533,35 @@ export class OceanService {
     const mat = new ShaderMaterial(name, scene,
       { vertexSource: OCEAN_VERT, fragmentSource: OCEAN_FRAG },
       {
-        attributes: ['position', 'uv'],
+        attributes: ['position'],
         uniforms: [
           'world', 'worldViewProjection',
-          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale', 'u_MaxCascade',
-          'u_DomainC0', 'u_DomainC1', 'u_DomainC2',
-          'u_Time', 'u_choppiness', 'u_Beaufort',
-          'u_WaveDepth', 'u_WaveFreq', 'u_DragMult', 'u_Iterations', 'u_NormEpsilon',
-          'u_Direction', 'u_WindSpeed',
+          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale',
+          'u_Time', 'u_WaveDepth', 'u_WaveFreq',
+          'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
           'u_cameraPosition',
-          'u_sunDir', 'u_sunColor', 'u_skyColorA', 'u_skyColorB',
         ],
-        samplers: [
-          // FFT normals only — procedural vertex displacement no longer reads disp textures.
-          'u_norm0', 'u_norm1', 'u_norm2',
-          'u_reflectionSampler',
-        ],
+        samplers: ['u_reflectionSampler'],
         needAlphaBlending: false,
       },
     );
 
-    // FFT normal blending is disabled for now; keep the ocean on the procedural
-    // wave path only and sample a static flat normal texture.
-    const effectiveCascade = 0;
-    const waveDepth = maxCascade >= 2 ? this.WAVE_DEPTH_NEAR : maxCascade >= 1 ? this.WAVE_DEPTH_MID : this.WAVE_DEPTH_FAR;
-    const iterationCount = maxCascade >= 2 ? 24 : maxCascade >= 1 ? 16 : 9;
-    const normEpsilon = maxCascade >= 2 ? 0.010 : maxCascade >= 1 ? 0.018 : 0.032;
+    const waveDepth = (maxCascade >= 2 ? this.WAVE_DEPTH_NEAR : maxCascade >= 1 ? this.WAVE_DEPTH_MID : this.WAVE_DEPTH_FAR) * this.waveDepthScale;
 
     mat.setFloat('u_DisplaceScale', displaceScale);
     mat.setFloat('u_MeshHalfSize',  meshHalfSize);
-    mat.setFloat('u_MaxCascade',    effectiveCascade);
-    mat.setFloat('u_DomainC0', 1000);
-    mat.setFloat('u_DomainC1', 200);
-    mat.setFloat('u_DomainC2', 25);
-
-    mat.setFloat('u_choppiness', 0.40);
-    mat.setFloat('u_Beaufort',    1.0);
-    mat.setFloat('u_WindSpeed',   this.windSpeed);
     mat.setFloat('u_WaveDepth',   waveDepth);
     mat.setFloat('u_WaveFreq',    this.WAVE_FREQ);
-    mat.setFloat('u_DragMult',    this.WAVE_DRAG);
-    mat.setFloat('u_Iterations',  iterationCount);
-    mat.setFloat('u_NormEpsilon', normEpsilon);
-    mat.setVector2('u_Direction', new Vector2(this.windDirX, this.windDirZ));
-
-    mat.setVector3('u_sunDir',    new Vector3(0.5, 0.85, 0.2).normalize());
-    mat.setVector3('u_sunColor',  new Vector3(1.00, 0.95, 0.80));
-    mat.setVector3('u_skyColorA', new Vector3(0.22, 0.48, 0.72));
-    mat.setVector3('u_skyColorB', new Vector3(0.08, 0.28, 0.58));
 
     mat.setFloat('u_Time', 0);
     mat.setVector3('u_cameraPosition', Vector3.Zero());
     mat.setVector2('u_WorldOffset',    new Vector2(0, 0));
-
+    mat.setVector2('u_BoatPos', new Vector2(0, 0));
+    mat.setVector2('u_BoatDir', new Vector2(0, 1));
+    mat.setFloat('u_BoatSpeed', 0);
     mat.setTexture('u_reflectionSampler', this.reflectionRTT);
-    this.uploadFlatNormalTextures(scene, mat);
 
     return mat;
-  }
-
-  // ── Flat normal texture ──────────────────────────────────────────────────
-
-  private uploadFlatNormalTextures(scene: Scene, mat: ShaderMaterial): void {
-    if (!this.flatNormalTex) {
-      this.flatNormalTex = new RawTexture(
-        new Float32Array([0, 0, 0, 1]),
-        1, 1,
-        Constants.TEXTUREFORMAT_RGBA,
-        scene,
-        false, false,
-        Constants.TEXTURE_NEAREST_SAMPLINGMODE,
-        Constants.TEXTURETYPE_FLOAT,
-      );
-    }
-    mat.setTexture('u_norm0', this.flatNormalTex);
-    mat.setTexture('u_norm1', this.flatNormalTex);
-    mat.setTexture('u_norm2', this.flatNormalTex);
   }
 
   // ── Kelvin wake plane ──────────────────────────────────────────────────────
@@ -702,30 +626,16 @@ export class OceanService {
         this.oceanMatFar.setVector3('u_cameraPosition', camV);
       }
 
-      const beaufortV = Math.max(0, Math.min(12, this.windSpeed * 0.75));
-      const windDir   = new Vector2(this.windDirX, this.windDirZ);
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
+      const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
+      const boatPos = new Vector2(this.boatX, this.boatZ);
+      const boatSpeedAbs = Math.abs(this.boatSpeed) * 4.0;
 
       for (const mat of allMats) {
-        mat.setFloat('u_Time',      t);
-        mat.setFloat('u_Beaufort',  beaufortV);
-        mat.setFloat('u_WindSpeed', this.windSpeed);
-        mat.setVector2('u_Direction', windDir);
-      }
-
-      const dl = scene.lights.find(l => l instanceof DirectionalLight) as DirectionalLight | undefined;
-      if (dl) {
-        const sunDir = dl.direction.negate().normalize();
-        const sunCol = new Vector3(dl.diffuse.r, dl.diffuse.g, dl.diffuse.b);
-        const elev   = Math.max(0, sunDir.y);
-        const skyA   = new Vector3(0.18 + elev * 0.48, 0.36 + elev * 0.38, 0.76 + elev * 0.22);
-        const skyB   = new Vector3(0.06 + elev * 0.22, 0.18 + elev * 0.26, 0.58 + elev * 0.26);
-        for (const mat of allMats) {
-          mat.setVector3('u_sunDir',    sunDir);
-          mat.setVector3('u_sunColor',  sunCol);
-          mat.setVector3('u_skyColorA', skyA);
-          mat.setVector3('u_skyColorB', skyB);
-        }
+        mat.setFloat('u_Time', t);
+        mat.setVector2('u_BoatPos', boatPos);
+        mat.setVector2('u_BoatDir', boatDir);
+        mat.setFloat('u_BoatSpeed', boatSpeedAbs);
       }
 
       this.wakeMat.setFloat('time',  t);
@@ -752,13 +662,12 @@ export class OceanService {
    * WaveEngine.getHeightAt) whenever the CPU height must match the visual
    * surface — e.g. hull buoyancy sampling in VesselBuoyancyService.
    *
-   * The shader reads `u_WindSpeed`, `u_Direction`, and `u_Time`; the CPU
-   * equivalents (windSpeed, windDirX/Z) are kept in sync by updateWeather().
+   * Shader-faithful CPU height path (from Babylon playground 7KGC8J).
    */
   getVisualHeightAt(wx: number, wz: number, t: number): number {
-    const px = (wx * this.windDirX + wz * this.windDirZ) * this.WAVE_FREQ;
-    const py = (-wx * this.windDirZ + wz * this.windDirX) * this.WAVE_FREQ;
-    const h = (_getWaves(px, py, t, this.windSpeed, this.WAVE_DRAG, 24) - 0.5) * this.WAVE_DEPTH_NEAR;
+    const px = wx * this.WAVE_FREQ;
+    const py = wz * this.WAVE_FREQ;
+    const h = (_getWaves(px, py, t) - 0.5) * this.WAVE_DEPTH_NEAR * this.waveDepthScale;
     return h;
   }
 
@@ -770,15 +679,14 @@ export class OceanService {
   }
 
   updateWeather(wind: Wind, sea: SeaConditions): void {
-    this.windSpeed = wind.speed;
-    const hdgRad   = wind.fromBearingDeg * Math.PI / 180;
-    this.windDirX  = Math.sin(hdgRad);
-    this.windDirZ  = Math.cos(hdgRad);
+    const chop = Math.max(0, Math.min(1, sea.choppiness));
+    const windT = Math.max(0, Math.min(1, wind.speed / 24));
+    this.waveDepthScale = 0.95 + chop * 0.30 + windT * 0.22;
 
-    const chop = sea.choppiness;
-    for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
-      if (mat) mat.setFloat('u_choppiness', chop);
-    }
+    if (this.oceanMatNear) this.oceanMatNear.setFloat('u_WaveDepth', this.WAVE_DEPTH_NEAR * this.waveDepthScale);
+    if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * this.waveDepthScale);
+    if (this.oceanMat1)    this.oceanMat1.setFloat('u_WaveDepth',    this.WAVE_DEPTH_MID  * this.waveDepthScale);
+    if (this.oceanMatFar)  this.oceanMatFar.setFloat('u_WaveDepth',  this.WAVE_DEPTH_FAR  * this.waveDepthScale);
   }
 
   // O(1) dedup — island meshes arrive via both the onNewMeshAdded observable and

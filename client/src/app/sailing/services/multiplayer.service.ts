@@ -14,7 +14,8 @@ interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
   sailFullRoot:    TransformNode | null;
   sailReducedRoot: TransformNode | null;
-  recoilRemaining: number;
+  recoilRoll:      number;
+  recoilRollVel:   number;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -35,7 +36,10 @@ export class MultiplayerService {
 
   private readonly VISIBILITY_RADIUS = 15_000;
   private readonly REMOTE_FLOAT_Y    = 1.65;
-  private readonly RECOIL_DUR        = 1.8;
+  private readonly RECOIL_SPRING     = 7.2;
+  private readonly RECOIL_DAMPING    = 5.8;
+  private readonly RECOIL_IMPULSE    = 0.46;   // rad/s
+  private readonly RECOIL_MAX_ROLL   = 0.12;   // ~6.9° cap
 
   private recoilTickFn: (() => void) | null = null;
 
@@ -193,7 +197,8 @@ export class MultiplayerService {
         root,
         sailFullRoot:    null,
         sailReducedRoot: null,
-        recoilRemaining: 0,
+        recoilRoll:      0,
+        recoilRollVel:   0,
         id:         data.id,
         x:          0, z: 0, heading: 0, speed: 0,
         sailState:  'full',
@@ -248,7 +253,7 @@ export class MultiplayerService {
   private publishSignal(): void {
     this.otherPlayers.set(
       Array.from(this.players.values()).map(
-        ({ root: _r, sailFullRoot: _sf, sailReducedRoot: _sr, recoilRemaining: _rc, ...p }) => p as OtherPlayer,
+        ({ root: _r, sailFullRoot: _sf, sailReducedRoot: _sr, recoilRoll: _rr, recoilRollVel: _rv, ...p }) => p as OtherPlayer,
       ),
     );
   }
@@ -268,20 +273,27 @@ export class MultiplayerService {
     }
     // Only apply if the nearest vessel is within ~50 world units of the muzzle tip
     if (closest && minDist2 < 2500) {
-      closest.recoilRemaining = this.RECOIL_DUR;
+      const hr = closest.heading * Math.PI / 180;
+      const dx = wx - closest.x;
+      const dz = wz - closest.z;
+      const localX = dx * Math.cos(hr) - dz * Math.sin(hr);
+      const firedSide: 'port' | 'stbd' = localX < 0 ? 'port' : 'stbd';
+      const dir = firedSide === 'port' ? 1 : -1;
+      closest.recoilRollVel += dir * this.RECOIL_IMPULSE;
     }
   }
 
   private tickRecoil(entry: OtherPlayerEntry, dt: number): void {
-    if (entry.recoilRemaining <= 0) {
-      entry.root.rotation.x = 0;
-      return;
+    const recoilAcc = -this.RECOIL_SPRING * entry.recoilRoll - this.RECOIL_DAMPING * entry.recoilRollVel;
+    entry.recoilRollVel += recoilAcc * dt;
+    entry.recoilRoll += entry.recoilRollVel * dt;
+    if (entry.recoilRoll > this.RECOIL_MAX_ROLL) entry.recoilRoll = this.RECOIL_MAX_ROLL;
+    if (entry.recoilRoll < -this.RECOIL_MAX_ROLL) entry.recoilRoll = -this.RECOIL_MAX_ROLL;
+    if (Math.abs(entry.recoilRoll) < 0.0002 && Math.abs(entry.recoilRollVel) < 0.0002) {
+      entry.recoilRoll = 0;
+      entry.recoilRollVel = 0;
     }
-    const elapsed = this.RECOIL_DUR - entry.recoilRemaining;
-    entry.recoilRemaining = Math.max(0, entry.recoilRemaining - dt);
-    const env  = entry.recoilRemaining / this.RECOIL_DUR;
-    const osc  = Math.sin(elapsed * 14.0);
-    entry.root.rotation.x = env * osc * 0.038;
+    entry.root.rotation.z = entry.recoilRoll;
   }
 
   // ── Visibility ────────────────────────────────────────────────────────────

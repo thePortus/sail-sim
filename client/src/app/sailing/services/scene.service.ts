@@ -1,6 +1,6 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
+  Engine, WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
@@ -12,8 +12,11 @@ import { SkyMaterial } from '@babylonjs/materials';
 export class SceneService {
   private zone = inject(NgZone);
 
-  engine!: WebGPUEngine;
-  scene!:  Scene;
+  engine!:    WebGPUEngine | Engine;
+  scene!:     Scene;
+  private _isWebGPU = false;
+  /** True when the session is running on a WebGPU backend. */
+  get isWebGPU(): boolean { return this._isWebGPU; }
   camera!: FreeCamera;
 
   private skyMat!:    SkyMaterial;
@@ -91,16 +94,34 @@ export class SceneService {
 
   async initAsync(canvas: HTMLCanvasElement): Promise<void> {
     await this.zone.runOutsideAngular(async () => {
-      this.engine = await WebGPUEngine.CreateAsync(canvas, {
-        antialias: true,
-        // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
-        // textures per stage.  The WebGPU default minimum is 4; the adapter
-        // supports 8.  We must declare this in requiredLimits at device creation
-        // time — it cannot be patched later without recreating the device.
-        deviceDescriptor: {
-          requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
-        },
-      });
+
+      // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
+      const gpuSupported = typeof navigator !== 'undefined' && !!navigator.gpu;
+
+      if (gpuSupported) {
+        try {
+          this.engine = await WebGPUEngine.CreateAsync(canvas, {
+            antialias: true,
+            // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
+            // textures per stage.  The WebGPU default minimum is 4; the adapter
+            // supports 8.  We must declare this in requiredLimits at device creation
+            // time — it cannot be patched later without recreating the device.
+            deviceDescriptor: {
+              requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
+            },
+          });
+          this._isWebGPU = true;
+          console.log('[Scene] WebGPU engine active');
+        } catch (err) {
+          console.warn('[Scene] WebGPU init failed — falling back to WebGL:', err);
+          this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+          this._isWebGPU = false;
+        }
+      } else {
+        console.log('[Scene] WebGPU not available — using WebGL');
+        this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+        this._isWebGPU = false;
+      }
 
       this.scene = new Scene(this.engine);
       this.scene.fogMode    = Scene.FOGMODE_EXP2;

@@ -25,6 +25,8 @@ export class MultiplayerService {
 
   otherPlayers  = signal<OtherPlayer[]>([]);
   chatMessages  = signal<ChatMessage[]>([]);
+  myFriends     = signal<string[]>([]);   // callsigns I've explicitly friended
+  mutualFriends = signal<string[]>([]);   // mutual (both sides friended, and online)
 
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
@@ -54,7 +56,18 @@ export class MultiplayerService {
 
   sendChat(text: string): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
+    // Intercept /friend command — handled via dedicated WS message, not chat
+    if (text.startsWith('/friend ')) {
+      const target = text.slice(8).trim();
+      if (target) this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign: target }));
+      return;
+    }
     this.ws.send(JSON.stringify({ type: 'chat', text }));
+  }
+
+  toggleFriend(callsign: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign }));
   }
 
   // Current local state — kept updated by updateLocalState()
@@ -114,6 +127,8 @@ export class MultiplayerService {
     for (const entry of this.players.values()) this.disposeEntry(entry);
     this.players.clear();
     this.otherPlayers.set([]);
+    this.myFriends.set([]);
+    this.mutualFriends.set([]);
   }
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
@@ -147,6 +162,10 @@ export class MultiplayerService {
       if (msg.id === this.myId) return;
       console.log('[MP] remote cannon_shot received', msg, 'onRemoteShot set:', !!this.onRemoteShot);
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
+
+    } else if (msg.type === 'friend_update') {
+      this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
+      this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
 
     } else if (msg.type === 'chat') {
       const chatMsg: ChatMessage = {

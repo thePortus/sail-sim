@@ -17,5 +17,10 @@ module.exports = (sequelize, DataTypes) => {
     lastVesselSlug:  { type: DataTypes.STRING(64), allowNull: true, defaultValue: null },
     lastCallsign:    { type: DataTypes.STRING(16), allowNull: true, defaultValue: null },
     locationSavedAt: { type: DataTypes.DATE,       allowNull: true, defaultValue: null },
+
+    // ── Friend list ──────────────────────────────────────────────────────────
+    // JSON array of callsigns this user has explicitly friended.
+    // Mutual friendship requires both players to have each other in their list.
+    friends: { type: DataTypes.TEXT, allowNull: true, defaultValue: null },
   });
 };

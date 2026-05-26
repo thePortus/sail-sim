@@ -1,6 +1,8 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const db   = require('./models');
+const User = db.User;
 
 /**
  * Sailing multiplayer WebSocket server.
@@ -11,12 +13,19 @@ const { WebSocketServer } = require('ws');
  *     { type: 'welcome',  id: string }
  *     { type: 'snapshot', players: PlayerState[] }
  *     { type: 'wave_state', windBearing, windSpeed, beaufort, t }
+ *     { type: 'friend_update', myFriends: string[], mutuals: string[] }
  *
  *   Client → server (~100 ms):
  *     { type: 'update', x, z, heading, speed, sailState, vesselName, vesselSlug, callsign }
  *
  *   Server → other clients on update:
  *     { type: 'update', id, x, z, heading, speed, sailState, vesselName, vesselSlug, callsign }
+ *
+ *   Client → server (friend toggle):
+ *     { type: 'friend_toggle', callsign: string }
+ *
+ *   Server → client (friend state):
+ *     { type: 'friend_update', myFriends: string[], mutuals: string[] }
  *
  *   Server → all clients on weather tick (~5 s):
  *     { type: 'wave_state', windBearing, windSpeed, beaufort, t }
@@ -26,11 +35,10 @@ const { WebSocketServer } = require('ws');
  */
 
 // ── Server-side weather state ─────────────────────────────────────────────────
-// All clients receive the same wave seed so every player sees the same ocean.
 
 const weather = {
-  windBearing:   180 + Math.random() * 180,  // start somewhere in the southern half
-  windSpeed:     6 + Math.random() * 6,       // 6–12 m/s (B3–B5)
+  windBearing:   180 + Math.random() * 180,
+  windSpeed:     6 + Math.random() * 6,
   targetBearing: 0,
   targetSpeed:   0,
   timeSec:       0,
@@ -51,35 +59,25 @@ function angularDiff(target, current) {
 
 function weatherTick() {
   weather.timeSec++;
-
-  // Occasionally choose a new target wind
   if (weather.timeSec >= weather.nextTargetSec) {
     const dramatic = Math.random() < 0.10;
     if (dramatic) {
       const shift = (Math.random() - 0.5) * 240;
       weather.targetBearing = (weather.windBearing + shift + 360) % 360;
-      weather.targetSpeed   = Math.max(3, Math.min(22,
-        weather.windSpeed + (Math.random() - 0.5) * 28,
-      ));
+      weather.targetSpeed   = Math.max(3, Math.min(22, weather.windSpeed + (Math.random() - 0.5) * 28));
     } else {
       const shift = (Math.random() - 0.5) * 50;
       weather.targetBearing = (weather.windBearing + shift + 360) % 360;
-      weather.targetSpeed   = Math.max(3, Math.min(16,
-        weather.windSpeed + (Math.random() - 0.5) * 12,
-      ));
+      weather.targetSpeed   = Math.max(3, Math.min(16, weather.windSpeed + (Math.random() - 0.5) * 12));
     }
     weather.nextTargetSec = weather.timeSec + 60 + Math.random() * 90;
   }
-
-  // Gradually move toward target (same rate limits as the old client-side service)
   const bearingDiff = angularDiff(weather.targetBearing, weather.windBearing);
   const bearingStep = Math.sign(bearingDiff) * Math.min(Math.abs(bearingDiff), 1.2);
   weather.windBearing = (weather.windBearing + bearingStep + 360) % 360;
-
   const speedDiff = weather.targetSpeed - weather.windSpeed;
   weather.windSpeed = Math.max(2, Math.min(22,
-    weather.windSpeed + Math.sign(speedDiff) * Math.min(Math.abs(speedDiff), 0.5),
-  ));
+    weather.windSpeed + Math.sign(speedDiff) * Math.min(Math.abs(speedDiff), 0.5)));
 }
 
 function currentWaveState() {
@@ -92,18 +90,81 @@ function currentWaveState() {
   };
 }
 
+// ── Friend helpers ────────────────────────────────────────────────────────────
+
+/** Parse the JSON friends column safely. */
+function parseFriends(raw) {
+  if (!raw) return [];
+  try { return JSON.parse(raw) || []; } catch { return []; }
+}
+
+/**
+ * From the in-memory players Map, compute which of `myFriends` are mutual
+ * (i.e. also have `myCallsign` in THEIR in-memory friends list).
+ * Only considers currently-connected players.
+ */
+function computeMutuals(myCallsign, myFriends, playersMap) {
+  const mutuals = [];
+  for (const [, p] of playersMap) {
+    if (!p.state?.callsign || p.state.callsign === myCallsign) continue;
+    const theirCallsign = p.state.callsign;
+    if (myFriends.includes(theirCallsign) && (p.friends || []).includes(myCallsign)) {
+      mutuals.push(theirCallsign);
+    }
+  }
+  return mutuals;
+}
+
+/** Send a friend_update message to a specific WS connection. */
+function sendFriendUpdate(ws, myFriends, mutuals) {
+  if (ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'friend_update', myFriends, mutuals }));
+  }
+}
+
+/**
+ * Load a player's friends from the DB by callsign, populate in-memory,
+ * then send them their current friend_update (including online mutuals).
+ * Also nudges any already-connected mutual friend so THEIR mutuals refresh.
+ */
+async function loadAndBroadcastFriends(id, callsign, playersMap) {
+  try {
+    const user = await User.findOne({ where: { callsign }, attributes: ['friends'] });
+    const friends = parseFriends(user?.friends);
+
+    const entry = playersMap.get(id);
+    if (!entry) return;
+    entry.friends = friends;
+
+    // Send this player their friend state
+    const mutuals = computeMutuals(callsign, friends, playersMap);
+    sendFriendUpdate(entry.ws, friends, mutuals);
+
+    // Any connected player whose mutual status changes because this player came online
+    for (const [pid, p] of playersMap) {
+      if (pid === id || !p.state?.callsign) continue;
+      if ((p.friends || []).includes(callsign)) {
+        const theirMutuals = computeMutuals(p.state.callsign, p.friends, playersMap);
+        sendFriendUpdate(p.ws, p.friends, theirMutuals);
+      }
+    }
+  } catch (err) {
+    console.warn('[WS] loadAndBroadcastFriends error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
   let nextId = 1;
 
-  // ── Server-side weather tick (1 Hz) ─────────────────────────────────────────
+  // ── Weather tick (1 Hz) ───────────────────────────────────────────────────────
   let broadcastCooldown = 0;
   setInterval(() => {
     weatherTick();
     broadcastCooldown++;
-
-    // Broadcast wave state to all connected clients every 5 s
     if (broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       const msg = JSON.stringify(currentWaveState());
@@ -115,11 +176,9 @@ function attachMultiplayer(server) {
 
   wss.on('connection', (ws) => {
     const id = String(nextId++);
-    players.set(id, { ws, state: null });
+    players.set(id, { ws, state: null, friends: [] });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
-
-    // Send current wave state immediately so the new client syncs up
     ws.send(JSON.stringify(currentWaveState()));
 
     const existing = [];
@@ -135,6 +194,7 @@ function attachMultiplayer(server) {
       try { msg = JSON.parse(raw); } catch { return; }
 
       if (msg.type === 'update') {
+        const prevCallsign = players.get(id)?.state?.callsign;
         const state = {
           x:          +msg.x          || 0,
           z:          +msg.z          || 0,
@@ -147,10 +207,74 @@ function attachMultiplayer(server) {
         };
         players.get(id).state = state;
 
+        // On first callsign assignment: load friends from DB
+        if (state.callsign && state.callsign !== prevCallsign) {
+          loadAndBroadcastFriends(id, state.callsign, players);
+        }
+
         const broadcast = JSON.stringify({ type: 'update', id, ...state });
         for (const [pid, p] of players) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(broadcast);
         }
+
+      } else if (msg.type === 'friend_toggle') {
+        const myCallsign = players.get(id)?.state?.callsign;
+        if (!myCallsign) return;
+
+        const targetCallsign = String(msg.callsign ?? '').slice(0, 32).trim();
+        if (!targetCallsign || targetCallsign === myCallsign) return;
+
+        (async () => {
+          try {
+            const user = await User.findOne({ where: { callsign: myCallsign }, attributes: ['id', 'friends'] });
+            if (!user) return;
+
+            const current = parseFriends(user.friends);
+            const alreadyFriended = current.includes(targetCallsign);
+            const updated = alreadyFriended
+              ? current.filter(f => f !== targetCallsign)
+              : [...current, targetCallsign];
+
+            await User.update({ friends: JSON.stringify(updated) }, { where: { id: user.id } });
+
+            const entry = players.get(id);
+            if (!entry) return;
+            entry.friends = updated;
+
+            // Respond to requester
+            const mutuals = computeMutuals(myCallsign, updated, players);
+            sendFriendUpdate(entry.ws, updated, mutuals);
+
+            // System chat confirmation
+            let sysText;
+            if (!alreadyFriended) {
+              sysText = mutuals.includes(targetCallsign)
+                ? `You are now mutual friends with ${targetCallsign}! 💛`
+                : `You friended ${targetCallsign}. They need to /friend you back for it to be mutual.`;
+            } else {
+              sysText = `You unfriended ${targetCallsign}.`;
+            }
+            entry.ws.send(JSON.stringify({ type: 'chat', chatType: 'global', from: '⚓ System', text: sysText }));
+
+            // Notify target if online — their mutuals changed
+            for (const [pid, p] of players) {
+              if (pid !== id && p.state?.callsign === targetCallsign && p.ws.readyState === 1) {
+                const theirMutuals = computeMutuals(targetCallsign, p.friends || [], players);
+                sendFriendUpdate(p.ws, p.friends || [], theirMutuals);
+
+                if (!alreadyFriended && theirMutuals.includes(myCallsign)) {
+                  p.ws.send(JSON.stringify({
+                    type: 'chat', chatType: 'global', from: '⚓ System',
+                    text: `${myCallsign} friended you — you are now mutual friends! 💛`,
+                  }));
+                }
+                break;
+              }
+            }
+          } catch (err) {
+            console.warn('[WS] friend_toggle error:', err.message);
+          }
+        })();
 
       } else if (msg.type === 'cannon_shot') {
         const shot = JSON.stringify({
@@ -171,7 +295,6 @@ function attachMultiplayer(server) {
         const senderCallsign = players.get(id)?.state?.callsign ?? 'Unknown';
 
         if (text.startsWith('/t ')) {
-          // DM: /t <callsign> <message>
           const rest = text.slice(3).trim();
           const spaceIdx = rest.indexOf(' ');
           if (spaceIdx === -1) return;
@@ -183,24 +306,16 @@ function attachMultiplayer(server) {
             type: 'chat', chatType: 'dm',
             from: senderCallsign, to: targetCallsign, text: dmText,
           });
-
-          // Deliver to target
           for (const [, p] of players) {
             if (p.state?.callsign === targetCallsign && p.ws.readyState === 1) {
-              p.ws.send(dmMsg);
-              break;
+              p.ws.send(dmMsg); break;
             }
           }
-          // Echo back to sender so they see it in their DM tab
           const senderEntry = players.get(id);
           if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg);
 
         } else {
-          // Global broadcast
-          const globalMsg = JSON.stringify({
-            type: 'chat', chatType: 'global',
-            from: senderCallsign, text,
-          });
+          const globalMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });
           for (const [, p] of players) {
             if (p.ws.readyState === 1) p.ws.send(globalMsg);
           }
@@ -209,7 +324,18 @@ function attachMultiplayer(server) {
     });
 
     ws.on('close', () => {
+      const closingCallsign = players.get(id)?.state?.callsign;
       players.delete(id);
+
+      // Notify any connected player whose mutuals changed because this player left
+      if (closingCallsign) {
+        for (const [, p] of players) {
+          if (!p.state?.callsign || !(p.friends || []).includes(closingCallsign)) continue;
+          const theirMutuals = computeMutuals(p.state.callsign, p.friends, players);
+          sendFriendUpdate(p.ws, p.friends, theirMutuals);
+        }
+      }
+
       const leave = JSON.stringify({ type: 'leave', id });
       for (const [, p] of players) {
         if (p.ws.readyState === 1) p.ws.send(leave);

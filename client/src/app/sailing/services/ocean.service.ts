@@ -578,9 +578,14 @@ export class OceanService {
       },
     );
 
+    // When the FFT engine is inactive (WebGL fallback), cap cascade usage at 0
+    // so the fragment shader only samples the dummy 1×1 flat-normal texture once
+    // rather than three times.  Procedural vertex displacement still runs fine.
+    const effectiveCascade = this.fftEngine.isActive ? maxCascade : Math.min(maxCascade, 0);
+
     mat.setFloat('u_DisplaceScale', displaceScale);
     mat.setFloat('u_MeshHalfSize',  meshHalfSize);
-    mat.setFloat('u_MaxCascade',    maxCascade);
+    mat.setFloat('u_MaxCascade',    effectiveCascade);
     mat.setFloat('u_DomainC0', this.fftEngine.getDomain(0));
     mat.setFloat('u_DomainC1', this.fftEngine.getDomain(1));
     mat.setFloat('u_DomainC2', this.fftEngine.getDomain(2));

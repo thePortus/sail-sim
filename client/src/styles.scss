@@ -267,10 +267,7 @@ kbd {
 // ── Chat panel ────────────────────────────────────────────────────────────────
 
 app-chat {
-  position: absolute;
-  left: 1.25rem;
-  top: 50%;
-  transform: translateY(-50%);
+  position: absolute;   // left/top driven by ChatComponent @HostBinding
   z-index: 45;
   pointer-events: auto;
 }
@@ -284,6 +281,45 @@ app-chat {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+.chat-drag-handle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px 4px;
+  cursor: grab;
+  user-select: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.025);
+
+  &:active { cursor: grabbing; }
+}
+
+.chat-drag-grip {
+  color: rgba(255,255,255,0.20);
+  font-size: 10px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.chat-drag-title {
+  color: rgba(255,255,255,0.30);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.chat-drag-hint {
+  color: rgba(255,255,255,0.14);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-tabs {
@@ -352,7 +388,8 @@ app-chat {
   color: #60a5fa;
   margin-right: 3px;
 
-  &--mine { color: #34d399; }
+  &--mine   { color: #34d399; }
+  &--system { color: #fbbf24; }
 }
 
 .chat-msg-text { color: rgba(255, 255, 255, 0.75); }

@@ -235,14 +235,41 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       ctx.stroke();
     }
 
-    // Other players
+    // Other players — split into friends (gold) and strangers (orange)
+    const mutuals = this.multiplayerService.mutualFriends();
+
     for (const p of this.multiplayerService.otherPlayers()) {
       const px = wx(p.x);
       const pz = wz(p.z);
-      ctx.fillStyle = 'rgba(255, 120, 80, 0.85)';
-      ctx.beginPath();
-      ctx.arc(px, pz, 3, 0, Math.PI * 2);
-      ctx.fill();
+
+      if (mutuals.includes(p.callsign)) {
+        // Mutual friend — gold diamond with callsign label
+        const s = this.expanded() ? 6 : 5;
+        ctx.fillStyle   = '#fbbf24';
+        ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+        ctx.lineWidth   = 0.9;
+        ctx.beginPath();
+        ctx.moveTo(px,     pz - s);
+        ctx.lineTo(px + s, pz);
+        ctx.lineTo(px,     pz + s);
+        ctx.lineTo(px - s, pz);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        const fontSize = this.expanded() ? 9 : 8;
+        ctx.fillStyle    = 'rgba(251,191,36,0.92)';
+        ctx.font         = `bold ${fontSize}px monospace`;
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(p.callsign.toUpperCase(), px, pz - s - 2);
+      } else {
+        // Regular player — small orange circle
+        ctx.fillStyle = 'rgba(255, 120, 80, 0.85)';
+        ctx.beginPath();
+        ctx.arc(px, pz, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     // Local vessel — arrow pointing in heading direction

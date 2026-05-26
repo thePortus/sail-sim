@@ -460,10 +460,25 @@ export class OceanFFTEngine {
   // FFT dispatch dimensions: N/16 × N/16
   private readonly DX = N / 16;   // = 16
 
+  /** True when WebGPU is available and the compute pipeline was initialised. */
+  private _active = false;
+  get isActive(): boolean { return this._active; }
+
+  /** Flat-normal (0,0) fallback returned by getNormalsTex when running on WebGL. */
+  private _dummyNormalTex: RawTexture | null = null;
+
   // ── Init ───────────────────────────────────────────────────────────────────
 
   async init(): Promise<void> {
-    const engine = this.sceneService.engine;
+    if (!this.sceneService.isWebGPU) {
+      // WebGL path — GPU compute is unavailable.
+      // CPU physics (waveEngine) still works; visual normals are flat.
+      console.log('[OceanFFT] WebGPU unavailable — running without FFT compute');
+      this._active = false;
+      return;
+    }
+
+    const engine = this.sceneService.engine as WebGPUEngine;
     const scene  = this.sceneService.scene;
 
     this.cascadeTex = [];
@@ -482,11 +497,13 @@ export class OceanFFTEngine {
 
     // Initialise spectra with default weather
     await this.initSpectra();
+    this._active = true;
   }
 
   // ── Per-frame tick ─────────────────────────────────────────────────────────
 
   tick(dt: number): void {
+    if (!this._active) return;
     this.elapsed += dt;
 
     for (let c = 0; c < 3; c++) {
@@ -532,6 +549,21 @@ export class OceanFFTEngine {
   }
 
   getNormalsTex(cascade: number): RawTexture {
+    if (!this._active) {
+      // Return a 1×1 flat-normal (0,0,0,0) texture so the shader doesn't crash.
+      if (!this._dummyNormalTex) {
+        this._dummyNormalTex = new RawTexture(
+          new Float32Array([0, 0, 0, 0]),
+          1, 1,
+          Constants.TEXTUREFORMAT_RGBA,
+          this.sceneService.scene,
+          false, false,
+          Constants.TEXTURE_NEAREST_SAMPLINGMODE,
+          Constants.TEXTURETYPE_FLOAT,
+        );
+      }
+      return this._dummyNormalTex;
+    }
     return this.cascadeTex[cascade].normals;
   }
 
@@ -549,6 +581,7 @@ export class OceanFFTEngine {
 
   async updateWeather(wind: Wind, sea: SeaConditions): Promise<void> {
     this.waveEngine.updateWeather(wind, sea);
+    if (!this._active) return;   // GPU spectra not running on WebGL
 
     this.windSpeed   = wind.speed;
     const hdgRad     = wind.fromBearingDeg * Math.PI / 180;

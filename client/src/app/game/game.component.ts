@@ -273,7 +273,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       this.loadingMsg.set('Returning to your last anchorage…');
     }
 
-    this.vesselService.init(vessel, spawnX, spawnZ, spawnHeading);
+    await this.vesselService.init(vessel, spawnX, spawnZ, spawnHeading);
 
     // 5b. Arm the cannons (must be after vessel + scene are ready)
     this.cannonService.init();

@@ -2,13 +2,15 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh,
   TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  VertexBuffer,
+  SceneLoader, Quaternion,
 } from '@babylonjs/core';
+import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
 import { IslandService } from './island.service';
 import { OceanService }  from './ocean.service';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
+import { Settings } from '../../app.settings';
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
@@ -50,10 +52,23 @@ export class VesselService {
 
   // ── Mesh handles ──────────────────────────────────────────────────────────
   private root!:         TransformNode;
-  private mainSailPivot: TransformNode | null = null;
-  private jibPivot:      TransformNode | null = null;
-  private mainSailMesh:  Mesh | null = null;
-  private jibMesh:       Mesh | null = null;
+
+
+  // ── GLB pivots and sail nodes ──────────────────────────────────────────────
+  private flagPivot:       TransformNode | null = null;
+  private boomPivot:       TransformNode | null = null;
+  private sailFullRoot:    TransformNode | null = null;  // sloop-sail.glb root
+  private sailReducedRoot: TransformNode | null = null;  // sloop-sail-reduced.glb root
+
+  // ── Procedural running rigging (Option B) ─────────────────────────────────
+  private rigLineMainsheet: Mesh | null = null;
+  private rigLineVang:      Mesh | null = null;
+
+  // ── Shared spar geometry constants (buildSails + rigging update) ──────────
+  private readonly MAST_Z       = 1.5;
+  private readonly MAST_TOP_Y   = 15.1;
+  private readonly BOOM_Y_CONST = 1.76;
+  private readonly BOOM_LEN_TIP = 7.82;   // pivot-local Z distance to boom tip
 
   // ── PBR material / texture pools ─────────────────────────────────────────
   private matPool         = new Map<string, PBRMaterial>();
@@ -133,7 +148,7 @@ export class VesselService {
   private stbdEmit  = new Vector3(0, this.WAKE_Y, 0);
 
   // ─────────────────────────────────────────────────────────────────────────
-  init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): void {
+  async init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): Promise<void> {
     this.x       = spawnX;
     this.z       = spawnZ;
     this.heading = spawnHeading;
@@ -143,14 +158,14 @@ export class VesselService {
     // Group 2 renders after ocean (groups 0+1) but keeps the ocean's depth values
     // so the wave surface correctly occludes submerged hull geometry.
     scene.setRenderingAutoClearDepthStencil(2, false);
-    this.buildMesh(vessel, scene);
+    await this.buildMesh(vessel, scene);
     this.setupInput();
     this.setupCameraInput();
     this.startLoop(scene);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  private buildMesh(vessel: Vessel, scene: Scene): void {
+  private async buildMesh(vessel: Vessel, scene: Scene): Promise<void> {
     this.root = new TransformNode('vessel_root', scene);
     this.root.position = new Vector3(this.x, 0, this.z);
     this.root.rotation.y = this.heading * Math.PI / 180;
@@ -160,9 +175,8 @@ export class VesselService {
       this.createPart(part, scene);
     }
 
-    // Build sails (animated, so handled separately)
+    // Build mast pivot
     this.buildSails(scene);
-    this.updateSailMeshes();
 
     // Build torches after root is set up so they can be parented
     this.buildTorches(scene);
@@ -170,11 +184,123 @@ export class VesselService {
     // Build wake trail (world-space, not parented to root)
     this.buildWake(scene);
 
+    // Load GLB geometry parts (hull, mast, flag, sails, cannons)
+    await this.buildGLBMeshes(scene);
+
     // Register every hull / rig / sail mesh with the WaterMaterial so it appears
     // in both the reflection RTT (mirror of the above-water hull in the surface)
     // and the refraction RTT (the submerged hull visible through the water).
     for (const mesh of this.root.getChildMeshes()) {
       this.oceanService.addToRenderList(mesh);
+    }
+  }
+
+  // ── GLB geometry loading ──────────────────────────────────────────────────
+  // Loads GLB files (from Blender; textures embedded).
+  // Files are fetched from the /geometry/ static route on the server.
+  //
+  // Orientation: GLB from Blender is already Y-up per the GLTF spec.
+  // The GLTF loader handles right→left-hand conversion internally.
+  // We compound a 180° Y-axis flip so the bow faces +Z (forward).
+  private async buildGLBMeshes(scene: Scene): Promise<void> {
+    const baseUrl = Settings.apiUrl + 'geometry/';
+
+    // Helper: import one GLB, orient it, set parent and renderingGroupId.
+    // GLB materials (with embedded textures) are kept as-is.
+    const loadGLB = async (
+      filename:    string,
+      finalParent: TransformNode = this.root,
+    ): Promise<TransformNode | null> => {
+      try {
+        const res  = await SceneLoader.ImportMeshAsync('', baseUrl, filename, scene);
+        if (!res.meshes.length) return null;
+        const root = res.meshes[0];
+
+        // Compound 180° Y-flip with the GLTF loader's existing orientation
+        const flipY = Quaternion.RotationAxis(Vector3.Up(), Math.PI);
+        root.rotationQuaternion = root.rotationQuaternion
+          ? flipY.multiply(root.rotationQuaternion)
+          : flipY;
+
+        root.parent = finalParent;
+        for (const m of res.meshes) m.renderingGroupId = 2;
+        return root as TransformNode;
+      } catch (err) {
+        console.warn(`[VesselService] GLB load failed: ${filename}`, err);
+        return null;
+      }
+    };
+
+    // Hull (includes the mast — stationary)
+    await loadGLB('sloop-hull.glb');
+
+    // Boom — parented to boomPivot so it rotates with sail trim
+    await loadGLB('sloop-boom.glb', this.boomPivot!);
+
+    // Flag — pivot at masthead; rotation.y driven each frame in physicsStep
+    this.flagPivot          = new TransformNode('flag_pivot', scene);
+    this.flagPivot.parent   = this.root;
+    // GLB geometry is in vessel-relative space (same convention as sloop-hull.glb),
+    // so the pivot lives at the vessel origin — no masthead offset needed here.
+    this.flagPivot.position = Vector3.Zero();
+    await loadGLB('sloop-flag.glb', this.flagPivot);
+
+    // Cannons — root node renamed so CannonService.setupCannonPivots() can find them
+    const portRoot = await loadGLB('sloop-cannon-port.glb');
+    if (portRoot) portRoot.name = 'sloop_cannon_port';
+    const stbdRoot = await loadGLB('sloop-cannon-starboard.glb');
+    if (stbdRoot) stbdRoot.name = 'sloop_cannon_stbd';
+
+    // Sails — both parented to boomPivot so they rotate with the boom
+    this.sailFullRoot    = await loadGLB('sloop-sail.glb',         this.boomPivot!);
+    this.sailReducedRoot = await loadGLB('sloop-sail-reduced.glb', this.boomPivot!);
+
+    // Apply initial visibility based on current sail state
+    this.sailFullRoot?.setEnabled(this.sailState === 'full');
+    this.sailReducedRoot?.setEnabled(this.sailState === 'topsails');
+  }
+
+  // ── Procedural running rigging (Option B) ─────────────────────────────────
+  // Two thin rope cylinders span from fixed hull points to the rotating boom
+  // tip.  Each frame physicsStep() calls updateRigLine() to reposition them.
+  // Cylinder height=1 at creation; scaling.y stretches to the actual length.
+  private buildProceduralRigging(scene: Scene): void {
+    const ropeMat = this.buildVesselMat(
+      { id: 'rope', shape: 'box', params: {},
+        position: { x: 0, y: 0, z: 0 },
+        materialType: 'rope', material: { color: '#000000' } } as VesselPart,
+      scene,
+    );
+    const mk = (name: string): Mesh => {
+      const m = MeshBuilder.CreateCylinder(name,
+        { diameter: 0.045, height: 1, tessellation: 5 }, scene);
+      m.parent           = this.root;
+      m.renderingGroupId = 2;
+      m.material         = ropeMat;
+      return m;
+    };
+    this.rigLineMainsheet = mk('rig_mainsheet');
+    this.rigLineVang      = mk('rig_vang');
+  }
+
+  // Aligns a unit-height (+Y axis) cylinder between two root-local points.
+  private updateRigLine(mesh: Mesh, a: Vector3, b: Vector3): void {
+    const diff = b.subtract(a);
+    const len  = diff.length();
+    if (len < 0.01) { mesh.setEnabled(false); return; }
+    mesh.setEnabled(true);
+    mesh.position.copyFrom(Vector3.Lerp(a, b, 0.5));
+    mesh.scaling.y = len;
+    const dir = diff.normalize();
+    const up  = new Vector3(0, 1, 0);
+    const dot = Vector3.Dot(up, dir);
+    if (Math.abs(dot) < 0.9999) {
+      const axis = Vector3.Cross(up, dir).normalize();
+      const ang  = Math.acos(Math.max(-1, Math.min(1, dot)));
+      mesh.rotationQuaternion = Quaternion.RotationAxis(axis, ang);
+    } else {
+      mesh.rotationQuaternion = null;
+      mesh.rotation.x = dot > 0 ? 0 : Math.PI;
     }
   }
 
@@ -226,8 +352,8 @@ export class VesselService {
 
   private buildTorches(scene: Scene): void {
     const torchPositions = [
-      { x: -1.55, y: 2.26, z: -5.4 },  // port stern rail cap
-      { x:  1.55, y: 2.26, z: -5.4 },  // stbd stern rail cap
+      { x: -1.55, y: 4.00, z: -5.4 },  // port stern rail cap
+      { x:  1.55, y: 4.00, z: -5.4 },  // stbd stern rail cap
     ];
 
     for (let i = 0; i < torchPositions.length; i++) {
@@ -272,148 +398,19 @@ export class VesselService {
   }
 
   private buildSails(scene: Scene): void {
-    const mastX   = 0,   mastZ   = 1.5;
-    const mastTopY = 15.1;
-    const boomY    = 1.76;   // matches gooseneck height in vessel data
-    const boomLen  = 7.8;    // boom cylinder height (mast to end)
-
-    // ── Main sail pivot ───────────────────────────────────────────────────
-    this.mainSailPivot = new TransformNode('main_sail_pivot', scene);
-    this.mainSailPivot.parent   = this.root;
-    this.mainSailPivot.position = new Vector3(mastX, 0, mastZ);
-
-    // ── Boom assembly — parented to pivot so it swings with the sail ─────
-    // All positions in pivot-local space (subtract pivot world offset z=1.5 from
-    // any root-local z, since the pivot is at root-local (0,0,1.5)).
-    {
-      const sparMat  = this.buildVesselMat(
-        { id:'boom_dyn', shape:'cylinder', params:{}, position:{x:0,y:0,z:0},
-          materialType:'wood_spar', material:{color:'#D8D5C8'} }, scene);
-      const steelMat = this.buildVesselMat(
-        { id:'steel_boom', shape:'torus', params:{}, position:{x:0,y:0,z:0},
-          materialType:'steel', material:{color:'#AAAAAA'} }, scene);
-      const brassMat = this.buildVesselMat(
-        { id:'brass_gooseneck', shape:'cylinder', params:{}, position:{x:0,y:0,z:0},
-          materialType:'brass', material:{color:'#C8962A'} }, scene);
-
-      // Gooseneck — at pivot origin (z_local=0 = z_world=1.5=mast)
-      const gooseneck = MeshBuilder.CreateCylinder('gooseneck_dyn',
-        { diameter:0.30, height:0.26, tessellation:12 }, scene);
-      gooseneck.parent = this.mainSailPivot;
-      gooseneck.position = new Vector3(0, boomY, 0);
-      gooseneck.rotation = new Vector3(Math.PI / 2, 0, 0);
-      gooseneck.renderingGroupId = 2;
-      gooseneck.material = brassMat;
-
-      // Boom cylinder — z_local = -2.4 - 1.5 = -3.9 (centre of 7.8m cylinder)
-      const boom = MeshBuilder.CreateCylinder('boom_dyn',
-        { diameter:0.13, height:boomLen, tessellation:8 }, scene);
-      boom.parent = this.mainSailPivot;
-      boom.position = new Vector3(0, boomY, -3.9);
-      boom.rotation = new Vector3(Math.PI / 2, 0, 0);
-      boom.renderingGroupId = 2;
-      boom.material = sparMat;
-
-      // Boom end cap — z_local = -6.32 - 1.5 = -7.82
-      const boomEnd = MeshBuilder.CreateSphere('boom_end_dyn',
-        { diameter:0.22, segments:10 }, scene);
-      boomEnd.parent = this.mainSailPivot;
-      boomEnd.position = new Vector3(0, boomY, -7.82);
-      boomEnd.renderingGroupId = 2;
-      boomEnd.material = sparMat;
-
-      // Mainsheet block — z_local = -6.28 - 1.5 = -7.78
-      const boomBlock = MeshBuilder.CreateTorus('boom_block_dyn',
-        { diameter:0.24, thickness:0.05, tessellation:12 }, scene);
-      boomBlock.parent = this.mainSailPivot;
-      boomBlock.position = new Vector3(0, boomY - 0.18, -7.78);
-      boomBlock.renderingGroupId = 2;
-      boomBlock.material = steelMat;
-    }
-
-    // ── Multi-path mainsail (5 chord stations, 24 height segs) ───────────
-    // Paths run foot→head; 5 paths sweep luff(mast)→leech(free edge).
-    // Parabolic belly: sin(u·π) profile across chord, sin(t·π) scaling
-    // along span — fullest in mid-sail, tapers at foot and head.
-    const CHORD  = 5;
-    const SEGS   = 24;
-    const DRAFT  = 0.11;   // max belly as fraction of local chord width
-
-    const mainPaths: Vector3[][] = [];
-    for (let ci = 0; ci < CHORD; ci++) {
-      const u    = ci / (CHORD - 1);   // 0 = luff, 1 = leech
-      const path: Vector3[] = [];
-      for (let i = 0; i <= SEGS; i++) {
-        const t      = i / SEGS;
-        const y      = boomY + t * (mastTopY - boomY);
-        const zLeech = -(boomLen * (1 - t * 0.22));   // leech z at this height
-        const z      = u * zLeech;                     // chord-station z
-        const chord  = Math.abs(zLeech);
-        // Belly: parabolic across chord, sinusoidal along span
-        const bellyCross = Math.sin(u * Math.PI);
-        const bellySpan  = 0.55 + 0.45 * Math.sin(t * Math.PI);
-        const x          = bellyCross * bellySpan * chord * DRAFT;
-        path.push(new Vector3(x, y, z));
-      }
-      mainPaths.push(path);
-    }
-
-    this.mainSailMesh = MeshBuilder.CreateRibbon('mainsail', {
-      pathArray: mainPaths, sideOrientation: Mesh.DOUBLESIDE, updatable: true,
-    }, scene);
-    this.mainSailMesh.parent           = this.mainSailPivot;
-    this.mainSailMesh.renderingGroupId = 2;
-    // Bake UVs by path/vertex index so threads scale physically uniformly.
-    // 3 tiles luff→leech × 5 tiles foot→head keeps canvas threads near-square.
-    this.bakeRibbonUVs(this.mainSailMesh, CHORD, SEGS, 3, 5);
-    this.mainSailMesh.material = this.buildCanvasMat(scene);
-
-    // ── Jib (pivot at forestay tack near bow) ─────────────────────────────
-    const jibBaseZ = 7.0;
-    const jibTopY  = mastTopY - 1.0;
-    this.jibPivot  = new TransformNode('jib_pivot', scene);
-    this.jibPivot.parent   = this.root;
-    this.jibPivot.position = new Vector3(0, 0, jibBaseZ);
-
-    // 4 chord paths × 16 height segs — gentler belly than mainsail
-    const J_CHORD = 4;
-    const J_SEGS  = 16;
-    const J_DRAFT = 0.09;
-    const span     = jibBaseZ - mastZ;   // = 5.5 units (forestay length projected)
-
-    const jibPaths: Vector3[][] = [];
-    for (let ci = 0; ci < J_CHORD; ci++) {
-      const u    = ci / (J_CHORD - 1);
-      const path: Vector3[] = [];
-      for (let i = 0; i <= J_SEGS; i++) {
-        const t    = i / J_SEGS;
-        const y    = 1.5 + t * (jibTopY - 1.5);
-        const zL   = -t * span;                          // luff z (along forestay)
-        const zLe  = -span * t + zL * 0.3;              // leech z
-        const z    = zL + u * (zLe - zL);               // interpolated z
-        const chord = Math.abs(zLe - zL);
-        const bellyCross = Math.sin(u * Math.PI);
-        const bellySpan  = 0.45 + 0.55 * Math.sin(t * Math.PI);
-        const x    = bellyCross * bellySpan * chord * J_DRAFT;
-        path.push(new Vector3(x, y, z));
-      }
-      jibPaths.push(path);
-    }
-
-    this.jibMesh = MeshBuilder.CreateRibbon('jib', {
-      pathArray: jibPaths, sideOrientation: Mesh.DOUBLESIDE, updatable: true,
-    }, scene);
-    this.jibMesh.parent           = this.jibPivot;
-    this.jibMesh.renderingGroupId = 2;
-    this.bakeRibbonUVs(this.jibMesh, J_CHORD, J_SEGS, 2, 3);
-    this.jibMesh.material = this.buildCanvasMat(scene);
+    // ── Boom pivot — only the boom (and the sails on it) rotate for sail trim.
+    //    The mast is now part of sloop-hull.glb and is stationary.
+    this.boomPivot = new TransformNode('boom_pivot', scene);
+    this.boomPivot.parent   = this.root;
+    this.boomPivot.position = Vector3.Zero();   // will calibrate after GLB testing
   }
 
   // ── Sail state ────────────────────────────────────────────────────────────
 
   setSailState(state: SailState): void {
     this.sailState = state;
-    this.updateSailMeshes();
+    if (this.sailFullRoot)    this.sailFullRoot.setEnabled(state === 'full');
+    if (this.sailReducedRoot) this.sailReducedRoot.setEnabled(state === 'topsails');
   }
 
   // ── Refloat ───────────────────────────────────────────────────────────────
@@ -441,28 +438,6 @@ export class VesselService {
     this.resetWake();
   }
 
-  private updateSailMeshes(): void {
-    if (!this.mainSailMesh || !this.jibMesh) return;
-    switch (this.sailState) {
-      case 'reefed':
-        // Hide both sails completely — a squished mesh looks wrong at the mast foot
-        this.mainSailMesh.setEnabled(false);
-        this.jibMesh.setEnabled(false);
-        break;
-      case 'topsails':
-        this.mainSailMesh.setEnabled(true);
-        this.mainSailMesh.scaling.y = 0.5;
-        this.jibMesh.setEnabled(true);
-        this.jibMesh.scaling.y = 0.5;
-        break;
-      case 'full':
-        this.mainSailMesh.setEnabled(true);
-        this.mainSailMesh.scaling.y = 1.0;
-        this.jibMesh.setEnabled(true);
-        this.jibMesh.scaling.y = 1.0;
-        break;
-    }
-  }
 
   // ── Sail efficiency curve ─────────────────────────────────────────────────
   // Redesigned to make close-hauled sailing viable (~52 % eff at minTackAngle).
@@ -661,9 +636,9 @@ export class VesselService {
       this.heading = ((this.heading + buoy.steeringBias * dt) + 360) % 360;
     }
 
-    // FLOAT_DRAFT: small fixed freeboard so the waterline sits at deck level in
-    // perfectly flat water (corrects for any systematic offset in the wave model).
-    const FLOAT_DRAFT = 0.05;
+    // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water.
+    // Negative = lower the vessel (increase draft visible below waterline).
+    const FLOAT_DRAFT = -0.75;
 
     // Cannon recoil: brief decaying heave + pitch oscillation after a broadside.
     let recoilY = 0, recoilPitchR = 0;
@@ -687,11 +662,36 @@ export class VesselService {
     this.root.rotation.z = buoy.rollRad  + (heelAngle * Math.PI / 180);
     this.root.rotation.x = buoy.pitchRad + recoilPitchR;
 
-    // Sail rotation — driven by the player-controlled sheet angle
+    // Sail rotation — driven by the player-controlled sheet angle.
+    // Square rig: boom is forward (0°) when running downwind and sweeps toward
+    // athwartship as the vessel heads upwind, so we offset by -90°.
     const swingDeg  = this.sheetAngleDeg;
     const swingSide = isPortTack ? -1 : 1;
-    if (this.mainSailPivot) this.mainSailPivot.rotation.y = swingSide * swingDeg * Math.PI / 180;
-    if (this.jibPivot)      this.jibPivot.rotation.y      = swingSide * swingDeg * 0.7 * Math.PI / 180;
+    const swingRad  = swingSide * (swingDeg - 90) * Math.PI / 180;
+    if (this.boomPivot)     this.boomPivot.rotation.y     = swingRad;
+
+    // Flag — rotate to face downwind relative to vessel heading
+    if (this.flagPivot) {
+      const windToDir = (this.currentWind.fromBearingDeg + 180) % 360;
+      this.flagPivot.rotation.y = (windToDir - this.heading) * Math.PI / 180;
+    }
+
+    // Procedural running rigging (Option B) — mainsheet and vang track the boom tip
+    if (this.rigLineMainsheet && this.rigLineVang) {
+      const alpha    = swingRad;
+      const boomTip  = new Vector3(
+        this.BOOM_LEN_TIP * Math.sin(alpha),
+        this.BOOM_Y_CONST,
+        this.MAST_Z - this.BOOM_LEN_TIP * Math.cos(alpha),
+      );
+      const boomNear = new Vector3(
+        1.5 * Math.sin(alpha),
+        this.BOOM_Y_CONST,
+        this.MAST_Z - 1.5 * Math.cos(alpha),
+      );
+      this.updateRigLine(this.rigLineMainsheet, boomTip,  new Vector3(0, 1.1,  -2.8));
+      this.updateRigLine(this.rigLineVang,      boomNear, new Vector3(0, 1.22, this.MAST_Z));
+    }
 
     // Torch flicker — multi-frequency sine waves + small random noise
     if (this.torchLights.length > 0) {
@@ -1135,149 +1135,6 @@ export class VesselService {
   }
 
   /**
-   * Procedural canvas-weave albedo (128 × 128).
-   * Alternating warp/weft threads using a cosine cross-section profile.
-   */
-  private makeCanvasAlbedo(scene: Scene, name: string): DynamicTexture {
-    const SZ  = 128;
-    const S   = 8;   // thread pitch in pixels
-    const tex = new DynamicTexture(name, { width: SZ, height: SZ }, scene, true);
-    const ctx = tex.getContext() as CanvasRenderingContext2D;
-    const img = ctx.createImageData(SZ, SZ);
-    const px  = img.data;
-
-    for (let y = 0; y < SZ; y++) {
-      const rowPhase = Math.floor(y / S) % 2;
-      for (let x = 0; x < SZ; x++) {
-        const colPhase = Math.floor(x / S) % 2;
-        const ty   = (y % S) / S;
-        const tx   = (x % S) / S;
-        const over = (colPhase === rowPhase);   // this thread is on top
-        // Cosine cross-section: raised in the centre, tapered at edges
-        const prof = over
-          ? 0.5 + 0.5 * Math.cos((tx - 0.5) * Math.PI * 2)
-          : 0.3 + 0.4 * Math.cos((ty - 0.5) * Math.PI * 2);
-        const base = over ? 230 : 215;
-        const val  = Math.round(base - prof * 30);
-        const idx  = (y * SZ + x) * 4;
-        px[idx + 0] = Math.min(255, val + 15);   // warm off-white
-        px[idx + 1] = Math.min(255, val + 8);
-        px[idx + 2] = Math.max(0,   val - 10);
-        px[idx + 3] = 255;
-      }
-    }
-
-    ctx.putImageData(img, 0, 0);
-    tex.update();
-    return tex;
-  }
-
-  /**
-   * Procedural canvas-weave normal map (128 × 128).
-   * Each thread arc contributes a normal that slopes toward its apex.
-   */
-  private makeCanvasNormal(scene: Scene, name: string): DynamicTexture {
-    const SZ  = 128;
-    const S   = 8;
-    const tex = new DynamicTexture(name + '_nrm', { width: SZ, height: SZ }, scene, false);
-    const ctx = tex.getContext() as CanvasRenderingContext2D;
-    const img = ctx.createImageData(SZ, SZ);
-    const px  = img.data;
-
-    for (let y = 0; y < SZ; y++) {
-      const rowPhase = Math.floor(y / S) % 2;
-      for (let x = 0; x < SZ; x++) {
-        const colPhase = Math.floor(x / S) % 2;
-        const ty   = (y % S) / S;
-        const tx   = (x % S) / S;
-        const over = (colPhase === rowPhase);
-        // Top thread: normal curves left-right (R channel)
-        // Under thread: normal curves up-down (G channel)
-        const nx = over ? Math.round(128 + 48 * Math.sin((tx - 0.5) * Math.PI)) : 128;
-        const ny = over ? 128 : Math.round(128 + 48 * Math.sin((ty - 0.5) * Math.PI));
-        const idx = (y * SZ + x) * 4;
-        px[idx + 0] = nx;
-        px[idx + 1] = ny;
-        px[idx + 2] = 220;   // slightly reduced Z — threads are rounded, not flat
-        px[idx + 3] = 255;
-      }
-    }
-
-    ctx.putImageData(img, 0, 0);
-    tex.update();
-    return tex;
-  }
-
-  /**
-   * Replace BabylonJS ribbon auto-UVs with world-space UVs so the canvas-weave
-   * texture tiles at a consistent physical size regardless of sail taper.
-   *
-   * BabylonJS CreateRibbon maps U 0→1 across the full width and V 0→1 along the
-   * full height, which stretches the texture to match the sail's aspect ratio.
-   * Instead we derive U from the local-space z-position and V from the y-position,
-   * then scale by tilesAcross / tilesUp so the texture repeats at the chosen rate.
-   *
-   * physWidth  — maximum z-extent of the sail in pivot-local space (boom length)
-   * physHeight — y-extent of the sail (boom to masthead)
-   * yBase      — local y at the foot of the sail (V = 0 origin)
-   */
-  private fixRibbonUVs(
-    mesh: Mesh,
-    physWidth: number,
-    physHeight: number,
-    yBase: number,
-    tilesAcross: number,
-    tilesUp: number,
-  ): void {
-    const pos = mesh.getVerticesData(VertexBuffer.PositionKind);
-    const raw = mesh.getVerticesData(VertexBuffer.UVKind);
-    if (!pos || !raw) return;
-
-    // Work on a mutable Float32Array copy — getVerticesData may return a view
-    const uvs = new Float32Array(raw.length);
-    const n   = pos.length / 3;
-    for (let i = 0; i < n; i++) {
-      const py = pos[i * 3 + 1];   // y → V (0 at foot, 1 at head)
-      const pz = pos[i * 3 + 2];   // z → U (0 at luff/mast, negative toward leech)
-      uvs[i * 2 + 0] = (-pz  / physWidth)  * tilesAcross;
-      uvs[i * 2 + 1] = ((py - yBase) / physHeight) * tilesUp;
-    }
-    mesh.updateVerticesData(VertexBuffer.UVKind, uvs);
-  }
-
-  /**
-   * Bake UV coordinates for a multi-path ribbon by path/vertex index.
-   *
-   * BabylonJS ribbon vertex ordering: all vertices of path 0, then path 1, etc.
-   * Within each path, vertices go from first to last (foot→head for our sails).
-   *
-   * U = pathIndex / (numPaths−1)  →  0=luff, 1=leech
-   * V = vertIndex / numSegs       →  0=foot, 1=head
-   *
-   * tilesAcross/tilesUp scale so canvas-weave threads have near-square physical size.
-   */
-  private bakeRibbonUVs(
-    mesh:        Mesh,
-    numPaths:    number,
-    numSegs:     number,
-    tilesAcross: number,
-    tilesUp:     number,
-  ): void {
-    const raw = mesh.getVerticesData(VertexBuffer.UVKind);
-    if (!raw) return;
-    const uvs        = new Float32Array(raw.length);
-    const vertsPerPath = numSegs + 1;
-    const n          = uvs.length / 2;
-    for (let k = 0; k < n; k++) {
-      const pathIdx = Math.floor(k / vertsPerPath);
-      const vertIdx = k % vertsPerPath;
-      uvs[k * 2 + 0] = (pathIdx / (numPaths - 1)) * tilesAcross;
-      uvs[k * 2 + 1] = (vertIdx / numSegs)         * tilesUp;
-    }
-    mesh.updateVerticesData(VertexBuffer.UVKind, uvs);
-  }
-
-  /**
    * Build (or retrieve from cache) the PBR material for a vessel part.
    * Dispatches on `part.materialType`; falls back to a flat-colour PBR for
    * any part that has no materialType annotation.
@@ -1424,36 +1281,6 @@ export class VesselService {
     return m;
   }
 
-  /**
-   * PBR canvas-weave material shared by all sails.
-   * Semi-transparent (alpha 0.92), double-sided, with woven albedo + normal map.
-   */
-  private buildCanvasMat(scene: Scene): PBRMaterial {
-    const key = 'canvas_sail';
-    if (this.matPool.has(key)) return this.matPool.get(key)!;
-
-    const alb = this.getTex(scene, 'canvas_alb', () => this.makeCanvasAlbedo(scene, 'canvas_alb'));
-    const nrm = this.getTex(scene, 'canvas_nrm', () => this.makeCanvasNormal(scene, 'canvas'));
-    // UV tiling is baked per-mesh via fixRibbonUVs — keep scale at 1 here
-    // so both mainsail and jib can have independent physical tile counts.
-    alb.uScale = 1; alb.vScale = 1;
-    nrm.uScale = 1; nrm.vScale = 1;
-    nrm.level  = 0.45;
-
-    const m = new PBRMaterial('canvas_sail_mat', scene);
-    m.albedoTexture    = alb;
-    m.bumpTexture      = nrm;
-    m.roughness        = 0.82;
-    m.metallic         = 0;
-    m.alpha            = 0.92;
-    m.transparencyMode = PBRMaterial.PBRMATERIAL_ALPHABLEND;
-    m.backFaceCulling  = false;
-    m.twoSidedLighting = true;
-
-    this.matPool.set(key, m);
-    return m;
-  }
-
   getPosition(): { x: number; z: number } {
     return { x: this.x, z: this.z };
   }
@@ -1468,6 +1295,14 @@ export class VesselService {
     if (canvas && this.wheelHandler) {
       canvas.removeEventListener('wheel', this.wheelHandler as EventListener);
     }
+    for (const m of [this.rigLineMainsheet, this.rigLineVang]) {
+      if (m) m.dispose();
+    }
+    this.rigLineMainsheet = null;
+    this.rigLineVang      = null;
+    this.boomPivot?.dispose(); this.boomPivot = null;
+    this.sailFullRoot    = null;   // disposed via mastPivot above
+    this.sailReducedRoot = null;
     for (const light of this.torchLights) light.dispose();
     this.torchLights     = [];
     this.torchFlameMats  = [];

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * The Archipelago of Ignis — ~100 islands.
+ * The Bay of Pirates — ~100 islands.
  *
  * Three zones:
  *   CENTRAL  (±3 000 X) — the neutral strait

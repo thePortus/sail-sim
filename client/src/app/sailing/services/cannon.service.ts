@@ -23,9 +23,9 @@ const BALL_POOL  = 8;            // max simultaneous cannonballs
 const ARC_HALF  = 60 * Math.PI / 180;
 
 // Muzzle tip in vessel root-local space.
-// Barrel cylinder (h=1.26) centred at x=±2.10 → tip at ±(2.10+0.63)=±2.73.
-const PORT_MUZ = { x: -2.73, y: 1.48, z: 0 } as const;
-const STBD_MUZ = { x:  2.73, y: 1.48, z: 0 } as const;
+// x = lateral offset (port −, starboard +); z = forward offset (bow = +Z).
+const PORT_MUZ = { x: -2.73, y: 2.48, z: 2.5 } as const;
+const STBD_MUZ = { x:  2.73, y: 2.48, z: 2.5 } as const;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -394,20 +394,10 @@ export class CannonService {
       return pivot;
     };
 
-    // Pivot is at the carriage centre — the natural traversal axis for the gun.
-    this.portPivot = reparent(new Vector3(-1.38, 1.34, 0), [
-      'cannon_port_carriage', 'cannon_port_barrel',
-      'cannon_port_band_breech', 'cannon_port_band_mid',
-      'cannon_port_muzzle_ring', 'cannon_port_cascabel',
-      'cannon_port_wheel_fwd', 'cannon_port_wheel_aft', 'cannon_port_axle',
-    ]);
-
-    this.stbdPivot = reparent(new Vector3(1.38, 1.34, 0), [
-      'cannon_stbd_carriage', 'cannon_stbd_barrel',
-      'cannon_stbd_band_breech', 'cannon_stbd_band_mid',
-      'cannon_stbd_muzzle_ring', 'cannon_stbd_cascabel',
-      'cannon_stbd_wheel_fwd', 'cannon_stbd_wheel_aft', 'cannon_stbd_axle',
-    ]);
+    // GLB with 180° Y-flip: sloop-cannon-port.glb stays on the port side (-X),
+    // sloop-cannon-starboard.glb stays on the starboard side (+X).
+    this.portPivot = reparent(new Vector3(-1.66, 2.57, 2.16), ['sloop_cannon_port']);
+    this.stbdPivot = reparent(new Vector3( 1.64, 2.51, 2.18), ['sloop_cannon_stbd']);
   }
 
   // ── Input ─────────────────────────────────────────────────────────────────
@@ -532,8 +522,8 @@ export class CannonService {
 
       // Active muzzle world position (local muzzle → world via heading rotation)
       const muz  = isPort ? PORT_MUZ : STBD_MUZ;
-      const mwx  = vs.x + muz.x * cosH;   // muz.z = 0, so just muz.x * cosH
-      const mwz  = vs.z - muz.x * sinH;   // standard BabylonJS local→world
+      const mwx  = vs.x + muz.x * cosH + muz.z * sinH;
+      const mwz  = vs.z - muz.x * sinH + muz.z * cosH;
 
       // Landing spot from muzzle in the clamped aim direction
       const v   = MIN_V + charge * (MAX_V - MIN_V);
@@ -653,9 +643,9 @@ export class CannonService {
     // Active side is whatever was last shown in tick()
     const isPort = this.activeSide() === 'port';
     const muz    = isPort ? PORT_MUZ : STBD_MUZ;
-    const mwx    = vs.x + muz.x * cosH;
+    const mwx    = vs.x + muz.x * cosH + muz.z * sinH;
     const mwy    = muz.y;
-    const mwz    = vs.z - muz.x * sinH;
+    const mwz    = vs.z - muz.x * sinH + muz.z * cosH;
 
     const bvx = this.aimDirX * vh;
     const bvz = this.aimDirZ * vh;

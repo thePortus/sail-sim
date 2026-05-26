@@ -26,6 +26,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use('/', express.static(path.join(__dirname, 'pages')))
 app.use('/api', express.static(path.join(__dirname, 'pages')));
+app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry')));
 // set API routes
 require('./routes/index')(app);
 

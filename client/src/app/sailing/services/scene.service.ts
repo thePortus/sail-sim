@@ -28,6 +28,11 @@ export class SceneService {
   private sunMesh!:   Mesh;
   private glowLayer!: GlowLayer;
 
+  /** Exclude a mesh from the glow/emissive composite pass (WebGPU-safe). */
+  excludeFromGlow(mesh: Mesh): void {
+    this.glowLayer?.addExcludedMesh(mesh);
+  }
+
   // Shadow generator — attached to the sun DirectionalLight and exposed so that
   // VesselService, TerrainService, CannonService, and MultiplayerService can
   // register their meshes as casters / receivers.
@@ -62,6 +67,10 @@ export class SceneService {
   private _cachedExposure = 1.0;
   private _cachedContrast = 1.10;
   private _cachedBloomW   = 0.28;   // bloomWeight cache (setter fires per-call with no guard)
+  private _cachedBloomThreshold = 0.78;
+  private _cachedBloomEnabled = true;
+  private _cachedGrainAnimated = true;
+  private _cachedGrainIntensity = 12;
 
   // 1 real second = 1 game minute → full day/night cycle every 24 real minutes.
   private gameHours = 10.5;
@@ -86,7 +95,8 @@ export class SceneService {
     await this.zone.runOutsideAngular(async () => {
 
       // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
-      const gpuSupported = typeof navigator !== 'undefined' && !!navigator.gpu;
+      const FORCE_WEBGL = false;
+      const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined' && !!navigator.gpu;
 
       if (gpuSupported) {
         try {
@@ -306,6 +316,7 @@ export class SceneService {
     const dir     = this.computeSunDir();
     const h       = dir.y;              // -1 midnight → +1 noon
     const above   = Math.max(0, h);     // 0..1 above horizon
+    const isNight = h < -0.05;
     // Spikes near horizon for sunrise/sunset colour effects
     const horizon = Math.max(0, 1 - Math.abs(h) / 0.22);
 
@@ -348,17 +359,49 @@ export class SceneService {
         Math.min(1, 0.28 + above * 0.72) * occT,
         Math.min(1, 0.10 + above * 0.82) * occT,
       );
-      this.glowLayer.intensity = Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT);
+      // Clamp solar glow below the horizon so terrain cannot be brightened by bloom/glow at night.
+      this.glowLayer.intensity = h > 0.02
+        ? Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT)
+        : 0;
     }
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
     if (this.pipeline) {
+      // Hard-disable dynamic post FX at night to eliminate visible luminance pulsing.
+      const bloomEnabled = !isNight;
+      if (bloomEnabled !== this._cachedBloomEnabled) {
+        this.pipeline.bloomEnabled = bloomEnabled;
+        this._cachedBloomEnabled = bloomEnabled;
+      }
+
+      const grainAnimated = !isNight;
+      if (grainAnimated !== this._cachedGrainAnimated) {
+        this.pipeline.grain.animated = grainAnimated;
+        this._cachedGrainAnimated = grainAnimated;
+      }
+
+      const grainIntensity = isNight ? 4 : 12;
+      if (Math.abs(grainIntensity - this._cachedGrainIntensity) > this.PIPELINE_EPS) {
+        this.pipeline.grain.intensity = grainIntensity;
+        this._cachedGrainIntensity = grainIntensity;
+      }
+
+      // 0 in daytime, ramps to 1 shortly after sunset to suppress non-emissive glow.
+      const nightBlend = isNight ? 1 : Math.max(0, Math.min(1, (-h - 0.03) / 0.20));
+
       // bloomWeight: throttle like exposure/contrast — the DefaultRenderingPipeline
       // setter chain fires internal observers on every write.
-      const newBloomW = Math.max(0.12, 0.26 + horizon * 0.58 - cloud * 0.30);
+      const dayBloomW = Math.max(0.12, 0.26 + horizon * 0.58 - cloud * 0.30);
+      const newBloomW = Math.max(0, dayBloomW * (1 - nightBlend));
       if (Math.abs(newBloomW - this._cachedBloomW) > this.PIPELINE_EPS) {
         this.pipeline.bloomWeight = newBloomW;
         this._cachedBloomW = newBloomW;
+      }
+
+      const newBloomThreshold = 0.78 + nightBlend * 0.35;
+      if (Math.abs(newBloomThreshold - this._cachedBloomThreshold) > this.PIPELINE_EPS) {
+        this.pipeline.bloomThreshold = newBloomThreshold;
+        this._cachedBloomThreshold = newBloomThreshold;
       }
 
       // exposure and contrast setters fire onUpdateParameters with NO equality
@@ -367,8 +410,12 @@ export class SceneService {
       // WebGPU bind-group recreation stall during dawn/dusk.  Only push a new
       // value when it has changed by more than PIPELINE_EPS (≈ every 0.5 s
       // real-time during the transition window, invisible at the rate the sky moves).
-      const newExposure = Math.max(0.85, 1.0 + horizon * 0.40 - cloud * 0.16);
-      const newContrast = Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
+      const newExposure = isNight
+        ? 0.58
+        : Math.max(0.52, 1.0 + horizon * 0.40 - cloud * 0.16 - nightBlend * 0.38);
+      const newContrast = isNight
+        ? 1.06
+        : Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
       if (Math.abs(newExposure - this._cachedExposure) > this.PIPELINE_EPS) {
         this.pipeline.imageProcessing.exposure = newExposure;
         this._cachedExposure = newExposure;
@@ -393,20 +440,28 @@ export class SceneService {
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.
     // Smooth transition: full moon feel with cool blue-white tones.
     this.moonLight.direction = dir;               // toward-sun = away-from-sun's direction
-    this.moonLight.intensity = Math.max(0, -h * 0.35) * (1 - cloud * 0.40);
+    this.moonLight.intensity = (isNight ? Math.max(0, -h * 0.16) : Math.max(0, -h * 0.35)) * (1 - cloud * 0.35);
 
     // ── Hemisphere (ambient sky fill) ─────────────────────────────────────────
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
-    this.ambient.intensity = 0.10 + above * 0.38 + cloud * 0.06;
+    this.ambient.intensity = isNight
+      ? 0.035 + cloud * 0.02
+      : 0.10 + above * 0.38 + cloud * 0.06;
     // Lerp between standard daylight ambient and warm golden-hour tones.
-    const dayAmbient  = new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
+    const dayAmbient  = isNight
+      ? new Color3(0.20, 0.25, 0.35)
+      : new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
     const warmAmbient = new Color3(1.0, 0.68, 0.30);
-    this.ambient.diffuse     = Color3.Lerp(dayAmbient, warmAmbient, horizon * 0.60);
-    this.ambient.groundColor = new Color3(
-      0.04 + above * 0.14 + horizon * 0.26,
-      0.07 + above * 0.16 + horizon * 0.08,
-      Math.max(0, 0.14 + above * 0.10 - horizon * 0.09),
-    );
+    // Restrict warm amber fill to daytime golden hour only.
+    const warmMix = h > 0 ? horizon * 0.60 : 0;
+    this.ambient.diffuse     = Color3.Lerp(dayAmbient, warmAmbient, warmMix);
+    this.ambient.groundColor = isNight
+      ? new Color3(0.01, 0.02, 0.05)
+      : new Color3(
+        0.04 + above * 0.14 + horizon * 0.26,
+        0.07 + above * 0.16 + horizon * 0.08,
+        Math.max(0, 0.14 + above * 0.10 - horizon * 0.09),
+      );
 
     // ── Fog and scene clear colour ─────────────────────────────────────────────
     // night deep navy → dawn warm orange → full day sea blue

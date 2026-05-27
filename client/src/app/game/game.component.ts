@@ -230,76 +230,95 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     }
     this.phase.set('initializing');
 
-    // ── 0. Verify the JWT is still accepted by this server instance ───────────
-    // Guards against stale cached tokens surviving a server wipe or secret rotation.
-    this.loadingMsg.set('Verifying credentials…');
     try {
-      await firstValueFrom(
-        this.http.get(`${Settings.apiUrl}user/me`)
-      );
-    } catch {
-      // 401 or network error — token is invalid; force re-login
-      this.authService.clearStorage();
+      await this.runInitStep('verify-auth', 'Verifying credentials…', async () => {
+        await firstValueFrom(this.http.get(`${Settings.apiUrl}user/me`));
+      });
+
+      // 1. Boot BabylonJS scene (WebGPU/WebGL)
+      await this.runInitStep('init-scene', 'Preparing the ocean…', async () => {
+        await this.sceneService.initAsync(this.canvasRef.nativeElement);
+      });
+
+      // 2. Build ocean + atmosphere
+      await this.runInitStep('init-ocean-clouds', 'Preparing the ocean…', async () => {
+        await this.oceanService.init();
+        this.cloudService.init();
+      });
+
+      // 3. Load terrain
+      await this.runInitStep('init-terrain', 'Surveying the coastline…', async () => {
+        await this.terrainService.init();
+      });
+
+      // 4. Fetch vessel
+      const vessel = await this.runInitStep('fetch-vessel', 'Rigging your vessel…', async () => {
+        return await firstValueFrom(
+          this.http.get<Vessel>(`${Settings.apiUrl}vessels/${this.selectedSlug}`),
+        );
+      });
+
+      // 5. Determine spawn
+      const defaultSpawn = this.terrainService.nearestSpawn(0, 0);
+      let spawnX = defaultSpawn.spawnX;
+      let spawnZ = defaultSpawn.spawnZ;
+      let spawnHeading = defaultSpawn.heading;
+
+      const saved = await this.runInitStep('load-player-location', 'Checking your last anchorage…', async () => {
+        return await firstValueFrom(
+          this.http.get<{ x: number; z: number; heading: number } | null>(
+            `${Settings.apiUrl}player-location/${encodeURIComponent(this.callsign)}`,
+          ).pipe(catchError(() => of(null))),
+        );
+      });
+
+      if (saved && typeof saved.x === 'number') {
+        spawnX = saved.x;
+        spawnZ = saved.z;
+        spawnHeading = saved.heading ?? 270;
+        this.loadingMsg.set('Returning to your last anchorage…');
+      }
+
+      await this.runInitStep('init-vessel', 'Rigging your vessel…', async () => {
+        await this.vesselService.init(vessel, spawnX, spawnZ, spawnHeading);
+      });
+
+      await this.runInitStep('init-cannons', 'Arming the cannons…', async () => {
+        this.cannonService.init();
+      });
+
+      await this.runInitStep('init-music', 'Tuning the instruments…', async () => {
+        this.musicService.init(Settings.apiUrl);
+      });
+
+      await this.runInitStep('start-weather', 'Reading the wind…', async () => {
+        this.weatherService.start();
+      });
+
+      await this.runInitStep('connect-multiplayer', 'Raising signal flags…', async () => {
+        this.multiplayerService.connect(this.callsign);
+      });
+
+      this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
+      this.phase.set('sailing');
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      console.error('[GameInit] Fatal startup error:', err);
+      this.loadingMsg.set('Startup failed. Check browser console for [GameInit] logs.');
       this.phase.set('selecting');
-      this.router.navigate(['/login']);
       return;
     }
+  }
 
-    // 1. Boot BabylonJS scene (WebGPU — async device acquisition)
-    this.loadingMsg.set('Preparing the ocean…');
-    await this.sceneService.initAsync(this.canvasRef.nativeElement);
-
-    // 2. Build ocean + atmosphere
-    await this.oceanService.init();
-    this.cloudService.init();
-
-    // 3. Load terrain from elevation map artifacts
-    this.loadingMsg.set('Surveying the coastline…');
-    await this.terrainService.init();
-    // 4. Fetch vessel definition
-    this.loadingMsg.set('Rigging your vessel…');
-    const vessel = await firstValueFrom(
-      this.http.get<Vessel>(`${Settings.apiUrl}vessels/${this.selectedSlug}`)
-    );
-
-    // 5. Determine spawn — try saved location first, fall back to terrain spawn
-    const defaultSpawn = this.terrainService.nearestSpawn(0, 0);
-    let spawnX       = defaultSpawn.spawnX;
-    let spawnZ       = defaultSpawn.spawnZ;
-    let spawnHeading = defaultSpawn.heading;
-
-    const saved = await firstValueFrom(
-      this.http.get<{ x: number; z: number; heading: number } | null>(
-        `${Settings.apiUrl}player-location/${encodeURIComponent(this.callsign)}`
-      ).pipe(catchError(() => of(null)))
-    );
-    if (saved && typeof saved.x === 'number') {
-      spawnX       = saved.x;
-      spawnZ       = saved.z;
-      spawnHeading = saved.heading ?? 270;
-      this.loadingMsg.set('Returning to your last anchorage…');
+  private async runInitStep<T>(tag: string, message: string, fn: () => Promise<T>): Promise<T> {
+    this.loadingMsg.set(message);
+    try {
+      return await fn();
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      console.error(`[GameInit:${tag}]`, err);
+      throw err;
     }
-
-    await this.vesselService.init(vessel, spawnX, spawnZ, spawnHeading);
-
-    // 5b. Arm the cannons (must be after vessel + scene are ready)
-    this.cannonService.init();
-
-    // 5c. Start music (requires a prior user gesture — vessel selection click counts)
-    this.musicService.init(Settings.apiUrl);
-
-    // 6. Weather
-    this.loadingMsg.set('Reading the wind…');
-    this.weatherService.start();
-
-    // 7. Multiplayer — connect using the player's callsign
-    this.multiplayerService.connect(this.callsign);
-
-    // 8. Auto-save position every 30 s while sailing
-    this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
-
-    // 9. Done
-    this.phase.set('sailing');
   }
 
   /** PUT the current position to the server so it survives a reload. */

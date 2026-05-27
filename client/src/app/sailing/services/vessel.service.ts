@@ -200,6 +200,9 @@ export class VesselService {
     // Load GLB geometry parts (hull, mast, flag, sails, cannons)
     await this.buildGLBMeshes(scene);
 
+    // Torch point lights should illuminate the ship, not distant terrain.
+    this.configureTorchLightAffectors();
+
     // Register every hull / rig / sail mesh with the WaterMaterial so it appears
     // in both the reflection RTT (mirror of the above-water hull in the surface)
     // and the refraction RTT (the submerged hull visible through the water).
@@ -215,6 +218,15 @@ export class VesselService {
         sg.addShadowCaster(mesh, true);
         mesh.receiveShadows = true;
       }
+    }
+  }
+
+  private configureTorchLightAffectors(): void {
+    const vesselMeshes = this.root.getChildMeshes();
+    for (const light of this.torchLights) {
+      light.includedOnlyMeshes = vesselMeshes;
+      light.range = 3.8;
+      light.intensity = 0.5;
     }
   }
 
@@ -754,11 +766,9 @@ export class VesselService {
       for (let i = 0; i < this.torchLights.length; i++) {
         const offset = i * 2.73;
         const flicker =
-          Math.sin(t * 9.1  + offset)       * 0.14 +
-          Math.sin(t * 17.3 + offset * 1.7) * 0.07 +
-          Math.sin(t * 31.7 + offset * 3.1) * 0.04 +
-          (Math.random() - 0.5)              * 0.07;
-        const intensity = Math.max(0.45, 0.85 + flicker);
+          Math.sin(t * 4.6  + offset)       * 0.03 +
+          Math.sin(t * 8.9 + offset * 1.7)  * 0.015;
+        const intensity = Math.max(0.42, 0.50 + flicker);
         this.torchLights[i].intensity = intensity;
         if (this.torchFlameMats[i]) {
           // Shift emissive between deep orange and bright yellow-orange

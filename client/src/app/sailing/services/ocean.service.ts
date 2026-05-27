@@ -131,6 +131,9 @@ uniform vec3  u_cameraPosition;
 uniform float u_Time;
 uniform float u_WaveDepth;
 uniform float u_WaveFreq;
+uniform vec2  u_BoatPos;
+uniform vec2  u_BoatDir;
+uniform float u_BoatSpeed;
 uniform sampler2D u_reflectionSampler;
 
 varying vec3 v_worldPos;

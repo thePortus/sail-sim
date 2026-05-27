@@ -1,6 +1,7 @@
 import { Component, Output, EventEmitter, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MusicService } from '../../services/music.service';
+import { TerrainService } from '../../services/terrain.service';
 
 @Component({
   selector: 'app-pause-menu',
@@ -38,6 +39,23 @@ import { MusicService } from '../../services/music.service';
                   [disabled]="music.trackList().length <= 1">
             ⏭ Next Track
           </button>
+        </div>
+      </div>
+
+      <!-- Graphics section -->
+      <div class="pause-section">
+        <div class="pause-section-label">Graphics</div>
+
+        <div class="quality-row">
+          <span class="quality-label">Shadows</span>
+          <span class="quality-value">{{ shadowLabels[shadowQuality] }}</span>
+        </div>
+        <input type="range" min="0" max="3" step="1"
+               [value]="shadowQuality"
+               (input)="onShadowQuality($event)"
+               class="quality-slider" />
+        <div class="quality-ticks">
+          <span>Off</span><span>Low</span><span>Medium</span><span>High</span>
         </div>
       </div>
 
@@ -153,6 +171,43 @@ import { MusicService } from '../../services/music.service';
     }
     .pause-btn--danger:hover { color: rgba(255,100,100,0.85); border-color: rgba(255,100,100,0.25); }
 
+    /* ── Quality slider ───────────────────────────────────────────────────── */
+    .quality-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .quality-label {
+      font-family: monospace; font-size: 0.8rem; color: rgba(255,255,255,0.60);
+    }
+    .quality-value {
+      font-family: monospace; font-size: 0.75rem; color: #c8a44a;
+      min-width: 3.5rem; text-align: right;
+    }
+    .quality-slider {
+      width: 100%; height: 4px; margin: 0.25rem 0;
+      appearance: none; -webkit-appearance: none;
+      background: rgba(255,255,255,0.12);
+      border-radius: 2px; cursor: pointer; outline: none;
+    }
+    .quality-slider::-webkit-slider-thumb {
+      appearance: none; -webkit-appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: #c8a44a;
+      box-shadow: 0 0 6px rgba(200,164,74,0.50);
+      cursor: pointer;
+    }
+    .quality-slider::-moz-range-thumb {
+      width: 14px; height: 14px; border-radius: 50%; border: none;
+      background: #c8a44a;
+      box-shadow: 0 0 6px rgba(200,164,74,0.50);
+      cursor: pointer;
+    }
+    .quality-ticks {
+      display: flex; justify-content: space-between;
+      font-family: monospace; font-size: 0.6rem;
+      color: rgba(255,255,255,0.25);
+      margin-top: 0.1rem;
+    }
+
     /* ── Footer ───────────────────────────────────────────────────────────── */
     .pause-hint {
       text-align: center; font-family: monospace;
@@ -169,7 +224,11 @@ export class PauseMenuComponent {
   @Output() resume = new EventEmitter<void>();
   @Output() quit   = new EventEmitter<void>();
 
-  readonly music = inject(MusicService);
+  readonly music   = inject(MusicService);
+  private readonly terrain = inject(TerrainService);
+
+  readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
+  shadowQuality = this.terrain.getShadowQuality();
 
   onResume(): void { this.resume.emit(); }
   onQuit():   void { this.quit.emit();   }
@@ -180,5 +239,10 @@ export class PauseMenuComponent {
 
   async nextTrack(): Promise<void> {
     await this.music.next();
+  }
+
+  onShadowQuality(event: Event): void {
+    this.shadowQuality = +(event.target as HTMLInputElement).value;
+    this.terrain.setShadowQuality(this.shadowQuality);
   }
 }

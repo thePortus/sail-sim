@@ -14,6 +14,7 @@ import {
   Quaternion,
   Scene,
   InstancedMesh,
+  DirectionalLight,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds } from '../models';
@@ -46,6 +47,15 @@ export class TerrainService {
   private treePatches: TreePatch[] = [];
   private treeInstances: InstancedMesh[] = [];
   private treeCullingObserver: any = null;
+  private terrainShadowTexture: DynamicTexture | null = null;
+  private terrainShadowObserver: any = null;
+  private terrainShadowFrame = 0;
+  private shadowQualityLevel = 2;
+
+  private readonly TERRAIN_SHADOW_RES = 128;
+  private readonly TERRAIN_SHADOW_WORLD_SIZE = 7000;
+  private terrainShadowSteps = 22;
+  private terrainShadowUpdateEvery = 4;
 
   async init(): Promise<void> {
     if (!this.manifest || !this.heightfield) {
@@ -67,6 +77,12 @@ export class TerrainService {
 
   dispose(): void {
     this.disposeFoliage();
+    if (this.terrainShadowObserver) {
+      this.sceneService.scene.onBeforeRenderObservable.remove(this.terrainShadowObserver);
+      this.terrainShadowObserver = null;
+    }
+    this.terrainShadowTexture?.dispose();
+    this.terrainShadowTexture = null;
     this.terrainMesh?.dispose();
     this.terrainMesh = null;
     this.terrainMaterial?.dispose();
@@ -247,6 +263,127 @@ export class TerrainService {
 
     this.terrainMesh = mesh;
     this.buildTreeFoliage(scene, manifest);
+    this.setupTerrainShadowMask(scene);
+  }
+
+  private setupTerrainShadowMask(scene: Scene): void {
+    if (this.terrainShadowTexture) return;
+
+    // Apply persisted quality before the first update runs.
+    const saved = parseInt(localStorage.getItem('shadow-quality') ?? '2', 10);
+    this.applyQualityLevel(saved);
+
+    this.terrainShadowTexture = new DynamicTexture(
+      'terrainShadowMask',
+      { width: this.TERRAIN_SHADOW_RES, height: this.TERRAIN_SHADOW_RES },
+      scene,
+      false,
+    );
+    this.terrainShadowTexture.hasAlpha = false;
+
+    this.updateTerrainShadowMask();
+    this.terrainShadowObserver = scene.onBeforeRenderObservable.add(() => {
+      this.terrainShadowFrame++;
+      if (this.terrainShadowFrame % this.terrainShadowUpdateEvery !== 0) return;
+      this.updateTerrainShadowMask();
+    });
+  }
+
+  private updateTerrainShadowMask(): void {
+    const texture = this.terrainShadowTexture;
+    const camera = this.sceneService.camera;
+    if (!texture || !camera || !this.manifest || !this.heightfield) return;
+
+    const sun = this.sceneService.scene.lights.find(
+      (l): l is DirectionalLight => l instanceof DirectionalLight && l.name === 'sun',
+    );
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+    const size = this.TERRAIN_SHADOW_WORLD_SIZE;
+
+    if (this.shadowQualityLevel === 0 || !sun || sun.direction.y >= -0.01) {
+      const clearCtx = texture.getContext();
+      clearCtx.fillStyle = 'rgb(0,0,0)';
+      clearCtx.fillRect(0, 0, this.TERRAIN_SHADOW_RES, this.TERRAIN_SHADOW_RES);
+      texture.update();
+      this.oceanService.setTerrainShadowMask(texture, cx, cz, size, 0);
+      return;
+    }
+
+    const dir = sun.direction.normalizeToNew();
+    const marchX = -dir.x;
+    const marchZ = -dir.z;
+    const rayRisePerMeter = Math.max(0.015, -dir.y);
+
+    const maxDistance = size * 0.80;
+    const stepDistance = maxDistance / this.terrainShadowSteps;
+
+    const res = this.TERRAIN_SHADOW_RES;
+    const half = size * 0.5;
+    const worldPerTexel = size / (res - 1);
+
+    const ctx = texture.getContext();
+    const imageData = ctx.getImageData(0, 0, res, res);
+    const data = imageData.data;
+
+    let ptr = 0;
+    for (let py = 0; py < res; py++) {
+      const wz = (cz + half) - py * worldPerTexel;
+      for (let px = 0; px < res; px++) {
+        const wx = (cx - half) + px * worldPerTexel;
+        const ground = this.getElevation(wx, wz);
+
+        let mask = 0;
+        if (ground <= 0.2) {
+          for (let s = 1; s <= this.terrainShadowSteps; s++) {
+            const dist = stepDistance * s;
+            const sx = wx + marchX * dist;
+            const sz = wz + marchZ * dist;
+            const hTerrain = this.getElevation(sx, sz);
+            const hRay = rayRisePerMeter * dist;
+            if (hTerrain > hRay + 2.0) {
+              mask = 1;
+              break;
+            }
+          }
+        }
+
+        const v = mask ? 255 : 0;
+        data[ptr++] = v;
+        data[ptr++] = v;
+        data[ptr++] = v;
+        data[ptr++] = 255;
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+    texture.update();
+
+    const strength = Math.max(0.25, Math.min(0.9, 0.25 + (1 - Math.max(0, rayRisePerMeter)) * 0.45));
+    this.oceanService.setTerrainShadowMask(texture, cx, cz, size, strength);
+  }
+
+  // ── Shadow quality ────────────────────────────────────────────────────────
+
+  getShadowQuality(): number {
+    return parseInt(localStorage.getItem('shadow-quality') ?? '2', 10);
+  }
+
+  setShadowQuality(level: number): void {
+    this.applyQualityLevel(level);
+    localStorage.setItem('shadow-quality', String(level));
+    if (this.terrainShadowTexture) this.updateTerrainShadowMask();
+  }
+
+  private applyQualityLevel(level: number): void {
+    this.shadowQualityLevel = level;
+    switch (level) {
+      case 0:  this.terrainShadowSteps =  1; this.terrainShadowUpdateEvery = 999; break;
+      case 1:  this.terrainShadowSteps = 12; this.terrainShadowUpdateEvery =   8; break;
+      case 2:  this.terrainShadowSteps = 22; this.terrainShadowUpdateEvery =   4; break;
+      default: this.terrainShadowSteps = 40; this.terrainShadowUpdateEvery =   1; break;
+    }
   }
 
   private buildTreeFoliage(scene: Scene, manifest: TerrainManifest): void {

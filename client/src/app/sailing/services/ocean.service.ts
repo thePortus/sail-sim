@@ -1,8 +1,9 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  MirrorTexture, Plane,
+  MirrorTexture, Plane, Texture,
 } from '@babylonjs/core';
+import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
 import { SeaConditions, Wind } from '../models';
 
@@ -141,6 +142,10 @@ uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
 uniform sampler2D u_reflectionSampler;
+uniform sampler2D u_terrainShadowMask;
+uniform vec2  u_terrainShadowCenter;
+uniform float u_terrainShadowSize;
+uniform float u_terrainShadowStrength;
 
 #ifdef WEBGPU
 layout(location = 0) in vec3 v_worldPos;
@@ -281,6 +286,13 @@ vec3 aces_tonemap(vec3 color) {
   return pow(clamp(m2 * (a / b), 0.0, 1.0), vec3(1.0 / 2.2));
 }
 
+float terrainShadowMask(vec2 worldXZ) {
+  float halfSize = max(1.0, u_terrainShadowSize * 0.5);
+  vec2 uv = (worldXZ - u_terrainShadowCenter) / (halfSize * 2.0) + 0.5;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+  return texture2D(u_terrainShadowMask, uv).r;
+}
+
 void main() {
   float depth = u_WaveDepth;
   vec2 worldXZ = v_worldPos.xz;
@@ -304,8 +316,11 @@ void main() {
   screenUV = clamp(screenUV, 0.001, 0.999);
   vec3 reflectionRTT = texture2D(u_reflectionSampler, screenUV).rgb;
   vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80);
+  float terrainShadow = terrainShadowMask(worldXZ) * clamp(u_terrainShadowStrength, 0.0, 1.0);
+  reflection *= (1.0 - terrainShadow * 0.40);
   float wakeT = max(v_wakeMask, wakeMask(worldXZ));
   vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
+  scattering *= (1.0 - terrainShadow * 0.75);
   vec3 color = fresnel * reflection + scattering;
   float wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
   color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
@@ -316,6 +331,324 @@ void main() {
 #else
   gl_FragColor = outCol;
 #endif
+}
+`;
+
+const OCEAN_VERT_WGSL = `
+attribute position: vec3f;
+varying v_worldPos: vec3f;
+varying v_projPos: vec4f;
+varying v_wakeMask: f32;
+
+uniform worldViewProjection: mat4x4f;
+uniform world: mat4x4f;
+
+uniform u_Time: f32;
+uniform u_WorldOffset: vec2f;
+uniform u_MeshHalfSize: f32;
+uniform u_DisplaceScale: f32;
+uniform u_WaveDepth: f32;
+uniform u_WaveFreq: f32;
+uniform u_BoatPos: vec2f;
+uniform u_BoatDir: vec2f;
+uniform u_BoatSpeed: f32;
+
+const DRAG_MULT: f32 = 0.38;
+const ITERATIONS: i32 = 24;
+
+fn wavedx(position: vec2f, direction: vec2f, frequency: f32, timeshift: f32) -> vec2f {
+  let x = dot(direction, position) * frequency + timeshift;
+  let wave = exp(sin(x) - 1.0);
+  let dx = wave * cos(x);
+  return vec2f(wave, -dx);
+}
+
+fn getwaves(positionIn: vec2f) -> f32 {
+  var position = positionIn;
+  let wavePhaseShift = length(position) * 0.1;
+  var iter = 0.0;
+  var frequency = 1.0;
+  var timeMultiplier = 2.0;
+  var weight = 1.0;
+  var sum = 0.0;
+  var sumW = 0.0;
+
+  for (var i: i32 = 0; i < ITERATIONS; i = i + 1) {
+    let p = vec2f(sin(iter), cos(iter));
+    let res = wavedx(position, p, frequency, uniforms.u_Time * timeMultiplier + wavePhaseShift);
+    position += p * res.y * weight * DRAG_MULT;
+    sum += res.x * weight;
+    sumW += weight;
+    weight = mix(weight, 0.0, 0.2);
+    frequency *= 1.18;
+    timeMultiplier *= 1.07;
+    iter += 1232.399963;
+  }
+  return sum / max(sumW, 1e-5);
+}
+
+fn wakeDisplacement(worldPos: vec2f) -> f32 {
+  let rel = worldPos - uniforms.u_BoatPos;
+  let along = dot(rel, -uniforms.u_BoatDir);
+  if (along <= 0.0) {
+    return 0.0;
+  }
+
+  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
+  let lateral = dot(rel, right);
+
+  let width = 4.8 + min(10.0, uniforms.u_BoatSpeed * 0.42);
+  let depth = 0.36 + min(1.05, uniforms.u_BoatSpeed * 0.060);
+  let build = 1.0 - exp(-along * 0.030);
+  let trail = exp(-along * 0.0082);
+
+  let trench = exp(-(lateral * lateral) / (width * width));
+  let shoulderOffset = abs(lateral) - width * 1.55;
+  let shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
+
+  let ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
+  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+}
+
+fn wakeMask(worldPos: vec2f) -> f32 {
+  let rel = worldPos - uniforms.u_BoatPos;
+  let along = dot(rel, -uniforms.u_BoatDir);
+  if (along <= 0.0) {
+    return 0.0;
+  }
+
+  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
+  let lateral = dot(rel, right);
+  let width = 12.0 + min(18.0, uniforms.u_BoatSpeed * 1.10);
+  let spread = exp(-(lateral * lateral) / (width * width));
+  let trail = exp(-along * 0.0068);
+  let build = 1.0 - exp(-along * 0.026);
+  return clamp(spread * trail * build, 0.0, 1.0);
+}
+
+@vertex
+fn main(input: VertexInputs) -> FragmentInputs {
+  let wx = input.position.x + uniforms.u_WorldOffset.x;
+  let wz = input.position.z + uniforms.u_WorldOffset.y;
+
+  let d = max(abs(input.position.x), abs(input.position.z));
+  let fade = uniforms.u_DisplaceScale * (1.0 - smoothstep(
+    uniforms.u_MeshHalfSize * 0.80,
+    uniforms.u_MeshHalfSize * 0.97,
+    d
+  ));
+
+  var pos = input.position;
+
+  if (fade > 0.001) {
+    let wavePos = vec2f(wx, wz) * uniforms.u_WaveFreq;
+    var h = (getwaves(wavePos) - 0.5) * uniforms.u_WaveDepth;
+    h += wakeDisplacement(vec2f(wx, wz));
+    pos.y += h * fade;
+  }
+
+  vertexOutputs.v_wakeMask = wakeMask(vec2f(wx, wz));
+  vertexOutputs.v_worldPos = (uniforms.world * vec4f(pos, 1.0)).xyz;
+  vertexOutputs.position = uniforms.worldViewProjection * vec4f(pos, 1.0);
+  vertexOutputs.v_projPos = vertexOutputs.position;
+}
+`;
+
+const OCEAN_FRAG_WGSL = `
+uniform u_cameraPosition: vec3f;
+uniform u_Time: f32;
+uniform u_WaveDepth: f32;
+uniform u_WaveFreq: f32;
+uniform u_BoatPos: vec2f;
+uniform u_BoatDir: vec2f;
+uniform u_BoatSpeed: f32;
+var u_reflectionSamplerSampler: sampler;
+var u_reflectionSampler: texture_2d<f32>;
+var u_terrainShadowMaskSampler: sampler;
+var u_terrainShadowMask: texture_2d<f32>;
+uniform u_terrainShadowCenter: vec2f;
+uniform u_terrainShadowSize: f32;
+uniform u_terrainShadowStrength: f32;
+
+varying v_worldPos: vec3f;
+varying v_projPos: vec4f;
+varying v_wakeMask: f32;
+
+const DRAG_MULT: f32 = 0.38;
+const ITERATIONS: i32 = 24;
+
+fn wavedx(position: vec2f, direction: vec2f, frequency: f32, timeshift: f32) -> vec2f {
+  let x = dot(direction, position) * frequency + timeshift;
+  let wave = exp(sin(x) - 1.0);
+  let dx = wave * cos(x);
+  return vec2f(wave, -dx);
+}
+
+fn getwaves(positionIn: vec2f) -> f32 {
+  var position = positionIn;
+  let wavePhaseShift = length(position) * 0.1;
+  var iter = 0.0;
+  var frequency = 1.0;
+  var timeMultiplier = 2.0;
+  var weight = 1.0;
+  var sum = 0.0;
+  var sumW = 0.0;
+
+  for (var i: i32 = 0; i < ITERATIONS; i = i + 1) {
+    let p = vec2f(sin(iter), cos(iter));
+    let res = wavedx(position, p, frequency, uniforms.u_Time * timeMultiplier + wavePhaseShift);
+    position += p * res.y * weight * DRAG_MULT;
+    sum += res.x * weight;
+    sumW += weight;
+    weight = mix(weight, 0.0, 0.2);
+    frequency *= 1.18;
+    timeMultiplier *= 1.07;
+    iter += 1232.399963;
+  }
+  return sum / max(sumW, 1e-5);
+}
+
+fn wakeDisplacement(worldPos: vec2f) -> f32 {
+  let rel = worldPos - uniforms.u_BoatPos;
+  let along = dot(rel, -uniforms.u_BoatDir);
+  if (along <= 0.0) {
+    return 0.0;
+  }
+
+  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
+  let lateral = dot(rel, right);
+
+  let width = 4.8 + min(10.0, uniforms.u_BoatSpeed * 0.42);
+  let depth = 0.36 + min(1.05, uniforms.u_BoatSpeed * 0.060);
+  let build = 1.0 - exp(-along * 0.030);
+  let trail = exp(-along * 0.0082);
+
+  let trench = exp(-(lateral * lateral) / (width * width));
+  let shoulderOffset = abs(lateral) - width * 1.55;
+  let shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
+  let ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
+
+  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+}
+
+fn wakeMask(worldPos: vec2f) -> f32 {
+  let rel = worldPos - uniforms.u_BoatPos;
+  let along = dot(rel, -uniforms.u_BoatDir);
+  if (along <= 0.0) {
+    return 0.0;
+  }
+
+  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
+  let lateral = dot(rel, right);
+  let width = 12.0 + min(18.0, uniforms.u_BoatSpeed * 1.10);
+  let spread = exp(-(lateral * lateral) / (width * width));
+  let trail = exp(-along * 0.0068);
+  let build = 1.0 - exp(-along * 0.026);
+  return clamp(spread * trail * build, 0.0, 1.0);
+}
+
+fn waveHeightWithWake(worldPos: vec2f, depth: f32) -> f32 {
+  return (getwaves(worldPos * uniforms.u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos);
+}
+
+fn normal(worldPos: vec2f, e: f32, depth: f32) -> vec3f {
+  let ex = vec2f(e, 0.0);
+  let H = waveHeightWithWake(worldPos, depth);
+  let a = vec3f(worldPos.x, H, worldPos.y);
+  return normalize(
+    cross(
+      a - vec3f(worldPos.x - e, waveHeightWithWake(worldPos - ex, depth), worldPos.y),
+      a - vec3f(worldPos.x, waveHeightWithWake(worldPos + ex.yx, depth), worldPos.y + e)
+    )
+  );
+}
+
+fn getSunDirection() -> vec3f {
+  return normalize(vec3f(-0.07735, 0.5 + sin(uniforms.u_Time * 0.2 + 2.6) * 0.45, 0.57735));
+}
+
+fn extra_cheap_atmosphere(raydir: vec3f, sundir: vec3f) -> vec3f {
+  let special_trick = 1.0 / (raydir.y * 1.0 + 0.1);
+  let special_trick2 = 1.0 / (sundir.y * 11.0 + 1.0);
+  let raysundt = pow(abs(dot(sundir, raydir)), 2.0);
+  let suncolor = mix(vec3f(1.0),
+                     max(vec3f(0.0), vec3f(1.0) - vec3f(5.5, 13.0, 22.4) / 22.4),
+                     vec3f(special_trick2));
+  let bluesky = vec3f(5.5, 13.0, 22.4) / 22.4 * suncolor;
+  var bluesky2 = max(vec3f(0.0),
+                     bluesky - vec3f(5.5, 13.0, 22.4) * 0.002 *
+                     (special_trick - 6.0 * sundir.y * sundir.y));
+  bluesky2 *= special_trick * (0.24 + raysundt * 0.24);
+  return bluesky2 * (1.0 + pow(1.0 - raydir.y, 3.0));
+}
+
+fn getAtmosphere(dir: vec3f) -> vec3f {
+  return extra_cheap_atmosphere(dir, getSunDirection()) * 0.5;
+}
+
+fn getSun(dir: vec3f) -> f32 {
+  return pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0;
+}
+
+fn aces_tonemap(color: vec3f) -> vec3f {
+  let m1 = mat3x3f(
+    0.59719, 0.07600, 0.02840,
+    0.35458, 0.90834, 0.13383,
+    0.04823, 0.01566, 0.83777
+  );
+  let m2 = mat3x3f(
+    1.60475, -0.10208, -0.00327,
+    -0.53108, 1.10813, -0.07276,
+    -0.07367, -0.00605, 1.07602
+  );
+  let v = m1 * color;
+  let a = v * (v + vec3f(0.0245786)) - vec3f(0.000090537);
+  let b = v * (0.983729 * v + vec3f(0.4329510)) + vec3f(0.238081);
+  return pow(clamp(m2 * (a / b), vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
+}
+
+fn terrainShadowMask(worldXZ: vec2f) -> f32 {
+  let halfSize = max(1.0, uniforms.u_terrainShadowSize * 0.5);
+  let uv = (worldXZ - uniforms.u_terrainShadowCenter) / (halfSize * 2.0) + vec2f(0.5);
+  let inBounds = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+  // textureSampleLevel (explicit LOD) is valid in non-uniform control flow.
+  let s = textureSampleLevel(u_terrainShadowMask, u_terrainShadowMaskSampler,
+                             clamp(uv, vec2f(0.001), vec2f(0.999)), 0.0).r;
+  return select(0.0, s, inBounds);
+}
+
+@fragment
+fn main(input: FragmentInputs) -> FragmentOutputs {
+  let depth = uniforms.u_WaveDepth;
+  let worldXZ = input.v_worldPos.xz;
+
+  let ray = normalize(input.v_worldPos - uniforms.u_cameraPosition);
+  var N = normal(worldXZ, 0.55, depth);
+
+  N = mix(
+    N,
+    vec3f(0.0, 1.0, 0.0),
+    vec3f(0.8 * min(1.0, sqrt(length(input.v_worldPos - uniforms.u_cameraPosition) * 0.01) * 1.1))
+  );
+
+  let fresnel = 0.04 + (1.0 - 0.04) * pow(1.0 - max(0.0, dot(-N, ray)), 5.0);
+
+  var R = normalize(reflect(ray, N));
+  R.y = abs(R.y);
+  let reflectionAnalytic = getAtmosphere(R) + vec3f(getSun(R));
+  var screenUV = (input.v_projPos.xy / input.v_projPos.w) * 0.5 + vec2f(0.5);
+  screenUV += N.xz * 0.020;
+  screenUV = clamp(screenUV, vec2f(0.001), vec2f(0.999));
+  let reflectionRTT = textureSample(u_reflectionSampler, u_reflectionSamplerSampler, screenUV).rgb;
+  let terrainShadow = terrainShadowMask(worldXZ) * clamp(uniforms.u_terrainShadowStrength, 0.0, 1.0);
+  let reflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80)) * (1.0 - terrainShadow * 0.40);
+  let wakeT = max(input.v_wakeMask, wakeMask(worldXZ));
+  let scattering = vec3f(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07) * (1.0 - terrainShadow * 0.75);
+  var color = fresnel * reflection + scattering;
+  let wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
+  color = mix(color, vec3f(0.86, 0.92, 0.98), vec3f(wakeFoam));
+
+  fragmentOutputs.color = vec4f(aces_tonemap(color * 2.0), 1.0);
 }
 `;
 
@@ -371,6 +704,47 @@ void main(){
 #else
   gl_FragColor = outCol;
 #endif
+}
+`;
+
+const WAKE_VERT_WGSL = `
+attribute position: vec3f;
+attribute uv: vec2f;
+varying vUV: vec2f;
+uniform worldViewProjection: mat4x4f;
+
+@vertex
+fn main(input: VertexInputs) -> FragmentInputs {
+  vertexOutputs.vUV = input.uv;
+  vertexOutputs.position = uniforms.worldViewProjection * vec4f(input.position, 1.0);
+}
+`;
+
+const WAKE_FRAG_WGSL = `
+varying vUV: vec2f;
+uniform time: f32;
+uniform speed: f32;
+uniform planeW: f32;
+uniform planeL: f32;
+
+@fragment
+fn main(input: FragmentInputs) -> FragmentOutputs {
+  let lx = (input.vUV.x - 0.5) * uniforms.planeW;
+  let lz = (1.0 - input.vUV.y) * uniforms.planeL;
+  if (lz < 1.0) {
+    discard;
+  }
+  let kelvinArm = abs(lx) - lz * 0.354;
+  let lengthFade = exp(-lz * 0.0045);
+  let armFoam = exp(-kelvinArm * kelvinArm * 0.016) * lengthFade;
+  let tPhase = lz * 0.09 - uniforms.time * 1.7;
+  let trans = (sin(tPhase) * 0.5 + 0.5) * exp(-lz * 0.006) * exp(-lx * lx * 0.0005);
+  let dPhase = kelvinArm * 0.13 - uniforms.time * 1.1;
+  let diverg = (sin(dPhase) * 0.5 + 0.5) * armFoam;
+  let r = sqrt(lx * lx + lz * lz);
+  let centre = exp(-r * 0.035) * (1.0 - exp(-r * 0.22)) * exp(-lx * lx * 0.07);
+  let foam = clamp(armFoam * 0.52 + trans * 0.20 + diverg * 0.12 + centre * 0.36, 0.0, 1.0) * uniforms.speed;
+  fragmentOutputs.color = vec4f(1.0, 1.0, 1.0, foam * 0.80);
 }
 `;
 
@@ -438,6 +812,10 @@ export class OceanService {
   private wakeMat!:   ShaderMaterial;
 
   private reflectionRTT!: MirrorTexture;
+  private terrainShadowMask: Texture | null = null;
+  private terrainShadowCenter = new Vector2(0, 0);
+  private terrainShadowSize = 1;
+  private terrainShadowStrength = 0;
 
   private elapsed    = 0;
   private boatX      = 0;
@@ -485,6 +863,18 @@ export class OceanService {
     this.buildLodNear(scene);
     this.buildWakePlane(scene);
     this.registerRenderLoop(scene);
+
+    // WGSL ShaderMaterials can't participate in Babylon's prePass G-buffer
+    // compilation (used by SSAO2 + DoF).  Exclude all ocean/wake materials so
+    // the prePass skips them — water doesn't need AO or DoF depth data anyway.
+    if (this.sceneService.isWebGPU) {
+      for (const mat of [
+        this.oceanMatFar, this.oceanMat1, this.oceanMat0,
+        this.oceanMatNear, this.wakeMat,
+      ]) {
+        this.sceneService.excludeFromPrePass(mat);
+      }
+    }
   }
 
   // ── Reflection RTT ────────────────────────────────────────────────────────
@@ -575,8 +965,12 @@ export class OceanService {
     meshHalfSize:  number,
     maxCascade:    number,
   ): ShaderMaterial {
+    const useWgsl = this.sceneService.isWebGPU;
     const mat = new ShaderMaterial(name, scene,
-      { vertexSource: OCEAN_VERT, fragmentSource: OCEAN_FRAG },
+      {
+        vertexSource: useWgsl ? OCEAN_VERT_WGSL : OCEAN_VERT,
+        fragmentSource: useWgsl ? OCEAN_FRAG_WGSL : OCEAN_FRAG,
+      },
       {
         attributes: ['position'],
         uniforms: [
@@ -585,9 +979,11 @@ export class OceanService {
           'u_Time', 'u_WaveDepth', 'u_WaveFreq',
           'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
           'u_cameraPosition',
+          'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
         ],
-        samplers: ['u_reflectionSampler'],
+        samplers: ['u_reflectionSampler', 'u_terrainShadowMask'],
         needAlphaBlending: false,
+        shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
       },
     );
 
@@ -605,6 +1001,14 @@ export class OceanService {
     mat.setVector2('u_BoatDir', new Vector2(0, 1));
     mat.setFloat('u_BoatSpeed', 0);
     mat.setTexture('u_reflectionSampler', this.reflectionRTT);
+    if (this.terrainShadowMask) {
+      mat.setTexture('u_terrainShadowMask', this.terrainShadowMask);
+    } else {
+      mat.setTexture('u_terrainShadowMask', this.reflectionRTT);
+    }
+    mat.setVector2('u_terrainShadowCenter', this.terrainShadowCenter);
+    mat.setFloat('u_terrainShadowSize', this.terrainShadowSize);
+    mat.setFloat('u_terrainShadowStrength', this.terrainShadowStrength);
 
     return mat;
   }
@@ -618,12 +1022,17 @@ export class OceanService {
     this.wakePlane.isPickable    = false;
     this.wakePlane.renderingGroupId = 2;
 
+    const useWgsl = this.sceneService.isWebGPU;
     this.wakeMat = new ShaderMaterial('wakeMat', scene,
-      { vertexSource: WAKE_VERT, fragmentSource: WAKE_FRAG },
+      {
+        vertexSource: useWgsl ? WAKE_VERT_WGSL : WAKE_VERT,
+        fragmentSource: useWgsl ? WAKE_FRAG_WGSL : WAKE_FRAG,
+      },
       {
         attributes: ['position', 'uv'],
         uniforms:   ['worldViewProjection', 'time', 'speed', 'planeW', 'planeL'],
         needAlphaBlending: true,
+        shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
       },
     );
     this.wakeMat.setFloat('planeW', this.WAKE_W);
@@ -732,6 +1141,22 @@ export class OceanService {
     if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * this.waveDepthScale);
     if (this.oceanMat1)    this.oceanMat1.setFloat('u_WaveDepth',    this.WAVE_DEPTH_MID  * this.waveDepthScale);
     if (this.oceanMatFar)  this.oceanMatFar.setFloat('u_WaveDepth',  this.WAVE_DEPTH_FAR  * this.waveDepthScale);
+  }
+
+  setTerrainShadowMask(mask: Texture, centerX: number, centerZ: number, size: number, strength: number): void {
+    this.terrainShadowMask = mask;
+    this.terrainShadowCenter.set(centerX, centerZ);
+    this.terrainShadowSize = Math.max(1, size);
+    this.terrainShadowStrength = Math.max(0, Math.min(1, strength));
+
+    const mats = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
+    for (const mat of mats) {
+      if (!mat) continue;
+      mat.setTexture('u_terrainShadowMask', mask);
+      mat.setVector2('u_terrainShadowCenter', this.terrainShadowCenter);
+      mat.setFloat('u_terrainShadowSize', this.terrainShadowSize);
+      mat.setFloat('u_terrainShadowStrength', this.terrainShadowStrength);
+    }
   }
 
   // O(1) dedup — island meshes arrive via both the onNewMeshAdded observable and

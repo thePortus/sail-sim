@@ -2,7 +2,7 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Engine, WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
   HemisphericLight, DirectionalLight,
-  FreeCamera, MeshBuilder, StandardMaterial, Mesh, GlowLayer,
+  FreeCamera, MeshBuilder, StandardMaterial, Mesh, Material, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
 } from '@babylonjs/core';
@@ -31,6 +31,19 @@ export class SceneService {
   /** Exclude a mesh from the glow/emissive composite pass (WebGPU-safe). */
   excludeFromGlow(mesh: Mesh): void {
     this.glowLayer?.addExcludedMesh(mesh);
+  }
+
+  /**
+   * Exclude a material from the prePass G-buffer render (normals/depth).
+   * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't
+   * generate a G-buffer variant for them, which would break SSAO2 and DoF.
+   */
+  excludeFromPrePass(material: Material): void {
+    const prePass = this.scene?.prePassRenderer;
+    if (!prePass) return;
+    if (!prePass.excludedMaterials.includes(material)) {
+      prePass.excludedMaterials.push(material);
+    }
   }
 
   // Shadow generator — attached to the sun DirectionalLight and exposed so that
@@ -95,9 +108,7 @@ export class SceneService {
     await this.zone.runOutsideAngular(async () => {
 
       // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
-      // Temporary safety switch: WebGPU custom shader stack currently emits
-      // invalid GLSL->SPIR-V on some browsers, causing a black frame.
-      const FORCE_WEBGL = true;
+      const FORCE_WEBGL = false;
       const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined' && !!navigator.gpu;
 
       if (gpuSupported) {

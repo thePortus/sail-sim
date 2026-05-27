@@ -9,7 +9,17 @@ import { SeaConditions, Wind } from '../models';
 const OCEAN_VERT = `
 precision highp float;
 
+#ifdef WEBGPU
+layout(location = 0) in vec3 position;
+layout(location = 0) out vec3 v_worldPos;
+layout(location = 1) out vec4 v_projPos;
+layout(location = 2) out float v_wakeMask;
+#else
 attribute vec3 position;
+varying vec3  v_worldPos;
+varying vec4  v_projPos;
+varying float v_wakeMask;
+#endif
 
 uniform mat4 worldViewProjection;
 uniform mat4 world;
@@ -23,10 +33,6 @@ uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
-
-varying vec3  v_worldPos;
-varying vec4  v_projPos;
-varying float v_wakeMask;
 
 #define DRAG_MULT 0.38
 #define ITERATIONS 24
@@ -136,9 +142,16 @@ uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
 uniform sampler2D u_reflectionSampler;
 
+#ifdef WEBGPU
+layout(location = 0) in vec3 v_worldPos;
+layout(location = 1) in vec4 v_projPos;
+layout(location = 2) in float v_wakeMask;
+layout(location = 0) out vec4 fragmentColor;
+#else
 varying vec3 v_worldPos;
 varying vec4 v_projPos;
 varying float v_wakeMask;
+#endif
 
 #define DRAG_MULT 0.38
 #define ITERATIONS 24
@@ -297,27 +310,51 @@ void main() {
   float wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
   color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
 
-  gl_FragColor = vec4(aces_tonemap(color * 2.0), 1.0);
+  vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
+#ifdef WEBGPU
+  fragmentColor = outCol;
+#else
+  gl_FragColor = outCol;
+#endif
 }
 `;
 
 // ── Kelvin wake shaders (unchanged) ──────────────────────────────────────────
 const WAKE_VERT = `
 precision highp float;
-attribute vec3 position; attribute vec2 uv;
+#ifdef WEBGPU
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
+layout(location = 0) out vec2 vUV;
+#else
+attribute vec3 position;
+attribute vec2 uv;
 varying vec2 vUV;
+#endif
 uniform mat4 worldViewProjection;
 void main(){ vUV = uv; gl_Position = worldViewProjection * vec4(position, 1.0); }
 `;
 
 const WAKE_FRAG = `
 precision highp float;
+#ifdef WEBGPU
+layout(location = 0) in vec2 vUV;
+layout(location = 0) out vec4 fragmentColor;
+#else
 varying vec2 vUV;
+#endif
 uniform float time; uniform float speed; uniform float planeW; uniform float planeL;
 void main(){
   float lx = (vUV.x - 0.5) * planeW;
   float lz = (1.0 - vUV.y) * planeL;
-  if (lz < 1.0) { gl_FragColor = vec4(0.0); return; }
+  if (lz < 1.0) {
+#ifdef WEBGPU
+    fragmentColor = vec4(0.0);
+#else
+    gl_FragColor = vec4(0.0);
+#endif
+    return;
+  }
   float kelvinArm  = abs(lx) - lz * 0.354;
   float lengthFade = exp(-lz * 0.0045);
   float armFoam    = exp(-kelvinArm * kelvinArm * 0.016) * lengthFade;
@@ -328,7 +365,12 @@ void main(){
   float r       = sqrt(lx * lx + lz * lz);
   float centre  = exp(-r * 0.035) * (1.0 - exp(-r * 0.22)) * exp(-lx * lx * 0.07);
   float foam    = clamp(armFoam * 0.52 + trans * 0.20 + diverg * 0.12 + centre * 0.36, 0.0, 1.0) * speed;
-  gl_FragColor  = vec4(1.0, 1.0, 1.0, foam * 0.80);
+  vec4 outCol = vec4(1.0, 1.0, 1.0, foam * 0.80);
+#ifdef WEBGPU
+  fragmentColor = outCol;
+#else
+  gl_FragColor = outCol;
+#endif
 }
 `;
 

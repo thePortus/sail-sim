@@ -95,7 +95,9 @@ export class SceneService {
     await this.zone.runOutsideAngular(async () => {
 
       // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
-      const FORCE_WEBGL = false;
+      // Temporary safety switch: WebGPU custom shader stack currently emits
+      // invalid GLSL->SPIR-V on some browsers, causing a black frame.
+      const FORCE_WEBGL = true;
       const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined' && !!navigator.gpu;
 
       if (gpuSupported) {

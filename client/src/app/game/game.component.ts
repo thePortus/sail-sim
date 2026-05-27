@@ -273,10 +273,18 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
 
       if (saved && typeof saved.x === 'number') {
-        spawnX = saved.x;
-        spawnZ = saved.z;
-        spawnHeading = saved.heading ?? 270;
-        this.loadingMsg.set('Returning to your last anchorage…');
+        if (!this.terrainService.isOnLand(saved.x, saved.z)) {
+          spawnX = saved.x;
+          spawnZ = saved.z;
+          spawnHeading = saved.heading ?? 270;
+          this.loadingMsg.set('Returning to your last anchorage…');
+        } else {
+          const safe = this.terrainService.nearestSpawn(saved.x, saved.z);
+          spawnX = safe.spawnX;
+          spawnZ = safe.spawnZ;
+          spawnHeading = safe.heading;
+          this.loadingMsg.set('Relocating you to safe waters…');
+        }
       }
 
       await this.runInitStep('init-vessel', 'Rigging your vessel…', async () => {

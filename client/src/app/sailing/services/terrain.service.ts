@@ -6,14 +6,28 @@ import {
   MeshBuilder,
   VertexBuffer,
   Color3,
+  Color4,
   Texture,
   DynamicTexture,
   StandardMaterial,
+  TransformNode,
+  Quaternion,
+  Scene,
+  InstancedMesh,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds } from '../models';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
+import { createSpsTreeArchetype } from '../utils/sps-tree-generator';
+
+type TreePatch = {
+  root: TransformNode;
+  centerX: number;
+  centerZ: number;
+  density: number;
+  count: number;
+};
 
 @Injectable({ providedIn: 'root' })
 export class TerrainService {
@@ -28,6 +42,10 @@ export class TerrainService {
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: StandardMaterial | null = null;
   private terrainTextures: DynamicTexture[] = [];
+  private treePrototypeMeshes: Mesh[] = [];
+  private treePatches: TreePatch[] = [];
+  private treeInstances: InstancedMesh[] = [];
+  private treeCullingObserver: any = null;
 
   async init(): Promise<void> {
     if (!this.manifest || !this.heightfield) {
@@ -48,6 +66,7 @@ export class TerrainService {
   }
 
   dispose(): void {
+    this.disposeFoliage();
     this.terrainMesh?.dispose();
     this.terrainMesh = null;
     this.terrainMaterial?.dispose();
@@ -120,6 +139,28 @@ export class TerrainService {
       }
     }
 
+    if (!this.isOnLand(best.x, best.z)) {
+      return { spawnX: best.x, spawnZ: best.z, heading: best.heading };
+    }
+
+    // Spawn points from content can drift onto land as terrain evolves.
+    // Search concentric rings for nearest navigable water.
+    const maxRadius = 2000;
+    const radiusStep = 60;
+    const angles = 48;
+
+    for (let radius = radiusStep; radius <= maxRadius; radius += radiusStep) {
+      for (let i = 0; i < angles; i++) {
+        const a = (i / angles) * Math.PI * 2;
+        const x = best.x + Math.cos(a) * radius;
+        const z = best.z + Math.sin(a) * radius;
+        if (this.isOnLand(x, z)) continue;
+
+        const heading = (Math.atan2(best.x - x, best.z - z) * 180 / Math.PI + 360) % 360;
+        return { spawnX: x, spawnZ: z, heading };
+      }
+    }
+
     return { spawnX: best.x, spawnZ: best.z, heading: best.heading };
   }
 
@@ -132,6 +173,7 @@ export class TerrainService {
       this.terrainMesh.dispose();
       this.terrainMesh = null;
     }
+    this.disposeFoliage();
 
     const worldWidth = manifest.worldBounds.maxX - manifest.worldBounds.minX;
     const worldDepth = manifest.worldBounds.maxZ - manifest.worldBounds.minZ;
@@ -204,6 +246,260 @@ export class TerrainService {
     mesh.receiveShadows = true;
 
     this.terrainMesh = mesh;
+    this.buildTreeFoliage(scene, manifest);
+  }
+
+  private buildTreeFoliage(scene: Scene, manifest: TerrainManifest): void {
+    const bounds = manifest.worldBounds;
+    const worldWidth = bounds.maxX - bounds.minX;
+    const worldDepth = bounds.maxZ - bounds.minZ;
+
+    this.treePrototypeMeshes = this.createTreeArchetypes(scene);
+    for (const prototype of this.treePrototypeMeshes) {
+      prototype.isVisible = false;
+      prototype.position.set(0, -10000, 0);
+      this.sceneService.excludeFromGlow(prototype);
+    }
+
+    const patchSize = 2300;
+    const gridX = 220;
+    const gridZ = 220;
+    const hardCap = 12000;
+    const patchMap = new Map<string, TreePatch>();
+    let placed = 0;
+
+    for (let gz = 0; gz < gridZ && placed < hardCap; gz++) {
+      for (let gx = 0; gx < gridX && placed < hardCap; gx++) {
+        const u = (gx + this.hashNoise(gx * 0.63 + 13.7, gz * 0.71 + 5.1) * 0.9) / gridX;
+        const v = (gz + this.hashNoise(gx * 0.49 + 17.9, gz * 0.55 + 11.3) * 0.9) / gridZ;
+
+        const wooded = this.computeWoodedScore(u, v);
+        if (wooded <= 0) continue;
+
+        const macro = this.hashNoise(u * 9.5 + 91.7, v * 9.5 + 34.1);
+        const patchDensity = this.clamp01(0.1 + macro * 1.1);
+        const chance = wooded * (0.09 + patchDensity * 0.64);
+        const accept = this.hashNoise(u * 63.7 + 7.3, v * 63.7 + 53.2);
+        if (accept > chance) continue;
+
+        const worldX = bounds.minX + u * worldWidth;
+        const worldZ = bounds.maxZ - v * worldDepth;
+        const y = this.getElevation(worldX, worldZ);
+        if (y <= 0.2) continue;
+
+        const slope = this.sampleSlope(u, v);
+        if (slope > 0.34) continue;
+
+        const archetypeIndex = this.pickTreeArchetype(u, v, patchDensity);
+        const prototype = this.treePrototypeMeshes[archetypeIndex];
+        const instance = prototype.createInstance(`tree_${placed}`);
+
+        const scaleRnd = this.hashNoise(worldX * 0.0017 + 2.1, worldZ * 0.0017 + 8.4);
+        const scale = 0.85 + scaleRnd * 0.95;
+        const yaw = this.hashNoise(worldX * 0.0021 + 101.9, worldZ * 0.0021 + 44.8) * Math.PI * 2;
+        const tiltX = (this.hashNoise(worldX * 0.0039 + 19.2, worldZ * 0.0039 + 2.8) - 0.5) * slope * 0.34;
+        const tiltZ = (this.hashNoise(worldX * 0.0042 + 71.1, worldZ * 0.0042 + 3.6) - 0.5) * slope * 0.34;
+
+        instance.position.set(worldX, y, worldZ);
+        instance.scaling.set(scale, scale, scale);
+        instance.rotationQuaternion = Quaternion.RotationYawPitchRoll(yaw, tiltX, tiltZ);
+        instance.isPickable = false;
+
+        const patchX = Math.floor((worldX - bounds.minX) / patchSize);
+        const patchZ = Math.floor((worldZ - bounds.minZ) / patchSize);
+        const patchKey = `${patchX}:${patchZ}`;
+        let patch = patchMap.get(patchKey);
+        if (!patch) {
+          patch = {
+            root: new TransformNode(`tree_patch_${patchKey}`, scene),
+            centerX: bounds.minX + (patchX + 0.5) * patchSize,
+            centerZ: bounds.minZ + (patchZ + 0.5) * patchSize,
+            density: patchDensity,
+            count: 0,
+          };
+          patchMap.set(patchKey, patch);
+          this.treePatches.push(patch);
+        }
+
+        instance.parent = patch.root;
+        patch.count += 1;
+        patch.density = Math.max(patch.density, patchDensity);
+        this.treeInstances.push(instance);
+        placed += 1;
+      }
+    }
+
+    // Frustum-distance patch culling keeps medium-density forests responsive.
+    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
+    this.updateTreePatchVisibility();
+    console.log(`[Terrain] Generated ${placed} SPS trees across ${this.treePatches.length} patches.`);
+  }
+
+  private updateTreePatchVisibility(): void {
+    const camera = this.sceneService.camera;
+    if (!camera) return;
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+
+    for (const patch of this.treePatches) {
+      const dx = patch.centerX - cx;
+      const dz = patch.centerZ - cz;
+      const dist2 = dx * dx + dz * dz;
+      const cullRadius = patch.density > 0.7 ? 12500 : 9800;
+      patch.root.setEnabled(dist2 <= cullRadius * cullRadius);
+    }
+  }
+
+  private createTreeArchetypes(scene: Scene): Mesh[] {
+    const trunkA = new Color4(0.34, 0.25, 0.16, 1);
+    const trunkB = new Color4(0.29, 0.22, 0.14, 1);
+
+    return [
+      createSpsTreeArchetype('tree_oak', scene, {
+        seed: 41,
+        trunkHeight: 11,
+        trunkRadius: 0.62,
+        branchLevels: 3,
+        forksPerLevel: 3,
+        lengthDecay: 0.63,
+        radiusDecay: 0.66,
+        forkAngleMin: 0.38,
+        forkAngleMax: 0.8,
+        bowAmount: 0.08,
+        leafClusters: 32,
+        leafSizeMin: 0.55,
+        leafSizeMax: 1.05,
+        leafAspectMin: 0.75,
+        leafAspectMax: 1.2,
+        branchColor: trunkA,
+        leafColor: new Color4(0.17, 0.41, 0.14, 1),
+      }),
+      createSpsTreeArchetype('tree_pine', scene, {
+        seed: 137,
+        trunkHeight: 15,
+        trunkRadius: 0.42,
+        branchLevels: 4,
+        forksPerLevel: 2,
+        lengthDecay: 0.58,
+        radiusDecay: 0.64,
+        forkAngleMin: 0.22,
+        forkAngleMax: 0.55,
+        bowAmount: 0.04,
+        leafClusters: 26,
+        leafSizeMin: 0.4,
+        leafSizeMax: 0.72,
+        leafAspectMin: 0.35,
+        leafAspectMax: 0.65,
+        branchColor: trunkB,
+        leafColor: new Color4(0.12, 0.31, 0.12, 1),
+      }),
+      createSpsTreeArchetype('tree_elm', scene, {
+        seed: 303,
+        trunkHeight: 10,
+        trunkRadius: 0.56,
+        branchLevels: 3,
+        forksPerLevel: 3,
+        lengthDecay: 0.67,
+        radiusDecay: 0.69,
+        forkAngleMin: 0.45,
+        forkAngleMax: 0.9,
+        bowAmount: 0.1,
+        leafClusters: 30,
+        leafSizeMin: 0.52,
+        leafSizeMax: 0.95,
+        leafAspectMin: 0.8,
+        leafAspectMax: 1.25,
+        branchColor: trunkA,
+        leafColor: new Color4(0.24, 0.47, 0.18, 1),
+      }),
+      createSpsTreeArchetype('tree_ash', scene, {
+        seed: 509,
+        trunkHeight: 13,
+        trunkRadius: 0.48,
+        branchLevels: 3,
+        forksPerLevel: 2,
+        lengthDecay: 0.65,
+        radiusDecay: 0.67,
+        forkAngleMin: 0.3,
+        forkAngleMax: 0.72,
+        bowAmount: 0.07,
+        leafClusters: 28,
+        leafSizeMin: 0.46,
+        leafSizeMax: 0.84,
+        leafAspectMin: 0.65,
+        leafAspectMax: 1.05,
+        branchColor: trunkB,
+        leafColor: new Color4(0.19, 0.39, 0.14, 1),
+      }),
+      createSpsTreeArchetype('tree_spruce', scene, {
+        seed: 881,
+        trunkHeight: 17,
+        trunkRadius: 0.36,
+        branchLevels: 4,
+        forksPerLevel: 2,
+        lengthDecay: 0.55,
+        radiusDecay: 0.6,
+        forkAngleMin: 0.18,
+        forkAngleMax: 0.48,
+        bowAmount: 0.03,
+        leafClusters: 24,
+        leafSizeMin: 0.34,
+        leafSizeMax: 0.64,
+        leafAspectMin: 0.25,
+        leafAspectMax: 0.58,
+        branchColor: trunkB,
+        leafColor: new Color4(0.1, 0.25, 0.11, 1),
+      }),
+    ];
+  }
+
+  private pickTreeArchetype(u: number, v: number, patchDensity: number): number {
+    const n = this.hashNoise(u * 17.1 + patchDensity * 3.2, v * 17.1 + patchDensity * 5.4);
+    if (patchDensity > 0.75) return n < 0.58 ? 1 : n < 0.86 ? 4 : 3;
+    if (patchDensity < 0.35) return n < 0.5 ? 0 : n < 0.8 ? 2 : 3;
+    if (n < 0.22) return 0;
+    if (n < 0.44) return 1;
+    if (n < 0.64) return 2;
+    if (n < 0.84) return 3;
+    return 4;
+  }
+
+  private computeWoodedScore(u: number, v: number): number {
+    const h = this.sampleNormalizedHeight(u, v);
+    const slope = this.sampleSlope(u, v);
+
+    if (h < 0.05 || h > 0.62) return 0;
+    if (slope > 0.36) return 0;
+
+    const beachFade = this.clamp01((h - 0.05) / 0.08);
+    const alpineFade = this.clamp01((0.62 - h) / 0.2);
+    const slopeFade = this.clamp01((0.36 - slope) / 0.2);
+    const meadowBand = Math.exp(-Math.pow((h - 0.22) / 0.16, 2));
+
+    return this.clamp01(beachFade * alpineFade * slopeFade * (0.35 + 0.65 * meadowBand));
+  }
+
+  private disposeFoliage(): void {
+    if (this.treeCullingObserver && this.sceneService.scene) {
+      this.sceneService.scene.onBeforeRenderObservable.remove(this.treeCullingObserver);
+      this.treeCullingObserver = null;
+    }
+
+    for (const instance of this.treeInstances) {
+      instance.dispose();
+    }
+    this.treeInstances = [];
+
+    for (const patch of this.treePatches) {
+      patch.root.dispose();
+    }
+    this.treePatches = [];
+
+    for (const prototype of this.treePrototypeMeshes) {
+      prototype.dispose();
+    }
+    this.treePrototypeMeshes = [];
   }
 
   private buildTerrainMaterial(scene: any, manifest: TerrainManifest): StandardMaterial {

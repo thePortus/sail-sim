@@ -130,9 +130,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   }
 
   ngAfterViewInit(): void {
-    // Centre the panel vertically at first render
-    const el = this.elRef.nativeElement as HTMLElement;
-    this.posTop = Math.max(10, Math.round((window.innerHeight - el.offsetHeight) / 2));
+    // Keep initial HostBinding values stable in dev mode to avoid NG0100.
   }
 
   ngOnDestroy(): void {

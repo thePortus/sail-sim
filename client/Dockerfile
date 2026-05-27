@@ -24,7 +24,7 @@ RUN npm run build -- --configuration $BUILD_CONFIG --base-href $BASE_HREF
 FROM nginx:alpine
 
 # Copy the built Angular application from the previous stage
-COPY --from=build /client/dist/flight-sim/browser /usr/share/nginx/html
+COPY --from=build /client/dist/sail-sim/browser /usr/share/nginx/html
 
 # Copy custom Nginx configuration file
 COPY --from=build /client/nginx.conf /etc/nginx/conf.d/default.conf

@@ -6,6 +6,9 @@ Thumbs.db
 certbot/
 */coverage/
 
+# generated terrain files
+server/assets/terrain/
+
 # Static Generated doc files
 server/pages/docs
 

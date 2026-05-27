@@ -21,6 +21,7 @@
   ],
   "scripts": {
     "start": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && npx apidoc -i . -o pages/docs/ && NODE_ENV=production node server.js",
+    "build:terrain": "node scripts/build-terrain.js",
     "test": "cross-env NODE_ENV=test jest --collect-coverage --testTimeout=10000 --detectOpenHandles",
     "pretest": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && cross-env NODE_ENV=test npm run migrate:reset --env=test",
     "migrate:reset": "npx sequelize-cli db:migrate:undo:all --env=production && npm run migrate --env=production",
@@ -49,6 +50,7 @@
     "jsonwebtoken": "^9.0.0",
     "md5": "^2.3.0",
     "mysql2": ">=3.9.8",
+    "pngjs": "^7.0.0",
     "sequelize": "^6.21.3",
     "sequelize-cli": "^6.6.0",
     "serve-favicon": "^2.5.0",

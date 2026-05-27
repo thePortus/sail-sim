@@ -53,6 +53,7 @@ export class CloudService {
   private initialized = false;
 
   private readonly SPRITE_CAPACITY = 260;
+  private readonly CANOPY_SPRITES = 72;
   private readonly WRAP_RANGE = 26000;
   private readonly WRAP_SPAN = 52000;
 
@@ -303,15 +304,26 @@ export class CloudService {
 
       s.isVisible = true;
 
-      s.position.x += this.windX * drift * e.driftScale;
-      s.position.z += this.windZ * drift * e.driftScale;
-      s.position.y = e.baseY - stormD * 260 + Math.sin(this.elapsed * 0.09 + e.phase) * 75;
-      s.angle += e.spin * dt;
+      if (i < this.CANOPY_SPRITES) {
+        // Camera-anchored canopy: behaves like skybox sprites overhead.
+        const canopyRadius = 1200 + (i % 12) * 210;
+        const canopyAngle = e.phase * 1.23;
+        const canopyDrift = this.elapsed * this.windSpeed * 16.0 * e.driftScale;
+        s.position.x = camX + Math.sin(canopyAngle) * canopyRadius + this.windX * canopyDrift;
+        s.position.z = camZ + Math.cos(canopyAngle) * canopyRadius + this.windZ * canopyDrift;
+        s.position.y = 980 + (i % 5) * 120 - stormD * 140 + Math.sin(this.elapsed * 0.11 + e.phase) * 45;
+      } else {
+        s.position.x += this.windX * drift * e.driftScale;
+        s.position.z += this.windZ * drift * e.driftScale;
+        s.position.y = e.baseY - stormD * 260 + Math.sin(this.elapsed * 0.09 + e.phase) * 75;
 
-      if (s.position.x - camX > this.WRAP_RANGE) s.position.x -= this.WRAP_SPAN;
-      if (camX - s.position.x > this.WRAP_RANGE) s.position.x += this.WRAP_SPAN;
-      if (s.position.z - camZ > this.WRAP_RANGE) s.position.z -= this.WRAP_SPAN;
-      if (camZ - s.position.z > this.WRAP_RANGE) s.position.z += this.WRAP_SPAN;
+        if (s.position.x - camX > this.WRAP_RANGE) s.position.x -= this.WRAP_SPAN;
+        if (camX - s.position.x > this.WRAP_RANGE) s.position.x += this.WRAP_SPAN;
+        if (s.position.z - camZ > this.WRAP_RANGE) s.position.z -= this.WRAP_SPAN;
+        if (camZ - s.position.z > this.WRAP_RANGE) s.position.z += this.WRAP_SPAN;
+      }
+
+      s.angle += e.spin * dt;
 
       const pulse = 0.94 + Math.sin(this.elapsed * 0.22 + e.phase) * 0.06;
       s.size = e.baseSize * (0.88 + cloudD * 0.26) * pulse;

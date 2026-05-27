@@ -55,6 +55,36 @@ export interface Island {
   spawnZ:        number;
 }
 
+export interface TerrainWorldBounds {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+export interface TerrainSpawnPoint {
+  x: number;
+  z: number;
+  heading: number;
+}
+
+export interface TerrainManifest {
+  version: number;
+  source: string;
+  width: number;
+  height: number;
+  chunkSize: number;
+  chunkCountX: number;
+  chunkCountZ: number;
+  quantizationLevels: number;
+  waterThreshold: number;
+  sourceMin: number;
+  sourceMax: number;
+  targetPeakElevation: number;
+  worldBounds: TerrainWorldBounds;
+  spawns: TerrainSpawnPoint[];
+}
+
 // ── Vessels ───────────────────────────────────────────────────────────────────
 
 export type SailState = 'reefed' | 'topsails' | 'full';

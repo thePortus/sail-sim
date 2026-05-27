@@ -29,7 +29,7 @@ export class SceneService {
   private glowLayer!: GlowLayer;
 
   // Shadow generator — attached to the sun DirectionalLight and exposed so that
-  // VesselService, IslandService, CannonService, and MultiplayerService can
+  // VesselService, TerrainService, CannonService, and MultiplayerService can
   // register their meshes as casters / receivers.
   shadowGenerator!: ShadowGenerator;
   private pipeline!: DefaultRenderingPipeline;

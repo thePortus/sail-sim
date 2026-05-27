@@ -11,7 +11,7 @@ import { catchError, of } from 'rxjs';
 
 import { SceneService }       from '../sailing/services/scene.service';
 import { OceanService }       from '../sailing/services/ocean.service';
-import { IslandService }      from '../sailing/services/island.service';
+import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
@@ -151,7 +151,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private authService        = inject(AuthService);
   private sceneService       = inject(SceneService);
   private oceanService       = inject(OceanService);
-  private islandService      = inject(IslandService);
+  private terrainService     = inject(TerrainService);
   private vesselService      = inject(VesselService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
@@ -253,20 +253,20 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     await this.oceanService.init();
     this.cloudService.init();
 
-    // 3. Load islands + scatter biome vegetation
-    this.loadingMsg.set('Raising the islands…');
-    await this.islandService.load();
+    // 3. Load terrain from elevation map artifacts
+    this.loadingMsg.set('Surveying the coastline…');
+    await this.terrainService.init();
     // 4. Fetch vessel definition
     this.loadingMsg.set('Rigging your vessel…');
     const vessel = await firstValueFrom(
       this.http.get<Vessel>(`${Settings.apiUrl}vessels/${this.selectedSlug}`)
     );
 
-    // 5. Determine spawn — try saved location first, fall back to island spawn
-    const spawnIsland = this.islandService.islands()[0];
-    let spawnX       = spawnIsland?.spawnX ?? 7200;
-    let spawnZ       = spawnIsland?.spawnZ ?? 0;
-    let spawnHeading = 270;
+    // 5. Determine spawn — try saved location first, fall back to terrain spawn
+    const defaultSpawn = this.terrainService.nearestSpawn(0, 0);
+    let spawnX       = defaultSpawn.spawnX;
+    let spawnZ       = defaultSpawn.spawnZ;
+    let spawnHeading = defaultSpawn.heading;
 
     const saved = await firstValueFrom(
       this.http.get<{ x: number; z: number; heading: number } | null>(
@@ -322,6 +322,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cannonService.dispose();
     this.musicService.dispose();
     this.cloudService.dispose();
+    this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();
   }

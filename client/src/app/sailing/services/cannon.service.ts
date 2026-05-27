@@ -7,7 +7,7 @@ import {
 import { SceneService }       from './scene.service';
 import { OceanService }       from './ocean.service';
 import { VesselService }      from './vessel.service';
-import { IslandService }      from './island.service';
+import { TerrainService }     from './terrain.service';
 import { MultiplayerService } from './multiplayer.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ export class CannonService {
   private sceneService       = inject(SceneService);
   private oceanService       = inject(OceanService);
   private vesselService      = inject(VesselService);
-  private islandService      = inject(IslandService);
+  private terrainService     = inject(TerrainService);
   private multiplayerService = inject(MultiplayerService);
   private zone               = inject(NgZone);
 
@@ -843,7 +843,7 @@ export class CannonService {
   // ── Impact ────────────────────────────────────────────────────────────────
 
   private onImpact(wx: number, wz: number): void {
-    const isLand = this.islandService.isOnLand(wx, wz);
+    const isLand = this.terrainService.isOnLand(wx, wz);
     if (isLand) {
       this.dirtEmit.set(wx, 1.5, wz);
       this.dirtPS.emitRate = 1200;

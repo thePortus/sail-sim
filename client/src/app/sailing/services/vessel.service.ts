@@ -6,7 +6,7 @@ import {
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
-import { IslandService } from './island.service';
+import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
@@ -15,7 +15,7 @@ import { Settings } from '../../app.settings';
 @Injectable({ providedIn: 'root' })
 export class VesselService {
   private sceneService     = inject(SceneService);
-  private islandService    = inject(IslandService);
+  private terrainService   = inject(TerrainService);
   private oceanService     = inject(OceanService);
   private buoyancyService  = inject(VesselBuoyancyService);
   private zone             = inject(NgZone);
@@ -467,15 +467,15 @@ export class VesselService {
   }
 
   // ── Refloat ───────────────────────────────────────────────────────────────
-  // Teleports the vessel to the spawn point of the nearest island, furls sails,
+  // Teleports the vessel to the nearest terrain spawn point, furls sails,
   // resets speed, and clears the grounded flag.
 
   refloat(): void {
-    const { spawnX, spawnZ } = this.islandService.nearestIslandSpawn(this.x, this.z);
+    const { spawnX, spawnZ, heading } = this.terrainService.nearestSpawn(this.x, this.z);
     this.x       = spawnX;
     this.z       = spawnZ;
     this.speed   = 0;
-    this.heading = 270;   // face west (out to sea) — sensible default
+    this.heading = heading;
     this.setSailState('reefed');
 
     // Snap mesh immediately so the camera doesn't pan across the world
@@ -635,7 +635,7 @@ export class VesselService {
     const newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyX;
     const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
 
-    if (this.islandService.isOnLand(newX, newZ)) {
+    if (this.terrainService.isOnLand(newX, newZ)) {
       // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
 

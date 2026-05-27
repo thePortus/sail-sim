@@ -1,46 +1,46 @@
 services:
-  mysqldb-prod:
+  mysqldb:
     image: docker.io/mysql:5.7
-    container_name: flight-sim-mysqldb-prod
+    container_name: sail-sim-mysqldb
     restart: unless-stopped
     platform: linux/x86_64
     environment:
       - MYSQL_ROOT_PASSWORD=123456
-      - MYSQL_DATABASE=flight-sim
+      - MYSQL_DATABASE=sail-sim
     ports:
       - 4307:3306
     volumes:
-      - db-prod:/var/lib/mysql
+      - db:/var/lib/mysql
     networks:
       - server-network
 
-  nodejs-prod:
-    container_name: flight-sim-nodejs-prod
+  nodejs:
+    container_name: sail-sim-nodejs
     depends_on:
-      - mysqldb-prod
+      - mysqldb
     build: server/
     restart: unless-stopped
     ports:
       - 9080:8080
     environment:
-      - DB_HOST=mysqldb-prod
+      - DB_HOST=mysqldb
       - DB_USER=root
       - DB_PASSWORD=123456
-      - DB_NAME=flight-sim
+      - DB_NAME=sail-sim
       - DB_LOCAL_PORT=4307
       - DB_PORT=3306
       - WEB_PORT=8080
       - JWT_SECRET=secret
       - OWNER_USERNAME=admin
       - OWNER_PASSWORD=123456
-      - OWNER_EMAIL=admin@flight-sim.local
+      - OWNER_EMAIL=admin@sail-sim.local
     stdin_open: true
     tty: true
     networks:
       - server-network
 
-  angular-prod:
-    container_name: flight-sim-angular-prod
+  angular:
+    container_name: sail-sim-angular
     build:
       context: client/
       args:
@@ -53,7 +53,7 @@ services:
       - server-network
 
 volumes:
-  db-prod:
+  db:
 
 networks:
   server-network:

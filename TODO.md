@@ -3,6 +3,7 @@
 # General or Current TODO Items
 
 * Improve ground texture
+* Waterfalls?
 * Add better island collision detection
 * Add starry night sky
 * Prevent multiple simultaneous windows at once

@@ -12,6 +12,15 @@ function clamp01(v) {
   return v;
 }
 
+/**
+ * Deterministic pseudo-random value in [0, 1) from two floats.
+ * Same formula used on the client so biome textures stay consistent.
+ */
+function hashNoise(x, y) {
+  const v = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+  return v - Math.floor(v);
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -175,8 +184,174 @@ function writeChunk(filePath, buffer) {
 }
 
 /**
+ * Separable box-blur on a Float32Array heightfield.
+ * O(width × height) — fast enough for large maps.
+ *
+ * @param {Float32Array} input
+ * @param {number} width
+ * @param {number} height
+ * @param {number} radius  Blur radius in pixels.
+ * @returns {Float32Array}
+ */
+function separableBoxBlur(input, width, height, radius) {
+  const r = Math.max(1, Math.floor(radius));
+  const count = 2 * r + 1;
+  const temp = new Float32Array(width * height);
+  const out  = new Float32Array(width * height);
+
+  // Horizontal pass
+  for (let y = 0; y < height; y++) {
+    let sum = 0;
+    for (let kx = -r; kx <= r; kx++) {
+      sum += input[y * width + Math.max(0, Math.min(width - 1, kx))];
+    }
+    for (let x = 0; x < width; x++) {
+      temp[y * width + x] = sum / count;
+      sum += input[y * width + Math.min(width - 1, x + r + 1)]
+           - input[y * width + Math.max(0,          x - r    )];
+    }
+  }
+
+  // Vertical pass
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let kz = -r; kz <= r; kz++) {
+      sum += temp[Math.max(0, Math.min(height - 1, kz)) * width + x];
+    }
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = sum / count;
+      sum += temp[Math.min(height - 1, y + r + 1) * width + x]
+           - temp[Math.max(0,           y - r    ) * width + x];
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Generates a greyscale specular map from the normalised (post-threshold)
+ * heightfield.  The R channel encodes specular intensity: rock faces and steep
+ * slopes shine; sand and grass are near-matte.
+ *
+ * @param {Float32Array} heights  Post-threshold normalised [0,1].
+ * @param {number} width
+ * @param {number} height
+ * @returns {Buffer} RGBA pixel data.
+ */
+function generateSpecularMap(heights, width, height) {
+  const out = Buffer.alloc(width * height * 4);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const h = sampleHeightAt(heights, width, height, x, y);
+
+      // Compute slope via Sobel (same kernel as normal map generator)
+      const tl = sampleHeightAt(heights, width, height, x - 1, y - 1);
+      const tm = sampleHeightAt(heights, width, height, x,     y - 1);
+      const tr = sampleHeightAt(heights, width, height, x + 1, y - 1);
+      const ml = sampleHeightAt(heights, width, height, x - 1, y    );
+      const mr = sampleHeightAt(heights, width, height, x + 1, y    );
+      const bl = sampleHeightAt(heights, width, height, x - 1, y + 1);
+      const bm = sampleHeightAt(heights, width, height, x,     y + 1);
+      const br = sampleHeightAt(heights, width, height, x + 1, y + 1);
+      const gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+      const gy = (bl + 2 * bm + br) - (tl + 2 * tm + tr);
+      const slope = clamp01(Math.sqrt(gx * gx + gy * gy) * 5.0);
+
+      let spec;
+      if (h <= 0) {
+        // Ocean floor — specular irrelevant (underwater), keep very low.
+        spec = 0.04;
+      } else if (h < 0.05) {
+        // Beach / sand — slightly moist sheen, low spec.
+        spec = clamp01(0.08 + slope * 0.12);
+      } else if (h < 0.30) {
+        // Grass & vegetation — almost matte; slopes expose rock → shinier.
+        spec = clamp01(0.04 + slope * 0.35);
+      } else if (h < 0.65) {
+        // Mid-elevation — rock increasingly dominates slopes.
+        spec = clamp01(0.08 + slope * 0.55);
+      } else {
+        // High alpine / snow — snow is matte, exposed peak rock is shiny.
+        spec = clamp01(0.12 + slope * 0.45 - (h - 0.65) * 0.10);
+      }
+
+      const v = Math.round(clamp01(spec) * 255);
+      const idx = (y * width + x) * 4;
+      out[idx]     = v;
+      out[idx + 1] = v;
+      out[idx + 2] = v;
+      out[idx + 3] = 255;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Generates a greyscale ambient-occlusion map using a depression-detection
+ * technique: pixels that sit below their blurred surroundings are occluded.
+ *
+ * Uses a separable box-blur so it runs in O(width × height) regardless of
+ * radius — no performance penalty for large blur windows.
+ *
+ * @param {Float32Array} rawHeights   Pre-threshold raw luminance [0,1].  Used
+ *                                    for the blur so coast transitions are
+ *                                    gradual (no hard cliff at the waterline).
+ * @param {Float32Array} landHeights  Post-threshold normalised heights [0,1].
+ *                                    Used only to identify ocean pixels
+ *                                    (landHeights[i] === 0 → ocean).  Ocean
+ *                                    pixels always output white (ao = 1) so
+ *                                    any UV bleeding near the waterline never
+ *                                    darkens visible coastal terrain.
+ * @param {number} width
+ * @param {number} height
+ * @param {number} radius   Blur radius in heightfield pixels.
+ * @param {number} strength Darkening multiplier.  Higher = deeper shadows.
+ * @returns {Buffer} RGBA pixel data (white = fully lit, dark = occluded).
+ */
+function generateAOMap(rawHeights, landHeights, width, height, radius, strength) {
+  const blurred = separableBoxBlur(rawHeights, width, height, radius);
+  const out = Buffer.alloc(width * height * 4);
+
+  // Minimum AO value for land pixels — prevents completely-black terrain even
+  // in deep valleys.  0.45 means the darkest possible surface still receives
+  // 45 % of its unoccluded brightness, which renders as clearly visible shadow
+  // rather than black.  (The old 0.30 floor was too aggressive given the
+  // multiplicative shadow-map application.)
+  const AO_MIN = 0.45;
+
+  for (let i = 0; i < width * height; i++) {
+    let ao;
+    if (landHeights[i] <= 0) {
+      // Ocean pixel — the terrain mesh is pushed below the water plane here,
+      // so this texel is never visible.  Force white so UV interpolation near
+      // the coastline never leaks dark AO values onto visible shore land.
+      ao = 1.0;
+    } else {
+      // Depression depth: how far below its blurred neighbourhood the pixel sits.
+      const depression = Math.max(0, blurred[i] - rawHeights[i]);
+      ao = Math.max(AO_MIN, clamp01(1.0 - depression * strength));
+    }
+    const v  = Math.round(ao * 255);
+    const idx = i * 4;
+    out[idx]     = v;
+    out[idx + 1] = v;
+    out[idx + 2] = v;
+    out[idx + 3] = 255;
+  }
+
+  return out;
+}
+
+/**
  * Generates an OpenGL tangent-space normal map from a normalised [0,1]
- * heightfield using a 3×3 Sobel kernel.
+ * heightfield using a 3×3 Sobel kernel, then blends in biome-appropriate
+ * micro-detail normals so that close-up terrain looks textured:
+ *   • sand / beach: barely any bump
+ *   • grass / soil: gentle undulation
+ *   • gravel / rock / steep slopes: strong angular crevice detail
+ *   • snow cap: subtle
  *
  * Convention (same as Blender, Godot, Babylon.js WebGL path):
  *   R = tangent X  (right in image  = world +X)
@@ -184,23 +359,25 @@ function writeChunk(filePath, buffer) {
  *   B = surface-normal magnitude
  *   Flat surface → approximately (127, 127, 255)
  *
- * If you view the map in Substance Painter or other DirectX-convention tools
- * the G channel will look inverted — that is normal.  In Babylon.js, use the
- * map as-is with bumpTexture; if it looks wrong, set material.invertNormalMapY = true.
- *
- * @param {Float32Array} heights  Normalised elevation values [0,1].
+ * @param {Float32Array} heights        Normalised elevation values [0,1]
+ *                                      (raw pre-threshold luminance for the
+ *                                      normal map so the Sobel sees smooth
+ *                                      coast gradients, not a hard cliff edge).
  * @param {number}       width
  * @param {number}       height
- * @param {number}       strength  Gradient scale factor.  Higher = bumpier.
+ * @param {number}       strength        Gradient scale for large-scale terrain shape.
+ * @param {number}       waterThreshold  Raw-luminance value below which pixels
+ *                                       are ocean.  Used to gate detail normals.
  * @returns {Buffer} RGBA pixel data (4 bytes per pixel, width × height pixels).
  */
-function generateNormalMap(heights, width, height, strength) {
-  const s   = Math.max(0.1, strength || 5.0);
+function generateNormalMap(heights, width, height, strength, waterThreshold) {
+  const s  = Math.max(0.1, strength || 5.0);
+  const wt = typeof waterThreshold === 'number' ? waterThreshold : 0.33;
   const out = Buffer.alloc(width * height * 4);
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      // 3×3 Sobel kernel neighbours
+      // ── Large-scale terrain shape via 3×3 Sobel ────────────────────────────
       const tl = sampleHeightAt(heights, width, height, x - 1, y - 1);
       const tm = sampleHeightAt(heights, width, height, x,     y - 1);
       const tr = sampleHeightAt(heights, width, height, x + 1, y - 1);
@@ -210,25 +387,88 @@ function generateNormalMap(heights, width, height, strength) {
       const bm = sampleHeightAt(heights, width, height, x,     y + 1);
       const br = sampleHeightAt(heights, width, height, x + 1, y + 1);
 
-      // Horizontal gradient (positive = slope rises going right / world +X)
-      const gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
-      // Vertical gradient (positive = slope rises going down the image / world -Z)
-      const gy = (bl + 2 * bm + br) - (tl + 2 * tm + tr);
+      const gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);  // horizontal gradient
+      const gy = (bl + 2 * bm + br) - (tl + 2 * tm + tr);  // vertical gradient
 
-      // Tangent-space normal components:
-      //   nx = -gx  (surface tilts right → normal leans left)
-      //   ny = -gy  (surface tilts downward in image → normal leans upward in image)
-      //   nz =  1/s (Z controls "sharpness" — scaling gx/gy by s is equivalent)
-      const nx  = -gx * s;
-      const ny  = -gy * s;
-      const nz  = 1.0;
+      let nx = -gx * s;
+      let ny = -gy * s;
+      const nz = 1.0;
+
+      // ── Biome micro-detail normals ─────────────────────────────────────────
+      // rawH is pre-threshold luminance; convert to normalised land height.
+      const rawH = sampleHeightAt(heights, width, height, x, y);
+      const nh   = Math.max(0, (rawH - wt) / Math.max(1e-6, 1 - wt));
+
+      if (nh > 0) {
+        // Slope magnitude from Sobel (not scaled by s — just for biome gating).
+        const slope = Math.sqrt(gx * gx + gy * gy);
+
+        // Detail strength varies by biome: rock/steep = strong angular bumps,
+        // grass = gentle, sand/snow = near-flat.
+        let detailStr;
+        if      (nh < 0.05) detailStr = 0.05;                        // beach / sand
+        else if (nh < 0.30) detailStr = 0.08 + slope * 0.06;         // grass / soil
+        else if (nh < 0.65) detailStr = 0.30 + slope * 0.45;         // gravel / rock (raised from 0.22+0.32)
+        else                detailStr = 0.06;                          // snow cap
+
+        // Five fBm octaves — biome-aware blend emphasises fine detail for rock,
+        // coarser octaves for grass, minimal for sand/snow.  UV coords keep
+        // frequencies world-relative regardless of source image resolution.
+        const u = x / (width  - 1);
+        const v = y / (height - 1);
+
+        // Octave 1 ~220 m world period (coarse rock facet planes)
+        const d1x = hashNoise(u * 220  + 11.3, v * 220  +  7.7) * 2 - 1;
+        const d1y = hashNoise(u * 220  + 99.7, v * 220  + 43.1) * 2 - 1;
+        // Octave 2 ~95 m period (finer crevices / grass blades)
+        const d2x = hashNoise(u * 510  + 33.3, v * 510  + 71.9) * 2 - 1;
+        const d2y = hashNoise(u * 510  + 17.1, v * 510  + 88.3) * 2 - 1;
+        // Octave 3 ~40 m period (rock crumble)
+        const d3x = hashNoise(u * 1200 + 57.7, v * 1200 + 23.4) * 2 - 1;
+        const d3y = hashNoise(u * 1200 +  4.9, v * 1200 + 61.8) * 2 - 1;
+        // Octave 4 ~18 m period (fine rock grain)
+        const d4x = hashNoise(u * 2700 + 81.3, v * 2700 + 44.2) * 2 - 1;
+        const d4y = hashNoise(u * 2700 + 22.9, v * 2700 + 93.6) * 2 - 1;
+        // Octave 5 ~8 m period (pebble-scale grit — rock only)
+        const d5x = hashNoise(u * 6100 + 13.7, v * 6100 + 67.1) * 2 - 1;
+        const d5y = hashNoise(u * 6100 + 55.4, v * 6100 +  8.9) * 2 - 1;
+
+        // Biome-dependent blend weights.
+        let blendX, blendY;
+        if (nh < 0.05) {
+          // Beach / sand — barely any bump, coarse-only
+          blendX = d1x * 0.70 + d2x * 0.30;
+          blendY = d1y * 0.70 + d2y * 0.30;
+        } else if (nh < 0.30) {
+          // Grass / soil — gentle undulation, no grit
+          blendX = d1x * 0.55 + d2x * 0.30 + d3x * 0.15;
+          blendY = d1y * 0.55 + d2y * 0.30 + d3y * 0.15;
+        } else if (nh < 0.65) {
+          // Gravel / rock — fine octaves 4+5 heavily weighted
+          blendX = d1x * 0.15 + d2x * 0.20 + d3x * 0.25 + d4x * 0.25 + d5x * 0.15;
+          blendY = d1y * 0.15 + d2y * 0.20 + d3y * 0.25 + d4y * 0.25 + d5y * 0.15;
+        } else {
+          // Snow cap — coarse and medium only
+          blendX = d1x * 0.60 + d2x * 0.40;
+          blendY = d1y * 0.60 + d2y * 0.40;
+        }
+
+        const detX = blendX * detailStr;
+        const detY = blendY * detailStr;
+
+        // Partial-derivative blending: add detail XY on top of terrain XY,
+        // keeping Z = 1 before final normalisation.  Preserves the terrain's
+        // overall slope direction while perturbing the per-pixel normal.
+        nx += detX;
+        ny += detY;
+      }
+
       const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-
       const idx = (y * width + x) * 4;
       out[idx]     = Math.round(((nx / len) * 0.5 + 0.5) * 255); // R = X
       out[idx + 1] = Math.round(((ny / len) * 0.5 + 0.5) * 255); // G = Y
       out[idx + 2] = Math.round(((nz / len) * 0.5 + 0.5) * 255); // B = Z
-      out[idx + 3] = 255;                                          // A = opaque
+      out[idx + 3] = 255;
     }
   }
 
@@ -375,6 +615,7 @@ async function run() {
       width,
       height,
       terrainConfig.normalMapStrength,
+      terrainConfig.waterThreshold,   // needed to distinguish land biome for detail normals
     );
     const nmPath = path.join(terrainConfig.outputDir, 'normal_map.png');
     await writePng(nmPath, nmData, width, height);
@@ -382,6 +623,34 @@ async function run() {
     console.log('  Convention: OpenGL tangent-space, flat = (127,127,255)');
     console.log(`  Strength:   ${terrainConfig.normalMapStrength}`);
     console.log('  To flip G (DirectX → OpenGL): set material.invertNormalMapY=true in Babylon.js');
+  }
+
+  // ── Optional specular map ─────────────────────────────────────────────────
+  if (terrainConfig.generateSpecularMap) {
+    const specData = generateSpecularMap(normalizedHeights, width, height);
+    const specPath = path.join(terrainConfig.outputDir, 'specular_map.png');
+    await writePng(specPath, specData, width, height);
+    console.log(`Specular map: ${specPath}`);
+    console.log('  R=specular intensity: rock/steep slopes bright, grass/sand dark');
+  }
+
+  // ── Optional ambient-occlusion map ────────────────────────────────────────
+  if (terrainConfig.generateAOMap) {
+    // rawLuminance drives the blur (gradual coast transitions, no hard cliff).
+    // normalizedHeights identifies ocean pixels → those get ao = 1 (white) so
+    // UV interpolation near the waterline never leaks AO darkening onto shore.
+    const aoData = generateAOMap(
+      rawLuminance,
+      normalizedHeights,
+      width,
+      height,
+      terrainConfig.aoRadius,
+      terrainConfig.aoStrength,
+    );
+    const aoPath = path.join(terrainConfig.outputDir, 'ao_map.png');
+    await writePng(aoPath, aoData, width, height);
+    console.log(`AO map: ${aoPath}`);
+    console.log(`  Radius: ${terrainConfig.aoRadius} px  Strength: ${terrainConfig.aoStrength}`);
   }
 
   console.log('Terrain build complete.');

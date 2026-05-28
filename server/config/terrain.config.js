@@ -49,7 +49,7 @@ module.exports = {
   // Spawn search tuning.
   spawnPointsCount: 8,
 
-  // ── Normal map generation ──────────────────────────────────────────────────
+  // ── Texture map generation ────────────────────────────────────────────────
   // When true, the build script writes normal_map.png to outputDir alongside
   // the terrain chunks.  The output is an OpenGL tangent-space normal map:
   //   flat surface → (127, 127, 255)  ← the standard blue
@@ -67,4 +67,18 @@ module.exports = {
   // Typical range 1–8.  Lower = subtle bump, higher = very pronounced slopes.
   // 2.0 is a good starting point; increase if the terrain looks too flat.
   normalMapStrength: 2.0,
+
+  // ── Specular map ──────────────────────────────────────────────────────────
+  // Encodes per-texel shininess: rock/steep slopes shine, grass/sand are matte.
+  generateSpecularMap: true,
+
+  // ── Ambient Occlusion map ─────────────────────────────────────────────────
+  // Darkens valleys and depressions using a depression-detection blur.
+  // aoRadius: blur window in heightfield pixels (larger = softer, wider AO).
+  // aoStrength: how aggressively depressions are darkened (2–6 typical range).
+  generateAOMap: true,
+  aoRadius:   80,   // ~1 km at 4096×4096 covering 50 km
+  // Keep strength low — coast edges are extremal and will darken hard.
+  // 1.5 gives visible valley depth while the 0.30 floor prevents black areas.
+  aoStrength:  1.5,
 };

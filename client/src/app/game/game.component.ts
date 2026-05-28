@@ -258,11 +258,19 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         );
       });
 
-      // 5. Determine spawn
-      const defaultSpawn = this.terrainService.nearestSpawn(0, 0);
-      let spawnX = defaultSpawn.spawnX;
-      let spawnZ = defaultSpawn.spawnZ;
-      let spawnHeading = defaultSpawn.heading;
+      // 5. Determine spawn.
+      // First-time players start at the world origin (0, 0) — the map centre.
+      // If (0, 0) happens to be on land, find the nearest navigable water.
+      let spawnX: number;
+      let spawnZ: number;
+      let spawnHeading: number;
+
+      if (!this.terrainService.isOnLand(0, 0)) {
+        spawnX = 0; spawnZ = 0; spawnHeading = 270;
+      } else {
+        const s = this.terrainService.nearestSpawn(0, 0);
+        spawnX = s.spawnX; spawnZ = s.spawnZ; spawnHeading = s.heading;
+      }
 
       const saved = await this.runInitStep('load-player-location', 'Checking your last anchorage…', async () => {
         return await firstValueFrom(

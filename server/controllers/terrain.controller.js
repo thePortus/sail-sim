@@ -26,17 +26,23 @@ exports.getManifest = (req, res) => {
   res.json(manifest);
 };
 
-exports.getNormalMap = (req, res) => {
-  const nmPath = path.join(terrainConfig.outputDir, 'normal_map.png');
-  if (!fs.existsSync(nmPath)) {
-    return res.status(404).json({
-      message: 'Normal map not found. Run: npm run build:terrain',
-    });
-  }
-  res.setHeader('Content-Type', 'image/png');
-  res.setHeader('Cache-Control', 'public, max-age=86400');
-  return res.sendFile(nmPath);
-};
+function serveTerrainPng(filename, label) {
+  return (req, res) => {
+    const filePath = path.join(terrainConfig.outputDir, filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        message: `${label} not found. Run: npm run build:terrain`,
+      });
+    }
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(filePath);
+  };
+}
+
+exports.getNormalMap   = serveTerrainPng('normal_map.png',   'Normal map');
+exports.getSpecularMap = serveTerrainPng('specular_map.png', 'Specular map');
+exports.getAOMap       = serveTerrainPng('ao_map.png',       'AO map');
 
 exports.getChunk = (req, res) => {
   const manifest = loadManifest();

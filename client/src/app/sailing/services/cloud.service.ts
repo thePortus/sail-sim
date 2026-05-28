@@ -11,6 +11,7 @@ import {
   Observer,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
+import { OceanService } from './ocean.service';
 import { VolumetricCloudsPlugin } from './volumetric-clouds-plugin';
 import { Weather } from '../models';
 
@@ -26,6 +27,7 @@ type CloudSpriteEntry = {
 @Injectable({ providedIn: 'root' })
 export class CloudService {
   private sceneService = inject(SceneService);
+  private oceanService = inject(OceanService);
 
   private scene: Scene | null = null;
   private beforeRenderObserver: Observer<Scene> | null = null;
@@ -40,6 +42,12 @@ export class CloudService {
   private stormParticles: ParticleSystem | GPUParticleSystem | null = null;
   private stormUsesGpu = false;
 
+  // Layer E: rain streaks (separate from mist; elongated additive particles)
+  private rainTexture: DynamicTexture | null = null;
+  private rainEmitter = new Vector3(0, 0, 0);
+  private rainParticles: ParticleSystem | GPUParticleSystem | null = null;
+  private rainUsesGpu = false;
+
   // Weather-driven state
   private cloudiness = 0.25;
   private targetCloudiness = 0.25;
@@ -49,12 +57,38 @@ export class CloudService {
   private windZ = 1;
   private windSpeed = 8;
   private stormPrecipitation = false;
+  // Precipitation type + intensity (blended separately from storminess so the
+  // visual rain ramp can differ from the fog ramp).
+  private precipType: 'none' | 'drizzle' | 'rain' | 'storm' = 'none';
+  private precipIntensity = 0;
+  private targetPrecipIntensity = 0;
 
   // Layer D: volumetric ray-march clouds (post-process)
   private volClouds: VolumetricCloudsPlugin | null = null;
 
   private elapsed = 0;
   private initialized = false;
+
+  // Cloud quality: 0=Low 1=Medium 2=High(default) 3=Ultra
+  private static readonly QUALITY_STEPS = [
+    { marchSteps: 16, lightSteps: 3 },   // 0 Low
+    { marchSteps: 28, lightSteps: 4 },   // 1 Medium
+    { marchSteps: 48, lightSteps: 6 },   // 2 High  ← default
+    { marchSteps: 80, lightSteps: 8 },   // 3 Ultra
+  ] as const;
+  private _cloudQuality = 2;
+
+  getCloudQuality(): number { return this._cloudQuality; }
+
+  setCloudQuality(level: number): void {
+    const q = Math.max(0, Math.min(3, Math.round(level)));
+    this._cloudQuality = q;
+    if (this.volClouds) {
+      const step = CloudService.QUALITY_STEPS[q];
+      this.volClouds.marchSteps = step.marchSteps;
+      this.volClouds.lightSteps = step.lightSteps;
+    }
+  }
 
   private readonly SPRITE_CAPACITY = 320;
   private readonly CANOPY_SPRITES  =  48;
@@ -72,6 +106,7 @@ export class CloudService {
     this.scene = scene;
     this.initSpriteLayer(scene);
     this.initStormLayer(scene);
+    this.initRainLayer(scene);
     this.initVolumetricLayer();
 
     this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => {
@@ -91,6 +126,13 @@ export class CloudService {
     else if (weather.precipitation === 'rain') precip = 0.30;
     else if (weather.precipitation === 'drizzle') precip = 0.10;
     this.targetStorminess = Math.max(precip, Math.max(0, this.targetCloudiness - 0.78) * 1.15);
+
+    // Rain intensity target (blended independently from storm fog).
+    this.precipType = (weather.precipitation ?? 'none') as typeof this.precipType;
+    if (this.precipType === 'storm')        this.targetPrecipIntensity = 1.0;
+    else if (this.precipType === 'rain')    this.targetPrecipIntensity = 0.40;
+    else if (this.precipType === 'drizzle') this.targetPrecipIntensity = 0.12;
+    else                                    this.targetPrecipIntensity = 0;
 
     // Wind comes FROM bearing, cloud advection moves TO opposite direction.
     const bearingRad = ((weather.wind.fromBearingDeg + 180) % 360) * Math.PI / 180;
@@ -122,6 +164,11 @@ export class CloudService {
     this.stormParticles = null;
     this.stormTexture?.dispose();
     this.stormTexture = null;
+
+    this.rainParticles?.dispose();
+    this.rainParticles = null;
+    this.rainTexture?.dispose();
+    this.rainTexture = null;
 
     this.volClouds?.dispose();
     this.volClouds = null;
@@ -440,6 +487,11 @@ export class CloudService {
 
     this.tickSprites(dt, camX, camZ);
     this.tickStormLayer(dt, camX, camZ);
+    this.tickRainLayer(dt, camX, camZ);
+
+    // Keep ocean reflection in sync with current sky coverage and sun position.
+    const sunEl = this.sceneService.getSunDirection().y;
+    this.oceanService.setCloudReflection(this.cloudiness, sunEl);
   }
 
   private tickSprites(dt: number, camX: number, camZ: number): void {
@@ -529,5 +581,175 @@ export class CloudService {
 
     // Time modulation to avoid static fog plate.
     this.stormParticles.updateSpeed = 0.008 + severity * 0.006 + Math.sin(this.elapsed * 0.35) * 0.0012;
+  }
+
+  // --------------------------------------------------------------------------
+  // Layer E: rain streaks
+  // --------------------------------------------------------------------------
+
+  private initRainLayer(scene: Scene): void {
+    this.rainTexture = this.buildRainTexture(scene);
+
+    // Always use the CPU particle system for rain: GPUParticleSystem does not
+    // support non-uniform minScaleX/minScaleY, which are essential for the
+    // elongated streak appearance.  5 000 CPU particles is plenty for a
+    // convincing effect and still runs comfortably at 60 fps.
+    this.rainParticles = new ParticleSystem('rain', 5_000, scene);
+    this.rainUsesGpu = false;
+
+    const ps = this.rainParticles;
+    ps.particleTexture = this.rainTexture;
+    ps.emitter = this.rainEmitter;
+
+    // Spread emitters in a 400 m × 400 m square at a fixed height above the
+    // emitter point.  The emitter itself tracks the camera (see tickRainLayer).
+    ps.minEmitBox = new Vector3(-200, 0, -200);
+    ps.maxEmitBox = new Vector3( 200, 0,  200);
+
+    // Direction is predominantly downward; wind component is set each tick.
+    // emitPower × direction gives particle velocity — 20 m/s downward with a
+    // slight spread means streaks fall ~100 m in 5 s, from emitter at +110 m.
+    ps.direction1 = new Vector3(-0.04, -1, -0.04);
+    ps.direction2 = new Vector3( 0.04, -1,  0.04);
+    ps.minEmitPower = 18;
+    ps.maxEmitPower = 24;
+    ps.minLifeTime  = 4.0;
+    ps.maxLifeTime  = 5.5;
+
+    // Rain-drop colour: bright blue-white, clearly visible against the sea.
+    ps.color1    = new Color4(0.82, 0.90, 0.98, 0.80);
+    ps.color2    = new Color4(0.76, 0.85, 0.96, 0.68);
+    ps.colorDead = new Color4(0.76, 0.85, 0.96, 0.0);
+
+    // Non-uniform scale: slightly elongated drops, not long thin streaks.
+    // Base size 3–5 m; scaleX makes them somewhat narrow, scaleY adds a
+    // modest vertical stretch so they read as falling drops, not blobs.
+    // At 100 m distance a 4 m base × scaleY 1.8 = 7.2 m tall particle
+    // spans ~40 px — clearly a drop, not a multi-metre streak.
+    ps.minSize   = 3.0;
+    ps.maxSize   = 5.0;
+    ps.minScaleX = 0.28;
+    ps.maxScaleX = 0.45;
+    ps.minScaleY = 1.4;
+    ps.maxScaleY = 2.2;
+
+    // Additive blending brightens rain over the ocean without occluding it.
+    ps.blendMode   = ParticleSystem.BLENDMODE_ADD;
+    ps.gravity     = Vector3.Zero();  // velocity comes from direction × emitPower
+    ps.updateSpeed = 0.016;
+    ps.emitRate    = 0;
+
+    // Group 3 renders after ocean + terrain (groups 0–2) so additive blending
+    // composites correctly over water.  Without this call, Babylon.js would
+    // clear the depth buffer before group 3, making rain appear in front of the
+    // ship.  Keeping the depth buffer lets rain depth-test against the hull.
+    scene.setRenderingAutoClearDepthStencil(3, false);
+    ps.renderingGroupId = 3;
+    ps.start();
+  }
+
+  /**
+   * Soft oval drop texture — wider than a pure streak so it reads as a
+   * raindrop rather than a thin line.  Radial gradient with a slight vertical
+   * stretch: transparent edge → bright blue-white centre.
+   */
+  private buildRainTexture(scene: Scene): DynamicTexture {
+    const w = 16, h = 24;
+    const tex = new DynamicTexture('rainTex', { width: w, height: h }, scene, false);
+    tex.hasAlpha = true;
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, w, h);
+
+    // Elliptical radial gradient: centre of the oval is slightly above middle
+    // (teardrop bias — heavier at the bottom like a real falling drop).
+    const cx = w / 2, cy = h * 0.42;
+    const rx = w / 2, ry = h * 0.48;   // semi-axes of the oval
+    const maxR = Math.max(rx, ry);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(rx / maxR, ry / maxR);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, maxR);
+    g.addColorStop(0.00, 'rgba(230,242,255,0.95)');
+    g.addColorStop(0.35, 'rgba(210,232,255,0.75)');
+    g.addColorStop(0.68, 'rgba(190,218,255,0.35)');
+    g.addColorStop(1.00, 'rgba(180,210,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(0, 0, maxR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    tex.update();
+    return tex;
+  }
+
+  private tickRainLayer(dt: number, camX: number, camZ: number): void {
+    if (!this.rainParticles) return;
+
+    // Smoothly blend toward target intensity (faster ramp-up than ramp-down).
+    const lerpRate = this.precipIntensity < this.targetPrecipIntensity ? 0.9 : 0.55;
+    this.precipIntensity += (this.targetPrecipIntensity - this.precipIntensity) *
+      Math.min(1, dt * lerpRate);
+
+    const camera = this.sceneService.camera;
+    const camY = camera?.position.y ?? 0;
+
+    // Keep emitter directly above the camera so rain falls around the player.
+    // 110 m height + ~22 m/s × 5 s ≈ 110 m fall — just enough to reach the
+    // water surface before the particle expires.
+    this.rainEmitter.x = camX;
+    this.rainEmitter.y = camY + 110;
+    this.rainEmitter.z = camZ;
+
+    const intens = this.precipIntensity;
+    if (intens < 0.005) {
+      this.rainParticles.emitRate = 0;
+      return;
+    }
+
+    // Emit rate: drizzle ≈ 120/s, rain ≈ 600/s, extreme storm ≈ 2 000/s.
+    // 2 000 × lifetime 5 s = 10 000 simultaneous particles — at 5 000 capacity
+    // the oldest recycle quickly, keeping the screen dense with streaks.
+    const gustFactor = intens > 0.75
+      ? (0.88 + 0.12 * Math.sin(this.elapsed * 0.7 + 1.3))
+      : 1.0;
+    this.rainParticles.emitRate = (120 + intens * 1880) * gustFactor;
+
+    // Wind direction tilts the rain.  At windSpeed = 20 m/s with factor 0.022
+    // the lateral velocity is ≈ 0.44 m/s per m/s of downward velocity,
+    // producing a noticeable ~24° tilt during a gale.
+    const tilt = this.windSpeed * 0.022;
+    const jitter = 0.06;
+    this.rainParticles.direction1 = new Vector3(
+      this.windX * tilt - jitter, -1, this.windZ * tilt - jitter,
+    );
+    this.rainParticles.direction2 = new Vector3(
+      this.windX * tilt + jitter, -1, this.windZ * tilt + jitter,
+    );
+
+    // Rotate each newly-emitted particle so its long axis aligns with the
+    // screen-space fall direction.  Without this the drop sprite is always
+    // drawn upright even when the wind tilts the trajectory sideways.
+    //
+    // Project the 3-D velocity (windX*tilt, -1, windZ*tilt) onto the camera's
+    // right and up axes to get the 2-D screen-space direction, then compute
+    // the angle from "pointing downward on screen" (angle = 0 = no rotation).
+    if (camera) {
+      const wm = camera.getWorldMatrix();
+      const camRight = Vector3.TransformNormal(new Vector3(1, 0, 0), wm);
+      const camUp    = Vector3.TransformNormal(new Vector3(0, 1, 0), wm);
+      const screenX  = this.windX * tilt * camRight.x - camRight.y + this.windZ * tilt * camRight.z;
+      const screenY  = this.windX * tilt * camUp.x    - camUp.y    + this.windZ * tilt * camUp.z;
+      const dropAngle = Math.atan2(screenX, -screenY);
+      this.rainParticles.minInitialRotation = dropAngle - 0.05;
+      this.rainParticles.maxInitialRotation = dropAngle + 0.05;
+    }
+
+    // Alpha scales with intensity: drizzle is light, storm is heavy and opaque.
+    const alphaA = 0.45 + intens * 0.40;
+    const alphaB = 0.35 + intens * 0.38;
+    this.rainParticles.color1 = new Color4(0.82, 0.90, 0.98, alphaA);
+    this.rainParticles.color2 = new Color4(0.76, 0.85, 0.96, alphaB);
   }
 }

@@ -3,4 +3,5 @@ module.exports = app => {
 
   app.get('/terrain/manifest', terrain.getManifest);
   app.get('/terrain/chunk/:cz/:cx', terrain.getChunk);
+  app.get('/terrain/normal-map', terrain.getNormalMap);
 };

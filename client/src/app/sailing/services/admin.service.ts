@@ -10,11 +10,12 @@ import { Settings } from '../../app.settings';
  * for anyone else.  The admin panel reads the role from localStorage before
  * even rendering so non-admins never see the controls.
  *
- * Server routes (from weather.routes.js):
+ * Server routes:
  *   POST   /api/weather/override        { windSpeed, fromBearingDeg }
  *   DELETE /api/weather/override
  *   POST   /api/weather/time-offset     { offsetSecs }
  *   DELETE /api/weather/time-offset
+ *   POST   /api/admin/teleport          { x, z }   — authorization gate only
  */
 @Injectable({ providedIn: 'root' })
 export class AdminService {
@@ -34,5 +35,10 @@ export class AdminService {
 
   clearTimeOffset(): Observable<any> {
     return this.http.delete(`${Settings.apiUrl}weather/time-offset`);
+  }
+
+  /** Authorization gate — server verifies admin role before the client teleports. */
+  teleport(x: number, z: number): Observable<any> {
+    return this.http.post(`${Settings.apiUrl}admin/teleport`, { x, z });
   }
 }

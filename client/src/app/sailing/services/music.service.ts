@@ -13,6 +13,7 @@ export interface TrackMeta {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const LS_KEY        = 'ignis_music_enabled';
+const LS_VOL_KEY    = 'ignis_music_volume';
 const TRACK_GAP_SEC = 1.5;   // silence at end of a track before advancing to the next
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -25,6 +26,8 @@ export class MusicService {
   readonly isPlaying  = signal<boolean>(false);
   readonly trackIndex = signal<number>(0);
   readonly trackList  = signal<TrackMeta[]>([]);
+  /** Linear volume 0→1.  Persisted to localStorage. */
+  readonly volume     = signal<number>(this.readStoredVolume());
 
   readonly currentTrackName = computed(() => {
     const list = this.trackList();
@@ -94,8 +97,19 @@ export class MusicService {
     // ── Start playback if the user preference says so ──────────────────────
     if (this.isEnabled()) {
       await Tone.start();   // ensure AudioContext is running after user gesture
+      // Restore saved volume now that the AudioContext exists.
+      this.setVolume(this.volume());
       await this.startCurrentTrack();
     }
+  }
+
+  /** Set master volume (0 = silent, 1 = full).  Persists to localStorage. */
+  setVolume(v: number): void {
+    const clamped = Math.max(0, Math.min(1, v));
+    this.volume.set(clamped);
+    localStorage.setItem(LS_VOL_KEY, String(clamped));
+    // Tone.gainToDb(0) would be -Infinity; clamp to −60 dB for silence.
+    Tone.Destination.volume.value = clamped < 0.001 ? -60 : 20 * Math.log10(clamped);
   }
 
   /** Toggle music on/off; persists preference to localStorage. */
@@ -137,6 +151,15 @@ export class MusicService {
       return v === null ? true : v === 'true';   // default: enabled
     } catch {
       return true;
+    }
+  }
+
+  private readStoredVolume(): number {
+    try {
+      const v = parseFloat(localStorage.getItem(LS_VOL_KEY) ?? '1');
+      return isNaN(v) ? 1 : Math.max(0, Math.min(1, v));
+    } catch {
+      return 1;
     }
   }
 

@@ -87,7 +87,8 @@ p {
   font-family: ui-monospace, 'Cascadia Code', monospace;
 
   &.top-left    { top: 1.25rem; left: 1.25rem; min-width: 220px; }
-  &.top-right   { top: 1.25rem; right: 1.25rem; min-width: 160px; }
+  // top-right starts below the fullscreen button (34 px button + 1.25 rem gap × 2 ≈ 74 px)
+  &.top-right   { top: 4.5rem; right: 1.25rem; min-width: 160px; }
   &.bottom-left { bottom: 1.25rem; left: 1.25rem; }
   &.bottom-center {
     bottom: 1.25rem;
@@ -146,6 +147,33 @@ p {
     background: rgba(239, 68, 68, 0.12);
     border-color: rgba(239, 68, 68, 0.3);
     color: #fca5a5;
+  }
+}
+
+// ── Fullscreen toggle button ──────────────────────────────────────────────────
+
+.fullscreen-btn {
+  position: absolute;
+  top: 1.25rem;
+  right: 1.25rem;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(8, 17, 30, 0.72);
+  backdrop-filter: blur(12px);
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  z-index: 41;   // sits above hud-panel (z-index: 40)
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.90);
+    border-color: rgba(255, 255, 255, 0.25);
   }
 }
 

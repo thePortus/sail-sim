@@ -4,6 +4,9 @@ const path = require('path');
 
 module.exports = {
   // Source grayscale elevation map image.
+  // This must be a HEIGHT MAP (bright = high, dark = low / ocean).
+  // Do NOT point this at a normal map — that will produce meaningless terrain.
+  // If you want a normal map output, set generateNormalMap below.
   sourceImage: path.join(__dirname, '..', 'assets', 'maps', 'elevation.png'),
 
   // Generated terrain artifacts.
@@ -45,4 +48,23 @@ module.exports = {
 
   // Spawn search tuning.
   spawnPointsCount: 8,
+
+  // ── Normal map generation ──────────────────────────────────────────────────
+  // When true, the build script writes normal_map.png to outputDir alongside
+  // the terrain chunks.  The output is an OpenGL tangent-space normal map:
+  //   flat surface → (127, 127, 255)  ← the standard blue
+  //   R encodes tangent-X, G encodes tangent-Y, B encodes the surface normal.
+  //
+  // Using the result in Babylon.js StandardMaterial:
+  //   material.bumpTexture = new Texture('.../normal_map.png', scene);
+  //   // For OpenGL-convention tools: no extra flip needed.
+  //   // For DirectX-convention (Substance Painter, some Photoshop plugins):
+  //   //   material.invertNormalMapY = true;
+  //
+  // normalMapStrength: scales the slope gradient before normalisation.
+  // Higher → bumpier-looking normals.  Typical range 2–15; start with 5.
+  generateNormalMap: true,
+  // Typical range 1–8.  Lower = subtle bump, higher = very pronounced slopes.
+  // 2.0 is a good starting point; increase if the terrain looks too flat.
+  normalMapStrength: 2.0,
 };

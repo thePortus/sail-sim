@@ -271,12 +271,33 @@ export class CannonService {
       l.diffuse   = new Color3(1.0, 0.72, 0.22);
       l.specular  = new Color3(1.0, 0.50, 0.08);
       l.intensity = 0;
-      l.range     = 10;
+      l.range     = 40;   // enough to light nearby hull / water nicely
       return l;
     };
     this.flashPort   = make('cannonFlashPort');
     this.flashStbd   = make('cannonFlashStbd');
     this.flashRemote = make('cannonFlashRemote');
+
+    // Exclude large scene meshes so the muzzle flash doesn't incorrectly
+    // illuminate the entire terrain or distant islands.
+    this.excludeMeshFromFlashLights('terrain_heightfield');
+
+    // Island meshes are loaded asynchronously — wire them up as they arrive.
+    this.scene.onNewMeshAddedObservable.add((mesh) => {
+      if (mesh.name.startsWith('island_') || mesh.name === 'terrain_heightfield') {
+        this.excludeMeshFromFlashLights(mesh.name);
+      }
+    });
+  }
+
+  private excludeMeshFromFlashLights(meshName: string): void {
+    const mesh = this.scene.getMeshByName(meshName);
+    if (!mesh) return;
+    for (const light of [this.flashPort, this.flashStbd, this.flashRemote]) {
+      if (light && !light.excludedMeshes.includes(mesh)) {
+        light.excludedMeshes.push(mesh);
+      }
+    }
   }
 
   // ── Muzzle blast (flame) particle systems ─────────────────────────────────

@@ -51,6 +51,7 @@ export class SceneService {
   // register their meshes as casters / receivers.
   shadowGenerator!: ShadowGenerator;
   private pipeline!: DefaultRenderingPipeline;
+  private _aaQuality = 1; // 0=Off 1=FXAA 2=MSAA2x 3=MSAA4x
 
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
@@ -259,8 +260,10 @@ export class SceneService {
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
 
-    // FXAA smooths aliased edges on the ocean and cloud geometry.
-    this.pipeline.fxaaEnabled = true;
+    // FXAA / MSAA — read persisted preference (default level 1 = FXAA only).
+    const storedAa = parseInt(localStorage.getItem('ignis_aa_quality') ?? '1', 10);
+    this._aaQuality = isNaN(storedAa) ? 1 : Math.max(0, Math.min(3, storedAa));
+    this.applyAaQuality();
 
     // Sharpening — counteracts the softening from FXAA and SSAO's bilateral blur,
     // keeping hull edges, rigging, and deck detail crisp.
@@ -295,6 +298,26 @@ export class SceneService {
     this.pipeline.imageProcessing.vignetteWeight           = 0.60;
     this.pipeline.imageProcessing.contrast                 = 1.10;
     this.pipeline.imageProcessing.exposure                 = 1.0;
+  }
+
+  // ── Anti-aliasing quality ──────────────────────────────────────────────────
+
+  private applyAaQuality(): void {
+    if (!this.pipeline) return;
+    switch (this._aaQuality) {
+      case 0: this.pipeline.fxaaEnabled = false; this.pipeline.samples = 1; break;
+      case 1: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 1; break;
+      case 2: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 2; break;
+      case 3: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 4; break;
+    }
+  }
+
+  getAaQuality(): number { return this._aaQuality; }
+
+  setAaQuality(level: number): void {
+    this._aaQuality = Math.max(0, Math.min(3, Math.round(level)));
+    localStorage.setItem('ignis_aa_quality', String(this._aaQuality));
+    this.applyAaQuality();
   }
 
   getSkyMesh(): any { return this.skyMesh; }
@@ -456,12 +479,12 @@ export class SceneService {
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.
     // Smooth transition: full moon feel with cool blue-white tones.
     this.moonLight.direction = dir;               // toward-sun = away-from-sun's direction
-    this.moonLight.intensity = (isNight ? Math.max(0, -h * 0.16) : Math.max(0, -h * 0.35)) * (1 - cloud * 0.35);
+    this.moonLight.intensity = (isNight ? Math.max(0, -h * 0.28) : Math.max(0, -h * 0.35)) * (1 - cloud * 0.35);
 
     // ── Hemisphere (ambient sky fill) ─────────────────────────────────────────
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
     this.ambient.intensity = isNight
-      ? 0.035 + cloud * 0.02
+      ? 0.14 + cloud * 0.03     // moonlit night — enough to see terrain & waves
       : 0.10 + above * 0.38 + cloud * 0.06;
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight
@@ -472,7 +495,7 @@ export class SceneService {
     const warmMix = h > 0 ? horizon * 0.60 : 0;
     this.ambient.diffuse     = Color3.Lerp(dayAmbient, warmAmbient, warmMix);
     this.ambient.groundColor = isNight
-      ? new Color3(0.01, 0.02, 0.05)
+      ? new Color3(0.05, 0.07, 0.14)   // dark but visible moonlit ground
       : new Color3(
         0.04 + above * 0.14 + horizon * 0.26,
         0.07 + above * 0.16 + horizon * 0.08,

@@ -2,9 +2,11 @@ import {
   Component, inject, signal, computed, OnInit, OnDestroy,
 } from '@angular/core';
 import { CommonModule, DecimalPipe } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { AdminService }   from '../../services/admin.service';
 import { WeatherService } from '../../services/weather.service';
 import { SceneService }   from '../../services/scene.service';
+import { VesselService }  from '../../services/vessel.service';
 
 const CARDINALS = [
   'N','NNE','NE','ENE','E','ESE','SE','SSE',
@@ -14,7 +16,7 @@ const CARDINALS = [
 @Component({
   selector: 'app-admin-panel',
   standalone: true,
-  imports: [CommonModule, DecimalPipe],
+  imports: [CommonModule, DecimalPipe, FormsModule],
   templateUrl: './admin-panel.component.html',
   styles: [`
     .admin-panel {
@@ -84,12 +86,25 @@ const CARDINALS = [
     .btn--apply:hover:not(:disabled) { background: #226699; }
     .btn--clear { background: rgba(80,30,20,0.7); color: #ffaa88; }
     .btn--clear:hover:not(:disabled) { background: rgba(120,40,25,0.8); }
+    .btn--teleport { background: #1a4a30; color: #88ffbb; }
+    .btn--teleport:hover:not(:disabled) { background: #226040; }
+    .coord-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    .coord-field { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+    .coord-label { font-size: 10px; color: #8899aa; letter-spacing: 0.06em; }
+    .coord-input {
+      width: 100%; padding: 4px 6px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.06); color: #ccddee;
+      font-family: inherit; font-size: 12px; outline: none; box-sizing: border-box;
+    }
+    .coord-input:focus { border-color: rgba(51,136,204,0.6); background: rgba(51,136,204,0.08); }
+    .current-pos { font-size: 10px; color: #556677; margin-bottom: 8px; }
   `],
 })
 export class AdminPanelComponent implements OnInit, OnDestroy {
   private adminService   = inject(AdminService);
   private weatherService = inject(WeatherService);
   private sceneService   = inject(SceneService);
+  private vesselService  = inject(VesselService);
 
   // ── Panel visibility ──────────────────────────────────────────────────────
   visible = signal(false);
@@ -113,6 +128,15 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
     if (c > 0.50) return 'Overcast';
     if (c > 0.28) return 'Partly Cloudy';
     return 'Clear';
+  });
+
+  // ── Teleport controls ────────────────────────────────────────────────────
+  teleportX = signal('0');
+  teleportZ = signal('0');
+
+  vesselPos = computed(() => {
+    const s = this.vesselService.state();
+    return { x: Math.round(s.x), z: Math.round(s.z) };
   });
 
   // ── Time controls ─────────────────────────────────────────────────────────
@@ -195,6 +219,26 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
     });
 
     this.timeOverrideActive.set(true);
+  }
+
+  // ── Teleport actions ──────────────────────────────────────────────────────
+
+  useCurrentPos(): void {
+    const pos = this.vesselPos();
+    this.teleportX.set(String(pos.x));
+    this.teleportZ.set(String(pos.z));
+  }
+
+  teleport(): void {
+    const x = parseFloat(this.teleportX());
+    const z = parseFloat(this.teleportZ());
+    if (isNaN(x) || isNaN(z)) return;
+
+    // Server verifies admin role first; only move the vessel on a 200 response.
+    this.adminService.teleport(x, z).subscribe({
+      next: () => this.vesselService.teleportTo(x, z),
+      error: (err) => console.warn('[AdminPanel] teleport rejected:', err.status),
+    });
   }
 
   clearTime(): void {

@@ -243,11 +243,15 @@ void main(void) {
     tNear = max(tNear, 0.01);
     tFar  = min(tFar, farZ);
 
-    // Depth occlusion: if opaque terrain sits in front of the cloud slab,
-    // skip or clamp the march so clouds don't overdraw terrain.
-    // rawDepth == 0 means "no geometry here" (sky) — leave tFar alone.
+    // Depth occlusion: if opaque geometry sits in front of the cloud slab,
+    // skip or clamp the march so clouds don't overdraw it.
+    // With nearZ=0.5, farZ=120000, the threshold rawDepth > 0.0001 corresponds
+    // to ~12.5 m — objects closer than that (including the player ship) would
+    // slip below the threshold and have clouds composited over them.
+    // Using 1e-7 safely catches any geometry at camera.minZ or beyond while
+    // excluding sky pixels which are cleared to exactly 0.
     float rawDepth = texture2D(depthSampler, vUV).r;
-    if (rawDepth > 0.0001) {
+    if (rawDepth > 1e-7) {
         // Reconstruct view-space Z, then convert to ray-t via projection onto rd.
         float geoEyeZ = rawDepth * (farZ - nearZ) + nearZ;
         float geoT    = geoEyeZ / max(dot(rd, cameraForward), 0.001);
@@ -513,11 +517,12 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     tNear = max(tNear, 0.01);
     tFar  = min(tFar, uniforms.farZ);
 
-    // Depth occlusion: if opaque terrain sits in front of the cloud slab,
-    // skip or clamp the march so clouds don't overdraw terrain.
-    // rawDepth == 0 means "no geometry here" (sky) — leave tFar alone.
+    // Depth occlusion: if opaque geometry sits in front of the cloud slab,
+    // skip or clamp the march so clouds don't overdraw it.
+    // Threshold 1e-7 catches geometry at camera.minZ while excluding sky
+    // pixels (cleared to exactly 0) — see GLSL path comment for full reasoning.
     let rawDepth = textureSampleLevel(depthSampler, depthSamplerSampler, input.vUV, 0.0).r;
-    if (rawDepth > 0.0001) {
+    if (rawDepth > 1e-7) {
         let geoEyeZ = rawDepth * (uniforms.farZ - uniforms.nearZ) + uniforms.nearZ;
         let geoT    = geoEyeZ / max(dot(rd, uniforms.cameraForward), 0.001);
         if (geoT <= tNear) {

@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  MirrorTexture, Plane, Texture,
+  MirrorTexture, Plane, Texture, DynamicTexture,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -146,6 +146,11 @@ uniform sampler2D u_terrainShadowMask;
 uniform vec2  u_terrainShadowCenter;
 uniform float u_terrainShadowSize;
 uniform float u_terrainShadowStrength;
+uniform sampler2D u_shoreMap;      // elevation map: R = clamp((elev+15)/20, 0,1)
+uniform vec2  u_shoreMapCenter;    // world-space XZ of shore map centre
+uniform float u_shoreMapSize;      // full world-space width covered (metres)
+uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
+uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
 
 #ifdef WEBGPU
 layout(location = 0) in vec3 v_worldPos;
@@ -316,7 +321,20 @@ void main() {
   screenUV = clamp(screenUV, 0.001, 0.999);
   vec3 reflectionRTT = texture2D(u_reflectionSampler, screenUV).rgb;
   vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80);
-  float terrainShadow = terrainShadowMask(worldXZ) * clamp(u_terrainShadowStrength, 0.0, 1.0);
+
+  // Cloud reflection: when the reflected ray points upward and sky is covered,
+  // blend a cloud-grey into the sky portion of the mirror so the water surface
+  // shows cloud shapes rather than pure clear-sky colour.
+  if (R.y > 0.04 && u_cloudCoverage > 0.01) {
+    float cloudMask = smoothstep(0.04, 0.50, R.y) * u_cloudCoverage;
+    vec3  cloudDay  = vec3(0.82, 0.85, 0.90);   // bright overcast white
+    vec3  cloudNight= vec3(0.16, 0.20, 0.30);   // dim moonlit grey
+    vec3  cloudCol  = mix(cloudNight, cloudDay, clamp(u_sunElevation, 0.0, 1.0));
+    reflection = mix(reflection, cloudCol, cloudMask * 0.62);
+  }
+
+  float rawTerrainMask = terrainShadowMask(worldXZ);
+  float terrainShadow  = rawTerrainMask * clamp(u_terrainShadowStrength, 0.0, 1.0);
   reflection *= (1.0 - terrainShadow * 0.40);
   float wakeT = max(v_wakeMask, wakeMask(worldXZ));
   vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
@@ -324,6 +342,32 @@ void main() {
   vec3 color = fresnel * reflection + scattering;
   float wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
   color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
+
+  // ── Shore: shallow-water transparency + tint + animated foam ───────────────
+  // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
+  // Three layers build up as the shore approaches:
+  //   1. Turquoise water-column tint  — deep blue gives way to shallow turquoise
+  //   2. Sandy seafloor               — very shallow water lets the bottom show
+  //   3. Animated foam                — breaking waves right at the waterline
+  vec2 shoreUV = (worldXZ - u_shoreMapCenter) / u_shoreMapSize + 0.5;
+  if (shoreUV.x >= 0.001 && shoreUV.x <= 0.999 &&
+      shoreUV.y >= 0.001 && shoreUV.y <= 0.999) {
+    float proximity = texture2D(u_shoreMap, shoreUV).r;
+    // Layer 1: turquoise water column (shallowing water shifts from deep blue)
+    float shallowF = smoothstep(0.05, 0.70, proximity);
+    color = mix(color, vec3(0.10, 0.48, 0.50), shallowF * 0.50);
+    // Layer 2: sandy/rocky seafloor visible through very shallow transparent water
+    float seafloorF = smoothstep(0.60, 0.88, proximity);
+    color = mix(color, vec3(0.62, 0.55, 0.40), seafloorF * 0.62);
+    // Layer 3: animated foam breaking at the waterline
+    float foamF = smoothstep(0.75, 0.95, proximity);
+    float foamAnim = clamp(
+        0.44
+      + 0.38 * sin(worldXZ.x * 0.55 + u_Time * 1.3 + worldXZ.y * 0.25)
+      + 0.28 * cos(worldXZ.y * 0.48 - u_Time * 0.9 + worldXZ.x * 0.18),
+      0.0, 1.0);
+    color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.92);
+  }
 
   vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
 #ifdef WEBGPU
@@ -469,6 +513,12 @@ var u_terrainShadowMask: texture_2d<f32>;
 uniform u_terrainShadowCenter: vec2f;
 uniform u_terrainShadowSize: f32;
 uniform u_terrainShadowStrength: f32;
+var u_shoreMapSampler: sampler;
+var u_shoreMap: texture_2d<f32>;
+uniform u_shoreMapCenter: vec2f;
+uniform u_shoreMapSize: f32;
+uniform u_cloudCoverage: f32;
+uniform u_sunElevation: f32;
 
 varying v_worldPos: vec3f;
 varying v_projPos: vec4f;
@@ -640,13 +690,52 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   screenUV += N.xz * 0.020;
   screenUV = clamp(screenUV, vec2f(0.001), vec2f(0.999));
   let reflectionRTT = textureSample(u_reflectionSampler, u_reflectionSamplerSampler, screenUV).rgb;
-  let terrainShadow = terrainShadowMask(worldXZ) * clamp(uniforms.u_terrainShadowStrength, 0.0, 1.0);
-  let reflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80)) * (1.0 - terrainShadow * 0.40);
+  // Cloud reflection (same logic as GLSL path above)
+  var cloudReflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80));
+  if (R.y > 0.04 && uniforms.u_cloudCoverage > 0.01) {
+    let cloudMask  = smoothstep(0.04, 0.50, R.y) * uniforms.u_cloudCoverage;
+    let cloudDay   = vec3f(0.82, 0.85, 0.90);
+    let cloudNight = vec3f(0.16, 0.20, 0.30);
+    let cloudCol   = mix(cloudNight, cloudDay, clamp(uniforms.u_sunElevation, 0.0, 1.0));
+    cloudReflection = mix(cloudReflection, cloudCol, vec3f(cloudMask * 0.62));
+  }
+  let rawTerrainMask = terrainShadowMask(worldXZ);
+  let terrainShadow = rawTerrainMask * clamp(uniforms.u_terrainShadowStrength, 0.0, 1.0);
+  let reflection = cloudReflection * (1.0 - terrainShadow * 0.40);
   let wakeT = max(input.v_wakeMask, wakeMask(worldXZ));
   let scattering = vec3f(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07) * (1.0 - terrainShadow * 0.75);
   var color = fresnel * reflection + scattering;
   let wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
   color = mix(color, vec3f(0.86, 0.92, 0.98), vec3f(wakeFoam));
+
+  // ── Shore: shallow-water transparency + tint + animated foam ───────────────
+  // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
+  // Three layers build up as the shore approaches:
+  //   1. Turquoise water-column tint  — deep blue gives way to shallow turquoise
+  //   2. Sandy seafloor               — very shallow water lets the bottom show
+  //   3. Animated foam                — breaking waves right at the waterline
+  let shoreUV = (worldXZ - uniforms.u_shoreMapCenter) / uniforms.u_shoreMapSize + vec2f(0.5);
+  let shoreInBounds = shoreUV.x >= 0.001 && shoreUV.x <= 0.999 &&
+                      shoreUV.y >= 0.001 && shoreUV.y <= 0.999;
+  if (shoreInBounds) {
+    // textureSampleLevel (explicit LOD) is valid in non-uniform control flow.
+    let proximity = textureSampleLevel(u_shoreMap, u_shoreMapSampler,
+                                       clamp(shoreUV, vec2f(0.001), vec2f(0.999)), 0.0).r;
+    // Layer 1: turquoise water column
+    let shallowF = smoothstep(0.05, 0.70, proximity);
+    color = mix(color, vec3f(0.10, 0.48, 0.50), vec3f(shallowF * 0.50));
+    // Layer 2: sandy/rocky seafloor through very shallow transparent water
+    let seafloorF = smoothstep(0.60, 0.88, proximity);
+    color = mix(color, vec3f(0.62, 0.55, 0.40), vec3f(seafloorF * 0.62));
+    // Layer 3: animated foam at the waterline
+    let foamF = smoothstep(0.75, 0.95, proximity);
+    let foamAnim = clamp(
+        0.44
+      + 0.38 * sin(worldXZ.x * 0.55 + uniforms.u_Time * 1.3 + worldXZ.y * 0.25)
+      + 0.28 * cos(worldXZ.y * 0.48 - uniforms.u_Time * 0.9 + worldXZ.x * 0.18),
+      0.0, 1.0);
+    color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.92));
+  }
 
   fragmentOutputs.color = vec4f(aces_tonemap(color * 2.0), 1.0);
 }
@@ -719,6 +808,14 @@ export class OceanService {
   private terrainShadowCenter = new Vector2(0, 0);
   private terrainShadowSize = 1;
   private terrainShadowStrength = 0;
+  // Shore elevation map (set by TerrainService after init).
+  // shoreMapBlackTexture is a 1×1 black placeholder — enc=0 decodes to
+  // tElev=−15 m so wDep≈15 m, both foam and tint thresholds fail to trigger.
+  // This prevents the foamAnim polka-dot artefact before the real map arrives.
+  private shoreMap: Texture | null = null;
+  private shoreMapBlackTexture: DynamicTexture | null = null;
+  private shoreMapCenter = new Vector2(0, 0);
+  private shoreMapSize = 3000;  // correct world width; placeholder is always black
 
   private elapsed    = 0;
   private boatX      = 0;
@@ -757,6 +854,7 @@ export class OceanService {
   async init(): Promise<void> {
     const { scene } = this.sceneService;
     this.buildReflectionRTT(scene);
+    this.buildShoreMapBlackTexture(scene);
     this.buildLodFar(scene);
     this.buildLod1(scene);
     this.buildLod0(scene);
@@ -802,6 +900,26 @@ export class OceanService {
         this.addToRenderList(mesh);
       }
     });
+  }
+
+  // ── Shore-map black placeholder ────────────────────────────────────────────
+
+  /**
+   * 1×1 black DynamicTexture used as the `u_shoreMap` sampler placeholder
+   * before TerrainService writes the real elevation map.  Sampling it gives
+   * R=0 → enc=0 → tElev=−15 m → wDep≈+15 m, which exceeds every foam/tint
+   * threshold → both effects stay fully transparent.  This prevents the
+   * foamAnim dot-grid artefact that appears when the reflectionRTT is used
+   * (which encodes scene colours, not ocean depths).
+   */
+  private buildShoreMapBlackTexture(scene: Scene): void {
+    const tex = new DynamicTexture('shoreMapBlack', { width: 1, height: 1 }, scene, false);
+    tex.hasAlpha = false;
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, 1, 1);
+    tex.update();
+    this.shoreMapBlackTexture = tex;
   }
 
   // ── LOD meshes ─────────────────────────────────────────────────────────────
@@ -878,8 +996,10 @@ export class OceanService {
           'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
           'u_cameraPosition',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
+          'u_shoreMapCenter', 'u_shoreMapSize',
+          'u_cloudCoverage', 'u_sunElevation',
         ],
-        samplers: ['u_reflectionSampler', 'u_terrainShadowMask'],
+        samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap'],
         needAlphaBlending: false,
         shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
       },
@@ -907,6 +1027,14 @@ export class OceanService {
     mat.setVector2('u_terrainShadowCenter', this.terrainShadowCenter);
     mat.setFloat('u_terrainShadowSize', this.terrainShadowSize);
     mat.setFloat('u_terrainShadowStrength', this.terrainShadowStrength);
+    // Shore map: use the 1×1 black placeholder until TerrainService sets the
+    // real elevation texture.  Black → enc=0 → tElev=−15 m → wDep≈15 m →
+    // foamF and shallowF both zero → no spurious polka-dot effect.
+    mat.setTexture('u_shoreMap', this.shoreMap ?? this.shoreMapBlackTexture ?? this.reflectionRTT);
+    mat.setVector2('u_shoreMapCenter', this.shoreMapCenter);
+    mat.setFloat('u_shoreMapSize', this.shoreMapSize);
+    mat.setFloat('u_cloudCoverage', 0);
+    mat.setFloat('u_sunElevation',  0);
 
     return mat;
   }
@@ -958,9 +1086,21 @@ export class OceanService {
         mat.setVector2('u_BoatPos', boatPos);
         mat.setVector2('u_BoatDir', boatDir);
         mat.setFloat('u_BoatSpeed', boatSpeedAbs);
+        mat.setFloat('u_cloudCoverage', this._cloudCoverage);
+        mat.setFloat('u_sunElevation',  this._sunElevation);
       }
 
     });
+  }
+
+  // ── Cloud reflection ──────────────────────────────────────────────────────
+  private _cloudCoverage = 0;
+  private _sunElevation  = 0;
+
+  /** Call each frame from CloudService so the water mirrors current sky state. */
+  setCloudReflection(coverage: number, sunElevation: number): void {
+    this._cloudCoverage = coverage;
+    this._sunElevation  = sunElevation;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -1002,6 +1142,21 @@ export class OceanService {
     if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * this.waveDepthScale);
     if (this.oceanMat1)    this.oceanMat1.setFloat('u_WaveDepth',    this.WAVE_DEPTH_MID  * this.waveDepthScale);
     if (this.oceanMatFar)  this.oceanMatFar.setFloat('u_WaveDepth',  this.WAVE_DEPTH_FAR  * this.waveDepthScale);
+  }
+
+  /** Called every ~10 frames by TerrainService with the freshly-painted shore elevation map. */
+  setShoreMap(map: Texture, centerX: number, centerZ: number, size: number): void {
+    this.shoreMap = map;
+    this.shoreMapCenter.set(centerX, centerZ);
+    this.shoreMapSize = Math.max(1, size);
+
+    const mats = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
+    for (const mat of mats) {
+      if (!mat) continue;
+      mat.setTexture('u_shoreMap', map);
+      mat.setVector2('u_shoreMapCenter', this.shoreMapCenter);
+      mat.setFloat('u_shoreMapSize', this.shoreMapSize);
+    }
   }
 
   setTerrainShadowMask(mask: Texture, centerX: number, centerZ: number, size: number, strength: number): void {

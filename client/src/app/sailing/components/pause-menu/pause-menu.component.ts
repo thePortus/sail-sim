@@ -2,6 +2,8 @@ import { Component, Output, EventEmitter, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MusicService } from '../../services/music.service';
 import { TerrainService } from '../../services/terrain.service';
+import { CloudService } from '../../services/cloud.service';
+import { SceneService } from '../../services/scene.service';
 
 @Component({
   selector: 'app-pause-menu',
@@ -40,6 +42,15 @@ import { TerrainService } from '../../services/terrain.service';
             ⏭ Next Track
           </button>
         </div>
+
+        <div class="quality-row">
+          <span class="quality-label">Volume</span>
+          <span class="quality-value">{{ volumePct() }}%</span>
+        </div>
+        <input type="range" min="0" max="1" step="0.01"
+               [value]="music.volume()"
+               (input)="onVolume($event)"
+               class="quality-slider" />
       </div>
 
       <!-- Graphics section -->
@@ -56,6 +67,30 @@ import { TerrainService } from '../../services/terrain.service';
                class="quality-slider" />
         <div class="quality-ticks">
           <span>Off</span><span>Low</span><span>Medium</span><span>High</span>
+        </div>
+
+        <div class="quality-row" style="margin-top:0.5rem">
+          <span class="quality-label">Cloud Quality</span>
+          <span class="quality-value">{{ cloudLabels[cloudQuality] }}</span>
+        </div>
+        <input type="range" min="0" max="3" step="1"
+               [value]="cloudQuality"
+               (input)="onCloudQuality($event)"
+               class="quality-slider" />
+        <div class="quality-ticks">
+          <span>Low</span><span>Medium</span><span>High</span><span>Ultra</span>
+        </div>
+
+        <div class="quality-row" style="margin-top:0.5rem">
+          <span class="quality-label">Anti-aliasing</span>
+          <span class="quality-value">{{ aaLabels[aaQuality] }}</span>
+        </div>
+        <input type="range" min="0" max="3" step="1"
+               [value]="aaQuality"
+               (input)="onAaQuality($event)"
+               class="quality-slider" />
+        <div class="quality-ticks">
+          <span>Off</span><span>FXAA</span><span>2×</span><span>4×</span>
         </div>
       </div>
 
@@ -225,13 +260,27 @@ export class PauseMenuComponent {
   @Output() quit   = new EventEmitter<void>();
 
   readonly music   = inject(MusicService);
-  private readonly terrain = inject(TerrainService);
+  private readonly terrain  = inject(TerrainService);
+  private readonly cloudSvc = inject(CloudService);
+  private readonly sceneSvc = inject(SceneService);
 
   readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
   shadowQuality = this.terrain.getShadowQuality();
 
+  readonly cloudLabels = ['Low', 'Medium', 'High', 'Ultra'];
+  cloudQuality = this.cloudSvc.getCloudQuality();
+
+  readonly aaLabels = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
+  aaQuality = this.sceneSvc.getAaQuality();
+
   onResume(): void { this.resume.emit(); }
   onQuit():   void { this.quit.emit();   }
+
+  volumePct(): number { return Math.round(this.music.volume() * 100); }
+
+  onVolume(event: Event): void {
+    this.music.setVolume(+(event.target as HTMLInputElement).value);
+  }
 
   async toggleMusic(): Promise<void> {
     await this.music.toggle();
@@ -244,5 +293,15 @@ export class PauseMenuComponent {
   onShadowQuality(event: Event): void {
     this.shadowQuality = +(event.target as HTMLInputElement).value;
     this.terrain.setShadowQuality(this.shadowQuality);
+  }
+
+  onCloudQuality(event: Event): void {
+    this.cloudQuality = +(event.target as HTMLInputElement).value;
+    this.cloudSvc.setCloudQuality(this.cloudQuality);
+  }
+
+  onAaQuality(event: Event): void {
+    this.aaQuality = +(event.target as HTMLInputElement).value;
+    this.sceneSvc.setAaQuality(this.aaQuality);
   }
 }

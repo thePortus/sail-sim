@@ -1,4 +1,4 @@
-import { Component, computed, inject, output } from '@angular/core';
+import { Component, computed, inject, output, signal, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
@@ -12,7 +12,7 @@ import { ChatComponent } from '../chat/chat.component';
   imports: [CommonModule, ChatComponent],
   templateUrl: './hud.component.html',
 })
-export class HudComponent {
+export class HudComponent implements OnInit, OnDestroy {
   vesselService  = inject(VesselService);
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
@@ -116,6 +116,26 @@ export class HudComponent {
 
   grounded  = this.vesselService.grounded;
   exitGame  = output<void>();
+
+  // ── Fullscreen ────────────────────────────────────────────────────────────
+  isFullscreen = signal(!!document.fullscreenElement);
+  private onFullscreenChange = () => this.isFullscreen.set(!!document.fullscreenElement);
+
+  ngOnInit(): void {
+    document.addEventListener('fullscreenchange', this.onFullscreenChange);
+  }
+
+  ngOnDestroy(): void {
+    document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+  }
+
+  async toggleFullscreen(): Promise<void> {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen().catch(() => {});
+    } else {
+      await document.exitFullscreen().catch(() => {});
+    }
+  }
 
   setSail(state: SailState): void {
     this.vesselService.setSailState(state);

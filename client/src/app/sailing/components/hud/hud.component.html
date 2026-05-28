@@ -1,5 +1,21 @@
 <div class="hud-overlay pointer-events-none select-none">
 
+  <!-- ── Fullscreen toggle (top-right corner, above sail panel) ─────────── -->
+  <button class="fullscreen-btn pointer-events-auto" (click)="toggleFullscreen()"
+          [title]="isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen'">
+    @if (!isFullscreen()) {
+      <!-- Expand icon: four arrows pointing outward -->
+      <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18">
+        <path d="M3 3h5v2H5v3H3V3zm9 0h5v5h-2V5h-3V3zM3 12h2v3h3v2H3v-5zm12 3h-3v2h5v-5h-2v3z"/>
+      </svg>
+    } @else {
+      <!-- Compress icon: four arrows pointing inward -->
+      <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18">
+        <path d="M6 6H3V4h5v5H6V6zm8-2h-5v2h3v3h2V4zm-8 9H3v-2h5v5H6v-3zm5 3h2v-3h3v-2h-5v5z"/>
+      </svg>
+    }
+  </button>
+
   <!-- ── Wind & speed panel (top-left) ──────────────────────────────────── -->
   <div class="hud-panel top-left">
 

@@ -46,6 +46,36 @@
       </div>
     </section>
 
+    <!-- ── Teleport section ───────────────────────────── -->
+    <section class="panel-section">
+      <h3 class="section-title">Teleport</h3>
+
+      <div class="current-pos">
+        Current position: X&nbsp;{{ vesselPos().x }}&nbsp; Z&nbsp;{{ vesselPos().z }}
+        <button class="btn btn--apply" style="flex:none;padding:2px 8px;margin-left:8px;font-size:10px;"
+                (click)="useCurrentPos()" title="Copy current position into fields">Copy</button>
+      </div>
+
+      <div class="coord-row">
+        <div class="coord-field">
+          <span class="coord-label">X (west ← → east)</span>
+          <input class="coord-input" type="number" step="10"
+                 [ngModel]="teleportX()" (ngModelChange)="teleportX.set($event)"
+                 placeholder="0" />
+        </div>
+        <div class="coord-field">
+          <span class="coord-label">Z (south ← → north)</span>
+          <input class="coord-input" type="number" step="10"
+                 [ngModel]="teleportZ()" (ngModelChange)="teleportZ.set($event)"
+                 placeholder="0" />
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn--teleport" (click)="teleport()">⛵ Teleport</button>
+      </div>
+    </section>
+
     <!-- ── Time of day section ─────────────────────────── -->
     <section class="panel-section">
       <h3 class="section-title">

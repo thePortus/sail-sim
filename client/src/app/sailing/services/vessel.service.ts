@@ -479,6 +479,25 @@ export class VesselService {
   }
 
   // ── Refloat ───────────────────────────────────────────────────────────────
+  // Teleports the vessel to an arbitrary world position.
+  // Keeps the current heading, furls sails, and resets speed/grounded state.
+  teleportTo(worldX: number, worldZ: number): void {
+    this.x     = worldX;
+    this.z     = worldZ;
+    this.speed = 0;
+    this.setSailState('reefed');
+
+    if (this.root) {
+      this.root.position.x = this.x;
+      this.root.position.z = this.z;
+    }
+
+    this.isGrounded   = false;
+    this.groundedTime = 0;
+    this.grounded.set(false);
+    this.resetWake();
+  }
+
   // Teleports the vessel to the nearest terrain spawn point, furls sails,
   // resets speed, and clears the grounded flag.
 

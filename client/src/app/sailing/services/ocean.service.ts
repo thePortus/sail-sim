@@ -653,101 +653,6 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
 `;
 
 // ── Kelvin wake shaders (unchanged) ──────────────────────────────────────────
-const WAKE_VERT = `
-precision highp float;
-#ifdef WEBGPU
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec2 uv;
-layout(location = 0) out vec2 vUV;
-#else
-attribute vec3 position;
-attribute vec2 uv;
-varying vec2 vUV;
-#endif
-uniform mat4 worldViewProjection;
-void main(){ vUV = uv; gl_Position = worldViewProjection * vec4(position, 1.0); }
-`;
-
-const WAKE_FRAG = `
-precision highp float;
-#ifdef WEBGPU
-layout(location = 0) in vec2 vUV;
-layout(location = 0) out vec4 fragmentColor;
-#else
-varying vec2 vUV;
-#endif
-uniform float time; uniform float speed; uniform float planeW; uniform float planeL;
-void main(){
-  float lx = (vUV.x - 0.5) * planeW;
-  float lz = (1.0 - vUV.y) * planeL;
-  if (lz < 1.0) {
-#ifdef WEBGPU
-    fragmentColor = vec4(0.0);
-#else
-    gl_FragColor = vec4(0.0);
-#endif
-    return;
-  }
-  float kelvinArm  = abs(lx) - lz * 0.354;
-  float lengthFade = exp(-lz * 0.0045);
-  float armFoam    = exp(-kelvinArm * kelvinArm * 0.016) * lengthFade;
-  float tPhase  = lz * 0.09 - time * 1.7;
-  float trans   = (sin(tPhase) * 0.5 + 0.5) * exp(-lz * 0.006) * exp(-lx * lx * 0.0005);
-  float dPhase  = kelvinArm * 0.13 - time * 1.1;
-  float diverg  = (sin(dPhase) * 0.5 + 0.5) * armFoam;
-  float r       = sqrt(lx * lx + lz * lz);
-  float centre  = exp(-r * 0.035) * (1.0 - exp(-r * 0.22)) * exp(-lx * lx * 0.07);
-  float foam    = clamp(armFoam * 0.52 + trans * 0.20 + diverg * 0.12 + centre * 0.36, 0.0, 1.0) * speed;
-  vec4 outCol = vec4(1.0, 1.0, 1.0, foam * 0.80);
-#ifdef WEBGPU
-  fragmentColor = outCol;
-#else
-  gl_FragColor = outCol;
-#endif
-}
-`;
-
-const WAKE_VERT_WGSL = `
-attribute position: vec3f;
-attribute uv: vec2f;
-varying vUV: vec2f;
-uniform worldViewProjection: mat4x4f;
-
-@vertex
-fn main(input: VertexInputs) -> FragmentInputs {
-  vertexOutputs.vUV = input.uv;
-  vertexOutputs.position = uniforms.worldViewProjection * vec4f(input.position, 1.0);
-}
-`;
-
-const WAKE_FRAG_WGSL = `
-varying vUV: vec2f;
-uniform time: f32;
-uniform speed: f32;
-uniform planeW: f32;
-uniform planeL: f32;
-
-@fragment
-fn main(input: FragmentInputs) -> FragmentOutputs {
-  let lx = (input.vUV.x - 0.5) * uniforms.planeW;
-  let lz = (1.0 - input.vUV.y) * uniforms.planeL;
-  if (lz < 1.0) {
-    discard;
-  }
-  let kelvinArm = abs(lx) - lz * 0.354;
-  let lengthFade = exp(-lz * 0.0045);
-  let armFoam = exp(-kelvinArm * kelvinArm * 0.016) * lengthFade;
-  let tPhase = lz * 0.09 - uniforms.time * 1.7;
-  let trans = (sin(tPhase) * 0.5 + 0.5) * exp(-lz * 0.006) * exp(-lx * lx * 0.0005);
-  let dPhase = kelvinArm * 0.13 - uniforms.time * 1.1;
-  let diverg = (sin(dPhase) * 0.5 + 0.5) * armFoam;
-  let r = sqrt(lx * lx + lz * lz);
-  let centre = exp(-r * 0.035) * (1.0 - exp(-r * 0.22)) * exp(-lx * lx * 0.07);
-  let foam = clamp(armFoam * 0.52 + trans * 0.20 + diverg * 0.12 + centre * 0.36, 0.0, 1.0) * uniforms.speed;
-  fragmentOutputs.color = vec4f(1.0, 1.0, 1.0, foam * 0.80);
-}
-`;
-
 // ── CPU port of GPU waveHeight() ─────────────────────────────────────────────
 //
 // Mirrors the GLSL `waveHeight(wx, wz)` in OCEAN_VERT exactly so that the CPU
@@ -808,8 +713,6 @@ export class OceanService {
   private oceanMat1!:    ShaderMaterial;
   private oceanMatFar!:  ShaderMaterial;
 
-  private wakePlane!: Mesh;
-  private wakeMat!:   ShaderMaterial;
 
   private reflectionRTT!: MirrorTexture;
   private terrainShadowMask: Texture | null = null;
@@ -841,9 +744,6 @@ export class OceanService {
   private readonly FAR_SIZE  = 200_000;
   private readonly FAR_SUB   = 32;
 
-  private readonly WAKE_W      = 180;
-  private readonly WAKE_L      = 320;
-  private readonly BOAT_HALF_L =   7.0;
 
   // Playground-style wave tuning. Near and LOD0 use full quality;
   // LOD1/FAR are reduced for performance.
@@ -861,7 +761,6 @@ export class OceanService {
     this.buildLod1(scene);
     this.buildLod0(scene);
     this.buildLodNear(scene);
-    this.buildWakePlane(scene);
     this.registerRenderLoop(scene);
 
     // WGSL ShaderMaterials can't participate in Babylon's prePass G-buffer
@@ -869,8 +768,7 @@ export class OceanService {
     // the prePass skips them — water doesn't need AO or DoF depth data anyway.
     if (this.sceneService.isWebGPU) {
       for (const mat of [
-        this.oceanMatFar, this.oceanMat1, this.oceanMat0,
-        this.oceanMatNear, this.wakeMat,
+        this.oceanMatFar, this.oceanMat1, this.oceanMat0, this.oceanMatNear,
       ]) {
         this.sceneService.excludeFromPrePass(mat);
       }
@@ -1013,36 +911,6 @@ export class OceanService {
     return mat;
   }
 
-  // ── Kelvin wake plane ──────────────────────────────────────────────────────
-
-  private buildWakePlane(scene: Scene): void {
-    this.wakePlane = MeshBuilder.CreateGround('wakePlane', {
-      width: this.WAKE_W, height: this.WAKE_L, subdivisions: 1,
-    }, scene);
-    this.wakePlane.isPickable    = false;
-    this.wakePlane.renderingGroupId = 2;
-
-    const useWgsl = this.sceneService.isWebGPU;
-    this.wakeMat = new ShaderMaterial('wakeMat', scene,
-      {
-        vertexSource: useWgsl ? WAKE_VERT_WGSL : WAKE_VERT,
-        fragmentSource: useWgsl ? WAKE_FRAG_WGSL : WAKE_FRAG,
-      },
-      {
-        attributes: ['position', 'uv'],
-        uniforms:   ['worldViewProjection', 'time', 'speed', 'planeW', 'planeL'],
-        needAlphaBlending: true,
-        shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
-      },
-    );
-    this.wakeMat.setFloat('planeW', this.WAKE_W);
-    this.wakeMat.setFloat('planeL', this.WAKE_L);
-    this.wakeMat.setFloat('time',   0);
-    this.wakeMat.setFloat('speed',  0);
-    this.wakeMat.backFaceCulling = false;
-    this.wakePlane.material = this.wakeMat;
-  }
-
   // ── Per-frame render loop ──────────────────────────────────────────────────
 
   private registerRenderLoop(scene: Scene): void {
@@ -1092,13 +960,6 @@ export class OceanService {
         mat.setFloat('u_BoatSpeed', boatSpeedAbs);
       }
 
-      this.wakeMat.setFloat('time',  t);
-      this.wakeMat.setFloat('speed', Math.min(1, Math.abs(this.boatSpeed) / 8));
-      const shift = this.WAKE_L / 2 - this.BOAT_HALF_L;
-      this.wakePlane.position.x = this.boatX - Math.sin(this.boatHdgR) * shift;
-      this.wakePlane.position.z = this.boatZ - Math.cos(this.boatHdgR) * shift;
-      this.wakePlane.rotation.y = this.boatHdgR;
-      this.wakePlane.position.y = this.getVisualHeightAt(this.boatX, this.boatZ, t) + 0.12;
     });
   }
 

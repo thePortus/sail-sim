@@ -52,10 +52,12 @@ export class CloudService {
   private elapsed = 0;
   private initialized = false;
 
-  private readonly SPRITE_CAPACITY = 260;
-  private readonly CANOPY_SPRITES = 72;
+  private readonly SPRITE_CAPACITY = 320;
+  private readonly CANOPY_SPRITES  =  48;
   private readonly WRAP_RANGE = 26000;
-  private readonly WRAP_SPAN = 52000;
+  private readonly WRAP_SPAN  = 52000;
+  private readonly CELL_SIZE  = 256;
+  private readonly NUM_CELLS  =   4;
 
   init(): void {
     if (this.initialized) return;
@@ -117,91 +119,202 @@ export class CloudService {
 
   private initSpriteLayer(scene: Scene): void {
     const spriteImage = this.buildCloudSpriteImage();
-    this.spriteManager = new SpriteManager('cloudSpriteManager', spriteImage, this.SPRITE_CAPACITY, 256, scene);
+    this.spriteManager = new SpriteManager(
+      'cloudSpriteManager', spriteImage,
+      this.SPRITE_CAPACITY, this.CELL_SIZE, scene,
+    );
     this.spriteManager.renderingGroupId = 0;
 
-    // Order matters: low-cloudiness states activate earliest entries first,
-    // so near rings must be generated first to ensure visible overhead sprites.
-    const rings = [2200, 3800, 6200, 9800, 14800, 21200, 28600];
+    // ── Seeded hash so cloud layout is deterministic ────────────────────────
+    const h = (n: number) => { const x = Math.sin(n * 127.1) * 43758.5; return x - Math.floor(x); };
 
-    let created = 0;
-    for (let r = 0; r < rings.length && created < this.SPRITE_CAPACITY; r++) {
-      const ring = rings[r];
-      const count = r < 3 ? 44 + r * 12 : 24 + r * 8;
-      for (let i = 0; i < count && created < this.SPRITE_CAPACITY; i++, created++) {
-        const a = (i / count) * Math.PI * 2 + r * 0.17;
-        const jitter = (Math.sin(i * 1.7 + r) * 0.5 + 0.5) * (r < 3 ? 900 : 1800);
-        const x = Math.sin(a) * ring + Math.cos(a * 1.9) * jitter;
-        const z = Math.cos(a) * ring + Math.sin(a * 1.3) * jitter;
+    // ── 1. Camera-anchored canopy sprites (overhead coverage) ───────────────
+    for (let i = 0; i < this.CANOPY_SPRITES && i < this.SPRITE_CAPACITY; i++) {
+      const angle  = (i / this.CANOPY_SPRITES) * Math.PI * 2 + i * 0.41;
+      const radius = 1400 + (i % 8) * 280;
+      const altBand = i % 3;
+      const y = 960 + altBand * 380 + (i % 4) * 90;
+      const size = 820 + (i % 6) * 140 + altBand * 80;
 
-        const altitudeBand = r % 3;
-        const y = 1180 + altitudeBand * 430 + (i % 4) * 110 + (r < 2 ? -80 : 0);
+      const sprite = new Sprite(`cloudCanopy_${i}`, this.spriteManager!);
+      sprite.position.set(Math.sin(angle) * radius, y, Math.cos(angle) * radius);
+      sprite.size      = size;
+      sprite.cellIndex = i % this.NUM_CELLS;
+      sprite.isVisible = false;
+      sprite.color     = new Color4(1, 1, 1, 0);
+      sprite.angle     = h(i * 3.7) * Math.PI;
 
-        const sprite = new Sprite(`cloudSprite_${created}`, this.spriteManager);
+      this.sprites.push({
+        sprite,
+        baseY: y,
+        baseSize: size,
+        driftScale: 0.18 + altBand * 0.06,
+        phase: i * 0.53,
+        spin: (h(i * 11.3) - 0.5) * 0.003,
+      });
+    }
+
+    // ── 2. World-drifting sprites organised into cloud banks ────────────────
+    //
+    // Banks are sparsely distributed so there are real gaps between formations
+    // rather than a uniform carpet.  Each bank spawns 5–9 overlapping sprites
+    // of varying size and altitude, which together read as a single cloud mass.
+    const BANK_COUNT  = 42;
+    const bankRadii   = [3400, 5800, 9200, 14000, 20000, 26000];
+
+    let created = this.CANOPY_SPRITES;
+    for (let b = 0; b < BANK_COUNT && created < this.SPRITE_CAPACITY; b++) {
+      // Bank centre
+      const ringIdx  = b % bankRadii.length;
+      const ring     = bankRadii[ringIdx];
+      const angle    = (b / BANK_COUNT) * Math.PI * 2 + h(b * 5.1) * 0.9;
+      const jitter   = h(b * 7.3) * (ring * 0.35);
+      const bx = Math.sin(angle) * ring + Math.cos(angle * 1.7) * jitter;
+      const bz = Math.cos(angle) * ring + Math.sin(angle * 1.3) * jitter;
+      const bAlt = 1100 + (b % 3) * 420 + h(b * 3.1) * 180;
+
+      // Sprites within this bank
+      const bankSprites = 4 + (b % 5);
+      for (let i = 0; i < bankSprites && created < this.SPRITE_CAPACITY; i++, created++) {
+        const sa = (i / bankSprites) * Math.PI * 2 + h(created * 2.9);
+        const sr = (140 + h(created * 4.1) * 420) * (1 + ringIdx * 0.22);
+        const x  = bx + Math.sin(sa) * sr;
+        const z  = bz + Math.cos(sa) * sr;
+        const y  = bAlt + (h(created * 6.7) - 0.5) * 220;
+        const sz = (880 + ringIdx * 90 + h(created * 8.3) * 280);
+
+        const sprite = new Sprite(`cloudBank_${created}`, this.spriteManager!);
         sprite.position.set(x, y, z);
-        sprite.size = (r < 3 ? 1060 : 940) + (i % 7) * 150 + altitudeBand * 120;
-        sprite.cellIndex = 0;
+        sprite.size      = sz;
+        sprite.cellIndex = created % this.NUM_CELLS;
         sprite.isVisible = false;
-        sprite.color = new Color4(1, 1, 1, 0);
-        sprite.angle = (i % 13) * 0.18;
+        sprite.color     = new Color4(1, 1, 1, 0);
+        sprite.angle     = h(created * 5.3) * Math.PI;
 
         this.sprites.push({
           sprite,
           baseY: y,
-          baseSize: sprite.size,
-          driftScale: 0.22 + altitudeBand * 0.07,
+          baseSize: sz,
+          driftScale: 0.20 + (ringIdx % 3) * 0.05,
           phase: created * 0.37,
-          spin: ((i % 9) - 4) * 0.0022,
+          spin: (h(created * 9.1) - 0.5) * 0.0018,
         });
       }
     }
   }
 
+  // ── Spritesheet: NUM_CELLS cloud variants side-by-side ─────────────────────
   private buildCloudSpriteImage(): string {
-    const size = 256;
+    const cs = this.CELL_SIZE;
     const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
+    canvas.width  = cs * this.NUM_CELLS;
+    canvas.height = cs;
     const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
-
-    ctx.clearRect(0, 0, size, size);
-
-    const puffs = [
-      { x: 0.25, y: 0.52, r: 0.20 },
-      { x: 0.42, y: 0.45, r: 0.24 },
-      { x: 0.58, y: 0.50, r: 0.23 },
-      { x: 0.74, y: 0.56, r: 0.20 },
-      { x: 0.50, y: 0.62, r: 0.22 },
-    ];
-
-    for (const p of puffs) {
-      const cx = p.x * size;
-      const cy = p.y * size;
-      const rr = p.r * size;
-      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rr);
-      g.addColorStop(0.0, 'rgba(255,255,255,1.0)');
-      g.addColorStop(0.30, 'rgba(250,252,255,0.88)');
-      g.addColorStop(0.64, 'rgba(238,244,252,0.34)');
-      g.addColorStop(1.0, 'rgba(225,235,250,0.0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(cx, cy, rr, 0, Math.PI * 2);
-      ctx.fill();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (let v = 0; v < this.NUM_CELLS; v++) {
+      this.drawCloudCell(ctx, v * cs, 0, cs, v);
     }
-
-    // Break radial symmetry to avoid obvious circular fog blobs.
-    for (let i = 0; i < 28; i++) {
-      const x = (Math.sin(i * 1.73) * 0.5 + 0.5) * size;
-      const y = (Math.cos(i * 1.21) * 0.28 + 0.58) * size;
-      const w = 16 + (i % 7) * 8;
-      const h = 8 + (i % 5) * 6;
-      ctx.fillStyle = `rgba(255,255,255,${0.02 + (i % 4) * 0.01})`;
-      ctx.beginPath();
-      ctx.ellipse(x, y, w, h, i * 0.37, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
     return canvas.toDataURL('image/png');
+  }
+
+  /**
+   * Draws one cumulus cloud variant into the canvas at (ox, oy).
+   * Shape: flat base, bumpy top, built from layered elliptical soft puffs.
+   */
+  private drawCloudCell(
+    ctx: CanvasRenderingContext2D,
+    ox: number, oy: number, cs: number, v: number,
+  ): void {
+    // Deterministic per-variant hash.
+    const h = (i: number, k = 0) => {
+      const x = Math.sin(i * 127.1 + v * 311.7 + k * 53.3) * 43758.5;
+      return x - Math.floor(x);
+    };
+
+    type Puff = { x: number; y: number; rx: number; ry: number; a: number; w: number };
+    const puffs: Puff[] = [];
+
+    // Layer 1 – wide, flat base puffs (anchor the cloud footprint).
+    const nBase = 5 + (v % 2);
+    for (let i = 0; i < nBase; i++) {
+      puffs.push({
+        x:  0.12 + (i + h(i, 1) * 0.5) / nBase * 0.76,
+        y:  0.64 + h(i, 2) * 0.09,
+        rx: 0.18 + h(i, 3) * 0.10,
+        ry: 0.09 + h(i, 4) * 0.05,
+        a:  0.86,
+        w:  0.91,
+      });
+    }
+
+    // Layer 2 – mid puffs (fill the body).
+    const nMid = 8 + (v % 3);
+    for (let i = 0; i < nMid; i++) {
+      puffs.push({
+        x:  0.10 + (i + h(i + 50, 1) * 0.4) / nMid * 0.80,
+        y:  0.44 + h(i + 50, 2) * 0.16,
+        rx: 0.09 + h(i + 50, 3) * 0.08,
+        ry: 0.08 + h(i + 50, 4) * 0.07,
+        a:  0.78 + h(i + 50, 5) * 0.14,
+        w:  0.97 + h(i + 50, 6) * 0.03,
+      });
+    }
+
+    // Layer 3 – top puffs, arched for the classic cumulus crown.
+    const nTop = 10 + (v % 4);
+    for (let i = 0; i < nTop; i++) {
+      const t = i / (nTop - 1);
+      const arch = Math.sin(t * Math.PI);  // tallest in the middle
+      puffs.push({
+        x:  0.13 + t * 0.74 + (h(i + 100, 1) - 0.5) * 0.10,
+        y:  0.17 + (1 - arch) * 0.16 + h(i + 100, 2) * 0.07,
+        rx: 0.055 + h(i + 100, 3) * 0.065,
+        ry: 0.055 + h(i + 100, 4) * 0.060,
+        a:  0.70 + h(i + 100, 5) * 0.22,
+        w:  1.00,
+      });
+    }
+
+    // Layer 4 – tiny accent puffs for high-frequency texture.
+    for (let i = 0; i < 16; i++) {
+      puffs.push({
+        x:  0.14 + h(i + 200, 1) * 0.72,
+        y:  0.20 + h(i + 200, 2) * 0.48,
+        rx: 0.025 + h(i + 200, 3) * 0.040,
+        ry: 0.020 + h(i + 200, 4) * 0.035,
+        a:  0.28 + h(i + 200, 5) * 0.32,
+        w:  1.00,
+      });
+    }
+
+    // Draw puffs — base first so brighter tops render on top.
+    for (const p of puffs) {
+      const cx  = ox + p.x * cs;
+      const cy  = oy + p.y * cs;
+      const rx  = p.rx * cs;
+      const ry  = p.ry * cs;
+      const maxR = Math.max(rx, ry);
+
+      // Squash/stretch the drawing context so the gradient is elliptical.
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(rx / maxR, ry / maxR);
+
+      const rv = Math.round(255 * Math.min(1, p.w));
+      const gv = Math.round(255 * Math.min(1, p.w * 0.985));
+      const bv = Math.round(255 * Math.min(1, p.w * 0.97 + 0.03));
+      const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, maxR);
+      grad.addColorStop(0.00, `rgba(${rv},${gv},${bv},${p.a.toFixed(3)})`);
+      grad.addColorStop(0.38, `rgba(${rv},${gv},${bv},${(p.a * 0.68).toFixed(3)})`);
+      grad.addColorStop(0.68, `rgba(${rv},${gv},${bv},${(p.a * 0.22).toFixed(3)})`);
+      grad.addColorStop(0.88, `rgba(${rv},${gv},${bv},${(p.a * 0.05).toFixed(3)})`);
+      grad.addColorStop(1.00, `rgba(${rv},${gv},${bv},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, maxR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -286,49 +399,50 @@ export class CloudService {
   private tickSprites(dt: number, camX: number, camZ: number): void {
     const cloudD = Math.max(0, Math.min(1, this.cloudiness));
     const stormD = Math.max(0, Math.min(1, this.storminess));
-    const activeRatio = Math.max(0.24, Math.min(1, 0.26 + cloudD * 0.74));
+
+    // Fade in more sprites as cloudiness rises; always show canopy minimum.
+    const activeRatio = Math.max(this.CANOPY_SPRITES / this.sprites.length,
+                                 Math.min(1, 0.22 + cloudD * 0.78));
     const activeCount = Math.floor(this.sprites.length * activeRatio);
 
-    const drift = this.windSpeed * dt * 10.0;
+    const drift   = this.windSpeed * dt * 10.0;
     const overcast = Math.max(0, Math.min(1, cloudD * 0.75 + stormD * 0.45));
-    const shade = 1.0 - (overcast * 0.24 + stormD * 0.12);
-    const alphaBase = 0.14 + cloudD * 0.40;
+    const shade    = 1.0 - (overcast * 0.22 + stormD * 0.10);
+    const alphaBase = 0.13 + cloudD * 0.38;
 
     for (let i = 0; i < this.sprites.length; i++) {
       const e = this.sprites[i];
       const s = e.sprite;
-      if (i >= activeCount) {
-        s.isVisible = false;
-        continue;
-      }
+      if (i >= activeCount) { s.isVisible = false; continue; }
 
       s.isVisible = true;
 
       if (i < this.CANOPY_SPRITES) {
-        // Camera-anchored canopy: behaves like skybox sprites overhead.
-        const canopyRadius = 1200 + (i % 12) * 210;
-        const canopyAngle = e.phase * 1.23;
-        const canopyDrift = this.elapsed * this.windSpeed * 16.0 * e.driftScale;
-        s.position.x = camX + Math.sin(canopyAngle) * canopyRadius + this.windX * canopyDrift;
-        s.position.z = camZ + Math.cos(canopyAngle) * canopyRadius + this.windZ * canopyDrift;
-        s.position.y = 980 + (i % 5) * 120 - stormD * 140 + Math.sin(this.elapsed * 0.11 + e.phase) * 45;
+        // Camera-anchored: slow drift anchored to camera position.
+        const radius = e.baseSize * 1.6;           // re-use baseSize as rough scale
+        const angle  = e.phase * 1.23;
+        const drift2 = this.elapsed * this.windSpeed * 14.0 * e.driftScale;
+        s.position.x = camX + Math.sin(angle) * radius + this.windX * drift2;
+        s.position.z = camZ + Math.cos(angle) * radius + this.windZ * drift2;
+        s.position.y = e.baseY - stormD * 120 + Math.sin(this.elapsed * 0.10 + e.phase) * 40;
       } else {
+        // World-drifting bank sprite — advects with wind, wraps at edges.
         s.position.x += this.windX * drift * e.driftScale;
         s.position.z += this.windZ * drift * e.driftScale;
-        s.position.y = e.baseY - stormD * 260 + Math.sin(this.elapsed * 0.09 + e.phase) * 75;
+        s.position.y  = e.baseY - stormD * 240 + Math.sin(this.elapsed * 0.08 + e.phase) * 65;
 
-        if (s.position.x - camX > this.WRAP_RANGE) s.position.x -= this.WRAP_SPAN;
-        if (camX - s.position.x > this.WRAP_RANGE) s.position.x += this.WRAP_SPAN;
-        if (s.position.z - camZ > this.WRAP_RANGE) s.position.z -= this.WRAP_SPAN;
-        if (camZ - s.position.z > this.WRAP_RANGE) s.position.z += this.WRAP_SPAN;
+        if (s.position.x - camX >  this.WRAP_RANGE) s.position.x -= this.WRAP_SPAN;
+        if (camX - s.position.x >  this.WRAP_RANGE) s.position.x += this.WRAP_SPAN;
+        if (s.position.z - camZ >  this.WRAP_RANGE) s.position.z -= this.WRAP_SPAN;
+        if (camZ - s.position.z >  this.WRAP_RANGE) s.position.z += this.WRAP_SPAN;
       }
 
       s.angle += e.spin * dt;
 
-      const pulse = 0.94 + Math.sin(this.elapsed * 0.22 + e.phase) * 0.06;
-      s.size = e.baseSize * (0.88 + cloudD * 0.26) * pulse;
+      const pulse = 0.96 + Math.sin(this.elapsed * 0.18 + e.phase) * 0.04;
+      s.size = e.baseSize * (0.90 + cloudD * 0.22) * pulse;
 
-      const alpha = alphaBase + stormD * 0.05;
+      const alpha = Math.min(0.72, alphaBase + stormD * 0.05);
       s.color = new Color4(0.97 * shade, 0.98 * shade, 1.00 * shade, alpha);
     }
   }

@@ -11,6 +11,7 @@ import {
   Observer,
 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
+import { VolumetricCloudsPlugin } from './volumetric-clouds-plugin';
 import { Weather } from '../models';
 
 type CloudSpriteEntry = {
@@ -49,6 +50,9 @@ export class CloudService {
   private windSpeed = 8;
   private stormPrecipitation = false;
 
+  // Layer D: volumetric ray-march clouds (post-process)
+  private volClouds: VolumetricCloudsPlugin | null = null;
+
   private elapsed = 0;
   private initialized = false;
 
@@ -68,6 +72,7 @@ export class CloudService {
     this.scene = scene;
     this.initSpriteLayer(scene);
     this.initStormLayer(scene);
+    this.initVolumetricLayer();
 
     this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => {
       const dt = Math.min(scene.getEngine().getDeltaTime() / 1000, 0.05);
@@ -92,6 +97,15 @@ export class CloudService {
     this.windX = Math.sin(bearingRad);
     this.windZ = Math.cos(bearingRad);
     this.windSpeed = Math.max(2, weather.wind.speed);
+
+    // Keep volumetric layer in sync.
+    if (this.volClouds) {
+      this.volClouds.updateCoverage(this.targetCloudiness);
+      this.volClouds.updateWind(
+        new Vector3(this.windX, 0, this.windZ),
+        this.windSpeed,
+      );
+    }
   }
 
   dispose(): void {
@@ -109,8 +123,40 @@ export class CloudService {
     this.stormTexture?.dispose();
     this.stormTexture = null;
 
+    this.volClouds?.dispose();
+    this.volClouds = null;
+
     this.scene = null;
     this.initialized = false;
+  }
+
+  // --------------------------------------------------------------------------
+  // Layer D: volumetric ray-march clouds (post-process)
+  // --------------------------------------------------------------------------
+
+  private initVolumetricLayer(): void {
+    const camera = this.sceneService.camera;
+    if (!camera) {
+      console.warn('[CloudService] No camera — skipping volumetric clouds');
+      return;
+    }
+
+    this.volClouds = new VolumetricCloudsPlugin(
+      this.scene!,
+      camera,
+      () => this.sceneService.getSunDirection(),
+      {
+        cloudBaseHeight:  900,
+        cloudThickness:   600,
+        cloudCoverage:    this.cloudiness,
+        windDirection:    new Vector3(this.windX, 0, this.windZ),
+        windSpeed:        this.windSpeed,
+        // Quality defaults — can be tweaked at runtime.
+        marchSteps:  48,
+        lightSteps:  6,
+        renderScale: 0.82,
+      },
+    );
   }
 
   // --------------------------------------------------------------------------

@@ -299,6 +299,9 @@ export class SceneService {
 
   getSkyMesh(): any { return this.skyMesh; }
 
+  /** Returns a unit vector pointing FROM the scene origin TOWARD the sun. */
+  getSunDirection(): Vector3 { return this.computeSunDir(); }
+
   updateFogDensity(density: number): void {
     if (this.scene) this.scene.fogDensity = density;
   }

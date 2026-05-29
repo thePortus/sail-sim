@@ -6,4 +6,8 @@ module.exports = app => {
   app.get('/terrain/normal-map',   terrain.getNormalMap);
   app.get('/terrain/specular-map', terrain.getSpecularMap);
   app.get('/terrain/ao-map',       terrain.getAOMap);
+
+  // Tiling material textures — downloaded via: npm run download:terrain-tiles
+  // Name pattern: <biome>_diff or <biome>_nor  (e.g. rock_diff, rock_nor)
+  app.get('/terrain/tile/:name', terrain.getTile);
 };

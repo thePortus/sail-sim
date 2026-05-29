@@ -1,5 +1,5 @@
 {
-  "name": "jesuit-catalogs-server",
+  "name": "sail-sim",
   "version": "0.0.1",
   "description": "Jesuit Catalogs Database - Server",
   "private": true,
@@ -12,7 +12,9 @@
   ],
   "scripts": {
     "start": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && npx apidoc -i . -o pages/docs/ && NODE_ENV=production node server.js",
-    "build:terrain": "node scripts/build-terrain.js",
+    "build:terrain-geometry": "node scripts/build-terrain.js",
+    "download:terrain-tiles": "node scripts/download-terrain-tiles.js",
+    "build:terrain": "npm run build:terrain-geometry && npm run download:terrain-tiles",
     "test": "cross-env NODE_ENV=test jest --collect-coverage --testTimeout=10000 --detectOpenHandles",
     "pretest": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && cross-env NODE_ENV=test npm run migrate:reset --env=test",
     "migrate:reset": "npx sequelize-cli db:migrate:undo:all --env=production && npm run migrate --env=production",

@@ -13,7 +13,7 @@ describe('User Endpoints', () => {
   beforeAll(async () => {
     const ownerResponse = await supertest(app).post('/api/user/login')
       .send({
-        username: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+        username: process.env.OWNER_USERNAME || 'sail-sim-owner',
         password: process.env.OWNER_PASSWORD || 'password'
       });
     ownerToken = ownerResponse.body.token;
@@ -78,7 +78,7 @@ describe('User Endpoints', () => {
   });
 
   it('GET /api/user/profile should show all profile data', async () => {
-    const requestString = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'jesuit-catalogs-owner';
+    const requestString = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'sail-sim-owner';
     const res = await requestWithSupertest.get('/api/user/profile/' + requestString)
       .set('Authorization', `${ownerToken}`);
     expect(res.status).toEqual(200);
@@ -96,7 +96,7 @@ describe('User Endpoints', () => {
   });
 
   it('GET /api/user/profile should reject a request without proper authorization', async () => {
-    const requestString = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'jesuit-catalogs-owner';
+    const requestString = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'sail-sim-owner';
     const res = await requestWithSupertest.get('/api/user/profile/' + requestString);
     expect(res.status).toEqual(401);
   });

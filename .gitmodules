@@ -1,3 +1,0 @@
-[submodule "server/seeders/import"]
-	path = server/seeders/import
-	url = git@github.com:BCDigSchol/jesuit-catalogs-data.git

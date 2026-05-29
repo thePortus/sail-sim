@@ -10,7 +10,7 @@ describe('User Endpoints', () => {
   beforeAll(async () => {
     const ownerResponse = await supertest(app).post('/api/user/login')
       .send({
-        username: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+        username: process.env.OWNER_USERNAME || 'sail-sim-owner',
         password: process.env.OWNER_PASSWORD || 'password'
       });
     ownerToken = ownerResponse.body.token;
@@ -22,7 +22,7 @@ describe('User Endpoints', () => {
   });
 
   it('POST /api/user/login should log a user in', async () => {
-    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'jesuit-catalogs-owner';
+    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'sail-sim-owner';
     const password = process.env.OWNER_PASSWORD !== undefined ? process.env.OWNER_PASSWORD : 'password';
     const res = await requestWithSupertest.post('/api/user/login')
       .send({
@@ -35,7 +35,7 @@ describe('User Endpoints', () => {
   });
 
   it('POST /api/user/login should reject an improper user login', async () => {
-    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'jesuit-catalogs-owner';
+    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'sail-sim-owner';
     const password = 'xyz';
     const res = await requestWithSupertest.post('/api/user/login')
       .send({
@@ -57,7 +57,7 @@ describe('User Endpoints', () => {
   });
 
   it('POST /api/user/login require a password', async () => {
-    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'jesuit-catalogs-owner';
+    const username = process.env.OWNER_USERNAME !== undefined ? process.env.OWNER_USERNAME : 'sail-sim-owner';
     const res = await requestWithSupertest.post('/api/user/login')
       .send({
         username: username

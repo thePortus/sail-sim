@@ -260,11 +260,6 @@ export class SceneService {
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
 
-    // FXAA / MSAA — read persisted preference (default level 1 = FXAA only).
-    const storedAa = parseInt(localStorage.getItem('ignis_aa_quality') ?? '1', 10);
-    this._aaQuality = isNaN(storedAa) ? 1 : Math.max(0, Math.min(3, storedAa));
-    this.applyAaQuality();
-
     // Sharpening — counteracts the softening from FXAA and SSAO's bilateral blur,
     // keeping hull edges, rigging, and deck detail crisp.
     this.pipeline.sharpenEnabled         = true;
@@ -298,6 +293,18 @@ export class SceneService {
     this.pipeline.imageProcessing.vignetteWeight           = 0.60;
     this.pipeline.imageProcessing.contrast                 = 1.10;
     this.pipeline.imageProcessing.exposure                 = 1.0;
+
+    // FXAA / MSAA — applied LAST so that all the property setters above (each of
+    // which triggers an internal _buildPipeline() call in Babylon.js) have already
+    // fired before we stamp the AA state.  Applying it earlier means sharpen /
+    // grain / DOF / imageProcessing rebuilds can silently discard the FXAA pass
+    // — exactly the "looks off on first load but fine after toggling" symptom.
+    // The deferred re-apply catches any async WebGPU pipeline reconstruction that
+    // Babylon.js schedules on the following frame.
+    const storedAa = parseInt(localStorage.getItem('ignis_aa_quality') ?? '1', 10);
+    this._aaQuality = isNaN(storedAa) ? 1 : Math.max(0, Math.min(3, storedAa));
+    this.applyAaQuality();
+    setTimeout(() => this.applyAaQuality(), 0);
   }
 
   // ── Anti-aliasing quality ──────────────────────────────────────────────────
@@ -450,7 +457,7 @@ export class SceneService {
       // value when it has changed by more than PIPELINE_EPS (≈ every 0.5 s
       // real-time during the transition window, invisible at the rate the sky moves).
       const newExposure = isNight
-        ? 0.58
+        ? 0.72    // was 0.58 — too dark to see terrain at all at night
         : Math.max(0.52, 1.0 + horizon * 0.40 - cloud * 0.16 - nightBlend * 0.38);
       const newContrast = isNight
         ? 1.06
@@ -479,23 +486,27 @@ export class SceneService {
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.
     // Smooth transition: full moon feel with cool blue-white tones.
     this.moonLight.direction = dir;               // toward-sun = away-from-sun's direction
-    this.moonLight.intensity = (isNight ? Math.max(0, -h * 0.28) : Math.max(0, -h * 0.35)) * (1 - cloud * 0.35);
+    // Raised from 0.28/0.35 — peaks at 0.50 at midnight so terrain reads as moonlit
+    // rather than pitch-black.  Cloud cover attenuates as before.
+    this.moonLight.intensity = (isNight ? Math.max(0, -h * 0.50) : Math.max(0, -h * 0.60)) * (1 - cloud * 0.35);
 
     // ── Hemisphere (ambient sky fill) ─────────────────────────────────────────
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
+    // Night ambient raised from 0.14 → 0.28 so mountains are visible by starlight/
+    // moonlight and don't render as featureless black silhouettes.
     this.ambient.intensity = isNight
-      ? 0.14 + cloud * 0.03     // moonlit night — enough to see terrain & waves
+      ? 0.28 + cloud * 0.05
       : 0.10 + above * 0.38 + cloud * 0.06;
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight
-      ? new Color3(0.20, 0.25, 0.35)
+      ? new Color3(0.30, 0.38, 0.52)   // brighter blue — was (0.20, 0.25, 0.35)
       : new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
     const warmAmbient = new Color3(1.0, 0.68, 0.30);
     // Restrict warm amber fill to daytime golden hour only.
     const warmMix = h > 0 ? horizon * 0.60 : 0;
     this.ambient.diffuse     = Color3.Lerp(dayAmbient, warmAmbient, warmMix);
     this.ambient.groundColor = isNight
-      ? new Color3(0.05, 0.07, 0.14)   // dark but visible moonlit ground
+      ? new Color3(0.09, 0.12, 0.22)   // was (0.05, 0.07, 0.14) — raised for visibility
       : new Color3(
         0.04 + above * 0.14 + horizon * 0.26,
         0.07 + above * 0.16 + horizon * 0.08,

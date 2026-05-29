@@ -44,6 +44,44 @@ exports.getNormalMap   = serveTerrainPng('normal_map.png',   'Normal map');
 exports.getSpecularMap = serveTerrainPng('specular_map.png', 'Specular map');
 exports.getAOMap       = serveTerrainPng('ao_map.png',       'AO map');
 
+/**
+ * Serve a tiling terrain tile texture (JPG).
+ * Files live in assets/terrain/tiles/ and are downloaded via:
+ *   npm run download:terrain-tiles
+ *
+ * :name must be one of:
+ *   sand_diff, sand_nor, grass_diff, grass_nor,
+ *   gravel_diff, gravel_nor, rock_diff, rock_nor,
+ *   snow_diff, snow_nor
+ */
+const VALID_TILES = new Set([
+  'sand_diff',    'sand_nor',
+  'sand2_diff',   'sand2_nor',
+  'grass_diff',   'grass_nor',
+  'grass2_diff',  'grass2_nor',
+  'gravel_diff',  'gravel_nor',
+  'rock_diff',    'rock_nor',
+  'rock2_diff',   'rock2_nor',
+  'snow_diff',    'snow_nor',
+]);
+
+exports.getTile = (req, res) => {
+  const name = req.params.name;
+  if (!VALID_TILES.has(name)) {
+    return res.status(400).json({ message: `Unknown tile name '${name}'.` });
+  }
+  const filePath = path.join(terrainConfig.outputDir, 'tiles', `${name}.jpg`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      message: `Tile '${name}' not found. Run: npm run download:terrain-tiles`,
+    });
+  }
+  res.setHeader('Content-Type', 'image/jpeg');
+  // Tile textures are stable — cache aggressively in the browser
+  res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+  return res.sendFile(filePath);
+};
+
 exports.getChunk = (req, res) => {
   const manifest = loadManifest();
   if (!manifest) {

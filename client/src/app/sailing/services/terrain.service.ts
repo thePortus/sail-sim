@@ -9,13 +9,13 @@ import {
   Color4,
   Texture,
   DynamicTexture,
-  StandardMaterial,
   TransformNode,
   Quaternion,
   Scene,
   InstancedMesh,
   DirectionalLight,
 } from '@babylonjs/core';
+import { CustomMaterial } from '@babylonjs/materials';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds } from '../models';
 import { SceneService } from './scene.service';
@@ -40,8 +40,18 @@ export class TerrainService {
 
   private manifest: TerrainManifest | null = null;
   private heightfield: Uint16Array | null = null;
+
+  // Computed once after chunk load; drives beach grading + underwater depth.
+  // distToLand[i] = heightfield cells from water cell i to nearest land cell.
+  // depthLUT[d]   = seabed Y (metres) at d cells from shore.
+  private coastData: {
+    distToLand: Uint16Array;
+    cellSizeM:  number;
+    depthLUT:   Float32Array;
+    harbors:    Array<{ x: number; z: number; score: number }>;
+  } | null = null;
   private terrainMesh: Mesh | null = null;
-  private terrainMaterial: StandardMaterial | null = null;
+  private terrainMaterial: CustomMaterial | null = null;
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -75,6 +85,10 @@ export class TerrainService {
       this.manifest = manifest;
       this.heightfield = new Uint16Array(manifest.width * manifest.height);
       await this.loadAllChunks();
+      // Grade beaches and compute coastal distance data while heightfield
+      // is still fresh.  Must run before buildTerrainMesh so that
+      // getElevation(), tree placement, and the mesh all see consistent values.
+      this.coastData = this.applyCoastalGrading();
     }
 
     this.buildTerrainMesh();
@@ -235,12 +249,20 @@ export class TerrainService {
     const colors: number[] = [];
 
     // ── Pass 1: sample heightfield → raw vertex Y values ─────────────────────
-    const rawY = new Float32Array(numVerts);
+    // underwaterY[i] stores the seabed depth (≤ 0) for ocean vertices,
+    // pre-computed here so the smoothing write-back can reuse it cheaply.
+    const rawY       = new Float32Array(numVerts);
+    const underwaterY = new Float32Array(numVerts);
     for (let i = 0; i < numVerts; i++) {
       const wx = centerX + positions[i * 3];
       const wz = centerZ + positions[i * 3 + 2];
       rawY[i] = this.getElevation(wx, wz);
-      positions[i * 3 + 1] = rawY[i] > 0 ? rawY[i] : -2.2;
+      if (rawY[i] > 0) {
+        positions[i * 3 + 1] = rawY[i];
+      } else {
+        underwaterY[i]        = this.sampleUnderwaterDepth(wx, wz);
+        positions[i * 3 + 1] = underwaterY[i];
+      }
     }
 
     // ── Pass 2: Iterative Gaussian 3×3 smoothing on land heights ─────────────
@@ -249,7 +271,15 @@ export class TerrainService {
     // and cliffs without flattening genuine peaks.
     // Ocean-floor vertices (y ≤ 0) are held fixed throughout and excluded from
     // neighbour averages so the waterline is never dragged downward.
+    //
+    // BEACH PROTECTION: any land vertex whose rawY sits in the coastal-grading
+    // zone (0 < rawY ≤ BEACH_H_M) must never be raised by smoothing.  Without
+    // this guard, mountain neighbours at 200–500 m pull the 5 m beach cells up
+    // to 200–400 m after three passes, putting them in the rock biome and
+    // hiding the sandy texture entirely.  The clamp below preserves the beach
+    // profile while still letting the kernel round off genuine cliffs.
     const SMOOTH_PASSES = 3;
+    const BEACH_H_M = 5.0;   // must match applyCoastalGrading BEACH_H
     // Work on a copy so rawY stays intact for biome colour sampling below.
     let currentY = rawY.slice();
     for (let pass = 0; pass < SMOOTH_PASSES; pass++) {
@@ -274,7 +304,12 @@ export class TerrainService {
               wt  += w;
             }
           }
-          nextY[ci] = wt > 0 ? sum / wt : cy;
+          const smoothed = wt > 0 ? sum / wt : cy;
+          // Beach cells: smoothing may only lower (blend out polygon steps toward
+          // water), never raise.  Mountain neighbours must not contaminate them.
+          nextY[ci] = (rawY[ci] > 0 && rawY[ci] <= BEACH_H_M)
+            ? Math.min(rawY[ci], smoothed)
+            : smoothed;
         }
       }
       currentY = nextY;
@@ -282,8 +317,9 @@ export class TerrainService {
 
     // Write smoothed Y back and build vertex colours (colours use rawY so
     // biome bands stay aligned with the source heightfield, not the smoothed mesh).
+    // Ocean vertices use the pre-computed exponential depth rather than a flat plane.
     for (let i = 0; i < numVerts; i++) {
-      positions[i * 3 + 1] = currentY[i] > 0 ? currentY[i] : -2.2;
+      positions[i * 3 + 1] = currentY[i] > 0 ? currentY[i] : underwaterY[i];
     }
 
     for (let i = 0; i < numVerts; i++) {
@@ -313,7 +349,13 @@ export class TerrainService {
     mesh.useVertexColors = false;
 
     this.oceanService.addToRenderList(mesh);
-    this.sceneService.shadowGenerator?.addShadowCaster(mesh, true);
+    // NOTE: the terrain is intentionally NOT added as a shadow caster. At this
+    // world scale the far shadow cascades have huge texels, so the terrain
+    // shadowing itself produced moving diagonal moiré (self-shadow acne) on
+    // steep slopes, worst at noon. Leaving it out of the shadow map means it can
+    // never self-shadow. It still RECEIVES shadows (trees, boat) via
+    // receiveShadows below, and large-scale terrain shadows are handled by the
+    // dedicated raymarched terrainShadowMask system.
     this.sceneService.excludeFromGlow(mesh);
     mesh.receiveShadows = true;
 
@@ -805,7 +847,7 @@ export class TerrainService {
     this.treePrototypeMeshes = [];
   }
 
-  private buildTerrainMaterial(scene: any, manifest: TerrainManifest): StandardMaterial {
+  private buildTerrainMaterial(scene: any, manifest: TerrainManifest): CustomMaterial {
     this.terrainMaterial?.dispose();
     this.terrainMaterial = null;
     for (const texture of this.terrainTextures) {
@@ -813,15 +855,23 @@ export class TerrainService {
     }
     this.terrainTextures = [];
 
+    // Procedural macro-albedo — used as a large-scale tonal luminance modifier
+    // in the shader (±25 % brightness variation across the terrain surface).
+    // It is no longer the primary colour source; the tiling textures are.
     const { albedoTexture } = this.createTerrainTextures(scene, manifest);
     this.terrainTextures.push(albedoTexture);
 
-    const material = new StandardMaterial('terrain_mat', scene);
-    material.diffuseTexture   = albedoTexture;
-    material.emissiveColor    = Color3.Black();
-    material.disableLighting  = false;
-    // specularColor is set below after the specular map texture is loaded.
+    // ── CustomMaterial: extends StandardMaterial with injected GLSL ──────────
+    // Keeps Babylon's full lighting / shadow / SSAO / DoF pipeline while
+    // replacing the diffuse colour with triplanar texture splatting.
+    const material = new CustomMaterial('terrain_mat', scene);
+    material.diffuseTexture  = albedoTexture;   // macro tonal tint map
+    material.emissiveColor   = Color3.Black();
+    material.disableLighting = false;
+    material.specularColor   = Color3.Black();  // fully matte
+    material.specularPower   = 256;
 
+    // ── Helper: load a server-generated terrain map (png) ────────────────────
     const loadTerrainTex = (path: string, label: string): Texture => {
       const tex = new Texture(
         `${Settings.apiUrl}${path}`, scene,
@@ -833,38 +883,522 @@ export class TerrainService {
       return tex;
     };
 
-    // Normal map — adds per-pixel slope detail between geometry vertices.
-    // Generated from raw pre-threshold luminance so coast transitions are smooth.
-    // level < 1.0 prevents steep cliff normals from tilting so far sideways /
-    // downward that they escape all light sources and render completely black.
-    // At level 0.4 the bump detail is still visible but no face goes dark.
-    const bumpTex = loadTerrainTex('terrain/normal-map', 'normal_map.png');
-    bumpTex.level = 0.4;
-    material.bumpTexture = bumpTex;
-    // The build script outputs OpenGL convention (flat = 127,127,255).
-    // Uncomment if normals look inverted: material.invertNormalMapY = true;
+    // Macro normal map: the normal_map.png has coastal wave marks baked from the
+    // original terrain geometry.  Those marks create moving diffuse stripes as the
+    // sun sweeps overhead — confirmed by red-specular debug (stripes were diffuse,
+    // not specular).  Fix: replace the real map with a 2×2 flat/neutral normal map
+    // (all pixels 128,128,255 = straight-up normal, zero perturbation).  This keeps
+    // Babylon's bumpTexture shader path active so Fragment_Custom_Diffuse compiles,
+    // but contributes nothing to the lighting.  Swap back to the real map once it is
+    // regenerated from the beach-graded heightfield.
+    const neutralNormal = new DynamicTexture(
+      'neutralNormal', { width: 2, height: 2 }, scene, false,
+    );
+    (neutralNormal.getContext() as unknown as CanvasRenderingContext2D)
+      .fillStyle = 'rgb(128,128,255)';
+    (neutralNormal.getContext() as unknown as CanvasRenderingContext2D)
+      .fillRect(0, 0, 2, 2);
+    neutralNormal.update();
+    neutralNormal.level = 1.0;
+    material.bumpTexture = neutralNormal;
+    this.terrainTextures.push(neutralNormal);
 
-    // Specular map — preserves directional information but kept near-invisible.
-    // Real landscape is diffuse-dominant: even wet rock reflects at most a tiny
-    // glint.  specularPower = 256 keeps the lobe as a tight pinpoint (not a
-    // broad plastic sheen).  The specular texture is retained so it can be
-    // tuned up later (e.g. for rain effects) without reworking the pipeline.
-    const specTex = loadTerrainTex('terrain/specular-map', 'specular_map.png');
-    material.specularTexture = specTex;
-    material.specularColor   = new Color3(0.03, 0.028, 0.022);  // barely perceptible
-    material.specularPower   = 256;                              // pinpoint, not smear
+    // Still load the real map so it exists on disk and the 404 warning stays quiet
+    loadTerrainTex('terrain/normal-map', 'normal_map.png');
 
-    // AO map — multiplies the final lighting result so valleys and depressions
-    // appear naturally darker.  The build script now sets ocean pixels to white
-    // (ao=1) so UV interpolation near the waterline never leaks darkening onto
-    // visible shore land, and the 0.45 floor prevents any surface going below
-    // 45 % of its unoccluded brightness (no completely-black terrain).
+    // AO map — multiplies final lighting so valleys / depressions look darker.
     const aoTex = loadTerrainTex('terrain/ao-map', 'ao_map.png');
-    material.lightmapTexture      = aoTex;
-    material.useLightmapAsShadowmap = true;   // multiply mode — correct for AO
+    material.lightmapTexture        = aoTex;
+    material.useLightmapAsShadowmap = true;
+
+    // ── Tiling tile textures (Polyhaven CC0, download:terrain-tiles) ─────────
+    // Each biome has a diffuse tile that repeats at a per-material world scale.
+    // wrapU/V defaults to WRAP in Babylon — explicitly set for clarity.
+    const loadTile = (name: string): Texture => {
+      const tex = new Texture(
+        `${Settings.apiUrl}terrain/tile/${name}`, scene,
+        false, false, Texture.LINEAR_LINEAR_MIPLINEAR,
+        null,
+        () => console.warn(`[Terrain] Tile '${name}' not found — run: npm run download:terrain-tiles`),
+      );
+      tex.wrapU = Texture.WRAP_ADDRESSMODE;
+      tex.wrapV = Texture.WRAP_ADDRESSMODE;
+      this.terrainTextures.push(tex);
+      return tex;
+    };
+
+    const sandTex    = loadTile('sand_diff');      // coast_sand_01 — warm golden beach sand
+    const grassTex   = loadTile('grass_diff');
+    const grass2Tex  = loadTile('grass2_diff');   // aerial_grass_rock — blended with grass
+    const gravelTex  = loadTile('gravel_diff');
+    const rockTex    = loadTile('rock_diff');
+    const rock2Tex   = loadTile('rock2_diff');    // rock_face_03 — blended with rock
+    const snowTex    = loadTile('snow_diff');
+    // Normal maps — downloaded by download:terrain-tiles
+    const sandNorTex  = loadTile('sand_nor');
+    const grassNorTex = loadTile('grass_nor');
+    const rockNorTex  = loadTile('rock_nor');
+
+    // ── Declare shader uniforms ───────────────────────────────────────────────
+    material.AddUniform('uPeakH',       'float',     null);
+    material.AddUniform('uSandDiff',    'sampler2D', null);
+    material.AddUniform('uGrassDiff',   'sampler2D', null);
+    material.AddUniform('uGrass2Diff',  'sampler2D', null);
+    material.AddUniform('uGravelDiff',  'sampler2D', null);
+    material.AddUniform('uRockDiff',    'sampler2D', null);
+    material.AddUniform('uRock2Diff',   'sampler2D', null);
+    material.AddUniform('uSnowDiff',    'sampler2D', null);
+    material.AddUniform('uSandNor',     'sampler2D', null);
+    material.AddUniform('uGrassNor',    'sampler2D', null);
+    material.AddUniform('uRockNor',     'sampler2D', null);
+
+    // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
+    const peakH = manifest.targetPeakElevation ?? 920;
+
+    // ── GLSL injection: triplanar splatting ───────────────────────────────────
+    // Runs after the diffuse texture (macro albedo) is sampled into baseColor,
+    // before Babylon's lighting / bump / fog calculations.
+    //
+    // Strategy:
+    //   • vPositionW.y / peakH  → normalised elevation h ∈ [0,1]
+    //   • 1 − nW.y              → slope  ∈ [0 (flat), 1 (cliff)]
+    //   • abs(nW) ^ 6 normalised → triplanar weights (sharp at axis crossings)
+    //   • Each tiling texture sampled from all 3 world-space planes, blended
+    //   • Result tinted by macro-albedo luminance for large-scale variation
+
+
+    material.Fragment_Custom_Diffuse(`
+      // ── 1. Macro tonal modifier from procedural albedo ────────────────────
+      float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
+      float macroMod = 0.75 + macroLum * 0.50;  // [0.75 .. 1.25]
+
+      // ── 2. Triplanar blend weights ────────────────────────────────────────
+      vec3 nW   = normalize(vNormalW);
+      vec3 triW = abs(nW);
+      triW      = triW * triW * triW * triW * triW * triW;  // pow 6 — no built-in
+      triW     /= (triW.x + triW.y + triW.z);               // normalise to sum = 1
+
+      // ── 3. Elevation & slope ──────────────────────────────────────────────
+      float h     = clamp(vPositionW.y / uPeakH, 0.0, 1.0);
+      float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
+
+      // ── 4. Biome blend weights (mirrors CPU paintTerrainAlbedoTexture) ────
+      //
+      // Shore proximity override: anything within SHORE_H metres of sea level
+      // (including all of the beach zone and the seabed) gets a strong sand
+      // boost that overrides the height-normalised calculation.  This acts as
+      // a safety net so that even if smoothing or bilinear sampling edges a
+      // beach vertex slightly above the sand threshold, it still reads as sand.
+      // uPeakH is 920 m so SHORE_H / uPeakH ≈ 0.011 — well below the normal
+      // sand ceiling of 0.085.
+      // shoreW: 1.0 at sea-level/below, 0.0 at 10 m and above.
+      // max() with hSand means beach and seabed always show sand even if the
+      // normalised h ended up slightly too high due to mesh smoothing.
+      float shoreW  = clamp(1.0 - vPositionW.y / 10.0, 0.0, 1.0);
+      float hSand   = clamp(1.0 - h / 0.085, 0.0, 1.0);
+      // sandSlopeFactor: near sea level (y < 15 m) the slope penalty is fully
+      // removed so sand shows even on steep beach/cliff transition vertices.
+      // Above 15 m the normal slope penalty returns so mountain rock faces still
+      // look rocky on steep slopes.
+      float sandSlopeFactor = mix(1.0, clamp(1.0 - slope * 1.25, 0.0, 1.0),
+                                  smoothstep(0.0, 15.0, vPositionW.y));
+      float wSand   = max(hSand, shoreW) * sandSlopeFactor;
+      float wGrass  = clamp((h - 0.035) / 0.28, 0.0, 1.0) * clamp(1.0 - slope * 0.95, 0.0, 1.0);
+      float wGravel = clamp((h - 0.20)  / 0.52, 0.0, 1.0) * clamp(0.25 + slope * 1.5,  0.0, 1.0);
+      float wRock   = clamp((h - 0.34)  / 0.54, 0.0, 1.0) * clamp(0.22 + slope * 1.7,  0.0, 1.0);
+      float wSnow   = clamp((h - 0.68)  / 0.22, 0.0, 1.0) * clamp(1.0 - slope * 0.55,  0.0, 1.0);
+      float wTotal  = max(0.0001, wSand + wGrass + wGravel + wRock + wSnow);
+      wSand   /= wTotal;  wGrass  /= wTotal;  wGravel /= wTotal;
+      wRock   /= wTotal;  wSnow   /= wTotal;
+
+      // ── 5. UV warp — ZEROED for diagnostic ───────────────────────────────────
+      // Testing whether the warp computation is the source of moving stripe bands.
+      vec2 wFineYZ=vec2(0.0), wFineXZ=vec2(0.0), wFineXY=vec2(0.0);
+      vec2 wCoarseYZ=vec2(0.0), wCoarseXZ=vec2(0.0), wCoarseXY=vec2(0.0);
+
+      // ── 6. Texture-variety blend noise ───────────────────────────────────
+      // Slow sinusoidal values (period ~880–1460 m) that smoothly mix each
+      // biome's two textures across the terrain.  Different axes and phases so
+      // grass and rock patches don't coincide.
+      // (Sand uses a single texture — see section 7 comment.)
+      float rMix = cos(vPositionW.z * 0.0071 + vPositionW.x * 0.0043) * 0.5 + 0.5;
+      float gMix = sin(vPositionW.x * 0.0055 + vPositionW.z * 0.0031) * 0.5 + 0.5;
+
+      // ── 7. Multi-scale triplanar sampling with UV warp ───────────────────
+      // Each biome blends a FINE triplanar layer (detail scale) with a COARSE
+      // layer (3–4× larger, often a different texture) to suppress tiling.
+      // Rock and grass each have a SECOND fine texture that blends in via the
+      // slow noise above, breaking monotony across large mountain faces.
+
+      // Sand — 15 m fine triplanar (coast_sand_01)  +  55 m coarse XZ.
+      // Warmed by vec3(1.12, 1.04, 0.82) so the beach reads as golden sand
+      // rather than the neutral-grey tone the raw Polyhaven texture has in
+      // overcast / ambient lighting.  Clamped to [0,1] in section 8.
+      vec3 sandFine =
+          texture2D(uSandDiff, vPositionW.yz * 0.067 + wFineYZ).rgb * triW.x +
+          texture2D(uSandDiff, vPositionW.xz * 0.067 + wFineXZ).rgb * triW.y +
+          texture2D(uSandDiff, vPositionW.xy * 0.067 + wFineXY).rgb * triW.z;
+      vec3 sandRaw = sandFine * 0.65
+                   + texture2D(uSandDiff, vPositionW.xz * 0.018 + wCoarseXZ).rgb * 0.35;
+      // Warm tint: coast_sand_01 ~[0.55,0.52,0.50] → ~[0.66,0.56,0.40]
+      // A sandy tan-gold rather than grey stone.  coast_sand_01 has no directional
+      // grain so it won't produce stripe artefacts under moving sunlight.
+      vec3 sandC = clamp(sandRaw * vec3(1.20, 1.08, 0.80), 0.0, 1.0);
+
+      // Grass — 20 m fine tri blending forrest_ground_01 ↔ aerial_grass_rock
+      //       + 75 m coarse XZ (forrest_ground_01 as tonal anchor)
+      vec3 grassF1 =
+          texture2D(uGrassDiff,  vPositionW.yz * 0.050 + wFineYZ).rgb * triW.x +
+          texture2D(uGrassDiff,  vPositionW.xz * 0.050 + wFineXZ).rgb * triW.y +
+          texture2D(uGrassDiff,  vPositionW.xy * 0.050 + wFineXY).rgb * triW.z;
+      vec3 grassF2 =
+          texture2D(uGrass2Diff, vPositionW.yz * 0.044 + wFineYZ).rgb * triW.x +
+          texture2D(uGrass2Diff, vPositionW.xz * 0.044 + wFineXZ).rgb * triW.y +
+          texture2D(uGrass2Diff, vPositionW.xy * 0.044 + wFineXY).rgb * triW.z;
+      vec3 grassFine = mix(grassF1, grassF2, gMix);
+      vec3 grassC = grassFine * 0.65
+                  + texture2D(uGrassDiff, vPositionW.xz * 0.013 + wCoarseXZ).rgb * 0.35;
+
+      // Gravel — 25 m fine tri  +  50 m coarse ROCK tri (cross-texture)
+      vec3 gravFine =
+          texture2D(uGravelDiff, vPositionW.yz * 0.040 + wFineYZ).rgb * triW.x +
+          texture2D(uGravelDiff, vPositionW.xz * 0.040 + wFineXZ).rgb * triW.y +
+          texture2D(uGravelDiff, vPositionW.xy * 0.040 + wFineXY).rgb * triW.z;
+      vec3 gravMacro =
+          texture2D(uRockDiff, vPositionW.yz * 0.020 + wCoarseYZ).rgb * triW.x +
+          texture2D(uRockDiff, vPositionW.xz * 0.020 + wCoarseXZ).rgb * triW.y +
+          texture2D(uRockDiff, vPositionW.xy * 0.020 + wCoarseXY).rgb * triW.z;
+      vec3 gravC = gravFine * 0.55 + gravMacro * 0.45;
+
+      // Rock — 12/14 m fine tri blending rock_face ↔ rock_face_03 (different grain)
+      //       + 40 m coarse GRAVEL tri (cross-texture macro, unchanged)
+      vec3 rockF1 =
+          texture2D(uRockDiff,  vPositionW.yz * 0.083 + wFineYZ).rgb * triW.x +
+          texture2D(uRockDiff,  vPositionW.xz * 0.083 + wFineXZ).rgb * triW.y +
+          texture2D(uRockDiff,  vPositionW.xy * 0.083 + wFineXY).rgb * triW.z;
+      vec3 rockF2 =
+          texture2D(uRock2Diff, vPositionW.yz * 0.071 + wFineYZ).rgb * triW.x +
+          texture2D(uRock2Diff, vPositionW.xz * 0.071 + wFineXZ).rgb * triW.y +
+          texture2D(uRock2Diff, vPositionW.xy * 0.071 + wFineXY).rgb * triW.z;
+      vec3 rockFine = mix(rockF1, rockF2, rMix);
+      vec3 rockMacro =
+          texture2D(uGravelDiff, vPositionW.yz * 0.025 + wCoarseYZ).rgb * triW.x +
+          texture2D(uGravelDiff, vPositionW.xz * 0.025 + wCoarseXZ).rgb * triW.y +
+          texture2D(uGravelDiff, vPositionW.xy * 0.025 + wCoarseXY).rgb * triW.z;
+      vec3 rockC = rockFine * 0.55 + rockMacro * 0.45;
+
+      // Snow — 30 m fine tri  +  100 m coarse XZ (same tex)
+      vec3 snowFine =
+          texture2D(uSnowDiff, vPositionW.yz * 0.033 + wFineYZ).rgb * triW.x +
+          texture2D(uSnowDiff, vPositionW.xz * 0.033 + wFineXZ).rgb * triW.y +
+          texture2D(uSnowDiff, vPositionW.xy * 0.033 + wFineXY).rgb * triW.z;
+      vec3 snowC = snowFine * 0.70
+                 + texture2D(uSnowDiff, vPositionW.xz * 0.010 + wCoarseXZ).rgb * 0.30;
+
+      // ── 8. Weighted blend + macro tonal modulation ────────────────────────
+      vec3 splatC = sandC*wSand + grassC*wGrass + gravC*wGravel
+                  + rockC*wRock + snowC*wSnow;
+
+      baseColor.rgb = clamp(splatC * macroMod, 0.0, 1.0);
+
+      // ── 9. Tiled normal-map perturbation (modifies normalW for lighting) ──
+      // Sample grass + rock normal maps with the same triplanar UVs and warp
+      // used for diffuse.  Blend by biome weight, then add to the existing
+      // normalW so tiling surface detail stacks on top of the macro bump map.
+      //
+      // Triplanar reorientation (OpenGL normal map: R=+U, G=+V, B=+N):
+      //   YZ plane (surface normal ≈ +X):  (b, r, g)  in world XYZ
+      //   XZ plane (surface normal ≈ +Y):  (r, b, g)  in world XYZ
+      //   XY plane (surface normal ≈ +Z):  (r, g, b)  in world XYZ
+      //
+      // Strength 0.40 — strong enough to see per-biome surface character;
+      // not so strong that it fights the large-scale terrain bump map.
+
+      // Sand normals — triplanar at fine scale (same UVs as sandF1)
+      // Beach faces are near-horizontal so XZ plane dominates, but full triplanar
+      // handles the rare case of sand on a slope correctly.
+      vec3 snYZ = texture2D(uSandNor, vPositionW.yz * 0.067 + wFineYZ).rgb * 2.0 - 1.0;
+      vec3 snXZ = texture2D(uSandNor, vPositionW.xz * 0.067 + wFineXZ).rgb * 2.0 - 1.0;
+      vec3 snXY = texture2D(uSandNor, vPositionW.xy * 0.067 + wFineXY).rgb * 2.0 - 1.0;
+      vec3 snWorld = normalize(
+          vec3(snYZ.b, snYZ.r, snYZ.g) * triW.x +
+          vec3(snXZ.r, snXZ.b, snXZ.g) * triW.y +
+          vec3(snXY.r, snXY.g, snXY.b) * triW.z
+      );
+
+      // Grass normals — triplanar at fine scale (same UVs as grassF1)
+      vec3 gnYZ = texture2D(uGrassNor, vPositionW.yz * 0.050 + wFineYZ).rgb * 2.0 - 1.0;
+      vec3 gnXZ = texture2D(uGrassNor, vPositionW.xz * 0.050 + wFineXZ).rgb * 2.0 - 1.0;
+      vec3 gnXY = texture2D(uGrassNor, vPositionW.xy * 0.050 + wFineXY).rgb * 2.0 - 1.0;
+      vec3 gnWorld = normalize(
+          vec3(gnYZ.b, gnYZ.r, gnYZ.g) * triW.x +
+          vec3(gnXZ.r, gnXZ.b, gnXZ.g) * triW.y +
+          vec3(gnXY.r, gnXY.g, gnXY.b) * triW.z
+      );
+
+      // Rock normals — triplanar at fine scale (blended rock scale ~12/14 m)
+      vec3 rnYZ = texture2D(uRockNor, vPositionW.yz * 0.083 + wFineYZ).rgb * 2.0 - 1.0;
+      vec3 rnXZ = texture2D(uRockNor, vPositionW.xz * 0.083 + wFineXZ).rgb * 2.0 - 1.0;
+      vec3 rnXY = texture2D(uRockNor, vPositionW.xy * 0.083 + wFineXY).rgb * 2.0 - 1.0;
+      vec3 rnWorld = normalize(
+          vec3(rnYZ.b, rnYZ.r, rnYZ.g) * triW.x +
+          vec3(rnXZ.r, rnXZ.b, rnXZ.g) * triW.y +
+          vec3(rnXY.r, rnXY.g, rnXY.b) * triW.z
+      );
+
+      // Per-biome normal blend — each biome gets its own surface character:
+      //   sand   → coast_sand_01 normals (ripple grain, gentle bumps)
+      //   grass  → forrest_ground_01 normals (leaf litter, organic micro-detail)
+      //   gravel/rock/snow → rock_face normals (hard angular surface detail)
+      vec3 tileNorm = normalize(
+          snWorld * wSand +
+          gnWorld * wGrass +
+          rnWorld * (wGravel + wRock + wSnow)
+      );
+
+      // Tiled normal maps zeroed while we verify that no second stripe source
+      // remains after the neutral bumpTexture fix.  Restore once confirmed clean.
+      float normStrength = 0.0;
+      normalW = normalize(normalW + tileNorm * normStrength);
+    `);
+
+    // ── Bind uniforms every draw call ─────────────────────────────────────────
+    material.onBindObservable.add(() => {
+      const fx = material.getEffect();
+      if (!fx) return;
+      fx.setFloat('uPeakH', peakH);
+      fx.setTexture('uSandDiff',   sandTex);
+      fx.setTexture('uGrassDiff',  grassTex);
+      fx.setTexture('uGrass2Diff', grass2Tex);
+      fx.setTexture('uGravelDiff', gravelTex);
+      fx.setTexture('uRockDiff',   rockTex);
+      fx.setTexture('uRock2Diff',  rock2Tex);
+      fx.setTexture('uSnowDiff',   snowTex);
+      fx.setTexture('uSandNor',    sandNorTex);
+      fx.setTexture('uGrassNor',   grassNorTex);
+      fx.setTexture('uRockNor',    rockNorTex);
+    });
 
     this.terrainMaterial = material;
     return material;
+  }
+
+  // ── Coastal grading ───────────────────────────────────────────────────────
+
+  /**
+   * Runs once after chunks load.  Does three things:
+   *
+   * 1. Two-pass Manhattan distance transform → distToWater (land→sea distance)
+   *    and distToLand (sea→land distance), both in heightfield cells.
+   *
+   * 2. Beach grading: caps each land cell within BEACH_M metres of water to a
+   *    concave height profile — turns cliffs at the waterline into sandy slopes.
+   *    Only ever LOWERS cells, never raises them.
+   *
+   * 3. Builds a depth LUT for the underwater-slope helper, and runs lightweight
+   *    harbor-cove detection (results logged and returned for future use).
+   *
+   * Returns the coast data structure consumed by buildTerrainMesh().
+   */
+  private applyCoastalGrading(): NonNullable<TerrainService['coastData']> {
+    const { width, height, worldBounds, quantizationLevels, targetPeakElevation } = this.manifest!;
+    const hf       = this.heightfield!;
+    const n        = width * height;
+    const cellSizeM = (worldBounds.maxX - worldBounds.minX) / (width - 1);
+
+    // ── 1. Distance transforms ────────────────────────────────────────────────
+    const MAX16  = 0xFFFF;
+    const distW  = new Uint16Array(n).fill(MAX16);   // land cell → nearest water
+    const distL  = new Uint16Array(n).fill(MAX16);   // water cell → nearest land
+
+    for (let i = 0; i < n; i++) {
+      if (hf[i] === 0) distW[i] = 0;
+      else             distL[i] = 0;
+    }
+
+    // Forward pass (top-left → bottom-right)
+    for (let z = 0; z < height; z++) {
+      for (let x = 0; x < width; x++) {
+        const i = z * width + x;
+        let dw = distW[i], dl = distL[i];
+        if (x > 0)      { const j = i-1;     dw = Math.min(dw, distW[j]+1); dl = Math.min(dl, distL[j]+1); }
+        if (z > 0)      { const j = i-width;  dw = Math.min(dw, distW[j]+1); dl = Math.min(dl, distL[j]+1); }
+        distW[i] = dw;  distL[i] = dl;
+      }
+    }
+    // Backward pass (bottom-right → top-left)
+    for (let z = height-1; z >= 0; z--) {
+      for (let x = width-1; x >= 0; x--) {
+        const i = z * width + x;
+        let dw = distW[i], dl = distL[i];
+        if (x < width-1)  { const j = i+1;     dw = Math.min(dw, distW[j]+1); dl = Math.min(dl, distL[j]+1); }
+        if (z < height-1) { const j = i+width;  dw = Math.min(dw, distW[j]+1); dl = Math.min(dl, distL[j]+1); }
+        distW[i] = dw;  distL[i] = dl;
+      }
+    }
+
+    // ── 2. Beach grading ──────────────────────────────────────────────────────
+    // BEACH_M:  width of the coastal grading zone in world metres.
+    //           At ~33 m/mesh-vertex this is ~6 mesh polygons — clearly visible
+    //           as a sandy shelf.  Wider = more beach, flatter small islands.
+    // BEACH_H:  maximum height (m) at the inner edge of the beach zone.
+    //           slope ≈ BEACH_H / BEACH_M = 5/200 = 2.5 % — very walkable.
+    // PROFILE:  exponent < 1 → concave curve: flat near water, gently rising
+    //           inland.  A natural beach cross-section.
+    const BEACH_M   = 200;
+    const BEACH_H   = 5.0;
+    const PROFILE   = 0.55;
+    const beachCells = Math.ceil(BEACH_M / cellSizeM);
+    const maxBeachQ  = Math.round((BEACH_H / targetPeakElevation) * quantizationLevels);
+
+    for (let i = 0; i < n; i++) {
+      if (hf[i] === 0) continue;                     // skip ocean
+      const d = distW[i];
+      if (d >= beachCells) continue;                 // outside beach zone
+      const t   = d / beachCells;                    // 0 = waterline, 1 = inner edge
+      const cap = Math.round(Math.pow(t, PROFILE) * maxBeachQ);
+      if (hf[i] > cap) hf[i] = cap;
+    }
+
+    // distW goes out of scope here and will be GC'd.
+
+    // ── 3. Underwater depth LUT ───────────────────────────────────────────────
+    // Exponential dropoff: water deepens steeply just past the beach then
+    // levels off.  Boats sailing close to an island always have clearance;
+    // only intentional beaching (sailing onto land) causes grounding.
+    //
+    // FULL_DEPTH: maximum seabed depth in metres (12 m → ample for any boat).
+    // DROPOFF_M:  e-folding distance. At DROPOFF_M from shore the seabed is
+    //             at 63 % of full depth; at 3× DROPOFF_M it is at 95 %.
+    //   dist=0   → y =  0 m (waterline)
+    //   dist= 60 → y ≈ -3.0 m
+    //   dist=180 → y ≈ -7.6 m
+    //   dist=360 → y ≈-10.9 m
+    //   dist=600 → y ≈-11.8 m  (near full depth)
+    const FULL_DEPTH = 12.0;
+    const DROPOFF_M  = 150.0;
+    const dropoffCells = DROPOFF_M / cellSizeM;
+    const lutLen   = Math.min(MAX16, Math.ceil(1800 / cellSizeM) + 2);
+    const depthLUT = new Float32Array(lutLen);
+    for (let d = 0; d < lutLen; d++) {
+      depthLUT[d] = -FULL_DEPTH * (1 - Math.exp(-d / dropoffCells));
+    }
+
+    // ── 4. Harbor cove detection ──────────────────────────────────────────────
+    const harbors = this.detectHarborCandidates(distL, cellSizeM);
+
+    return { distToLand: distL, cellSizeM, depthLUT, harbors };
+  }
+
+  /**
+   * Detects concave coastline sections (coves / natural harbors) by casting
+   * rays outward from each near-shore water cell and measuring how many
+   * directions are enclosed by land.
+   *
+   * A true cove → many rays blocked.  Open water → few rays blocked.
+   * Returns up to 15 candidates sorted by enclosure score, in world coords.
+   * Results are logged at info level; no ports are built at this stage.
+   */
+  private detectHarborCandidates(
+    distToLand: Uint16Array,
+    cellSizeM: number,
+  ): Array<{ x: number; z: number; score: number }> {
+    const { width, height, worldBounds } = this.manifest!;
+    const hf = this.heightfield!;
+
+    // Only check water cells within this many metres of land
+    const NEAR_SHORE_M = 180;
+    const nearCells    = Math.ceil(NEAR_SHORE_M / cellSizeM);
+
+    // Cast this many rays from each candidate; check out to ENCLOSURE_M
+    const RAYS        = 16;
+    const ENCLOSURE_M = 600;
+    const encCells    = Math.ceil(ENCLOSURE_M / cellSizeM);
+
+    const scores = new Float32Array(width * height);
+    for (let z = 1; z < height - 1; z++) {
+      for (let x = 1; x < width - 1; x++) {
+        const i = z * width + x;
+        if (hf[i] > 0) continue;                  // land
+        if (distToLand[i] > nearCells) continue;  // too far from shore
+
+        let hits = 0;
+        for (let r = 0; r < RAYS; r++) {
+          const angle = (r / RAYS) * Math.PI * 2;
+          const dx = Math.cos(angle);
+          const dz = Math.sin(angle);
+          for (let step = 4; step <= encCells; step += 3) {
+            const nx = Math.round(x + dx * step);
+            const nz = Math.round(z + dz * step);
+            if (nx < 0 || nx >= width || nz < 0 || nz >= height) break;
+            if (hf[nz * width + nx] > 0) { hits++; break; }
+          }
+        }
+        scores[i] = hits / RAYS;
+      }
+    }
+
+    // Non-maximum suppression in 5×5 window
+    const MIN_SCORE   = 0.30;  // at least 30 % of rays blocked → enclosed enough
+    const CLUSTER_M   = 800;
+    const clusterCells = Math.ceil(CLUSTER_M / cellSizeM);
+
+    const raw: Array<{ ix: number; iz: number; s: number }> = [];
+    for (let z = 2; z < height - 2; z++) {
+      for (let x = 2; x < width - 2; x++) {
+        const s = scores[z * width + x];
+        if (s < MIN_SCORE) continue;
+        let isMax = true;
+        outer: for (let dz = -2; dz <= 2; dz++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            if (dx === 0 && dz === 0) continue;
+            if (scores[(z + dz) * width + (x + dx)] > s) { isMax = false; break outer; }
+          }
+        }
+        if (isMax) raw.push({ ix: x, iz: z, s });
+      }
+    }
+
+    raw.sort((a, b) => b.s - a.s);
+
+    const kept: typeof raw = [];
+    for (const c of raw) {
+      const tooClose = kept.some(k =>
+        Math.hypot((k.ix - c.ix) * cellSizeM, (k.iz - c.iz) * cellSizeM) < CLUSTER_M,
+      );
+      if (!tooClose) kept.push(c);
+      if (kept.length >= 15) break;
+    }
+
+    const result = kept.map(({ ix, iz, s }) => ({
+      x: worldBounds.minX + (ix / (width  - 1)) * (worldBounds.maxX - worldBounds.minX),
+      z: worldBounds.maxZ - (iz / (height - 1)) * (worldBounds.maxZ - worldBounds.minZ),
+      score: s,
+    }));
+
+    console.info(
+      `[Terrain] ${result.length} harbor candidate(s):`,
+      result.map(h => `(${Math.round(h.x)}, ${Math.round(h.z)}) enc=${h.score.toFixed(2)}`).join(' | '),
+    );
+    return result;
+  }
+
+  /**
+   * Returns the seabed Y position (metres, ≤ 0) for an ocean vertex at the
+   * given world position, using the pre-computed exponential depth LUT.
+   * Falls back to the old flat -2.2 m if coast data is not yet ready.
+   */
+  private sampleUnderwaterDepth(worldX: number, worldZ: number): number {
+    const cd = this.coastData;
+    const m  = this.manifest;
+    if (!cd || !m) return -2.2;
+
+    const { width, height, worldBounds } = m;
+    const px  = Math.round(((worldX - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX)) * (width  - 1));
+    const pz  = Math.round(((worldBounds.maxZ - worldZ)  / (worldBounds.maxZ - worldBounds.minZ)) * (height - 1));
+    const idx = Math.max(0, Math.min(height - 1, pz)) * width + Math.max(0, Math.min(width - 1, px));
+    const d   = cd.distToLand[idx];
+    return d < cd.depthLUT.length ? cd.depthLUT[d] : cd.depthLUT[cd.depthLUT.length - 1];
   }
 
   private createTerrainTextures(scene: any, manifest: TerrainManifest): {
@@ -894,12 +1428,66 @@ export class TerrainService {
     const size    = mainCtx.canvas.width;   // 4096
     const peak    = Math.max(1, manifest.targetPeakElevation);
 
-    // ── Pass 1: biome macro-palette + three-octave grain at 2048 × 2048 ───────
-    // Running at 2048 gives 24 m/texel biome boundaries (vs 49 m at 1024),
-    // eliminating the blocky "late-1990s" look.  Three octaves of hash noise are
-    // baked directly into the biome loop — no separate grain pass is needed.
-    // Scales to 4096 via drawImage.  Total cost ≈ 400 ms.
-    const BIOME_RES  = 2048;
+    // ── Pass 1: biome macro-palette at 2048 × 2048, scaled to 4096 ─────────────
+    // THREE-OCTAVE VALUE NOISE
+    // hashNoise(u * N, …) at 2048 canvas gives white noise regardless of N — the
+    // ×43758 magnifier before frac() destroys spatial correlation for any Δu.
+    // Precompute three small hash lattices and bilinearly interpolate (classic
+    // "value noise"): fully smooth, no Math.sin in the inner loop.
+    //
+    //   lat1  S=180 → patch period ≈ 50 000/180 ≈ 278 m  (coarse mineral zone colour)
+    //   lat2  S=580 → patch period ≈ 50 000/580 ≈  86 m  (medium rock-face variation)
+    //   lat3  S=820 → patch period ≈ 50 000/820 ≈  61 m  (fine detail within faces)
+    //
+    // Precompute cost: 181²+581²+821² ≈ 1.04 M hash calls, ~10 ms total — done
+    // once before the pixel loop.  Per-pixel cost: 12 array reads, zero trig.
+    const BIOME_RES = 2048;
+
+    const L1 = 180, L1n = L1 + 1;
+    const L2 = 580, L2n = L2 + 1;
+    const L3 = 820, L3n = L3 + 1;
+    const lat1 = new Float32Array(L1n * L1n);
+    const lat2 = new Float32Array(L2n * L2n);
+    const lat3 = new Float32Array(L3n * L3n);
+    for (let j = 0; j < L1n; j++)
+      for (let i = 0; i < L1n; i++)
+        lat1[j * L1n + i] = this.hashNoise(i * 3.71, j * 7.23 + 4.17);
+    for (let j = 0; j < L2n; j++)
+      for (let i = 0; i < L2n; i++)
+        lat2[j * L2n + i] = this.hashNoise(i * 5.31 + 91.7, j * 11.13 + 23.9);
+    for (let j = 0; j < L3n; j++)
+      for (let i = 0; i < L3n; i++)
+        lat3[j * L3n + i] = this.hashNoise(i * 8.17 + 37.3, j * 4.91 + 66.1);
+
+    // Smooth bilinear value-noise sampler — smoothstep in both axes.
+    const vn1 = (u: number, v: number): number => {
+      const x = u * L1, y = v * L1;
+      const xi = Math.min(L1 - 1, x | 0), yi = Math.min(L1 - 1, y | 0);
+      const xf = x - xi, yf = y - yi;
+      const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      const b = yi * L1n + xi;
+      const h00 = lat1[b], h10 = lat1[b + 1], h01 = lat1[b + L1n], h11 = lat1[b + L1n + 1];
+      return h00 + (h10 - h00) * sx + (h01 - h00) * sy + (h00 - h10 - h01 + h11) * sx * sy;
+    };
+    const vn2 = (u: number, v: number): number => {
+      const x = u * L2, y = v * L2;
+      const xi = Math.min(L2 - 1, x | 0), yi = Math.min(L2 - 1, y | 0);
+      const xf = x - xi, yf = y - yi;
+      const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      const b = yi * L2n + xi;
+      const h00 = lat2[b], h10 = lat2[b + 1], h01 = lat2[b + L2n], h11 = lat2[b + L2n + 1];
+      return h00 + (h10 - h00) * sx + (h01 - h00) * sy + (h00 - h10 - h01 + h11) * sx * sy;
+    };
+    const vn3 = (u: number, v: number): number => {
+      const x = u * L3, y = v * L3;
+      const xi = Math.min(L3 - 1, x | 0), yi = Math.min(L3 - 1, y | 0);
+      const xf = x - xi, yf = y - yi;
+      const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      const b = yi * L3n + xi;
+      const h00 = lat3[b], h10 = lat3[b + 1], h01 = lat3[b + L3n], h11 = lat3[b + L3n + 1];
+      return h00 + (h10 - h00) * sx + (h01 - h00) * sy + (h00 - h10 - h01 + h11) * sx * sy;
+    };
+
     const tmpCanvas  = document.createElement('canvas');
     tmpCanvas.width  = BIOME_RES;
     tmpCanvas.height = BIOME_RES;
@@ -915,17 +1503,19 @@ export class TerrainService {
         const h       = this.clamp01(hMeters / peak);
         const slope   = this.sampleSlope(u, v);
 
-        // Low-frequency noise — well-sampled at 1024; drives macro biome patches.
-        const macroA = this.hashNoise(u * manifest.width * 0.22,        v * manifest.height * 0.22);
-        const macroB = this.hashNoise(u * manifest.width * 0.61 + 11.3, v * manifest.height * 0.61 + 7.9);
-        const micro  = this.hashNoise(u * manifest.width * 4.4  + 31.7, v * manifest.height * 4.4  + 19.1);
-        const micro2 = this.hashNoise(u * manifest.width * 10.2 + 71.4, v * manifest.height * 10.2 + 53.8);
-        const micro3 = this.hashNoise(u * manifest.width * 22.7 + 19.9, v * manifest.height * 22.7 + 87.3);
-        // Strata: horizontal elevation bands that give sedimentary layering.
-        const strata = Math.sin(h * 72.0 + macroA * 8.0) * 0.5 + 0.5;
-        // Three-octave fBm grain baked into the biome loop — no separate pass.
-        const grain  = micro * 0.50 + micro2 * 0.32 + micro3 * 0.18;
-        const tonal  = 0.88 + strata * 0.14 + (grain - 0.5) * 0.28;
+        // ── Smooth value noise (from precomputed lattices above the loop) ────────
+        const n1 = vn1(u, v);   // ~278 m smooth patches — coarse mineral zone
+        const n2 = vn2(u, v);   // ~86 m smooth patches  — medium rock-face tone
+        const n3 = vn3(u, v);   // ~61 m smooth patches  — fine face detail
+
+        // Medium scale dominates so rock faces show 60–90 m variation patches.
+        const colorVar = n1 * 0.22 + n2 * 0.48 + n3 * 0.30;
+
+        // Geological strata bands, organically distorted by smooth noise.
+        const strata = Math.sin(h * 8.0 + n1 * 3.0 + n2 * 2.0) * 0.5 + 0.5;
+
+        // Tonal: ±19 % brightness swing driven by genuine spatial variation.
+        const tonal  = 0.86 + strata * 0.09 + (colorVar - 0.5) * 0.38;
 
         let sandW   = this.clamp01(1.0 - h / 0.085)     * this.clamp01(1.0 - slope * 1.25);
         let grassW  = this.clamp01((h - 0.035) / 0.28)  * this.clamp01(1.0 - slope * 0.95);
@@ -934,11 +1524,13 @@ export class TerrainService {
         let rockW   = this.clamp01((h - 0.34)  / 0.54)  * this.clamp01(0.22 + slope * 1.7);
         let snowW   = this.clamp01((h - 0.68)  / 0.22)  * this.clamp01(1.0 - slope * 0.55);
 
-        grassW  *= 0.78 + macroA * 0.44;
-        soilW   *= 0.74 + macroB * 0.52;
-        gravelW *= 0.68 + micro  * 0.64;
-        rockW   *= 0.72 + strata * 0.48;
-        snowW   *= 0.70 + macroB * 0.38;
+        // Smooth noise modulates biome weight boundaries → organic blobs at
+        // 60–280 m scale break the elevation-locked biome lines.
+        grassW  *= 0.68 + n1 * 0.62;
+        soilW   *= 0.64 + n2 * 0.72;
+        gravelW *= 0.55 + n2 * 0.90;
+        rockW   *= 0.68 + strata * 0.32 + n2 * 0.30;
+        snowW   *= 0.80 + n1 * 0.26;
 
         const total = Math.max(0.0001, sandW + grassW + soilW + gravelW + rockW + snowW);
         sandW   /= total;  grassW  /= total;  soilW  /= total;
@@ -947,10 +1539,30 @@ export class TerrainService {
         const sand   = [0.78, 0.73, 0.62];
         const grass  = [0.23, 0.43, 0.19];
         const soil   = [0.40, 0.31, 0.23];
-        const gravel = [0.47, 0.44, 0.39];
-        const rock   = [0.33, 0.33, 0.35];
         const snow   = [0.88, 0.89, 0.90];
 
+        // Dynamic rock colour: n2 (86 m) is the PRIMARY driver so a 400–600 m
+        // mountain face shows 4–6 distinct colour patches rather than one uniform
+        // tone.  n1 (278 m) adds a broad warm/cool zone tendency; n3 (61 m) adds
+        // fine variation at the top.  Extremes: warm iron-oxide ↔ cool basalt.
+        const rockT = this.clamp01(n2 * 0.65 + n1 * 0.25 + n3 * 0.10);
+        const rock = [
+          0.50 * rockT + 0.20 * (1 - rockT),   // R: rust 0.50 ↔ basalt 0.20
+          0.35 * rockT + 0.22 * (1 - rockT),   // G: 0.35 ↔ 0.22
+          0.19 * rockT + 0.40 * (1 - rockT),   // B: 0.19 ↔ basalt 0.40
+        ];
+
+        // Dynamic gravel: n3 (61 m) primary, n2 (86 m) secondary — ensures
+        // gravel/talus patches are finer-grained than rock face patches.
+        // Sandy limestone [0.56,0.49,0.33] ↔ slate [0.32,0.35,0.50].
+        const gravT = this.clamp01(n3 * 0.55 + n2 * 0.35 + n1 * 0.10);
+        const gravel = [
+          0.56 * gravT + 0.32 * (1 - gravT),
+          0.49 * gravT + 0.35 * (1 - gravT),
+          0.33 * gravT + 0.50 * (1 - gravT),
+        ];
+
+        // Mix base colour from biome weights and apply tonal brightness.
         const r = this.clamp01((sand[0]*sandW + grass[0]*grassW + soil[0]*soilW + gravel[0]*gravelW + rock[0]*rockW + snow[0]*snowW) * tonal);
         const g = this.clamp01((sand[1]*sandW + grass[1]*grassW + soil[1]*soilW + gravel[1]*gravelW + rock[1]*rockW + snow[1]*snowW) * tonal);
         const b = this.clamp01((sand[2]*sandW + grass[2]*grassW + soil[2]*soilW + gravel[2]*gravelW + rock[2]*rockW + snow[2]*snowW) * tonal);

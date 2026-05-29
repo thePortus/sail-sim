@@ -12,7 +12,7 @@ describe('Change Endpoints', () => {
   beforeAll(async () => {
     const ownerResponse = await supertest(app).post('/api/user/login')
       .send({
-        username: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+        username: process.env.OWNER_USERNAME || 'sail-sim-owner',
         password: process.env.OWNER_PASSWORD || 'password'
       });
     ownerToken = ownerResponse.body.token;
@@ -156,7 +156,7 @@ describe('Change Endpoints', () => {
   });
 
   it('GET /api/changes?page=1&size=5&username=xyz should search by username', async () => {
-    const res = await requestWithSupertest.get('/api/changes?page=0&size=5&username=jesuit-catalogs-owner')
+    const res = await requestWithSupertest.get('/api/changes?page=0&size=5&username=sail-sim-owner')
       .set('Authorization', `${ownerToken}`);
     expect(res.status).toEqual(200);
     expect(res.type).toEqual(expect.stringContaining('json'));

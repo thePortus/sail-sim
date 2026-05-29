@@ -13,7 +13,7 @@ describe('Office Delete Endpoints', () => {
   beforeAll(async () => {
     const ownerResponse = await supertest(app).post('/api/user/login')
       .send({
-        username: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+        username: process.env.OWNER_USERNAME || 'sail-sim-owner',
         password: process.env.OWNER_PASSWORD || 'password'
       });
     ownerToken = ownerResponse.body.token;

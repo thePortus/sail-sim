@@ -21,7 +21,7 @@ module.exports = {
     idle: 10000
   },
   JWT_SECRET: process.env.JWT_SECRET || 'secret',
-  OWNER_USERNAME: process.env.OWNER_USERNAME || 'jesuit-catalogs-owner',
+  OWNER_USERNAME: process.env.OWNER_USERNAME || 'sail-sim-owner',
   OWNER_PASSWORD: process.env.OWNER_PASSWORD || 'password',
   OWNER_EMAIL: process.env.OWNER_EMAIL || 'sample@email.com'
 };

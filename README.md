@@ -29,3 +29,6 @@ npm run migrate
 
 Go to the port for the angular container specified in the docker compose and you should be set.
 
+# Credits
+
+Some textures from Polyhaven

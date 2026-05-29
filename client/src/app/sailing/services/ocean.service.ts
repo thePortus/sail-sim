@@ -151,6 +151,8 @@ uniform vec2  u_shoreMapCenter;    // world-space XZ of shore map centre
 uniform float u_shoreMapSize;      // full world-space width covered (metres)
 uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
 uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
+uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
+uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 
 #ifdef WEBGPU
 layout(location = 0) in vec3 v_worldPos;
@@ -369,6 +371,27 @@ void main() {
     color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.92);
   }
 
+  // ── Soft waterline ─────────────────────────────────────────────────────────
+  // Hide the hard, aliased edge where the hull (and shore) meet the water.
+  // Sample the opaque-scene camera-space depth (ocean excluded) at this pixel and
+  // compare it to this water fragment's own camera-space depth. Where opaque
+  // geometry sits just behind the water surface, feather a soft foam wash.
+  vec2 sceneUV = clamp((v_projPos.xy / v_projPos.w) * 0.5 + 0.5, 0.0, 1.0);
+  float sceneZ = texture2D(u_sceneDepth, sceneUV).r;     // 1e8 where nothing opaque
+  float waterZ = (view * vec4(v_worldPos, 1.0)).z;       // same space as sceneZ
+  float dz     = sceneZ - waterZ;                        // >0: opaque just behind surface
+  // Band: ramp up over the first 0.20 m (kills the dz≈0 hard cut), fade out by 1.6 m.
+  float waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
+  color = mix(color, vec3(0.90, 0.95, 1.00), waterline * 0.70);
+
+  // ── Night dimming ───────────────────────────────────────────────────────────
+  // The reflection, scattering and shallow-water tints are all day-calibrated, so
+  // without this the water (especially turquoise shallows) stays unnaturally
+  // bright after dark. Fade the whole surface toward a dim moonlit floor as the
+  // sun drops below the horizon (u_sunElevation = sun dir .y, <0 at night).
+  float dayLight = mix(0.12, 1.0, smoothstep(-0.12, 0.22, u_sunElevation));
+  color *= dayLight;
+
   vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
 #ifdef WEBGPU
   fragmentColor = outCol;
@@ -519,6 +542,9 @@ uniform u_shoreMapCenter: vec2f;
 uniform u_shoreMapSize: f32;
 uniform u_cloudCoverage: f32;
 uniform u_sunElevation: f32;
+uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
+var u_sceneDepthSampler: sampler;
+var u_sceneDepth: texture_2d<f32>; // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 
 varying v_worldPos: vec3f;
 varying v_projPos: vec4f;
@@ -736,6 +762,22 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
       0.0, 1.0);
     color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.92));
   }
+
+  // ── Soft waterline ─────────────────────────────────────────────────────────
+  // (same logic as the GLSL path) feather a soft foam wash where opaque geometry
+  // sits just behind the water surface, hiding the hard aliased waterline edge.
+  let sceneUV = clamp((input.v_projPos.xy / input.v_projPos.w) * 0.5 + vec2f(0.5), vec2f(0.0), vec2f(1.0));
+  let sceneZ  = textureSampleLevel(u_sceneDepth, u_sceneDepthSampler, sceneUV, 0.0).r;
+  let waterZ  = (uniforms.view * vec4f(input.v_worldPos, 1.0)).z;
+  let dz      = sceneZ - waterZ;
+  let waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
+  color = mix(color, vec3f(0.90, 0.95, 1.00), vec3f(waterline * 0.70));
+
+  // ── Night dimming ───────────────────────────────────────────────────────────
+  // (same as GLSL path) fade the surface toward a dim moonlit floor after dark so
+  // the day-calibrated reflection / scattering / shallow tints aren't too bright.
+  let dayLight = mix(0.12, 1.0, smoothstep(-0.12, 0.22, uniforms.u_sunElevation));
+  color *= dayLight;
 
   fragmentOutputs.color = vec4f(aces_tonemap(color * 2.0), 1.0);
 }
@@ -994,12 +1036,12 @@ export class OceanService {
           'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale',
           'u_Time', 'u_WaveDepth', 'u_WaveFreq',
           'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
-          'u_cameraPosition',
+          'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
           'u_cloudCoverage', 'u_sunElevation',
         ],
-        samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap'],
+        samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth'],
         needAlphaBlending: false,
         shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
       },
@@ -1035,6 +1077,10 @@ export class OceanService {
     mat.setFloat('u_shoreMapSize', this.shoreMapSize);
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
+    // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
+    // until the scene's depth map exists — harmless because its colour values are
+    // < the water's camera-space Z, so dz is negative and no foam is drawn.
+    mat.setTexture('u_sceneDepth', this.sceneService.oceanDepthMap ?? this.reflectionRTT);
 
     return mat;
   }
@@ -1081,6 +1127,7 @@ export class OceanService {
       const boatPos = new Vector2(this.boatX, this.boatZ);
       const boatSpeedAbs = Math.abs(this.boatSpeed) * 4.0;
 
+      const depthMap = this.sceneService.oceanDepthMap;
       for (const mat of allMats) {
         mat.setFloat('u_Time', t);
         mat.setVector2('u_BoatPos', boatPos);
@@ -1088,6 +1135,7 @@ export class OceanService {
         mat.setFloat('u_BoatSpeed', boatSpeedAbs);
         mat.setFloat('u_cloudCoverage', this._cloudCoverage);
         mat.setFloat('u_sunElevation',  this._sunElevation);
+        if (depthMap) mat.setTexture('u_sceneDepth', depthMap);
       }
 
     });

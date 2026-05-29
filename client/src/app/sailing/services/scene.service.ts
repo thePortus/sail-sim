@@ -5,6 +5,7 @@ import {
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, Material, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
+  DepthRenderer, RenderTargetTexture, Texture, Constants,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
@@ -52,6 +53,15 @@ export class SceneService {
   shadowGenerator!: ShadowGenerator;
   private pipeline!: DefaultRenderingPipeline;
   private _aaQuality = 1; // 0=Off 1=FXAA 2=MSAA2x 3=MSAA4x
+
+  // Dedicated camera-space-Z depth map of all opaque geometry EXCEPT the ocean.
+  // The ocean shader samples this to find where the hull / shore sits just behind
+  // the water surface and lays a soft foam wash there, hiding the hard aliased
+  // waterline edge. Empty pixels clear to 1e8 (treated as "infinitely far").
+  private oceanDepthRenderer: DepthRenderer | null = null;
+  private _oceanDepthMap: RenderTargetTexture | null = null;
+  /** Camera-space-Z depth of opaque geometry (ocean excluded). Null until built. */
+  get oceanDepthMap(): RenderTargetTexture | null { return this._oceanDepthMap; }
 
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
@@ -137,6 +147,17 @@ export class SceneService {
         this._isWebGPU = false;
       }
 
+      // Render at the display's native pixel density. Without this the backing
+      // buffer is sized in CSS pixels and the browser upscales it to physical
+      // pixels on HiDPI/Retina screens — making the whole frame soft and thin
+      // geometry (mast, rigging, hull outline) stair-step regardless of MSAA/FXAA,
+      // because the aliasing happens during the upscale AFTER anti-aliasing runs.
+      // Load the stored AA level first (it caps the resolution) and apply before
+      // any render targets are created so they size to the final resolution.
+      const storedAa = parseInt(localStorage.getItem('ignis_aa_quality') ?? '1', 10);
+      this._aaQuality = isNaN(storedAa) ? 1 : Math.max(0, Math.min(3, storedAa));
+      this.applyResolutionScale();
+
       this.scene = new Scene(this.engine);
       this.scene.fogMode    = Scene.FOGMODE_EXP2;
       this.scene.fogDensity = 0.000035;
@@ -146,6 +167,7 @@ export class SceneService {
       this.buildCelestialBodies();
       this.buildCamera(canvas);
       this.buildPostProcessing();
+      this.buildOceanDepthRenderer();
       this.startRenderLoop();
     });
   }
@@ -234,6 +256,34 @@ export class SceneService {
     this.camera.fov  = 1.1;
   }
 
+  // ── Ocean depth map ───────────────────────────────────────────────────────────
+  // A dedicated depth pass that stores camera-space Z (linear world-unit depth)
+  // of every opaque mesh EXCEPT the ocean itself. The ocean fragment shader
+  // compares its own camera-space Z against this to detect where the hull (or
+  // shore) sits just behind the water surface, then feathers a soft foam wash
+  // over that band — softening the hard, aliased waterline silhouette that MSAA
+  // and FXAA can't resolve. NEAREST sampling avoids smearing hull depth into the
+  // 1e8 "empty" clear value at silhouette edges.
+  private buildOceanDepthRenderer(): void {
+    const depthRenderer = new DepthRenderer(
+      this.scene,
+      Constants.TEXTURETYPE_FLOAT, // wide range — camera-space Z up to maxZ / 1e8 clear
+      this.camera,
+      /* storeNonLinearDepth */ false,
+      Texture.NEAREST_SAMPLINGMODE,
+      /* storeCameraSpaceZ  */ true,
+    );
+    const depthMap = depthRenderer.getDepthMap();
+    // Exclude the four ocean LOD meshes (all named 'ocean_*') so open water reads
+    // the 1e8 clear (= "far") rather than its own surface depth.
+    depthMap.renderListPredicate = (m) => !m.name.startsWith('ocean_');
+    // Render this map every frame alongside the scene's other render targets.
+    this.scene.customRenderTargets.push(depthMap);
+
+    this.oceanDepthRenderer = depthRenderer;
+    this._oceanDepthMap = depthMap;
+  }
+
   // ── Post-processing pipeline ──────────────────────────────────────────────────
 
   private buildPostProcessing(): void {
@@ -260,10 +310,13 @@ export class SceneService {
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
 
-    // Sharpening — counteracts the softening from FXAA and SSAO's bilateral blur,
-    // keeping hull edges, rigging, and deck detail crisp.
+    // Sharpening — restores a little crispness to rigging and deck detail after
+    // FXAA / SSAO's bilateral blur. Kept low: a high edgeAmount amplifies contrast
+    // across the highest-contrast silhouette in the scene — the dark hull against
+    // the bright ocean — which un-does FXAA's edge smoothing and makes the
+    // waterline look pixelated/stair-stepped. 0.08 keeps detail without re-aliasing.
     this.pipeline.sharpenEnabled         = true;
-    this.pipeline.sharpen.edgeAmount     = 0.25;
+    this.pipeline.sharpen.edgeAmount     = 0.08;
     this.pipeline.sharpen.colorAmount    = 1.0;
 
     // Film grain — breaks up the uniform "CG plastic" look on flat surfaces
@@ -317,6 +370,9 @@ export class SceneService {
       case 2: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 2; break;
       case 3: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 4; break;
     }
+    // Render resolution is part of the same quality dial (it's the single biggest
+    // quality/perf lever), so re-apply it whenever the AA level changes.
+    this.applyResolutionScale();
   }
 
   getAaQuality(): number { return this._aaQuality; }
@@ -573,10 +629,33 @@ export class SceneService {
       this.tickTimeOfDay(dt);
       this.scene.render();
     });
-    window.addEventListener('resize', () => this.engine.resize());
+    window.addEventListener('resize', () => {
+      this.applyResolutionScale();
+      this.engine.resize();
+    });
+  }
+
+  // Render resolution is tied to the AA-quality level so users on weaker machines
+  // can trade sharpness for FPS with a single setting:
+  //   level 0 ("Off")  → 1.0  : CSS-pixel resolution (cheapest; on HiDPI this is
+  //                             the low-res upscaled look — performance mode)
+  //   levels 1–3       → ≤2.0 : the display's native pixel density (sharp), capped
+  //                             at 2× to bound cost on very high-DPR screens
+  //                             (1/scale of 0.5 already quadruples pixel count).
+  // On non-HiDPI displays (devicePixelRatio = 1) every level renders at native
+  // resolution — only the FXAA/MSAA behaviour differs, exactly as before.
+  private readonly MAX_PIXEL_RATIO = 2;
+  private applyResolutionScale(): void {
+    if (!this.engine) return;
+    const cap = this._aaQuality === 0 ? 1 : this.MAX_PIXEL_RATIO;
+    const dpr = Math.min(window.devicePixelRatio || 1, cap);
+    this.engine.setHardwareScalingLevel(1 / dpr);
   }
 
   dispose(): void {
+    this.oceanDepthRenderer?.dispose();
+    this.oceanDepthRenderer = null;
+    this._oceanDepthMap = null;
     this.engine?.dispose();
   }
 }

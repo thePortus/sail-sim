@@ -90,7 +90,7 @@ import { SceneService } from '../../services/scene.service';
                (input)="onAaQuality($event)"
                class="quality-slider" />
         <div class="quality-ticks">
-          <span>Off</span><span>FXAA</span><span>2×</span><span>4×</span>
+          <span>Perf</span><span>FXAA</span><span>2×</span><span>4×</span>
         </div>
       </div>
 
@@ -270,7 +270,7 @@ export class PauseMenuComponent {
   readonly cloudLabels = ['Low', 'Medium', 'High', 'Ultra'];
   cloudQuality = this.cloudSvc.getCloudQuality();
 
-  readonly aaLabels = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
+  readonly aaLabels = ['Performance', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
   aaQuality = this.sceneSvc.getAaQuality();
 
   onResume(): void { this.resume.emit(); }

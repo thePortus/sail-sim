@@ -3,9 +3,7 @@
 # General or Current TODO Items
 
 * Heighten normal/bump mapping on sand, rocks, grass... effect is muted
-* Add masking to the player's ship edges to blur pixelation with the sea as background
 * Remove silly wake sprite
-* Reduce ocean brightness at night
 * More trees
 * Plan to improve quality of ground texture, more realistic
 * Fix sun behind island

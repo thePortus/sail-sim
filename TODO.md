@@ -2,8 +2,9 @@
 
 # General or Current TODO Items
 
+* Follow improve plan for terrain
+* Modify foam & turquoise overlap around beaches to be transparent and SHOW beach through certain layer depth... also rain splashes don't show on this ring
 * Heighten normal/bump mapping on sand, rocks, grass... effect is mutedgit a
-* Remove silly wake sprite
 * More trees
 * Plan to improve quality of ground texture, more realistic
 * Improve rain

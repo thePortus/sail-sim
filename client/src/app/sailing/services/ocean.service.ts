@@ -34,6 +34,8 @@ uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
+uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
+uniform float u_wakeCount;      // number of valid points in u_wakePath
 
 #define DRAG_MULT 0.38
 #define ITERATIONS 24
@@ -68,25 +70,39 @@ float getwaves(vec2 position) {
   return sum / max(sumW, 1e-5);
 }
 
+// Froth/turbulence intensity from the ship's recent track: 1 on a fresh part of
+// the path, fading to 0 with lateral distance and with age. Curves with the
+// actual route sailed; early-outs cheaply for fragments far from the boat.
+float wakeTrail(vec2 p) {
+  if (u_wakeCount < 2.0) return 0.0;
+  if (length(p - u_BoatPos) > 170.0) return 0.0;
+  float best = 1.0e9;
+  float bestAge = 0.0;
+  for (int i = 0; i < 23; i++) {
+    if (float(i) >= u_wakeCount - 1.0) break;
+    vec2 a = u_wakePath[i].xy;
+    vec2 b = u_wakePath[i + 1].xy;
+    vec2 ab = b - a;
+    float L2 = max(dot(ab, ab), 1.0e-3);
+    float t = clamp(dot(p - a, ab) / L2, 0.0, 1.0);
+    float d = length(p - (a + ab * t));
+    if (d < best) { best = d; bestAge = mix(u_wakePath[i].z, u_wakePath[i + 1].z, t); }
+  }
+  float lat = 1.0 - smoothstep(3.0, 15.0, best);
+  float age = 1.0 - smoothstep(0.0, 7.0, bestAge);
+  return lat * age;
+}
+
 float wakeDisplacement(vec2 worldPos) {
-  vec2 rel = worldPos - u_BoatPos;
-  float along = dot(rel, -u_BoatDir);
-  if (along <= 0.0) return 0.0;
-
-  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
-  float lateral = dot(rel, right);
-
-  float width = 4.8 + min(10.0, u_BoatSpeed * 0.42);
-  float depth = 0.36 + min(1.05, u_BoatSpeed * 0.060);
-  float build = 1.0 - exp(-along * 0.030);
-  float trail = exp(-along * 0.0082);
-
-  float trench = exp(-(lateral * lateral) / (width * width));
-  float shoulderOffset = abs(lateral) - width * 1.55;
-  float shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
-
-  float ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
-  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+  float wake = wakeTrail(worldPos);
+  if (wake < 0.001) return 0.0;
+  // Frothy churn following the ship's track: a slight trench plus fast animated
+  // chop, all scaled by the trail freshness (wake).
+  float chop = (sin(worldPos.x * 0.65 + u_Time *  9.0)
+              + sin(worldPos.y * 0.80 - u_Time * 11.0)
+              + sin((worldPos.x - worldPos.y) * 0.50 + u_Time * 7.0)
+              + sin((worldPos.x + worldPos.y) * 1.00 - u_Time * 8.0)) * 0.25;
+  return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
 float wakeMask(vec2 worldPos) {
@@ -141,6 +157,8 @@ uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
+uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
+uniform float u_wakeCount;      // number of valid points in u_wakePath
 uniform sampler2D u_reflectionSampler;
 uniform sampler2D u_terrainShadowMask;
 uniform vec2  u_terrainShadowCenter;
@@ -199,25 +217,38 @@ float getwaves(vec2 position) {
   return sum / max(sumW, 1e-5);
 }
 
+// Froth/turbulence intensity from the ship's recent track: 1 on a fresh part of
+// the path, fading to 0 with lateral distance and with age. Curves with the
+// actual route sailed; early-outs cheaply for fragments far from the boat.
+float wakeTrail(vec2 p) {
+  if (u_wakeCount < 2.0) return 0.0;
+  if (length(p - u_BoatPos) > 170.0) return 0.0;
+  float best = 1.0e9;
+  float bestAge = 0.0;
+  for (int i = 0; i < 23; i++) {
+    if (float(i) >= u_wakeCount - 1.0) break;
+    vec2 a = u_wakePath[i].xy;
+    vec2 b = u_wakePath[i + 1].xy;
+    vec2 ab = b - a;
+    float L2 = max(dot(ab, ab), 1.0e-3);
+    float t = clamp(dot(p - a, ab) / L2, 0.0, 1.0);
+    float d = length(p - (a + ab * t));
+    if (d < best) { best = d; bestAge = mix(u_wakePath[i].z, u_wakePath[i + 1].z, t); }
+  }
+  float lat = 1.0 - smoothstep(3.0, 15.0, best);
+  float age = 1.0 - smoothstep(0.0, 7.0, bestAge);
+  return lat * age;
+}
+
 float wakeDisplacement(vec2 worldPos) {
-  vec2 rel = worldPos - u_BoatPos;
-  float along = dot(rel, -u_BoatDir);
-  if (along <= 0.0) return 0.0;
-
-  vec2 right = vec2(-u_BoatDir.y, u_BoatDir.x);
-  float lateral = dot(rel, right);
-
-  float width = 4.8 + min(10.0, u_BoatSpeed * 0.42);
-  float depth = 0.36 + min(1.05, u_BoatSpeed * 0.060);
-  float build = 1.0 - exp(-along * 0.030);
-  float trail = exp(-along * 0.0082);
-
-  float trench = exp(-(lateral * lateral) / (width * width));
-  float shoulderOffset = abs(lateral) - width * 1.55;
-  float shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
-  float ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
-
-  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+  float wake = wakeTrail(worldPos);
+  if (wake < 0.001) return 0.0;
+  // Frothy churn following the ship's track (feeds the surface normals).
+  float chop = (sin(worldPos.x * 0.65 + u_Time *  9.0)
+              + sin(worldPos.y * 0.80 - u_Time * 11.0)
+              + sin((worldPos.x - worldPos.y) * 0.50 + u_Time * 7.0)
+              + sin((worldPos.x + worldPos.y) * 1.00 - u_Time * 8.0)) * 0.25;
+  return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
 float wakeMask(vec2 worldPos) {
@@ -299,6 +330,15 @@ float terrainShadowMask(vec2 worldXZ) {
   vec2 uv = (worldXZ - u_terrainShadowCenter) / (halfSize * 2.0) + 0.5;
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
   return texture2D(u_terrainShadowMask, uv).r;
+}
+
+// Animated caustic web for the shallow seabed: domain-warped ridged sine field
+// sharpened into thin bright filaments that drift and shimmer over time.
+float causticPattern(vec2 uv, float t) {
+  uv += vec2(sin(uv.y * 1.7 + t * 1.1), cos(uv.x * 1.5 - t * 0.9)) * 0.5;
+  float a = (sin(uv.x * 2.0 + t) + sin(uv.y * 2.0 - t * 1.2)
+           + sin((uv.x + uv.y) * 1.4 + t * 0.7)) / 3.0;
+  return pow(clamp(1.0 - abs(a), 0.0, 1.0), 3.5);
 }
 
 // ── Rain ripple noise ───────────────────────────────────────────────────────
@@ -388,8 +428,18 @@ void main() {
   vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
   scattering *= (1.0 - terrainShadow * 0.75);
   vec3 color = fresnel * reflection + scattering;
-  // (wake foam removed — the displacement trench/trail is the wake now; the white
-  // foam cone read as a static blob behind the hull.)
+
+  // Frothy wake: a thin, ~90%-transparent white wisp hugging the boat only — the
+  // rest of the track is just turbulence. Narrow (only the freshest centerline
+  // core) and gated to the area right around the hull.
+  float wakeF = wakeTrail(worldXZ);
+  if (wakeF > 0.001) {
+    float core     = smoothstep(0.95, 0.998, wakeF);  // razor-thin: only the tightest core
+    float nearBoat = 1.0 - smoothstep(18.0, 65.0, length(worldXZ - u_BoatPos));
+    float grain    = rVNoise(worldXZ * 1.4 + vec2(u_Time * 0.6, -u_Time * 0.4));
+    float froth    = core * nearBoat * (0.6 + 0.4 * grain);
+    color = mix(color, vec3(0.92, 0.96, 1.0), froth * 0.03);
+  }
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
@@ -401,20 +451,28 @@ void main() {
   if (shoreUV.x >= 0.001 && shoreUV.x <= 0.999 &&
       shoreUV.y >= 0.001 && shoreUV.y <= 0.999) {
     float proximity = texture2D(u_shoreMap, shoreUV).r;
-    // Layer 1: turquoise water column (shallowing water shifts from deep blue)
-    float shallowF = smoothstep(0.05, 0.70, proximity);
-    color = mix(color, vec3(0.10, 0.48, 0.50), shallowF * 0.50);
-    // Layer 2: sandy/rocky seafloor visible through very shallow transparent water
-    float seafloorF = smoothstep(0.60, 0.88, proximity);
-    color = mix(color, vec3(0.62, 0.55, 0.40), seafloorF * 0.62);
-    // Layer 3: animated foam breaking at the waterline
-    float foamF = smoothstep(0.75, 0.95, proximity);
+    // 1. Subtle turquoise water column on the broad shallows.
+    float shallowF = smoothstep(0.05, 0.65, proximity);
+    color = mix(color, vec3(0.10, 0.48, 0.50), shallowF * 0.25);
+    // 2. Seabed reveal — the see-through effect. Lerp the reflective surface
+    // toward the wet seabed sand as the water shallows, strongly near the edge,
+    // so the thin water at the waterline reads as clear (depth-fade illusion).
+    float reveal = smoothstep(0.40, 0.92, proximity);
+    color = mix(color, vec3(0.40, 0.34, 0.25), reveal * 0.88);
+    // 3. Caustics over the shallows and the revealed sand.
+    float causMask = smoothstep(0.12, 0.95, proximity);
+    float caus = causticPattern(worldXZ * 0.18, u_Time * 0.9)
+               + causticPattern(worldXZ * 0.33 + 7.3, u_Time * 1.3) * 0.6;
+    color += vec3(0.80, 1.0, 0.92) * caus * causMask * 0.24;
+    // 4. Thin, translucent breaking foam at the very waterline (not a wide wash,
+    // which used to bury the seabed under opaque white).
+    float foamF = smoothstep(0.90, 0.99, proximity);
     float foamAnim = clamp(
         0.44
       + 0.38 * sin(worldXZ.x * 0.55 + u_Time * 1.3 + worldXZ.y * 0.25)
       + 0.28 * cos(worldXZ.y * 0.48 - u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
-    color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.92);
+    color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.50);
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────
@@ -426,6 +484,16 @@ void main() {
   float sceneZ = texture2D(u_sceneDepth, sceneUV).r;     // 1e8 where nothing opaque
   float waterZ = (view * vec4(v_worldPos, 1.0)).z;       // same space as sceneZ
   float dz     = sceneZ - waterZ;                        // >0: opaque just behind surface
+
+  // Depth-based shallow seabed reveal — the reliable "see the sand" effect.
+  // u_sceneDepth holds the seabed depth (terrain is in it; only the ocean is
+  // excluded), so a small dz means the water is a thin sheet over the bottom.
+  // Blend toward the wet seabed sand there so shallow water reads as clear.
+  // (Open ocean → dz ≈ 1e8 → no reveal. Works at every shore, unlike the shore
+  // map's proximity which is location-dependent.)
+  float seabedReveal = 1.0 - smoothstep(0.5, 14.0, dz);
+  color = mix(color, vec3(0.40, 0.34, 0.25), seabedReveal * 0.85);
+
   // Band: ramp up over the first 0.20 m (kills the dz≈0 hard cut), fade out by 1.6 m.
   float waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
   color = mix(color, vec3(0.90, 0.95, 1.00), waterline * 0.70);
@@ -465,6 +533,8 @@ uniform u_WaveFreq: f32;
 uniform u_BoatPos: vec2f;
 uniform u_BoatDir: vec2f;
 uniform u_BoatSpeed: f32;
+uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
+uniform u_wakeCount: f32;               // number of valid points in u_wakePath
 
 const DRAG_MULT: f32 = 0.38;
 const ITERATIONS: i32 = 24;
@@ -500,27 +570,36 @@ fn getwaves(positionIn: vec2f) -> f32 {
   return sum / max(sumW, 1e-5);
 }
 
-fn wakeDisplacement(worldPos: vec2f) -> f32 {
-  let rel = worldPos - uniforms.u_BoatPos;
-  let along = dot(rel, -uniforms.u_BoatDir);
-  if (along <= 0.0) {
-    return 0.0;
+// Froth/turbulence intensity from the ship's recent track (see GLSL path).
+fn wakeTrail(p: vec2f) -> f32 {
+  if (uniforms.u_wakeCount < 2.0) { return 0.0; }
+  if (length(p - uniforms.u_BoatPos) > 170.0) { return 0.0; }
+  var best = 1.0e9;
+  var bestAge = 0.0;
+  for (var i = 0; i < 23; i = i + 1) {
+    if (f32(i) >= uniforms.u_wakeCount - 1.0) { break; }
+    let a = uniforms.u_wakePath[i].xy;
+    let b = uniforms.u_wakePath[i + 1].xy;
+    let ab = b - a;
+    let L2 = max(dot(ab, ab), 1.0e-3);
+    let t = clamp(dot(p - a, ab) / L2, 0.0, 1.0);
+    let d = length(p - (a + ab * t));
+    if (d < best) { best = d; bestAge = mix(uniforms.u_wakePath[i].z, uniforms.u_wakePath[i + 1].z, t); }
   }
+  let lat = 1.0 - smoothstep(3.0, 15.0, best);
+  let age = 1.0 - smoothstep(0.0, 7.0, bestAge);
+  return lat * age;
+}
 
-  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
-  let lateral = dot(rel, right);
-
-  let width = 4.8 + min(10.0, uniforms.u_BoatSpeed * 0.42);
-  let depth = 0.36 + min(1.05, uniforms.u_BoatSpeed * 0.060);
-  let build = 1.0 - exp(-along * 0.030);
-  let trail = exp(-along * 0.0082);
-
-  let trench = exp(-(lateral * lateral) / (width * width));
-  let shoulderOffset = abs(lateral) - width * 1.55;
-  let shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
-
-  let ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
-  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+fn wakeDisplacement(worldPos: vec2f) -> f32 {
+  let wake = wakeTrail(worldPos);
+  if (wake < 0.001) { return 0.0; }
+  // Frothy churn following the ship's track, scaled by trail freshness (wake).
+  let chop = (sin(worldPos.x * 0.65 + uniforms.u_Time *  9.0)
+            + sin(worldPos.y * 0.80 - uniforms.u_Time * 11.0)
+            + sin((worldPos.x - worldPos.y) * 0.50 + uniforms.u_Time * 7.0)
+            + sin((worldPos.x + worldPos.y) * 1.00 - uniforms.u_Time * 8.0)) * 0.25;
+  return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
 fn wakeMask(worldPos: vec2f) -> f32 {
@@ -575,6 +654,8 @@ uniform u_WaveFreq: f32;
 uniform u_BoatPos: vec2f;
 uniform u_BoatDir: vec2f;
 uniform u_BoatSpeed: f32;
+uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
+uniform u_wakeCount: f32;               // number of valid points in u_wakePath
 var u_reflectionSamplerSampler: sampler;
 var u_reflectionSampler: texture_2d<f32>;
 var u_terrainShadowMaskSampler: sampler;
@@ -631,27 +712,36 @@ fn getwaves(positionIn: vec2f) -> f32 {
   return sum / max(sumW, 1e-5);
 }
 
-fn wakeDisplacement(worldPos: vec2f) -> f32 {
-  let rel = worldPos - uniforms.u_BoatPos;
-  let along = dot(rel, -uniforms.u_BoatDir);
-  if (along <= 0.0) {
-    return 0.0;
+// Froth/turbulence intensity from the ship's recent track (see GLSL path).
+fn wakeTrail(p: vec2f) -> f32 {
+  if (uniforms.u_wakeCount < 2.0) { return 0.0; }
+  if (length(p - uniforms.u_BoatPos) > 170.0) { return 0.0; }
+  var best = 1.0e9;
+  var bestAge = 0.0;
+  for (var i = 0; i < 23; i = i + 1) {
+    if (f32(i) >= uniforms.u_wakeCount - 1.0) { break; }
+    let a = uniforms.u_wakePath[i].xy;
+    let b = uniforms.u_wakePath[i + 1].xy;
+    let ab = b - a;
+    let L2 = max(dot(ab, ab), 1.0e-3);
+    let t = clamp(dot(p - a, ab) / L2, 0.0, 1.0);
+    let d = length(p - (a + ab * t));
+    if (d < best) { best = d; bestAge = mix(uniforms.u_wakePath[i].z, uniforms.u_wakePath[i + 1].z, t); }
   }
+  let lat = 1.0 - smoothstep(3.0, 15.0, best);
+  let age = 1.0 - smoothstep(0.0, 7.0, bestAge);
+  return lat * age;
+}
 
-  let right = vec2f(-uniforms.u_BoatDir.y, uniforms.u_BoatDir.x);
-  let lateral = dot(rel, right);
-
-  let width = 4.8 + min(10.0, uniforms.u_BoatSpeed * 0.42);
-  let depth = 0.36 + min(1.05, uniforms.u_BoatSpeed * 0.060);
-  let build = 1.0 - exp(-along * 0.030);
-  let trail = exp(-along * 0.0082);
-
-  let trench = exp(-(lateral * lateral) / (width * width));
-  let shoulderOffset = abs(lateral) - width * 1.55;
-  let shoulders = exp(-(shoulderOffset * shoulderOffset) / (width * width * 1.8));
-  let ripple = sin(along * 0.18) * exp(-along * 0.028) * 0.06;
-
-  return (-trench * 0.96 + shoulders * 0.30 + ripple) * depth * build * trail;
+fn wakeDisplacement(worldPos: vec2f) -> f32 {
+  let wake = wakeTrail(worldPos);
+  if (wake < 0.001) { return 0.0; }
+  // Frothy churn following the ship's track (feeds the surface normals).
+  let chop = (sin(worldPos.x * 0.65 + uniforms.u_Time *  9.0)
+            + sin(worldPos.y * 0.80 - uniforms.u_Time * 11.0)
+            + sin((worldPos.x - worldPos.y) * 0.50 + uniforms.u_Time * 7.0)
+            + sin((worldPos.x + worldPos.y) * 1.00 - uniforms.u_Time * 8.0)) * 0.25;
+  return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
 fn wakeMask(worldPos: vec2f) -> f32 {
@@ -740,6 +830,14 @@ fn terrainShadowMask(worldXZ: vec2f) -> f32 {
   return select(0.0, s, inBounds);
 }
 
+// Animated caustic web for the shallow seabed (same as GLSL path).
+fn causticPattern(uvIn: vec2f, t: f32) -> f32 {
+  let uv = uvIn + vec2f(sin(uvIn.y * 1.7 + t * 1.1), cos(uvIn.x * 1.5 - t * 0.9)) * 0.5;
+  let a = (sin(uv.x * 2.0 + t) + sin(uv.y * 2.0 - t * 1.2)
+         + sin((uv.x + uv.y) * 1.4 + t * 0.7)) / 3.0;
+  return pow(clamp(1.0 - abs(a), 0.0, 1.0), 3.5);
+}
+
 // ── Rain ripple noise (same as GLSL path) ───────────────────────────────────
 fn rVHash(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
 fn rVNoise(p: vec2f) -> f32 {
@@ -818,7 +916,16 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let wakeT = max(input.v_wakeMask, wakeMask(worldXZ));
   let scattering = vec3f(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07) * (1.0 - terrainShadow * 0.75);
   var color = fresnel * reflection + scattering;
-  // (wake foam removed — see GLSL path.)
+
+  // Frothy wake (same as GLSL path): thin, ~90%-transparent wisp near the boat.
+  let wakeF = wakeTrail(worldXZ);
+  if (wakeF > 0.001) {
+    let core     = smoothstep(0.95, 0.998, wakeF);
+    let nearBoat = 1.0 - smoothstep(18.0, 65.0, length(worldXZ - uniforms.u_BoatPos));
+    let grain    = rVNoise(worldXZ * 1.4 + vec2f(uniforms.u_Time * 0.6, -uniforms.u_Time * 0.4));
+    let froth    = core * nearBoat * (0.6 + 0.4 * grain);
+    color = mix(color, vec3f(0.92, 0.96, 1.0), vec3f(froth * 0.03));
+  }
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
@@ -833,20 +940,25 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     // textureSampleLevel (explicit LOD) is valid in non-uniform control flow.
     let proximity = textureSampleLevel(u_shoreMap, u_shoreMapSampler,
                                        clamp(shoreUV, vec2f(0.001), vec2f(0.999)), 0.0).r;
-    // Layer 1: turquoise water column
-    let shallowF = smoothstep(0.05, 0.70, proximity);
-    color = mix(color, vec3f(0.10, 0.48, 0.50), vec3f(shallowF * 0.50));
-    // Layer 2: sandy/rocky seafloor through very shallow transparent water
-    let seafloorF = smoothstep(0.60, 0.88, proximity);
-    color = mix(color, vec3f(0.62, 0.55, 0.40), vec3f(seafloorF * 0.62));
-    // Layer 3: animated foam at the waterline
-    let foamF = smoothstep(0.75, 0.95, proximity);
+    // 1. Subtle turquoise water column on the broad shallows.
+    let shallowF = smoothstep(0.05, 0.65, proximity);
+    color = mix(color, vec3f(0.10, 0.48, 0.50), vec3f(shallowF * 0.25));
+    // 2. Seabed reveal — the see-through effect (depth-fade toward wet sand).
+    let reveal = smoothstep(0.40, 0.92, proximity);
+    color = mix(color, vec3f(0.40, 0.34, 0.25), vec3f(reveal * 0.88));
+    // 3. Caustics over the shallows AND the revealed sand.
+    let causMask = smoothstep(0.12, 0.95, proximity);
+    let caus = causticPattern(worldXZ * 0.18, uniforms.u_Time * 0.9)
+             + causticPattern(worldXZ * 0.33 + vec2f(7.3), uniforms.u_Time * 1.3) * 0.6;
+    color += vec3f(0.80, 1.0, 0.92) * (caus * causMask * 0.24);
+    // 4. Thin, translucent breaking foam at the very waterline only.
+    let foamF = smoothstep(0.90, 0.99, proximity);
     let foamAnim = clamp(
         0.44
       + 0.38 * sin(worldXZ.x * 0.55 + uniforms.u_Time * 1.3 + worldXZ.y * 0.25)
       + 0.28 * cos(worldXZ.y * 0.48 - uniforms.u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
-    color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.92));
+    color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.50));
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────
@@ -856,6 +968,12 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let sceneZ  = textureSampleLevel(u_sceneDepth, u_sceneDepthSampler, sceneUV, 0.0).r;
   let waterZ  = (uniforms.view * vec4f(input.v_worldPos, 1.0)).z;
   let dz      = sceneZ - waterZ;
+
+  // Depth-based shallow seabed reveal (same as GLSL path) — reliable "see the
+  // sand" effect from the seabed's depth, independent of the shore map.
+  let seabedReveal = 1.0 - smoothstep(0.5, 14.0, dz);
+  color = mix(color, vec3f(0.40, 0.34, 0.25), vec3f(seabedReveal * 0.85));
+
   let waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
   color = mix(color, vec3f(0.90, 0.95, 1.00), vec3f(waterline * 0.70));
 
@@ -950,6 +1068,18 @@ export class OceanService {
   private boatZ      = 0;
   private boatHdgR   = 0;
   private boatSpeed  = 0;
+
+  // ── Wake trail ──────────────────────────────────────────────────────────────
+  // Recent track of the ship as a short polyline (x, z, age, _) per point, newest
+  // appended at the end. The shader computes froth/turbulence from distance-to-
+  // path + age, so the wake follows the exact route sailed and fades behind.
+  private readonly WAKE_PATH_MAX  = 24;     // matches the shader array size
+  private readonly WAKE_PATH_STEP = 6;      // metres travelled between recorded points
+  private readonly WAKE_PATH_LIFE = 7.0;    // seconds before a point fully fades
+  private wakePath = new Float32Array(this.WAKE_PATH_MAX * 4);
+  private wakePathCount = 0;
+  private wakeLastX = 0;
+  private wakeLastZ = 0;
 
   // Small weather coupling: stormy seas slightly amplify wave depth.
   private waveDepthScale = 1.0;
@@ -1126,6 +1256,7 @@ export class OceanService {
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
           'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity',
+          'u_wakePath', 'u_wakeCount',
         ],
         samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth'],
         needAlphaBlending: false,
@@ -1164,6 +1295,8 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setArray4('u_wakePath', Array(this.WAKE_PATH_MAX * 4).fill(0));
+    mat.setFloat('u_wakeCount', 0);
     // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
     // until the scene's depth map exists — harmless because its colour values are
     // < the water's camera-space Z, so dz is negative and no foam is drawn.
@@ -1209,10 +1342,13 @@ export class OceanService {
         this.oceanMatFar.setVector3('u_cameraPosition', camV);
       }
 
+      this.updateWakePath(dt);
+
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
       const boatPos = new Vector2(this.boatX, this.boatZ);
       const boatSpeedAbs = Math.abs(this.boatSpeed) * 4.0;
+      const wakePathArr = this.wakePath as unknown as number[];
 
       const depthMap = this.sceneService.oceanDepthMap;
       for (const mat of allMats) {
@@ -1223,10 +1359,53 @@ export class OceanService {
         mat.setFloat('u_cloudCoverage', this._cloudCoverage);
         mat.setFloat('u_sunElevation',  this._sunElevation);
         mat.setFloat('u_rainIntensity', this._rainIntensity);
+        mat.setArray4('u_wakePath', wakePathArr);
+        mat.setFloat('u_wakeCount', this.wakePathCount);
         if (depthMap) mat.setTexture('u_sceneDepth', depthMap);
       }
 
     });
+  }
+
+  /**
+   * Maintains the ship's recent track polyline: ages points, drops faded/old ones
+   * from the front, and appends a new point each time the boat has travelled far
+   * enough while moving. The shader turns this into a path-following, fading wake.
+   */
+  private updateWakePath(dt: number): void {
+    const buf = this.wakePath;
+    const N = 4;
+
+    // Age every active point.
+    for (let i = 0; i < this.wakePathCount; i++) buf[i * N + 2] += dt;
+
+    // Drop fully-faded points from the front (they are the oldest).
+    let drop = 0;
+    while (drop < this.wakePathCount && buf[drop * N + 2] > this.WAKE_PATH_LIFE) drop++;
+    if (drop > 0) {
+      buf.copyWithin(0, drop * N, this.wakePathCount * N);
+      this.wakePathCount -= drop;
+    }
+
+    // Append a fresh point once the boat has moved far enough (and is moving).
+    const dx = this.boatX - this.wakeLastX;
+    const dz = this.boatZ - this.wakeLastZ;
+    const movedSq = dx * dx + dz * dz;
+    if (Math.abs(this.boatSpeed) > 0.05 && movedSq >= this.WAKE_PATH_STEP * this.WAKE_PATH_STEP) {
+      if (this.wakePathCount >= this.WAKE_PATH_MAX) {
+        // Make room by dropping the oldest.
+        buf.copyWithin(0, N, this.WAKE_PATH_MAX * N);
+        this.wakePathCount = this.WAKE_PATH_MAX - 1;
+      }
+      const idx = this.wakePathCount * N;
+      buf[idx]     = this.boatX;
+      buf[idx + 1] = this.boatZ;
+      buf[idx + 2] = 0;
+      buf[idx + 3] = 0;
+      this.wakePathCount++;
+      this.wakeLastX = this.boatX;
+      this.wakeLastZ = this.boatZ;
+    }
   }
 
   // ── Cloud reflection ──────────────────────────────────────────────────────

@@ -21,6 +21,10 @@ import { TerrainManifest, TerrainWorldBounds } from '../models';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { createSpsTreeArchetype } from '../utils/sps-tree-generator';
+import {
+  createRockProto, createGrassProto, createBeachGrassProto,
+  createDriftwoodProto, createDeadTreeProto,
+} from '../utils/scatter-generator';
 
 type TreePatch = {
   root: TransformNode;
@@ -28,6 +32,27 @@ type TreePatch = {
   centerZ: number;
   density: number;
   count: number;
+};
+
+// Camera-local ground-scatter pool (thin-instanced). Instances are placed on a
+// deterministic world grid but only within `radius` of the camera, and refilled
+// as the camera moves — so the world's 50 km span gets dense, visible cover near
+// the player without billions of instances.
+type ScatterType = {
+  proto: Mesh;
+  instances: InstancedMesh[];   // reused camera-local pool (grows to peak need)
+  poolMax: number;
+  cellSize: number;     // world grid spacing (m) — controls density
+  radius: number;       // how far from the camera to populate (m)
+  seed: number;
+  gate: (h: number, slope: number) => number;
+  scale: (r: number) => { sx: number; sy: number; sz: number };
+  embed: number;
+  tilt: number;
+  alignSlope: number;
+  lastX: number;
+  lastZ: number;
+  logged: boolean;
 };
 
 @Injectable({ providedIn: 'root' })
@@ -57,6 +82,9 @@ export class TerrainService {
   private treePatches: TreePatch[] = [];
   private treeInstances: InstancedMesh[] = [];
   private treeCullingObserver: any = null;
+  private scatterMeshes: Mesh[] = [];   // thin-instanced ground scatter prototypes
+  private scatterTypes: ScatterType[] = [];
+  private scatterObserver: any = null;
   private terrainShadowTexture: DynamicTexture | null = null;
   private terrainShadowObserver: any = null;
   private terrainShadowFrame = 0;
@@ -364,6 +392,11 @@ export class TerrainService {
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
     this.buildTreeFoliage(scene, manifest);
+    // Ground scatter (rocks/grass/driftwood/dead trees) is implemented but
+    // DISABLED pending a live debug: placement works (instances are created with
+    // valid positions, per console logs) but nothing renders via either thin
+    // instances or InstancedMesh — needs in-scene inspection to diagnose.
+    // To re-enable: this.buildGroundScatter(scene, manifest);
     this.setupTerrainShadowMask(scene);
     this.setupShoreMap(scene);
   }
@@ -610,9 +643,9 @@ export class TerrainService {
     }
 
     const patchSize = 2300;
-    const gridX = 220;
-    const gridZ = 220;
-    const hardCap = 12000;
+    const gridX = 300;
+    const gridZ = 300;
+    const hardCap = 30000;
     const patchMap = new Map<string, TreePatch>();
     let placed = 0;
 
@@ -626,7 +659,7 @@ export class TerrainService {
 
         const macro = this.hashNoise(u * 9.5 + 91.7, v * 9.5 + 34.1);
         const patchDensity = this.clamp01(0.1 + macro * 1.1);
-        const chance = wooded * (0.09 + patchDensity * 0.64);
+        const chance = wooded * (0.20 + patchDensity * 0.85);
         const accept = this.hashNoise(u * 63.7 + 7.3, v * 63.7 + 53.2);
         if (accept > chance) continue;
 
@@ -636,7 +669,7 @@ export class TerrainService {
         if (y <= 0.2) continue;
 
         const slope = this.sampleSlope(u, v);
-        if (slope > 0.34) continue;
+        if (slope > 0.6) continue;
 
         const archetypeIndex = this.pickTreeArchetype(u, v, patchDensity);
         const prototype = this.treePrototypeMeshes[archetypeIndex];
@@ -681,6 +714,148 @@ export class TerrainService {
     this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
     this.updateTreePatchVisibility();
     console.log(`[Terrain] Generated ${placed} SPS trees across ${this.treePatches.length} patches.`);
+  }
+
+  /**
+   * Ground scatter (grass, rocks, beach grass, driftwood, dead trees). Each prop
+   * type is one thin-instanced mesh whose instances are placed on a deterministic
+   * world grid but only within `radius` of the camera, and refilled as the camera
+   * moves. This gives dense, visible cover near the player across the 50 km world
+   * without astronomical instance counts. (Deterministic placement = no shimmer.)
+   */
+  private buildGroundScatter(scene: Scene, manifest: TerrainManifest): void {
+    const mk = (
+      proto: Mesh,
+      cfg: Omit<ScatterType, 'proto' | 'instances' | 'lastX' | 'lastZ' | 'logged'>,
+    ): ScatterType => {
+      proto.isVisible = false;        // source mesh — only its instances are drawn
+      proto.isPickable = false;
+      proto.position.set(0, -10000, 0);
+      this.sceneService.excludeFromGlow(proto);
+      this.scatterMeshes.push(proto);
+      return { proto, instances: [], lastX: NaN, lastZ: NaN, logged: false, ...cfg };
+    };
+
+    this.scatterTypes = [
+      mk(createGrassProto('scatter_grass', scene), {
+        poolMax: 6000, cellSize: 5, radius: 450, seed: 11,
+        gate: (h, s) => (h > 0.04 && h < 0.5 && s < 0.34)
+          ? Math.exp(-Math.pow((h - 0.22) / 0.18, 2)) * this.clamp01(1 - s * 2.2) : 0,
+        scale: r => { const k = 0.55 + r * 0.8; return { sx: k, sy: k * (0.8 + r * 0.6), sz: k }; },
+        embed: 0.0, tilt: 0.12, alignSlope: 0.0,
+      }),
+      mk(createRockProto('scatter_rock', scene), {
+        poolMax: 2500, cellSize: 13, radius: 700, seed: 23,
+        gate: (h, s) => (h > 0.02) ? this.clamp01(s * 1.3 + Math.max(0, h - 0.45) * 1.2) * 0.55 : 0,
+        scale: r => { const k = 0.5 + r * r * 2.4; return { sx: k * (0.8 + r * 0.5), sy: k * (0.55 + r * 0.4), sz: k * (0.8 + r * 0.5) }; },
+        embed: 0.35, tilt: 0.4, alignSlope: 0.3,
+      }),
+      mk(createBeachGrassProto('scatter_beachgrass', scene), {
+        poolMax: 3500, cellSize: 6, radius: 450, seed: 37,
+        gate: (h, s) => (h > 0.006 && h < 0.06 && s < 0.2) ? 0.85 : 0,
+        scale: r => { const k = 0.7 + r * 0.9; return { sx: k * 0.8, sy: k * (1.0 + r * 0.7), sz: k * 0.8 }; },
+        embed: 0.0, tilt: 0.14, alignSlope: 0.0,
+      }),
+      mk(createDriftwoodProto('scatter_driftwood', scene), {
+        poolMax: 1200, cellSize: 14, radius: 450, seed: 53,
+        gate: (h, s) => (h > 0.001 && h < 0.055 && s < 0.22) ? 0.5 : 0,
+        scale: r => { const k = 1.1 + r * 1.3; return { sx: k, sy: k, sz: k }; },
+        embed: 0.12, tilt: 0.3, alignSlope: 0.0,
+      }),
+      mk(createDeadTreeProto('scatter_deadtree', scene), {
+        poolMax: 1200, cellSize: 18, radius: 800, seed: 71,
+        gate: (h, s) => (h > 0.58 && h < 0.86 && s < 0.5) ? 0.3 : 0,
+        scale: r => { const k = 0.8 + r * 0.8; return { sx: k, sy: k, sz: k }; },
+        embed: 0.05, tilt: 0.18, alignSlope: 0.15,
+      }),
+    ];
+
+    this.scatterObserver = scene.onBeforeRenderObservable.add(() => this.updateScatter());
+    this.updateScatter();
+  }
+
+  /** Refill any scatter pool whose camera has moved more than half a cell. */
+  private updateScatter(): void {
+    const cam = this.sceneService.camera;
+    if (!cam || !this.manifest) return;
+    const camX = cam.position.x;
+    const camZ = cam.position.z;
+    for (const s of this.scatterTypes) {
+      const threshold = (s.cellSize * 0.5) ** 2;
+      const moved = (camX - s.lastX) ** 2 + (camZ - s.lastZ) ** 2;
+      if (Number.isFinite(s.lastX) && moved < threshold) continue;
+      s.lastX = camX;
+      s.lastZ = camZ;
+      this.repopulateScatter(s, camX, camZ);
+    }
+  }
+
+  /** Fill a scatter pool from the deterministic world grid within radius of the camera. */
+  private repopulateScatter(s: ScatterType, camX: number, camZ: number): void {
+    const bounds = this.manifest!.worldBounds;
+    const worldWidth = bounds.maxX - bounds.minX;
+    const worldDepth = bounds.maxZ - bounds.minZ;
+    const cs = s.cellSize;
+    const R = s.radius;
+    const R2 = R * R;
+    const ix0 = Math.floor((camX - R) / cs);
+    const ix1 = Math.floor((camX + R) / cs);
+    const iz0 = Math.floor((camZ - R) / cs);
+    const iz1 = Math.floor((camZ + R) / cs);
+    let count = 0;
+
+    for (let iz = iz0; iz <= iz1 && count < s.poolMax; iz++) {
+      for (let ix = ix0; ix <= ix1 && count < s.poolMax; ix++) {
+        const jx = this.hashNoise(ix * 0.137 + s.seed, iz * 0.131 + s.seed * 0.7);
+        const jz = this.hashNoise(ix * 0.149 + s.seed * 1.7, iz * 0.127 + s.seed);
+        const worldX = ix * cs + jx * cs;
+        const worldZ = iz * cs + jz * cs;
+        const dx = worldX - camX;
+        const dz = worldZ - camZ;
+        if (dx * dx + dz * dz > R2) continue;
+
+        const u = (worldX - bounds.minX) / worldWidth;
+        const v = (bounds.maxZ - worldZ) / worldDepth;
+        if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+
+        const h = this.sampleNormalizedHeight(u, v);
+        const slope = this.sampleSlope(u, v);
+        const weight = s.gate(h, slope);
+        if (weight <= 0) continue;
+        if (this.hashNoise(ix * 7.31 + s.seed, iz * 5.17 + s.seed * 2.1) > weight) continue;
+
+        const y = this.getElevation(worldX, worldZ);
+        if (y <= 0.05) continue;
+
+        const r = this.hashNoise(ix * 3.7 + s.seed, iz * 2.3 + s.seed * 3.3);
+        const sc = s.scale(r);
+        const yaw = this.hashNoise(ix * 1.1 + s.seed * 5, iz * 1.3 + s.seed) * Math.PI * 2;
+        const tiltAmt = s.tilt + slope * s.alignSlope * 2.0;
+        const tiltX = (this.hashNoise(ix * 0.7 + s.seed, iz * 0.9) - 0.5) * tiltAmt;
+        const tiltZ = (this.hashNoise(ix * 0.9 + s.seed * 7, iz * 0.7 + 9) - 0.5) * tiltAmt;
+
+        // Reuse an existing instance from the pool, or grow it on demand.
+        let inst = s.instances[count];
+        if (!inst) {
+          inst = s.proto.createInstance(`${s.proto.name}_${count}`);
+          inst.isPickable = false;
+          s.instances.push(inst);
+        }
+        inst.position.set(worldX, y - sc.sy * s.embed, worldZ);
+        inst.scaling.set(sc.sx, sc.sy, sc.sz);
+        inst.rotationQuaternion = Quaternion.RotationYawPitchRoll(yaw, tiltX, tiltZ);
+        inst.setEnabled(true);
+        count++;
+      }
+    }
+
+    // Disable any leftover instances from a previous (denser) refill.
+    for (let i = count; i < s.instances.length; i++) s.instances[i].setEnabled(false);
+
+    if (!s.logged) {
+      console.log(`[Terrain] Scatter '${s.proto.name}': ${count} instances within ${R}m of camera (${camX.toFixed(0)}, ${camZ.toFixed(0)}).`);
+      s.logged = true;
+    }
   }
 
   private updateTreePatchVisibility(): void {
@@ -817,15 +992,27 @@ export class TerrainService {
     const h = this.sampleNormalizedHeight(u, v);
     const slope = this.sampleSlope(u, v);
 
-    if (h < 0.05 || h > 0.62) return 0;
-    if (slope > 0.36) return 0;
+    // Trees from just above the waterline (sparse beach growth) up through rocky
+    // upper slopes, only excluded from the very peaks and near-vertical faces.
+    if (h < 0.012 || h > 0.85) return 0;
+    if (slope > 0.62) return 0;
 
-    const beachFade = this.clamp01((h - 0.05) / 0.08);
-    const alpineFade = this.clamp01((0.62 - h) / 0.2);
-    const slopeFade = this.clamp01((0.36 - slope) / 0.2);
-    const meadowBand = Math.exp(-Math.pow((h - 0.22) / 0.16, 2));
+    const beachFade  = this.clamp01((h - 0.012) / 0.05);   // sparse band right above the sand
+    const alpineFade = this.clamp01((0.85 - h) / 0.22);    // thin out toward the peaks
+    const slopeFade  = this.clamp01((0.62 - slope) / 0.34);
+    const meadowBand = Math.exp(-Math.pow((h - 0.25) / 0.24, 2));
 
-    return this.clamp01(beachFade * alpineFade * slopeFade * (0.35 + 0.65 * meadowBand));
+    // Moisture: forests cluster in wet zones (matching the shader's lush grass),
+    // thinning out on dry/exposed ground so the trees and the ground agree.
+    const bounds = this.manifest!.worldBounds;
+    const wx = bounds.minX + u * (bounds.maxX - bounds.minX);
+    const wz = bounds.maxZ - v * (bounds.maxZ - bounds.minZ);
+    const wetF = this.clamp01((this.terrainMoisture(wx, wz) - 0.25) / 0.53);
+    const moistFactor = 0.3 + 1.35 * wetF;
+
+    // Lush in the meadow band but with a solid floor so rocky/upper slopes still
+    // carry a real scattering of trees rather than going bare.
+    return this.clamp01(beachFade * alpineFade * slopeFade * (0.5 + 0.5 * meadowBand) * moistFactor);
   }
 
   private disposeFoliage(): void {
@@ -848,6 +1035,17 @@ export class TerrainService {
       prototype.dispose();
     }
     this.treePrototypeMeshes = [];
+
+    if (this.scatterObserver && this.sceneService.scene) {
+      this.sceneService.scene.onBeforeRenderObservable.remove(this.scatterObserver);
+      this.scatterObserver = null;
+    }
+    for (const mesh of this.scatterMeshes) {
+      mesh.material?.dispose();
+      mesh.dispose();
+    }
+    this.scatterMeshes = [];
+    this.scatterTypes = [];
   }
 
   private buildTerrainMaterial(scene: any, manifest: TerrainManifest): CustomMaterial {
@@ -954,6 +1152,7 @@ export class TerrainService {
     material.AddUniform('uSandNor',     'sampler2D', null);
     material.AddUniform('uGrassNor',    'sampler2D', null);
     material.AddUniform('uRockNor',     'sampler2D', null);
+    material.AddUniform('uHazeColor',   'vec3',      null);   // aerial-perspective tint (= sky/fog colour)
 
     // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
     const peakH = manifest.targetPeakElevation ?? 920;
@@ -1009,7 +1208,32 @@ export class TerrainService {
       float wGrass  = clamp((h - 0.035) / 0.28, 0.0, 1.0) * clamp(1.0 - slope * 0.95, 0.0, 1.0);
       float wGravel = clamp((h - 0.20)  / 0.52, 0.0, 1.0) * clamp(0.25 + slope * 1.5,  0.0, 1.0);
       float wRock   = clamp((h - 0.34)  / 0.54, 0.0, 1.0) * clamp(0.22 + slope * 1.7,  0.0, 1.0);
-      float wSnow   = clamp((h - 0.68)  / 0.22, 0.0, 1.0) * clamp(1.0 - slope * 0.55,  0.0, 1.0);
+      // Snow: wavy noise-jittered snowline (not a flat contour), bare on steep
+      // faces (snow slides off → rock pokes through), and less on warm/sun-facing
+      // aspects. warmDir is FIXED (not the live sun) so snow cover is stable
+      // through the day rather than melting/reforming as the sun moves.
+      float snowJitter = sin(vPositionW.x * 0.0040 + vPositionW.z * 0.0031) * 0.040
+                       + sin(vPositionW.x * 0.0017 - vPositionW.z * 0.0023) * 0.050;
+      float snowElev   = clamp((h - (0.66 + snowJitter)) / 0.16, 0.0, 1.0);
+      float snowSlope  = clamp(1.0 - slope * 2.2, 0.0, 1.0);
+      vec3  warmDir    = normalize(vec3(0.55, 0.35, 0.35));
+      float snowAspect = 1.0 - clamp(dot(nW, warmDir), 0.0, 1.0) * 0.55;
+      float wSnow   = snowElev * snowSlope * snowAspect;
+
+      // ── 4b. Moisture: low-frequency field (matches CPU terrainMoisture) so wet
+      // regions read lush (grass) and dry/exposed regions read barren (gravel/
+      // rock). Large ~6–10 km features mean whole islands lean wet or dry, with a
+      // smaller octave adding within-island variation.
+      float moist = 0.5
+        + 0.34 * sin(vPositionW.x * 0.00080 + 1.3)
+        + 0.24 * sin(vPositionW.z * 0.00095 - 0.7)
+        + 0.18 * sin((vPositionW.x - vPositionW.z) * 0.00060 + 2.1)
+        + 0.12 * sin((vPositionW.x * 0.7 + vPositionW.z * 1.1) * 0.0022 - 1.1);
+      float wetF = smoothstep(0.25, 0.78, clamp(moist, 0.0, 1.0));
+      wGrass  *= 0.35 + 1.30 * wetF;   // lush when wet, sparse when dry
+      wGravel *= 1.45 - 0.75 * wetF;   // bare scree dominates dry ground
+      wRock   *= 1.25 - 0.40 * wetF;
+
       float wTotal  = max(0.0001, wSand + wGrass + wGravel + wRock + wSnow);
       wSand   /= wTotal;  wGrass  /= wTotal;  wGravel /= wTotal;
       wRock   /= wTotal;  wSnow   /= wTotal;
@@ -1104,6 +1328,37 @@ export class TerrainService {
 
       baseColor.rgb = clamp(splatC * macroMod, 0.0, 1.0);
 
+      // ── 8b. Sedimentary strata on steep rock faces ────────────────────────
+      // Horizontal banding by elevation (warped so it isn't ruler-straight),
+      // gated to steep + rocky surfaces so beaches/meadows stay clean. Reads as
+      // layered rock strata, giving cliffs structure instead of flat colour.
+      float strataGate = smoothstep(0.18, 0.45, slope) * clamp(wRock + wGravel, 0.0, 1.0);
+      if (strataGate > 0.001) {
+        float warp  = sin(vPositionW.x * 0.030 + vPositionW.z * 0.021) * 1.6
+                    + sin(vPositionW.x * 0.011 - vPositionW.z * 0.014) * 2.4;
+        float band1 = sin(vPositionW.y * 0.55 + warp);
+        float band2 = sin(vPositionW.y * 1.70 + warp * 0.6);   // finer sub-layers
+        float strata = (band1 * 0.7 + band2 * 0.3) * 0.5 + 0.5; // 0..1
+        // Subtle banding (~±12%) so it reads as rock character on moderate slopes
+        // rather than hard contour lines.
+        baseColor.rgb *= mix(1.0, 0.88 + 0.24 * strata, strataGate);
+      }
+
+      // ── 8c. Wet sand / tide line ──────────────────────────────────────────
+      // Sand near the waterline is damp: darker + slightly desaturated (the main
+      // wet-sand cue), with a faint fresnel sheen toward the sky colour to fake
+      // the wet gloss. Strongest at the water, fading up the beach over ~3.5 m;
+      // the ocean's shoreline foam sits on top of this band.
+      float wetBand = (1.0 - smoothstep(0.0, 3.5, vPositionW.y)) * wSand;
+      if (wetBand > 0.001) {
+        float wetLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
+        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.62;  // damp & darker
+        baseColor.rgb = mix(baseColor.rgb, wetCol, wetBand);
+        vec3  Vw   = normalize(vEyePosition.xyz - vPositionW);
+        float fres = pow(1.0 - clamp(dot(Vw, nW), 0.0, 1.0), 4.0);
+        baseColor.rgb += uHazeColor * (fres * wetBand * 0.35);             // wet sheen
+      }
+
       // ── 9. Tiled normal-map perturbation (modifies normalW for lighting) ──
       // Sample grass + rock normal maps with the same triplanar UVs and warp
       // used for diffuse.  Blend by biome weight, then add to the existing
@@ -1159,10 +1414,42 @@ export class TerrainService {
           rnWorld * (wGravel + wRock + wSnow)
       );
 
-      // Tiled normal maps zeroed while we verify that no second stripe source
-      // remains after the neutral bumpTexture fix.  Restore once confirmed clean.
-      float normStrength = 0.0;
+      // Tiled normal detail, scaled UP on steep slopes so cliffs/rock faces read
+      // rugged while gentle ground stays smooth. (The old "moving stripe" bug was
+      // shadow self-shadowing — fixed by removing the terrain as a shadow caster —
+      // not these normals, so they're safe to restore.)
+      float normStrength = mix(0.28, 0.66, smoothstep(0.12, 0.45, slope));
       normalW = normalize(normalW + tileNorm * normStrength);
+
+      // ── 9b. Fine micro-detail normal (near-field) ─────────────────────────
+      // The terrain mesh is too coarse for real sub-metre geometry, so we fake
+      // it: a high-frequency ground-normal sample (XZ-planar, reused as a generic
+      // detail layer) perturbs normalW everywhere at low strength, so close-up
+      // ground reads as subtly bumpy instead of glassy-smooth. Faded out with
+      // distance to avoid shimmer/aliasing and keep the cost near the camera.
+      float detFade = 1.0 - smoothstep(70.0, 380.0, length(vPositionW - vEyePosition.xyz));
+      if (detFade > 0.001) {
+        vec3 detN1 = texture2D(uGrassNor, vPositionW.xz * 0.60).rgb * 2.0 - 1.0;
+        vec3 detN2 = texture2D(uRockNor,  vPositionW.xz * 1.30).rgb * 2.0 - 1.0;
+        vec3 detWorld = normalize(
+            vec3(detN1.r, detN1.b, detN1.g) * 0.6 +
+            vec3(detN2.r, detN2.b, detN2.g) * 0.4
+        );
+        normalW = normalize(normalW + detWorld * (0.24 * detFade));
+      }
+    `);
+
+    // ── Aerial perspective (distance haze) ────────────────────────────────────
+    // Applied AFTER lighting (Fragment_Before_FragColor) so the haze is a uniform
+    // atmospheric tint rather than something the terrain's own shading/shadows
+    // modulate. Far terrain fades toward the sky/fog colour, giving depth and
+    // scale; near terrain is untouched. Exponential ramp tuned for the few-hundred-
+    // metre → few-kilometre range we actually view at (the scene's global EXP2 fog
+    // only bites at ~20 km, far too distant to shape the mountains).
+    material.Fragment_Before_FragColor(`
+      float hazeDist = length(vPositionW - vEyePosition.xyz);
+      float hazeF = clamp((1.0 - exp(-hazeDist * 0.00034)) * 1.08, 0.0, 0.90);
+      color.rgb = mix(color.rgb, uHazeColor, hazeF);
     `);
 
     // ── Bind uniforms every draw call ─────────────────────────────────────────
@@ -1170,6 +1457,8 @@ export class TerrainService {
       const fx = material.getEffect();
       if (!fx) return;
       fx.setFloat('uPeakH', peakH);
+      // Haze tint tracks the current sky/fog colour (day/dusk/night/storm aware).
+      fx.setColor3('uHazeColor', scene.fogColor);
       fx.setTexture('uSandDiff',   sandTex);
       fx.setTexture('uGrassDiff',  grassTex);
       fx.setTexture('uGrass2Diff', grass2Tex);
@@ -1636,6 +1925,18 @@ export class TerrainService {
   private hashNoise(x: number, y: number): number {
     const value = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
     return value - Math.floor(value);
+  }
+
+  /** Low-frequency moisture field in [0,1] — MUST match the GLSL `moist` in the
+   *  terrain material so vegetation (trees) clusters where the shader paints lush
+   *  grass. Wet valleys → 1, dry exposed ground → 0. */
+  private terrainMoisture(wx: number, wz: number): number {
+    const m = 0.5
+      + 0.34 * Math.sin(wx * 0.00080 + 1.3)
+      + 0.24 * Math.sin(wz * 0.00095 - 0.7)
+      + 0.18 * Math.sin((wx - wz) * 0.00060 + 2.1)
+      + 0.12 * Math.sin((wx * 0.7 + wz * 1.1) * 0.0022 - 1.1);
+    return this.clamp01(m);
   }
 
   private clamp01(value: number): number {

@@ -723,9 +723,17 @@ export class VesselService {
     ));
     this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
 
-    // Cross-wave broaching bias: only active when player is not steering.
+    // Cross-wave broaching bias + slow sea-state wander: only active when the
+    // player is not steering. buoy.steeringBias is the fast wave-to-wave jostle
+    // (zero-mean, oscillates). On top we add a slow, low-frequency wander so the
+    // confused sea gradually nudges the boat off course over ~tens of seconds,
+    // requiring the occasional correction. Both scale with sea roughness, so calm
+    // water barely moves the bow while rough seas need more frequent attention.
     if (!this.keys.left && !this.keys.right) {
-      this.heading = ((this.heading + buoy.steeringBias * dt) + 360) % 360;
+      const roughT = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4.0);
+      const wander = Math.sin(t * 0.08 + 1.3) + 0.5 * Math.sin(t * 0.19 + 4.1);
+      const waveYaw = wander * roughT * 0.6;   // °/s slow drift
+      this.heading = ((this.heading + (buoy.steeringBias + waveYaw) * dt) + 360) % 360;
     }
 
     // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water.

@@ -145,6 +145,12 @@ export class VesselService {
 
   private readonly WAKE_Y = 0.30;          // at the waterline — slightly above wave trough
 
+  // Particle-sprite wake disabled: the additive white foam sprites read as flat
+  // billboards on the water and looked bad. The wake is now rendered entirely in
+  // the ocean shader (displacement trench + foam trail driven by setBoatTransform).
+  // Set true to bring the sprites back.
+  private readonly WAKE_PARTICLES_ENABLED = false;
+
   private wakeTex!:   DynamicTexture;
   private bowSpray!:  ParticleSystem;      // bow-wave V pushing water sideways
   private sternFoam!: ParticleSystem;      // long-life foam forming the wake V-trail
@@ -1115,10 +1121,11 @@ export class VesselService {
 
     // ── Emit rates — scale with speed, cut off below threshold ───────────
 
-    this.bowSpray.emitRate  = Math.round(sf * 100);
-    this.sternFoam.emitRate = Math.round(sf * 70);
-    this.portFroth.emitRate = Math.round(sf * 55);
-    this.stbdFroth.emitRate = Math.round(sf * 55);
+    const wf = this.WAKE_PARTICLES_ENABLED ? sf : 0;
+    this.bowSpray.emitRate  = Math.round(wf * 100);
+    this.sternFoam.emitRate = Math.round(wf * 70);
+    this.portFroth.emitRate = Math.round(wf * 55);
+    this.stbdFroth.emitRate = Math.round(wf * 55);
 
     // ── Size scales modestly with speed ───────────────────────────────────
     const sizeBoost = sf * 0.6;

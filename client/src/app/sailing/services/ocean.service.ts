@@ -120,7 +120,7 @@ void main() {
   if (fade > 0.001) {
     vec2 wavePos = vec2(wx, wz) * u_WaveFreq;
     float h = (getwaves(wavePos) - 0.5) * u_WaveDepth;
-    h += wakeDisplacement(vec2(wx, wz));
+    h += wakeDisplacement(vec2(wx, wz)) * 1.9;
     pos.y += h * fade;
   }
 
@@ -234,7 +234,7 @@ float wakeMask(vec2 worldPos) {
 }
 
 float waveHeightWithWake(vec2 worldPos, float depth) {
-  return (getwaves(worldPos * u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos);
+  return (getwaves(worldPos * u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9;
 }
 
 vec3 normal(vec2 worldPos, float e, float depth) {
@@ -342,7 +342,7 @@ void main() {
   vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
   scattering *= (1.0 - terrainShadow * 0.75);
   vec3 color = fresnel * reflection + scattering;
-  float wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
+  float wakeFoam = smoothstep(0.10, 0.78, wakeT) * 0.68;
   color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
@@ -510,7 +510,7 @@ fn main(input: VertexInputs) -> FragmentInputs {
   if (fade > 0.001) {
     let wavePos = vec2f(wx, wz) * uniforms.u_WaveFreq;
     var h = (getwaves(wavePos) - 0.5) * uniforms.u_WaveDepth;
-    h += wakeDisplacement(vec2f(wx, wz));
+    h += wakeDisplacement(vec2f(wx, wz)) * 1.9;
     pos.y += h * fade;
   }
 
@@ -624,7 +624,7 @@ fn wakeMask(worldPos: vec2f) -> f32 {
 }
 
 fn waveHeightWithWake(worldPos: vec2f, depth: f32) -> f32 {
-  return (getwaves(worldPos * uniforms.u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos);
+  return (getwaves(worldPos * uniforms.u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9;
 }
 
 fn normal(worldPos: vec2f, e: f32, depth: f32) -> vec3f {
@@ -731,7 +731,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let wakeT = max(input.v_wakeMask, wakeMask(worldXZ));
   let scattering = vec3f(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07) * (1.0 - terrainShadow * 0.75);
   var color = fresnel * reflection + scattering;
-  let wakeFoam = smoothstep(0.22, 0.92, wakeT) * 0.40;
+  let wakeFoam = smoothstep(0.10, 0.78, wakeT) * 0.68;
   color = mix(color, vec3f(0.86, 0.92, 0.98), vec3f(wakeFoam));
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
@@ -1184,7 +1184,11 @@ export class OceanService {
   updateWeather(wind: Wind, sea: SeaConditions): void {
     const chop = Math.max(0, Math.min(1, sea.choppiness));
     const windT = Math.max(0, Math.min(1, wind.speed / 24));
-    this.waveDepthScale = 0.95 + chop * 0.30 + windT * 0.22;
+    // Wave amplitude scales strongly with sea state so storms feel genuinely
+    // rougher than calm water: ~0.6 (glassy) → ~2.3 (full storm), a ~3.8× range
+    // (was 0.95→1.47, barely perceptible). Buoyancy follows automatically because
+    // getWaveHeightAt / getVisualHeightAt use the same waveDepthScale.
+    this.waveDepthScale = 0.6 + chop * 0.9 + windT * 0.8;
 
     if (this.oceanMatNear) this.oceanMatNear.setFloat('u_WaveDepth', this.WAVE_DEPTH_NEAR * this.waveDepthScale);
     if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * this.waveDepthScale);

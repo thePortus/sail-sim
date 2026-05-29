@@ -360,6 +360,9 @@ export class TerrainService {
     mesh.receiveShadows = true;
 
     this.terrainMesh = mesh;
+    // Let the scene occlude the sun against our heightfield (stops the sun disk
+    // shining through mountains at dawn/dusk).
+    this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
     this.buildTreeFoliage(scene, manifest);
     this.setupTerrainShadowMask(scene);
     this.setupShoreMap(scene);

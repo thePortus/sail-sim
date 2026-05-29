@@ -2,11 +2,10 @@
 
 # General or Current TODO Items
 
-* Heighten normal/bump mapping on sand, rocks, grass... effect is muted
+* Heighten normal/bump mapping on sand, rocks, grass... effect is mutedgit a
 * Remove silly wake sprite
 * More trees
 * Plan to improve quality of ground texture, more realistic
-* Fix sun behind island
 * Improve rain
 * Fix sky/cloud seam at 0/0
 * Smoothed multiplayer movement

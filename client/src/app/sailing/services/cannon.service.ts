@@ -9,6 +9,7 @@ import { OceanService }       from './ocean.service';
 import { VesselService }      from './vessel.service';
 import { TerrainService }     from './terrain.service';
 import { MultiplayerService } from './multiplayer.service';
+import { SfxService }         from './sfx.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ export class CannonService {
   private vesselService      = inject(VesselService);
   private terrainService     = inject(TerrainService);
   private multiplayerService = inject(MultiplayerService);
+  private sfx                = inject(SfxService);
   private zone               = inject(NgZone);
 
   // ── Public signals (consumed by HUD / GameComponent) ─────────────────────
@@ -126,8 +128,9 @@ export class CannonService {
   private mouseMoveFn!: (e: MouseEvent) => void;
   private ctxMenuFn!:   (e: Event) => void;
 
-  // Web Audio context for sound effects
+  // Web Audio context for sound effects, routed through a shared SFX master gain.
   private sfxCtx: AudioContext | null = null;
+  private sfxMaster: GainNode | null = null;
 
   // Shared soft-blob texture for all particle systems
   private blobTex!: DynamicTexture;
@@ -138,6 +141,7 @@ export class CannonService {
     this.scene  = this.sceneService.scene;
     this.canvas = this.scene.getEngine().getRenderingCanvas() as HTMLCanvasElement;
     this.sfxCtx = new AudioContext();
+    this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
 
     this.buildParticleTex();
     this.buildReticles();
@@ -188,6 +192,8 @@ export class CannonService {
       this.smokePortPS, this.smokeStbdPS, this.remoteSmokePS,
       this.splashPS, this.dirtPS,
     ]) { ps?.stop(); ps?.dispose(); }
+    this.sfx.releaseMaster(this.sfxMaster);
+    this.sfxMaster = null;
     this.sfxCtx?.close().catch(() => {});
     this.sfxCtx = null;
   }
@@ -797,7 +803,7 @@ export class CannonService {
     const crackHpf = ctx.createBiquadFilter(); crackHpf.type = 'highpass'; crackHpf.frequency.value = 1200;
     const crackGain = ctx.createGain();
     crackGain.gain.setValueAtTime(1.4 * vol, t); crackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
-    crack.connect(crackHpf); crackHpf.connect(crackGain); crackGain.connect(ctx.destination);
+    crack.connect(crackHpf); crackHpf.connect(crackGain); crackGain.connect(this.sfxMaster ?? ctx.destination);
     crack.start(t); crack.stop(t + 0.13);
 
     const boomBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 1.2), ctx.sampleRate);
@@ -808,14 +814,14 @@ export class CannonService {
     boomLpf.frequency.setValueAtTime(600, t); boomLpf.frequency.exponentialRampToValueAtTime(55, t + 0.5);
     const boomGain = ctx.createGain();
     boomGain.gain.setValueAtTime(1.1 * vol, t); boomGain.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
-    boom.connect(boomLpf); boomLpf.connect(boomGain); boomGain.connect(ctx.destination);
+    boom.connect(boomLpf); boomLpf.connect(boomGain); boomGain.connect(this.sfxMaster ?? ctx.destination);
     boom.start(t); boom.stop(t + 1.2);
 
     const osc = ctx.createOscillator(); osc.type = 'sine';
     osc.frequency.setValueAtTime(72, t); osc.frequency.exponentialRampToValueAtTime(22, t + 0.55);
     const oscGain = ctx.createGain();
     oscGain.gain.setValueAtTime(0.70 * vol, t); oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
-    osc.connect(oscGain); oscGain.connect(ctx.destination);
+    osc.connect(oscGain); oscGain.connect(this.sfxMaster ?? ctx.destination);
     osc.start(t); osc.stop(t + 0.56);
   }
 
@@ -833,7 +839,7 @@ export class CannonService {
     bpf.frequency.setValueAtTime(900, t); bpf.frequency.exponentialRampToValueAtTime(300, t + 0.4); bpf.Q.value = 0.6;
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0.85, t); gain.gain.exponentialRampToValueAtTime(0.001, t + 0.50);
-    src.connect(hpf); hpf.connect(bpf); bpf.connect(gain); gain.connect(ctx.destination);
+    src.connect(hpf); hpf.connect(bpf); bpf.connect(gain); gain.connect(this.sfxMaster ?? ctx.destination);
     src.start(t); src.stop(t + 0.56);
   }
 
@@ -850,14 +856,14 @@ export class CannonService {
     lpf.frequency.setValueAtTime(3500, t); lpf.frequency.exponentialRampToValueAtTime(250, t + 0.25);
     const noiseGain = ctx.createGain();
     noiseGain.gain.setValueAtTime(1.0, t); noiseGain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
-    src.connect(lpf); lpf.connect(noiseGain); noiseGain.connect(ctx.destination);
+    src.connect(lpf); lpf.connect(noiseGain); noiseGain.connect(this.sfxMaster ?? ctx.destination);
     src.start(t); src.stop(t + 0.30);
 
     const osc = ctx.createOscillator(); osc.type = 'sine';
     osc.frequency.setValueAtTime(100, t); osc.frequency.exponentialRampToValueAtTime(28, t + 0.22);
     const thudGain = ctx.createGain();
     thudGain.gain.setValueAtTime(0.65, t); thudGain.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
-    osc.connect(thudGain); thudGain.connect(ctx.destination);
+    osc.connect(thudGain); thudGain.connect(this.sfxMaster ?? ctx.destination);
     osc.start(t); osc.stop(t + 0.25);
   }
 

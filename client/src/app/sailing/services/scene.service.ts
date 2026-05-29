@@ -1,11 +1,11 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  Engine, WebGPUEngine, Scene, Color3, Color4, Vector3, Ray,
+  Engine, WebGPUEngine, Scene, Color3, Color4, Vector3,
   HemisphericLight, DirectionalLight,
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, Material, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
-  DepthRenderer, RenderTargetTexture, Texture, Constants,
+  DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
@@ -27,6 +27,7 @@ export class SceneService {
   private moonLight!: DirectionalLight;
   private ambient!:   HemisphericLight;
   private sunMesh!:   Mesh;
+  private moonMesh!:  Mesh;
   private glowLayer!: GlowLayer;
 
   /** Exclude a mesh from the glow/emissive composite pass (WebGPU-safe). */
@@ -54,6 +55,12 @@ export class SceneService {
   private pipeline!: DefaultRenderingPipeline;
   private _aaQuality = 1; // 0=Off 1=FXAA 2=MSAA2x 3=MSAA4x
 
+  // Lightning flash: additive boost to ambient light, driven by CloudService.
+  // 0 = no flash; ~1 = full strike. Applied on top of the time-of-day ambient.
+  private _lightningFlash = 0;
+  /** Set each frame by CloudService to flash the scene during storms (0–1+). */
+  setLightningFlash(amount: number): void { this._lightningFlash = Math.max(0, amount); }
+
   // Dedicated camera-space-Z depth map of all opaque geometry EXCEPT the ocean.
   // The ocean shader samples this to find where the hull / shore sits just behind
   // the water surface and lays a soft foam wash there, hiding the hard aliased
@@ -74,6 +81,20 @@ export class SceneService {
   private sunOcclusionT = 1.0;
   private sunOcclusionFrame = 0;
   private lastSunOccluded = false;
+
+  // Moon occlusion (same scheme as the sun, separate state).
+  private moonOcclusionT = 1.0;
+  private moonOcclusionFrame = 0;
+  private lastMoonOccluded = false;
+
+  // Terrain height query, injected by TerrainService once its heightfield is
+  // ready (avoids a DI cycle). Returns terrain elevation in metres at a world
+  // XZ. Used to ray-march sun occlusion against the mountains.
+  private terrainHeightSampler: ((x: number, z: number) => number) | null = null;
+  /** Called by TerrainService so the sun can be occluded by the heightfield. */
+  setTerrainHeightSampler(fn: (x: number, z: number) => number): void {
+    this.terrainHeightSampler = fn;
+  }
 
   // ── Post-processing setter cache ────────────────────────────────────────────
   // BabylonJS ImageProcessingConfiguration setters have NO equality guard:
@@ -245,6 +266,69 @@ export class SceneService {
     this.sunMesh.isPickable = false;
     this.sunMesh.renderingGroupId = 2;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
+
+    // Moon — a rocky, self-glowing sphere built from a procedural crater texture.
+    // disableLighting + emissiveTexture means it shows its surface fully lit (a
+    // glowing full moon) regardless of scene lighting; the glow layer adds a halo.
+    const moonMat = new StandardMaterial('moonMat', this.scene);
+    moonMat.disableLighting = true;
+    moonMat.emissiveTexture = this.buildMoonTexture();
+    moonMat.emissiveColor   = new Color3(0.82, 0.88, 1.0);   // cool moonlight tint
+    moonMat.diffuseColor    = Color3.Black();
+    moonMat.specularColor   = Color3.Black();
+
+    this.moonMesh = MeshBuilder.CreateSphere('moonDisk', { diameter: 1900, segments: 32 }, this.scene);
+    this.moonMesh.material = moonMat;
+    this.moonMesh.isPickable = false;
+    this.moonMesh.renderingGroupId = 2;
+    this.moonMesh.visibility = 0;
+    this.glowLayer.addIncludedOnlyMesh(this.moonMesh);
+  }
+
+  /**
+   * Procedural rocky moon: a grey surface with darker "maria" patches and many
+   * craters (dark floor + bright rim), built once into a DynamicTexture. Used as
+   * the moon's emissive map so no external image asset is needed.
+   */
+  private buildMoonTexture(): DynamicTexture {
+    const S = 512;
+    const tex = new DynamicTexture('moonTex', { width: S, height: S }, this.scene, true);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+
+    // Deterministic RNG so the moon looks the same every run.
+    let s = 0x9e3779b1 >>> 0;
+    const rnd = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 0xffffffff; };
+
+    // Base regolith grey.
+    ctx.fillStyle = '#b6bac2';
+    ctx.fillRect(0, 0, S, S);
+
+    // Maria — large darker basaltic plains.
+    for (let i = 0; i < 8; i++) {
+      const x = rnd() * S, y = rnd() * S, r = 50 + rnd() * 130;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, 'rgba(118,122,132,0.55)');
+      g.addColorStop(1, 'rgba(118,122,132,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Craters — dark bowl with a brighter rim.
+    for (let i = 0; i < 110; i++) {
+      const x = rnd() * S, y = rnd() * S, r = 2 + rnd() * rnd() * 24;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0.0, 'rgba(86,88,96,0.6)');
+      g.addColorStop(0.7, 'rgba(140,144,152,0.15)');
+      g.addColorStop(1.0, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(226,229,236,0.45)';
+      ctx.lineWidth = Math.max(0.5, r * 0.12);
+      ctx.beginPath(); ctx.arc(x, y, r * 0.95, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    tex.update();
+    return tex;
   }
 
   // ── Camera ───────────────────────────────────────────────────────────────────
@@ -461,10 +545,24 @@ export class SceneService {
         Math.min(1, 0.28 + above * 0.72) * occT,
         Math.min(1, 0.10 + above * 0.82) * occT,
       );
-      // Clamp solar glow below the horizon so terrain cannot be brightened by bloom/glow at night.
-      this.glowLayer.intensity = h > 0.02
+      // ── Moon: rocky glowing sphere at the anti-solar point ───────────────────
+      // Fades in as the sun drops below the horizon, sits opposite the sun, spins
+      // slowly, and is occluded by mountains just like the sun.
+      const moonDir = dir.scale(-1);
+      const moonBlocked = this.isMoonOccluded(moonDir);
+      this.moonOcclusionT += ((moonBlocked ? 0.0 : 1.0) - this.moonOcclusionT) * 0.50;
+
+      const moonVis = Math.max(0, Math.min(1, (0.04 - h) / 0.16)) * this.moonOcclusionT;
+      this.moonMesh.position.copyFrom(this.camera.position.add(moonDir.scale(62000)));
+      this.moonMesh.visibility = moonVis;
+      this.moonMesh.rotation.y += dt * 0.012;
+
+      // Glow layer includes ONLY the sun & moon: solar halo by day, lunar halo by
+      // night. Clamped so neither bleeds at the wrong time of day.
+      const sunGlow = h > 0.02
         ? Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT)
         : 0;
+      this.glowLayer.intensity = Math.max(sunGlow, moonVis * 0.55);
     }
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
@@ -550,9 +648,10 @@ export class SceneService {
     // Golden hour: warm amber fill; daytime: neutral blue-white; night: dim blue.
     // Night ambient raised from 0.14 → 0.28 so mountains are visible by starlight/
     // moonlight and don't render as featureless black silhouettes.
-    this.ambient.intensity = isNight
+    this.ambient.intensity = (isNight
       ? 0.28 + cloud * 0.05
-      : 0.10 + above * 0.38 + cloud * 0.06;
+      : 0.10 + above * 0.38 + cloud * 0.06)
+      + this._lightningFlash * 2.6;   // lightning flash brightens the whole scene
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight
       ? new Color3(0.30, 0.38, 0.52)   // brighter blue — was (0.20, 0.25, 0.35)
@@ -582,40 +681,69 @@ export class SceneService {
       fog = new Color3(0.01, 0.02, 0.07);                                    // night
     }
 
-    fog = Color3.Lerp(fog, new Color3(0.60, 0.65, 0.72), cloud * 0.45);
+    // Overcast/storm pulls fog toward a flat grey — but that grey must follow the
+    // light level, otherwise a night storm blends toward bright daytime grey and
+    // makes distant islands glow unnaturally. Dark storm-grey at night → bright
+    // overcast by day.
+    const fogDayLight = Math.max(0, Math.min(1, (h + 0.05) / 0.35));
+    // Daytime overcast: bright grey under light cloud, but a thick storm (cloud
+    // near 1) should read DARK and moody — otherwise the fog washes distant
+    // islands brighter than the storm sky behind them.
+    const stormDark = Math.max(0, (cloud - 0.6) / 0.4);   // 0 until cloud>0.6, →1 at full storm
+    const overcastDay = Color3.Lerp(
+      new Color3(0.60, 0.65, 0.72),   // light overcast: bright grey
+      new Color3(0.30, 0.34, 0.40),   // full storm: dark moody grey
+      stormDark,
+    );
+    const overcast = Color3.Lerp(
+      new Color3(0.05, 0.06, 0.09),   // night storm: dark grey, no glow
+      overcastDay,
+      fogDayLight,
+    );
+    fog = Color3.Lerp(fog, overcast, cloud * 0.45);
 
     this.scene.fogColor   = fog;
     this.scene.clearColor = new Color4(fog.r * 0.20, fog.g * 0.20, fog.b * 0.30, 1);
   }
 
   /**
-   * CPU ray-cast: is any island terrain mesh blocking the camera→sun ray?
+   * Ray-marches the terrain heightfield from the camera along a unit direction:
+   * returns true if any terrain surface rises above the ray (i.e. a mountain
+   * blocks the line of sight). Cheap — array lookups with a growing step — and
+   * used to occlude both the sun and the moon. NOT throttled; callers throttle.
    */
-  private isSunOccluded(sunDir: Vector3): boolean {
-    if (!this.camera) return false;
+  private marchTerrainBlock(dir: Vector3): boolean {
+    if (!this.camera || !this.terrainHeightSampler) return false;
+    if (dir.y < 0.02) return false;                 // pointing at/below horizon → nothing above
 
-    if (sunDir.y < 0.02) {
-      this.lastSunOccluded = false;
-      return false;
+    const cam = this.camera.position;
+    const MAX_DIST   = 30_000;   // how far to look for blocking terrain
+    const MAX_HEIGHT = 1_500;    // once the ray clears the tallest peaks, it's unblocked
+    const sample = this.terrainHeightSampler;
+
+    // Step size grows with distance — fine near the camera, coarse far away.
+    for (let d = 120; d < MAX_DIST; d += 40 + d * 0.02) {
+      const rayY = cam.y + dir.y * d;
+      if (rayY > MAX_HEIGHT) break;                 // above all terrain → clear
+      if (sample(cam.x + dir.x * d, cam.z + dir.z * d) > rayY) return true;
     }
+    return false;
+  }
 
+  /** Throttled (every 8th frame) sun occlusion — stops the sun shining through mountains. */
+  private isSunOccluded(sunDir: Vector3): boolean {
     this.sunOcclusionFrame = (this.sunOcclusionFrame + 1) % 8;
     if (this.sunOcclusionFrame !== 0) return this.lastSunOccluded;
+    this.lastSunOccluded = this.marchTerrainBlock(sunDir);
+    return this.lastSunOccluded;
+  }
 
-    const rayLen = Math.min(25_000, 800 / sunDir.y);
-    const ray = new Ray(this.camera.position, sunDir, rayLen);
-    const onlyBB = sunDir.y < 0.12;
-
-    for (const mesh of this.scene.meshes) {
-      if (!mesh.isEnabled() || !mesh.name.startsWith('island_')) continue;
-      if (ray.intersectsMesh(mesh, false, undefined, onlyBB).hit) {
-        this.lastSunOccluded = true;
-        return true;
-      }
-    }
-
-    this.lastSunOccluded = false;
-    return false;
+  /** Throttled (every 8th frame, offset from the sun) moon occlusion. */
+  private isMoonOccluded(moonDir: Vector3): boolean {
+    this.moonOcclusionFrame = (this.moonOcclusionFrame + 1) % 8;
+    if (this.moonOcclusionFrame !== 4) return this.lastMoonOccluded;
+    this.lastMoonOccluded = this.marchTerrainBlock(moonDir);
+    return this.lastMoonOccluded;
   }
 
   // ── Render loop ───────────────────────────────────────────────────────────────

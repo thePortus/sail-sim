@@ -4,6 +4,7 @@ import { MusicService } from '../../services/music.service';
 import { TerrainService } from '../../services/terrain.service';
 import { CloudService } from '../../services/cloud.service';
 import { SceneService } from '../../services/scene.service';
+import { SfxService } from '../../services/sfx.service';
 
 @Component({
   selector: 'app-pause-menu',
@@ -50,6 +51,19 @@ import { SceneService } from '../../services/scene.service';
         <input type="range" min="0" max="1" step="0.01"
                [value]="music.volume()"
                (input)="onVolume($event)"
+               class="quality-slider" />
+      </div>
+
+      <!-- Sound effects section -->
+      <div class="pause-section">
+        <div class="pause-section-label">Sound Effects</div>
+        <div class="quality-row">
+          <span class="quality-label">Volume</span>
+          <span class="quality-value">{{ sfxVolumePct() }}%</span>
+        </div>
+        <input type="range" min="0" max="1" step="0.01"
+               [value]="sfx.volume()"
+               (input)="onSfxVolume($event)"
                class="quality-slider" />
       </div>
 
@@ -260,6 +274,7 @@ export class PauseMenuComponent {
   @Output() quit   = new EventEmitter<void>();
 
   readonly music   = inject(MusicService);
+  readonly sfx     = inject(SfxService);
   private readonly terrain  = inject(TerrainService);
   private readonly cloudSvc = inject(CloudService);
   private readonly sceneSvc = inject(SceneService);
@@ -280,6 +295,12 @@ export class PauseMenuComponent {
 
   onVolume(event: Event): void {
     this.music.setVolume(+(event.target as HTMLInputElement).value);
+  }
+
+  sfxVolumePct(): number { return Math.round(this.sfx.volume() * 100); }
+
+  onSfxVolume(event: Event): void {
+    this.sfx.setVolume(+(event.target as HTMLInputElement).value);
   }
 
   async toggleMusic(): Promise<void> {

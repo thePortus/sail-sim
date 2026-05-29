@@ -151,6 +151,7 @@ uniform vec2  u_shoreMapCenter;    // world-space XZ of shore map centre
 uniform float u_shoreMapSize;      // full world-space width covered (metres)
 uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
 uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
+uniform float u_rainIntensity;   // 0 = dry, 1 = full storm — drives surface rain ripples
 uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 
@@ -300,6 +301,35 @@ float terrainShadowMask(vec2 worldXZ) {
   return texture2D(u_terrainShadowMask, uv).r;
 }
 
+// ── Rain ripple noise ───────────────────────────────────────────────────────
+// Cheap value noise + a fast two-octave drifting field used to dimple the water
+// surface normals where rain is falling (simulates countless drop impacts).
+float rVHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float rVNoise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(rVHash(i), rVHash(i + vec2(1.0, 0.0)), u.x),
+             mix(rVHash(i + vec2(0.0, 1.0)), rVHash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+// Raindrop impact field: each grid cell hosts a jittered impact with its own
+// random phase and rate, fading in → peak → out, so individual drops blink into
+// and out of existence in place rather than drifting as a static pattern.
+float rainField(vec2 p, float t){
+  vec2 cell = floor(p);
+  vec2 f    = fract(p);
+  float h1 = rVHash(cell);
+  float h2 = rVHash(cell + 5.7);
+  float h3 = rVHash(cell + 11.3);
+  vec2  center = vec2(0.25 + h1 * 0.5, 0.25 + h2 * 0.5);  // jittered within the cell
+  float rate = mix(1.4, 3.4, h3);                          // impacts per second
+  float life = fract(t * rate + h1 * 7.0);                 // 0..1 life cycle
+  float env  = sin(life * 3.14159265);                     // fade in → peak → out
+  env *= env;                                              // sharper attack/decay
+  float r = length(f - center);
+  return (1.0 - smoothstep(0.0, 0.30, r)) * env;
+}
+
 void main() {
   float depth = u_WaveDepth;
   vec2 worldXZ = v_worldPos.xz;
@@ -312,6 +342,22 @@ void main() {
     vec3(0.0, 1.0, 0.0),
     0.8 * min(1.0, sqrt(length(v_worldPos - u_cameraPosition) * 0.01) * 1.1)
   );
+
+  // Rain ripples: dimple the normal with fast-evolving noise near the camera so
+  // the surface looks peppered by raindrop impacts. Faded out with distance and
+  // scaled by rain intensity.
+  if (u_rainIntensity > 0.01) {
+    float nearF = 1.0 - smoothstep(25.0, 180.0, length(v_worldPos - u_cameraPosition));
+    if (nearF > 0.001) {
+      float rt = u_Time;
+      vec2  rp = worldXZ * 2.2;
+      float e  = 0.18;
+      float n0 = rainField(rp, rt);
+      vec2  grad = vec2(rainField(rp + vec2(e, 0.0), rt) - n0,
+                        rainField(rp + vec2(0.0, e), rt) - n0) / e;
+      N = normalize(N + vec3(grad.x, 0.0, grad.y) * (0.075 * u_rainIntensity * nearF));
+    }
+  }
 
   float fresnel = 0.04 + (1.0 - 0.04) * pow(1.0 - max(0.0, dot(-N, ray)), 5.0);
 
@@ -342,8 +388,8 @@ void main() {
   vec3 scattering = vec3(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07);
   scattering *= (1.0 - terrainShadow * 0.75);
   vec3 color = fresnel * reflection + scattering;
-  float wakeFoam = smoothstep(0.10, 0.78, wakeT) * 0.68;
-  color = mix(color, vec3(0.86, 0.92, 0.98), wakeFoam);
+  // (wake foam removed — the displacement trench/trail is the wake now; the white
+  // foam cone read as a static blob behind the hull.)
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
@@ -542,6 +588,7 @@ uniform u_shoreMapCenter: vec2f;
 uniform u_shoreMapSize: f32;
 uniform u_cloudCoverage: f32;
 uniform u_sunElevation: f32;
+uniform u_rainIntensity: f32;      // 0 = dry, 1 = full storm — drives surface rain ripples
 uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
 var u_sceneDepthSampler: sampler;
 var u_sceneDepth: texture_2d<f32>; // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
@@ -693,6 +740,32 @@ fn terrainShadowMask(worldXZ: vec2f) -> f32 {
   return select(0.0, s, inBounds);
 }
 
+// ── Rain ripple noise (same as GLSL path) ───────────────────────────────────
+fn rVHash(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
+fn rVNoise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(rVHash(i), rVHash(i + vec2f(1.0, 0.0)), u.x),
+             mix(rVHash(i + vec2f(0.0, 1.0)), rVHash(i + vec2f(1.0, 1.0)), u.x), u.y);
+}
+// Raindrop impact field: per-cell jittered impacts that fade in → peak → out at
+// random phases, so drops blink into and out of existence in place.
+fn rainField(p: vec2f, t: f32) -> f32 {
+  let cell = floor(p);
+  let f    = fract(p);
+  let h1 = rVHash(cell);
+  let h2 = rVHash(cell + 5.7);
+  let h3 = rVHash(cell + 11.3);
+  let center = vec2f(0.25 + h1 * 0.5, 0.25 + h2 * 0.5);
+  let rate = mix(1.4, 3.4, h3);
+  let life = fract(t * rate + h1 * 7.0);
+  var env  = sin(life * 3.14159265);
+  env = env * env;
+  let r = length(f - center);
+  return (1.0 - smoothstep(0.0, 0.30, r)) * env;
+}
+
 @fragment
 fn main(input: FragmentInputs) -> FragmentOutputs {
   let depth = uniforms.u_WaveDepth;
@@ -706,6 +779,20 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     vec3f(0.0, 1.0, 0.0),
     vec3f(0.8 * min(1.0, sqrt(length(input.v_worldPos - uniforms.u_cameraPosition) * 0.01) * 1.1))
   );
+
+  // Rain ripples (same logic as GLSL path): dimple the normal near the camera.
+  if (uniforms.u_rainIntensity > 0.01) {
+    let nearF = 1.0 - smoothstep(25.0, 180.0, length(input.v_worldPos - uniforms.u_cameraPosition));
+    if (nearF > 0.001) {
+      let rt = uniforms.u_Time;
+      let rp = worldXZ * 2.2;
+      let e  = 0.18;
+      let n0 = rainField(rp, rt);
+      let grad = vec2f(rainField(rp + vec2f(e, 0.0), rt) - n0,
+                       rainField(rp + vec2f(0.0, e), rt) - n0) / e;
+      N = normalize(N + vec3f(grad.x, 0.0, grad.y) * (0.075 * uniforms.u_rainIntensity * nearF));
+    }
+  }
 
   let fresnel = 0.04 + (1.0 - 0.04) * pow(1.0 - max(0.0, dot(-N, ray)), 5.0);
 
@@ -731,8 +818,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let wakeT = max(input.v_wakeMask, wakeMask(worldXZ));
   let scattering = vec3f(0.0293, 0.0698, 0.1717) * (0.20 - wakeT * 0.07) * (1.0 - terrainShadow * 0.75);
   var color = fresnel * reflection + scattering;
-  let wakeFoam = smoothstep(0.10, 0.78, wakeT) * 0.68;
-  color = mix(color, vec3f(0.86, 0.92, 0.98), vec3f(wakeFoam));
+  // (wake foam removed — see GLSL path.)
 
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
@@ -1039,7 +1125,7 @@ export class OceanService {
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
-          'u_cloudCoverage', 'u_sunElevation',
+          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity',
         ],
         samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth'],
         needAlphaBlending: false,
@@ -1077,6 +1163,7 @@ export class OceanService {
     mat.setFloat('u_shoreMapSize', this.shoreMapSize);
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
+    mat.setFloat('u_rainIntensity', 0);
     // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
     // until the scene's depth map exists — harmless because its colour values are
     // < the water's camera-space Z, so dz is negative and no foam is drawn.
@@ -1135,6 +1222,7 @@ export class OceanService {
         mat.setFloat('u_BoatSpeed', boatSpeedAbs);
         mat.setFloat('u_cloudCoverage', this._cloudCoverage);
         mat.setFloat('u_sunElevation',  this._sunElevation);
+        mat.setFloat('u_rainIntensity', this._rainIntensity);
         if (depthMap) mat.setTexture('u_sceneDepth', depthMap);
       }
 
@@ -1144,11 +1232,17 @@ export class OceanService {
   // ── Cloud reflection ──────────────────────────────────────────────────────
   private _cloudCoverage = 0;
   private _sunElevation  = 0;
+  private _rainIntensity = 0;
 
   /** Call each frame from CloudService so the water mirrors current sky state. */
   setCloudReflection(coverage: number, sunElevation: number): void {
     this._cloudCoverage = coverage;
     this._sunElevation  = sunElevation;
+  }
+
+  /** Call each frame from CloudService — drives the surface rain-ripple normals. */
+  setRainIntensity(intensity: number): void {
+    this._rainIntensity = Math.max(0, Math.min(1, intensity));
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────

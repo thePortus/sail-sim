@@ -492,7 +492,14 @@ void main() {
   // terrain through it (true refraction): sample the seabed colour from the
   // refraction RTT at this pixel, with a slight wave-driven wobble, and blend
   // toward it by shallowness. dz ≈ 1e8 in open ocean → reveal 0.
-  float seabedReveal = 1.0 - smoothstep(0.0, 45.0, dz);
+  float seabedReveal = 1.0 - smoothstep(0.0, 22.0, dz);
+  // Gate by distance to land (shore-map R = land proximity, 1 at shore → 0 far):
+  // only reveal the seabed near islands, never over shallow open water.
+  vec2 revShoreUV = (worldXZ - u_shoreMapCenter) / u_shoreMapSize + 0.5;
+  float landProx = (revShoreUV.x >= 0.0 && revShoreUV.x <= 1.0 &&
+                    revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0)
+                 ? texture2D(u_shoreMap, revShoreUV).r : 0.0;
+  seabedReveal *= smoothstep(0.18, 0.55, landProx);
   if (seabedReveal > 0.001) {
     vec2 refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, 0.001, 0.999);
     // Cool the submerged sand — water absorbs warm light, so the bottom seen
@@ -500,7 +507,7 @@ void main() {
     vec3 seabed = texture2D(u_refraction, refrUV).rgb * vec3(0.40, 0.49, 0.56);
     // Tint toward water teal with depth so the deeper shallows read as water,
     // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
-    float depthTint = smoothstep(0.0, 45.0, dz);
+    float depthTint = smoothstep(0.0, 22.0, dz);
     vec3 shallowWater = mix(seabed, vec3(0.07, 0.30, 0.38), depthTint * 0.65);
     color = mix(color, shallowWater, seabedReveal * 0.90);
   }
@@ -1005,12 +1012,17 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
 
   // Depth-based shallow water (same as GLSL path): show the REAL terrain through
   // thin water by sampling the seabed refraction RTT, blended by shallowness.
-  let seabedReveal = 1.0 - smoothstep(0.0, 45.0, dz);
+  var seabedReveal = 1.0 - smoothstep(0.0, 22.0, dz);
+  // Gate by distance to land (shore-map proximity) — only reveal near islands.
+  let revShoreUV = (worldXZ - uniforms.u_shoreMapCenter) / uniforms.u_shoreMapSize + vec2f(0.5);
+  let revInB = revShoreUV.x >= 0.0 && revShoreUV.x <= 1.0 && revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0;
+  let landProx = select(0.0, textureSampleLevel(u_shoreMap, u_shoreMapSampler, clamp(revShoreUV, vec2f(0.001), vec2f(0.999)), 0.0).r, revInB);
+  seabedReveal *= smoothstep(0.18, 0.55, landProx);
   if (seabedReveal > 0.001) {
     let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
     // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
     let seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
-    let depthTint = smoothstep(0.0, 45.0, dz);
+    let depthTint = smoothstep(0.0, 22.0, dz);
     let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));
     color = mix(color, shallowWater, vec3f(seabedReveal * 0.90));
   }

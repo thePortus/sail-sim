@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  MirrorTexture, Plane, Texture, DynamicTexture,
+  MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -170,8 +170,10 @@ uniform float u_shoreMapSize;      // full world-space width covered (metres)
 uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
 uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
 uniform float u_rainIntensity;   // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform vec3  u_sunDir;          // unit vector toward the sun (boat shadow on water)
 uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
+uniform sampler2D u_refraction;  // seabed (terrain) colour for true shallow-water transparency
 
 #ifdef WEBGPU
 layout(location = 0) in vec3 v_worldPos;
@@ -485,17 +487,46 @@ void main() {
   float waterZ = (view * vec4(v_worldPos, 1.0)).z;       // same space as sceneZ
   float dz     = sceneZ - waterZ;                        // >0: opaque just behind surface
 
-  // Depth-based shallow seabed reveal — the reliable "see the sand" effect.
-  // u_sceneDepth holds the seabed depth (terrain is in it; only the ocean is
-  // excluded), so a small dz means the water is a thin sheet over the bottom.
-  // Blend toward the wet seabed sand there so shallow water reads as clear.
-  // (Open ocean → dz ≈ 1e8 → no reveal. Works at every shore, unlike the shore
-  // map's proximity which is location-dependent.)
-  float seabedReveal = 1.0 - smoothstep(0.5, 14.0, dz);
-  color = mix(color, vec3(0.40, 0.34, 0.25), seabedReveal * 0.85);
+  // Depth-based shallow water: where the seabed (u_sceneDepth, ocean excluded)
+  // is only just behind the surface, the water is a thin sheet — show the REAL
+  // terrain through it (true refraction): sample the seabed colour from the
+  // refraction RTT at this pixel, with a slight wave-driven wobble, and blend
+  // toward it by shallowness. dz ≈ 1e8 in open ocean → reveal 0.
+  float seabedReveal = 1.0 - smoothstep(0.0, 45.0, dz);
+  if (seabedReveal > 0.001) {
+    vec2 refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, 0.001, 0.999);
+    // Cool the submerged sand — water absorbs warm light, so the bottom seen
+    // through water reads cooler/greener than dry sand (kills the "yellow water").
+    vec3 seabed = texture2D(u_refraction, refrUV).rgb * vec3(0.40, 0.49, 0.56);
+    // Tint toward water teal with depth so the deeper shallows read as water,
+    // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
+    float depthTint = smoothstep(0.0, 45.0, dz);
+    vec3 shallowWater = mix(seabed, vec3(0.07, 0.30, 0.38), depthTint * 0.65);
+    color = mix(color, shallowWater, seabedReveal * 0.90);
+  }
 
-  // Band: ramp up over the first 0.20 m (kills the dz≈0 hard cut), fade out by 1.6 m.
-  float waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
+  // Boat shadow on the water surface: an oriented ellipse projected from the hull
+  // toward the anti-sun direction. Gated by (1 - seabedReveal) so it doesn't
+  // double with the real seabed shadow seen through the shallow refraction, and
+  // only when the sun is above the horizon.
+  if (u_sunDir.y > 0.02) {
+    float sunUp = max(0.25, u_sunDir.y);
+    vec2 shOffset = -u_sunDir.xz / sunUp * 2.0;
+    vec2 rel = worldXZ - (u_BoatPos + shOffset);
+    vec2 fwd = normalize(u_BoatDir);
+    vec2 rgt = vec2(fwd.y, -fwd.x);
+    float along  = dot(rel, fwd);
+    float across = dot(rel, rgt);
+    float e = (along * along) / (9.0 * 9.0) + (across * across) / (3.6 * 3.6);
+    float boatShadow = (1.0 - smoothstep(0.5, 1.0, e)) * (1.0 - seabedReveal);
+    color *= 1.0 - boatShadow * 0.32;
+  }
+
+  // Soft waterline foam for the hull edge — but suppressed where the seabed shows
+  // through (that's clear shore water, not a hull edge), so it stops whitening the
+  // clear shallows.
+  float waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz))
+                  * (1.0 - seabedReveal * 0.92);
   color = mix(color, vec3(0.90, 0.95, 1.00), waterline * 0.70);
 
   // ── Night dimming ───────────────────────────────────────────────────────────
@@ -670,9 +701,12 @@ uniform u_shoreMapSize: f32;
 uniform u_cloudCoverage: f32;
 uniform u_sunElevation: f32;
 uniform u_rainIntensity: f32;      // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform u_sunDir: vec3f;           // unit vector toward the sun (boat shadow on water)
 uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
 var u_sceneDepthSampler: sampler;
 var u_sceneDepth: texture_2d<f32>; // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
+var u_refractionSampler: sampler;
+var u_refraction: texture_2d<f32>; // seabed (terrain) colour for true shallow-water transparency
 
 varying v_worldPos: vec3f;
 varying v_projPos: vec4f;
@@ -969,12 +1003,37 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let waterZ  = (uniforms.view * vec4f(input.v_worldPos, 1.0)).z;
   let dz      = sceneZ - waterZ;
 
-  // Depth-based shallow seabed reveal (same as GLSL path) — reliable "see the
-  // sand" effect from the seabed's depth, independent of the shore map.
-  let seabedReveal = 1.0 - smoothstep(0.5, 14.0, dz);
-  color = mix(color, vec3f(0.40, 0.34, 0.25), vec3f(seabedReveal * 0.85));
+  // Depth-based shallow water (same as GLSL path): show the REAL terrain through
+  // thin water by sampling the seabed refraction RTT, blended by shallowness.
+  let seabedReveal = 1.0 - smoothstep(0.0, 45.0, dz);
+  if (seabedReveal > 0.001) {
+    let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
+    // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
+    let seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
+    let depthTint = smoothstep(0.0, 45.0, dz);
+    let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));
+    color = mix(color, shallowWater, vec3f(seabedReveal * 0.90));
+  }
 
-  let waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz));
+  // Boat shadow on the water surface (same as GLSL path): oriented ellipse cast
+  // from the hull toward anti-sun, gated to deeper water and to daytime.
+  if (uniforms.u_sunDir.y > 0.02) {
+    let sunUp = max(0.25, uniforms.u_sunDir.y);
+    let shOffset = -uniforms.u_sunDir.xz / sunUp * 2.0;
+    let rel = worldXZ - (uniforms.u_BoatPos + shOffset);
+    let fwd = normalize(uniforms.u_BoatDir);
+    let rgt = vec2f(fwd.y, -fwd.x);
+    let along  = dot(rel, fwd);
+    let across = dot(rel, rgt);
+    let e = (along * along) / (9.0 * 9.0) + (across * across) / (3.6 * 3.6);
+    let boatShadow = (1.0 - smoothstep(0.5, 1.0, e)) * (1.0 - seabedReveal);
+    color *= 1.0 - boatShadow * 0.32;
+  }
+
+  // Soft waterline foam — suppressed where the seabed shows through (clear shore
+  // water, not a hull edge) so it stops whitening the clear shallows.
+  let waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz))
+                * (1.0 - seabedReveal * 0.92);
   color = mix(color, vec3f(0.90, 0.95, 1.00), vec3f(waterline * 0.70));
 
   // ── Night dimming ───────────────────────────────────────────────────────────
@@ -1050,6 +1109,7 @@ export class OceanService {
 
 
   private reflectionRTT!: MirrorTexture;
+  private refractionRTT!: RenderTargetTexture;   // seabed-only colour for true shallow-water transparency
   private terrainShadowMask: Texture | null = null;
   private terrainShadowCenter = new Vector2(0, 0);
   private terrainShadowSize = 1;
@@ -1148,6 +1208,21 @@ export class OceanService {
     // blank texture — BabylonJS only auto-renders RTTs that are wired through
     // StandardMaterial / PBRMaterial reflection slots, not ShaderMaterial.
     scene.customRenderTargets.push(this.reflectionRTT);
+
+    // ── Refraction RTT: the seabed (terrain only) rendered from the main camera,
+    // at half resolution, so the ocean shader can show the REAL terrain colour
+    // through shallow water (true depth transparency) without alpha-blending the
+    // ocean. Only the terrain heightfield is drawn — cheap-ish and exactly what
+    // we want behind the water.
+    this.refractionRTT = new RenderTargetTexture('oceanRefraction', { ratio: 0.5 }, scene, false);
+    // Include the terrain seabed AND the vessel (any non-ocean, non-foliage opaque
+    // mesh), so the submerged hull occludes the sand behind it — otherwise the
+    // shader "sees past" the keel to the seabed and sand shows through the hull.
+    // Trees/scatter excluded for perf.
+    this.refractionRTT.renderListPredicate = (m) =>
+      !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_');
+    this.refractionRTT.refreshRate = 1;
+    scene.customRenderTargets.push(this.refractionRTT);
 
     // Island meshes arrive asynchronously (HTTP load).  Auto-enroll them so
     // we don't need a separate manual call after each island is built.
@@ -1255,10 +1330,10 @@ export class OceanService {
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
-          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity',
+          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir',
           'u_wakePath', 'u_wakeCount',
         ],
-        samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth'],
+        samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth', 'u_refraction'],
         needAlphaBlending: false,
         shaderLanguage: useWgsl ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
       },
@@ -1295,12 +1370,14 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setVector3('u_sunDir', new Vector3(0, 1, 0));
     mat.setArray4('u_wakePath', Array(this.WAKE_PATH_MAX * 4).fill(0));
     mat.setFloat('u_wakeCount', 0);
     // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
     // until the scene's depth map exists — harmless because its colour values are
     // < the water's camera-space Z, so dz is negative and no foam is drawn.
     mat.setTexture('u_sceneDepth', this.sceneService.oceanDepthMap ?? this.reflectionRTT);
+    mat.setTexture('u_refraction', this.refractionRTT);
 
     return mat;
   }
@@ -1359,6 +1436,7 @@ export class OceanService {
         mat.setFloat('u_cloudCoverage', this._cloudCoverage);
         mat.setFloat('u_sunElevation',  this._sunElevation);
         mat.setFloat('u_rainIntensity', this._rainIntensity);
+        mat.setVector3('u_sunDir', this.sceneService.getSunDirection());
         mat.setArray4('u_wakePath', wakePathArr);
         mat.setFloat('u_wakeCount', this.wakePathCount);
         if (depthMap) mat.setTexture('u_sceneDepth', depthMap);

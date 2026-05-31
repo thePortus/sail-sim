@@ -25,6 +25,7 @@ import { MinimapComponent }        from '../sailing/components/minimap/minimap.c
 import { VesselSelectorComponent } from '../sailing/components/vessel-selector/vessel-selector.component';
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
+import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -34,7 +35,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent],
   template: `
     <div class="game-root">
       <!-- BabylonJS canvas -->
@@ -64,7 +65,12 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
-          <app-pause-menu (resume)="onResume()" (quit)="onExitGame()" />
+          <app-pause-menu (resume)="onResume()" (quit)="onExitGame()"
+                          (openSettings)="showSettings.set(true)" />
+        }
+        <!-- Settings panel — opened from the pause menu -->
+        @if (showSettings()) {
+          <app-settings-menu (close)="showSettings.set(false)" />
         }
         <div class="minimap-anchor">
           <app-minimap />
@@ -160,14 +166,19 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
-  paused     = signal<boolean>(false);
+  paused       = signal<boolean>(false);
+  showSettings = signal<boolean>(false);
   loadingMsg = signal('Charting the archipelago…');
 
   @HostListener('window:keydown.escape')
   onEscKey(): void {
-    if (this.phase() === 'sailing') {
-      this.paused.update(v => !v);
+    if (this.phase() !== 'sailing') return;
+    // Esc backs out of Settings first, then toggles the pause menu.
+    if (this.showSettings()) {
+      this.showSettings.set(false);
+      return;
     }
+    this.paused.update(v => !v);
   }
 
   /** Display the approximate range in the charge bar (20 m … 80 m). */
@@ -365,11 +376,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   /** Called by the pause menu Resume button or Esc toggle. */
   onResume(): void {
     this.paused.set(false);
+    this.showSettings.set(false);
   }
 
   /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */
   onExitGame(): void {
     this.paused.set(false);
+    this.showSettings.set(false);
     this.teardown();
     this.selectedSlug = '';
     this.callsign     = '';

@@ -6,6 +6,7 @@ import {
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
+  SceneInstrumentation, EngineInstrumentation,
 } from '@babylonjs/core';
 import { SkyMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
@@ -230,15 +231,26 @@ export class SceneService {
     //   Cascade 0 (~0–30 u)  : vessel hull, cannonballs — high resolution
     //   Cascade 1 (~30–150 u): island self-shadowing, vessel-on-island
     //   Cascade 2 (~150–400 u): distant terrain — low resolution
-    const csg = new CascadedShadowGenerator(1024, this.sun);
-    csg.numCascades        = 3;
+    const csg = new CascadedShadowGenerator(512, this.sun);  // was 1024 — cheaper map
+    csg.numCascades        = 3;                              // render/clear; fine at the
+    // NOTE: filteringQuality and sun.shadowEnabled both produce a broken shadow
+    // shader on this WebGPU path (scene renders black). Leave filtering at the
+    // default — shadows are NOT a safe perf lever here. Use the RTT off-switches.
     csg.stabilizeCascades  = true;   // reduces shimmering as camera pans
     csg.lambda             = 0.75;   // 0 = uniform splits, 1 = logarithmic
-    csg.shadowMaxZ         = 400;    // shadows discarded beyond 400 units
+    csg.shadowMaxZ         = 200;    // shadows discarded beyond 200 u (was 400): distant
+                                     // terrain skips all shadow work, and the 3 cascades
+                                     // pack into a tighter range → sharper near shadows.
     csg.bias               = 0.001;
     csg.normalBias         = 0.02;
     csg.darkness           = 0.05;   // 0 = fully opaque shadow, 1 = invisible
     csg.transparencyShadow = true;   // sails/flag cloth casts transparent shadows
+    // Throttle the shadow map to every other frame. It re-renders every tree/boat
+    // caster across all 3 cascades, and that geometry pass runs each frame with no
+    // setting to disable it — a big always-on cost. Shadows update at half-rate,
+    // which is imperceptible for slow-moving sun/trees/boat.
+    const shadowMap = csg.getShadowMap();
+    if (shadowMap) shadowMap.refreshRate = 2;
     this.shadowGenerator   = csg;
 
     // Cool blue-white directional light simulating moonlight.
@@ -361,7 +373,9 @@ export class SceneService {
     // Exclude the four ocean LOD meshes (all named 'ocean_*') so open water reads
     // the 1e8 clear (= "far") rather than its own surface depth.
     depthMap.renderListPredicate = (m) => !m.name.startsWith('ocean_');
-    // Render this map every frame alongside the scene's other render targets.
+    // Every other frame — this re-renders the terrain just for depth; the soft
+    // waterline / shallow-reveal it feeds tolerate a 1-frame lag invisibly.
+    depthMap.refreshRate = 2;
     this.scene.customRenderTargets.push(depthMap);
 
     this.oceanDepthRenderer = depthRenderer;
@@ -378,8 +392,12 @@ export class SceneService {
     this.pipeline.bloomEnabled   = true;
     this.pipeline.bloomThreshold = 0.78;
     this.pipeline.bloomWeight    = 0.28;
-    this.pipeline.bloomKernel    = 128;
-    this.pipeline.bloomScale     = 0.5;
+    // Perf: kernel 128→48 and scale 0.5→0.33. The wide-kernel blur on a HiDPI
+    // framebuffer was the entire daytime FPS hit (bloom is off at night, which is
+    // why daytime ran ~14 vs ~22 at night). The glow is a touch tighter — barely
+    // perceptible — for roughly 4× cheaper bloom.
+    this.pipeline.bloomKernel    = 48;
+    this.pipeline.bloomScale     = 0.33;
 
     // SSAO — bakes contact shadows into corners and crevices of nearby geometry
     // (mast base, under the boom, beneath deck railings, etc.).  maxZ = 100
@@ -749,6 +767,33 @@ export class SceneService {
   // ── Render loop ───────────────────────────────────────────────────────────────
 
   private startRenderLoop(): void {
+    // FPS overlay — hidden by default, toggled with the backtick (`) key.
+    // (F12 can't be used: browsers reserve it for DevTools and block preventDefault.)
+    const fpsEl = document.createElement('div');
+    fpsEl.style.cssText =
+      'position:fixed;top:6px;left:6px;z-index:99999;text-align:left;line-height:1.45;' +
+      'font:600 12px ui-monospace,monospace;color:#9effa0;background:rgba(0,0,0,0.62);' +
+      'padding:6px 9px;border-radius:6px;pointer-events:none;display:none;white-space:pre;';
+    document.body.appendChild(fpsEl);
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Backquote') {
+        fpsEl.style.display = fpsEl.style.display === 'none' ? 'block' : 'none';
+      }
+    });
+
+    // Perf instrumentation — only read when the overlay is visible. Breaks the
+    // frame into CPU (active-mesh eval, render-targets, inter-frame JS) and GPU
+    // time so we can see exactly what's pinning the frame rate.
+    const sInstr = new SceneInstrumentation(this.scene);
+    sInstr.captureActiveMeshesEvaluationTime = true;
+    sInstr.captureRenderTargetsRenderTime = true;
+    sInstr.captureRenderTime = true;
+    sInstr.captureFrameTime = true;
+    sInstr.captureInterFrameTime = true;
+    const eInstr = new EngineInstrumentation(this.engine);
+    eInstr.captureGPUFrameTime = true;
+    let perfFrame = 0;
+
     let lastTime = performance.now();
     this.engine.runRenderLoop(() => {
       const now = performance.now();
@@ -756,6 +801,18 @@ export class SceneService {
       lastTime  = now;
       this.tickTimeOfDay(dt);
       this.scene.render();
+      if (fpsEl.style.display !== 'none' && (perfFrame++ % 15) === 0) {
+        const ms = (c: { lastSecAverage: number }) => c.lastSecAverage.toFixed(1);
+        const gpuMs = (eInstr.gpuFrameTimeCounter.lastSecAverage / 1e6) || 0;
+        fpsEl.textContent =
+          `${this.engine.getFps().toFixed(0)} FPS   (${sInstr.frameTimeCounter.lastSecAverage.toFixed(1)} ms/frame)\n` +
+          `gpu        ${gpuMs ? gpuMs.toFixed(1) + ' ms' : 'n/a'}\n` +
+          `evalMeshes ${ms(sInstr.activeMeshesEvaluationTimeCounter)} ms\n` +
+          `renderTgts ${ms(sInstr.renderTargetsRenderTimeCounter)} ms\n` +
+          `mainRender ${ms(sInstr.renderTimeCounter)} ms\n` +
+          `interFrame ${ms(sInstr.interFrameTimeCounter)} ms (cpu/js)\n` +
+          `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}`;
+      }
     });
     window.addEventListener('resize', () => {
       this.applyResolutionScale();
@@ -763,21 +820,52 @@ export class SceneService {
     });
   }
 
-  // Render resolution is tied to the AA-quality level so users on weaker machines
-  // can trade sharpness for FPS with a single setting:
-  //   level 0 ("Off")  → 1.0  : CSS-pixel resolution (cheapest; on HiDPI this is
-  //                             the low-res upscaled look — performance mode)
-  //   levels 1–3       → ≤2.0 : the display's native pixel density (sharp), capped
-  //                             at 2× to bound cost on very high-DPR screens
-  //                             (1/scale of 0.5 already quadruples pixel count).
-  // On non-HiDPI displays (devicePixelRatio = 1) every level renders at native
-  // resolution — only the FXAA/MSAA behaviour differs, exactly as before.
+  // Render resolution is now its own user setting (the single biggest perf/quality
+  // lever), independent of AA. _renderScale is a fraction (0.5–1.0) of the display's
+  // native pixel density (native = min(devicePixelRatio, 2), capped to bound cost
+  // on very-high-DPR screens). 1.0 = full native (sharpest, current look); 0.5 =
+  // half-res (quarter the pixels → big FPS win, softer). Persisted to localStorage.
   private readonly MAX_PIXEL_RATIO = 2;
+  private _renderScale = (() => {
+    const r = parseFloat(localStorage.getItem('ignis_render_scale') ?? '1');
+    return isNaN(r) ? 1 : Math.max(0.5, Math.min(1.0, r));
+  })();
+
+  getRenderScale(): number { return this._renderScale; }
+
+  setRenderScale(scale: number): void {
+    this._renderScale = Math.max(0.5, Math.min(1.0, scale));
+    localStorage.setItem('ignis_render_scale', String(this._renderScale));
+    this.applyResolutionScale();
+  }
+
   private applyResolutionScale(): void {
     if (!this.engine) return;
-    const cap = this._aaQuality === 0 ? 1 : this.MAX_PIXEL_RATIO;
-    const dpr = Math.min(window.devicePixelRatio || 1, cap);
-    this.engine.setHardwareScalingLevel(1 / dpr);
+    const native = Math.min(window.devicePixelRatio || 1, this.MAX_PIXEL_RATIO);
+    const eff = Math.max(0.25, native * this._renderScale);
+    this.engine.setHardwareScalingLevel(1 / eff);
+  }
+
+  /**
+   * Drive the real cascaded shadow MAP from the Shadows quality setting (the same
+   * slider also controls the separate raymarched terrain-shadow mask in
+   * TerrainService — this is the half that was never wired up).
+   *   0 Off  — shadow map not rendered at all
+   *   1 Low  — 2 cascades, every-other-frame
+   *   2 Med  — 3 cascades, every-other-frame (default)
+   *   3 High — 3 cascades, every frame
+   */
+  setShadowMapQuality(level: number): void {
+    if (!this.shadowGenerator) return;
+    const csg = this.shadowGenerator as CascadedShadowGenerator;
+    // Do NOT toggle sun.shadowEnabled — flipping it recompiles every receiver shader
+    // and blanks the scene on WebGPU. Vary only cascade count + refresh rate, which
+    // recompile to a valid shadow shader and render fine. Level 0 = cheapest (1
+    // cascade, quarter-rate); 3 = best (3 cascades, every frame).
+    const cascades = level <= 0 ? 1 : (level === 1 ? 2 : 3);
+    if (csg.numCascades !== cascades) csg.numCascades = cascades;
+    const sm = csg.getShadowMap();
+    if (sm) sm.refreshRate = level >= 3 ? 1 : (level <= 0 ? 4 : 2);
   }
 
   dispose(): void {

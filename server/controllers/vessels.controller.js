@@ -37,30 +37,7 @@ const VESSELS = [
       sailAreaFactor:   0.40,
       weight:           2800,
     },
-    parts: [
-
-      // ── Navigation lights ─────────────────────────────────────────────────────
-
-      { id: 'nav_red',
-        shape: 'sphere', params: { diameter: 0.20, tessellation: 12 },
-        position: { x: -1.05, y: 2.65, z: 5.10 },
-        materialType: 'nav_red',
-        material: { color: '#FF2200', specular: '#FF6644', emissive: '#CC1100' } },
-
-      { id: 'nav_green',
-        shape: 'sphere', params: { diameter: 0.20, tessellation: 12 },
-        position: { x: 1.05, y: 2.65, z: 5.10 },
-        materialType: 'nav_green',
-        material: { color: '#00CC44', specular: '#44FF88', emissive: '#008833' } },
-
-      // Stern navigation light (white — visible from astern 135° arc)
-      { id: 'stern_light',
-        shape: 'sphere', params: { diameter: 0.20, tessellation: 12 },
-        position: { x: 0, y: 4.30, z: -5.4 },
-        materialType: 'nav_white',
-        material: { color: '#FFFFF0', specular: '#FFFFFF', emissive: '#FFFFEE' } },
-
-    ],
+    parts: [],
   },
 ];
 

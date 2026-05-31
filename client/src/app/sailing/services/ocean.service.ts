@@ -170,6 +170,9 @@ uniform float u_shoreMapSize;      // full world-space width covered (metres)
 uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
 uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
 uniform float u_rainIntensity;   // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform float u_reflectionStrength;  // 1 = RTT reflections on, 0 = analytic-sky only (Reflections setting)
+uniform float u_seabedStrength;      // 1 = shallow-water transparency on, 0 = off (Water-transparency setting)
+uniform int u_normalIter;            // per-LOD fragment normal detail (near hi, far lo)
 uniform vec3  u_sunDir;          // unit vector toward the sun (boat shadow on water)
 uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
@@ -187,7 +190,10 @@ varying float v_wakeMask;
 #endif
 
 #define DRAG_MULT 0.38
-#define ITERATIONS 24
+#define ITERATIONS u_normalIter   // FRAGMENT normal count, set PER-LOD via
+                        // setInt('u_normalIter',…): near water hi (smooth reflections),
+                        // far LODs lo (most of the screen, tiny reflections). Vertex
+                        // geometry stays a fixed 24. (Loop below expands to u_normalIter.)
 
 vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   float x = dot(direction, position) * frequency + timeshift;
@@ -410,7 +416,9 @@ void main() {
   screenUV += N.xz * 0.020;
   screenUV = clamp(screenUV, 0.001, 0.999);
   vec3 reflectionRTT = texture2D(u_reflectionSampler, screenUV).rgb;
-  vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80);
+  vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80 * u_reflectionStrength);
+  // (u_reflectionStrength = 0 → analytic sky only; the reflection RTT pass is also
+  //  stopped on the CPU side so there's no off-screen geometry re-render.)
 
   // Cloud reflection: when the reflected ray points upward and sky is covered,
   // blend a cloud-grey into the sky portion of the mirror so the water surface
@@ -500,6 +508,7 @@ void main() {
                     revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0)
                  ? texture2D(u_shoreMap, revShoreUV).r : 0.0;
   seabedReveal *= smoothstep(0.18, 0.55, landProx);
+  seabedReveal *= u_seabedStrength;   // 0 → shallow-water transparency off (refraction+depth RTTs also stopped)
   if (seabedReveal > 0.001) {
     vec2 refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, 0.001, 0.999);
     // Cool the submerged sand — water absorbs warm light, so the bottom seen
@@ -708,6 +717,9 @@ uniform u_shoreMapSize: f32;
 uniform u_cloudCoverage: f32;
 uniform u_sunElevation: f32;
 uniform u_rainIntensity: f32;      // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform u_reflectionStrength: f32; // 1 = RTT reflections on, 0 = analytic-sky only
+uniform u_seabedStrength: f32;     // 1 = shallow-water transparency on, 0 = off
+uniform u_normalIter: i32;         // per-LOD fragment normal detail (near hi, far lo)
 uniform u_sunDir: vec3f;           // unit vector toward the sun (boat shadow on water)
 uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
 var u_sceneDepthSampler: sampler;
@@ -720,7 +732,7 @@ varying v_projPos: vec4f;
 varying v_wakeMask: f32;
 
 const DRAG_MULT: f32 = 0.38;
-const ITERATIONS: i32 = 24;
+// FRAGMENT normal iteration count is the per-LOD uniform u_normalIter (see GLSL note).
 
 fn wavedx(position: vec2f, direction: vec2f, frequency: f32, timeshift: f32) -> vec2f {
   let x = dot(direction, position) * frequency + timeshift;
@@ -739,7 +751,7 @@ fn getwaves(positionIn: vec2f) -> f32 {
   var sum = 0.0;
   var sumW = 0.0;
 
-  for (var i: i32 = 0; i < ITERATIONS; i = i + 1) {
+  for (var i: i32 = 0; i < uniforms.u_normalIter; i = i + 1) {
     let p = vec2f(sin(iter), cos(iter));
     let res = wavedx(position, p, frequency, uniforms.u_Time * timeMultiplier + wavePhaseShift);
     position += p * res.y * weight * DRAG_MULT;
@@ -942,8 +954,9 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   screenUV += N.xz * 0.020;
   screenUV = clamp(screenUV, vec2f(0.001), vec2f(0.999));
   let reflectionRTT = textureSample(u_reflectionSampler, u_reflectionSamplerSampler, screenUV).rgb;
+  let reflStrength = uniforms.u_reflectionStrength;
   // Cloud reflection (same logic as GLSL path above)
-  var cloudReflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80));
+  var cloudReflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80 * reflStrength));
   if (R.y > 0.04 && uniforms.u_cloudCoverage > 0.01) {
     let cloudMask  = smoothstep(0.04, 0.50, R.y) * uniforms.u_cloudCoverage;
     let cloudDay   = vec3f(0.82, 0.85, 0.90);
@@ -1018,6 +1031,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let revInB = revShoreUV.x >= 0.0 && revShoreUV.x <= 1.0 && revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0;
   let landProx = select(0.0, textureSampleLevel(u_shoreMap, u_shoreMapSampler, clamp(revShoreUV, vec2f(0.001), vec2f(0.999)), 0.0).r, revInB);
   seabedReveal *= smoothstep(0.18, 0.55, landProx);
+  seabedReveal *= uniforms.u_seabedStrength;   // 0 → shallow-water transparency off
   if (seabedReveal > 0.001) {
     let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
     // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
@@ -1119,6 +1133,10 @@ export class OceanService {
   private oceanMat1!:    ShaderMaterial;
   private oceanMatFar!:  ShaderMaterial;
 
+  // Quality toggles (persisted). When off, the shader falls back to analytic sky /
+  // no seabed AND the corresponding off-screen RTT pass is stopped (the real win).
+  private _reflectionsEnabled = (localStorage.getItem('ignis_reflections') ?? '1') !== '0';
+  private _transparencyEnabled = (localStorage.getItem('ignis_water_transparency') ?? '1') !== '0';
 
   private reflectionRTT!: MirrorTexture;
   private refractionRTT!: RenderTargetTexture;   // seabed-only colour for true shallow-water transparency
@@ -1201,13 +1219,23 @@ export class OceanService {
         this.sceneService.excludeFromPrePass(mat);
       }
     }
+
+    // Sync the persisted quality toggles: if either is off, stop its RTT pass now
+    // (buildReflectionRTT pushes both unconditionally).
+    this.setReflectionsEnabled(this._reflectionsEnabled);
+    this.setWaterTransparencyEnabled(this._transparencyEnabled);
   }
 
   // ── Reflection RTT ────────────────────────────────────────────────────────
 
   private buildReflectionRTT(scene: Scene): void {
-    // 1024 px gives crisp, close-up reflections; 512 looks blurry at hull range.
-    this.reflectionRTT = new MirrorTexture('oceanReflection', 1024, scene, true);
+    // 512 px + every-other-frame: this RTT re-renders the whole scene (terrain
+    // included) mirrored, which is a big fixed per-frame cost independent of the
+    // main render-scale. Water reflections are distorted/blurry anyway, so neither
+    // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
+    // 1/8ths the reflection's cost.
+    this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
+    this.reflectionRTT.refreshRate = 2;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
 
@@ -1233,7 +1261,7 @@ export class OceanService {
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
       !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_');
-    this.refractionRTT.refreshRate = 1;
+    this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
     scene.customRenderTargets.push(this.refractionRTT);
 
     // Island meshes arrive asynchronously (HTTP load).  Auto-enroll them so
@@ -1343,6 +1371,7 @@ export class OceanService {
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
           'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir',
+          'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter',
           'u_wakePath', 'u_wakeCount',
         ],
         samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth', 'u_refraction'],
@@ -1382,6 +1411,13 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setFloat('u_reflectionStrength', this._reflectionsEnabled ? 1 : 0);
+    mat.setFloat('u_seabedStrength',     this._transparencyEnabled ? 1 : 0);
+    // Per-LOD fragment-normal detail: near/LOD0 stay smooth (reflections read clearly),
+    // LOD1 + far drop low — the far sea is most of the screen but its reflections are
+    // tiny, so the faceting is invisible there while the iteration savings are large.
+    const normalIter = maxCascade >= 2 ? 16 : (maxCascade >= 1 ? 10 : 6);
+    mat.setInt('u_normalIter', normalIter);
     mat.setVector3('u_sunDir', new Vector3(0, 1, 0));
     mat.setArray4('u_wakePath', Array(this.WAKE_PATH_MAX * 4).fill(0));
     mat.setFloat('u_wakeCount', 0);
@@ -1588,6 +1624,44 @@ export class OceanService {
       mat.setFloat('u_terrainShadowSize', this.terrainShadowSize);
       mat.setFloat('u_terrainShadowStrength', this.terrainShadowStrength);
     }
+  }
+
+  // ── Quality toggles (Settings) ─────────────────────────────────────────────
+
+  isReflectionsEnabled(): boolean { return this._reflectionsEnabled; }
+  isWaterTransparencyEnabled(): boolean { return this._transparencyEnabled; }
+
+  /** Water reflections on/off. Off → analytic sky only in-shader AND the reflection
+   *  RTT (a full mirrored scene re-render) is removed from the render loop. */
+  setReflectionsEnabled(enabled: boolean): void {
+    this._reflectionsEnabled = enabled;
+    localStorage.setItem('ignis_reflections', enabled ? '1' : '0');
+    for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
+      if (mat) mat.setFloat('u_reflectionStrength', enabled ? 1 : 0);
+    }
+    this.toggleCustomRenderTarget(this.reflectionRTT, enabled);
+  }
+
+  /** Shallow-water see-through on/off. Off → no seabed reveal in-shader AND the
+   *  refraction RTT (a terrain/vessel re-render) is removed. The depth renderer is
+   *  left running because it also feeds the soft waterline. */
+  setWaterTransparencyEnabled(enabled: boolean): void {
+    this._transparencyEnabled = enabled;
+    localStorage.setItem('ignis_water_transparency', enabled ? '1' : '0');
+    for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
+      if (mat) mat.setFloat('u_seabedStrength', enabled ? 1 : 0);
+    }
+    this.toggleCustomRenderTarget(this.refractionRTT, enabled);
+  }
+
+  /** Add/remove an RTT from the scene's per-frame render list (stops its GPU pass). */
+  private toggleCustomRenderTarget(rtt: RenderTargetTexture | MirrorTexture, enabled: boolean): void {
+    const scene = this.sceneService.scene;
+    if (!scene || !rtt) return;
+    const list = scene.customRenderTargets;
+    const idx = list.indexOf(rtt);
+    if (enabled && idx < 0) list.push(rtt);
+    else if (!enabled && idx >= 0) list.splice(idx, 1);
   }
 
   // O(1) dedup — island meshes arrive via both the onNewMeshAdded observable and

@@ -85,7 +85,7 @@ export function createSpsTreeArchetype(
     const dir = direction.normalize();
     const side = Vector3.Cross(dir, Math.abs(dir.y) > 0.85 ? Vector3.Forward() : Vector3.Up()).normalize();
     const bowSign = rng() > 0.5 ? 1 : -1;
-    const segmentCount = Math.max(3, Math.round(3 + length * 0.35));
+    const segmentCount = Math.max(2, Math.round(2 + length * 0.26));
     let branchEnd = start.clone();
 
     for (let i = 0; i < segmentCount; i++) {

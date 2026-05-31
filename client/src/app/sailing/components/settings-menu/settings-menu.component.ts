@@ -29,6 +29,14 @@ import { OceanService } from '../../services/ocean.service';
         <div class="set-section">
           <div class="set-section-label">Graphics</div>
 
+          <div class="preset-row">
+            @for (p of presetNames; track p) {
+              <button class="preset-btn" [class.preset-btn--active]="activePreset === p"
+                      (click)="applyPreset(p)">{{ p }}</button>
+            }
+          </div>
+          <div class="q-hint" style="margin-bottom:0.7rem">One-tap quality preset. Tweak anything below and it becomes “Custom”.</div>
+
           <div class="q-row">
             <span class="q-label">Render Scale</span>
             <span class="q-value">{{ renderScalePct() }}%</span>
@@ -163,6 +171,13 @@ import { OceanService } from '../../services/ocean.service';
       border: 1px solid rgba(255,255,255,0.14); }
     .toggle-btn--on { color: #c8a44a; border-color: rgba(200,170,100,0.45);
       background: rgba(200,170,100,0.10); }
+    .preset-row { display: flex; gap: 0.3rem; }
+    .preset-btn { flex: 1; padding: 0.4rem 0.2rem; border-radius: 6px; cursor: pointer;
+      font-family: monospace; font-size: 0.68rem; font-weight: bold;
+      background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.55);
+      border: 1px solid rgba(255,255,255,0.12); }
+    .preset-btn:hover { color: #fff; background: rgba(255,255,255,0.10); }
+    .preset-btn--active { color: #0c1e35; background: #c8a44a; border-color: #c8a44a; }
     .set-back { width: 100%; padding: 0.7rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14);
       background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.75); font-family: monospace;
       font-size: 0.9rem; font-weight: bold; cursor: pointer; }
@@ -190,12 +205,29 @@ export class SettingsMenuComponent {
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
 
+  // ── Graphics presets ───────────────────────────────────────────────────────
+  // Each bundles every graphics dial. Tweaking an individual control afterwards
+  // drops the selection to "Custom" (activePreset = null).
+  readonly presetNames = ['Potato', 'Low', 'Medium', 'High', 'Ultra'] as const;
+  private readonly PRESETS: Record<string, {
+    render: number; shadows: number; clouds: number; aa: number;
+    reflections: boolean; transparency: boolean;
+  }> = {
+    Potato: { render: 0.50, shadows: 0, clouds: 0, aa: 0, reflections: false, transparency: false },
+    Low:    { render: 0.65, shadows: 1, clouds: 0, aa: 1, reflections: false, transparency: false },
+    Medium: { render: 0.80, shadows: 2, clouds: 1, aa: 1, reflections: false, transparency: true  },
+    High:   { render: 1.00, shadows: 2, clouds: 2, aa: 2, reflections: true,  transparency: true  },
+    Ultra:  { render: 1.00, shadows: 3, clouds: 3, aa: 3, reflections: true,  transparency: true  },
+  };
+  activePreset: string | null = localStorage.getItem('ignis_graphics_preset');
+
   onClose(): void { this.close.emit(); }
 
   renderScalePct(): number { return Math.round(this.renderScale * 100); }
   onRenderScale(e: Event): void {
     this.renderScale = +(e.target as HTMLInputElement).value;
     this.sceneSvc.setRenderScale(this.renderScale);
+    this.markCustom();
   }
 
   volumePct(): number { return Math.round(this.music.volume() * 100); }
@@ -209,22 +241,48 @@ export class SettingsMenuComponent {
   onShadowQuality(e: Event): void {
     this.shadowQuality = +(e.target as HTMLInputElement).value;
     this.terrain.setShadowQuality(this.shadowQuality);
+    this.markCustom();
   }
   onCloudQuality(e: Event): void {
     this.cloudQuality = +(e.target as HTMLInputElement).value;
     this.cloudSvc.setCloudQuality(this.cloudQuality);
+    this.markCustom();
   }
   onAaQuality(e: Event): void {
     this.aaQuality = +(e.target as HTMLInputElement).value;
     this.sceneSvc.setAaQuality(this.aaQuality);
+    this.markCustom();
   }
 
   toggleReflections(): void {
     this.reflectionsOn = !this.reflectionsOn;
     this.ocean.setReflectionsEnabled(this.reflectionsOn);
+    this.markCustom();
   }
   toggleTransparency(): void {
     this.transparencyOn = !this.transparencyOn;
     this.ocean.setWaterTransparencyEnabled(this.transparencyOn);
+    this.markCustom();
+  }
+
+  applyPreset(name: string): void {
+    const p = this.PRESETS[name];
+    if (!p) return;
+    this.renderScale = p.render;          this.sceneSvc.setRenderScale(p.render);
+    this.shadowQuality = p.shadows;       this.terrain.setShadowQuality(p.shadows);
+    this.cloudQuality = p.clouds;         this.cloudSvc.setCloudQuality(p.clouds);
+    this.aaQuality = p.aa;                this.sceneSvc.setAaQuality(p.aa);
+    this.reflectionsOn = p.reflections;   this.ocean.setReflectionsEnabled(p.reflections);
+    this.transparencyOn = p.transparency; this.ocean.setWaterTransparencyEnabled(p.transparency);
+    this.activePreset = name;
+    localStorage.setItem('ignis_graphics_preset', name);
+  }
+
+  /** An individual tweak drops the preset selection to "Custom". */
+  private markCustom(): void {
+    if (this.activePreset !== null) {
+      this.activePreset = null;
+      localStorage.removeItem('ignis_graphics_preset');
+    }
   }
 }

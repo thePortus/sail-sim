@@ -14,12 +14,6 @@ import {
   Scene,
   InstancedMesh,
   DirectionalLight,
-  Vector3,
-  StandardMaterial,
-  Material,
-  RenderTargetTexture,
-  FreeCamera,
-  Camera,
 } from '@babylonjs/core';
 import { CustomMaterial } from '@babylonjs/materials';
 import { Settings } from '../../app.settings';
@@ -397,11 +391,11 @@ export class TerrainService {
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
-    // Distant forests are now faked as a green canopy painted into the terrain shader
+    // Distant forests are faked as a green canopy painted into the terrain shader
     // (buildTerrainMaterial §8d) — the 42k 3-D tree instances were THE FPS bottleneck
     // (~12ms/frame CPU cull + geometry + 3 shadow cascades) and were never seen up
-    // close anyway. buildTreeFoliage is left out deliberately. Billboard silhouettes
-    // (buildForestBillboards) were tried and removed — didn't look good. Canopy only.
+    // close anyway. buildTreeFoliage is left out deliberately. (Billboard silhouettes
+    // were tried and dropped — looked worse than the canopy alone.)
     // Ground scatter (rocks/grass/driftwood/dead trees) is implemented but
     // DISABLED pending a live debug: placement works (instances are created with
     // valid positions, per console logs) but nothing renders via either thin
@@ -648,13 +642,6 @@ export class TerrainService {
     const worldDepth = bounds.maxZ - bounds.minZ;
 
     this.treePrototypeMeshes = this.createTreeArchetypes(scene);
-    // Bake distant-tree impostors and attach them as LOD levels BEFORE hiding the
-    // prototypes (the bake needs them visible at the origin). Far instances then
-    // auto-swap to a cheap cross-quad — keeps dense forests at a fraction of the cost.
-    // NOTE: setupTreeImpostorLODs (distant-tree billboard LODs) is parked — the
-    // per-instance LOD swap to alpha-tested cross-quads made FPS worse (overdraw +
-    // active-mesh explosion), not better. Kept for live debugging, not called.
-    // this.setupTreeImpostorLODs(scene);
     for (const prototype of this.treePrototypeMeshes) {
       prototype.isVisible = false;
       prototype.position.set(0, -10000, 0);
@@ -743,246 +730,6 @@ export class TerrainService {
     this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
     this.updateTreePatchVisibility();
     console.log(`[Terrain] Generated ${placed} SPS trees across ${this.treePatches.length} patches.`);
-  }
-
-  /**
-   * Sparse forest billboards for the horizon silhouette. The terrain-shader canopy
-   * (§8d) paints dense forest cheaply but leaves a smooth ground silhouette against
-   * the sky; these low-poly cross-quad impostors poke treetops above the canopy on
-   * ridges. Deliberately CHEAP and SAFE (the 42k tree mesh was the FPS wall):
-   *   • hard cap ~2500 instances (vs 42k) → ~1ms cull, not ~12ms
-   *   • static cross-quads, NO per-instance LOD (that caused the active-mesh blowup)
-   *   • NOT shadow casters (no cascade re-render)
-   *   • procedural texture, no RTT bake
-   *   • reuses the tree-patch distance culling so far ones switch off
-   */
-  private buildForestBillboards(scene: Scene, manifest: TerrainManifest): void {
-    const bounds = manifest.worldBounds;
-    const worldWidth = bounds.maxX - bounds.minX;
-    const worldDepth = bounds.maxZ - bounds.minZ;
-
-    const tex = this.buildBillboardTexture(scene);
-    const mat = new StandardMaterial('forestBillboardMat', scene);
-    mat.diffuseTexture = tex;
-    mat.useAlphaFromDiffuseTexture = true;
-    mat.transparencyMode = Material.MATERIAL_ALPHATEST;
-    mat.alphaCutOff = 0.4;
-    mat.diffuseColor = new Color3(1, 1, 1);
-    mat.specularColor = new Color3(0, 0, 0);
-    mat.emissiveColor = new Color3(0.08, 0.10, 0.07);  // floor so silhouettes never go pure black
-    mat.backFaceCulling = false;
-
-    // Cross-quad (two perpendicular planes), base at y=0, ~30 u tall clump.
-    const W = 28, H = 32;
-    const p1 = MeshBuilder.CreatePlane('forestBB_p1', { width: W, height: H, sideOrientation: Mesh.DOUBLESIDE }, scene);
-    const p2 = MeshBuilder.CreatePlane('forestBB_p2', { width: W, height: H, sideOrientation: Mesh.DOUBLESIDE }, scene);
-    p1.position.y = H * 0.5;
-    p2.position.y = H * 0.5;
-    p2.rotation.y = Math.PI / 2;
-    const proto = Mesh.MergeMeshes([p1, p2], true, true)!;
-    proto.name = 'tree_billboard';  // 'tree_' prefix → excluded from ocean reflection/refraction RTTs
-    proto.material = mat;
-    proto.isVisible = false;
-    proto.isPickable = false;
-    proto.position.set(0, -10000, 0);
-    this.sceneService.excludeFromGlow(proto);
-    this.treePrototypeMeshes = [proto];   // so disposeFoliage cleans it up
-
-    const patchSize = 2300;
-    const gridX = 220;
-    const gridZ = 220;
-    const hardCap = 2500;
-    const patchMap = new Map<string, TreePatch>();
-    let placed = 0;
-
-    for (let gz = 0; gz < gridZ && placed < hardCap; gz++) {
-      for (let gx = 0; gx < gridX && placed < hardCap; gx++) {
-        const u = (gx + this.hashNoise(gx * 0.63 + 13.7, gz * 0.71 + 5.1) * 0.9) / gridX;
-        const v = (gz + this.hashNoise(gx * 0.49 + 17.9, gz * 0.55 + 11.3) * 0.9) / gridZ;
-        const wooded = this.computeWoodedScore(u, v);
-        if (wooded <= 0) continue;
-        // Sparse accents only — silhouette, not coverage (the canopy paint does coverage).
-        if (this.hashNoise(u * 71.3 + 3.1, v * 71.3 + 9.4) > wooded * 0.5) continue;
-
-        const worldX = bounds.minX + u * worldWidth;
-        const worldZ = bounds.maxZ - v * worldDepth;
-        const y = this.getElevation(worldX, worldZ);
-        if (y <= 1.0) continue;
-        if (this.sampleSlope(u, v) > 0.55) continue;
-
-        const inst = proto.createInstance(`tree_bb_${placed}`);
-        const scaleRnd = this.hashNoise(worldX * 0.0017 + 2.1, worldZ * 0.0017 + 8.4);
-        inst.position.set(worldX, y, worldZ);
-        inst.scaling.setAll(0.8 + scaleRnd * 0.9);
-        inst.rotation.y = this.hashNoise(worldX * 0.0021 + 101.9, worldZ * 0.0021 + 44.8) * Math.PI;
-        inst.isPickable = false;
-
-        const patchX = Math.floor((worldX - bounds.minX) / patchSize);
-        const patchZ = Math.floor((worldZ - bounds.minZ) / patchSize);
-        const key = `${patchX}:${patchZ}`;
-        let patch = patchMap.get(key);
-        if (!patch) {
-          patch = {
-            root: new TransformNode(`tree_patch_${key}`, scene),
-            centerX: bounds.minX + (patchX + 0.5) * patchSize,
-            centerZ: bounds.minZ + (patchZ + 0.5) * patchSize,
-            density: 0.5, count: 0,
-          };
-          patchMap.set(key, patch);
-          this.treePatches.push(patch);
-        }
-        inst.parent = patch.root;
-        inst.freezeWorldMatrix();
-        inst.doNotSyncBoundingInfo = true;
-        patch.count += 1;
-        this.treeInstances.push(inst);
-        placed += 1;
-      }
-    }
-
-    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
-    this.updateTreePatchVisibility();
-    console.log(`[Terrain] Placed ${placed} forest billboards across ${this.treePatches.length} patches.`);
-  }
-
-  /** Procedural tree-clump silhouette (transparent background) for forest billboards. */
-  private buildBillboardTexture(scene: Scene): DynamicTexture {
-    const S = 128;
-    const tex = new DynamicTexture('forestBillboardTex', { width: S, height: S }, scene, true);
-    tex.hasAlpha = true;
-    const ctx = tex.getContext() as CanvasRenderingContext2D;
-    ctx.clearRect(0, 0, S, S);
-
-    const drawTree = (cx: number, baseY: number, w: number, h: number, conifer: boolean): void => {
-      const g = ctx.createLinearGradient(0, baseY - h, 0, baseY);
-      g.addColorStop(0, '#43702f');   // sunlit top
-      g.addColorStop(1, '#16300f');   // shaded base
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      if (conifer) {
-        ctx.moveTo(cx, baseY - h);
-        ctx.lineTo(cx + w * 0.5, baseY);
-        ctx.lineTo(cx - w * 0.5, baseY);
-        ctx.closePath();
-      } else {
-        ctx.ellipse(cx, baseY - h * 0.55, w * 0.5, h * 0.55, 0, 0, Math.PI * 2);
-      }
-      ctx.fill();
-    };
-
-    // A clump of overlapping trees along the bottom, varied height/type, so the
-    // silhouette reads as a stand of treetops rather than one shape.
-    const baseY = S - 4;
-    drawTree(S * 0.20, baseY, 38, 70, true);
-    drawTree(S * 0.42, baseY, 46, 96, false);
-    drawTree(S * 0.62, baseY, 40, 110, true);
-    drawTree(S * 0.80, baseY, 44, 82, false);
-    drawTree(S * 0.52, baseY, 50, 124, true);
-
-    tex.update(true);
-    return tex;
-  }
-
-  /**
-   * For each tree archetype, bake a flat side-view "impostor" texture and attach
-   * a cheap cross-quad (two perpendicular alpha-tested planes) as an LOD level.
-   * Babylon swaps each instance to the cross-quad past SWAP_DIST automatically and
-   * batches them as hardware instances — so a forest of 42k trees costs almost
-   * nothing in the distance (8 verts/tree, no leaf overdraw, frozen matrices).
-   *
-   * The impostor is rendered from the procedural tree itself → perfect match, no
-   * external assets. Baked unlit (pure albedo) so it never goes black; the display
-   * material is mildly lit so distant forests still read with the time of day.
-   */
-  private setupTreeImpostorLODs(scene: Scene): void {
-    const SWAP_DIST = 500;     // full 3-D mesh within this radius, cross-quad beyond
-    const CULL_DIST = 12500;   // hard cull (matches the densest patch cull radius)
-    const TEX_W = 192;
-    const TEX_H = 384;
-    const PARK_Y = -10000;     // clone bakes here, underground, so there's no flash
-
-    for (const proto of this.treePrototypeMeshes) {
-      proto.computeWorldMatrix(true);
-      const bb = proto.getBoundingInfo().boundingBox;
-      const minY = bb.minimumWorld.y;
-      const maxY = bb.maximumWorld.y;
-      const h = Math.max(1, maxY - minY);
-      const halfW = Math.max(
-        0.5,
-        Math.abs(bb.minimumWorld.x), Math.abs(bb.maximumWorld.x),
-        Math.abs(bb.minimumWorld.z), Math.abs(bb.maximumWorld.z),
-      ) * 1.04;
-      const cy = (minY + maxY) * 0.5;
-
-      // ── display material + cross-quad (built now; texture fills in async) ──
-      const rtt = new RenderTargetTexture(
-        `${proto.name}_impostor`, { width: TEX_W, height: TEX_H }, scene, true,
-      );
-      rtt.clearColor = new Color4(0, 0, 0, 0);
-      rtt.hasAlpha = true;
-
-      const imMat = new StandardMaterial(`${proto.name}_imMat`, scene);
-      imMat.diffuseTexture = rtt;
-      imMat.useAlphaFromDiffuseTexture = true;
-      imMat.transparencyMode = Material.MATERIAL_ALPHATEST;
-      imMat.alphaCutOff = 0.35;
-      imMat.diffuseColor = new Color3(1, 1, 1);
-      imMat.specularColor = new Color3(0, 0, 0);
-      imMat.emissiveColor = new Color3(0.10, 0.11, 0.09); // floor so it never goes black at night
-      imMat.backFaceCulling = false;
-
-      const p1 = MeshBuilder.CreatePlane(`${proto.name}_imp_p1`,
-        { width: halfW * 2, height: h, sideOrientation: Mesh.DOUBLESIDE }, scene);
-      const p2 = MeshBuilder.CreatePlane(`${proto.name}_imp_p2`,
-        { width: halfW * 2, height: h, sideOrientation: Mesh.DOUBLESIDE }, scene);
-      p1.position.y = minY + h * 0.5;
-      p2.position.y = minY + h * 0.5;
-      p2.rotation.y = Math.PI / 2;
-      const cross = Mesh.MergeMeshes([p1, p2], true, true)!;
-      cross.name = `${proto.name}_impostor_lod`;
-      cross.material = imMat;
-      cross.isPickable = false;
-      cross.position.set(0, -10000, 0); // template parked underground; instances render at their own matrices
-      this.sceneService.excludeFromGlow(cross);
-
-      proto.addLODLevel(SWAP_DIST, cross);
-      proto.addLODLevel(CULL_DIST, null);
-
-      // ── bake: render a throw-away CLONE (no instances attached → the RTT can't
-      // pull in the 42k tree instances) once, from an orthographic side view, into
-      // the impostor texture. We force the clone's shader to compile first so the
-      // (single, one-shot) render can't capture blank on WebGPU, then dispose every
-      // bake resource — nothing lingers in the per-frame render loop.
-      const bakeSrc = proto.clone(`${proto.name}_bakeSrc`, null)!;
-      bakeSrc.makeGeometryUnique();
-      const bakeMat = (proto.material as StandardMaterial).clone(`${proto.name}_bakeMat`)!;
-      bakeMat.disableLighting = true; // capture pure albedo, never a shadowed near-black
-      bakeSrc.material = bakeMat;
-      bakeSrc.isVisible = true;
-      bakeSrc.position.set(0, PARK_Y, 0);
-      bakeSrc.computeWorldMatrix(true);
-
-      rtt.renderList = [bakeSrc];
-      const cam = new FreeCamera(`${proto.name}_bakeCam`,
-        new Vector3(0, PARK_Y + cy, Math.max(h, halfW * 2) * 2), scene);
-      cam.setTarget(new Vector3(0, PARK_Y + cy, 0));
-      cam.mode = Camera.ORTHOGRAPHIC_CAMERA;
-      cam.orthoTop = h * 0.5 * 1.04;
-      cam.orthoBottom = -h * 0.5 * 1.04;
-      cam.orthoLeft = -halfW;
-      cam.orthoRight = halfW;
-      cam.minZ = 0.1;
-      cam.maxZ = 10000;
-      rtt.activeCamera = cam;
-
-      bakeMat.forceCompilationAsync(bakeSrc).then(() => {
-        rtt.render();
-        rtt.activeCamera = null;
-        cam.dispose();
-        bakeSrc.dispose();
-        bakeMat.dispose();
-      });
-    }
   }
 
   /**

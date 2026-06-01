@@ -427,7 +427,10 @@ export class CannonService {
       pivot.parent   = root;
       pivot.position = pivotPos.clone();
       for (const name of names) {
-        const m = this.scene.getMeshByName(name);
+        // getNodeByName (not getMeshByName): the cannon GLB's instantiated root
+        // can come back as a TransformNode rather than a Mesh, which
+        // getMeshByName would miss. Both expose .parent and .position.
+        const m = this.scene.getNodeByName(name) as TransformNode | null;
         if (!m) continue;
         // m.position is currently in vessel-root-local space.
         // After re-parenting, subtract the pivot's root-local offset so the

@@ -1,12 +1,12 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  MeshBuilder, Vector3, Color3, StandardMaterial, TransformNode,
-  Mesh, Scene, DynamicTexture, SceneLoader, Quaternion,
+  MeshBuilder, Color3, StandardMaterial, TransformNode,
+  Mesh, Scene, DynamicTexture,
 } from '@babylonjs/core';
-import '@babylonjs/loaders/glTF';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
+import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -47,6 +47,7 @@ export class MultiplayerService {
   private sceneService   = inject(SceneService);
   private oceanService   = inject(OceanService);
   private weatherService = inject(WeatherService);
+  private assetCache     = inject(VesselAssetCacheService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -245,6 +246,9 @@ export class MultiplayerService {
       this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
       this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
 
+    } else if (msg.type === 'reload_assets') {
+      this.reloadRemoteVessels(+msg.version || 0, scene);
+
     } else if (msg.type === 'kicked') {
       // Server closed this session because the same account logged in elsewhere.
       this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
@@ -346,6 +350,31 @@ export class MultiplayerService {
     if (!entry) return;
     this.disposeEntry(entry);
     this.players.delete(id);
+    this.publishSignal();
+  }
+
+  /**
+   * Admin /reloadassets: bust the asset cache (in-memory containers + browser via
+   * ?v=version) and rebuild every remote vessel from its current pose so edited GLBs
+   * appear live. The local player's own ship picks up the new geometry on next refresh.
+   */
+  private reloadRemoteVessels(version: number, scene: Scene): void {
+    this.assetCache.setVersion(version);
+    this.assetCache.clearCache();
+
+    // Snapshot identity + last-known pose before tearing the entries down. The entry
+    // IS an OtherPlayer superset, so a shallow copy is a valid addOrUpdatePlayer input.
+    const snapshots = Array.from(this.players.values()).map((e) => ({
+      id: e.id, x: e.x, z: e.z, heading: e.heading, speed: e.speed,
+      turnRate: e.turnRate, sheetAngle: e.sheetAngle, isPortTack: e.isPortTack,
+      sailState: e.sailState, vesselName: e.vesselName,
+      vesselSlug: e.vesselSlug, callsign: e.callsign,
+    }));
+
+    for (const entry of this.players.values()) this.disposeEntry(entry);
+    this.players.clear();
+
+    for (const snap of snapshots) this.addOrUpdatePlayer(snap, scene);
     this.publishSignal();
   }
 
@@ -544,33 +573,18 @@ export class MultiplayerService {
     playerId: string, slug: string, callsign: string,
     entry: OtherPlayerEntry, scene: Scene,
   ): Promise<void> {
-    const baseUrl = Settings.apiUrl + 'geometry/';
     const prefix  = 'rp_' + playerId + '_';
 
+    // Instantiate from the shared cache instead of re-importing per player:
+    // the GLB is fetched + parsed once for the whole session (by whichever
+    // vessel — local or remote — needs it first) and cheaply cloned here.
+    // The 180° Y-flip, parenting, and renderingGroupId 2 happen in instantiate().
     const loadGLB = async (
       filename: string, parent: TransformNode,
     ): Promise<TransformNode | null> => {
-      try {
-        const res = await SceneLoader.ImportMeshAsync('', baseUrl, filename, scene);
-        if (!res.meshes.length) return null;
-        const glbRoot = res.meshes[0];
-
-        // Same 180° Y-flip the local VesselService applies
-        const flipY = Quaternion.RotationAxis(Vector3.Up(), Math.PI);
-        glbRoot.rotationQuaternion = glbRoot.rotationQuaternion
-          ? flipY.multiply(glbRoot.rotationQuaternion)
-          : flipY;
-
-        glbRoot.parent = parent;
-        for (const m of res.meshes) {
-          m.renderingGroupId = 2;
-          m.isPickable = false;
-        }
-        return glbRoot as unknown as TransformNode;
-      } catch (err) {
-        console.warn(`[Multiplayer] GLB load failed: ${filename}`, err);
-        return null;
-      }
+      const root = await this.assetCache.instantiate(filename, scene, parent);
+      if (root) for (const m of root.getChildMeshes(false)) m.isPickable = false;
+      return root;
     };
 
     // Hull (includes mast — same as local vessel)

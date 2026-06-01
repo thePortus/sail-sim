@@ -26,7 +26,13 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use('/', express.static(path.join(__dirname, 'pages')))
 app.use('/api', express.static(path.join(__dirname, 'pages')));
-app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry')));
+// Vessel GLBs change rarely; let browsers cache them across sessions (ETag still
+// revalidates on change). The client also instantiates each GLB once in-memory
+// per session (VesselAssetCacheService), so this mainly speeds cold loads.
+app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry'), {
+  maxAge: '1d',
+  etag: true,
+}));
 // set API routes
 require('./routes/index')(app);
 

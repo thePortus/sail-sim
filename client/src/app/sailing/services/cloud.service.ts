@@ -156,6 +156,9 @@ export class CloudService {
   // Layer B: sprite cloud masses
   private spriteManager: SpriteManager | null = null;
   private sprites: CloudSpriteEntry[] = [];
+  // P5: sprite clouds retired in favour of the volumetric layer. Kept dormant as a
+  // possible low-end fallback. Flip true to build + tick the old billboard clouds.
+  private spritesEnabled = false;
 
   // Layer C: storm fog (GPU particles, CPU fallback)
   private stormTexture: DynamicTexture | null = null;
@@ -240,7 +243,10 @@ export class CloudService {
     if (!scene) return;
 
     this.scene = scene;
-    this.initSpriteLayer(scene);
+    // Sprite cloud layer RETIRED (Phase 5): the volumetric clouds are now the sole cloud
+    // representation and look better alone. initSpriteLayer/tickSprites/buildCloudSpriteImage
+    // are kept in the file (dormant) as a potential low-end fallback, but not built or ticked.
+    if (this.spritesEnabled) this.initSpriteLayer(scene);
     this.initStormLayer(scene);
     this.initRainLayer(scene);
     this.initLensRain();
@@ -280,6 +286,9 @@ export class CloudService {
     // Keep volumetric layer in sync.
     if (this.volClouds) {
       this.volClouds.updateCoverage(this.targetCloudiness);
+      // Cloud TYPE follows the weather: calm skies → fair-weather cumulus, storms →
+      // towering cumulonimbus (taller, darker-based, more broken).
+      this.volClouds.cloudType = 0.40 + this.targetStorminess * 0.55;
       this.volClouds.updateWind(
         new Vector3(this.windX, 0, this.windZ),
         this.windSpeed,
@@ -635,7 +644,7 @@ export class CloudService {
     const camX = camera?.position.x ?? 0;
     const camZ = camera?.position.z ?? 0;
 
-    this.tickSprites(dt, camX, camZ);
+    if (this.spritesEnabled) this.tickSprites(dt, camX, camZ);
     this.tickStormLayer(dt, camX, camZ);
     this.tickRainLayer(dt, camX, camZ);
     this.tickLightning(dt);

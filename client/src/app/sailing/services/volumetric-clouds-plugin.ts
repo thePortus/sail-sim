@@ -63,6 +63,7 @@ uniform vec3  cameraForward;
 uniform vec3 sunDirection;   // unit vec toward sun
 uniform vec3 sunColor;
 uniform vec3 skyColor;
+uniform vec3 groundColor;    // upward bounce light (ocean/terrain tint) onto cloud bases
 
 // Cloud slab.
 uniform float cloudBase;
@@ -70,6 +71,7 @@ uniform float cloudTop;
 uniform float cloudCoverage;
 uniform float cloudDensity;
 uniform float absorptionCoeff;
+uniform float cloudType;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 = towering cumulonimbus
 
 // Wind / time.
 uniform float time;
@@ -150,11 +152,15 @@ float vc_noise3D(vec3 uvw) {
 
 float vc_heightFrac(float y) { return vc_remap(y, cloudBase, cloudTop); }
 
-// Height gradient: rises from 0 at the slab base, peaks in the middle, falls
-// back to 0 at the top.  vc_remap maps [lo,hi]→[0,1]; invert the top term.
+// Height gradient — its shape is driven by cloudType so one field renders different
+// cloud forms: stratus stays a low flat sheet, cumulus builds to mid-height with a
+// rounded top, cumulonimbus towers to the top of the slab. The cloud TOP rises and the
+// base softens with type. (type≈0.36 reproduces the previous fixed gradient.)
 float vc_heightGrad(float h) {
-    return vc_remap(h, 0.0,  0.07)               // [0.00, 0.07] → [0, 1]
-         * (1.0 - vc_remap(h, 0.65, 1.0));        // [0.65, 1.00] → [1, 0]
+    float topEnd = mix(0.42, 1.0,  cloudType);   // how high the cloud builds
+    float baseW  = mix(0.04, 0.12, cloudType);   // base softness (taller types fade in slower)
+    return vc_sat(vc_remap(h, 0.0, baseW)                       // rise off the base
+                * (1.0 - vc_remap(h, topEnd * 0.5, topEnd)));   // round off below the top
 }
 
 float vc_getDensity(vec3 p, float lod) {
@@ -186,7 +192,9 @@ float vc_getDensity(vec3 p, float lod) {
         vec3  dp  = p * 0.00038 + vec3(wd.x, 0.0, wd.y) * 0.00012;
         float det = vc_noise3D(dp * 3.0);
         float ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
-        shp = vc_remap(shp, ero * 0.22, 1.0);
+        // Erode more for puffy/storm types (broken cauliflower edges), less for stratus
+        // (smoother continuous sheet).
+        shp = vc_remap(shp, ero * mix(0.10, 0.32, cloudType), 1.0);
     }
 
     return vc_sat(shp) * cloudDensity;
@@ -269,8 +277,12 @@ void main(void) {
     // Time-varying jitter to break up banding.
     float jit = fract(sin(dot(vUV + fract(time * 0.1), vec2(127.1, 311.7))) * 43758.5) * step;
 
-    float cosA   = dot(rd, sunDirection);
-    float phaseV = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
+    // Dual-lobe phase: a broad lobe for overall forward scatter + a sharp forward
+    // lobe that lights the cloud edge facing the sun — the "silver lining".
+    float cosA    = dot(rd, sunDirection);
+    float phaseBroad = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
+    float phaseFwd   = vc_hgPhase(cosA, 0.92);   // tight forward spike
+    float phaseV     = phaseBroad + phaseFwd * 1.6;
 
     float transmit = 1.0;
     vec3  scatter  = vec3(0.0);
@@ -284,11 +296,19 @@ void main(void) {
 
         if (rho > 0.001) {
             float lt  = vc_lightMarch(p);
+            float hf  = vc_heightFrac(p.y);
             // Sky irradiance: strong at cloud top (open sky above), moderate at
-            // base (shadowed by the cloud mass itself).  This is the primary
-            // source of cloud "whiteness" during the day.
-            float amb = 0.25 + 0.45 * vc_heightFrac(p.y);
-            vec3  lum = sunColor * lt * phaseV + skyColor * amb;
+            // base (shadowed by the cloud mass itself). Primary daytime whitening.
+            float amb = 0.25 + 0.45 * hf;
+            // Multi-scatter approximation: thin/edge regions (high light transmit)
+            // glow with extra forward-scattered sun — boosts the silver lining and
+            // keeps deep cloud cores from going flat-black.
+            float ms  = (0.35 + 0.65 * lt);
+            // Ground/ocean bounce: faint upward light tints the shadowed cloud bases.
+            vec3  bounce = groundColor * (1.0 - hf) * 0.5;
+            vec3  lum = sunColor * lt * phaseV * ms
+                      + skyColor * amb
+                      + bounce;
 
             // Energy-conserving integration.
             float sT   = exp(-rho * absorptionCoeff * step);
@@ -368,11 +388,13 @@ uniform cameraForward: vec3f;
 uniform sunDirection: vec3f;
 uniform sunColor: vec3f;
 uniform skyColor: vec3f;
+uniform groundColor: vec3f;   // upward bounce light (ocean/terrain) onto cloud bases
 uniform cloudBase: f32;
 uniform cloudTop: f32;
 uniform cloudCoverage: f32;
 uniform cloudDensity: f32;
 uniform absorptionCoeff: f32;
+uniform cloudType: f32;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 = towering cumulonimbus
 uniform time: f32;
 uniform windDir: vec2f;
 uniform windSpeed: f32;
@@ -435,7 +457,11 @@ fn vc_heightFrac(y: f32) -> f32 {
 }
 
 fn vc_heightGrad(h: f32) -> f32 {
-    return vc_remap(h, 0.0, 0.07) * (1.0 - vc_remap(h, 0.65, 1.0));
+    // Shape driven by cloudType: stratus flat & low, cumulus mid w/ rounded top,
+    // cumulonimbus towers to the slab top. (type≈0.36 ≈ the previous fixed gradient.)
+    let topEnd = mix(0.42, 1.0,  uniforms.cloudType);
+    let baseW  = mix(0.04, 0.12, uniforms.cloudType);
+    return vc_sat(vc_remap(h, 0.0, baseW) * (1.0 - vc_remap(h, topEnd * 0.5, topEnd)));
 }
 
 fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
@@ -462,7 +488,8 @@ fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
         let dp  = p * 0.00038 + vec3f(wd.x, 0.0, wd.y) * 0.00012;
         let det = vc_noise3D(dp * 3.0);
         let ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
-        shp = vc_remap(shp, ero * 0.22, 1.0);
+        // More erosion for puffy/storm types, less for stratus (smoother sheet).
+        shp = vc_remap(shp, ero * mix(0.10, 0.32, uniforms.cloudType), 1.0);
     }
 
     return vc_sat(shp) * uniforms.cloudDensity;
@@ -539,8 +566,11 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     let jit_uv = input.vUV + fract(uniforms.time * 0.1);
     let jit    = fract(sin(dot(jit_uv, vec2f(127.1, 311.7))) * 43758.5) * step_size;
 
-    let cosA   = dot(rd, uniforms.sunDirection);
-    let phaseV = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
+    // Dual-lobe phase: broad forward scatter + a tight forward spike (silver lining).
+    let cosA       = dot(rd, uniforms.sunDirection);
+    let phaseBroad = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
+    let phaseFwd   = vc_hgPhase(cosA, 0.92);
+    let phaseV     = phaseBroad + phaseFwd * 1.6;
 
     var transmit: f32  = 1.0;
     var scatter:  vec3f = vec3f(0.0);
@@ -554,10 +584,16 @@ fn main(input: FragmentInputs)->FragmentOutputs {
 
         if (rho > 0.001) {
             let lt  = vc_lightMarch(p);
-            // Sky irradiance: strong at cloud top (open sky above), moderate at
-            // base (shadowed by the cloud mass itself).  Primary whitening term.
-            let amb = 0.25 + 0.45 * vc_heightFrac(p.y);
-            let lum = uniforms.sunColor * lt * phaseV + uniforms.skyColor * amb;
+            let hf  = vc_heightFrac(p.y);
+            // Sky irradiance: strong at cloud top, moderate at base. Primary whitening.
+            let amb = 0.25 + 0.45 * hf;
+            // Multi-scatter approx: thin/edge regions glow with extra forward sun.
+            let ms  = (0.35 + 0.65 * lt);
+            // Ground/ocean bounce: faint upward light tints shadowed cloud bases.
+            let bounce = uniforms.groundColor * (1.0 - hf) * 0.5;
+            let lum = uniforms.sunColor * lt * phaseV * ms
+                    + uniforms.skyColor * amb
+                    + bounce;
 
             let sT   = exp(-rho * uniforms.absorptionCoeff * step_size);
             let inte = (1.0 - sT) / max(rho * uniforms.absorptionCoeff, 1e-5);
@@ -615,6 +651,7 @@ export interface VolumetricCloudsOptions {
   cloudCoverage?:    number;
   cloudDensity?:     number;
   absorptionCoeff?:  number;
+  cloudType?:        number;
   marchSteps?:       number;
   lightSteps?:       number;
   renderScale?:      number;
@@ -636,6 +673,7 @@ export class VolumetricCloudsPlugin {
   cloudCoverage:   number;
   cloudDensity:    number;
   absorptionCoeff: number;
+  cloudType:       number;   // 0 stratus → ~0.4 cumulus → 1 cumulonimbus
   marchSteps:      number;
   lightSteps:      number;
   windDirection:   Vector3;
@@ -684,6 +722,7 @@ export class VolumetricCloudsPlugin {
     this.cloudBaseHeight = options.cloudBaseHeight ?? 900;
     this.cloudThickness  = options.cloudThickness  ?? 600;
     this.cloudCoverage   = options.cloudCoverage   ?? 0.50;
+    this.cloudType       = options.cloudType       ?? 0.40;   // ≈ the previous fixed look
     this.cloudDensity    = options.cloudDensity    ?? 0.40;
     this.absorptionCoeff = options.absorptionCoeff ?? 0.004;
     this.marchSteps      = options.marchSteps      ?? 48;
@@ -772,8 +811,8 @@ export class VolumetricCloudsPlugin {
       'volumetricClouds',
       /* uniforms */ [
         'invViewProjection', 'cameraPosition', 'cameraForward',
-        'sunDirection', 'sunColor', 'skyColor',
-        'cloudBase', 'cloudTop', 'cloudCoverage', 'cloudDensity', 'absorptionCoeff',
+        'sunDirection', 'sunColor', 'skyColor', 'groundColor',
+        'cloudBase', 'cloudTop', 'cloudCoverage', 'cloudDensity', 'absorptionCoeff', 'cloudType',
         'time', 'windDir', 'windSpeed',
         'nearZ', 'farZ', 'marchSteps', 'lightSteps',
         'noiseSliceDim', 'noiseDepth', 'atlasW', 'atlasH', 'atlasCols',
@@ -870,11 +909,22 @@ export class VolumetricCloudsPlugin {
     effect.setVector3('sunColor', sunColor);
     effect.setVector3('skyColor',  skyColor);
 
+    // Ground/ocean bounce — a faint upward light that tints the shadowed cloud bases
+    // (sea-blue by day, fading to near-black at night). Subtle, but it stops the
+    // undersides reading as flat dead grey.
+    const bounceColor = new Vector3(
+      stormDim * (0.05 + 0.16 * el),
+      stormDim * (0.07 + 0.20 * el),
+      stormDim * (0.09 + 0.26 * el),
+    );
+    effect.setVector3('groundColor', bounceColor);
+
     effect.setFloat('cloudBase',       this.cloudBaseHeight);
     effect.setFloat('cloudTop',        this.cloudBaseHeight + this.cloudThickness);
     effect.setFloat('cloudCoverage',   this.cloudCoverage);
     effect.setFloat('cloudDensity',    this.cloudDensity);
     effect.setFloat('absorptionCoeff', this.absorptionCoeff);
+    effect.setFloat('cloudType',       this.cloudType);
 
     effect.setFloat('time',      this.elapsedSecs);
     effect.setVector2('windDir', new Vector2(

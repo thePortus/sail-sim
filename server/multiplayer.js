@@ -39,22 +39,10 @@ const JOIN_LEAVE_MAX_PLAYERS = 30;
  *     { type: 'leave', id }
  */
 
-// ── Server-side weather state ─────────────────────────────────────────────────
-
-const weather = {
-  windBearing:   180 + Math.random() * 180,
-  windSpeed:     6 + Math.random() * 6,
-  targetBearing: 0,
-  targetSpeed:   0,
-  timeSec:       0,
-  nextTargetSec: 30,
-};
-weather.targetBearing = weather.windBearing;
-weather.targetSpeed   = weather.windSpeed;
-
-function beaufortFromSpeed(speed) {
-  return Math.min(8, Math.max(0, Math.floor(speed / 2.8)));
-}
+// ── Server-authoritative weather state ────────────────────────────────────────
+// Single source of truth shared with the admin REST controller (weather-state.js),
+// so every client — and every admin override — sees identical conditions.
+const weatherState = require('./weather-state');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -77,43 +65,8 @@ function parseTargetAndRest(input) {
   return { target: s.slice(0, sp).trim(), rest: s.slice(sp + 1).trim() };
 }
 
-function angularDiff(target, current) {
-  let diff = ((target - current) + 360) % 360;
-  if (diff > 180) diff -= 360;
-  return diff;
-}
-
-function weatherTick() {
-  weather.timeSec++;
-  if (weather.timeSec >= weather.nextTargetSec) {
-    const dramatic = Math.random() < 0.10;
-    if (dramatic) {
-      const shift = (Math.random() - 0.5) * 240;
-      weather.targetBearing = (weather.windBearing + shift + 360) % 360;
-      weather.targetSpeed   = Math.max(3, Math.min(22, weather.windSpeed + (Math.random() - 0.5) * 28));
-    } else {
-      const shift = (Math.random() - 0.5) * 50;
-      weather.targetBearing = (weather.windBearing + shift + 360) % 360;
-      weather.targetSpeed   = Math.max(3, Math.min(16, weather.windSpeed + (Math.random() - 0.5) * 12));
-    }
-    weather.nextTargetSec = weather.timeSec + 60 + Math.random() * 90;
-  }
-  const bearingDiff = angularDiff(weather.targetBearing, weather.windBearing);
-  const bearingStep = Math.sign(bearingDiff) * Math.min(Math.abs(bearingDiff), 1.2);
-  weather.windBearing = (weather.windBearing + bearingStep + 360) % 360;
-  const speedDiff = weather.targetSpeed - weather.windSpeed;
-  weather.windSpeed = Math.max(2, Math.min(22,
-    weather.windSpeed + Math.sign(speedDiff) * Math.min(Math.abs(speedDiff), 0.5)));
-}
-
 function currentWaveState() {
-  return {
-    type:        'wave_state',
-    windBearing: +weather.windBearing.toFixed(2),
-    windSpeed:   +weather.windSpeed.toFixed(2),
-    beaufort:    beaufortFromSpeed(weather.windSpeed),
-    t:           weather.timeSec,
-  };
+  return weatherState.snapshot();
 }
 
 // ── Friend helpers ────────────────────────────────────────────────────────────
@@ -327,19 +280,25 @@ function attachMultiplayer(server) {
   const players = new Map();
   let nextId = 1;
 
-  // ── Weather tick (1 Hz) ───────────────────────────────────────────────────────
+  // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
+  const broadcastWeather = () => {
+    const msg = JSON.stringify(currentWaveState());
+    for (const [, p] of players) {
+      if (p.ws.readyState === 1) p.ws.send(msg);
+    }
+  };
   let broadcastCooldown = 0;
   setInterval(() => {
-    weatherTick();
-    broadcastCooldown++;
-    if (broadcastCooldown >= 5) {
+    weatherState.tick();
+    if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
-      const msg = JSON.stringify(currentWaveState());
-      for (const [, p] of players) {
-        if (p.ws.readyState === 1) p.ws.send(msg);
-      }
+      broadcastWeather();
     }
   }, 1000);
+
+  // Push an immediate snapshot to everyone whenever an admin override / time change
+  // happens, so the whole server updates at once instead of waiting for the next tick.
+  weatherState.onChange(broadcastWeather);
 
   wss.on('connection', (ws) => {
     const id = String(nextId++);

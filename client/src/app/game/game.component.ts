@@ -229,6 +229,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       this.cloudService.updateWeather(w);
     });
 
+    // Day/night clock is server-authoritative — apply the server's offset so every
+    // client shares one time of day (and admin time changes hit the whole server).
+    effect(() => {
+      this.sceneService.setServerTimeOffset(this.weatherService.timeOffsetSec());
+    });
+
     // Wire vessel state → multiplayer broadcast
     effect(() => {
       const vs = this.vesselService.state();

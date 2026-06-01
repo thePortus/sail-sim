@@ -451,7 +451,7 @@ void main() {
       float n0 = rainField(rp, rt);
       vec2  grad = vec2(rainField(rp + vec2(e, 0.0), rt) - n0,
                         rainField(rp + vec2(0.0, e), rt) - n0) / e;
-      N = normalize(N + vec3(grad.x, 0.0, grad.y) * (0.075 * u_rainIntensity * nearF));
+      N = normalize(N + vec3(grad.x, 0.0, grad.y) * (0.18 * u_rainIntensity * nearF));
     }
   }
 
@@ -534,13 +534,15 @@ void main() {
     // 5. Rain impacts on the shallow turquoise/surf — the seabed-reveal overwrites the
     //    surface colour here, so the normal-based ripples (added earlier) don't show;
     //    paint the drop dimples directly as little bright splashes when it's raining.
-    if (u_rainIntensity > 0.01) {
+    // Gate strictly to the shallow/surf zone (where the seabed-reveal washed out the
+    // normal-based ripples). Open water — even within the shore-map bounds — keeps only
+    // the subtle normal ripples, so drops there aren't over-painted.
+    float rainShoreMask = smoothstep(0.45, 0.75, proximity);
+    if (u_rainIntensity > 0.01 && rainShoreMask > 0.001) {
       float rNear = 1.0 - smoothstep(25.0, 180.0, length(v_worldPos - u_cameraPosition));
       if (rNear > 0.001) {
         float drops = rainField(worldXZ * 2.2, u_Time);
-        // Soft rain gate (0.4..1) so even light rain shows clearly; darken the impact
-        // dimple strongly (reads on bright/turquoise surf) + a bright rim pop.
-        float dAmt = drops * (0.4 + 0.6 * u_rainIntensity) * rNear;
+        float dAmt = drops * (0.4 + 0.6 * u_rainIntensity) * rNear * rainShoreMask;
         color *= 1.0 - dAmt * 0.85;
         color += vec3(0.9, 0.95, 1.0) * dAmt * 0.5;
       }
@@ -1068,7 +1070,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
       let n0 = rainField(rp, rt);
       let grad = vec2f(rainField(rp + vec2f(e, 0.0), rt) - n0,
                        rainField(rp + vec2f(0.0, e), rt) - n0) / e;
-      N = normalize(N + vec3f(grad.x, 0.0, grad.y) * (0.075 * uniforms.u_rainIntensity * nearF));
+      N = normalize(N + vec3f(grad.x, 0.0, grad.y) * (0.18 * uniforms.u_rainIntensity * nearF));
     }
   }
 
@@ -1142,11 +1144,12 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.50));
     // 5. Rain impacts on the shallow turquoise/surf (seabed-reveal overwrites the
     //    normal-based ripples here, so paint the drop splashes directly).
-    if (uniforms.u_rainIntensity > 0.01) {
+    let rainShoreMask = smoothstep(0.45, 0.75, proximity);
+    if (uniforms.u_rainIntensity > 0.01 && rainShoreMask > 0.001) {
       let rNear = 1.0 - smoothstep(25.0, 180.0, length(input.v_worldPos - uniforms.u_cameraPosition));
       if (rNear > 0.001) {
         let drops = rainField(worldXZ * 2.2, uniforms.u_Time);
-        let dAmt = drops * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear;
+        let dAmt = drops * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear * rainShoreMask;
         color *= 1.0 - dAmt * 0.85;
         color += vec3f(0.9, 0.95, 1.0) * (dAmt * 0.5);
       }
@@ -1698,6 +1701,11 @@ export class OceanService {
     this._cloudCoverage = coverage;
     this._sunElevation  = sunElevation;
   }
+
+  /** Current cloud coverage (0–1) — shared with the terrain so its cloud shadows match. */
+  getCloudCoverage(): number { return this._cloudCoverage; }
+  /** Current shader time (same clock that drifts the ocean's cloud shadows). */
+  getOceanTime(): number { return this.elapsed; }
 
   /** Call each frame from CloudService — drives the surface rain-ripple normals. */
   setRainIntensity(intensity: number): void {

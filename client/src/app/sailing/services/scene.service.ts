@@ -142,6 +142,12 @@ export class SceneService {
     this.timeOffsetSecs = 0;
   }
 
+  /** Apply the server-authoritative day/night offset directly (game-cycle seconds).
+   *  Driven from the weather snapshot so every client shares one time of day. */
+  setServerTimeOffset(offsetSecs: number): void {
+    this.timeOffsetSecs = ((offsetSecs % (this.SECS_PER_GAME_HOUR * 24)) + (this.SECS_PER_GAME_HOUR * 24)) % (this.SECS_PER_GAME_HOUR * 24);
+  }
+
   async initAsync(canvas: HTMLCanvasElement): Promise<void> {
     await this.zone.runOutsideAngular(async () => {
 

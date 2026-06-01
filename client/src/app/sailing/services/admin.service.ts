@@ -21,16 +21,18 @@ import { Settings } from '../../app.settings';
 export class AdminService {
   private http = inject(HttpClient);
 
-  setWeatherOverride(windSpeed: number, fromBearingDeg: number): Observable<any> {
-    return this.http.post(`${Settings.apiUrl}weather/override`, { windSpeed, fromBearingDeg });
+  setWeatherOverride(windSpeed: number, fromBearingDeg: number, cloudiness?: number): Observable<any> {
+    return this.http.post(`${Settings.apiUrl}weather/override`,
+      cloudiness === undefined ? { windSpeed, fromBearingDeg } : { windSpeed, fromBearingDeg, cloudiness });
   }
 
   clearWeatherOverride(): Observable<any> {
     return this.http.delete(`${Settings.apiUrl}weather/override`);
   }
 
-  setTimeOffset(offsetSecs: number): Observable<any> {
-    return this.http.post(`${Settings.apiUrl}weather/time-offset`, { offsetSecs });
+  /** targetGameHour: 0–23.99. The server computes the offset and broadcasts it. */
+  setTimeOffset(targetGameHour: number): Observable<any> {
+    return this.http.post(`${Settings.apiUrl}weather/time-offset`, { targetGameHour });
   }
 
   clearTimeOffset(): Observable<any> {

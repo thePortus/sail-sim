@@ -186,7 +186,7 @@ export class MultiplayerService {
       this.removePlayer(msg.id);
 
     } else if (msg.type === 'wave_state') {
-      this.weatherService.receiveServerState(msg.windBearing, msg.windSpeed);
+      this.weatherService.receiveServerState(msg);
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;

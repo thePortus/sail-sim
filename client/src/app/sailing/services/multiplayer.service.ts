@@ -664,6 +664,11 @@ export class MultiplayerService {
     plane.billboardMode = Mesh.BILLBOARDMODE_ALL;
     plane.isPickable    = false;
     plane.material      = mat;
+    // Group 2 = same layer as terrain/ocean-near/vessels (see VesselService/TerrainService).
+    // The default group 0 renders BEFORE the group-2 world, so the shared depth buffer lets
+    // foreground ocean/terrain paint over the nameplate — making it vanish. Matching the
+    // world's group restores correct depth sorting: visible above the hull, hidden by hills.
+    plane.renderingGroupId = 2;
 
     return plane;
   }

@@ -7,13 +7,17 @@
 const md5    = require('md5');
 const config = require('../config/db.config.js');
 
+const ownerUsername = process.env.OWNER_USERNAME || 'sail-sim-owner';
+const ownerPassword = process.env.OWNER_PASSWORD || 'password';
+const ownerCallsign = process.env.OWNER_CALLSIGN || 'Teach';
+
 module.exports = {
   async up(queryInterface) {
     await queryInterface.bulkInsert('users', [
       {
-        username:  config.OWNER_USERNAME,
-        password:  md5(config.OWNER_PASSWORD),
-        callsign:     config.OWNER_USERNAME,
+        username:  ownerUsername,
+        password:  md5(ownerPassword),
+        callsign:     ownerCallsign,
         role:      'Owner',
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -22,6 +26,6 @@ module.exports = {
   },
 
   async down(queryInterface) {
-    await queryInterface.bulkDelete('users', { username: config.OWNER_USERNAME });
+    await queryInterface.bulkDelete('users', { username: ownerUsername });
   },
 };

@@ -51,6 +51,27 @@ function beaufortFromSpeed(speed) {
   return Math.min(8, Math.max(0, Math.floor(speed / 2.8)));
 }
 
+/**
+ * Split a command argument string into a target callsign and the remaining text.
+ * Callsigns containing spaces must be wrapped in double quotes; an unquoted target
+ * is the first whitespace-delimited token. Returns null if no target is present.
+ *   '"Red Sail" hello there' → { target: 'Red Sail', rest: 'hello there' }
+ *   'Solo hello there'       → { target: 'Solo',      rest: 'hello there' }
+ *   '"Red Sail"'             → { target: 'Red Sail', rest: '' }
+ */
+function parseTargetAndRest(input) {
+  const s = String(input).trim();
+  if (!s) return null;
+  if (s[0] === '"') {
+    const end = s.indexOf('"', 1);
+    if (end === -1) return null;                         // unterminated quote
+    return { target: s.slice(1, end).trim(), rest: s.slice(end + 1).trim() };
+  }
+  const sp = s.indexOf(' ');
+  if (sp === -1) return { target: s, rest: '' };
+  return { target: s.slice(0, sp).trim(), rest: s.slice(sp + 1).trim() };
+}
+
 function angularDiff(target, current) {
   let diff = ((target - current) + 360) % 360;
   if (diff > 180) diff -= 360;
@@ -119,6 +140,56 @@ function computeMutuals(myCallsign, myFriends, playersMap) {
 function sendFriendUpdate(ws, myFriends, mutuals) {
   if (ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'friend_update', myFriends, mutuals }));
+  }
+}
+
+/** Send a system chat line to one connection (shown as ⚓ System in the client). */
+function sysReply(ws, text) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text }));
+  }
+}
+
+/**
+ * Handle a /promote or /demote chat command. The WS layer is unauthenticated, so we
+ * verify the SENDER's privilege from the DB (by their callsign) rather than trusting
+ * the client. Rules: sender must be Owner/Admin; the Owner's role is immutable; you
+ * can't change your own role. Replies to the sender (and notifies the target if online).
+ */
+async function handleRoleCommand(senderId, senderCallsign, targetCallsign, newRole, players) {
+  const senderEntry = players.get(senderId);
+  const reply = (t) => sysReply(senderEntry?.ws, t);
+
+  if (!targetCallsign) { reply('Usage: /promote "<callsign>"  or  /demote "<callsign>"'); return; }
+  if (targetCallsign === senderCallsign) { reply('You cannot change your own role.'); return; }
+
+  try {
+    const sender = await User.findOne({ where: { callsign: senderCallsign }, attributes: ['role'] });
+    const senderRole = sender?.role;
+    if (senderRole !== 'Owner' && senderRole !== 'Admin') {
+      reply('Only an Owner or Admin may promote or demote players.');
+      return;
+    }
+
+    const target = await User.findOne({ where: { callsign: targetCallsign }, attributes: ['id', 'callsign', 'role'] });
+    if (!target) { reply(`No player found with callsign "${targetCallsign}".`); return; }
+    if (target.role === 'Owner') { reply("The Owner's role cannot be changed."); return; }
+    if (target.role === newRole) { reply(`"${target.callsign}" is already ${newRole === 'Admin' ? 'an Admin' : 'a regular user'}.`); return; }
+
+    await User.update({ role: newRole }, { where: { id: target.id } });
+
+    const verb = newRole === 'Admin' ? 'promoted' : 'demoted';
+    reply(`"${target.callsign}" has been ${verb} to ${newRole === 'Admin' ? 'Admin' : 'regular user'}.`);
+
+    // Notify the target if they're online.
+    for (const [, p] of players) {
+      if (p.state?.callsign === target.callsign && p.ws.readyState === 1) {
+        sysReply(p.ws, `You have been ${verb} to ${newRole === 'Admin' ? 'Admin' : 'a regular user'} by ${senderCallsign}.`);
+        break;
+      }
+    }
+  } catch (err) {
+    reply('Could not change role (server error).');
   }
 }
 
@@ -209,6 +280,27 @@ function attachMultiplayer(server) {
 
         // On first callsign assignment: load friends from DB
         if (state.callsign && state.callsign !== prevCallsign) {
+          // ── Single-session enforcement ──────────────────────────────────────
+          // Each account (callsign) may only be live in one window. If another
+          // connection already holds this callsign, kick the OLDER one — the newest
+          // login wins. Prevents the "two ghost ships of the same player" bug.
+          for (const [pid, p] of players) {
+            if (pid !== id && p.state?.callsign === state.callsign) {
+              if (p.ws.readyState === 1) {
+                p.ws.send(JSON.stringify({
+                  type: 'kicked',
+                  reason: 'This account was opened in another window.',
+                }));
+                p.ws.close(4001, 'duplicate-login');
+              }
+              // Tell everyone the old vessel is gone so its ghost is removed.
+              const leave = JSON.stringify({ type: 'leave', id: pid });
+              for (const [, q] of players) {
+                if (q.ws.readyState === 1) q.ws.send(leave);
+              }
+              players.delete(pid);
+            }
+          }
           loadAndBroadcastFriends(id, state.callsign, players);
         }
 
@@ -296,10 +388,12 @@ function attachMultiplayer(server) {
 
         if (text.startsWith('/t ')) {
           const rest = text.slice(3).trim();
-          const spaceIdx = rest.indexOf(' ');
-          if (spaceIdx === -1) return;
-          const targetCallsign = rest.slice(0, spaceIdx).trim();
-          const dmText         = rest.slice(spaceIdx + 1).trim();
+          // Callsigns may contain spaces, so they can be wrapped in double quotes:
+          //   /t "Red Sail" hello   →  target "Red Sail", message "hello"
+          //   /t Solo hello         →  target "Solo",      message "hello"  (unquoted = first token)
+          const parsed = parseTargetAndRest(rest);
+          if (!parsed) return;
+          const { target: targetCallsign, rest: dmText } = parsed;
           if (!dmText || !targetCallsign) return;
 
           const dmMsg = JSON.stringify({
@@ -313,6 +407,16 @@ function attachMultiplayer(server) {
           }
           const senderEntry = players.get(id);
           if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg);
+
+        } else if (text.startsWith('/promote ') || text.startsWith('/demote ')) {
+          // /promote "Red Sail"  → make target an Admin
+          // /demote  "Red Sail"  → make target a regular Viewer
+          const isPromote = text.startsWith('/promote ');
+          const arg       = text.slice(isPromote ? 9 : 8).trim();
+          const parsed    = parseTargetAndRest(arg);
+          const targetCallsign = parsed?.target;
+          const newRole   = isPromote ? 'Admin' : 'Viewer';
+          handleRoleCommand(id, senderCallsign, targetCallsign, newRole, players);
 
         } else {
           const globalMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });

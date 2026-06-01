@@ -21,6 +21,8 @@ module.exports = app => {
   router.get('/profile/:username', limitRate, auth.verifyToken, controller.findOne);
   // Update
   router.put('/update/:username', limitRate, auth.verifyToken, controller.update);
+  // Promote/demote by callsign (Owner/Admin only). Body: { role }.
+  router.put('/role/:callsign', limitRate, auth.verifyAdminToken, controller.setRoleByCallsign);
   // Delete
   router.delete('/delete/:username', limitRate, auth.verifyAdminToken, controller.delete);
   app.use('/user', router);

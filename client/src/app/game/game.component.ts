@@ -1,7 +1,7 @@
 import {
   Component, ElementRef, ViewChild,
   AfterViewInit, OnDestroy, inject, signal, effect, computed,
-  HostListener,
+  HostListener, untracked,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
@@ -223,6 +223,18 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       this.multiplayerService.updateLocalState(
         vs.x, vs.z, vs.heading, vs.speed, vs.sailState, 'Sloop', this.selectedSlug,
       );
+    });
+
+    // Kicked by the server because this account was opened in another window —
+    // tear down this session and return to the selection screen with a notice.
+    effect(() => {
+      const reason = this.multiplayerService.kickedReason();
+      if (!reason) return;
+      untracked(() => {
+        if (this.phase() === 'selecting') return;   // already out
+        this.onExitGame();
+        this.loadingMsg.set(reason);
+      });
     });
   }
 

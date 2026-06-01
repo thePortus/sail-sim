@@ -18,7 +18,7 @@ import { AuthService } from '../../../services/auth.service';
       <div class="chat-drag-handle" (mousedown)="onDragStart($event)">
         <span class="chat-drag-grip">⣿</span>
         <span class="chat-drag-title">Chat</span>
-        <span class="chat-drag-hint">/friend &lt;name&gt; to befriend</span>
+        <span class="chat-drag-hint">/help for commands</span>
       </div>
 
       <!-- Tab bar (tabs are not part of the drag zone) -->
@@ -103,10 +103,18 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   private readonly mouseMoveHandler = (e: MouseEvent) => this.onDragMove(e);
   private readonly mouseUpHandler   = ()               => this.onDragEnd();
 
+  // True for Owner/Admin — gates the /promote /demote help text.
+  isAdmin = false;
+
   constructor() {
     try {
       const raw = this.authService.getUserDetails();
-      if (raw) this.myCallsign = JSON.parse(raw)?.callsign ?? '';
+      if (raw) {
+        const data = JSON.parse(raw);
+        this.myCallsign = data?.callsign ?? '';
+        const role = (data?.role ?? '').toLowerCase();
+        this.isAdmin = role === 'admin' || role === 'owner';
+      }
     } catch { /* */ }
 
     effect(() => {
@@ -220,22 +228,35 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         'Commands: ' +
         '/t <name> <msg> — DM a player  |  ' +
         '/friend <name> — toggle friend  |  ' +
-        '/friends — list online friends  |  ' +
-        '/help — show this help',
+        '/friends — list online friends' +
+        (this.isAdmin
+          ? '  |  /promote <name> — make Admin  |  /demote <name> — make regular user'
+          : '') +
+        '  |  /help — show this help.  ' +
+        'Tip: wrap names with spaces in quotes, e.g. /t "Red Sail" ahoy',
       );
       return;
     }
 
     // ── Server-bound messages ──────────────────────────────────────────────
     const tab = this.activeTab();
-    if (tab !== 'global' && !text.startsWith('/t ') && !text.startsWith('/friend ')) {
-      this.multiplayerService.sendChat(`/t ${tab} ${text}`);
+    // In a DM tab, plain text is sent as a whisper to that tab's player. Quote the
+    // callsign so names containing spaces parse correctly server-side.
+    const passthrough = text.startsWith('/t ') || text.startsWith('/friend ') ||
+                        text.startsWith('/promote ') || text.startsWith('/demote ');
+    if (tab !== 'global' && !passthrough) {
+      this.multiplayerService.sendChat(`/t ${this.quoteName(tab)} ${text}`);
     } else {
       this.multiplayerService.sendChat(text);
     }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /** Wrap a callsign in double quotes if it contains a space, for command parsing. */
+  private quoteName(name: string): string {
+    return name.includes(' ') ? `"${name}"` : name;
+  }
 
   private addSystemMessage(text: string): void {
     const msg: import('../../models').ChatMessage = {

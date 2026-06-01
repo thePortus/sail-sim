@@ -28,6 +28,9 @@ export class MultiplayerService {
   chatMessages  = signal<ChatMessage[]>([]);
   myFriends     = signal<string[]>([]);   // callsigns I've explicitly friended
   mutualFriends = signal<string[]>([]);   // mutual (both sides friended, and online)
+  // Set when the server kicks this session (same account opened in another window).
+  // The game component watches this to show a notice and bail out of the session.
+  kickedReason  = signal<string | null>(null);
 
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
@@ -84,6 +87,7 @@ export class MultiplayerService {
 
   connect(callsign: string): void {
     this.localState.callsign = callsign;
+    this.kickedReason.set(null);   // clear any stale kick from a previous session
 
     // Recoil animation tick — runs every render frame while connected
     const scene = this.sceneService.scene;
@@ -170,6 +174,10 @@ export class MultiplayerService {
     } else if (msg.type === 'friend_update') {
       this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
       this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
+
+    } else if (msg.type === 'kicked') {
+      // Server closed this session because the same account logged in elsewhere.
+      this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
 
     } else if (msg.type === 'chat') {
       const chatMsg: ChatMessage = {

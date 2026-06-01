@@ -531,6 +531,20 @@ void main() {
       + 0.28 * cos(worldXZ.y * 0.48 - u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
     color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.50);
+    // 5. Rain impacts on the shallow turquoise/surf — the seabed-reveal overwrites the
+    //    surface colour here, so the normal-based ripples (added earlier) don't show;
+    //    paint the drop dimples directly as little bright splashes when it's raining.
+    if (u_rainIntensity > 0.01) {
+      float rNear = 1.0 - smoothstep(25.0, 180.0, length(v_worldPos - u_cameraPosition));
+      if (rNear > 0.001) {
+        float drops = rainField(worldXZ * 2.2, u_Time);
+        // Soft rain gate (0.4..1) so even light rain shows clearly; darken the impact
+        // dimple strongly (reads on bright/turquoise surf) + a bright rim pop.
+        float dAmt = drops * (0.4 + 0.6 * u_rainIntensity) * rNear;
+        color *= 1.0 - dAmt * 0.85;
+        color += vec3(0.9, 0.95, 1.0) * dAmt * 0.5;
+      }
+    }
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────
@@ -1126,6 +1140,17 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
       + 0.28 * cos(worldXZ.y * 0.48 - uniforms.u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
     color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.50));
+    // 5. Rain impacts on the shallow turquoise/surf (seabed-reveal overwrites the
+    //    normal-based ripples here, so paint the drop splashes directly).
+    if (uniforms.u_rainIntensity > 0.01) {
+      let rNear = 1.0 - smoothstep(25.0, 180.0, length(input.v_worldPos - uniforms.u_cameraPosition));
+      if (rNear > 0.001) {
+        let drops = rainField(worldXZ * 2.2, uniforms.u_Time);
+        let dAmt = drops * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear;
+        color *= 1.0 - dAmt * 0.85;
+        color += vec3f(0.9, 0.95, 1.0) * (dAmt * 0.5);
+      }
+    }
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────

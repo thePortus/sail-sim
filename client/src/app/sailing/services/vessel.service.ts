@@ -78,11 +78,6 @@ export class VesselService {
   private matPool         = new Map<string, PBRMaterial>();
   private texPool         = new Map<string, DynamicTexture>();
 
-  // ── Torches ───────────────────────────────────────────────────────────────
-  private torchLights:    PointLight[]         = [];
-  private torchFlameMats: StandardMaterial[]   = [];
-  private torchSconceMats: StandardMaterial[]  = [];
-
   // ── Cannon recoil ────────────────────────────────────────────────────────
   // Shot-triggered lateral roll impulse model (spring + damper):
   //   shot applies angular-velocity impulse away from firing side,
@@ -194,9 +189,6 @@ export class VesselService {
     // Build mast pivot
     this.buildSails(scene);
 
-    // Build torches after root is set up so they can be parented
-    this.buildTorches(scene);
-
     // Build wake trail (world-space, not parented to root)
     this.buildWake(scene);
 
@@ -205,9 +197,6 @@ export class VesselService {
 
     // Load GLB geometry parts (hull, mast, flag, sails, cannons)
     await this.buildGLBMeshes(scene);
-
-    // Torch point lights should illuminate the ship, not distant terrain.
-    this.configureTorchLightAffectors();
 
     // Register every hull / rig / sail mesh with the WaterMaterial so it appears
     // in both the reflection RTT (mirror of the above-water hull in the surface)
@@ -224,15 +213,6 @@ export class VesselService {
         sg.addShadowCaster(mesh, true);
         mesh.receiveShadows = true;
       }
-    }
-  }
-
-  private configureTorchLightAffectors(): void {
-    const vesselMeshes = this.root.getChildMeshes();
-    for (const light of this.torchLights) {
-      light.includedOnlyMeshes = vesselMeshes;
-      light.range = 3.8;
-      light.intensity = 0.5;
     }
   }
 
@@ -415,57 +395,6 @@ export class VesselService {
     mesh.material = this.buildVesselMat(part, scene);
 
     return mesh;
-  }
-
-  // ── Torches ───────────────────────────────────────────────────────────────
-  // Two oil torches on the stern rail uprights — each a sconce + flame sphere + PointLight.
-  // All meshes and lights are parented to this.root so they track the vessel.
-
-  private buildTorches(scene: Scene): void {
-    const torchPositions = [
-      { x: -1.55, y: 4.00, z: -5.4 },  // port stern rail cap
-      { x:  1.55, y: 4.00, z: -5.4 },  // stbd stern rail cap
-    ];
-
-    for (let i = 0; i < torchPositions.length; i++) {
-      const pos = torchPositions[i];
-
-      // Sconce bracket (small dark cylinder, like an iron bracket)
-      const sconce = MeshBuilder.CreateCylinder(`torch_sconce_${i}`, {
-        diameter: 0.12, height: 0.32, tessellation: 8,
-      }, scene);
-      sconce.parent           = this.root;
-      sconce.renderingGroupId = 2;
-      sconce.position = new Vector3(pos.x, pos.y, pos.z);
-      const sconceMat = new StandardMaterial(`torch_sconce_mat_${i}`, scene);
-      sconceMat.diffuseColor  = new Color3(0.16, 0.12, 0.10);
-      sconceMat.specularColor = new Color3(0.25, 0.20, 0.15);
-      sconce.material = sconceMat;
-      this.torchSconceMats.push(sconceMat);
-
-      // Flame sphere (emissive orange ball at the top of the sconce)
-      const flame = MeshBuilder.CreateSphere(`torch_flame_${i}`, {
-        diameter: 0.22, segments: 7,
-      }, scene);
-      flame.parent           = this.root;
-      flame.renderingGroupId = 2;
-      flame.position = new Vector3(pos.x, pos.y + 0.30, pos.z);
-      const flameMat = new StandardMaterial(`torch_flame_mat_${i}`, scene);
-      flameMat.diffuseColor   = new Color3(1.0, 0.55, 0.05);
-      flameMat.emissiveColor  = new Color3(1.0, 0.45, 0.02);
-      flameMat.disableLighting = false;
-      flame.material = flameMat;
-      this.torchFlameMats.push(flameMat);
-
-      // PointLight — parented to the vessel root so it moves with the ship
-      const light = new PointLight(`torch_light_${i}`, new Vector3(pos.x, pos.y + 0.32, pos.z), scene);
-      light.parent    = this.root;
-      light.diffuse   = new Color3(1.0, 0.55, 0.15);
-      light.specular  = new Color3(0.6, 0.30, 0.05);
-      light.intensity = 0.85;
-      light.range     = 9;
-      this.torchLights.push(light);
-    }
   }
 
   private buildSails(scene: Scene): void {
@@ -792,23 +721,6 @@ export class VesselService {
       );
       this.updateRigLine(this.rigLineMainsheet, boomTip,  new Vector3(0, 1.1,  -2.8));
       this.updateRigLine(this.rigLineVang,      boomNear, new Vector3(0, 1.22, this.MAST_Z));
-    }
-
-    // Torch flicker — multi-frequency sine waves + small random noise
-    if (this.torchLights.length > 0) {
-      for (let i = 0; i < this.torchLights.length; i++) {
-        const offset = i * 2.73;
-        const flicker =
-          Math.sin(t * 4.6  + offset)       * 0.03 +
-          Math.sin(t * 8.9 + offset * 1.7)  * 0.015;
-        const intensity = Math.max(0.42, 0.50 + flicker);
-        this.torchLights[i].intensity = intensity;
-        if (this.torchFlameMats[i]) {
-          // Shift emissive between deep orange and bright yellow-orange
-          const b = 0.35 + flicker * 0.4;
-          this.torchFlameMats[i].emissiveColor.set(1.0, Math.max(0.3, 0.45 + b), Math.max(0, b * 0.3));
-        }
-      }
     }
 
     // Publish state
@@ -1433,10 +1345,6 @@ export class VesselService {
     this.boomPivot?.dispose(); this.boomPivot = null;
     this.sailFullRoot    = null;   // disposed via mastPivot above
     this.sailReducedRoot = null;
-    for (const light of this.torchLights) light.dispose();
-    this.torchLights     = [];
-    this.torchFlameMats  = [];
-    this.torchSconceMats = [];
     for (const ps of [this.bowSpray, this.sternFoam, this.portFroth, this.stbdFroth]) {
       ps?.stop(); ps?.dispose();
     }

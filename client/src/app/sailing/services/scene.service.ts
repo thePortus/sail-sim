@@ -8,7 +8,7 @@ import {
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
   SceneInstrumentation, EngineInstrumentation,
 } from '@babylonjs/core';
-import { SkyMaterial } from '@babylonjs/materials';
+import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
 
 @Injectable({ providedIn: 'root' })
@@ -29,6 +29,9 @@ export class SceneService {
   private ambient!:   HemisphericLight;
   private sunMesh!:   Mesh;
   private moonMesh!:  Mesh;
+  private starDome: Mesh | null = null;
+  private starMat:  CustomMaterial | null = null;
+  private _starTime = 0;
   private glowLayer!: GlowLayer;
 
   /** Exclude a mesh from the glow/emissive composite pass (WebGPU-safe). */
@@ -187,6 +190,7 @@ export class SceneService {
       this.buildSky();
       this.buildLights();
       this.buildCelestialBodies();
+      this.buildStars();
       this.buildCamera(canvas);
       this.buildPostProcessing();
       this.buildOceanDepthRenderer();
@@ -295,6 +299,98 @@ export class SceneService {
     this.moonMesh.renderingGroupId = 2;
     this.moonMesh.visibility = 0;
     this.glowLayer.addIncludedOnlyMesh(this.moonMesh);
+  }
+
+  // ── Stars ───────────────────────────────────────────────────────────────────
+  // A procedural starfield on an infinite-distance dome (renders as background with
+  // the skybox), faded in as the sun drops. Stars vary in size, brightness, and very
+  // slightly in colour (cool blue-white ↔ faint warm amber), with a faint Milky Way
+  // band — baked into a texture so there's no fragile custom shader. Drifts slowly.
+  private buildStars(): void {
+    const tex = this.buildStarTexture();
+
+    const mat = new CustomMaterial('starMat', this.scene);
+    mat.disableLighting = true;
+    mat.emissiveTexture = tex;
+    mat.opacityTexture  = tex;            // alpha from the texture → black sky stays clear
+    mat.diffuseColor    = Color3.Black();
+    mat.specularColor   = Color3.Black();
+    mat.backFaceCulling = false;          // viewed from inside the dome
+    mat.alpha = 0;                        // faded in at night by tickTimeOfDay
+    // Soft twinkle: a high-spatial-frequency, low-amplitude shimmer (product of sines) so
+    // different stars dim/brighten at different times. uStarTime advances in tickTimeOfDay.
+    mat.AddUniform('uStarTime', 'float', null);
+    mat.Fragment_Before_FragColor(`
+      float tw = 0.80 + 0.20 * sin(vPositionW.x * 0.0021 + uStarTime * 3.0)
+                             * sin(vPositionW.y * 0.0017 + uStarTime * 2.2)
+                             * sin(vPositionW.z * 0.0019 - uStarTime * 2.6);
+      color.rgb *= tw;
+    `);
+    mat.onBindObservable.add(() => {
+      const fx = mat.getEffect();
+      if (fx) fx.setFloat('uStarTime', this._starTime);
+    });
+    this.starMat = mat;
+
+    const dome = MeshBuilder.CreateSphere('starDome', { diameter: 140000, segments: 24 }, this.scene);
+    dome.material         = mat;
+    dome.infiniteDistance = true;         // follow the camera, render at the far background
+    dome.renderingGroupId = 0;            // with the skybox; transparent → draws over it
+    dome.applyFog         = false;        // stars must not be tinted by scene fog
+    dome.isPickable       = false;
+    dome.setEnabled(false);               // off during the day
+    this.starDome = dome;
+  }
+
+  /** Procedurally paints a starfield (varied size / brightness / slight colour + a faint
+   *  Milky Way band) into a transparent texture. */
+  private buildStarTexture(): DynamicTexture {
+    const W = 2048, H = 1024;
+    const tex = new DynamicTexture('starTex', { width: W, height: H }, this.scene, true);
+    tex.hasAlpha = true;
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';   // overlapping glows accumulate
+
+    const rnd = Math.random;
+
+    // Faint Milky Way: extra dim stars scattered along a gently sloped diagonal band.
+    const mwY = H * 0.40, mwSlope = -0.12;
+    for (let i = 0; i < 1600; i++) {
+      const x = rnd() * W;
+      const y = mwY + (x - W * 0.5) * mwSlope + (rnd() - 0.5) * H * 0.18;
+      const b = Math.pow(rnd(), 3.0) * 0.5;
+      ctx.fillStyle = `rgba(232,236,255,${0.04 + b * 0.22})`;
+      ctx.beginPath();
+      ctx.arc(x, y, 0.4 + b * 0.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Main starfield: most faint & tiny, a few bright & large; subtle colour spread.
+    const STAR_COUNT = 2600;
+    for (let i = 0; i < STAR_COUNT; i++) {
+      const x = rnd() * W;
+      const y = rnd() * H;
+      const b = Math.pow(rnd(), 2.2);                              // brightness, weighted faint
+      const radius = 0.4 + b * 0.78 + (rnd() < 0.010 ? 0.55 : 0.0); // size: smaller still, rare few bigger
+      const cr = rnd();
+      let r = 255, g = 252, bl = 246;                              // near-white default
+      if (cr < 0.18)      { r = 255; g = 238; bl = 212; }          // warm / amber
+      else if (cr > 0.82) { r = 212; g = 229; bl = 255; }          // cool blue-white
+      const a = 0.25 + b * 0.75;
+      const grd = ctx.createRadialGradient(x, y, 0, x, y, radius * 1.7);
+      grd.addColorStop(0,   `rgba(${r},${g},${bl},${a})`);
+      grd.addColorStop(0.5, `rgba(${r},${g},${bl},${a * 0.35})`);
+      grd.addColorStop(1,   `rgba(${r},${g},${bl},0)`);
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(x, y, radius * 1.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    tex.update();
+    return tex;
   }
 
   /**
@@ -574,6 +670,15 @@ export class SceneService {
       this.moonMesh.position.copyFrom(this.camera.position.add(moonDir.scale(62000)));
       this.moonMesh.visibility = moonVis;
       this.moonMesh.rotation.y += dt * 0.012;
+
+      // Stars: fade in as the sun drops below the horizon; the dome drifts very slowly.
+      if (this.starDome && this.starMat) {
+        const starF = Math.max(0, Math.min(1, (-h - 0.02) / 0.16));
+        this.starDome.setEnabled(starF > 0.001);
+        this.starMat.alpha = starF * 0.95;
+        this.starDome.rotation.y += dt * 0.001;
+        this._starTime += dt;
+      }
 
       // Glow layer includes ONLY the sun & moon: solar halo by day, lunar halo by
       // night. Clamped so neither bleeds at the wrong time of day.

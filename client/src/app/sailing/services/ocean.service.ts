@@ -531,6 +531,20 @@ void main() {
       + 0.28 * cos(worldXZ.y * 0.48 - u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
     color = mix(color, vec3(0.92, 0.97, 1.00), foamF * foamAnim * 0.50);
+    // 5. Rain impacts on the shallow turquoise/surf — the seabed-reveal overwrites the
+    //    surface colour here, so the normal-based ripples (added earlier) don't show;
+    //    paint the drop dimples directly as little bright splashes when it's raining.
+    if (u_rainIntensity > 0.01) {
+      float rNear = 1.0 - smoothstep(25.0, 180.0, length(v_worldPos - u_cameraPosition));
+      if (rNear > 0.001) {
+        float drops = rainField(worldXZ * 2.2, u_Time);
+        // Soft rain gate (0.4..1) so even light rain shows clearly; darken the impact
+        // dimple strongly (reads on bright/turquoise surf) + a bright rim pop.
+        float dAmt = drops * (0.4 + 0.6 * u_rainIntensity) * rNear;
+        color *= 1.0 - dAmt * 0.85;
+        color += vec3(0.9, 0.95, 1.0) * dAmt * 0.5;
+      }
+    }
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────
@@ -596,6 +610,27 @@ void main() {
   float waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz))
                   * (1.0 - seabedReveal * 0.92);
   color = mix(color, vec3(0.90, 0.95, 1.00), waterline * 0.70);
+
+  // ── Cloud shadows ───────────────────────────────────────────────────────────
+  // Soft moving dappled shadows cast by the volumetric clouds onto the water. We
+  // sample a low-frequency drifting "cloud cover" field (same character as the
+  // volumetric weather map) at the point where the sun ray through this water
+  // fragment would pierce cloud height, so the shadows sit downsun of the clouds
+  // and drift with the wind. Gated by coverage + sun elevation.
+  if (u_sunDir.y > 0.03 && u_cloudCoverage > 0.02) {
+    // Project from the water point up to cloud altitude along the sun direction.
+    // Scale 0.004 → noise cells ~250 m, so several distinct shadow patches fall within
+    // view (0.00018 was ~5500 m/cell → one flat tone over the whole screen).
+    vec2  cloudUV = (worldXZ + u_sunDir.xz / max(u_sunDir.y, 0.2) * 900.0) * 0.004;
+    vec2  drift   = vec2(u_Time * 0.18, u_Time * 0.12);
+    float cf = rVNoise(cloudUV + drift) * 0.6
+             + rVNoise(cloudUV * 2.3 - drift * 1.7) * 0.4;
+    // Map the field through coverage: more cloud cover → lower threshold → more shadow.
+    // Tight smoothstep band → crisp shadow edges (not a vague wash).
+    float shadow = smoothstep(0.60 - u_cloudCoverage * 0.45, 0.70 - u_cloudCoverage * 0.30, cf);
+    shadow *= u_cloudCoverage * smoothstep(0.03, 0.18, u_sunDir.y);
+    color *= 1.0 - shadow * 0.78;
+  }
 
   // ── Night dimming ───────────────────────────────────────────────────────────
   // The reflection, scattering and shallow-water tints are all day-calibrated, so
@@ -1105,6 +1140,17 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
       + 0.28 * cos(worldXZ.y * 0.48 - uniforms.u_Time * 0.9 + worldXZ.x * 0.18),
       0.0, 1.0);
     color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.50));
+    // 5. Rain impacts on the shallow turquoise/surf (seabed-reveal overwrites the
+    //    normal-based ripples here, so paint the drop splashes directly).
+    if (uniforms.u_rainIntensity > 0.01) {
+      let rNear = 1.0 - smoothstep(25.0, 180.0, length(input.v_worldPos - uniforms.u_cameraPosition));
+      if (rNear > 0.001) {
+        let drops = rainField(worldXZ * 2.2, uniforms.u_Time);
+        let dAmt = drops * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear;
+        color *= 1.0 - dAmt * 0.85;
+        color += vec3f(0.9, 0.95, 1.0) * (dAmt * 0.5);
+      }
+    }
   }
 
   // ── Soft waterline ─────────────────────────────────────────────────────────
@@ -1157,6 +1203,17 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let waterline = smoothstep(0.0, 0.20, dz) * (1.0 - smoothstep(0.5, 1.6, dz))
                 * (1.0 - seabedReveal * 0.92);
   color = mix(color, vec3f(0.90, 0.95, 1.00), vec3f(waterline * 0.70));
+
+  // ── Cloud shadows (same as GLSL path) ───────────────────────────────────────
+  if (uniforms.u_sunDir.y > 0.03 && uniforms.u_cloudCoverage > 0.02) {
+    let cloudUV = (worldXZ + uniforms.u_sunDir.xz / max(uniforms.u_sunDir.y, 0.2) * 900.0) * 0.004;
+    let drift   = vec2f(uniforms.u_Time * 0.18, uniforms.u_Time * 0.12);
+    let cf = rVNoise(cloudUV + drift) * 0.6
+           + rVNoise(cloudUV * 2.3 - drift * 1.7) * 0.4;
+    var shadow = smoothstep(0.60 - uniforms.u_cloudCoverage * 0.45, 0.70 - uniforms.u_cloudCoverage * 0.30, cf);
+    shadow *= uniforms.u_cloudCoverage * smoothstep(0.03, 0.18, uniforms.u_sunDir.y);
+    color *= 1.0 - shadow * 0.78;
+  }
 
   // ── Night dimming ───────────────────────────────────────────────────────────
   // (same as GLSL path) fade the surface toward a dim moonlit floor after dark so

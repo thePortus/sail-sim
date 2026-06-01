@@ -1707,10 +1707,13 @@ export class TerrainService {
     // only bites at ~20 km, far too distant to shape the mountains).
     material.Fragment_Before_FragColor(`
       float hazeDist = length(vPositionW - vEyePosition.xyz);
-      // Cap near 1.0 so the most distant terrain washes almost fully into the sky
-      // colour — drops the silhouette's edge contrast to a few percent, which reads
-      // as a soft, hazy outline instead of a hard cut against the sky.
-      float hazeF = clamp((1.0 - exp(-hazeDist * 0.00034)) * 1.08, 0.0, 0.975);
+      // Lower density (0.00034→0.00020) + a pow(1.4) shaping push the haze ONSET much
+      // farther out, so near/mid islands keep their colour & saturation (they were
+      // washing toward the fog tint — grey/orange at dawn, desaturated by day — by ~1 km).
+      // The high cap (0.96) still lets the MOST distant terrain melt into the sky for a
+      // soft hazy silhouette rather than a hard edge.
+      float hazeRaw = 1.0 - exp(-hazeDist * 0.00020);
+      float hazeF   = clamp(pow(hazeRaw, 1.4), 0.0, 0.96);
       color.rgb = mix(color.rgb, uHazeColor, hazeF);
     `);
 

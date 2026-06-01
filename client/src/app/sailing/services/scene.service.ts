@@ -7,6 +7,7 @@ import {
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
   SceneInstrumentation, EngineInstrumentation,
+  VolumetricLightScatteringPostProcess,
 } from '@babylonjs/core';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
@@ -29,6 +30,7 @@ export class SceneService {
   private ambient!:   HemisphericLight;
   private sunMesh!:   Mesh;
   private moonMesh!:  Mesh;
+  private godRays: VolumetricLightScatteringPostProcess | null = null;
   private starDome: Mesh | null = null;
   private starMat:  CustomMaterial | null = null;
   private _starTime = 0;
@@ -556,6 +558,39 @@ export class SceneService {
     this._aaQuality = isNaN(storedAa) ? 1 : Math.max(0, Math.min(3, storedAa));
     this.applyAaQuality();
     setTimeout(() => this.applyAaQuality(), 0);
+
+    this.buildGodRays();
+  }
+
+  // ── Crepuscular rays (god rays / sun shafts) ────────────────────────────────
+  // Babylon's built-in volumetric light scattering: a radial-blur post-process that
+  // streaks the bright sun pixels outward, occluded by clouds/islands → shafts of
+  // light. Built-in (maintained WGSL) to avoid the blank-screen risk of a custom
+  // WebGPU post-process. Light source = the existing sun position (fed per frame in
+  // tickTimeOfDay via customMeshPosition); strength is also modulated there.
+  private buildGodRays(): void {
+    try {
+      const gr = new VolumetricLightScatteringPostProcess(
+        'godRays', 1.0, this.camera, this.sunMesh, 60,
+        Texture.BILINEAR_SAMPLINGMODE, this.engine, false, this.scene,
+      );
+      gr.useCustomMeshPosition = true;
+      // Tuned for distinct SHAFTS (not just a glow): high decay → rays reach far from
+      // the sun; high weight → each sample contributes strongly; high density → samples
+      // span a long path. exposure is the master strength (modulated per-frame).
+      gr.exposure = 0.4;
+      gr.decay    = 0.985;
+      gr.weight   = 0.9;
+      gr.density  = 0.97;
+      // The ocean's custom ShaderMaterial shouldn't occlude/contribute to the shaft
+      // pass; keep shafts driven by sun vs clouds/terrain only.
+      const ocean = this.scene.getMeshByName('ocean_lod0');
+      if (ocean) gr.excludedMeshes = [ocean];
+      this.godRays = gr;
+    } catch (e) {
+      console.warn('[Scene] God-rays post-process unavailable:', e);
+      this.godRays = null;
+    }
   }
 
   // ── Anti-aliasing quality ──────────────────────────────────────────────────
@@ -638,6 +673,16 @@ export class SceneService {
     if (this.camera) {
       const sunPos = this.camera.position.add(dir.scale(65000));
       this.sunMesh.position.copyFrom(sunPos);
+
+      // God rays: anchor the shaft source at the sun, and fade them out at night and at
+      // high noon (shafts read as long, dramatic streaks when the sun is low — golden
+      // hour — and vanish overhead). above = max(0, sun elevation).
+      if (this.godRays) {
+        this.godRays.customMeshPosition = sunPos;
+        const lowSun = 1.0 - Math.min(1, Math.max(0, h) / 0.55);   // 1 near horizon → 0 high
+        const dayUp  = Math.max(0, Math.min(1, (h + 0.02) / 0.10)); // fade in just above horizon
+        this.godRays.exposure = 0.55 * dayUp * (0.35 + 0.65 * lowSun);
+      }
 
       const sunShouldBeOn = h > -0.06;
       let occT = 1.0;

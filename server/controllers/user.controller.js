@@ -12,6 +12,8 @@ exports.login = (req, res) => {
       if (!user) return res.status(404).send({ message: 'User not found.' });
       if (user.password !== md5(password))
         return res.status(401).send({ message: 'Invalid password.' });
+      if (user.banned)
+        return res.status(403).send({ message: 'This account has been banned.' });
 
       const token = jwt.sign(
         { data: { id: user.id, username: user.username, callsign: user.callsign, role: user.role } },
@@ -136,6 +138,87 @@ exports.setRoleByCallsign = (req, res) => {
 exports.delete = (req, res) => {
   User.destroy({ where: { username: req.params.username } })
     .then(() => res.send({ message: 'Deleted successfully.' }))
+    .catch(err => res.status(500).send({ message: err.message }));
+};
+
+/**
+ * Owner-only export of all user accounts as a JSON array suitable for re-seeding.
+ * Password hashes (MD5) are included verbatim so accounts can be restored exactly.
+ * The route guard (verifyOwnerToken) ensures only the Owner can call this.
+ */
+exports.exportUsers = (req, res) => {
+  User.findAll({
+    attributes: ['username', 'callsign', 'password', 'role', 'friends', 'banned'],
+    order: [['id', 'ASC']],
+  })
+    .then(users => {
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        version: 1,
+        users: users.map(u => ({
+          username: u.username,
+          callsign: u.callsign,
+          password: u.password,   // already an MD5 hash
+          role:     u.role,
+          friends:  u.friends ?? null,
+          banned:   !!u.banned,
+        })),
+      };
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', 'attachment; filename="users.json"');
+      res.send(JSON.stringify(payload, null, 2));
+    })
+    .catch(err => res.status(500).send({ message: err.message }));
+};
+
+/**
+ * Set a user's password by CALLSIGN. Used by the /setpass chat command.
+ *  - Anyone may change their OWN password (callsign === requester's callsign).
+ *  - Owner/Admin may change a REGULAR user's password (target role Viewer/Editor).
+ *  - No one may change the Owner's password except the Owner themselves.
+ * (The route guard only requires a valid token; the rules are enforced here.)
+ */
+exports.setPasswordByCallsign = (req, res) => {
+  const { password } = req.body;
+  if (typeof password !== 'string' || password.length < 1) {
+    return res.status(400).send({ message: 'A new password is required.' });
+  }
+  const requesterCallsign = req.user?.callsign;
+  const requesterRole     = req.user?.role;
+  const targetCallsign    = req.params.callsign;
+  const isSelf = requesterCallsign === targetCallsign;
+
+  User.findOne({ where: { callsign: targetCallsign } })
+    .then(user => {
+      if (!user) return res.status(404).send({ message: 'User not found.' });
+
+      const isAdmin = requesterRole === 'Owner' || requesterRole === 'Admin';
+      // Admins may reset only regular users (Viewer/Editor); never another admin/owner.
+      const targetIsRegular = user.role === 'Viewer' || user.role === 'Editor';
+      if (!isSelf && !(isAdmin && targetIsRegular)) {
+        return res.status(401).send({ message: 'You are not authorized to change that password.' });
+      }
+      return user.update({ password: md5(password) })
+        .then(() => res.send({ message: 'Password updated successfully.' }));
+    })
+    .catch(err => res.status(500).send({ message: err.message }));
+};
+
+/**
+ * Set a user's banned flag by CALLSIGN. Owner/Admin only (route guard). The Owner
+ * can never be banned. Used by the /ban and /unban chat commands.
+ */
+exports.setBanByCallsign = (req, res) => {
+  const banned = !!req.body.banned;
+  User.findOne({ where: { callsign: req.params.callsign } })
+    .then(user => {
+      if (!user) return res.status(404).send({ message: 'User not found.' });
+      if (user.role === 'Owner') {
+        return res.status(401).send({ message: 'The Owner cannot be banned.' });
+      }
+      return user.update({ banned })
+        .then(() => res.send({ message: banned ? 'User banned.' : 'User unbanned.', callsign: user.callsign }));
+    })
     .catch(err => res.status(500).send({ message: err.message }));
 };
 

@@ -350,6 +350,37 @@ app-chat {
   text-overflow: ellipsis;
 }
 
+.chat-font-btns {
+  display: flex;
+  gap: 3px;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+.chat-font-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.45);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  &:hover { color: #93c5fd; background: rgba(59, 130, 246, 0.15); }
+}
+
+.chat-resize-handle {
+  align-self: flex-end;
+  color: rgba(255, 255, 255, 0.22);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: nwse-resize;
+  user-select: none;
+  &:hover { color: rgba(255, 255, 255, 0.5); }
+}
+
 .chat-tabs {
   display: flex;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
@@ -405,7 +436,7 @@ app-chat {
 
 .chat-msg {
   font-family: ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 1em;   // inherits the panel font-size so A+/A− scales messages
   color: rgba(255, 255, 255, 0.72);
   line-height: 1.5;
   word-break: break-word;
@@ -420,7 +451,7 @@ app-chat {
   &--system { color: #fbbf24; }
 }
 
-.chat-msg-text { color: rgba(255, 255, 255, 0.75); }
+.chat-msg-text { color: rgba(255, 255, 255, 0.75); white-space: pre-wrap; }
 
 .chat-empty {
   font-family: ui-monospace, monospace;
@@ -443,7 +474,7 @@ app-chat {
   padding: 9px 12px;
   color: white;
   font-family: ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 1em;   // inherits panel font-size (A+/A−)
 
   &::placeholder { color: rgba(255, 255, 255, 0.18); }
 }
@@ -459,6 +490,58 @@ app-chat {
   transition: color 0.15s;
 
   &:hover { color: #93c5fd; }
+}
+
+// ── Kicked / banned notice ────────────────────────────────────────────────────
+
+.kick-notice-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 10, 20, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+.kick-notice {
+  width: min(420px, 90vw);
+  background: linear-gradient(160deg, #2a0d12 0%, #1a0810 100%);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  border-radius: 12px;
+  padding: 1.75rem 2rem;
+  text-align: center;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7);
+}
+
+.kick-notice-icon  { font-size: 2rem; }
+.kick-notice-title {
+  font-family: ui-monospace, monospace;
+  font-size: 1.2rem;
+  font-weight: bold;
+  color: #fca5a5;
+  letter-spacing: 0.05em;
+  margin: 0.4rem 0 0.6rem;
+}
+.kick-notice-text {
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.8);
+  line-height: 1.5;
+}
+.kick-notice-btn {
+  margin-top: 1.25rem;
+  padding: 0.6rem 1.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+  font-weight: bold;
+  cursor: pointer;
+  &:hover { background: rgba(248, 113, 113, 0.22); color: #fff; }
 }
 
 // ── Vessel selector screen ────────────────────────────────────────────────────

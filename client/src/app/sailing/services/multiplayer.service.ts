@@ -32,6 +32,25 @@ export class MultiplayerService {
   // The game component watches this to show a notice and bail out of the session.
   kickedReason  = signal<string | null>(null);
 
+  // Callsigns this user has muted/blocked — their chat is dropped on receipt.
+  // Persisted in localStorage so the block list survives reloads.
+  private static readonly BLOCK_KEY = 'ignis_blocked_callsigns';
+  private blocked = new Set<string>(this.loadBlocked());
+
+  private loadBlocked(): string[] {
+    try { return JSON.parse(localStorage.getItem(MultiplayerService.BLOCK_KEY) ?? '[]'); }
+    catch { return []; }
+  }
+  private saveBlocked(): void {
+    localStorage.setItem(MultiplayerService.BLOCK_KEY, JSON.stringify([...this.blocked]));
+  }
+  isBlocked(callsign: string): boolean { return this.blocked.has(callsign); }
+  setBlocked(callsign: string, blocked: boolean): void {
+    if (blocked) this.blocked.add(callsign);
+    else         this.blocked.delete(callsign);
+    this.saveBlocked();
+  }
+
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
@@ -63,9 +82,12 @@ export class MultiplayerService {
 
   sendChat(text: string): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    // Intercept /friend command — handled via dedicated WS message, not chat
+    // Intercept /friend command — handled via dedicated WS message, not chat.
+    // Strip surrounding double-quotes so /friend "Red Sail" works for spaced names.
     if (text.startsWith('/friend ')) {
-      const target = text.slice(8).trim();
+      let target = text.slice(8).trim();
+      const m = target.match(/^"([^"]+)"/);
+      if (m) target = m[1].trim();
       if (target) this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign: target }));
       return;
     }
@@ -180,6 +202,8 @@ export class MultiplayerService {
       this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
 
     } else if (msg.type === 'chat') {
+      // Drop messages from blocked players (but never drop system messages).
+      if (msg.chatType !== 'system' && this.blocked.has(String(msg.from ?? ''))) return;
       const chatMsg: ChatMessage = {
         id:        `${Date.now()}-${Math.random()}`,
         from:      String(msg.from ?? ''),

@@ -47,6 +47,18 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <app-vessel-selector (vesselSelected)="onVesselSelected($event)" />
       }
 
+      <!-- Kicked / banned notice (prominent, dismissable) -->
+      @if (kickedNotice()) {
+        <div class="kick-notice-backdrop" (click)="dismissKicked()">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚓</div>
+            <div class="kick-notice-title">Disconnected</div>
+            <div class="kick-notice-text">{{ kickedNotice() }}</div>
+            <button class="kick-notice-btn" (click)="dismissKicked()">Dismiss</button>
+          </div>
+        </div>
+      }
+
       <!-- Loading overlay -->
       @if (phase() === 'initializing') {
         <div class="loading-overlay">
@@ -225,17 +237,23 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       );
     });
 
-    // Kicked by the server because this account was opened in another window —
-    // tear down this session and return to the selection screen with a notice.
+    // Kicked by the server (duplicate login, /kick, or /ban) — tear down this session,
+    // return to the selection screen, and show a prominent dismissable notice.
     effect(() => {
       const reason = this.multiplayerService.kickedReason();
       if (!reason) return;
       untracked(() => {
-        if (this.phase() === 'selecting') return;   // already out
-        this.onExitGame();
-        this.loadingMsg.set(reason);
+        if (this.phase() !== 'selecting') this.onExitGame();
+        this.kickedNotice.set(reason);
       });
     });
+  }
+
+  // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
+  kickedNotice = signal<string | null>(null);
+  dismissKicked(): void {
+    this.kickedNotice.set(null);
+    this.multiplayerService.kickedReason.set(null);
   }
 
   ngAfterViewInit(): void {

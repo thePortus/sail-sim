@@ -141,6 +141,7 @@ export interface VesselState {
   z:           number;
   heading:     number;    // compass bearing 0–360, 0=North (+Z), 90=East (+X)
   speed:       number;    // current speed (units/s)
+  turnRate?:   number;    // heading angular velocity (deg/s); broadcast for remote dead-reckoning
   sailState:   SailState;
   windAngle:   number;    // 0=into wind, 180=before wind
   isPortTack:  boolean;   // wind from port side
@@ -155,6 +156,9 @@ export interface OtherPlayer {
   z:           number;
   heading:     number;
   speed:       number;
+  turnRate?:   number;    // heading deg/s (for remote dead-reckoning that curves through turns)
+  sheetAngle?: number;    // boom sheet angle (deg) so remotes render trimmed sails
+  isPortTack?: boolean;   // which side the boom swings — needed to mirror the trim
   sailState:   SailState;
   vesselName:  string;
   vesselSlug:  string;

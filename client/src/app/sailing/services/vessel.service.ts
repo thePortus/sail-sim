@@ -2,15 +2,15 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh,
   TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  SceneLoader, Quaternion, DirectionalLight,
+  Quaternion, DirectionalLight,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
+import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
-import { Settings } from '../../app.settings';
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
@@ -18,6 +18,7 @@ export class VesselService {
   private terrainService   = inject(TerrainService);
   private oceanService     = inject(OceanService);
   private buoyancyService  = inject(VesselBuoyancyService);
+  private assetCache       = inject(VesselAssetCacheService);
   private zone             = inject(NgZone);
 
   // ── Public reactive state ─────────────────────────────────────────────────
@@ -34,6 +35,8 @@ export class VesselService {
   private z          = 0;
   private heading    = 270;   // compass bearing 0=N(+Z) 90=E(+X)
   private speed      = 0;
+  private prevHeading       = 270;   // last frame's heading, for angular-velocity calc
+  private turnRateSmoothed  = 0;     // smoothed heading deg/s, broadcast for remote dead-reckoning
   private sailState:  SailState = 'reefed';
   private isGrounded: boolean   = false;
 
@@ -247,33 +250,15 @@ export class VesselService {
   // The GLTF loader handles right→left-hand conversion internally.
   // We compound a 180° Y-axis flip so the bow faces +Z (forward).
   private async buildGLBMeshes(scene: Scene): Promise<void> {
-    const baseUrl = Settings.apiUrl + 'geometry/';
-
-    // Helper: import one GLB, orient it, set parent and renderingGroupId.
-    // GLB materials (with embedded textures) are kept as-is.
-    const loadGLB = async (
+    // Instantiate from the shared asset cache: each GLB is fetched + GLTF-parsed
+    // once per session and cheaply cloned here (and again for every remote
+    // player) — see VesselAssetCacheService. The 180° Y-flip, parenting, and
+    // renderingGroupId 2 tagging happen inside instantiate().
+    const loadGLB = (
       filename:    string,
       finalParent: TransformNode = this.root,
-    ): Promise<TransformNode | null> => {
-      try {
-        const res  = await SceneLoader.ImportMeshAsync('', baseUrl, filename, scene);
-        if (!res.meshes.length) return null;
-        const root = res.meshes[0];
-
-        // Compound 180° Y-flip with the GLTF loader's existing orientation
-        const flipY = Quaternion.RotationAxis(Vector3.Up(), Math.PI);
-        root.rotationQuaternion = root.rotationQuaternion
-          ? flipY.multiply(root.rotationQuaternion)
-          : flipY;
-
-        root.parent = finalParent;
-        for (const m of res.meshes) m.renderingGroupId = 2;
-        return root as TransformNode;
-      } catch (err) {
-        console.warn(`[VesselService] GLB load failed: ${filename}`, err);
-        return null;
-      }
-    };
+    ): Promise<TransformNode | null> =>
+      this.assetCache.instantiate(filename, scene, finalParent);
 
     // Hull (includes the mast — stationary)
     await loadGLB('sloop-hull.glb');
@@ -751,10 +736,20 @@ export class VesselService {
       this.updateRigLine(this.rigLineVang,      boomNear, new Vector3(0, 1.22, this.MAST_Z));
     }
 
+    // Actual heading angular velocity (deg/s, shortest arc) — covers steering, wave
+    // wander, and buoyancy yaw uniformly. Broadcast so remote clients can curve their
+    // dead-reckoning through our turns instead of projecting straight.
+    let hDelta = ((this.heading - this.prevHeading + 540) % 360) - 180;
+    const turnRate = dt > 0 ? hDelta / dt : 0;
+    // Light smoothing so a noisy per-frame value doesn't make remote turns jitter.
+    this.turnRateSmoothed += (turnRate - this.turnRateSmoothed) * Math.min(1, dt * 8);
+    this.prevHeading = this.heading;
+
     // Publish state
     this.zone.run(() => {
       this.state.set({
         x: this.x, z: this.z, heading: this.heading, speed: this.speed,
+        turnRate: this.turnRateSmoothed,
         sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
         sheetAngle:  Math.round(this.sheetAngleDeg),
         trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),

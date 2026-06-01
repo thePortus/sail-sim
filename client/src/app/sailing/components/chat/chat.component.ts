@@ -292,7 +292,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
 
   // Commands handled entirely on the server (passed through verbatim).
   private readonly SERVER_COMMANDS = [
-    't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban',
+    't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban', 'reloadassets',
   ];
 
   sendMessage(): void {
@@ -423,6 +423,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         '/ban "<name>" — ban a player from logging in',
         '/unban "<name>" — lift a ban',
         '/setpass "<name>" <new password> — reset a regular user\'s password',
+        '/reloadassets — re-fetch updated vessel models for all players',
       );
     }
     if (this.isOwner) {
@@ -467,7 +468,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'sail-sim-users.json';
+        a.download = 'users.json';
         document.body.appendChild(a);
         a.click();
         a.remove();

@@ -245,12 +245,12 @@ export class SceneService {
     csg.normalBias         = 0.02;
     csg.darkness           = 0.05;   // 0 = fully opaque shadow, 1 = invisible
     csg.transparencyShadow = true;   // sails/flag cloth casts transparent shadows
-    // Throttle the shadow map to every other frame. It re-renders every tree/boat
-    // caster across all 3 cascades, and that geometry pass runs each frame with no
-    // setting to disable it — a big always-on cost. Shadows update at half-rate,
-    // which is imperceptible for slow-moving sun/trees/boat.
+    // Render the shadow map EVERY frame. (An earlier every-other-frame throttle made
+    // the boat's shadow lag on alternate frames → visible wobble as the ship bobs. With
+    // the 42k forest trees gone, only the ship + a few near palms cast, so the shadow
+    // pass is cheap and every-frame is fine.)
     const shadowMap = csg.getShadowMap();
-    if (shadowMap) shadowMap.refreshRate = 2;
+    if (shadowMap) shadowMap.refreshRate = 1;
     this.shadowGenerator   = csg;
 
     // Cool blue-white directional light simulating moonlight.
@@ -865,7 +865,9 @@ export class SceneService {
     const cascades = level <= 0 ? 1 : (level === 1 ? 2 : 3);
     if (csg.numCascades !== cascades) csg.numCascades = cascades;
     const sm = csg.getShadowMap();
-    if (sm) sm.refreshRate = level >= 3 ? 1 : (level <= 0 ? 4 : 2);
+    // Every frame for normal levels (no shadow wobble); only the perf-floor level 0
+    // throttles to every other frame.
+    if (sm) sm.refreshRate = level <= 0 ? 2 : 1;
   }
 
   dispose(): void {

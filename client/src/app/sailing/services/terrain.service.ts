@@ -14,6 +14,9 @@ import {
   Scene,
   InstancedMesh,
   DirectionalLight,
+  StandardMaterial,
+  Matrix,
+  VertexData,
 } from '@babylonjs/core';
 import { CustomMaterial } from '@babylonjs/materials';
 import { Settings } from '../../app.settings';
@@ -391,11 +394,12 @@ export class TerrainService {
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
-    // Distant forests are faked as a green canopy painted into the terrain shader
-    // (buildTerrainMaterial §8d) — the 42k 3-D tree instances were THE FPS bottleneck
-    // (~12ms/frame CPU cull + geometry + 3 shadow cascades) and were never seen up
-    // close anyway. buildTreeFoliage is left out deliberately. (Billboard silhouettes
-    // were tried and dropped — looked worse than the canopy alone.)
+    // Distant forests = the green CANOPY painted into the terrain shader (§8d); there are
+    // NO 3-D forest trees (rendering 42k of them, even near-culled, was the FPS wall). The
+    // ONLY real 3-D trees are sparse PALMS dotted along the beaches, rendered only within
+    // ~200 m of the camera — so you get actual trees + shadows when you land on a shore for
+    // almost no cost (few exist, fewer enabled). buildTreeFoliage (forest trees) is unused.
+    this.buildBeachPalms(scene, manifest);
     // Ground scatter (rocks/grass/driftwood/dead trees) is implemented but
     // DISABLED pending a live debug: placement works (instances are created with
     // valid positions, per console logs) but nothing renders via either thin
@@ -653,7 +657,10 @@ export class TerrainService {
       this.sceneService.shadowGenerator?.addShadowCaster(prototype, true);
     }
 
-    const patchSize = 2300;
+    // Small patches so the near-camera cull is fine-grained (a 2300 m patch would
+    // pop a huge block of trees in/out at once). Full placement density is kept —
+    // only a few nearby patches are ever enabled at a time, so total count is cheap.
+    const patchSize = 350;
     const gridX = 480;
     const gridZ = 480;
     const hardCap = 42000;
@@ -874,6 +881,207 @@ export class TerrainService {
     }
   }
 
+  /**
+   * Sparse PALMS scattered along the beaches, rendered only within ~200 m of the camera
+   * (the updateTreePatchVisibility cull). Replaces the old forest-biome trees entirely:
+   * far fewer instances total (~2k vs 42k), placed only on the shoreline band, so the
+   * per-frame residual is tiny and only a handful are ever enabled at once.
+   */
+  private buildBeachPalms(scene: Scene, manifest: TerrainManifest): void {
+    const bounds = manifest.worldBounds;
+    const worldWidth = bounds.maxX - bounds.minX;
+    const worldDepth = bounds.maxZ - bounds.minZ;
+
+    const palm = this.buildPalmMesh(scene);
+    palm.isVisible = false;
+    palm.isPickable = false;
+    palm.position.set(0, -10000, 0);
+    palm.renderingGroupId = 2;   // CRITICAL: terrain/ocean/vessel are all group 2 with depth-
+                                 // clear disabled; a default group-0 mesh renders first and then
+                                 // gets buried behind the terrain. THIS was why palms were
+                                 // invisible — not placement, instancing, freeze, or the mesh.
+    this.sceneService.excludeFromGlow(palm);
+    this.sceneService.shadowGenerator?.addShadowCaster(palm, true);
+    this.treePrototypeMeshes = [palm];
+
+    const patchSize = 150;     // fine patches → tight near-camera culling
+    const gridX = 600;         // denser sampling so thin beach strips get hit
+    const gridZ = 600;
+    const hardCap = 60000;     // safety only — must NOT be hit, or placement clusters in
+                               // the first-scanned region. Density is controlled by chance.
+    const patchMap = new Map<string, TreePatch>();
+    let placed = 0;
+
+    for (let gz = 0; gz < gridZ && placed < hardCap; gz++) {
+      for (let gx = 0; gx < gridX && placed < hardCap; gx++) {
+        const u = (gx + this.hashNoise(gx * 0.63 + 13.7, gz * 0.71 + 5.1) * 0.9) / gridX;
+        const v = (gz + this.hashNoise(gx * 0.49 + 17.9, gz * 0.55 + 11.3) * 0.9) / gridZ;
+        const worldX = bounds.minX + u * worldWidth;
+        const worldZ = bounds.maxZ - v * worldDepth;
+        const y = this.getElevation(worldX, worldZ);
+        // Sandy coastal zone — widened to catch the actual beaches/dunes (they rise
+        // higher and steeper than a flat strip), not just rare flat lagoon spots.
+        if (y < 0.3 || y > 20.0) continue;
+        if (this.sampleSlope(u, v) > 0.9) continue;
+        // Density: enough that beaches you approach reliably have palms within the cull
+        // radius, but kept well under the cap so placement stays uniform (no clustering).
+        if (this.hashNoise(u * 131.7 + 3.1, v * 131.7 + 9.4) > 0.30) continue;
+
+        const inst = palm.createInstance(`tree_palm_${placed}`);
+        const r = this.hashNoise(worldX * 0.0017 + 2.1, worldZ * 0.0017 + 8.4);
+        inst.position.set(worldX, y, worldZ);
+        inst.scaling.setAll(0.8 + r * 0.7);
+        inst.rotation.y = this.hashNoise(worldX * 0.0021 + 101.9, worldZ * 0.0021 + 44.8) * Math.PI * 2;
+        inst.rotation.z = (this.hashNoise(worldX * 0.003 + 5.0, worldZ * 0.003 + 1.0) - 0.5) * 0.22; // slight lean
+        inst.isPickable = false;
+
+        const patchX = Math.floor((worldX - bounds.minX) / patchSize);
+        const patchZ = Math.floor((worldZ - bounds.minZ) / patchSize);
+        const key = `${patchX}:${patchZ}`;
+        let patch = patchMap.get(key);
+        if (!patch) {
+          patch = {
+            root: new TransformNode(`tree_patch_${key}`, scene),
+            centerX: bounds.minX + (patchX + 0.5) * patchSize,
+            centerZ: bounds.minZ + (patchZ + 0.5) * patchSize,
+            density: 0.5, count: 0,
+          };
+          patchMap.set(key, patch);
+          this.treePatches.push(patch);
+        }
+        inst.parent = patch.root;
+        // NOTE: deliberately NOT calling freezeWorldMatrix()/doNotSyncBoundingInfo here —
+        // that leaves the instance's bounding box stale at the prototype's location, so the
+        // frustum culler skips it and the palm never renders. There are few palms (near-
+        // culled), so normal per-frame bounding is cheap.
+        patch.count += 1;
+        this.treeInstances.push(inst);
+        placed += 1;
+      }
+    }
+
+    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
+    this.updateTreePatchVisibility();
+    console.log(`[Terrain] Placed ${placed} beach palms across ${this.treePatches.length} patches.`);
+  }
+
+  /** Low-poly stylised palm: a tapered, slightly tapering trunk + a crown of drooping
+   *  fronds. Vertex-coloured (brown trunk, green fronds) and merged into one mesh so it
+   *  instances cheaply. */
+  private buildPalmMesh(scene: Scene): Mesh {
+    const trunkBase = new Color4(0.42, 0.31, 0.19, 1);
+    const trunkTop  = new Color4(0.55, 0.43, 0.28, 1);
+    const frondBase = new Color4(0.11, 0.33, 0.12, 1);
+    const frondTip  = new Color4(0.33, 0.58, 0.24, 1);
+    const cocoCol   = new Color4(0.33, 0.24, 0.14, 1);
+
+    const TRUNK_H = 9;
+    const CROWN_Y = TRUNK_H;
+
+    // Trunk: tapered, with height subdivisions (so it can curve subtly) + ring shading.
+    const trunk = MeshBuilder.CreateCylinder('palm_trunk', {
+      height: TRUNK_H, diameterBottom: 0.85, diameterTop: 0.34, tessellation: 8, subdivisions: 6,
+    }, scene);
+    trunk.bakeTransformIntoVertices(Matrix.Translation(0, TRUNK_H / 2, 0));  // base at y = 0
+    this.setMeshColorGradientY(trunk, trunkBase, trunkTop, 0, TRUNK_H);
+    const parts: Mesh[] = [trunk];
+
+    // Fronds: two drooping rings of tapered leaves (narrow base → wide middle → point).
+    const makeFrond = (ring: number, idx: number): Mesh => {
+      const len = 6.0 - ring * 0.8 + (idx % 2) * 0.5;
+      const hw = 0.85;
+      const m = new Mesh(`palm_frond_${ring}_${idx}`, scene);
+      const positions = [
+        -hw * 0.28, 0,          0,    // 0 base L
+         hw * 0.28, 0,          0,    // 1 base R
+        -hw,        len * 0.42, 0,    // 2 mid L
+         hw,        len * 0.42, 0,    // 3 mid R
+         0,         len,        0,    // 4 tip
+      ];
+      const indices = [0, 2, 3, 0, 3, 1, 2, 4, 3];
+      const uvs = [0.5, 0, 0.5, 0, 0, 0.4, 1, 0.4, 0.5, 1];
+      const normals: number[] = [];
+      VertexData.ComputeNormals(positions, indices, normals);
+      const vd = new VertexData();
+      vd.positions = positions; vd.indices = indices; vd.normals = normals; vd.uvs = uvs;
+      vd.applyToMesh(m);
+      // Per-vertex gradient: dark green at the base → bright at the tip.
+      const tPer = [0, 0, 0.42, 0.42, 1];
+      const cols: number[] = [];
+      for (const t of tPer) {
+        cols.push(
+          frondBase.r + (frondTip.r - frondBase.r) * t,
+          frondBase.g + (frondTip.g - frondBase.g) * t,
+          frondBase.b + (frondTip.b - frondBase.b) * t,
+          1,
+        );
+      }
+      m.setVerticesData(VertexBuffer.ColorKind, cols);
+      return m;
+    };
+
+    const RINGS = 2;
+    const PER_RING = 6;
+    for (let ring = 0; ring < RINGS; ring++) {
+      for (let i = 0; i < PER_RING; i++) {
+        const f = makeFrond(ring, i);
+        f.rotation.x = (ring === 0 ? 0.70 : 1.45) + (i % 2) * 0.15;          // upper ring up, lower droops
+        f.rotation.y = (i / PER_RING) * Math.PI * 2 + ring * (Math.PI / PER_RING);  // offset rings
+        f.position.set(0, CROWN_Y, 0);
+        parts.push(f);
+      }
+    }
+
+    // Coconuts: a small cluster tucked under the crown.
+    for (let i = 0; i < 4; i++) {
+      const c = MeshBuilder.CreateSphere(`palm_coco_${i}`, { diameter: 0.5, segments: 4 }, scene);
+      const a = (i / 4) * Math.PI * 2;
+      c.bakeTransformIntoVertices(
+        Matrix.Translation(Math.cos(a) * 0.42, CROWN_Y - 0.5, Math.sin(a) * 0.42),
+      );
+      this.setMeshColor(c, cocoCol);
+      parts.push(c);
+    }
+
+    const palm = Mesh.MergeMeshes(parts, true, true)!;
+    palm.name = 'tree_palm';   // 'tree_' prefix → excluded from ocean reflection/refraction RTTs
+    const mat = new StandardMaterial('palmMat', scene);
+    mat.specularColor = new Color3(0, 0, 0);
+    mat.backFaceCulling = false;          // fronds visible from both sides
+    palm.material = mat;
+    palm.useVertexColors = true;
+    return palm;
+  }
+
+  /** Paints a single flat colour into a mesh's vertex-colour buffer. */
+  private setMeshColor(m: Mesh, c: Color4): void {
+    const pos = m.getVerticesData(VertexBuffer.PositionKind);
+    if (!pos) return;
+    const n = pos.length / 3;
+    const cols = new Array<number>(n * 4);
+    for (let i = 0; i < n; i++) {
+      cols[i * 4] = c.r; cols[i * 4 + 1] = c.g; cols[i * 4 + 2] = c.b; cols[i * 4 + 3] = c.a;
+    }
+    m.setVerticesData(VertexBuffer.ColorKind, cols);
+  }
+
+  /** Paints a base→top vertical colour gradient into a mesh's vertex-colour buffer. */
+  private setMeshColorGradientY(m: Mesh, cBase: Color4, cTop: Color4, yMin: number, yMax: number): void {
+    const pos = m.getVerticesData(VertexBuffer.PositionKind);
+    if (!pos) return;
+    const n = pos.length / 3;
+    const span = Math.max(1e-3, yMax - yMin);
+    const cols = new Array<number>(n * 4);
+    for (let i = 0; i < n; i++) {
+      const t = Math.max(0, Math.min(1, (pos[i * 3 + 1] - yMin) / span));
+      cols[i * 4]     = cBase.r + (cTop.r - cBase.r) * t;
+      cols[i * 4 + 1] = cBase.g + (cTop.g - cBase.g) * t;
+      cols[i * 4 + 2] = cBase.b + (cTop.b - cBase.b) * t;
+      cols[i * 4 + 3] = 1;
+    }
+    m.setVerticesData(VertexBuffer.ColorKind, cols);
+  }
+
   private updateTreePatchVisibility(): void {
     const camera = this.sceneService.camera;
     if (!camera) return;
@@ -885,7 +1093,10 @@ export class TerrainService {
       const dx = patch.centerX - cx;
       const dz = patch.centerZ - cz;
       const dist2 = dx * dx + dz * dz;
-      const cullRadius = patch.density > 0.7 ? 12500 : 9800;
+      // Beach palms render within ~1000 m of the camera (distant forest look is the shader
+      // canopy). They batch as instances so a long beach is cheap; tree shadows still clip
+      // at shadowMaxZ (~200 m), so only near palms pay shadow cost.
+      const cullRadius = 1000;
       patch.root.setEnabled(dist2 <= cullRadius * cullRadius);
     }
   }

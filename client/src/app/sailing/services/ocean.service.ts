@@ -349,6 +349,31 @@ float causticPattern(vec2 uv, float t) {
   return pow(clamp(1.0 - abs(a), 0.0, 1.0), 3.5);
 }
 
+// ── Fish: cheap drifting silhouettes for the clear shallows (viewed from above) ──
+// Two schools at different scales/directions; ~1/4 of cells hold a fish, squashed into
+// an elongated sliver with a tail wiggle. Only sampled on shallow pixels (see main).
+float fishHash(vec2 id) { return fract(sin(dot(id, vec2(41.3, 289.1))) * 43758.5453); }
+float fishField(vec2 p, float t) {
+  // One independent fish per occupied ~12 m cell. Each wanders on its own Lissajous
+  // path (unequal speeds → it turns and changes pace), and the body points along its
+  // actual heading — so neighbours swim in all different directions, not in lockstep.
+  float scale = 0.085;
+  vec2  id  = floor(p * scale);
+  float rnd = fishHash(id);
+  if (rnd <= 0.70) return 0.0;                                  // only ~30% of cells have a fish
+  float ph  = rnd * 53.0;
+  float sp1 = 0.30 + rnd * 0.55;                                // per-fish speeds (differ → curved path)
+  float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
+  vec2  cellC = (id + 0.5) / scale;
+  vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;  // wander within the cell
+  vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));     // heading + speed
+  vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
+  vec2  rel   = p - fishC;
+  vec2  local = vec2(dot(rel, fwd), dot(rel, vec2(-fwd.y, fwd.x)));               // into the fish's frame
+  float d = length(vec2(local.x / 0.95, local.y / 0.28));                        // long, thin body
+  return 1.0 - smoothstep(0.55, 1.0, d);
+}
+
 // ── Rain ripple noise ───────────────────────────────────────────────────────
 // Cheap value noise + a fast two-octave drifting field used to dimple the water
 // surface normals where rain is falling (simulates countless drop impacts).
@@ -514,6 +539,10 @@ void main() {
     // Cool the submerged sand — water absorbs warm light, so the bottom seen
     // through water reads cooler/greener than dry sand (kills the "yellow water").
     vec3 seabed = texture2D(u_refraction, refrUV).rgb * vec3(0.40, 0.49, 0.56);
+    // Fish: dark drifting silhouettes on the seabed — only when the camera is above the
+    // surface (avoids artifacts when the view dips underwater).
+    float fish = (u_cameraPosition.y > 0.05) ? fishField(worldXZ, u_Time) : 0.0;
+    seabed *= (1.0 - fish * 0.65);
     // Tint toward water teal with depth so the deeper shallows read as water,
     // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
     float depthTint = smoothstep(0.0, 22.0, dz);
@@ -891,6 +920,28 @@ fn causticPattern(uvIn: vec2f, t: f32) -> f32 {
   return pow(clamp(1.0 - abs(a), 0.0, 1.0), 3.5);
 }
 
+// ── Fish: cheap drifting silhouettes for the clear shallows (viewed from above) ──
+fn fishHash(id: vec2f) -> f32 { return fract(sin(dot(id, vec2f(41.3, 289.1))) * 43758.5453); }
+fn fishField(p: vec2f, t: f32) -> f32 {
+  // One independent fish per occupied ~12 m cell — own heading/speed, wandering on a
+  // Lissajous path (so it turns & changes pace), body oriented to its travel direction.
+  let scale = 0.085;
+  let id  = floor(p * scale);
+  let rnd = fishHash(id);
+  if (rnd <= 0.70) { return 0.0; }
+  let ph  = rnd * 53.0;
+  let sp1 = 0.30 + rnd * 0.55;
+  let sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
+  let cellC = (id + vec2f(0.5)) / scale;
+  let fishC = cellC + vec2f(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+  let vel   = vec2f(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
+  let fwd   = normalize(vel + vec2f(1e-4, 0.0));
+  let rel   = p - fishC;
+  let local = vec2f(dot(rel, fwd), dot(rel, vec2f(-fwd.y, fwd.x)));
+  let d = length(vec2f(local.x / 0.95, local.y / 0.28));
+  return 1.0 - smoothstep(0.55, 1.0, d);
+}
+
 // ── Rain ripple noise (same as GLSL path) ───────────────────────────────────
 fn rVHash(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
 fn rVNoise(p: vec2f) -> f32 {
@@ -1035,7 +1086,11 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   if (seabedReveal > 0.001) {
     let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
     // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
-    let seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
+    var seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
+    // Fish: dark drifting silhouettes — only with the camera above the surface.
+    var fish = 0.0;
+    if (uniforms.u_cameraPosition.y > 0.05) { fish = fishField(worldXZ, uniforms.u_Time); }
+    seabed = seabed * (1.0 - fish * 0.65);
     let depthTint = smoothstep(0.0, 22.0, dz);
     let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));
     color = mix(color, shallowWater, vec3f(seabedReveal * 0.90));

@@ -34,6 +34,8 @@ export class VesselService {
   private z          = 0;
   private heading    = 270;   // compass bearing 0=N(+Z) 90=E(+X)
   private speed      = 0;
+  private prevHeading       = 270;   // last frame's heading, for angular-velocity calc
+  private turnRateSmoothed  = 0;     // smoothed heading deg/s, broadcast for remote dead-reckoning
   private sailState:  SailState = 'reefed';
   private isGrounded: boolean   = false;
 
@@ -751,10 +753,20 @@ export class VesselService {
       this.updateRigLine(this.rigLineVang,      boomNear, new Vector3(0, 1.22, this.MAST_Z));
     }
 
+    // Actual heading angular velocity (deg/s, shortest arc) — covers steering, wave
+    // wander, and buoyancy yaw uniformly. Broadcast so remote clients can curve their
+    // dead-reckoning through our turns instead of projecting straight.
+    let hDelta = ((this.heading - this.prevHeading + 540) % 360) - 180;
+    const turnRate = dt > 0 ? hDelta / dt : 0;
+    // Light smoothing so a noisy per-frame value doesn't make remote turns jitter.
+    this.turnRateSmoothed += (turnRate - this.turnRateSmoothed) * Math.min(1, dt * 8);
+    this.prevHeading = this.heading;
+
     // Publish state
     this.zone.run(() => {
       this.state.set({
         x: this.x, z: this.z, heading: this.heading, speed: this.speed,
+        turnRate: this.turnRateSmoothed,
         sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
         sheetAngle:  Math.round(this.sheetAngleDeg),
         trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),

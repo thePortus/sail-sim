@@ -1838,5 +1838,17 @@ export class OceanService {
     }
   }
 
+  /** Remove a mesh from the reflection render list (e.g. a disconnected remote vessel),
+   *  so disposed meshes don't accumulate in the RTT over many join/leaves. */
+  removeFromRenderList(mesh: AbstractMesh): void {
+    if (!this.renderListSet.has(mesh)) return;
+    this.renderListSet.delete(mesh);
+    const list = this.reflectionRTT?.renderList;
+    if (list) {
+      const i = list.indexOf(mesh);
+      if (i >= 0) list.splice(i, 1);
+    }
+  }
+
   getOceanMesh(): Mesh { return this.oceanMesh0; }
 }

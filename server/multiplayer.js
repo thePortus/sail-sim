@@ -308,8 +308,9 @@ function attachMultiplayer(server) {
     ws.send(JSON.stringify(currentWaveState()));
 
     const existing = [];
+    const nowTs = Date.now();
     for (const [pid, p] of players) {
-      if (pid !== id && p.state) existing.push({ id: pid, ...p.state });
+      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
@@ -326,6 +327,9 @@ function attachMultiplayer(server) {
           z:          +msg.z          || 0,
           heading:    +msg.heading    || 0,
           speed:      +msg.speed      || 0,
+          turnRate:   +msg.turnRate   || 0,
+          sheetAngle: +msg.sheetAngle || 0,
+          isPortTack: !!msg.isPortTack,
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
@@ -371,7 +375,14 @@ function attachMultiplayer(server) {
           }
         }
 
-        const broadcast = JSON.stringify({ type: 'update', id, ...state });
+        // Stamp a server-authoritative send time (ms) so receivers can interpolate
+        // between snapshots on one consistent clock (avoids client clock-skew). seq is
+        // the sender's monotonic counter, passed through for ordering/staleness checks.
+        const broadcast = JSON.stringify({
+          type: 'update', id, ...state,
+          ts: Date.now(),
+          seq: Number.isFinite(+msg.seq) ? +msg.seq : 0,
+        });
         for (const [pid, p] of players) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(broadcast);
         }

@@ -1380,6 +1380,9 @@ export class TerrainService {
     material.AddUniform('uGrassNor',    'sampler2D', null);
     material.AddUniform('uRockNor',     'sampler2D', null);
     material.AddUniform('uHazeColor',   'vec3',      null);   // aerial-perspective tint (= sky/fog colour)
+    material.AddUniform('uCloudCoverage', 'float',   null);   // cloud-shadow strength (matches ocean)
+    material.AddUniform('uSunDir',        'vec3',    null);   // unit vector toward the sun
+    material.AddUniform('uCloudTime',     'float',   null);   // drives cloud-shadow drift
 
     // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
     const peakH = manifest.targetPeakElevation ?? 920;
@@ -1706,11 +1709,33 @@ export class TerrainService {
     // metre → few-kilometre range we actually view at (the scene's global EXP2 fog
     // only bites at ~20 km, far too distant to shape the mountains).
     material.Fragment_Before_FragColor(`
+      // ── Cloud shadows (match the ocean's drifting dappled shadow exactly) ──────
+      // Same projection + value-noise field + drift as ocean.service so shadows line
+      // up across the shoreline. Applied to the lit colour, before the distance haze.
+      if (uSunDir.y > 0.03 && uCloudCoverage > 0.02) {
+        vec2 cuv = (vPositionW.xz + uSunDir.xz / max(uSunDir.y, 0.2) * 900.0) * 0.004;
+        vec2 cdr = vec2(uCloudTime * 0.18, uCloudTime * 0.12);
+        vec2 i0 = floor(cuv + cdr);     vec2 f0 = fract(cuv + cdr);
+        vec2 i1 = floor(cuv*2.3 - cdr*1.7); vec2 f1 = fract(cuv*2.3 - cdr*1.7);
+        // hash-based value noise (matches ocean rVNoise character)
+        #define VCH(p) fract(sin(dot((p), vec2(127.1,311.7))) * 43758.5453)
+        f0 = f0*f0*(3.0-2.0*f0); f1 = f1*f1*(3.0-2.0*f1);
+        float n0 = mix(mix(VCH(i0),VCH(i0+vec2(1.,0.)),f0.x), mix(VCH(i0+vec2(0.,1.)),VCH(i0+vec2(1.,1.)),f0.x), f0.y);
+        float n1 = mix(mix(VCH(i1),VCH(i1+vec2(1.,0.)),f1.x), mix(VCH(i1+vec2(0.,1.)),VCH(i1+vec2(1.,1.)),f1.x), f1.y);
+        float cf = n0 * 0.6 + n1 * 0.4;
+        float cShadow = smoothstep(0.60 - uCloudCoverage * 0.45, 0.70 - uCloudCoverage * 0.30, cf);
+        cShadow *= uCloudCoverage * smoothstep(0.03, 0.18, uSunDir.y);
+        color.rgb *= 1.0 - cShadow * 0.55;
+      }
+
       float hazeDist = length(vPositionW - vEyePosition.xyz);
-      // Cap near 1.0 so the most distant terrain washes almost fully into the sky
-      // colour — drops the silhouette's edge contrast to a few percent, which reads
-      // as a soft, hazy outline instead of a hard cut against the sky.
-      float hazeF = clamp((1.0 - exp(-hazeDist * 0.00034)) * 1.08, 0.0, 0.975);
+      // Lower density (0.00034→0.00020) + a pow(1.4) shaping push the haze ONSET much
+      // farther out, so near/mid islands keep their colour & saturation (they were
+      // washing toward the fog tint — grey/orange at dawn, desaturated by day — by ~1 km).
+      // The high cap (0.96) still lets the MOST distant terrain melt into the sky for a
+      // soft hazy silhouette rather than a hard edge.
+      float hazeRaw = 1.0 - exp(-hazeDist * 0.00020);
+      float hazeF   = clamp(pow(hazeRaw, 1.4), 0.0, 0.96);
       color.rgb = mix(color.rgb, uHazeColor, hazeF);
     `);
 
@@ -1721,6 +1746,11 @@ export class TerrainService {
       fx.setFloat('uPeakH', peakH);
       // Haze tint tracks the current sky/fog colour (day/dusk/night/storm aware).
       fx.setColor3('uHazeColor', scene.fogColor);
+      // Cloud shadows — pull the SAME coverage, sun dir and clock the ocean uses so the
+      // dappled shadows line up exactly across the water/land boundary.
+      fx.setVector3('uSunDir', this.sceneService.getSunDirection());
+      fx.setFloat('uCloudCoverage', this.oceanService.getCloudCoverage());
+      fx.setFloat('uCloudTime', this.oceanService.getOceanTime());
       fx.setTexture('uSandDiff',   sandTex);
       fx.setTexture('uGrassDiff',  grassTex);
       fx.setTexture('uGrass2Diff', grass2Tex);

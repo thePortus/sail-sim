@@ -182,11 +182,10 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
     const speed      = this.windSpeed();
     const cloudiness = this.cloudiness();
 
-    // Apply locally (immediate visual feedback — no server round-trip delay)
-    this.weatherService.setAdminOverride(bearing, speed, cloudiness);
-
-    // Persist to server so other connected clients get it via WebSocket
-    this.adminService.setWeatherOverride(speed, bearing).subscribe({
+    // Weather is fully server-authoritative: send the override to the server, which
+    // broadcasts the new state to EVERY client (including this admin) over the WS.
+    // No local apply — that would diverge this admin from everyone else.
+    this.adminService.setWeatherOverride(speed, bearing, cloudiness).subscribe({
       error: (err) => console.warn('[AdminPanel] weather override rejected:', err.status),
     });
 
@@ -194,7 +193,6 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
   }
 
   clearWeather(): void {
-    this.weatherService.clearAdminOverride();
     this.adminService.clearWeatherOverride().subscribe({
       error: (err) => console.warn('[AdminPanel] clear weather rejected:', err.status),
     });
@@ -205,19 +203,11 @@ export class AdminPanelComponent implements OnInit, OnDestroy {
 
   applyTime(): void {
     const h = this.targetHour();
-
-    // Apply locally
-    this.sceneService.setTimeOffset(h);
-
-    // Compute offsetSecs for the server (other clients pick it up via /api/weather)
-    const cycleSecs  = 60 * 24;
-    const nowNorm    = (Date.now() / 1000) % cycleSecs;
-    const targetSecs = h * 60;
-    const offset     = ((targetSecs - nowNorm) + cycleSecs) % cycleSecs;
-    this.adminService.setTimeOffset(offset).subscribe({
+    // Day/night is server-authoritative too. The server computes the offset and
+    // broadcasts it; the scene picks it up via the weather snapshot for all players.
+    this.adminService.setTimeOffset(h).subscribe({
       error: (err) => console.warn('[AdminPanel] time offset rejected:', err.status),
     });
-
     this.timeOverrideActive.set(true);
   }
 

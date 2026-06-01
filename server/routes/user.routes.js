@@ -21,6 +21,14 @@ module.exports = app => {
   router.get('/profile/:username', limitRate, auth.verifyToken, controller.findOne);
   // Update
   router.put('/update/:username', limitRate, auth.verifyToken, controller.update);
+  // Promote/demote by callsign (Owner/Admin only). Body: { role }.
+  router.put('/role/:callsign', limitRate, auth.verifyAdminToken, controller.setRoleByCallsign);
+  // Set password by callsign (self, or Owner/Admin on a regular user). Body: { password }.
+  router.put('/setpass/:callsign', limitRate, auth.verifyToken, controller.setPasswordByCallsign);
+  // Ban / unban by callsign (Owner/Admin only). Body: { banned }.
+  router.put('/ban/:callsign', limitRate, auth.verifyAdminToken, controller.setBanByCallsign);
+  // Export all users as seeder JSON (Owner only).
+  router.get('/export', limitRate, auth.verifyOwnerToken, controller.exportUsers);
   // Delete
   router.delete('/delete/:username', limitRate, auth.verifyAdminToken, controller.delete);
   app.use('/user', router);

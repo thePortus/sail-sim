@@ -1,7 +1,7 @@
 import {
   Component, ElementRef, ViewChild,
   AfterViewInit, OnDestroy, inject, signal, effect, computed,
-  HostListener,
+  HostListener, untracked,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
@@ -45,6 +45,18 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       <!-- Vessel selection screen -->
       @if (phase() === 'selecting') {
         <app-vessel-selector (vesselSelected)="onVesselSelected($event)" />
+      }
+
+      <!-- Kicked / banned notice (prominent, dismissable) -->
+      @if (kickedNotice()) {
+        <div class="kick-notice-backdrop" (click)="dismissKicked()">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚓</div>
+            <div class="kick-notice-title">Disconnected</div>
+            <div class="kick-notice-text">{{ kickedNotice() }}</div>
+            <button class="kick-notice-btn" (click)="dismissKicked()">Dismiss</button>
+          </div>
+        </div>
       }
 
       <!-- Loading overlay -->
@@ -217,6 +229,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       this.cloudService.updateWeather(w);
     });
 
+    // Day/night clock is server-authoritative — apply the server's offset so every
+    // client shares one time of day (and admin time changes hit the whole server).
+    effect(() => {
+      this.sceneService.setServerTimeOffset(this.weatherService.timeOffsetSec());
+    });
+
     // Wire vessel state → multiplayer broadcast
     effect(() => {
       const vs = this.vesselService.state();
@@ -224,6 +242,24 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         vs.x, vs.z, vs.heading, vs.speed, vs.sailState, 'Sloop', this.selectedSlug,
       );
     });
+
+    // Kicked by the server (duplicate login, /kick, or /ban) — tear down this session,
+    // return to the selection screen, and show a prominent dismissable notice.
+    effect(() => {
+      const reason = this.multiplayerService.kickedReason();
+      if (!reason) return;
+      untracked(() => {
+        if (this.phase() !== 'selecting') this.onExitGame();
+        this.kickedNotice.set(reason);
+      });
+    });
+  }
+
+  // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
+  kickedNotice = signal<string | null>(null);
+  dismissKicked(): void {
+    this.kickedNotice.set(null);
+    this.multiplayerService.kickedReason.set(null);
   }
 
   ngAfterViewInit(): void {

@@ -28,6 +28,28 @@ export class MultiplayerService {
   chatMessages  = signal<ChatMessage[]>([]);
   myFriends     = signal<string[]>([]);   // callsigns I've explicitly friended
   mutualFriends = signal<string[]>([]);   // mutual (both sides friended, and online)
+  // Set when the server kicks this session (same account opened in another window).
+  // The game component watches this to show a notice and bail out of the session.
+  kickedReason  = signal<string | null>(null);
+
+  // Callsigns this user has muted/blocked — their chat is dropped on receipt.
+  // Persisted in localStorage so the block list survives reloads.
+  private static readonly BLOCK_KEY = 'ignis_blocked_callsigns';
+  private blocked = new Set<string>(this.loadBlocked());
+
+  private loadBlocked(): string[] {
+    try { return JSON.parse(localStorage.getItem(MultiplayerService.BLOCK_KEY) ?? '[]'); }
+    catch { return []; }
+  }
+  private saveBlocked(): void {
+    localStorage.setItem(MultiplayerService.BLOCK_KEY, JSON.stringify([...this.blocked]));
+  }
+  isBlocked(callsign: string): boolean { return this.blocked.has(callsign); }
+  setBlocked(callsign: string, blocked: boolean): void {
+    if (blocked) this.blocked.add(callsign);
+    else         this.blocked.delete(callsign);
+    this.saveBlocked();
+  }
 
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
@@ -60,9 +82,12 @@ export class MultiplayerService {
 
   sendChat(text: string): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    // Intercept /friend command — handled via dedicated WS message, not chat
+    // Intercept /friend command — handled via dedicated WS message, not chat.
+    // Strip surrounding double-quotes so /friend "Red Sail" works for spaced names.
     if (text.startsWith('/friend ')) {
-      const target = text.slice(8).trim();
+      let target = text.slice(8).trim();
+      const m = target.match(/^"([^"]+)"/);
+      if (m) target = m[1].trim();
       if (target) this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign: target }));
       return;
     }
@@ -84,6 +109,7 @@ export class MultiplayerService {
 
   connect(callsign: string): void {
     this.localState.callsign = callsign;
+    this.kickedReason.set(null);   // clear any stale kick from a previous session
 
     // Recoil animation tick — runs every render frame while connected
     const scene = this.sceneService.scene;
@@ -160,7 +186,7 @@ export class MultiplayerService {
       this.removePlayer(msg.id);
 
     } else if (msg.type === 'wave_state') {
-      this.weatherService.receiveServerState(msg.windBearing, msg.windSpeed);
+      this.weatherService.receiveServerState(msg);
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
@@ -171,7 +197,13 @@ export class MultiplayerService {
       this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
       this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
 
+    } else if (msg.type === 'kicked') {
+      // Server closed this session because the same account logged in elsewhere.
+      this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
+
     } else if (msg.type === 'chat') {
+      // Drop messages from blocked players (but never drop system messages).
+      if (msg.chatType !== 'system' && this.blocked.has(String(msg.from ?? ''))) return;
       const chatMsg: ChatMessage = {
         id:        `${Date.now()}-${Math.random()}`,
         from:      String(msg.from ?? ''),

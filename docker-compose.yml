@@ -33,7 +33,7 @@ services:
       - JWT_SECRET=secret
       - OWNER_USERNAME=admin
       - OWNER_PASSWORD=123456
-      - OWNER_EMAIL=admin@sail-sim.local
+      - OWNER_CALLSIGN=Teach
     stdin_open: true
     tty: true
     networks:

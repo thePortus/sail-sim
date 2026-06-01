@@ -1,4 +1,4 @@
-import { Component, computed, inject, output, signal, OnInit, OnDestroy } from '@angular/core';
+import { Component, computed, inject, output, signal, OnInit, OnDestroy, ViewChild, HostListener } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
@@ -16,6 +16,26 @@ export class HudComponent implements OnInit, OnDestroy {
   vesselService  = inject(VesselService);
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
+
+  @ViewChild(ChatComponent) private chat?: ChatComponent;
+
+  /**
+   * Global hotkeys: Enter focuses the chat input; "/" focuses it pre-filled with "/".
+   * Ignored while any input/textarea is already focused (so typing in chat — or any
+   * other field — isn't hijacked).
+   */
+  @HostListener('window:keydown', ['$event'])
+  onGlobalKey(e: KeyboardEvent): void {
+    const tag = (e.target as HTMLElement)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      this.chat?.focusInput();
+    } else if (e.key === '/') {
+      e.preventDefault();
+      this.chat?.focusInput('/');
+    }
+  }
 
   vessel  = this.vesselService.state;
   weather = this.weatherService.weather;

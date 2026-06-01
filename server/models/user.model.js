@@ -8,6 +8,9 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: 'Viewer',
     },
 
+    // When true, login is refused. Set/cleared by Owner/Admin via /ban /unban.
+    banned: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+
     // ── Last-known sailing position ──────────────────────────────────────────
     // Persisted on each auto-save (every 30 s), on exit, and on logout.
     // NULL means the player has never sailed — they will spawn at the island default.

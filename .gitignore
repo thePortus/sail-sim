@@ -9,6 +9,9 @@ certbot/
 # generated terrain files
 server/assets/terrain/
 
+# user info
+server/seeders/import/**/*
+
 # Static Generated doc files
 server/pages/docs
 

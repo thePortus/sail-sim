@@ -2,21 +2,15 @@
 
 # General or Current TODO Items
 
-* Follow improve plan for terrain
-
+* Improve clouds
 * Add ability to /promote and /demote users, and to /mute as an admin, and /block dms as a user
-* Heighten normal/bump mapping on sand, rocks, grass... effect is mutedgit a
-* More trees
-* Plan to improve quality of ground texture, more realistic
-* Improve rain
+* Enhance server-side streaming/caching of assets.... so that assets can be loaded slowly rather than all at once, stored between sessions
 * Fix sky/cloud seam at 0/0
 * Smoothed multiplayer movement
-* Waterfalls?
 * Add better island collision detection
 * Add starry night sky
 * Prevent multiple simultaneous windows at once
 * Add better cannon impact on water (since we have the new shader)
-* Add wake deformation - IMPROVE
 * Add in town geometries
 * Add in towns themselves
 

@@ -360,7 +360,8 @@ float fishField(vec2 p, float t) {
   float scale = 0.085;
   vec2  id  = floor(p * scale);
   float rnd = fishHash(id);
-  if (rnd <= 0.70) return 0.0;                                  // only ~30% of cells have a fish
+  if (rnd <= 0.76) return 0.0;                                  // ~24% of cells have a fish (a bit fewer)
+  float szr = fishHash(id + 31.7);                             // independent random → full size range
   float ph  = rnd * 53.0;
   float sp1 = 0.30 + rnd * 0.55;                                // per-fish speeds (differ → curved path)
   float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
@@ -370,8 +371,23 @@ float fishField(vec2 p, float t) {
   vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
   vec2  rel   = p - fishC;
   vec2  local = vec2(dot(rel, fwd), dot(rel, vec2(-fwd.y, fwd.x)));               // into the fish's frame
-  float d = length(vec2(local.x / 0.95, local.y / 0.28));                        // long, thin body
-  return 1.0 - smoothstep(0.55, 1.0, d);
+  // Fish silhouette (top-down): a teardrop body + a flaring triangular tail fin, with
+  // per-fish size variety. local.x = forward (+head), local.y = lateral.
+  local /= (0.5 + szr * 0.7);                            // per-fish size — small ↔ big (max trimmed down)
+  float fx = local.x;
+  float fy = abs(local.y);
+  float shape = 0.0;
+  if (fx > -0.45 && fx < 0.85) {                         // body: widest mid, tapering to nose & tail
+    float bs = (fx + 0.45) / 1.30;
+    float w  = max(0.045, 0.34 * sin(bs * 3.14159));
+    shape = max(shape, 1.0 - smoothstep(w * 0.45, w, fy));   // soft edge (slight blur)
+  }
+  if (fx > -1.15 && fx <= -0.35) {                       // caudal tail fin: flares toward the tip
+    float ts = (-0.35 - fx) / 0.80;
+    float tw = 0.05 + ts * 0.34;
+    shape = max(shape, (1.0 - smoothstep(tw * 0.45, tw, fy)) * 0.88);
+  }
+  return shape * (0.70 + rnd * 0.30);                    // per-fish darkness
 }
 
 // ── Rain ripple noise ───────────────────────────────────────────────────────
@@ -394,13 +410,20 @@ float rainField(vec2 p, float t){
   float h1 = rVHash(cell);
   float h2 = rVHash(cell + 5.7);
   float h3 = rVHash(cell + 11.3);
-  vec2  center = vec2(0.25 + h1 * 0.5, 0.25 + h2 * 0.5);  // jittered within the cell
-  float rate = mix(1.4, 3.4, h3);                          // impacts per second
+  float h4 = rVHash(cell + 19.1);
+  vec2  center = vec2(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);     // jittered impact point
+  float rate = mix(1.0, 3.2, h3);                          // impacts/sec (varied)
   float life = fract(t * rate + h1 * 7.0);                 // 0..1 life cycle
-  float env  = sin(life * 3.14159265);                     // fade in → peak → out
-  env *= env;                                              // sharper attack/decay
-  float r = length(f - center);
-  return (1.0 - smoothstep(0.0, 0.30, r)) * env;
+  float r    = length(f - center);
+  float sz   = mix(0.16, 0.42, h4);                        // per-drop size: drizzle → fat splash
+
+  // Sharp central plip the instant the drop lands.
+  float impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+  // Ripple ring that expands outward and fades — the real drop-on-water signature.
+  float ringR  = life * sz * 1.6;
+  float ring   = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+  ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+  return impact + ring * 0.6;
 }
 
 void main() {
@@ -542,7 +565,7 @@ void main() {
     // Fish: dark drifting silhouettes on the seabed — only when the camera is above the
     // surface (avoids artifacts when the view dips underwater).
     float fish = (u_cameraPosition.y > 0.05) ? fishField(worldXZ, u_Time) : 0.0;
-    seabed *= (1.0 - fish * 0.65);
+    seabed *= (1.0 - fish * 0.50);   // a touch fainter
     // Tint toward water teal with depth so the deeper shallows read as water,
     // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
     float depthTint = smoothstep(0.0, 22.0, dz);
@@ -928,7 +951,8 @@ fn fishField(p: vec2f, t: f32) -> f32 {
   let scale = 0.085;
   let id  = floor(p * scale);
   let rnd = fishHash(id);
-  if (rnd <= 0.70) { return 0.0; }
+  if (rnd <= 0.76) { return 0.0; }
+  let szr = fishHash(id + 31.7);
   let ph  = rnd * 53.0;
   let sp1 = 0.30 + rnd * 0.55;
   let sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
@@ -937,9 +961,22 @@ fn fishField(p: vec2f, t: f32) -> f32 {
   let vel   = vec2f(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
   let fwd   = normalize(vel + vec2f(1e-4, 0.0));
   let rel   = p - fishC;
-  let local = vec2f(dot(rel, fwd), dot(rel, vec2f(-fwd.y, fwd.x)));
-  let d = length(vec2f(local.x / 0.95, local.y / 0.28));
-  return 1.0 - smoothstep(0.55, 1.0, d);
+  let local = vec2f(dot(rel, fwd), dot(rel, vec2f(-fwd.y, fwd.x))) / (0.5 + szr * 0.7);
+  // Fish silhouette: teardrop body + flaring tail fin (local.x forward, local.y lateral).
+  let fx = local.x;
+  let fy = abs(local.y);
+  var shape = 0.0;
+  if (fx > -0.45 && fx < 0.85) {
+    let bs = (fx + 0.45) / 1.30;
+    let w  = max(0.045, 0.34 * sin(bs * 3.14159));
+    shape = max(shape, 1.0 - smoothstep(w * 0.45, w, fy));
+  }
+  if (fx > -1.15 && fx <= -0.35) {
+    let ts = (-0.35 - fx) / 0.80;
+    let tw = 0.05 + ts * 0.34;
+    shape = max(shape, (1.0 - smoothstep(tw * 0.45, tw, fy)) * 0.88);
+  }
+  return shape * (0.70 + rnd * 0.30);
 }
 
 // ── Rain ripple noise (same as GLSL path) ───────────────────────────────────
@@ -959,13 +996,17 @@ fn rainField(p: vec2f, t: f32) -> f32 {
   let h1 = rVHash(cell);
   let h2 = rVHash(cell + 5.7);
   let h3 = rVHash(cell + 11.3);
-  let center = vec2f(0.25 + h1 * 0.5, 0.25 + h2 * 0.5);
-  let rate = mix(1.4, 3.4, h3);
+  let h4 = rVHash(cell + 19.1);
+  let center = vec2f(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+  let rate = mix(1.0, 3.2, h3);
   let life = fract(t * rate + h1 * 7.0);
-  var env  = sin(life * 3.14159265);
-  env = env * env;
-  let r = length(f - center);
-  return (1.0 - smoothstep(0.0, 0.30, r)) * env;
+  let r    = length(f - center);
+  let sz   = mix(0.16, 0.42, h4);
+  let impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+  let ringR  = life * sz * 1.6;
+  var ring   = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+  ring = ring * smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+  return impact + ring * 0.6;
 }
 
 @fragment
@@ -1090,7 +1131,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     // Fish: dark drifting silhouettes — only with the camera above the surface.
     var fish = 0.0;
     if (uniforms.u_cameraPosition.y > 0.05) { fish = fishField(worldXZ, uniforms.u_Time); }
-    seabed = seabed * (1.0 - fish * 0.65);
+    seabed = seabed * (1.0 - fish * 0.50);   // a touch fainter
     let depthTint = smoothstep(0.0, 22.0, dz);
     let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));
     color = mix(color, shallowWater, vec3f(seabedReveal * 0.90));
@@ -1290,6 +1331,7 @@ export class OceanService {
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
     this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
+    // Every other frame (perf). If the sky/sun reflection strobes at low FPS, set to 1.
     this.reflectionRTT.refreshRate = 2;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];

@@ -373,9 +373,9 @@ export class SceneService {
     // Exclude the four ocean LOD meshes (all named 'ocean_*') so open water reads
     // the 1e8 clear (= "far") rather than its own surface depth.
     depthMap.renderListPredicate = (m) => !m.name.startsWith('ocean_');
-    // Every other frame — this re-renders the terrain just for depth; the soft
-    // waterline / shallow-reveal it feeds tolerate a 1-frame lag invisibly.
-    depthMap.refreshRate = 2;
+    // Every frame: at low FPS an every-other-frame depth pass makes the soft-waterline
+    // foam around the bobbing hull strobe. (Was 2 for perf; the strobe wasn't worth it.)
+    depthMap.refreshRate = 1;
     this.scene.customRenderTargets.push(depthMap);
 
     this.oceanDepthRenderer = depthRenderer;
@@ -707,10 +707,10 @@ export class SceneService {
     // Daytime overcast: bright grey under light cloud, but a thick storm (cloud
     // near 1) should read DARK and moody — otherwise the fog washes distant
     // islands brighter than the storm sky behind them.
-    const stormDark = Math.max(0, (cloud - 0.6) / 0.4);   // 0 until cloud>0.6, →1 at full storm
+    const stormDark = Math.max(0, (cloud - 0.45) / 0.45);   // ramps in earlier & faster
     const overcastDay = Color3.Lerp(
-      new Color3(0.60, 0.65, 0.72),   // light overcast: bright grey
-      new Color3(0.30, 0.34, 0.40),   // full storm: dark moody grey
+      new Color3(0.58, 0.63, 0.70),   // light overcast: bright grey
+      new Color3(0.19, 0.22, 0.27),   // full storm: dark, matches the moody sky
       stormDark,
     );
     const overcast = Color3.Lerp(
@@ -718,7 +718,9 @@ export class SceneService {
       overcastDay,
       fogDayLight,
     );
-    fog = Color3.Lerp(fog, overcast, cloud * 0.45);
+    // Heavier cloud washes the fog more fully toward the (now darker) overcast, so distant
+    // islands don't read brighter than the dark storm sky behind them.
+    fog = Color3.Lerp(fog, overcast, Math.min(0.92, cloud * (0.45 + stormDark * 0.45)));
 
     this.scene.fogColor   = fog;
     this.scene.clearColor = new Color4(fog.r * 0.20, fog.g * 0.20, fog.b * 0.30, 1);

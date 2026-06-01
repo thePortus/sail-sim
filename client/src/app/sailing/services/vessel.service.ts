@@ -132,6 +132,29 @@ export class VesselService {
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
   private readonly TRAVEL_SCALE = 5.0;
 
+  // ── Hull collision ──────────────────────────────────────────────────────────
+  // The aground check used to test only the boat's CENTRE point, so the long bow
+  // could plunge ~half a hull-length into an island before the centre reached land
+  // (the "sailing inside the island" bug). We instead sample several points along
+  // the hull's length so the bow/stern stops at the shoreline like a solid body.
+  private readonly HULL_HALF_LEN = 7.0;   // world units from centre to bow/stern tip
+  private readonly HULL_SAMPLES  = 4;     // points sampled fore-of-centre to the bow
+
+  /**
+   * True if any point along the hull centreline (from centre toward the moving end)
+   * lies on land — so the bow/stern is blocked the instant it touches shore, not
+   * once the centre arrives. `dirSign` is +1 when moving ahead, -1 when reversing.
+   */
+  private hullHitsLand(cx: number, cz: number, hr: number, dirSign: number): boolean {
+    const fx = Math.sin(hr) * dirSign;   // unit heading vector (forward / reverse)
+    const fz = Math.cos(hr) * dirSign;
+    for (let i = 1; i <= this.HULL_SAMPLES; i++) {
+      const d = (this.HULL_HALF_LEN * i) / this.HULL_SAMPLES;
+      if (this.terrainService.isOnLand(cx + fx * d, cz + fz * d)) return true;
+    }
+    return false;
+  }
+
   // ── Wake / hull-wash particle systems ────────────────────────────────────
   // Four ParticleSystems share one foam texture and use plain Vector3 emitters
   // that are repositioned every physics tick to follow the hull.  Particles are
@@ -601,7 +624,12 @@ export class VesselService {
     const newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyX;
     const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
 
-    if (this.terrainService.isOnLand(newX, newZ)) {
+    // Block when the HULL (bow when moving ahead, stern when reversing) — not just
+    // the centre — would touch land, so the ship halts at the shoreline instead of
+    // burying its bow inside the island. dirSign follows the direction of travel.
+    const dirSign = this.speed >= 0 ? 1 : -1;
+    if (this.hullHitsLand(newX, newZ, hr, dirSign) ||
+        this.terrainService.isOnLand(newX, newZ)) {
       // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
 

@@ -288,11 +288,24 @@ void main(void) {
     vec3  scatter  = vec3(0.0);
     float t        = tNear + jit;
 
+    // Adaptive empty-space skipping: most rays cross mostly-empty sky. Advance with a
+    // big step while the (cheap) density probe reads empty; on the first hit, step back
+    // once and switch to fine steps for accurate cloud sampling. This reaches tFar in far
+    // fewer iterations over clear sky — a real speedup with no quality change inside cloud.
+    float bigStep = step * 3.0;
+    bool  fine    = false;   // false = coarse skipping, true = inside/near cloud
+
     for (int i = 0; i < marchSteps; i++) {
         if (t >= tFar || transmit < 0.02) break;
 
         vec3  p   = cameraPosition + rd * t;
         float rho = vc_getDensity(p, 0.0);
+
+        if (!fine) {
+            if (rho > 0.001) { t -= bigStep; fine = true; continue; }  // back up, refine
+            t += bigStep;
+            continue;
+        }
 
         if (rho > 0.001) {
             float lt  = vc_lightMarch(p);
@@ -576,11 +589,22 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     var scatter:  vec3f = vec3f(0.0);
     var t: f32 = tNear + jit;
 
+    // Adaptive empty-space skipping (see GLSL note): coarse strides over clear sky,
+    // back up one stride + fine-march on the first density hit. No quality change inside.
+    let bigStep = step_size * 3.0;
+    var fine = false;
+
     for (var i: i32 = 0; i < uniforms.marchSteps; i++) {
         if (t >= tFar || transmit < 0.02) { break; }
 
         let p   = uniforms.cameraPosition + rd * t;
         let rho = vc_getDensity(p, 0.0);
+
+        if (!fine) {
+            if (rho > 0.001) { t -= bigStep; fine = true; continue; }
+            t += bigStep;
+            continue;
+        }
 
         if (rho > 0.001) {
             let lt  = vc_lightMarch(p);

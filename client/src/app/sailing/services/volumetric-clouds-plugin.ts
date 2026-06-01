@@ -708,10 +708,16 @@ export class VolumetricCloudsPlugin {
   private readonly camera:    Camera;
   private readonly getSunDir: () => Vector3;
 
-  private cloudPass:   PostProcess | null = null;
-  private denoisePass: PostProcess | null = null;
+  private cloudPass:    PostProcess | null = null;
+  private denoisePass:  PostProcess | null = null;
   private weatherTex:  Texture    | null = null;
   private noiseTex:    RawTexture | null = null;
+
+  // NOTE: P3 temporal reprojection was attempted and removed — it can't work cleanly in
+  // Babylon's auto-managed camera post-process chain (persistent cross-frame history
+  // capture fights the pooled pass outputs; an off-chain capture pass crashes at
+  // construction). The perf goal of P3 is instead met by the adaptive empty-space
+  // skipping in the march loop. See cloud_upgrade_roadmap.md.
 
   // 1×1 placeholder textures used until async loads complete.
   // WebGPU requires every declared binding to be present on the first frame;
@@ -1097,8 +1103,8 @@ export class VolumetricCloudsPlugin {
   }
 
   dispose(): void {
-    if (this.cloudPass)   { this.cloudPass.dispose(this.camera);   this.cloudPass   = null; }
-    if (this.denoisePass) { this.denoisePass.dispose(this.camera); this.denoisePass = null; }
+    if (this.cloudPass)    { this.cloudPass.dispose(this.camera);    this.cloudPass    = null; }
+    if (this.denoisePass)  { this.denoisePass.dispose(this.camera);  this.denoisePass  = null; }
     if (this.depthRenderer) {
       this.scene.disableDepthRenderer(this.camera);
       this.depthRenderer = null;

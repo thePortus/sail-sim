@@ -243,6 +243,43 @@ async function handleModCommand(senderId, senderCallsign, action, targetCallsign
 }
 
 /**
+ * Handle /reloadassets. Owner/Admin only. Broadcasts a cache-bust signal to every
+ * connected client so they re-fetch edited vessel GLBs (?v=<version>) and rebuild
+ * remote vessels live; each client's own ship updates on its next refresh.
+ */
+async function handleReloadAssets(senderId, senderCallsign, players) {
+  const senderEntry = players.get(senderId);
+  const reply = (t) => sysReply(senderEntry?.ws, t);
+
+  try {
+    const sender = await User.findOne({ where: { callsign: senderCallsign }, attributes: ['role'] });
+    if (sender?.role !== 'Owner' && sender?.role !== 'Admin') {
+      reply('Only an Owner or Admin may reload assets.');
+      return;
+    }
+
+    const version = Date.now();
+    const signal = JSON.stringify({ type: 'reload_assets', version });
+    let n = 0;
+    for (const [, p] of players) {
+      if (p.ws.readyState === 1) { p.ws.send(signal); n++; }
+    }
+    // System notice so everyone sees why vessels just re-rendered.
+    const notice = JSON.stringify({
+      type: 'chat', chatType: 'system', from: '⚓ System',
+      text: `${senderCallsign} reloaded vessel assets.`,
+    });
+    for (const [, p] of players) {
+      if (p.ws.readyState === 1) p.ws.send(notice);
+    }
+    console.log(`[WS] /reloadassets by ${senderCallsign}: v${version} → ${n} client(s)`);
+  } catch (err) {
+    console.error('[WS] /reloadassets failed:', err.message);
+    reply(`Could not reload assets: ${err.message}`);
+  }
+}
+
+/**
  * Load a player's friends from the DB by callsign, populate in-memory,
  * then send them their current friend_update (including online mutuals).
  * Also nudges any already-connected mutual friend so THEIR mutuals refresh.
@@ -308,8 +345,9 @@ function attachMultiplayer(server) {
     ws.send(JSON.stringify(currentWaveState()));
 
     const existing = [];
+    const nowTs = Date.now();
     for (const [pid, p] of players) {
-      if (pid !== id && p.state) existing.push({ id: pid, ...p.state });
+      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
@@ -326,6 +364,9 @@ function attachMultiplayer(server) {
           z:          +msg.z          || 0,
           heading:    +msg.heading    || 0,
           speed:      +msg.speed      || 0,
+          turnRate:   +msg.turnRate   || 0,
+          sheetAngle: +msg.sheetAngle || 0,
+          isPortTack: !!msg.isPortTack,
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
@@ -371,7 +412,14 @@ function attachMultiplayer(server) {
           }
         }
 
-        const broadcast = JSON.stringify({ type: 'update', id, ...state });
+        // Stamp a server-authoritative send time (ms) so receivers can interpolate
+        // between snapshots on one consistent clock (avoids client clock-skew). seq is
+        // the sender's monotonic counter, passed through for ordering/staleness checks.
+        const broadcast = JSON.stringify({
+          type: 'update', id, ...state,
+          ts: Date.now(),
+          seq: Number.isFinite(+msg.seq) ? +msg.seq : 0,
+        });
         for (const [pid, p] of players) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(broadcast);
         }
@@ -488,6 +536,9 @@ function attachMultiplayer(server) {
           const arg    = text.slice(action.length + 2).trim();
           const parsed = parseTargetAndRest(arg);
           handleModCommand(id, senderCallsign, action, parsed?.target, players);
+
+        } else if (text === '/reloadassets') {
+          handleReloadAssets(id, senderCallsign, players);
 
         } else if (text.startsWith('/')) {
           // Strict command parsing: anything starting with '/' that wasn't matched

@@ -89,6 +89,41 @@ export interface TerrainManifest {
 
 export type SailState = 'reefed' | 'topsails' | 'full';
 
+// ── Rigged vessel manifest (companion JSON to a single rigged GLB) ──────────────
+// Describes the animation clips, morph targets, and free-rotation bones baked into
+// a one-file rigged vessel (e.g. bermuda_sloop_rigged.glb). Consumed by
+// SloopController to drive rudder/trim/furl/flag without hardcoding node names.
+
+export interface RiggedMorphRef {
+  node:   string;   // mesh node that owns the morph target manager
+  target: string;   // morph target name (e.g. "Furl")
+  index:  number;   // morph target index on that manager
+}
+
+export interface RiggedSailSheetPair {
+  sail:        string;                 // logical sail name (Mainsail, Jib, …)
+  sail_morph:  RiggedMorphRef;         // the sail's furl morph
+  sheet_morph: RiggedMorphRef | null;  // paired sheet-rope morph (drive in lockstep)
+}
+
+export interface RiggedClip {
+  frames: [number, number];
+  kind:   'scrub' | 'play';
+  [extra: string]: unknown;
+}
+
+export interface RiggedManifest {
+  model:        string;
+  frame_range:  [number, number];
+  fps_authored?: number;
+  constants:    Record<string, number>;
+  skeleton:     { armature_node: string; joints: string[] };
+  clips:        Record<string, RiggedClip>;
+  morph_targets: Record<string, Record<string, number>>;
+  sail_sheet_pairs: RiggedSailSheetPair[];
+  free_rotation_bones: Record<string, { role: string; drive: string; suggestion: string }>;
+}
+
 export interface VesselPhysics {
   maxSpeed:        number;
   accelerationRate: number;
@@ -148,6 +183,8 @@ export interface VesselState {
   heelAngle:   number;    // lean angle (degrees, positive=starboard)
   sheetAngle:  number;    // sail sheet angle 5–88° (5=close-hauled, 88=fully eased)
   trimQuality: number;    // 0–1 how well the sail is trimmed for the current wind angle
+  anchored:    boolean;   // anchor down (boat parked/tethered)
+  anchorSide:  'S' | 'P'; // which anchor dropped
 }
 
 export interface OtherPlayer {
@@ -159,6 +196,8 @@ export interface OtherPlayer {
   turnRate?:   number;    // heading deg/s (for remote dead-reckoning that curves through turns)
   sheetAngle?: number;    // boom sheet angle (deg) so remotes render trimmed sails
   isPortTack?: boolean;   // which side the boom swings — needed to mirror the trim
+  anchored?:   boolean;   // anchor down — render the dropped anchor on remotes
+  anchorSide?: 'S' | 'P'; // which anchor dropped
   sailState:   SailState;
   vesselName:  string;
   vesselSlug:  string;

@@ -367,6 +367,8 @@ function attachMultiplayer(server) {
           turnRate:   +msg.turnRate   || 0,
           sheetAngle: +msg.sheetAngle || 0,
           isPortTack: !!msg.isPortTack,
+          anchored:   !!msg.anchored,
+          anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),

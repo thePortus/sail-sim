@@ -135,6 +135,7 @@ export class HudComponent implements OnInit, OnDestroy {
   });
 
   grounded  = this.vesselService.grounded;
+  anchored  = this.vesselService.anchored;
   exitGame  = output<void>();
 
   // ── Fullscreen ────────────────────────────────────────────────────────────
@@ -159,6 +160,10 @@ export class HudComponent implements OnInit, OnDestroy {
 
   setSail(state: SailState): void {
     this.vesselService.setSailState(state);
+  }
+
+  toggleAnchor(): void {
+    this.vesselService.toggleAnchor();
   }
 
   refloat(): void {

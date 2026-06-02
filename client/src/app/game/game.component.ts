@@ -240,7 +240,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       const vs = this.vesselService.state();
       this.multiplayerService.updateLocalState(
         vs.x, vs.z, vs.heading, vs.speed, vs.sailState, 'Sloop', this.selectedSlug,
-        vs.turnRate ?? 0, vs.sheetAngle, vs.isPortTack,
+        vs.turnRate ?? 0, vs.sheetAngle, vs.isPortTack, vs.anchored, vs.anchorSide,
       );
     });
 

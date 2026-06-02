@@ -131,6 +131,15 @@
           <span class="sail-key">{{ opt.key }}</span>
         </button>
       }
+
+      <!-- Anchor (parking): tethers the boat in place until weighed -->
+      <button
+        (click)="toggleAnchor()"
+        [class]="'sail-btn mt-0.5 ' + (anchored() ? 'sail-btn--active' : '')">
+        <span class="sail-icon">⚓</span>
+        <span class="flex-1 text-left">{{ anchored() ? 'Weigh anchor' : 'Drop anchor' }}</span>
+        <span class="sail-key">P</span>
+      </button>
     </div>
 
     <!-- Current point of sail -->

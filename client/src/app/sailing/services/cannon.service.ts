@@ -408,46 +408,15 @@ export class CannonService {
 
   // ── Cannon traversal pivots ───────────────────────────────────────────────
   //
-  // Each cannon assembly (9 parts) is re-parented from the vessel root to a
-  // shared TransformNode whose position is the barrel trunnion point.
-  // Rotating that node's Y axis swings the whole assembly in azimuth.
-  //
-  // Pivot coordinate-frame maths (Ry(α) maps +X → (cosα, 0, -sinα) in Babylon):
-  //   portPivot.rotation.y = +clamped   → muzzle sweeps port-beam → bow    ✓
-  //   stbdPivot.rotation.y = -clamped   → muzzle sweeps stbd-beam → bow    ✓
-
+  // The single rigged sloop GLB bakes the cannons into the hull as skeleton-bound
+  // groups (B_Gun_S/B_Gun_P) — they are NOT separate reparentable nodes, and the
+  // design intent is that cannons do not rotate to an aim point. So there is nothing
+  // to reparent or traverse: this is intentionally a no-op (portPivot/stbdPivot stay
+  // unset, and the traversal in tick() is skipped). Firing still works off fixed
+  // muzzle offsets relative to the vessel root. Cannonfire physics will be redone
+  // later; aiming/rotation is deliberately deferred.
   private setupCannonPivots(): void {
-    const root = this.vesselService.getRoot();
-
-    const reparent = (
-      pivotPos: Vector3,
-      names: string[],
-    ): TransformNode => {
-      const pivot = new TransformNode('cannon_pivot', this.scene);
-      pivot.parent   = root;
-      pivot.position = pivotPos.clone();
-      for (const name of names) {
-        // getNodeByName (not getMeshByName): the cannon GLB's instantiated root
-        // can come back as a TransformNode rather than a Mesh, which
-        // getMeshByName would miss. Both expose .parent and .position.
-        const m = this.scene.getNodeByName(name) as TransformNode | null;
-        if (!m) continue;
-        // m.position is currently in vessel-root-local space.
-        // After re-parenting, subtract the pivot's root-local offset so the
-        // mesh retains the same world position.
-        const orig = m.position.clone();
-        m.parent      = pivot;
-        m.position.x  = orig.x - pivotPos.x;
-        m.position.y  = orig.y - pivotPos.y;
-        m.position.z  = orig.z - pivotPos.z;
-      }
-      return pivot;
-    };
-
-    // GLB with 180° Y-flip: sloop-cannon-port.glb stays on the port side (-X),
-    // sloop-cannon-starboard.glb stays on the starboard side (+X).
-    this.portPivot = reparent(new Vector3(-1.66, 2.57, 2.16), ['sloop_cannon_port']);
-    this.stbdPivot = reparent(new Vector3( 1.64, 2.51, 2.18), ['sloop_cannon_stbd']);
+    /* no-op — cannons are baked into the rigged hull and do not traverse */
   }
 
   // ── Input ─────────────────────────────────────────────────────────────────
@@ -600,29 +569,9 @@ export class CannonService {
         this.reticleStbd.scaling.setAll(scale);
       }
 
-      // ── Cannon traversal ─────────────────────────────────────────────────────
-      // The active cannon instantly tracks the clamped aim angle.
-      // The inactive cannon smoothly returns to the beam-rest position.
-      // Pivot rotation maths derived from BabylonJS YXZ Euler + Ry(α) analysis:
-      //   portPivot.rotation.y = +clamped → port muzzle sweeps toward bow  ✓
-      //   stbdPivot.rotation.y = −clamped → stbd muzzle sweeps toward bow  ✓
-      if (this.portPivot) {
-        const returnFactor = Math.exp(-8 * dt);
-        if (isPort) {
-          this.portPivot.rotation.y = this.clampedAngle;
-          this.stbdPivot.rotation.y *= returnFactor;
-        } else {
-          this.portPivot.rotation.y *= returnFactor;
-          this.stbdPivot.rotation.y = -this.clampedAngle;
-        }
-      }
-    } else {
-      // Not charging — both cannons drift back to beam-rest position
-      if (this.portPivot) {
-        const returnFactor = Math.exp(-5 * dt);
-        this.portPivot.rotation.y *= returnFactor;
-        this.stbdPivot.rotation.y *= returnFactor;
-      }
+      // Cannon barrels no longer traverse — the rigged hull's cannons are fixed
+      // (aiming/rotation deferred; cannonfire physics to be redone). Aim still drives
+      // the reticle + firing direction above; only the mesh rotation is gone.
     }
 
     // ── Active cannonball arcs ────────────────────────────────────────────────

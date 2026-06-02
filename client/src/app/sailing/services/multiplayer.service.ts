@@ -9,6 +9,8 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { SloopController } from './rigged-vessel.controller';
+import { CombatService } from './combat.service';
+import { CombatHitMsg, ZoneState } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -64,6 +66,7 @@ export class MultiplayerService {
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
   private vesselService  = inject(VesselService);
+  private combatService  = inject(CombatService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -141,15 +144,23 @@ export class MultiplayerService {
   private readonly LABEL_HEIGHT = 1.8;
   private readonly LABEL_Y      = 9;
 
-  // ── Cannon shot callbacks ─────────────────────────────────────────────────
+  // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
-                  vx: number, vy: number, vz: number) => void) | null = null;
+                  vx: number, vy: number, vz: number,
+                  shooterId: string, seq: number) => void) | null = null;
+  /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
+  onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
 
   broadcastShot(ox: number, oy: number, oz: number,
-                vx: number, vy: number, vz: number): void {
+                vx: number, vy: number, vz: number, seq: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
   }
+
+  /** Our own server-assigned id (for combat targeting). */
+  getMyId(): string | null { return this.myId; }
+  /** The root TransformNode of a remote vessel, or null. */
+  getRemoteRoot(id: string): TransformNode | null { return this.players.get(id)?.root ?? null; }
 
   /** Broadcast a gun-deploy change so other players see this ship's ports/run-out.
    *  deploy: 1 = arming/ready (ports open, gun out), 0 = stowing/reloaded (ports shut). */
@@ -275,7 +286,21 @@ export class MultiplayerService {
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
-      this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
+      this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
+                          String(msg.id), +msg.seq || 0);
+
+    } else if (msg.type === 'combat_hit') {
+      // Authoritative ship hit: shudder the struck ship + play the cosmetic.
+      const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
+      if (msg.victimId === this.myId) this.vesselService.addHitShudder(side);
+      else                            this.applyHitShudder(String(msg.victimId), side);
+      this.onCombatHit?.(msg as CombatHitMsg);
+
+    } else if (msg.type === 'combat_state') {
+      this.combatService.setLocalZones(msg.zones as ZoneState);
+
+    } else if (msg.type === 'combat_sunk') {
+      // Messages are delivered via system chat by the server; nothing extra to do yet.
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;

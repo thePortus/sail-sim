@@ -2,8 +2,9 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Scene, Mesh, MeshBuilder, Vector3, Color3, Color4,
   StandardMaterial, DynamicTexture, ParticleSystem, PointLight,
-  NoiseProceduralTexture,
+  NoiseProceduralTexture, Ray, AbstractMesh, TransformNode,
 } from '@babylonjs/core';
+import type { CombatHitMsg } from './combat.constants';
 import { SceneService }       from './scene.service';
 import { OceanService }       from './ocean.service';
 import { VesselService }      from './vessel.service';
@@ -53,6 +54,7 @@ interface Ball {
   vx:    number; vy: number; vz: number;  // world-space velocity (m/s)
   t:     number;                           // elapsed seconds since launch
   alive: boolean;
+  key:   string;                           // `${shooterId}:${seq}` — matches server combat_hit
 }
 
 /** Per-side gunnery cycle. */
@@ -98,6 +100,7 @@ export class CannonService {
 
   // Cannonball pool
   private balls: Ball[] = [];
+  private shotSeq = 0;   // per-client shot counter; echoed by the server in combat_hit
 
   // Muzzle-flash point lights (one per cannon, reused across shots)
   private flashPort!:    PointLight;
@@ -203,12 +206,12 @@ export class CannonService {
     this.buildImpactParticles();
     this.setupInput();
 
-    // Wire remote-shot callback (avoids circular injection with MultiplayerService)
-    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz) => {
-      console.log('[Cannon] fireRemoteEffect called', ox, oy, oz, vx, vy, vz);
-      this.launchBall(ox, oy, oz, vx, vy, vz);
+    // Wire remote-shot + combat callbacks (avoids circular injection with MultiplayerService)
+    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq) => {
+      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
       this.fireRemoteEffect(ox, oy, oz, vx, vz);
     };
+    this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
 
     this.scene.registerBeforeRender(() => {
       const dt = Math.min(this.scene.getEngine().getDeltaTime() * 0.001, 0.05);
@@ -222,6 +225,7 @@ export class CannonService {
       this.keyHandler = null;
     }
     this.multiplayerService.onRemoteShot = null;
+    this.multiplayerService.onCombatHit = null;
 
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
@@ -274,7 +278,7 @@ export class CannonService {
       m.setEnabled(false);
       this.sceneService.shadowGenerator?.addShadowCaster(m);
       this.oceanService.addToRenderList(m);
-      this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false });
+      this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
     }
   }
 
@@ -724,18 +728,8 @@ export class CannonService {
       ball.mesh.position.set(bx, by, bz);
       ball.mesh.rotation.z += dt * 5;
 
-      // Ship hit — only after the ball has cleared the firing vessel (t>0.35), so a
-      // freshly-fired ball never registers a hit on its own ship at the muzzle.
-      if (ball.t > 0.35) {
-        const ship = this.shipHitTest(bx, by, bz);
-        if (ship) {
-          this.onShipImpact(bx, by, bz, ball.vx, ball.vy - G * ball.t, ball.vz, ship);
-          ball.alive = false;
-          ball.mesh.setEnabled(false);
-          continue;
-        }
-      }
-
+      // Ship hits are adjudicated by the SERVER (combat_hit despawns the matching ball
+      // and plays the cosmetic). Here we only handle misses into water/land.
       if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
         this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
         ball.alive = false;
@@ -841,8 +835,10 @@ export class CannonService {
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;
 
-    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz);
-    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz);
+    const seq = ++this.shotSeq;
+    const myId = this.multiplayerService.getMyId() ?? 'local';
+    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq);
+    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq);
     this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
     this.playCannonSound();
   }
@@ -936,10 +932,11 @@ export class CannonService {
   launchBall(
     ox: number, oy: number, oz: number,
     vx: number, vy: number, vz: number,
+    shooterId = 'local', seq = 0,
   ): void {
     const ball = this.balls.find(b => !b.alive);
     if (!ball) return;
-    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true });
+    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, key: `${shooterId}:${seq}` });
     ball.mesh.position.set(ox, oy, oz);
     ball.mesh.rotation.setAll(0);
     ball.mesh.setEnabled(true);
@@ -1280,30 +1277,59 @@ export class CannonService {
     }
   }
 
-  // ── Ship hit (cosmetic) ─────────────────────────────────────────────────────
+  // ── Server-adjudicated ship hit (authoritative) ─────────────────────────────
 
   /**
-   * Local ship + remote ships hull test. Returns the hit ship's pose plus which ship
-   * it was ('local' or a remote player id) so we can shudder the right vessel, or null.
+   * A server-confirmed hit: refine the impact onto the actual hull surface (mesh
+   * raycast along the ball's incoming line), play the cosmetic there, and despawn the
+   * matching in-flight ball so it doesn't go on to splash. The shudder on the struck
+   * ship is applied by MultiplayerService when the message arrives.
    */
-  private shipHitTest(bx: number, by: number, bz: number):
-    { x: number; z: number; heading: number; target: 'local' | string } | null {
-    if (by < -1.0 || by > 6.0) return null;   // outside the hull/deck height band
-    const vs = this.vesselService.state();
-    if (this.hullContains(bx, bz, vs.x, vs.z, vs.heading)) {
-      return { x: vs.x, z: vs.z, heading: vs.heading, target: 'local' };
+  private onCombatHit(msg: CombatHitMsg): void {
+    const myId = this.multiplayerService.getMyId();
+    const shipRoot: TransformNode | null = msg.victimId === myId
+      ? this.vesselService.getRoot()
+      : this.multiplayerService.getRemoteRoot(msg.victimId);
+
+    // Incoming direction from the matching ball (then despawn it); else shooter→impact.
+    let dirX = 0, dirY = -1, dirZ = 0;
+    const ball = this.balls.find(b => b.alive && b.key === `${msg.shooterId}:${msg.seq}`);
+    if (ball) {
+      const vyi = ball.vy - G * ball.t;
+      const l = Math.hypot(ball.vx, vyi, ball.vz) || 1;
+      dirX = ball.vx / l; dirY = vyi / l; dirZ = ball.vz / l;
+      ball.alive = false;
+      ball.mesh.setEnabled(false);
+    } else {
+      const sRoot = msg.shooterId === myId
+        ? this.vesselService.getRoot()
+        : this.multiplayerService.getRemoteRoot(msg.shooterId);
+      if (sRoot) {
+        const dx = msg.hx - sRoot.position.x, dy = msg.hy - sRoot.position.y, dz = msg.hz - sRoot.position.z;
+        const l = Math.hypot(dx, dy, dz) || 1;
+        dirX = dx / l; dirY = dy / l; dirZ = dz / l;
+      }
     }
-    const remote = this.multiplayerService.shipHitAt(bx, bz);
-    return remote ? { x: remote.x, z: remote.z, heading: remote.heading, target: remote.id } : null;
+
+    // Raycast onto the hull for the exact surface point; fall back to the server point.
+    let px = msg.hx, py = msg.hy, pz = msg.hz;
+    if (shipRoot) {
+      const start = new Vector3(px - dirX * 6, py - dirY * 6, pz - dirZ * 6);
+      const pick = this.scene.pickWithRay(
+        new Ray(start, new Vector3(dirX, dirY, dirZ), 12),
+        (m) => this.isUnder(m, shipRoot),
+      );
+      if (pick?.hit && pick.pickedPoint) { px = pick.pickedPoint.x; py = pick.pickedPoint.y; pz = pick.pickedPoint.z; }
+    }
+
+    this.playShipHitCosmetic(px, py, pz, dirX, dirY, dirZ);
   }
 
-  /** Oriented-ellipse hull test (~18 m × 7 m) around a ship at (sx,sz,headingDeg). */
-  private hullContains(bx: number, bz: number, sx: number, sz: number, headingDeg: number): boolean {
-    const dx = bx - sx, dz = bz - sz;
-    const hr = headingDeg * Math.PI / 180;
-    const lat = dx * Math.cos(hr) - dz * Math.sin(hr);
-    const lon = dx * Math.sin(hr) + dz * Math.cos(hr);
-    return (lat * lat) / 12.25 + (lon * lon) / 81.0 <= 1.0;
+  /** True if `mesh` is `root` or one of its descendants. */
+  private isUnder(mesh: AbstractMesh, root: TransformNode): boolean {
+    let n: TransformNode | null = mesh;
+    while (n) { if (n === root) return true; n = n.parent as TransformNode | null; }
+    return false;
   }
 
   /** Unit reverse of a ball's incoming velocity (its entry direction + angle, flipped). */
@@ -1322,29 +1348,22 @@ export class CannonService {
     ps.direction2.set(rx * spd + spr, ry * spd + upBias + sprY, rz * spd + spr);
   }
 
-  /** Cannonball strikes a hull: wood splinters + fire gust + flash + dust + smoke,
-   *  oriented to the hit, and a heavy shudder on the struck ship (local or remote). */
-  private onShipImpact(
-    bx: number, by: number, bz: number, vx: number, vyImpact: number, vz: number,
-    ship: { x: number; z: number; heading: number; target: 'local' | string },
-  ): void {
+  /** Wood splinters + fire gust + flash + dust + smoke for a ship hit at a world point,
+   *  sprayed back along the reverse of the ball's incoming direction (dirX,dirY,dirZ). */
+  private playShipHitCosmetic(px: number, py: number, pz: number, dirX: number, dirY: number, dirZ: number): void {
     const vs   = this.vesselService.state();
-    const dist = Math.hypot(bx - vs.x, bz - vs.z);
+    const dist = Math.hypot(px - vs.x, pz - vs.z);
     const vol  = Math.max(0, 1 - dist / 800);
 
-    // Emit everything from the actual strike point on the hull.
-    this.shipDebrisEmit.set(bx, by, bz);
-    this.dirtEmit.set(bx, by, bz);
-    this.landSmokeEmit.set(bx, by, bz);
+    this.shipDebrisEmit.set(px, py, pz);
+    this.dirtEmit.set(px, py, pz);
+    this.landSmokeEmit.set(px, py, pz);
 
-    // Spray back along the REVERSE of the ball's incoming velocity (its exact entry
-    // direction AND angle, flipped) — splinters/dust blast back out of the entry
-    // toward where the ball came from, not straight up.
-    const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);   // unit reverse-incoming
-    // Short throw — it's reverse-incoming, it bursts back out of the entry, close in.
-    this.setCone(this.shipDebrisPS, rx, ry, rz, 1.1, 0.65, 0.45);   // splinters back out the entry
-    this.setCone(this.dirtPS,       rx, ry, rz, 0.85, 0.55, 0.40);  // dust back along the entry line
-    this.setCone(this.landSmokePS,  rx, ry, rz, 0.45, 0.35, 0.25);  // pall drifts back then hangs
+    // Reverse-incoming: splinters/dust burst back out of the entry, close in.
+    const rx = -dirX, ry = -dirY, rz = -dirZ;
+    this.setCone(this.shipDebrisPS, rx, ry, rz, 1.1, 0.65, 0.45);
+    this.setCone(this.dirtPS,       rx, ry, rz, 0.85, 0.55, 0.40);
+    this.setCone(this.landSmokePS,  rx, ry, rz, 0.45, 0.35, 0.25);
 
     this.shipDebrisPS.emitRate = 3200;
     this.shipDebrisCutoffT     = this.elapsed + 0.14;
@@ -1353,30 +1372,20 @@ export class CannonService {
     this.landSmokePS.emitRate  = 200;
     this.landSmokeCutoffT      = this.elapsed + 0.5;
 
-    // Black sooty smoke that hangs over the strike — leans slightly back along the
-    // entry, then rises and lingers for several seconds.
-    this.shipSmokeEmit.set(bx, by + 0.4, bz);
+    // Black sooty smoke that hangs over the strike for several seconds.
+    this.shipSmokeEmit.set(px, py + 0.4, pz);
     this.shipSmokePS.direction1.set(rx * 0.7 - 0.5, 0.7, rz * 0.7 - 0.5);
     this.shipSmokePS.direction2.set(rx * 0.7 + 0.5, 1.8, rz * 0.7 + 0.5);
     this.shipSmokePS.emitRate  = 170;
     this.shipSmokeCutoffT      = this.elapsed + 0.6;
 
-    // Quick gust of fire + a flash of light at the strike point (fire flares back
-    // out the entry along the same reverse-incoming cone).
-    this.shipFireEmit.set(bx, by, bz);
+    // Quick gust of fire + a flash of light at the strike point.
+    this.shipFireEmit.set(px, py, pz);
     this.setCone(this.shipFirePS, rx, ry, rz, 0.75, 0.45, 0.35);
     this.shipFirePS.emitRate = 1600;
     this.shipFireCutoffT     = this.elapsed + 0.10;
-    this.shipFlash.position.set(bx, by, bz);
+    this.shipFlash.position.set(px, py, pz);
     this.shipFlashEndT       = this.elapsed + FLASH_DUR;
-
-    // Heavy shudder on whichever ship was struck. The struck SIDE (from the impact's
-    // lateral offset) sets which way it heels/lurches — away from the blow.
-    const hr  = ship.heading * Math.PI / 180;
-    const lat = (bx - ship.x) * Math.cos(hr) - (bz - ship.z) * Math.sin(hr);
-    const struckSide: 'port' | 'stbd' = lat < 0 ? 'port' : 'stbd';
-    if (ship.target === 'local') this.vesselService.addHitShudder(struckSide);
-    else                         this.multiplayerService.applyHitShudder(ship.target, struckSide);
 
     if (vol > 0.01) this.playShipHitSound(vol);
   }

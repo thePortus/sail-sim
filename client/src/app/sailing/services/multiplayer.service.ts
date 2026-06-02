@@ -153,6 +153,8 @@ export class MultiplayerService {
                   shooterId: string, seq: number) => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
+  /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
+  onCombatRepair: ((playerId: string) => void) | null = null;
 
   broadcastShot(ox: number, oy: number, oz: number,
                 vx: number, vy: number, vz: number, seq: number): void {
@@ -164,6 +166,7 @@ export class MultiplayerService {
   requestCombatReset(): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'combat_reset' }));
     this.combatService.clearSunk();
+    if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
   }
 
   /** Our own server-assigned id (for combat targeting). */
@@ -323,6 +326,10 @@ export class MultiplayerService {
 
     } else if (msg.type === 'combat_sunk') {
       if (msg.victimId === this.myId) this.combatService.markSunk(String(msg.shooterName ?? ''));
+
+    } else if (msg.type === 'combat_repair') {
+      // A remote ship was restored to full → clear its persistent battle damage.
+      this.onCombatRepair?.(String(msg.playerId));
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;

@@ -551,6 +551,11 @@ function attachMultiplayer(server) {
           if (me.ws.readyState === 1) {
             me.ws.send(JSON.stringify({ type: 'combat_state', zones: me.combat.zones }));
           }
+          // Tell everyone else this ship is repaired so they clear its scorch decals.
+          const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
+          for (const [pid, p] of players) {
+            if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
         }
 
       } else if (msg.type === 'gun_state') {

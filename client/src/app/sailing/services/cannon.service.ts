@@ -27,6 +27,10 @@ const STAGGER_MAX = 0.42;
 const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
 const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
 
+// Persistent battle damage: charred scorch decals projected onto the struck hull/mast.
+// They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
+const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this many accrue
+
 // Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
 // x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
 // (Model gunports are mirrored+flipped by the 180° instantiate flip — tune at runtime.)
@@ -119,6 +123,10 @@ export class CannonService {
   private scene!:   Scene;
   private canvas!:  HTMLCanvasElement;
   private elapsed = 0;
+
+  // Persistent scorch decals, keyed by the victim player's id (own id for local ship).
+  private scorchMat: StandardMaterial | null = null;
+  private readonly decals = new Map<string, Mesh[]>();
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
@@ -241,6 +249,8 @@ export class CannonService {
       this.fireRemoteEffect(ox, oy, oz, vx, vz);
     };
     this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
+    // A repaired ship (server `combat_reset`) clears its accumulated scorch decals.
+    this.multiplayerService.onCombatRepair = (playerId) => this.clearShipDecals(playerId);
 
     this.scene.registerBeforeRender(() => {
       const dt = Math.min(this.scene.getEngine().getDeltaTime() * 0.001, 0.05);
@@ -255,6 +265,11 @@ export class CannonService {
     }
     this.multiplayerService.onRemoteShot = null;
     this.multiplayerService.onCombatHit = null;
+    this.multiplayerService.onCombatRepair = null;
+
+    for (const list of this.decals.values()) for (const d of list) d.dispose();
+    this.decals.clear();
+    this.scorchMat?.dispose();
 
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
@@ -1352,10 +1367,124 @@ export class CannonService {
         new Ray(start, new Vector3(dirX, dirY, dirZ), 12),
         (m) => this.isUnder(m, shipRoot),
       );
-      if (pick?.hit && pick.pickedPoint) { px = pick.pickedPoint.x; py = pick.pickedPoint.y; pz = pick.pickedPoint.z; }
+      if (pick?.hit && pick.pickedPoint) {
+        px = pick.pickedPoint.x; py = pick.pickedPoint.y; pz = pick.pickedPoint.z;
+        // Burn a lasting scorch mark onto the actual surface we struck.
+        if (pick.pickedMesh) {
+          const n = pick.getNormal(true) ?? new Vector3(-dirX, -dirY, -dirZ);
+          const small = msg.zone === 'masts';
+          this.addScorchDecal(String(msg.victimId), pick.pickedMesh, pick.pickedPoint, n, small);
+        }
+      }
     }
 
     this.playShipHitCosmetic(px, py, pz, dirX, dirY, dirZ);
+  }
+
+  /**
+   * Project a charred scorch decal onto the struck mesh at `point`, facing `normal`.
+   * Parented to the mesh so it sails with the ship; persists until the ship is repaired.
+   * Oldest decals fade off once a ship accrues more than `DECAL_MAX_PER_SHIP`.
+   */
+  private addScorchDecal(
+    victimId: string, target: AbstractMesh, point: Vector3, normal: Vector3, small: boolean,
+  ): void {
+    this.ensureScorchMat();
+    if (!this.scorchMat) return;
+
+    const base = small ? 0.55 : 1.35;
+    const s = base * (0.82 + Math.random() * 0.36);
+    let decal: Mesh;
+    try {
+      decal = MeshBuilder.CreateDecal('scorch', target as Mesh, {
+        position: point,
+        normal,
+        size: new Vector3(s, s, Math.max(0.6, s * 0.7)),
+        angle: Math.random() * Math.PI * 2,
+        cullBackFaces: true,
+      });
+    } catch {
+      return; // skinned/degenerate target the projector can't handle — skip the mark
+    }
+    decal.material        = this.scorchMat;
+    decal.isPickable      = false;
+    decal.receiveShadows  = true;
+    decal.renderingGroupId = target.renderingGroupId;
+    decal.setParent(target);   // follow the hull as it moves
+
+    const list = this.decals.get(victimId) ?? [];
+    list.push(decal);
+    while (list.length > DECAL_MAX_PER_SHIP) list.shift()?.dispose();
+    this.decals.set(victimId, list);
+  }
+
+  /** Remove every scorch decal on a ship (called when that ship repairs to full). */
+  private clearShipDecals(victimId: string): void {
+    const list = this.decals.get(victimId);
+    if (!list) return;
+    for (const d of list) d.dispose();
+    this.decals.delete(victimId);
+  }
+
+  /** Lazily build the shared scorch material: charred radial albedo + a dented normal map. */
+  private ensureScorchMat(): void {
+    if (this.scorchMat) return;
+    const S = 128, cx = S / 2, cy = S / 2;
+
+    // Albedo — overlapping ragged char blotches with an alpha falloff to the rim.
+    const alb = new DynamicTexture('scorchAlb', { width: S, height: S }, this.scene, true);
+    const ctx = alb.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, S, S);
+    for (let i = 0; i < 5; i++) {
+      const a  = (i / 5) * Math.PI * 2;
+      const ox = cx + Math.cos(a) * S * 0.10, oy = cy + Math.sin(a) * S * 0.10;
+      const r  = S * (0.34 + Math.random() * 0.10);
+      const g  = ctx.createRadialGradient(ox, oy, 0, ox, oy, r);
+      g.addColorStop(0,    'rgba(8,6,5,0.96)');
+      g.addColorStop(0.5,  'rgba(20,15,12,0.78)');
+      g.addColorStop(0.85, 'rgba(36,27,20,0.30)');
+      g.addColorStop(1,    'rgba(40,30,22,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(ox, oy, r, 0, Math.PI * 2); ctx.fill();
+    }
+    // Faint warm rim to read as a singed, raised lip around the burn.
+    const rim = ctx.createRadialGradient(cx, cy, S * 0.18, cx, cy, S * 0.30);
+    rim.addColorStop(0,   'rgba(0,0,0,0)');
+    rim.addColorStop(0.6, 'rgba(74,42,20,0.20)');
+    rim.addColorStop(1,   'rgba(0,0,0,0)');
+    ctx.fillStyle = rim; ctx.fillRect(0, 0, S, S);
+    alb.hasAlpha = true;
+    alb.update();
+
+    // Normal map — a central pit so light catches a shallow dent in the planking.
+    const bump = new DynamicTexture('scorchBump', { width: S, height: S }, this.scene, false);
+    const bctx = bump.getContext() as CanvasRenderingContext2D;
+    const img  = bctx.createImageData(S, S);
+    const R2   = (S * 0.42) * (S * 0.42);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const dx = x - cx, dy = y - cy, r = Math.hypot(dx, dy);
+      const slope = (2 / R2) * Math.exp(-(r * r) / R2);   // |d height / d r| of a Gaussian pit
+      let nx = r > 0.001 ? (dx / r) * slope * 38 : 0;
+      let ny = r > 0.001 ? (dy / r) * slope * 38 : 0;
+      const inv = 1 / Math.hypot(nx, ny, 1);
+      nx *= inv; ny *= inv;
+      const o = (y * S + x) * 4;
+      img.data[o]     = Math.round((nx * 0.5 + 0.5) * 255);
+      img.data[o + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+      img.data[o + 2] = Math.round((inv * 0.5 + 0.5) * 255);
+      img.data[o + 3] = 255;
+    }
+    bctx.putImageData(img, 0, 0);
+    bump.update();
+
+    const mat = new StandardMaterial('scorchMat', this.scene);
+    mat.diffuseTexture            = alb;
+    mat.diffuseColor              = new Color3(1, 1, 1);
+    mat.specularColor             = new Color3(0.03, 0.03, 0.03);
+    mat.bumpTexture               = bump;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.zOffset                   = -2;   // lift off the hull to beat z-fighting
+    this.scorchMat = mat;
   }
 
   /** True if `mesh` is `root` or one of its descendants. */

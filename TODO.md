@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* damage decal
 * highlighted rectable showing firing path when guns run out
 * improve ocean https://github.com/Popov72/OceanDemo
 * fix webgl ocean

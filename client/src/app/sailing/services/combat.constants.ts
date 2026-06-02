@@ -32,10 +32,12 @@ export interface CombatHitMsg {
   side: 'port' | 'stbd';                // struck side (for the shudder)
 }
 
-/** Server → the victim: their authoritative hull state (drives the HUD diagram). */
+/** Server → ALL clients: a ship's authoritative hull state. Drives the victim's HUD
+ *  diagram and every client's damage-listing tilt for that ship. */
 export interface CombatStateMsg {
-  type:  'combat_state';
-  zones: ZoneState;
+  type:     'combat_state';
+  playerId: string;          // whose hull this is (own id → also feeds the HUD)
+  zones:    ZoneState;
 }
 
 /** Server → victim + shooter: a sinking (messages only, for now). */
@@ -43,6 +45,34 @@ export interface CombatSunkMsg {
   type: 'combat_sunk';
   victimId:  string;
   shooterId: string;
+}
+
+// ── Damage listing (visual hull tilt from battle damage) ──────────────────────
+// A flooded side/end drags the ship down: damaged port/starboard rolls her toward the
+// holed beam; a damaged bow/stern settles her by the head/stern. Tuned to read clearly
+// over the wave roll — pronounced, but still short of capsizing. Both offsets are added
+// on top of the wave/heel/recoil rotation.
+export const LIST_ROLL_MAX  = 0.32;   // rad (~18°) at total loss of one beam
+export const LIST_PITCH_MAX = 0.24;   // rad (~14°) at total loss of bow or stern
+// Response curve: <1 makes partial damage list much more (a half-holed side already
+// leans hard) instead of only showing near total destruction.
+export const LIST_CURVE     = 0.55;
+
+/**
+ * Listing offsets (radians) from a hull state, matching the float conventions:
+ * roll `+` = starboard-down, pitch `+` = bow-up.
+ * Returns {0,0} for a pristine / unknown hull.
+ */
+export function listingFor(z: ZoneState | null | undefined): { roll: number; pitch: number } {
+  if (!z) return { roll: 0, pitch: 0 };
+  const dmg = (zone: Zone) => {
+    const frac = 1 - Math.max(0, Math.min(1, (z[zone] ?? ZONE_HP[zone]) / ZONE_HP[zone]));
+    return Math.pow(frac, LIST_CURVE);   // partial damage lists sooner
+  };
+  return {
+    roll:  LIST_ROLL_MAX  * (dmg('port')  - dmg('starboard')),  // lean toward the holed beam
+    pitch: LIST_PITCH_MAX * (dmg('bow')   - dmg('stern')),      // settle by the damaged end
+  };
 }
 
 export type Severity = 'none' | 'green' | 'yellow' | 'red' | 'destroyed';

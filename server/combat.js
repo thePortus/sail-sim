@@ -50,8 +50,11 @@ function deadReckon(state, t) {
   };
 }
 
-/** Damage from a hit: heavier when fast + head-on (closing), lighter when slow + glancing. */
-function computeDamage(bvx, bvy, bvz, pose, zone) {
+/**
+ * Damage from a hit: heavier when fast + head-on (closing), lighter when slow + glancing,
+ * and amplified for a strike at/near the waterline (`hy` = hull-local impact height).
+ */
+function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
   const relSpeed = Math.hypot(bvx - pose.vvx, bvy, bvz - pose.vvz);
   let perp;
   if (zone === 'masts') {
@@ -65,7 +68,13 @@ function computeDamage(bvx, bvy, bvz, pose, zone) {
     const n = C.ZONE_NORMAL[zone];
     perp = Math.min(1, Math.abs(dirLat * n.lat + dirLon * n.lon));
   }
-  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP);
+  // Waterline amplifier — full bonus at/below the waterline, fading to none up the hull.
+  let waterline = 1;
+  if (zone !== 'masts') {
+    const prox = Math.max(0, Math.min(1, (C.WATERLINE_BAND - hy) / C.WATERLINE_BAND));
+    waterline = 1 + C.WATERLINE_BONUS_MAX * prox;
+  }
+  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP) * waterline;
 }
 
 /**
@@ -100,7 +109,7 @@ function simulateShot(shot, shooterId, players) {
       const zone = zoneAtLocal(lat, lon, by);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
-      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone);
+      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by);
       return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg };
     }
   }

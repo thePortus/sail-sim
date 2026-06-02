@@ -11,6 +11,8 @@ import { OceanService }  from './ocean.service';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { SloopController } from './rigged-vessel.controller';
+import { CombatService } from './combat.service';
+import { listingFor } from './combat.constants';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 // Single rigged vessel asset (replaces the old 7-part split sloop). The companion
@@ -25,6 +27,7 @@ export class VesselService {
   private oceanService     = inject(OceanService);
   private buoyancyService  = inject(VesselBuoyancyService);
   private assetCache       = inject(VesselAssetCacheService);
+  private combatService    = inject(CombatService);
   private zone             = inject(NgZone);
 
   // ── Public reactive state ─────────────────────────────────────────────────
@@ -82,6 +85,9 @@ export class VesselService {
   //   then hull naturally returns with heavy naval damping.
   private recoilRoll = 0;
   private recoilRollVel = 0;
+  // Damage listing — eased toward the tilt from our own hull state (combatService.zones).
+  private listRoll  = 0;
+  private listPitch = 0;
   private readonly RECOIL_SPRING = 7.2;
   private readonly RECOIL_DAMPING = 5.8;
   private readonly RECOIL_IMPULSE = 0.40;   // rad/s heel kick PER shot
@@ -775,8 +781,14 @@ export class VesselService {
     this.root.position.y = FLOAT_DRAFT + heaveApplied;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
-    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll;
-    this.root.rotation.x = buoy.pitchRad;
+    // Damage listing: ease toward the tilt implied by our hull state, then layer it on
+    // top of wave roll + heel + recoil/hit. roll +stbd-down, pitch +bow-up (buoy convention).
+    const list = listingFor(this.combatService.zones());
+    this.listRoll  += (list.roll  - this.listRoll)  * 0.04;
+    this.listPitch += (list.pitch - this.listPitch) * 0.04;
+
+    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll;
+    this.root.rotation.x = buoy.pitchRad + this.listPitch;
 
     // ── Rigged vessel drive (single GLB: skeleton clips + free bones) ─────────
     if (this.controller) {

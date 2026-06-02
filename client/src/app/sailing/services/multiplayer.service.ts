@@ -11,7 +11,7 @@ import { VesselService } from './vessel.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState } from './combat.constants';
+import { CombatHitMsg, ZoneState, listingFor } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -58,6 +58,10 @@ interface OtherPlayerEntry extends OtherPlayer {
   heaveY:    number;           // smoothed vertical offset (m)
   pitchRad:  number;           // smoothed bow-up/down
   rollWaveRad: number;         // smoothed wave-induced roll (added to recoil roll)
+
+  // ── Damage listing (eased toward the target tilt from this ship's hull state) ──
+  listRoll:  number;           // smoothed extra roll from beam damage
+  listPitch: number;           // smoothed extra pitch from bow/stern damage
 }
 
 @Injectable({ providedIn: 'root' })
@@ -101,6 +105,8 @@ export class MultiplayerService {
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
+  /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
+  private remoteZones  = new Map<string, ZoneState>();
   private updateTimer: ReturnType<typeof setInterval> | null = null;
   private pingTimer:   ReturnType<typeof setInterval> | null = null;
 
@@ -128,6 +134,7 @@ export class MultiplayerService {
   // almost always a newer snapshot to interpolate toward (eliminates the per-update
   // teleport). ~2 updates of slack at the 10 Hz (100 ms) send rate.
   private readonly INTERP_DELAY_MS = 110;
+  private readonly LIST_EASE = 0.04;   // per-frame ease toward the damage-listing tilt (slow settle)
   // Beyond this gap with no new snapshot we DEAD-RECKON (extrapolate) instead of
   // freezing — covers a lagging/stalled sender — capped so a vanished player doesn't
   // sail off to infinity.
@@ -322,7 +329,9 @@ export class MultiplayerService {
       this.telemetry.ping.set(Math.round(performance.now() - (+msg.t || 0)));
 
     } else if (msg.type === 'combat_state') {
-      this.combatService.setLocalZones(msg.zones as ZoneState);
+      const pid = String(msg.playerId ?? '');
+      if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState);
+      else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
     } else if (msg.type === 'combat_sunk') {
       if (msg.victimId === this.myId) this.combatService.markSunk(String(msg.shooterName ?? ''));
@@ -405,8 +414,13 @@ export class MultiplayerService {
         heaveY:      this.REMOTE_DRAFT,   // seed near the waterline (avoids spawn rise from y=0)
         pitchRad:    0,
         rollWaveRad: 0,
+        listRoll:    0,
+        listPitch:   0,
       };
       this.players.set(data.id, entry);
+      // Seed any hull state we already heard about before this ship's mesh existed.
+      const known = this.remoteZones.get(data.id);
+      if (known) { const l = listingFor(known); entry.listRoll = l.roll; entry.listPitch = l.pitch; }
 
       const callsign = String(data.callsign ?? '').slice(0, 32);
       const slug     = String(data.vesselSlug ?? 'sloop').slice(0, 64);
@@ -454,6 +468,7 @@ export class MultiplayerService {
     if (!entry) return;
     this.disposeEntry(entry);
     this.players.delete(id);
+    this.remoteZones.delete(id);
     this.publishSignal();
   }
 
@@ -710,9 +725,15 @@ export class MultiplayerService {
       entry.hitRoll = 0; entry.hitRollVel = 0;
     }
 
-    // Combine cannon recoil + hit shudder with the wave-induced roll set by
-    // tickRemoteMotion (runs first) so neither overwrites the other.
-    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll;
+    // Damage listing: ease toward the tilt implied by this ship's hull state.
+    const list = listingFor(this.remoteZones.get(entry.id));
+    entry.listRoll  += (list.roll  - entry.listRoll)  * this.LIST_EASE;
+    entry.listPitch += (list.pitch - entry.listPitch) * this.LIST_EASE;
+
+    // Combine cannon recoil + hit shudder + damage list with the wave-induced roll/pitch
+    // set by tickRemoteMotion (runs first) so neither channel overwrites the other.
+    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll + entry.listRoll;
+    entry.root.rotation.x = entry.pitchRad + entry.listPitch;
 
     // Lateral shudder: damped sideways lurch away from the firing side, layered on
     // top of the interpolated display position (dispX/dispZ set by tickRemoteMotion).

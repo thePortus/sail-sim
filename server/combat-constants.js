@@ -47,6 +47,13 @@ const ZONE_NORMAL = {
 const DMG_K        = 0.5;
 const DMG_PERP_EXP = 1.3;
 
+// Waterline bonus: a shot striking at/near the waterline holes the ship below the
+// floodline and hurts far more. Hull y runs 0 (waterline) .. DECK_Y (deck). A hit at or
+// below y=0 gets the full bonus; it fades to nothing by WATERLINE_BAND above the water.
+//   dmg *= 1 + WATERLINE_BONUS_MAX * clamp((WATERLINE_BAND - hitY) / WATERLINE_BAND, 0, 1)
+const WATERLINE_BONUS_MAX = 0.6;   // up to +60% for a clean waterline hole
+const WATERLINE_BAND      = 1.6;   // metres above the waterline over which the bonus fades
+
 // ── Severity bands (fraction of a zone's max HP) for the HUD diagram ───────────
 //   frac == 1            -> none (unlit)
 //   GREEN_MIN <= f < 1   -> green
@@ -74,7 +81,7 @@ module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
   ZONES, ZONE_HP, ZONE_NORMAL,
-  DMG_K, DMG_PERP_EXP,
+  DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,

@@ -525,10 +525,12 @@ function attachMultiplayer(server) {
             });
             for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hitMsg);
 
-            // The victim's authoritative hull state drives their HUD diagram.
-            if (victim.ws.readyState === 1) {
-              victim.ws.send(JSON.stringify({ type: 'combat_state', zones: victim.combat.zones }));
-            }
+            // Broadcast the victim's authoritative hull state to everyone: it drives the
+            // victim's own HUD diagram AND every client's damage-listing tilt for that ship.
+            const stateMsg = JSON.stringify({
+              type: 'combat_state', playerId: hit.victimId, zones: victim.combat.zones,
+            });
+            for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
             if (justSunk) {
               const sinker = me?.state?.callsign || 'an unknown ship';
@@ -548,9 +550,11 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat) {
           me.combat = combat.newCombatState();
-          if (me.ws.readyState === 1) {
-            me.ws.send(JSON.stringify({ type: 'combat_state', zones: me.combat.zones }));
-          }
+          // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
+          const stateMsg = JSON.stringify({
+            type: 'combat_state', playerId: id, zones: me.combat.zones,
+          });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
           // Tell everyone else this ship is repaired so they clear its scorch decals.
           const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
           for (const [pid, p] of players) {

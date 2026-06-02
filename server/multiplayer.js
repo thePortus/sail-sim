@@ -367,6 +367,8 @@ function attachMultiplayer(server) {
           turnRate:   +msg.turnRate   || 0,
           sheetAngle: +msg.sheetAngle || 0,
           isPortTack: !!msg.isPortTack,
+          anchored:   !!msg.anchored,
+          anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
@@ -494,6 +496,14 @@ function attachMultiplayer(server) {
           if (pid !== id && p.ws.readyState === 1) { p.ws.send(shot); forwarded++; }
         }
         console.log(`[WS] cannon_shot from ${id} forwarded to ${forwarded} player(s)`);
+
+      } else if (msg.type === 'gun_state') {
+        // Relay a ship's gun run-out/stow so others see its ports + barrels animate.
+        const side = msg.side === 'port' ? 'port' : 'stbd';
+        const gunState = JSON.stringify({ type: 'gun_state', id, side, deploy: +msg.deploy ? 1 : 0 });
+        for (const [pid, p] of players) {
+          if (pid !== id && p.ws.readyState === 1) p.ws.send(gunState);
+        }
 
       } else if (msg.type === 'chat') {
         const text = String(msg.text ?? '').slice(0, 512).trim();

@@ -174,14 +174,16 @@ float vc_getDensity(vec3 p, float lod) {
     float wt = time * windSpeed * 0.08;
     vec2  wd = windDir * wt;
 
-    // 2-D weather map drives spatial coverage.
-    vec2  wuv = p.xz * 0.000012 + wd * 0.00002;
+    // 2-D weather map drives spatial coverage. The +0.37 shifts the sampling domain
+    // off world origin: without it, the weather-texture wrap boundary AND the noise
+    // fract() boundaries all coincide at (0,0), producing a visible seam there.
+    vec2  wuv = p.xz * 0.000012 + wd * 0.00002 + 0.37;
     float wc  = texture2D(weatherSampler, wuv).r;
     float cov = vc_sat(cloudCoverage + wc - 0.5);
     if (cov < 0.01) return 0.0;
 
-    // Low-frequency base shape.
-    vec3 np   = p * 0.000075 + vec3(wd.x, 0.0, wd.y) * 0.00004;
+    // Low-frequency base shape. +0.37 (xz) keeps the fract() tile boundary off origin.
+    vec3 np   = p * 0.000075 + vec3(wd.x, 0.0, wd.y) * 0.00004 + vec3(0.37, 0.0, 0.37);
     // lod is used to scale the noise coordinates for a coarser sample.
     float ns  = vc_noise3D(np * (1.0 + lod * 0.5));
     float shp = vc_remap(ns, 1.0 - cov, 1.0) * hg;
@@ -189,7 +191,7 @@ float vc_getDensity(vec3 p, float lod) {
 
     // High-frequency detail erosion (skipped at high LOD).
     if (lod < 1.5) {
-        vec3  dp  = p * 0.00038 + vec3(wd.x, 0.0, wd.y) * 0.00012;
+        vec3  dp  = p * 0.00038 + vec3(wd.x, 0.0, wd.y) * 0.00012 + vec3(0.37, 0.0, 0.37);
         float det = vc_noise3D(dp * 3.0);
         float ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
         // Erode more for puffy/storm types (broken cauliflower edges), less for stratus
@@ -487,18 +489,20 @@ fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
     let wt = uniforms.time * uniforms.windSpeed * 0.08;
     let wd = uniforms.windDir * wt;
 
-    let wuv = p.xz * 0.000012 + wd * 0.00002;
+    // +0.37 shifts the sampling domain off world origin (see GLSL note): otherwise the
+    // weather-wrap and noise fract() boundaries all coincide at (0,0) → visible seam.
+    let wuv = p.xz * 0.000012 + wd * 0.00002 + vec2f(0.37);
     let wc  = textureSampleLevel(weatherSampler, weatherSamplerSampler, wuv, 0.0).r;
     let cov = vc_sat(uniforms.cloudCoverage + wc - 0.5);
     if (cov < 0.01) { return 0.0; }
 
-    let np  = p * 0.000075 + vec3f(wd.x, 0.0, wd.y) * 0.00004;
+    let np  = p * 0.000075 + vec3f(wd.x, 0.0, wd.y) * 0.00004 + vec3f(0.37, 0.0, 0.37);
     let ns  = vc_noise3D(np * (1.0 + lod * 0.5));
     var shp = vc_remap(ns, 1.0 - cov, 1.0) * hg;
     if (shp < 0.001) { return 0.0; }
 
     if (lod < 1.5) {
-        let dp  = p * 0.00038 + vec3f(wd.x, 0.0, wd.y) * 0.00012;
+        let dp  = p * 0.00038 + vec3f(wd.x, 0.0, wd.y) * 0.00012 + vec3f(0.37, 0.0, 0.37);
         let det = vc_noise3D(dp * 3.0);
         let ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
         // More erosion for puffy/storm types, less for stratus (smoother sheet).
@@ -1003,8 +1007,10 @@ export class VolumetricCloudsPlugin {
       weatherUrl, this.scene,
       /*noMipmap=*/false, /*invertY=*/true, Texture.TRILINEAR_SAMPLINGMODE,
     );
-    this.weatherTex.wrapU = Texture.WRAP_ADDRESSMODE;
-    this.weatherTex.wrapV = Texture.WRAP_ADDRESSMODE;
+    // MIRROR (not WRAP): reflected tiling is C0-continuous across tile boundaries, so
+    // even the distant weather-map seam disappears instead of showing a hard line.
+    this.weatherTex.wrapU = Texture.MIRROR_ADDRESSMODE;
+    this.weatherTex.wrapV = Texture.MIRROR_ADDRESSMODE;
 
     // 3-D grey-noise bin → repacked as 2-D atlas.
     fetch(noiseUrl)

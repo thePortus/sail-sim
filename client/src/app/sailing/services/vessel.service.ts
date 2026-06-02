@@ -1,8 +1,8 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh,
-  TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  Quaternion, DirectionalLight,
+  MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
+  AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
+  DirectionalLight,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
@@ -10,7 +10,13 @@ import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { SloopController } from './rigged-vessel.controller';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
+
+// Single rigged vessel asset (replaces the old 7-part split sloop). The companion
+// manifest names every clip / morph / bone the SloopController drives.
+const SLOOP_GLB      = 'bermuda_sloop_rigged.glb';
+const SLOOP_MANIFEST = 'bermuda_sloop_rigged.manifest.json';
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
@@ -23,11 +29,13 @@ export class VesselService {
 
   // ── Public reactive state ─────────────────────────────────────────────────
   grounded = signal<boolean>(false);
+  /** True while the anchor is down (boat parked/tethered). */
+  anchored = signal<boolean>(false);
 
   state = signal<VesselState>({
     x: 7200, z: 0, heading: 270, speed: 0,
     sailState: 'reefed', windAngle: 90, isPortTack: false, heelAngle: 0,
-    sheetAngle: 30, trimQuality: 1,
+    sheetAngle: 30, trimQuality: 1, anchored: false, anchorSide: 'S',
   });
 
   // ── Physics ────────────────────────────────────────────────────────────────
@@ -57,25 +65,12 @@ export class VesselService {
   private root!:         TransformNode;
 
 
-  // ── GLB pivots and sail nodes ──────────────────────────────────────────────
-  private flagPivot:       TransformNode | null = null;
-  private boomPivot:       TransformNode | null = null;
-  private sailFullRoot:    TransformNode | null = null;  // sloop-sail.glb root
-  private sailReducedRoot: TransformNode | null = null;  // sloop-sail-reduced.glb root
-
-  // ── Procedural running rigging (Option B) ─────────────────────────────────
-  private rigLineMainsheet: Mesh | null = null;
-  private rigLineVang:      Mesh | null = null;
+  // ── Rigged vessel animation driver (single GLB: skeleton clips + morphs) ────
+  private controller: SloopController | null = null;
 
   // Water-contact shadow projected beneath the hull.
   private waterShadow: Mesh | null = null;
   private waterShadowMat: StandardMaterial | null = null;
-
-  // ── Shared spar geometry constants (buildSails + rigging update) ──────────
-  private readonly MAST_Z       = 1.5;
-  private readonly MAST_TOP_Y   = 15.1;
-  private readonly BOOM_Y_CONST = 1.76;
-  private readonly BOOM_LEN_TIP = 7.82;   // pivot-local Z distance to boom tip
 
   // ── PBR material / texture pools ─────────────────────────────────────────
   private matPool         = new Map<string, PBRMaterial>();
@@ -89,14 +84,70 @@ export class VesselService {
   private recoilRollVel = 0;
   private readonly RECOIL_SPRING = 7.2;
   private readonly RECOIL_DAMPING = 5.8;
-  private readonly RECOIL_IMPULSE = 0.46;   // rad/s
-  private readonly RECOIL_MAX_ROLL = 0.12;  // ~6.9° hard safety cap
+  private readonly RECOIL_IMPULSE = 0.40;   // rad/s heel kick PER shot
+  private readonly RECOIL_MAX_ROLL = 0.17;  // ~9.7° hard safety cap
+
+  // Lateral shudder: a damped sideways lurch AWAY from the firing side (fire
+  // starboard → hull jolts to port), layered on top of the sim position.
+  private recoilSway = 0;
+  private recoilSwayVel = 0;
+  private readonly RECOIL_SWAY_SPRING  = 9.0;
+  private readonly RECOIL_SWAY_DAMPING = 6.0;
+  private readonly RECOIL_SWAY_IMPULSE = 0.95;  // m/s lateral kick PER shot
+  private readonly RECOIL_SWAY_MAX     = 0.95;  // m hard cap
+
+  // Hit shudder — a SEPARATE, much heavier roll+sway transient for taking a cannonball
+  // (so it reads as violent without changing the tuned firing recoil).
+  private hitRoll = 0;
+  private hitRollVel = 0;
+  private hitSway = 0;
+  private hitSwayVel = 0;
+  private readonly HIT_SPRING       = 8.5;
+  private readonly HIT_DAMPING      = 4.6;
+  private readonly HIT_ROLL_IMPULSE = 1.1;   // rad/s — violent heel
+  private readonly HIT_SWAY_IMPULSE = 2.6;   // m/s — violent lurch
+  private readonly HIT_MAX_ROLL     = 0.34;  // ~19° cap
+  private readonly HIT_MAX_SWAY     = 1.8;   // m cap
+
+  /** Heavy shudder from taking a cannonball on the given struck side. */
+  addHitShudder(side: 'port' | 'stbd'): void {
+    const dir = side === 'port' ? 1 : -1;
+    this.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
+    this.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
+  }
 
   addCannonRecoil(side: 'port' | 'stbd'): void {
-    // Port broadside should initially roll starboard (+Z roll), and vice versa.
+    // Reaction shoves the hull AWAY from the firing side: a port broadside heels +
+    // lurches to starboard (+Z roll, +sway), a starboard broadside to port.
     const dir = side === 'port' ? 1 : -1;
     this.recoilRollVel += dir * this.RECOIL_IMPULSE;
+    this.recoilSwayVel += dir * this.RECOIL_SWAY_IMPULSE;
   }
+
+  // ── Gunnery animation delegators (CannonService → SloopController) ──────────
+  // Map game-layer 'port'/'stbd' to the model's 'S'/'P' bone-side codes in ONE place.
+  // Verified at runtime: the model's 'P' bones sit on the vessel's port (−x) side, which
+  // matches the port muzzle offsets — so game 'port' drives the model's 'P' clips.
+  private gunSide(side: 'port' | 'stbd'): 'S' | 'P' { return side === 'port' ? 'P' : 'S'; }
+
+  /** 0 = stowed (gun in, ports closed) .. 1 = ready (ports open, gun run out). */
+  setGunDeploy(side: 'port' | 'stbd', t: number): void {
+    this.controller?.setGunDeployTarget(this.gunSide(side), t);
+  }
+  /** Recoil kick on a side (call once per cannon shot). */
+  addGunRecoilKick(side: 'port' | 'stbd', kick = 0.7): void {
+    this.controller?.addGunRecoil(this.gunSide(side), kick);
+  }
+  /** True once a side has finished running out (safe to fire). */
+  isGunReady(side: 'port' | 'stbd'): boolean {
+    return this.controller?.isGunReady(this.gunSide(side)) ?? false;
+  }
+  /** True once a side's stow animation + recoil have fully settled. */
+  isGunSettled(side: 'port' | 'stbd'): boolean {
+    return this.controller?.gunSettled(this.gunSide(side)) ?? true;
+  }
+  /** Per-ship reload window (seconds). */
+  getReloadWindow(): number { return this.physics.reloadWindow ?? 6; }
 
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
   getRoot(): TransformNode { return this.root; }
@@ -107,6 +158,27 @@ export class VesselService {
   //  88 = fully eased (sail right out, running downwind)
   // The player adjusts with Q (ease) / E (haul in).
   private sheetAngleDeg = 30;    // sensible default for a reaching start
+
+  // ── Anchor (parking) ───────────────────────────────────────────────────────
+  // While anchored the boat is tethered within ANCHOR_RADIUS of the drop point: it can
+  // sail/drift only a metre or two before the rode snubs taut, and can't drift in current.
+  private isAnchored   = false;
+  private anchorSide: 'S' | 'P' = 'S';   // which anchor dropped (random per drop)
+  private anchorX      = 0;
+  private anchorZ      = 0;
+  private anchorDeploy = 0;              // animated 0=stowed .. 1=lowered
+  private readonly ANCHOR_RADIUS = 2.5;  // metres of scope before the rode snubs
+
+  /** Drop or weigh anchor (P key / HUD button). Dropping picks a random side. */
+  toggleAnchor(): void {
+    this.isAnchored = !this.isAnchored;
+    if (this.isAnchored) {
+      this.anchorSide = Math.random() < 0.5 ? 'S' : 'P';
+      this.anchorX = this.x;
+      this.anchorZ = this.z;
+    }
+    this.anchored.set(this.isAnchored);
+  }
 
   // ── Input ─────────────────────────────────────────────────────────────────
   private keys = { left: false, right: false, sheetIn: false, sheetOut: false };
@@ -212,9 +284,6 @@ export class VesselService {
       this.createPart(part, scene);
     }
 
-    // Build mast pivot
-    this.buildSails(scene);
-
     // Build wake trail (world-space, not parented to root)
     this.buildWake(scene);
 
@@ -224,94 +293,70 @@ export class VesselService {
     // Load GLB geometry parts (hull, mast, flag, sails, cannons)
     await this.buildGLBMeshes(scene);
 
-    // Register every hull / rig / sail mesh with the WaterMaterial so it appears
-    // in both the reflection RTT (mirror of the above-water hull in the surface)
-    // and the refraction RTT (the submerged hull visible through the water).
-    for (const mesh of this.root.getChildMeshes()) {
-      this.oceanService.addToRenderList(mesh);
-    }
+    // Register every hull / rig / sail mesh for ocean reflection + shadows + the WebGPU
+    // varying-budget trims (see helper).
+    this.registerMeshesForRendering(this.root.getChildMeshes());
+  }
 
-    // Shadow: all vessel child meshes cast shadows (hull onto water, sails onto
-    // deck) and receive shadows (island shadow falling on the hull/deck).
+  /** Register a set of vessel meshes for ocean reflection/refraction, shadow casting, and
+   *  the WebGPU varying-budget trims. The single rigged GLB's PBR materials carry more vertex
+   *  varyings than the old split parts; combined with the SSAO prePass, shadow receipt, fog,
+   *  and the ocean-reflection clip-plane they blow past WebGPU's hard 16 inter-stage limit,
+   *  which invalidates EVERY pipeline that includes the vessel (black screen). So: cast
+   *  shadows (depth-only, cheap) but don't receive them, drop fog, exclude from the prePass. */
+  private registerMeshesForRendering(meshes: AbstractMesh[]): void {
     const sg = this.sceneService.shadowGenerator;
-    if (sg) {
-      for (const mesh of this.root.getChildMeshes()) {
-        sg.addShadowCaster(mesh, true);
-        mesh.receiveShadows = true;
+    const seenMats = new Set<Material>();
+    for (const mesh of meshes) {
+      this.oceanService.addToRenderList(mesh);
+      sg?.addShadowCaster(mesh, true);
+      mesh.receiveShadows = false;
+      const mat = mesh.material;
+      if (mat && !seenMats.has(mat)) {
+        seenMats.add(mat);
+        mat.fogEnabled = false;
+        this.sceneService.excludeFromPrePass(mat);
       }
     }
   }
 
-  // ── GLB geometry loading ──────────────────────────────────────────────────
-  // Loads GLB files (from Blender; textures embedded).
-  // Files are fetched from the /geometry/ static route on the server.
-  //
-  // Orientation: GLB from Blender is already Y-up per the GLTF spec.
-  // The GLTF loader handles right→left-hand conversion internally.
-  // We compound a 180° Y-axis flip so the bow faces +Z (forward).
-  private async buildGLBMeshes(scene: Scene): Promise<void> {
-    // Instantiate from the shared asset cache: each GLB is fetched + GLTF-parsed
-    // once per session and cheaply cloned here (and again for every remote
-    // player) — see VesselAssetCacheService. The 180° Y-flip, parenting, and
-    // renderingGroupId 2 tagging happen inside instantiate().
-    const loadGLB = (
-      filename:    string,
-      finalParent: TransformNode = this.root,
-    ): Promise<TransformNode | null> =>
-      this.assetCache.instantiate(filename, scene, finalParent);
+  /** Live-reload the rigged model after /reloadassets bumped the cache version: dispose the
+   *  current model + controller and re-instantiate from the (now cache-busted) GLB, keeping
+   *  the vessel root, physics, input, camera, and cannon wiring intact. */
+  async reloadModel(): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.root) return;
+    const oldRoot = this.controller?.root ?? null;
+    if (oldRoot) {
+      for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m);
+    }
+    this.controller?.dispose();
+    this.controller = null;
+    oldRoot?.dispose();   // disposes the old instanced meshes (shared materials are kept)
 
-    // Hull (includes the mast — stationary)
-    await loadGLB('sloop-hull.glb');
-
-    // Boom — parented to boomPivot so it rotates with sail trim
-    await loadGLB('sloop-boom.glb', this.boomPivot!);
-
-    // Flag — pivot at masthead; rotation.y driven each frame in physicsStep
-    this.flagPivot          = new TransformNode('flag_pivot', scene);
-    this.flagPivot.parent   = this.root;
-    // Pivot at (0, 0, MAST_Z): the Y-rotation axis passes through the mast so
-    // the flag sweeps cleanly around the flagstaff as wind direction changes.
-    // GLB geometry is in vessel-relative space, so Y=0 is correct — the mesh's
-    // own Y position (≈15) places it at the masthead.
-    this.flagPivot.position = new Vector3(0, 0, this.MAST_Z);
-    await loadGLB('sloop-flag.glb', this.flagPivot);
-
-    // Cannons — root node renamed so CannonService.setupCannonPivots() can find them
-    const portRoot = await loadGLB('sloop-cannon-port.glb');
-    if (portRoot) portRoot.name = 'sloop_cannon_port';
-    const stbdRoot = await loadGLB('sloop-cannon-starboard.glb');
-    if (stbdRoot) stbdRoot.name = 'sloop_cannon_stbd';
-
-    // Sails — both parented to boomPivot so they rotate with the boom
-    this.sailFullRoot    = await loadGLB('sloop-sail.glb',         this.boomPivot!);
-    this.sailReducedRoot = await loadGLB('sloop-sail-reduced.glb', this.boomPivot!);
-
-    // Apply initial visibility based on current sail state
-    this.sailFullRoot?.setEnabled(this.sailState === 'full');
-    this.sailReducedRoot?.setEnabled(this.sailState === 'topsails');
+    await this.buildGLBMeshes(scene);   // re-instantiate fresh + build a new controller
+    if (this.controller) {
+      this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
+    }
   }
 
-  // ── Procedural running rigging (Option B) ─────────────────────────────────
-  // Two thin rope cylinders span from fixed hull points to the rotating boom
-  // tip.  Each frame physicsStep() calls updateRigLine() to reposition them.
-  // Cylinder height=1 at creation; scaling.y stretches to the actual length.
-  private buildProceduralRigging(scene: Scene): void {
-    const ropeMat = this.buildVesselMat(
-      { id: 'rope', shape: 'box', params: {},
-        position: { x: 0, y: 0, z: 0 },
-        materialType: 'rope', material: { color: '#000000' } } as VesselPart,
-      scene,
-    );
-    const mk = (name: string): Mesh => {
-      const m = MeshBuilder.CreateCylinder(name,
-        { diameter: 0.045, height: 1, tessellation: 5 }, scene);
-      m.parent           = this.root;
-      m.renderingGroupId = 2;
-      m.material         = ropeMat;
-      return m;
-    };
-    this.rigLineMainsheet = mk('rig_mainsheet');
-    this.rigLineVang      = mk('rig_vang');
+  // ── GLB geometry loading ──────────────────────────────────────────────────
+  // Loads the single rigged sloop GLB (skeleton clips + morph targets, Draco +
+  // WEBP) from the /geometry/ static route, plus its companion manifest, and wraps
+  // the instantiated model in a SloopController that drives rudder/trim/furl/flag.
+  //
+  // Orientation: after the loader's handedness conversion the model's bow points -Z,
+  // so we apply the 180° Y flip (flipY=true) to face +Z = forward = direction of travel.
+  // Parenting + renderingGroupId 2 still happen inside instantiateRigged().
+  private async buildGLBMeshes(scene: Scene): Promise<void> {
+    const [rigged, manifest] = await Promise.all([
+      this.assetCache.instantiateRigged(SLOOP_GLB, scene, this.root, true),
+      this.assetCache.loadManifest(SLOOP_MANIFEST),
+    ]);
+    if (!rigged) { console.warn('[Vessel] rigged sloop failed to load'); return; }
+
+    this.controller = new SloopController(rigged.entries, rigged.root, manifest, scene);
+    this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
   }
 
   private buildWaterShadow(scene: Scene): void {
@@ -340,27 +385,6 @@ export class VesselService {
     this.waterShadow.isPickable = false;
     this.waterShadow.rotation.x = Math.PI / 2;
     this.waterShadow.alwaysSelectAsActiveMesh = true;
-  }
-
-  // Aligns a unit-height (+Y axis) cylinder between two root-local points.
-  private updateRigLine(mesh: Mesh, a: Vector3, b: Vector3): void {
-    const diff = b.subtract(a);
-    const len  = diff.length();
-    if (len < 0.01) { mesh.setEnabled(false); return; }
-    mesh.setEnabled(true);
-    mesh.position.copyFrom(Vector3.Lerp(a, b, 0.5));
-    mesh.scaling.y = len;
-    const dir = diff.normalize();
-    const up  = new Vector3(0, 1, 0);
-    const dot = Vector3.Dot(up, dir);
-    if (Math.abs(dot) < 0.9999) {
-      const axis = Vector3.Cross(up, dir).normalize();
-      const ang  = Math.acos(Math.max(-1, Math.min(1, dot)));
-      mesh.rotationQuaternion = Quaternion.RotationAxis(axis, ang);
-    } else {
-      mesh.rotationQuaternion = null;
-      mesh.rotation.x = dot > 0 ? 0 : Math.PI;
-    }
   }
 
   private createPart(part: VesselPart, scene: Scene): Mesh {
@@ -405,20 +429,11 @@ export class VesselService {
     return mesh;
   }
 
-  private buildSails(scene: Scene): void {
-    // ── Boom pivot — only the boom (and the sails on it) rotate for sail trim.
-    //    The mast is now part of sloop-hull.glb and is stationary.
-    this.boomPivot = new TransformNode('boom_pivot', scene);
-    this.boomPivot.parent   = this.root;
-    this.boomPivot.position = Vector3.Zero();   // will calibrate after GLB testing
-  }
-
   // ── Sail state ────────────────────────────────────────────────────────────
 
   setSailState(state: SailState): void {
     this.sailState = state;
-    if (this.sailFullRoot)    this.sailFullRoot.setEnabled(state === 'full');
-    if (this.sailReducedRoot) this.sailReducedRoot.setEnabled(state === 'topsails');
+    this.controller?.applySailState(state);
   }
 
   // ── Refloat ───────────────────────────────────────────────────────────────
@@ -428,6 +443,8 @@ export class VesselService {
     this.x     = worldX;
     this.z     = worldZ;
     this.speed = 0;
+    this.isAnchored = false;
+    this.anchored.set(false);
     this.setSailState('reefed');
 
     if (this.root) {
@@ -450,6 +467,8 @@ export class VesselService {
     this.z       = spawnZ;
     this.speed   = 0;
     this.heading = heading;
+    this.isAnchored = false;
+    this.anchored.set(false);
     this.setSailState('reefed');
 
     // Snap mesh immediately so the camera doesn't pan across the world
@@ -606,8 +625,21 @@ export class VesselService {
     const lwyX = Math.cos(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
     const lwyZ = -Math.sin(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
 
-    const newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyX;
-    const newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
+    let newX = this.x + Math.sin(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyX;
+    let newZ = this.z + Math.cos(hr) * this.speed * dt * this.TRAVEL_SCALE + lwyZ;
+
+    // Anchor tether: clamp travel to a small radius around the drop point so the boat
+    // can sail/drift only a metre or two before the rode snubs taut, then halts. The boat
+    // is free to swing on the rode (heading unchanged here), it just can't drift away.
+    if (this.isAnchored) {
+      const dx = newX - this.anchorX, dz = newZ - this.anchorZ;
+      const d  = Math.hypot(dx, dz);
+      if (d > this.ANCHOR_RADIUS) {
+        newX = this.anchorX + (dx / d) * this.ANCHOR_RADIUS;
+        newZ = this.anchorZ + (dz / d) * this.ANCHOR_RADIUS;
+        this.speed = 0;
+      }
+    }
 
     // Block when the HULL (bow when moving ahead, stern when reversing) — not just
     // the centre — would touch land, so the ship halts at the shoreline instead of
@@ -678,9 +710,10 @@ export class VesselService {
       this.heading = ((this.heading + (buoy.steeringBias + waveYaw) * dt) + 360) % 360;
     }
 
-    // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water.
-    // Negative = lower the vessel (increase draft visible below waterline).
-    const FLOAT_DRAFT = -0.75;
+    // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water. The rigged
+    // model's origin is authored AT the waterline (midships), so 0 sits it right; the old
+    // -0.75 was tuned for the previous model and swamped this one. Negative = lower/more draft.
+    const FLOAT_DRAFT = 0.0;
 
     // Cannon recoil: damped lateral roll response driven only by fire impulses.
     const recoilAcc = -this.RECOIL_SPRING * this.recoilRoll - this.RECOIL_DAMPING * this.recoilRollVel;
@@ -693,6 +726,46 @@ export class VesselService {
       this.recoilRollVel = 0;
     }
 
+    // Cannon recoil sway: a damped sideways lurch away from the firing side, layered
+    // on top of the sim position so the hull visibly shudders sideways as it fires.
+    const swayAcc = -this.RECOIL_SWAY_SPRING * this.recoilSway - this.RECOIL_SWAY_DAMPING * this.recoilSwayVel;
+    this.recoilSwayVel += swayAcc * dt;
+    this.recoilSway += this.recoilSwayVel * dt;
+    if (this.recoilSway >  this.RECOIL_SWAY_MAX) this.recoilSway =  this.RECOIL_SWAY_MAX;
+    if (this.recoilSway < -this.RECOIL_SWAY_MAX) this.recoilSway = -this.RECOIL_SWAY_MAX;
+    if (Math.abs(this.recoilSway) < 0.0005 && Math.abs(this.recoilSwayVel) < 0.0005) {
+      this.recoilSway = 0;
+      this.recoilSwayVel = 0;
+    }
+
+    // Hit shudder (taking a cannonball): a separate, heavier spring-damper on its own
+    // caps, added on top of the firing recoil.
+    const hitRollAcc = -this.HIT_SPRING * this.hitRoll - this.HIT_DAMPING * this.hitRollVel;
+    this.hitRollVel += hitRollAcc * dt;
+    this.hitRoll += this.hitRollVel * dt;
+    if (this.hitRoll >  this.HIT_MAX_ROLL) this.hitRoll =  this.HIT_MAX_ROLL;
+    if (this.hitRoll < -this.HIT_MAX_ROLL) this.hitRoll = -this.HIT_MAX_ROLL;
+    if (Math.abs(this.hitRoll) < 0.0002 && Math.abs(this.hitRollVel) < 0.0002) {
+      this.hitRoll = 0; this.hitRollVel = 0;
+    }
+    const hitSwayAcc = -this.HIT_SPRING * this.hitSway - this.HIT_DAMPING * this.hitSwayVel;
+    this.hitSwayVel += hitSwayAcc * dt;
+    this.hitSway += this.hitSwayVel * dt;
+    if (this.hitSway >  this.HIT_MAX_SWAY) this.hitSway =  this.HIT_MAX_SWAY;
+    if (this.hitSway < -this.HIT_MAX_SWAY) this.hitSway = -this.HIT_MAX_SWAY;
+    if (Math.abs(this.hitSway) < 0.0005 && Math.abs(this.hitSwayVel) < 0.0005) {
+      this.hitSway = 0; this.hitSwayVel = 0;
+    }
+
+    // Apply the combined sway (firing recoil + hit shudder) along the hull's beam
+    // (starboard) axis, overriding the plain sim position set earlier this frame.
+    const totalSway = this.recoilSway + this.hitSway;
+    if (totalSway !== 0) {
+      const swayHRad = this.heading * Math.PI / 180;
+      this.root.position.x = this.x + totalSway * Math.cos(swayHRad);
+      this.root.position.z = this.z - totalSway * Math.sin(swayHRad);
+    }
+
     // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess
     // rather than a hard snap-to.  The 0.55 m tolerance already absorbs most
     // momentary corner submersion, so a light blend is enough to prevent the
@@ -702,38 +775,40 @@ export class VesselService {
     this.root.position.y = FLOAT_DRAFT + heaveApplied;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
-    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll;
+    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll;
     this.root.rotation.x = buoy.pitchRad;
 
-    // Sail rotation — driven by the player-controlled sheet angle.
-    // Square rig: boom is forward (0°) when running downwind and sweeps toward
-    // athwartship as the vessel heads upwind, so we offset by -90°.
-    const swingDeg  = this.sheetAngleDeg;
-    const swingSide = isPortTack ? -1 : 1;
-    const swingRad  = swingSide * (swingDeg - 90) * Math.PI / 180;
-    if (this.boomPivot)     this.boomPivot.rotation.y     = swingRad;
+    // ── Rigged vessel drive (single GLB: skeleton clips + free bones) ─────────
+    if (this.controller) {
+      // Yards: brace from square (eased / running, sheet 88°) to fully braced
+      // (close-hauled, sheet 5°). Maps the player sheet angle onto the Trim clip.
+      const braced = Math.max(0, Math.min(1, (88 - this.sheetAngleDeg) / 83));
+      this.controller.setTrim(braced);
 
-    // Flag — rotate to face downwind relative to vessel heading
-    if (this.flagPivot) {
-      const windToDir = (this.currentWind.fromBearingDeg + 180) % 360;
-      this.flagPivot.rotation.y = (windToDir - this.heading) * Math.PI / 180;
-    }
+      // Boom + gaff: tack-correct leeward swing (same math as the old boom pivot:
+      // boom forward at 0° running downwind, swinging athwartship upwind).
+      const swingSide = isPortTack ? -1 : 1;
+      const swingRad  = swingSide * (this.sheetAngleDeg - 90) * Math.PI / 180;
+      this.controller.setBoomSwing(swingRad);
 
-    // Procedural running rigging (Option B) — mainsheet and vang track the boom tip
-    if (this.rigLineMainsheet && this.rigLineVang) {
-      const alpha    = swingRad;
-      const boomTip  = new Vector3(
-        this.BOOM_LEN_TIP * Math.sin(alpha),
-        this.BOOM_Y_CONST,
-        this.MAST_Z - this.BOOM_LEN_TIP * Math.cos(alpha),
-      );
-      const boomNear = new Vector3(
-        1.5 * Math.sin(alpha),
-        this.BOOM_Y_CONST,
-        this.MAST_Z - 1.5 * Math.cos(alpha),
-      );
-      this.updateRigLine(this.rigLineMainsheet, boomTip,  new Vector3(0, 1.1,  -2.8));
-      this.updateRigLine(this.rigLineVang,      boomNear, new Vector3(0, 1.22, this.MAST_Z));
+      // Rudder/wheel: from the helm keys; when not steering, mirror the actual yaw
+      // (wave wander + momentum) so the rudder isn't frozen amidships.
+      let rudder = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0);
+      if (rudder === 0) rudder = Math.max(-1, Math.min(1, this.turnRateSmoothed / 20));
+      this.controller.setRudder(rudder);
+
+      // Flag + pennant stream downwind, relative to the hull heading (the controller yaws
+      // the bones about world-up so it's heel-independent).
+      const windLocalRad = (((this.currentWind.fromBearingDeg + 180) % 360) - this.heading) * Math.PI / 180;
+      this.controller.idleWind(windLocalRad, Math.min(1.2, this.currentWind.speed / 8), this.simTime);
+
+      // Anchor: lower/raise the dropped side; keep the other stowed.
+      this.anchorDeploy += ((this.isAnchored ? 1 : 0) - this.anchorDeploy) * Math.min(1, dt * 2.5);
+      this.controller.dropAnchor('S', this.anchorSide === 'S' ? this.anchorDeploy : 0);
+      this.controller.dropAnchor('P', this.anchorSide === 'P' ? this.anchorDeploy : 0);
+
+      // Ease trim / boom-swing / furl toward their targets (no teleporting on tack/auto-trim).
+      this.controller.tickRig(dt);
     }
 
     // Actual heading angular velocity (deg/s, shortest arc) — covers steering, wave
@@ -753,6 +828,7 @@ export class VesselService {
         sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
         sheetAngle:  Math.round(this.sheetAngleDeg),
         trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),
+        anchored: this.isAnchored, anchorSide: this.anchorSide,
       });
     });
   }
@@ -879,6 +955,7 @@ export class VesselService {
         case 'Digit1': this.setSailState('reefed');   break;
         case 'Digit2': this.setSailState('topsails'); break;
         case 'Digit3': this.setSailState('full');     break;
+        case 'KeyP':   this.toggleAnchor();           break;
       }
     };
     this.keyUpHandler = (e: KeyboardEvent) => {
@@ -1360,14 +1437,8 @@ export class VesselService {
     if (canvas && this.wheelHandler) {
       canvas.removeEventListener('wheel', this.wheelHandler as EventListener);
     }
-    for (const m of [this.rigLineMainsheet, this.rigLineVang]) {
-      if (m) m.dispose();
-    }
-    this.rigLineMainsheet = null;
-    this.rigLineVang      = null;
-    this.boomPivot?.dispose(); this.boomPivot = null;
-    this.sailFullRoot    = null;   // disposed via mastPivot above
-    this.sailReducedRoot = null;
+    this.controller?.dispose();
+    this.controller = null;
     for (const ps of [this.bowSpray, this.sternFoam, this.portFroth, this.stbdFroth]) {
       ps?.stop(); ps?.dispose();
     }

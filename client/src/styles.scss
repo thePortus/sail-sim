@@ -96,6 +96,28 @@ p {
     transform: translateX(-50%);
     padding: 8px 20px;
   }
+  // Gunnery panel sits just above the controls reminder, centred.
+  &.gunnery {
+    bottom: 4.75rem;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 14px;
+  }
+}
+
+// ── Gunnery buttons (reuse .sail-btn; add a reload progress bar) ───────────────
+.gun-btn {
+  position: relative;
+  overflow: hidden;
+  min-width: 200px;
+}
+.gun-reload {
+  position: absolute;
+  left: 0; bottom: 0; height: 3px;
+  background: #f59e0b;
+  border-radius: 2px;
+  transition: width 0.1s linear;
+  pointer-events: none;
 }
 
 // ── Sail buttons ──────────────────────────────────────────────────────────────

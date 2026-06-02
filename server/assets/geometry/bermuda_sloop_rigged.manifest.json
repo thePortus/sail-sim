@@ -1,0 +1,466 @@
+{
+  "model": "bermuda_sloop_rigged.glb",
+  "schema_version": 2,
+  "units": "meters",
+  "up_axis": "Y",
+  "forward_axis": "+Z (bow)",
+  "right_axis": "+X (starboard)",
+  "frame_range": [
+    0,
+    30
+  ],
+  "fps_authored": 30,
+  "constants": {
+    "rudder_max_deg": 35.0,
+    "trim_max_deg": 40.0,
+    "anchor_drop_m": 5.128,
+    "gun_stow_m": 0.15,
+    "gun_recoil_m": 0.15,
+    "lid_closed_deg": 108.0,
+    "furl_max": 1.0,
+    "clip_frame_end": 30
+  },
+  "skeleton": {
+    "armature_node": "Ship_Rig",
+    "joints": [
+      "ROOT",
+      "B_Rudder",
+      "B_Wheel",
+      "B_Yard_Top",
+      "B_Yard_Mid",
+      "B_Yard_Low",
+      "B_Boom",
+      "B_Gaff",
+      "B_Flag",
+      "B_Pennant",
+      "B_Anchor_S",
+      "B_Anchor_P",
+      "B_Gun_S",
+      "B_Gun_P",
+      "B_LidS_0",
+      "B_LidS_1",
+      "B_LidS_2",
+      "B_LidP_0",
+      "B_LidP_1",
+      "B_LidP_2"
+    ]
+  },
+  "notes": [
+    "All clips are normalized poses over frame_range; scrub by normalized time for state, play for recoil.",
+    "Clips are sparse/composable: each touches only its listed targets; apply several at once.",
+    "Rudder is SYMMETRIC: 0=hard port, 0.5=center (frame 15), 1=hard starboard.",
+    "Guns: 0=STOWED (pulled in 0.15m, barrels clear the closed lids), 1=READY (run out at port). Recoil reuses this same travel (kick from ready toward stowed ~0.15m).",
+    "ORDERING: to CLOSE a port, set gun stowed (Gun=0) THEN close lid (Lid=0). To OPEN for action, open lid (Lid=1) THEN run gun out (Gun=1).",
+    "Lids: 0=CLOSED (flush to hull; each lid has its own baked toe-in to follow the hull curve), 1=OPEN. Closed is the default; init lid clips at frame 0 on load.",
+    "Sail furl + its paired sheet morph must be driven to the same value (see sail_sheet_pairs).",
+    "Morph weights can be driven directly (0..1) instead of via Furl_* clips.",
+    "B_Flag, B_Pennant, B_Wheel have no clip - rotate in code."
+  ],
+  "clips": {
+    "AnchorDrop_P": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Anchor_P",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed 1=lowered",
+      "max": 5.128
+    },
+    "AnchorDrop_S": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Anchor_S",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed 1=lowered",
+      "max": 5.128
+    },
+    "Gun_P": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Gun_P",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed(lid-safe) 1=ready(run out)",
+      "stow_m": 0.15,
+      "recoil_m": 0.15
+    },
+    "Gun_S": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Gun_S",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed(lid-safe) 1=ready(run out)",
+      "stow_m": 0.15,
+      "recoil_m": 0.15
+    },
+    "Lid_P": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_LidP_0",
+          "path": "rotation"
+        },
+        {
+          "node": "B_LidP_1",
+          "path": "rotation"
+        },
+        {
+          "node": "B_LidP_2",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=closed(flush,per-lid toe) 1=open",
+      "max": 108.0
+    },
+    "Lid_S": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_LidS_0",
+          "path": "rotation"
+        },
+        {
+          "node": "B_LidS_1",
+          "path": "rotation"
+        },
+        {
+          "node": "B_LidS_2",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=closed(flush,per-lid toe) 1=open",
+      "max": 108.0
+    },
+    "Rudder": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Rudder",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=hard_port 0.5=center 1=hard_starboard",
+      "center_frame": 15,
+      "max": 35.0
+    },
+    "Trim": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Yard_Top",
+          "path": "rotation"
+        },
+        {
+          "node": "B_Yard_Mid",
+          "path": "rotation"
+        },
+        {
+          "node": "B_Yard_Low",
+          "path": "rotation"
+        },
+        {
+          "node": "B_Boom",
+          "path": "rotation"
+        },
+        {
+          "node": "B_Gaff",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=square 1=fully_braced",
+      "max": 40.0
+    },
+    "Furl_Mainsail": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_Mainsail",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_Topsail": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_Topsail",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_Topgallant": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_Topgallant",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_Course": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_Course",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_ForeStaysail": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_ForeStaysail",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_Jib": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Sail_Jib",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_CourseSheet": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Course_Sheets",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_JibSheet": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Headsail_Sheets",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_StaysailSheet": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Headsail_Sheets",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    }
+  },
+  "morph_targets": {
+    "Sail_Mainsail": {
+      "Furl": 0
+    },
+    "Sail_Topsail": {
+      "Furl": 0
+    },
+    "Sail_Topgallant": {
+      "Furl": 0
+    },
+    "Sail_Course": {
+      "Furl": 0
+    },
+    "Sail_ForeStaysail": {
+      "Furl": 0
+    },
+    "Sail_Jib": {
+      "Furl": 0
+    },
+    "Course_Sheets": {
+      "Furl": 0
+    },
+    "Headsail_Sheets": {
+      "Furl": 0,
+      "Furl_FS": 1
+    }
+  },
+  "sail_sheet_pairs": [
+    {
+      "sail": "Jib",
+      "sail_furl_clip": "Furl_Jib",
+      "sail_morph": {
+        "node": "Sail_Jib",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": "Furl_JibSheet",
+      "sheet_morph": {
+        "node": "Headsail_Sheets",
+        "target": "Furl",
+        "index": 0
+      }
+    },
+    {
+      "sail": "ForeStaysail",
+      "sail_furl_clip": "Furl_ForeStaysail",
+      "sail_morph": {
+        "node": "Sail_ForeStaysail",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": "Furl_StaysailSheet",
+      "sheet_morph": {
+        "node": "Headsail_Sheets",
+        "target": "Furl_FS",
+        "index": 1
+      }
+    },
+    {
+      "sail": "Course",
+      "sail_furl_clip": "Furl_Course",
+      "sail_morph": {
+        "node": "Sail_Course",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": "Furl_CourseSheet",
+      "sheet_morph": {
+        "node": "Course_Sheets",
+        "target": "Furl",
+        "index": 0
+      }
+    },
+    {
+      "sail": "Mainsail",
+      "sail_furl_clip": "Furl_Mainsail",
+      "sail_morph": {
+        "node": "Sail_Mainsail",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": null,
+      "sheet_morph": null
+    },
+    {
+      "sail": "Topsail",
+      "sail_furl_clip": "Furl_Topsail",
+      "sail_morph": {
+        "node": "Sail_Topsail",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": null,
+      "sheet_morph": null
+    },
+    {
+      "sail": "Topgallant",
+      "sail_furl_clip": "Furl_Topgallant",
+      "sail_morph": {
+        "node": "Sail_Topgallant",
+        "target": "Furl",
+        "index": 0
+      },
+      "sheet_furl_clip": null,
+      "sheet_morph": null
+    }
+  ],
+  "free_rotation_bones": {
+    "B_Flag": {
+      "role": "ensign",
+      "drive": "code",
+      "suggestion": "oscillate yaw a few degrees + slight roll for wind"
+    },
+    "B_Pennant": {
+      "role": "masthead pennant",
+      "drive": "code",
+      "suggestion": "larger/delayed oscillation vs flag"
+    },
+    "B_Wheel": {
+      "role": "ship's wheel",
+      "drive": "code",
+      "suggestion": "spin about wheel axis, sync to rudder"
+    }
+  }
+}

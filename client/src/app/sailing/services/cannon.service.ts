@@ -19,7 +19,10 @@ const BALL_POOL  = 24;           // max simultaneous cannonballs (broadsides = 3
 // Fixed broadside ballistics (no aiming/charging — guns fire straight out the beam).
 const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
 const MUZZLE_V   = 55;                   // fixed muzzle velocity (m/s)
-const STAGGER    = 0.06;                 // seconds between the 3 cannons of a broadside
+// Gap between the 3 cannons of a broadside — randomized per shot so the volley reads
+// as a human gun crew firing in sequence, not a single mechanical burst.
+const STAGGER_MIN = 0.18;
+const STAGGER_MAX = 0.42;
 const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
 const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
 
@@ -59,6 +62,7 @@ interface SideGun {
   state:      GunState;
   shotsFired: number;   // 0..3 within the current broadside
   shotTimer:  number;   // stagger accumulator within firing
+  nextShotAt: number;   // shotTimer threshold at which the next cannon fires (randomized)
   timer:      number;   // dwell (firing) / countdown (reloading)
 }
 
@@ -87,8 +91,8 @@ export class CannonService {
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
-    port: { state: 'stowed', shotsFired: 0, shotTimer: 0, timer: 0 },
-    stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, timer: 0 },
+    port: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
+    stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
   };
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
@@ -150,6 +154,11 @@ export class CannonService {
   private sfxCtx: AudioContext | null = null;
   private sfxMaster: GainNode | null = null;
 
+  // Cannon audio bus: all shot layers feed `cannonBus` → (dry) limiter and
+  // (wet) reverb → limiter → sfxMaster. The limiter keeps a 3-gun broadside from
+  // spiking into ear-pain; the convolver gives the boom its rolling reverberation.
+  private cannonBus: GainNode | null = null;
+
   // Shared soft-blob texture for all particle systems
   private blobTex!: DynamicTexture;
 
@@ -160,6 +169,7 @@ export class CannonService {
     this.canvas = this.scene.getEngine().getRenderingCanvas() as HTMLCanvasElement;
     this.sfxCtx = new AudioContext();
     this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
+    this.buildCannonAudio();
 
     this.buildParticleTex();
     this.buildSmokeNoise();
@@ -202,6 +212,7 @@ export class CannonService {
       this.splashPS, this.dirtPS,
     ]) { ps?.stop(); ps?.dispose(); }
     this.smokeNoise?.dispose();
+    this.cannonBus = null;   // torn down with the context below
     this.sfx.releaseMaster(this.sfxMaster);
     this.sfxMaster = null;
     this.sfxCtx?.close().catch(() => {});
@@ -390,11 +401,13 @@ export class CannonService {
       ps.addSizeGradient(0.00, 1.50, 2.50);
       ps.addSizeGradient(0.40, 5.00, 7.00);
       ps.addSizeGradient(1.00, 8.00, 11.0);
+      // Blast OUT fast (like the fountain) so the lingering pall fills the same wide
+      // footprint as the initial plume, then decelerate hard and hang for many seconds.
       ps.addVelocityGradient(0.00, 1.00);
-      ps.addVelocityGradient(0.30, 0.20);
+      ps.addVelocityGradient(0.05, 0.15);
       ps.addVelocityGradient(1.00, 0.02);
       ps.minLifeTime  = 10.0;  ps.maxLifeTime  = 15.0;
-      ps.minEmitPower = 1.5;   ps.maxEmitPower = 4.5;
+      ps.minEmitPower = 9.0;   ps.maxEmitPower = 24.0;
       ps.updateSpeed  = 0.012;
       ps.gravity      = new Vector3(0, 0.5, 0);   // slow drift upward
       ps.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
@@ -480,7 +493,7 @@ export class CannonService {
       this.publishState(side);
     } else if (g.state === 'ready') {
       g.state = 'firing';
-      g.shotsFired = 0; g.shotTimer = 0; g.timer = 0;
+      g.shotsFired = 0; g.shotTimer = 0; g.nextShotAt = 0; g.timer = 0;
       this.publishState(side);
     }
   }
@@ -518,12 +531,14 @@ export class CannonService {
 
     } else if (g.state === 'firing') {
       g.shotTimer += dt;
-      // Fire the 3 cannons staggered; one full hull-roll impulse on the first.
-      while (g.shotsFired < 3 && g.shotTimer >= g.shotsFired * STAGGER) {
+      // Fire the 3 cannons in sequence with a randomized human gap; one full
+      // hull-roll impulse on the first.
+      while (g.shotsFired < 3 && g.shotTimer >= g.nextShotAt) {
         if (g.shotsFired === 0) this.vesselService.addCannonRecoil(side);
         this.fireOneCannon(side, g.shotsFired);
         this.vesselService.addGunRecoilKick(side);
         g.shotsFired++;
+        g.nextShotAt += STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN);
       }
       if (g.shotsFired >= 3) {
         g.timer += dt;
@@ -685,10 +700,11 @@ export class CannonService {
     smokePS.emitRate  = 850;
     this.smokeCutoffT = this.elapsed + 0.55;
 
-    // 3) Lingering cloud — slow billows that hang in the air for many seconds.
-    lEmit.set(mwx + dirX * 0.9, mwy + 0.3, mwz + dirZ * 0.9);
-    lingerPS.direction1.set(dirX * 0.3 - 0.3, 0.40, dirZ * 0.3 - 0.3);
-    lingerPS.direction2.set(dirX * 0.6 + 0.3, 1.00, dirZ * 0.6 + 0.3);
+    // 3) Lingering cloud — same wide directional spread as the fountain so the pall
+    //    that hangs covers the whole plume footprint, just slower and far longer-lived.
+    lEmit.set(mwx + dirX * 0.3, mwy + 0.2, mwz + dirZ * 0.3);
+    lingerPS.direction1.set(dirX * 1.0 - sSpread, 0.10, dirZ * 1.0 - sSpread);
+    lingerPS.direction2.set(dirX * 1.5 + sSpread, 0.65, dirZ * 1.5 + sSpread);
     lingerPS.emitRate  = 120;
     this.lingerCutoffT = this.elapsed + 0.55;
   }
@@ -721,10 +737,10 @@ export class CannonService {
     this.remoteSmokePS.emitRate = 850;
     this.remoteSmokeCutoffT = this.elapsed + 0.55;
 
-    // 3) Lingering cloud — slow billows that hang for many seconds
-    this.remoteLingerEmit.set(ox + dx * 0.9, oy + 0.3, oz + dz * 0.9);
-    this.remoteLingerPS.direction1.set(dx * 0.3 - 0.3, 0.40, dz * 0.3 - 0.3);
-    this.remoteLingerPS.direction2.set(dx * 0.6 + 0.3, 1.00, dz * 0.6 + 0.3);
+    // 3) Lingering cloud — same wide spread as the fountain (covers the plume footprint)
+    this.remoteLingerEmit.set(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3);
+    this.remoteLingerPS.direction1.set(dx * 1.0 - sSpread, 0.10, dz * 1.0 - sSpread);
+    this.remoteLingerPS.direction2.set(dx * 1.5 + sSpread, 0.65, dz * 1.5 + sSpread);
     this.remoteLingerPS.emitRate = 120;
     this.remoteLingerCutoffT = this.elapsed + 0.55;
 
@@ -752,39 +768,151 @@ export class CannonService {
 
   // ── Sound effects ─────────────────────────────────────────────────────────
 
+  /** Build the cannon audio bus: dry → limiter, plus a parallel convolver reverb. */
+  private buildCannonAudio(): void {
+    const ctx = this.sfxCtx;
+    if (!ctx) return;
+    const dest = this.sfxMaster ?? ctx.destination;
+
+    // Limiter — catches the summed peaks of overlapping shots so a broadside lands
+    // powerful but never ear-piercing. Fast attack; release kept long so the reverb
+    // tail isn't pumped/ducked.
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -10;
+    limiter.knee.value      = 6;
+    limiter.ratio.value     = 16;
+    limiter.attack.value    = 0.002;
+    limiter.release.value   = 0.30;
+    limiter.connect(dest);
+
+    // Reverb chain (parallel wet path): pre-delay → long slow convolver → darkening
+    // lowpass → wet gain → limiter. A 5 s, slow-decaying impulse plus pre-delay makes
+    // the boom BLOOM and roll out across the bay for seconds instead of stopping dead
+    // like a drum hit. The lowpass keeps the long tail dark/distant, not hissy.
+    const preDelay = ctx.createDelay(0.5);
+    preDelay.delayTime.value = 0.09;
+
+    const reverb = ctx.createConvolver();
+    reverb.buffer = this.makeReverbIR(ctx, 5.0, 1.3);
+
+    const dark = ctx.createBiquadFilter(); dark.type = 'lowpass';
+    dark.frequency.value = 1500;
+
+    const wet = ctx.createGain();
+    wet.gain.value = 1.0;
+
+    preDelay.connect(reverb); reverb.connect(dark); dark.connect(wet); wet.connect(limiter);
+
+    const send = ctx.createGain();
+    send.gain.value = 1.0;
+    send.connect(preDelay);
+
+    const bus = ctx.createGain();
+    bus.gain.value = 1.0;
+    bus.connect(limiter);   // dry
+    bus.connect(send);      // wet
+    this.cannonBus = bus;
+  }
+
+  /** Exponentially-decaying stereo noise → a natural reverb impulse response. */
+  private makeReverbIR(ctx: AudioContext, seconds: number, decay: number): AudioBuffer {
+    const len = Math.floor(ctx.sampleRate * seconds);
+    const ir  = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = ir.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        const env = Math.pow(1 - i / len, decay);
+        d[i] = (Math.random() * 2 - 1) * env;
+      }
+    }
+    return ir;
+  }
+
+  // A deep, powerful cannon shot: a sharp ignition BANG, a throaty down-swept BLAST,
+  // a pitched PUNCH, a controlled SUB chest-thump, and a long ROLL that the bus
+  // reverb turns into rolling reverberation. The limiter keeps three-in-a-row safe.
   private playCannonSound(vol = 1.0): void {
     const ctx = this.sfxCtx;
     if (!ctx) return;
     if (ctx.state === 'suspended') ctx.resume();
-    const t = ctx.currentTime;
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
 
-    const crackBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.12), ctx.sampleRate);
-    const cd = crackBuf.getChannelData(0);
-    for (let i = 0; i < cd.length; i++) cd[i] = Math.random() * 2 - 1;
-    const crack = ctx.createBufferSource(); crack.buffer = crackBuf;
-    const crackHpf = ctx.createBiquadFilter(); crackHpf.type = 'highpass'; crackHpf.frequency.value = 1200;
-    const crackGain = ctx.createGain();
-    crackGain.gain.setValueAtTime(1.4 * vol, t); crackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
-    crack.connect(crackHpf); crackHpf.connect(crackGain); crackGain.connect(this.sfxMaster ?? ctx.destination);
-    crack.start(t); crack.stop(t + 0.13);
+    const noise = (secs: number): AudioBufferSourceNode => {
+      const buf = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * secs)), ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      return src;
+    };
 
-    const boomBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 1.2), ctx.sampleRate);
-    const bd = boomBuf.getChannelData(0);
-    for (let i = 0; i < bd.length; i++) bd[i] = Math.random() * 2 - 1;
-    const boom = ctx.createBufferSource(); boom.buffer = boomBuf;
-    const boomLpf = ctx.createBiquadFilter(); boomLpf.type = 'lowpass';
-    boomLpf.frequency.setValueAtTime(600, t); boomLpf.frequency.exponentialRampToValueAtTime(55, t + 0.5);
-    const boomGain = ctx.createGain();
-    boomGain.gain.setValueAtTime(1.1 * vol, t); boomGain.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
-    boom.connect(boomLpf); boomLpf.connect(boomGain); boomGain.connect(this.sfxMaster ?? ctx.destination);
-    boom.start(t); boom.stop(t + 1.2);
+    // 1) BANG — sharp ignition transient: bright but very short.
+    {
+      const src = noise(0.06);
+      const bp  = ctx.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = rnd(1400, 2200); bp.Q.value = 0.7;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, t);
+      g.gain.linearRampToValueAtTime(0.85 * vol, t + 0.001);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+      src.connect(bp); bp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 0.07);
+    }
 
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(72, t); osc.frequency.exponentialRampToValueAtTime(22, t + 0.55);
-    const oscGain = ctx.createGain();
-    oscGain.gain.setValueAtTime(0.70 * vol, t); oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
-    osc.connect(oscGain); oscGain.connect(this.sfxMaster ?? ctx.destination);
-    osc.start(t); osc.stop(t + 0.56);
+    // 2) BLAST — lowpassed noise sweeping down hard: the throaty roar of the powder.
+    {
+      const src = noise(0.7);
+      const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.8;
+      lp.frequency.setValueAtTime(rnd(800, 1000), t);
+      lp.frequency.exponentialRampToValueAtTime(85, t + 0.45);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.6 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 0.7);
+    }
+
+    // 3) PUNCH — a pitched thump for the percussive hit.
+    {
+      const osc = ctx.createOscillator(); osc.type = 'sine';
+      osc.frequency.setValueAtTime(rnd(105, 125), t);
+      osc.frequency.exponentialRampToValueAtTime(38, t + 0.18);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.0 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+      osc.connect(g); g.connect(out);
+      osc.start(t); osc.stop(t + 0.33);
+    }
+
+    // 4) SUB — the deep chest-thump that makes it feel powerful (kept controlled).
+    {
+      const osc = ctx.createOscillator(); osc.type = 'sine';
+      osc.frequency.setValueAtTime(rnd(58, 66), t);
+      osc.frequency.exponentialRampToValueAtTime(24, t + 0.55);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.9 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.95);
+      osc.connect(g); g.connect(out);
+      osc.start(t); osc.stop(t + 0.97);
+    }
+
+    // 5) ROLL — a long, sustained low rumble. Fed through the bus reverb it becomes
+    //    the boom rolling out across the water for several seconds (the part that
+    //    turns a "drum hit" into a "cannon"). Two stages: a near growl then a long
+    //    decaying thunder.
+    {
+      const src = noise(1.7);
+      const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(380, t);
+      lp.frequency.exponentialRampToValueAtTime(95, t + 1.5);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, t);
+      g.gain.linearRampToValueAtTime(0.72 * vol, t + 0.05);
+      g.gain.setTargetAtTime(0.0, t + 0.28, 0.42);   // tighter thunder decay (less breathy tail)
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 1.7);
+    }
   }
 
   private playSplashSound(): void {

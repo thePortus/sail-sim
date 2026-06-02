@@ -1,7 +1,7 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
-  TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
+  AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
   DirectionalLight,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
@@ -92,6 +92,31 @@ export class VesselService {
     const dir = side === 'port' ? 1 : -1;
     this.recoilRollVel += dir * this.RECOIL_IMPULSE;
   }
+
+  // ── Gunnery animation delegators (CannonService → SloopController) ──────────
+  // Map game-layer 'port'/'stbd' to the model's 'S'/'P' bone-side codes in ONE place.
+  // Verified at runtime: the model's 'P' bones sit on the vessel's port (−x) side, which
+  // matches the port muzzle offsets — so game 'port' drives the model's 'P' clips.
+  private gunSide(side: 'port' | 'stbd'): 'S' | 'P' { return side === 'port' ? 'P' : 'S'; }
+
+  /** 0 = stowed (gun in, ports closed) .. 1 = ready (ports open, gun run out). */
+  setGunDeploy(side: 'port' | 'stbd', t: number): void {
+    this.controller?.setGunDeployTarget(this.gunSide(side), t);
+  }
+  /** Recoil kick on a side (call once per cannon shot). */
+  addGunRecoilKick(side: 'port' | 'stbd', kick = 0.7): void {
+    this.controller?.addGunRecoil(this.gunSide(side), kick);
+  }
+  /** True once a side has finished running out (safe to fire). */
+  isGunReady(side: 'port' | 'stbd'): boolean {
+    return this.controller?.isGunReady(this.gunSide(side)) ?? false;
+  }
+  /** True once a side's stow animation + recoil have fully settled. */
+  isGunSettled(side: 'port' | 'stbd'): boolean {
+    return this.controller?.gunSettled(this.gunSide(side)) ?? true;
+  }
+  /** Per-ship reload window (seconds). */
+  getReloadWindow(): number { return this.physics.reloadWindow ?? 6; }
 
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
   getRoot(): TransformNode { return this.root; }
@@ -237,22 +262,22 @@ export class VesselService {
     // Load GLB geometry parts (hull, mast, flag, sails, cannons)
     await this.buildGLBMeshes(scene);
 
-    // Register every hull / rig / sail mesh with the WaterMaterial so it appears
-    // in both the reflection RTT (mirror of the above-water hull in the surface)
-    // and the refraction RTT (the submerged hull visible through the water).
-    for (const mesh of this.root.getChildMeshes()) {
-      this.oceanService.addToRenderList(mesh);
-    }
+    // Register every hull / rig / sail mesh for ocean reflection + shadows + the WebGPU
+    // varying-budget trims (see helper).
+    this.registerMeshesForRendering(this.root.getChildMeshes());
+  }
 
-    // Shadow + WebGPU varying budget. The single rigged GLB's PBR materials carry more
-    // vertex varyings than the old split parts; combined with the SSAO prePass, shadow
-    // receipt, fog, and the ocean reflection clip-plane they blow past WebGPU's hard 16
-    // inter-stage-variable limit, which invalidates EVERY pipeline that includes the
-    // vessel (black screen). Trim the load: cast shadows (depth-only, cheap) but don't
-    // receive them, drop fog, and exclude the materials from the prePass G-buffer.
+  /** Register a set of vessel meshes for ocean reflection/refraction, shadow casting, and
+   *  the WebGPU varying-budget trims. The single rigged GLB's PBR materials carry more vertex
+   *  varyings than the old split parts; combined with the SSAO prePass, shadow receipt, fog,
+   *  and the ocean-reflection clip-plane they blow past WebGPU's hard 16 inter-stage limit,
+   *  which invalidates EVERY pipeline that includes the vessel (black screen). So: cast
+   *  shadows (depth-only, cheap) but don't receive them, drop fog, exclude from the prePass. */
+  private registerMeshesForRendering(meshes: AbstractMesh[]): void {
     const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
-    for (const mesh of this.root.getChildMeshes()) {
+    for (const mesh of meshes) {
+      this.oceanService.addToRenderList(mesh);
       sg?.addShadowCaster(mesh, true);
       mesh.receiveShadows = false;
       const mat = mesh.material;
@@ -261,6 +286,26 @@ export class VesselService {
         mat.fogEnabled = false;
         this.sceneService.excludeFromPrePass(mat);
       }
+    }
+  }
+
+  /** Live-reload the rigged model after /reloadassets bumped the cache version: dispose the
+   *  current model + controller and re-instantiate from the (now cache-busted) GLB, keeping
+   *  the vessel root, physics, input, camera, and cannon wiring intact. */
+  async reloadModel(): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.root) return;
+    const oldRoot = this.controller?.root ?? null;
+    if (oldRoot) {
+      for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m);
+    }
+    this.controller?.dispose();
+    this.controller = null;
+    oldRoot?.dispose();   // disposes the old instanced meshes (shared materials are kept)
+
+    await this.buildGLBMeshes(scene);   // re-instantiate fresh + build a new controller
+    if (this.controller) {
+      this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
     }
   }
 

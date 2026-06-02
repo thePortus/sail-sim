@@ -1,8 +1,7 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
-  Scene, Mesh, MeshBuilder, Vector3, Color3, Color4, Matrix,
+  Scene, Mesh, MeshBuilder, Vector3, Color3, Color4,
   StandardMaterial, DynamicTexture, ParticleSystem, PointLight,
-  PointerEventTypes, TransformNode,
 } from '@babylonjs/core';
 import { SceneService }       from './scene.service';
 import { OceanService }       from './ocean.service';
@@ -14,20 +13,30 @@ import { SfxService }         from './sfx.service';
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const G          = 9.81;
-const MAX_CHARGE = 2.8;          // seconds of hold for full charge
-const MIN_V      = 20;           // muzzle velocity (m/s) at minimum charge
-const MAX_V      = 72;           // muzzle velocity at full charge
-const ELEV_RAD   = 11 * Math.PI / 180;  // fixed launch elevation
-const BALL_POOL  = 8;            // max simultaneous cannonballs
+const BALL_POOL  = 24;           // max simultaneous cannonballs (broadsides = 3/side)
 
-// Firing arc: ±60° from the beam (perpendicular to the ship).
-// Angles beyond this toward bow or stern are clamped to the arc edge.
-const ARC_HALF  = 60 * Math.PI / 180;
+// Fixed broadside ballistics (no aiming/charging — guns fire straight out the beam).
+const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
+const MUZZLE_V   = 55;                   // fixed muzzle velocity (m/s)
+const STAGGER    = 0.06;                 // seconds between the 3 cannons of a broadside
+const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
 
-// Muzzle tip in vessel root-local space.
-// x = lateral offset (port −, starboard +); z = forward offset (bow = +Z).
-const PORT_MUZ = { x: -2.73, y: 2.48, z: 2.5 } as const;
-const STBD_MUZ = { x:  2.73, y: 2.48, z: 2.5 } as const;
+// Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
+// x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
+// (Model gunports are mirrored+flipped by the 180° instantiate flip — tune at runtime.)
+type Muz = { x: number; y: number; z: number };
+const MUZZLES: Record<'port' | 'stbd', Muz[]> = {
+  port: [
+    { x: -1.98, y: 2.05, z: 1.36 },
+    { x: -1.87, y: 2.20, z: 2.40 },
+    { x: -1.72, y: 2.45, z: 3.44 },
+  ],
+  stbd: [
+    { x: 1.98, y: 2.05, z: 1.36 },
+    { x: 1.87, y: 2.20, z: 2.40 },
+    { x: 1.72, y: 2.45, z: 3.44 },
+  ],
+};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -37,6 +46,16 @@ interface Ball {
   vx:    number; vy: number; vz: number;  // world-space velocity (m/s)
   t:     number;                           // elapsed seconds since launch
   alive: boolean;
+}
+
+/** Per-side gunnery cycle. */
+type GunState = 'stowed' | 'arming' | 'ready' | 'firing' | 'reloading';
+
+interface SideGun {
+  state:      GunState;
+  shotsFired: number;   // 0..3 within the current broadside
+  shotTimer:  number;   // stagger accumulator within firing
+  timer:      number;   // dwell (firing) / countdown (reloading)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,25 +70,23 @@ export class CannonService {
   private sfx                = inject(SfxService);
   private zone               = inject(NgZone);
 
-  // ── Public signals (consumed by HUD / GameComponent) ─────────────────────
-  readonly isCharging  = signal(false);
-  readonly chargeLevel = signal(0);          // 0 → 1
-  readonly activeSide  = signal<'port' | 'stbd'>('port');
+  // ── Public signals (consumed by HUD) — per-side gun state + reload progress ──
+  readonly portGunState  = signal<GunState>('stowed');
+  readonly stbdGunState  = signal<GunState>('stowed');
+  readonly portReloadFrac = signal(0);   // 0..1 reload progress
+  readonly stbdReloadFrac = signal(0);
 
   // ── Private state ─────────────────────────────────────────────────────────
   private scene!:   Scene;
   private canvas!:  HTMLCanvasElement;
   private elapsed = 0;
-  private chargeT = 0;    // seconds RMB has been held
 
-  // Aim direction — arc-clamped unit vector in world XZ, updated by updateAim().
-  // Represents the direction the active cannon will fire.
-  private aimDirX = -1;   // default: port beam when heading north
-  private aimDirZ =  0;
-
-  // Reticles — flat discs floating just above the water
-  private reticlePort!: Mesh;
-  private reticleStbd!: Mesh;
+  // Per-side gunnery state machines.
+  private readonly gun: Record<'port' | 'stbd', SideGun> = {
+    port: { state: 'stowed', shotsFired: 0, shotTimer: 0, timer: 0 },
+    stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, timer: 0 },
+  };
+  private keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
   // Cannonball pool
   private balls: Ball[] = [];
@@ -112,22 +129,6 @@ export class CannonService {
   private splashCutoffT  = -1;
   private dirtCutoffT    = -1;
 
-  // Cannon assembly traversal pivots — one per broadside.
-  // All cannon mesh components are re-parented to these in setupCannonPivots().
-  // Rotating the pivot.rotation.y swings the whole cannon assembly in azimuth.
-  private portPivot!: TransformNode;
-  private stbdPivot!: TransformNode;
-
-  // Arc-clamped angle (rad) from the active beam toward bow, set by updateAim().
-  // portPivot.rotation.y = clampedAngle   → barrel sweeps port-beam → bow
-  // stbdPivot.rotation.y = -clampedAngle  → barrel sweeps stbd-beam → bow
-  private clampedAngle = 0;
-
-  // Input handlers (stored for cleanup)
-  private pointerObserver: any = null;
-  private mouseMoveFn!: (e: MouseEvent) => void;
-  private ctxMenuFn!:   (e: Event) => void;
-
   // Web Audio context for sound effects, routed through a shared SFX master gain.
   private sfxCtx: AudioContext | null = null;
   private sfxMaster: GainNode | null = null;
@@ -144,13 +145,11 @@ export class CannonService {
     this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
 
     this.buildParticleTex();
-    this.buildReticles();
     this.buildBallPool();
     this.buildFlashLights();
     this.buildFlameParticles();
     this.buildSmokeParticles();
     this.buildImpactParticles();
-    this.setupCannonPivots();
     this.setupInput();
 
     // Wire remote-shot callback (avoids circular injection with MultiplayerService)
@@ -167,22 +166,12 @@ export class CannonService {
   }
 
   dispose(): void {
-    if (this.pointerObserver) {
-      this.scene?.onPointerObservable.remove(this.pointerObserver);
-      this.pointerObserver = null;
+    if (this.keyHandler) {
+      window.removeEventListener('keydown', this.keyHandler);
+      this.keyHandler = null;
     }
-    window.removeEventListener('mousemove', this.mouseMoveFn);
-    this.canvas?.removeEventListener('contextmenu', this.ctxMenuFn);
-
     this.multiplayerService.onRemoteShot = null;
 
-    // Cannon pivots are children of the vessel root and will be disposed with
-    // it — null them here so tick() stops touching them during teardown.
-    this.portPivot = null!;
-    this.stbdPivot = null!;
-
-    this.reticlePort?.dispose();
-    this.reticleStbd?.dispose();
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
     this.flashStbd?.dispose();
@@ -211,42 +200,6 @@ export class CannonService {
     ctx.fillRect(0, 0, 64, 64);
     this.blobTex.update();
     this.blobTex.hasAlpha = true;
-  }
-
-  // ── Reticles ──────────────────────────────────────────────────────────────
-
-  private buildReticles(): void {
-    const rtex = new DynamicTexture('reticleTex', { width: 128, height: 128 }, this.scene, false);
-    const ctx  = rtex.getContext() as CanvasRenderingContext2D;
-    ctx.strokeStyle = 'rgba(255, 210, 50, 0.95)';
-    ctx.lineWidth   = 6;
-    ctx.beginPath(); ctx.arc(64, 64, 50, 0, Math.PI * 2); ctx.stroke();
-    ctx.lineWidth   = 2;
-    ctx.beginPath(); ctx.arc(64, 64, 28, 0, Math.PI * 2); ctx.stroke();
-    ctx.lineWidth = 2.5;
-    [[64,14,64,48],[64,80,64,114],[14,64,48,64],[80,64,114,64]].forEach(
-      ([x1,y1,x2,y2]) => { ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
-    );
-    rtex.update();
-    rtex.hasAlpha = true;
-
-    const mat = new StandardMaterial('reticleMat', this.scene);
-    mat.diffuseTexture  = rtex;
-    mat.emissiveTexture = rtex;
-    mat.opacityTexture  = rtex;
-    mat.disableLighting = true;
-    mat.backFaceCulling = false;
-
-    for (const id of ['reticle_port', 'reticle_stbd']) {
-      const d = MeshBuilder.CreateDisc(id, { radius: 3.5, tessellation: 40 }, this.scene);
-      d.rotation.x = Math.PI / 2;
-      d.position.y = 0.30;
-      d.material   = mat;
-      d.isPickable = false;
-      d.setEnabled(false);
-      if (id === 'reticle_port') this.reticlePort = d;
-      else                       this.reticleStbd = d;
-    }
   }
 
   // ── Cannonball pool ───────────────────────────────────────────────────────
@@ -406,113 +359,99 @@ export class CannonService {
     this.dirtPS.start();
   }
 
-  // ── Cannon traversal pivots ───────────────────────────────────────────────
-  //
-  // The single rigged sloop GLB bakes the cannons into the hull as skeleton-bound
-  // groups (B_Gun_S/B_Gun_P) — they are NOT separate reparentable nodes, and the
-  // design intent is that cannons do not rotate to an aim point. So there is nothing
-  // to reparent or traverse: this is intentionally a no-op (portPivot/stbdPivot stay
-  // unset, and the traversal in tick() is skipped). Firing still works off fixed
-  // muzzle offsets relative to the vessel root. Cannonfire physics will be redone
-  // later; aiming/rotation is deliberately deferred.
-  private setupCannonPivots(): void {
-    /* no-op — cannons are baked into the rigged hull and do not traverse */
-  }
-
   // ── Input ─────────────────────────────────────────────────────────────────
 
   private setupInput(): void {
-    this.ctxMenuFn = (e: Event) => e.preventDefault();
-    this.canvas.addEventListener('contextmenu', this.ctxMenuFn);
-
-    // Both press and release through BabylonJS's pointer observable — avoids
-    // the macOS context-menu swallowing of raw window.mouseup for button 2.
-    this.pointerObserver = this.scene.onPointerObservable.add((info) => {
-      if (info.event.button !== 2) return;
-
-      if (info.type === PointerEventTypes.POINTERDOWN) {
-        this.chargeT = 0;
-        this.updateAim(info.event.clientX, info.event.clientY);
-        this.zone.run(() => { this.isCharging.set(true); this.chargeLevel.set(0); });
-        // Reticle visibility set in tick() once active side is known
-
-      } else if (info.type === PointerEventTypes.POINTERUP) {
-        if (!this.isCharging()) return;
-        const charge = Math.min(this.chargeT / MAX_CHARGE, 1.0);
-        this.zone.run(() => { this.isCharging.set(false); this.chargeLevel.set(0); });
-        this.reticlePort.setEnabled(false);
-        this.reticleStbd.setEnabled(false);
-        this.fire(charge);
-      }
-    });
-
-    this.mouseMoveFn = (e: MouseEvent) => {
-      if (!this.isCharging()) return;
-      this.updateAim(e.clientX, e.clientY);
+    this.keyHandler = (e: KeyboardEvent) => {
+      if (document.activeElement instanceof HTMLInputElement ||
+          document.activeElement instanceof HTMLTextAreaElement) return;
+      if (e.repeat) return;
+      if (e.code === 'KeyZ')      this.armOrFire('port');
+      else if (e.code === 'KeyC') this.armOrFire('stbd');
     };
-    window.addEventListener('mousemove', this.mouseMoveFn);
+    window.addEventListener('keydown', this.keyHandler);
   }
 
-  // ── Aim update with arc clamping ──────────────────────────────────────────
+  // ── Gunnery state machine (public; driven by keys + HUD) ───────────────────
   //
-  // The aim direction is clamped so it stays within ±ARC_HALF of the beam.
-  // This is the realistic firing arc of a fixed broadside cannon — it can
-  // traverse somewhat forward and aft but cannot fire through the bow or stern.
-  //
-  // Coordinate frame:
-  //   forward   = (sin hRad,  cos hRad) in world XZ   (+Z = north/bow)
-  //   port beam = (-cos hRad, sin hRad)                (90° CCW from forward)
-  //   stbd beam = ( cos hRad,-sin hRad)                (90° CW from forward)
+  // Per side: STOWED → (arm) → ARMING → READY → (fire) → FIRING → RELOADING → STOWED.
+  // Animations (ports/run-out/recoil) are eased in SloopController via VesselService.
 
-  private updateAim(clientX: number, clientY: number): void {
-    const rect = this.canvas.getBoundingClientRect();
-    const sx = clientX - rect.left;
-    const sy = clientY - rect.top;
+  /** Z / port button, C / stbd button. ARM if stowed; FIRE if ready; else ignore. */
+  armOrFire(side: 'port' | 'stbd'): void {
+    const g = this.gun[side];
+    if (g.state === 'stowed') {
+      g.state = 'arming';
+      this.vesselService.setGunDeploy(side, 1);
+      this.multiplayerService.broadcastGunState(side, 1);
+      this.publishState(side);
+    } else if (g.state === 'ready') {
+      g.state = 'firing';
+      g.shotsFired = 0; g.shotTimer = 0; g.timer = 0;
+      this.publishState(side);
+    }
+  }
 
-    const ray = this.scene.createPickingRay(sx, sy, Matrix.Identity(), this.scene.activeCamera);
-    if (Math.abs(ray.direction.y) < 0.001) return;
+  /** Esc / stand-down: cancel an arming/ready side back to stowed (no fire). */
+  cancel(side?: 'port' | 'stbd'): void {
+    const sides: ('port' | 'stbd')[] = side ? [side] : ['port', 'stbd'];
+    for (const s of sides) {
+      const g = this.gun[s];
+      if (g.state === 'arming' || g.state === 'ready') {
+        g.state = 'stowed';
+        this.vesselService.setGunDeploy(s, 0);
+        this.multiplayerService.broadcastGunState(s, 0);
+        this.publishState(s);
+      }
+    }
+  }
 
-    const t       = -ray.origin.y / ray.direction.y;
-    const targetX = ray.origin.x + t * ray.direction.x;
-    const targetZ = ray.origin.z + t * ray.direction.z;
+  /** True if any side is mid-arm/ready (so Esc should stand down rather than pause). */
+  anyCancellable(): boolean {
+    return this.gun.port.state === 'arming' || this.gun.port.state === 'ready'
+        || this.gun.stbd.state === 'arming' || this.gun.stbd.state === 'ready';
+  }
 
-    const vs   = this.vesselService.state();
-    const hRad = vs.heading * Math.PI / 180;
-    const sinH = Math.sin(hRad);
-    const cosH = Math.cos(hRad);
+  private publishState(side: 'port' | 'stbd'): void {
+    const st = this.gun[side].state;
+    this.zone.run(() => (side === 'port' ? this.portGunState : this.stbdGunState).set(st));
+  }
 
-    // Raw aim direction from vessel centre
-    const dx  = targetX - vs.x;
-    const dz  = targetZ - vs.z;
-    const len = Math.sqrt(dx * dx + dz * dz);
-    if (len < 0.5) return;
-    const rawX = dx / len;
-    const rawZ = dz / len;
+  /** Advance one side's gunnery state machine each frame. */
+  private tickGun(side: 'port' | 'stbd', dt: number): void {
+    const g = this.gun[side];
+    if (g.state === 'arming') {
+      if (this.vesselService.isGunReady(side)) { g.state = 'ready'; this.publishState(side); }
 
-    // Port beam direction; if dotPort >= 0 the cursor is on the port side
-    const portBeamX = -cosH;
-    const portBeamZ =  sinH;
-    const dotPort   = rawX * portBeamX + rawZ * portBeamZ;
-    const isPort    = dotPort >= 0;
+    } else if (g.state === 'firing') {
+      g.shotTimer += dt;
+      // Fire the 3 cannons staggered; one full hull-roll impulse on the first.
+      while (g.shotsFired < 3 && g.shotTimer >= g.shotsFired * STAGGER) {
+        if (g.shotsFired === 0) this.vesselService.addCannonRecoil(side);
+        this.fireOneCannon(side, g.shotsFired);
+        this.vesselService.addGunRecoilKick(side);
+        g.shotsFired++;
+      }
+      if (g.shotsFired >= 3) {
+        g.timer += dt;
+        if (g.timer >= FIRE_HOLD) {
+          g.state = 'reloading'; g.timer = 0;
+          this.vesselService.setGunDeploy(side, 0);   // stow gun + close ports
+          this.multiplayerService.broadcastGunState(side, 0);
+          this.publishState(side);
+        }
+      }
 
-    // Active beam direction for this side
-    const beamX = isPort ?  portBeamX : -portBeamX;
-    const beamZ = isPort ?  portBeamZ : -portBeamZ;
-
-    // Decompose raw aim into (beam, forward) components, then clamp the
-    // angle from the beam axis to ±ARC_HALF.
-    const compBeam = rawX * beamX + rawZ * beamZ;
-    const compFwd  = rawX * sinH  + rawZ * cosH;
-    const angle    = Math.atan2(compFwd, Math.max(0.001, compBeam));
-    const clamped  = Math.max(-ARC_HALF, Math.min(ARC_HALF, angle));
-
-    // Store for use in tick() to drive pivot traversal rotation
-    this.clampedAngle = clamped;
-
-    // Reconstruct unit aim vector from clamped angle
-    // (beam and forward are orthogonal unit vectors → result is unit length)
-    this.aimDirX = Math.cos(clamped) * beamX + Math.sin(clamped) * sinH;
-    this.aimDirZ = Math.cos(clamped) * beamZ + Math.sin(clamped) * cosH;
+    } else if (g.state === 'reloading') {
+      g.timer += dt;
+      const frac = Math.min(1, g.timer / this.vesselService.getReloadWindow());
+      this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(frac));
+      if (frac >= 1 && this.vesselService.isGunSettled(side)) {
+        g.state = 'stowed';
+        this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(0));
+        this.publishState(side);
+      }
+    }
   }
 
   // ── Main tick ─────────────────────────────────────────────────────────────
@@ -520,59 +459,9 @@ export class CannonService {
   private tick(dt: number): void {
     this.elapsed += dt;
 
-    // ── Charge accumulation + reticle ────────────────────────────────────────
-    if (this.isCharging()) {
-      this.chargeT = Math.min(this.chargeT + dt, MAX_CHARGE);
-      const charge = this.chargeT / MAX_CHARGE;
-      this.zone.run(() => this.chargeLevel.set(charge));
-
-      const vs   = this.vesselService.state();
-      const hRad = vs.heading * Math.PI / 180;
-      const sinH = Math.sin(hRad);
-      const cosH = Math.cos(hRad);
-
-      // Determine active side from current aim direction vs. port beam
-      const portBeamX = -cosH, portBeamZ = sinH;
-      const isPort    = (this.aimDirX * portBeamX + this.aimDirZ * portBeamZ) >= 0;
-      const side: 'port' | 'stbd' = isPort ? 'port' : 'stbd';
-      if (this.activeSide() !== side) {
-        this.zone.run(() => this.activeSide.set(side));
-      }
-
-      // Active muzzle world position (local muzzle → world via heading rotation)
-      const muz  = isPort ? PORT_MUZ : STBD_MUZ;
-      const mwx  = vs.x + muz.x * cosH + muz.z * sinH;
-      const mwz  = vs.z - muz.x * sinH + muz.z * cosH;
-
-      // Landing spot from muzzle in the clamped aim direction
-      const v   = MIN_V + charge * (MAX_V - MIN_V);
-      const vh  = v * Math.cos(ELEV_RAD);
-      const T   = 2 * v * Math.sin(ELEV_RAD) / G;
-      const lx  = mwx + this.aimDirX * vh * T;
-      const lz  = mwz + this.aimDirZ * vh * T;
-
-      // Show only the active reticle
-      const pulse = 1.0 + 0.15 * Math.sin(this.elapsed * 8);
-      const scale = (0.55 + charge * 0.65) * pulse;
-
-      if (isPort) {
-        this.reticlePort.setEnabled(true);
-        this.reticleStbd.setEnabled(false);
-        this.reticlePort.position.x = lx;
-        this.reticlePort.position.z = lz;
-        this.reticlePort.scaling.setAll(scale);
-      } else {
-        this.reticleStbd.setEnabled(true);
-        this.reticlePort.setEnabled(false);
-        this.reticleStbd.position.x = lx;
-        this.reticleStbd.position.z = lz;
-        this.reticleStbd.scaling.setAll(scale);
-      }
-
-      // Cannon barrels no longer traverse — the rigged hull's cannons are fixed
-      // (aiming/rotation deferred; cannonfire physics to be redone). Aim still drives
-      // the reticle + firing direction above; only the mesh rotation is gone.
-    }
+    // ── Per-side gunnery state machines ──────────────────────────────────────
+    this.tickGun('port', dt);
+    this.tickGun('stbd', dt);
 
     // ── Active cannonball arcs ────────────────────────────────────────────────
     for (const ball of this.balls) {
@@ -634,36 +523,38 @@ export class CannonService {
     light.intensity = env * 8.0 * (0.85 + 0.15 * Math.random());
   }
 
-  // ── Fire ──────────────────────────────────────────────────────────────────
+  // ── Fire one cannon of a broadside (fixed beam direction, no aiming) ────────
 
-  private fire(charge: number): void {
-    if (charge < 0.04) return;
-    const clamp = Math.max(0.12, charge);
-    const v     = MIN_V + clamp * (MAX_V - MIN_V);
-    const vh    = v * Math.cos(ELEV_RAD);
-    const vy    = v * Math.sin(ELEV_RAD);
-
+  private fireOneCannon(side: 'port' | 'stbd', idx: number): void {
     const vs   = this.vesselService.state();
     const hRad = vs.heading * Math.PI / 180;
     const sinH = Math.sin(hRad);
     const cosH = Math.cos(hRad);
 
-    // Active side is whatever was last shown in tick()
-    const isPort = this.activeSide() === 'port';
-    const muz    = isPort ? PORT_MUZ : STBD_MUZ;
-    const mwx    = vs.x + muz.x * cosH + muz.z * sinH;
-    const mwy    = muz.y;
-    const mwz    = vs.z - muz.x * sinH + muz.z * cosH;
+    // Beam direction (perpendicular to the hull): port = (-cosH, sinH), stbd = (cosH, -sinH).
+    const dirX = side === 'port' ? -cosH :  cosH;
+    const dirZ = side === 'port' ?  sinH : -sinH;
+    const vh   = MUZZLE_V * Math.cos(ELEV_RAD);
+    const vy   = MUZZLE_V * Math.sin(ELEV_RAD);
+    const bvx  = dirX * vh;
+    const bvz  = dirZ * vh;
 
-    const bvx = this.aimDirX * vh;
-    const bvz = this.aimDirZ * vh;
+    // Muzzle world position from this cannon's local offset, rotated by heading.
+    const muz = MUZZLES[side][idx] ?? MUZZLES[side][0];
+    const mwx = vs.x + muz.x * cosH + muz.z * sinH;
+    const mwy = muz.y;
+    const mwz = vs.z - muz.x * sinH + muz.z * cosH;
 
     this.launchBall(mwx, mwy, mwz, bvx, vy, bvz);
     this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz);
+    this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
+    this.playCannonSound();
+  }
 
-    // Flash + muzzle effects on the active side
-    const fSpread = 0.18;
-    const sSpread = 0.40;
+  /** Flash + flame + smoke at a muzzle, blasting out the beam direction. */
+  private muzzleEffect(side: 'port' | 'stbd', mwx: number, mwy: number, mwz: number, dirX: number, dirZ: number): void {
+    const fSpread = 0.18, sSpread = 0.40;
+    const isPort  = side === 'port';
     const flamePS = isPort ? this.flamePortPS : this.flameStbdPS;
     const smokePS = isPort ? this.smokePortPS : this.smokeStbdPS;
     const flash   = isPort ? this.flashPort   : this.flashStbd;
@@ -674,10 +565,10 @@ export class CannonService {
     if (isPort) this.flashPortEndT = this.elapsed + 0.45;
     else        this.flashStbdEndT = this.elapsed + 0.45;
 
-    flamePS.direction1.set(this.aimDirX - fSpread, 0.06, this.aimDirZ - fSpread);
-    flamePS.direction2.set(this.aimDirX + fSpread, 0.32, this.aimDirZ + fSpread);
-    smokePS.direction1.set(this.aimDirX - sSpread, 0.18, this.aimDirZ - sSpread);
-    smokePS.direction2.set(this.aimDirX + sSpread, 1.10, this.aimDirZ + sSpread);
+    flamePS.direction1.set(dirX - fSpread, 0.06, dirZ - fSpread);
+    flamePS.direction2.set(dirX + fSpread, 0.32, dirZ + fSpread);
+    smokePS.direction1.set(dirX - sSpread, 0.18, dirZ - sSpread);
+    smokePS.direction2.set(dirX + sSpread, 1.10, dirZ + sSpread);
     fEmit.set(mwx, mwy, mwz);
     sEmit.set(mwx, mwy, mwz);
 
@@ -685,9 +576,6 @@ export class CannonService {
     smokePS.emitRate = 110;
     this.flameCutoffT = this.elapsed + 0.18;
     this.smokeCutoffT = this.elapsed + 1.4;
-
-    this.vesselService.addCannonRecoil(isPort ? 'port' : 'stbd');
-    this.playCannonSound();
   }
 
   private fireRemoteEffect(

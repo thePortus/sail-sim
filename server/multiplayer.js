@@ -497,6 +497,14 @@ function attachMultiplayer(server) {
         }
         console.log(`[WS] cannon_shot from ${id} forwarded to ${forwarded} player(s)`);
 
+      } else if (msg.type === 'gun_state') {
+        // Relay a ship's gun run-out/stow so others see its ports + barrels animate.
+        const side = msg.side === 'port' ? 'port' : 'stbd';
+        const gunState = JSON.stringify({ type: 'gun_state', id, side, deploy: +msg.deploy ? 1 : 0 });
+        for (const [pid, p] of players) {
+          if (pid !== id && p.ws.readyState === 1) p.ws.send(gunState);
+        }
+
       } else if (msg.type === 'chat') {
         const text = String(msg.text ?? '').slice(0, 512).trim();
         if (!text) return;

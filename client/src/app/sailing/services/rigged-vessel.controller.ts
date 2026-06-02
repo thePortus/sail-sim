@@ -57,6 +57,16 @@ export class SloopController {
   private readonly TRIM_RATE       = 2.0;   // braced units/sec
   private readonly BOOM_SWING_RATE = 1.8;   // rad/sec (~1.2s for a 120° tack swing)
 
+  /** Per-side gunnery animation (keyed 'S'/'P'). deploy 0 = stowed (gun in, lid closed),
+   *  1 = ready (lid open, gun run out). The single eased value auto-orders the manifest
+   *  rule: opening runs lid-then-gun, stowing runs gun-then-lid. recoil is subtracted from
+   *  the gun term only (lid stays open while the barrel kicks). */
+  private readonly gunDeployCur:    Record<'S' | 'P', number> = { S: 0, P: 0 };
+  private readonly gunDeployTarget: Record<'S' | 'P', number> = { S: 0, P: 0 };
+  private readonly gunRecoil:       Record<'S' | 'P', number> = { S: 0, P: 0 };
+  private readonly GUN_DEPLOY_RATE  = 1.4;   // deploy units/sec (~0.7s to arm or stow)
+  private readonly GUN_RECOIL_DECAY = 5.0;   // recoil kick decay per sec
+
   private readonly frameEnd: number;
 
   // Sail-state → per-sail furl table (0 = set, 1 = furled). Semantic per-sail mapping;
@@ -138,10 +148,10 @@ export class SloopController {
     this.applySailState('full', true);
     this.setRudder(0);
     this.setTrim(0);
-    // Gunport lids: the model's bind/rest pose is OPEN, so scrub the Lid clips to frame 0
-    // to close them. They stay shut until future cannon work opens them.
-    this.setGunports('S', 0);
-    this.setGunports('P', 0);
+    // Guns stowed: pose both Lid (→closed) and Gun (→pulled in) to frame 0. The lid bind
+    // pose is OPEN, so this is required to start shut; deploy stays 0 until a side is armed.
+    this.applyGunPose('S');
+    this.applyGunPose('P');
     this.dropAnchor('S', 0);
     this.dropAnchor('P', 0);
 
@@ -207,6 +217,36 @@ export class SloopController {
   /** Gunport lids per side: 0 = closed (default), 1 = open. */
   setGunports(side: 'S' | 'P', open: number): void {
     this.pose(`Lid_${side}`, Math.max(0, Math.min(1, open)) * this.frameEnd);
+  }
+
+  // ── Gunnery: run-out / stow / recoil (eased + applied in tickRig) ──────────
+  /** Set the run-out target for a side: 0 = stowed (gun in, lid closed),
+   *  1 = ready (lid open, gun run out). tickRig eases toward it. */
+  setGunDeployTarget(side: 'S' | 'P', t: number): void {
+    this.gunDeployTarget[side] = Math.max(0, Math.min(1, t));
+  }
+
+  /** Add a recoil impulse to a side (call once per cannon shot); decays in tickRig. */
+  addGunRecoil(side: 'S' | 'P', kick = 0.7): void {
+    this.gunRecoil[side] = Math.min(1, this.gunRecoil[side] + kick);
+  }
+
+  /** True once the side has fully run out (safe to fire). */
+  isGunReady(side: 'S' | 'P'): boolean { return this.gunDeployCur[side] >= 0.99; }
+
+  /** True once the side reached its target and recoil has settled (stow complete). */
+  gunSettled(side: 'S' | 'P'): boolean {
+    return Math.abs(this.gunDeployCur[side] - this.gunDeployTarget[side]) < 0.01
+        && this.gunRecoil[side] < 0.02;
+  }
+
+  /** Derive lid + gun (recoil on the gun term only) from the current deploy value. */
+  private applyGunPose(side: 'S' | 'P'): void {
+    const dep = this.gunDeployCur[side];
+    const lid = Math.max(0, Math.min(1, dep * 2));
+    const gun = Math.max(0, Math.min(1, dep * 2 - 1) - this.gunRecoil[side]);
+    this.pose(`Lid_${side}`, lid * this.frameEnd);
+    this.pose(`Gun_${side}`, gun * this.frameEnd);
   }
 
   /** Anchor per side: 0 = stowed, 1 = fully lowered. */
@@ -284,6 +324,23 @@ export class SloopController {
       cur = cur < target ? Math.min(target, cur + step) : Math.max(target, cur - step);
       this.sailFurlCur.set(sail, cur);
       this.setSailFurl(sail, cur);
+    }
+
+    // Gunnery — ease run-out/stow toward target + decay recoil, then pose the Gun/Lid clips.
+    // Skip sides that are fully stowed with no recoil so we don't fight the default pose
+    // (and so remote vessels that never arm stay shut).
+    for (const side of ['S', 'P'] as const) {
+      const cur = this.gunDeployCur[side], tgt = this.gunDeployTarget[side];
+      if (cur !== tgt) {
+        const d = tgt - cur;
+        this.gunDeployCur[side] = cur + Math.sign(d) * Math.min(Math.abs(d), this.GUN_DEPLOY_RATE * dt);
+      }
+      if (this.gunRecoil[side] > 0) {
+        this.gunRecoil[side] = Math.max(0, this.gunRecoil[side] - this.GUN_RECOIL_DECAY * dt);
+      }
+      if (this.gunDeployCur[side] !== 0 || tgt !== 0 || this.gunRecoil[side] > 0) {
+        this.applyGunPose(side);
+      }
     }
 
     // Recompute the skeleton from the bone nodes we just posed. The yard/boom meshes are

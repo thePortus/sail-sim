@@ -1,6 +1,6 @@
 import {
   Component, ElementRef, ViewChild,
-  AfterViewInit, OnDestroy, inject, signal, effect, computed,
+  AfterViewInit, OnDestroy, inject, signal, effect,
   HostListener, untracked,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
@@ -88,21 +88,6 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-minimap />
         </div>
 
-        <!-- Cannon charge indicator — visible while right-click is held -->
-        @if (cannonService.isCharging()) {
-          <div class="cannon-charge-hud">
-            <div class="cannon-charge-label">⚫ {{ cannonService.activeSide() === 'port' ? 'PORT' : 'STBD' }} CANNON</div>
-            <div class="cannon-charge-track">
-              <div class="cannon-charge-fill"
-                   [style.width.%]="cannonService.chargeLevel() * 100"
-                   [class.cannon-charge-full]="cannonService.chargeLevel() >= 0.98"></div>
-            </div>
-            <div class="cannon-charge-range">
-              {{ chargeRangeLabel() }}
-            </div>
-          </div>
-        }
-
         @if (isAdmin) {
           <app-admin-panel #adminPanel />
           <div class="admin-hint">Press <kbd>&#96;</kbd> for admin controls</div>
@@ -127,37 +112,6 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .admin-hint kbd {
       display: inline-block; padding: 0 4px; border-radius: 3px;
       border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.35);
-    }
-    /* ── Cannon charge HUD ────────────────────────────────────────────── */
-    .cannon-charge-hud {
-      position: absolute; bottom: 5.5rem; left: 50%; transform: translateX(-50%);
-      z-index: 60; pointer-events: none;
-      display: flex; flex-direction: column; align-items: center; gap: 4px;
-      background: rgba(8, 16, 28, 0.75);
-      border: 1px solid rgba(255, 200, 50, 0.35);
-      border-radius: 8px; padding: 8px 16px;
-      backdrop-filter: blur(6px);
-    }
-    .cannon-charge-label {
-      font-family: monospace; font-size: 11px; font-weight: bold;
-      color: rgba(255, 200, 50, 0.90); letter-spacing: 0.12em;
-    }
-    .cannon-charge-track {
-      width: 180px; height: 6px;
-      background: rgba(255,255,255,0.10); border-radius: 3px; overflow: hidden;
-    }
-    .cannon-charge-fill {
-      height: 100%; border-radius: 3px;
-      background: linear-gradient(90deg, #f97316, #facc15);
-      transition: width 0.05s linear, background 0.2s;
-    }
-    .cannon-charge-fill.cannon-charge-full {
-      background: linear-gradient(90deg, #ef4444, #f97316);
-      animation: charge-pulse 0.25s ease-in-out infinite alternate;
-    }
-    @keyframes charge-pulse { from { opacity: 0.85; } to { opacity: 1.0; } }
-    .cannon-charge-range {
-      font-family: monospace; font-size: 10px; color: rgba(255,220,100,0.65);
     }
   `],
 })
@@ -185,20 +139,17 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   @HostListener('window:keydown.escape')
   onEscKey(): void {
     if (this.phase() !== 'sailing') return;
-    // Esc backs out of Settings first, then toggles the pause menu.
+    // Esc backs out of Settings first; then stands down an armed gun; then pause.
     if (this.showSettings()) {
       this.showSettings.set(false);
       return;
     }
+    if (this.cannonService.anyCancellable()) {
+      this.cannonService.cancel();
+      return;
+    }
     this.paused.update(v => !v);
   }
-
-  /** Display the approximate range in the charge bar (20 m … 80 m). */
-  chargeRangeLabel = computed(() => {
-    const c = this.cannonService.chargeLevel();
-    const range = Math.round((20 + c * 60) / 5) * 5;   // snap to 5 m grid
-    return `~${range} m range`;
-  });
 
   /** True if the logged-in user has admin or owner role — controls admin panel visibility. */
   isAdmin = false;

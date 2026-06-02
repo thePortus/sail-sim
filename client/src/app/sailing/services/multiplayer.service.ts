@@ -7,6 +7,7 @@ import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { VesselService } from './vessel.service';
 import { SloopController } from './rigged-vessel.controller';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
@@ -56,6 +57,7 @@ export class MultiplayerService {
   private oceanService   = inject(OceanService);
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
+  private vesselService  = inject(VesselService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -129,6 +131,13 @@ export class MultiplayerService {
                 vx: number, vy: number, vz: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz }));
+  }
+
+  /** Broadcast a gun-deploy change so other players see this ship's ports/run-out.
+   *  deploy: 1 = arming/ready (ports open, gun out), 0 = stowing/reloaded (ports shut). */
+  broadcastGunState(side: 'port' | 'stbd', deploy: 0 | 1): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'gun_state', side, deploy }));
   }
 
   sendChat(text: string): void {
@@ -248,15 +257,23 @@ export class MultiplayerService {
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
-      console.log('[MP] remote cannon_shot received', msg, 'onRemoteShot set:', !!this.onRemoteShot);
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
+
+    } else if (msg.type === 'gun_state') {
+      if (msg.id === this.myId) return;
+      const entry = this.players.get(msg.id);
+      const side = msg.side === 'port' ? 'P' : 'S';   // game port → model 'P' (matches local)
+      entry?.controller?.setGunDeployTarget(side, +msg.deploy ? 1 : 0);
 
     } else if (msg.type === 'friend_update') {
       this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
       this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
 
     } else if (msg.type === 'reload_assets') {
+      // Bust the cache + rebuild remotes, then live-reload the local player's own ship
+      // (reloadRemoteVessels already set the cache version, so this fetches the fresh GLB).
       this.reloadRemoteVessels(+msg.version || 0, scene);
+      this.vesselService.reloadModel().catch((e) => console.warn('[MP] local model reload failed', e));
 
     } else if (msg.type === 'kicked') {
       // Server closed this session because the same account logged in elsewhere.
@@ -431,6 +448,8 @@ export class MultiplayerService {
       const firedSide: 'port' | 'stbd' = localX < 0 ? 'port' : 'stbd';
       const dir = firedSide === 'port' ? 1 : -1;
       closest.recoilRollVel += dir * this.RECOIL_IMPULSE;
+      // Kick the firing side's gun barrels too (game port → model 'P', matches local).
+      closest.controller?.addGunRecoil(firedSide === 'port' ? 'P' : 'S');
     }
   }
 

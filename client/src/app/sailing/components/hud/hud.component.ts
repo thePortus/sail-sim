@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
 import { SceneService } from '../../services/scene.service';
+import { CannonService } from '../../services/cannon.service';
 import { SailState } from '../../models';
 import { ChatComponent } from '../chat/chat.component';
 
@@ -16,6 +17,7 @@ export class HudComponent implements OnInit, OnDestroy {
   vesselService  = inject(VesselService);
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
+  cannonService  = inject(CannonService);
 
   @ViewChild(ChatComponent) private chat?: ChatComponent;
 
@@ -164,6 +166,27 @@ export class HudComponent implements OnInit, OnDestroy {
 
   toggleAnchor(): void {
     this.vesselService.toggleAnchor();
+  }
+
+  // ── Gunnery ─────────────────────────────────────────────────────────────────
+  fireGun(side: 'port' | 'stbd'): void {
+    this.cannonService.armOrFire(side);
+  }
+
+  /** Button label per gun state. */
+  gunLabel(state: string): string {
+    switch (state) {
+      case 'arming':    return 'Running out…';
+      case 'ready':     return 'FIRE!';
+      case 'firing':    return 'Firing…';
+      case 'reloading': return 'Reloading…';
+      default:          return 'Run out';
+    }
+  }
+
+  /** Active/highlight class per gun state (reuses the sail-btn active styling). */
+  gunBtnClass(state: string): string {
+    return state === 'ready' ? 'sail-btn--active' : '';
   }
 
   refloat(): void {

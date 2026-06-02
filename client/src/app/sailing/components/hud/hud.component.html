@@ -235,6 +235,27 @@
     </div>
   </div>
 
+  <!-- ── Gunnery (bottom-center, above controls) ───────────────────────── -->
+  <div class="hud-panel gunnery pointer-events-auto">
+    <div class="text-slate-400 text-xs font-mono uppercase tracking-wider mb-2 text-center">Guns</div>
+    <div class="flex gap-2">
+      <button (click)="fireGun('port')"
+              [class]="'sail-btn gun-btn ' + gunBtnClass(cannonService.portGunState())">
+        <span class="sail-icon">◀</span>
+        <span class="flex-1 text-left">Port · {{ gunLabel(cannonService.portGunState()) }}</span>
+        <span class="sail-key">Z</span>
+        <span class="gun-reload" [style.width.%]="cannonService.portReloadFrac() * 100"></span>
+      </button>
+      <button (click)="fireGun('stbd')"
+              [class]="'sail-btn gun-btn ' + gunBtnClass(cannonService.stbdGunState())">
+        <span class="sail-key">C</span>
+        <span class="flex-1 text-right">{{ gunLabel(cannonService.stbdGunState()) }} · Stbd</span>
+        <span class="sail-icon">▶</span>
+        <span class="gun-reload" [style.width.%]="cannonService.stbdReloadFrac() * 100"></span>
+      </button>
+    </div>
+  </div>
+
   <!-- ── Controls reminder (bottom-center) ─────────────────────────────── -->
   <div class="hud-panel bottom-center pointer-events-none">
     <div class="text-slate-500 text-xs font-mono flex gap-x-4 gap-y-1 flex-wrap justify-center">
@@ -242,7 +263,7 @@
       <span><kbd>W</kbd>/<kbd>S</kbd> Sail ±</span>
       <span><kbd>Q</kbd>/<kbd>E</kbd> Sheet</span>
       <span><kbd>T</kbd> Auto-trim</span>
-      <span class="text-orange-400/60"><kbd>R-Click</kbd> Fire (hold to aim)</span>
+      <span class="text-orange-400/60"><kbd>Z</kbd>/<kbd>C</kbd> Fire · <kbd>Esc</kbd> Stand down</span>
     </div>
   </div>
 

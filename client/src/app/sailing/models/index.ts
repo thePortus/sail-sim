@@ -130,6 +130,9 @@ export interface VesselPhysics {
   minTackAngle:    number;
   sailAreaFactor:  number;
   weight:          number;
+  /** Seconds a fired broadside takes to reload before that side can fire again.
+   *  Later modified by crew/morale; a flat per-ship constant for now. */
+  reloadWindow?:   number;
 }
 
 export interface VesselPartParams {

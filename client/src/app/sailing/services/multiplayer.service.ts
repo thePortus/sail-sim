@@ -1,14 +1,24 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Color3, StandardMaterial, TransformNode,
-  Mesh, Scene, DynamicTexture,
+  Mesh, Material, Scene, DynamicTexture,
 } from '@babylonjs/core';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { VesselService } from './vessel.service';
+import { SloopController } from './rigged-vessel.controller';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
+
+// Single rigged vessel asset, shared with VesselService. Future ships map their slug
+// to a different GLB/manifest here.
+const SLOOP_GLB      = 'bermuda_sloop_rigged.glb';
+const SLOOP_MANIFEST = 'bermuda_sloop_rigged.manifest.json';
+function glbForSlug(_slug: string): { glb: string; manifest: string } {
+  return { glb: SLOOP_GLB, manifest: SLOOP_MANIFEST };
+}
 
 // One buffered server snapshot of a remote vessel's pose, stamped with the local
 // arrival time so we can render on a consistent local clock.
@@ -21,11 +31,16 @@ interface PoseSnapshot {
 // ── OtherPlayerEntry holds everything for one remote vessel ───────────────────
 interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
-  boomPivot:       TransformNode | null;   // rotates to render the remote player's sail trim
-  sailFullRoot:    TransformNode | null;
-  sailReducedRoot: TransformNode | null;
+  controller:      SloopController | null;  // drives this remote's trim/sail/rudder/flag
   recoilRoll:      number;
   recoilRollVel:   number;
+  recoilSway:      number;
+  recoilSwayVel:   number;
+  hitRoll:         number;
+  hitRollVel:      number;
+  hitSway:         number;
+  hitSwayVel:      number;
+  anchorDeploy:    number;                  // animated 0=stowed .. 1=lowered
 
   // ── Movement smoothing (interpolation + dead-reckoning) ──────────────────
   // x/z/heading (from OtherPlayer) are the DISPLAYED pose, updated each frame by
@@ -48,6 +63,7 @@ export class MultiplayerService {
   private oceanService   = inject(OceanService);
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
+  private vesselService  = inject(VesselService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -83,11 +99,23 @@ export class MultiplayerService {
   private updateTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly VISIBILITY_RADIUS = 15_000;
-  private readonly REMOTE_DRAFT      = -0.75;  // matches VesselService FLOAT_DRAFT (waterline)
+  private readonly REMOTE_DRAFT      = 0.0;  // matches VesselService FLOAT_DRAFT (model origin = waterline)
   private readonly RECOIL_SPRING     = 7.2;
   private readonly RECOIL_DAMPING    = 5.8;
-  private readonly RECOIL_IMPULSE    = 0.46;   // rad/s
-  private readonly RECOIL_MAX_ROLL   = 0.12;   // ~6.9° cap
+  private readonly RECOIL_IMPULSE    = 0.40;   // rad/s heel kick PER shot (matches VesselService)
+  private readonly RECOIL_MAX_ROLL   = 0.17;   // ~9.7° cap
+  // Lateral shudder — mirrors VesselService so remotes lurch away from their guns too.
+  private readonly RECOIL_SWAY_SPRING  = 9.0;
+  private readonly RECOIL_SWAY_DAMPING = 6.0;
+  private readonly RECOIL_SWAY_IMPULSE = 0.95;  // m/s lateral kick PER shot
+  private readonly RECOIL_SWAY_MAX     = 0.95;  // m hard cap
+  // Heavy hit shudder — mirrors VesselService so a struck remote ship rocks violently.
+  private readonly HIT_SPRING       = 8.5;
+  private readonly HIT_DAMPING      = 4.6;
+  private readonly HIT_ROLL_IMPULSE = 1.1;
+  private readonly HIT_SWAY_IMPULSE = 2.6;
+  private readonly HIT_MAX_ROLL     = 0.34;
+  private readonly HIT_MAX_SWAY     = 1.8;
 
   // ── Remote movement smoothing ──────────────────────────────────────────────
   // We render remote vessels this many ms BEHIND the newest snapshot, so there's
@@ -121,6 +149,13 @@ export class MultiplayerService {
                 vx: number, vy: number, vz: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz }));
+  }
+
+  /** Broadcast a gun-deploy change so other players see this ship's ports/run-out.
+   *  deploy: 1 = arming/ready (ports open, gun out), 0 = stowing/reloaded (ports shut). */
+  broadcastGunState(side: 'port' | 'stbd', deploy: 0 | 1): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'gun_state', side, deploy }));
   }
 
   sendChat(text: string): void {
@@ -190,8 +225,9 @@ export class MultiplayerService {
     x: number, z: number, heading: number, speed: number,
     sailState: SailState, vesselName: string, vesselSlug: string,
     turnRate = 0, sheetAngle = 30, isPortTack = false,
+    anchored = false, anchorSide: 'S' | 'P' = 'S',
   ): void {
-    Object.assign(this.localState, { x, z, heading, speed, turnRate, sheetAngle, isPortTack, sailState, vesselName, vesselSlug });
+    Object.assign(this.localState, { x, z, heading, speed, turnRate, sheetAngle, isPortTack, anchored, anchorSide, sailState, vesselName, vesselSlug });
     if (this.sceneService.scene) this.refreshAllVisibility();
   }
 
@@ -239,15 +275,23 @@ export class MultiplayerService {
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
-      console.log('[MP] remote cannon_shot received', msg, 'onRemoteShot set:', !!this.onRemoteShot);
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
+
+    } else if (msg.type === 'gun_state') {
+      if (msg.id === this.myId) return;
+      const entry = this.players.get(msg.id);
+      const side = msg.side === 'port' ? 'P' : 'S';   // game port → model 'P' (matches local)
+      entry?.controller?.setGunDeployTarget(side, +msg.deploy ? 1 : 0);
 
     } else if (msg.type === 'friend_update') {
       this.myFriends.set(Array.isArray(msg.myFriends) ? msg.myFriends.map(String) : []);
       this.mutualFriends.set(Array.isArray(msg.mutuals) ? msg.mutuals.map(String) : []);
 
     } else if (msg.type === 'reload_assets') {
+      // Bust the cache + rebuild remotes, then live-reload the local player's own ship
+      // (reloadRemoteVessels already set the cache version, so this fetches the fresh GLB).
       this.reloadRemoteVessels(+msg.version || 0, scene);
+      this.vesselService.reloadModel().catch((e) => console.warn('[MP] local model reload failed', e));
 
     } else if (msg.type === 'kicked') {
       // Server closed this session because the same account logged in elsewhere.
@@ -285,11 +329,16 @@ export class MultiplayerService {
 
       entry = {
         root,
-        boomPivot:       null,
-        sailFullRoot:    null,
-        sailReducedRoot: null,
+        controller:      null,
         recoilRoll:      0,
         recoilRollVel:   0,
+        recoilSway:      0,
+        recoilSwayVel:   0,
+        hitRoll:         0,
+        hitRollVel:      0,
+        hitSway:         0,
+        hitSwayVel:      0,
+        anchorDeploy:    0,
         id:         data.id,
         x:          sx, z: sz, heading: sHeading, speed: sSpeed,
         sailState:  'full',
@@ -323,10 +372,11 @@ export class MultiplayerService {
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
+    entry.anchored   = !!data.anchored;
+    entry.anchorSide = data.anchorSide === 'P' ? 'P' : 'S';
 
-    // Update sail visibility + boom trim to match the remote player's current state.
-    entry.sailFullRoot?.setEnabled(entry.sailState === 'full');
-    entry.sailReducedRoot?.setEnabled(entry.sailState === 'topsails');
+    // Update sail furl + boom trim to match the remote player's current state.
+    entry.controller?.applySailState(entry.sailState);
     this.applyRemoteTrim(entry);
 
     // Buffer this snapshot for interpolation (don't snap the mesh — tickRemoteMotion
@@ -367,6 +417,7 @@ export class MultiplayerService {
     const snapshots = Array.from(this.players.values()).map((e) => ({
       id: e.id, x: e.x, z: e.z, heading: e.heading, speed: e.speed,
       turnRate: e.turnRate, sheetAngle: e.sheetAngle, isPortTack: e.isPortTack,
+      anchored: e.anchored, anchorSide: e.anchorSide,
       sailState: e.sailState, vesselName: e.vesselName,
       vesselSlug: e.vesselSlug, callsign: e.callsign,
     }));
@@ -379,6 +430,8 @@ export class MultiplayerService {
   }
 
   private disposeEntry(entry: OtherPlayerEntry): void {
+    entry.controller?.dispose();
+    entry.controller = null;
     // Unregister from the ocean reflection list before disposing so stale meshes don't
     // pile up in the RTT across many join/leaves.
     entry.root.getChildMeshes(false).forEach(m => {
@@ -392,7 +445,10 @@ export class MultiplayerService {
   private publishSignal(): void {
     this.otherPlayers.set(
       Array.from(this.players.values()).map(
-        ({ root: _r, sailFullRoot: _sf, sailReducedRoot: _sr, recoilRoll: _rr, recoilRollVel: _rv, ...p }) => p as OtherPlayer,
+        ({ root: _r, controller: _c, recoilRoll: _rr, recoilRollVel: _rv,
+           recoilSway: _rs, recoilSwayVel: _rsv,
+           hitRoll: _hr, hitRollVel: _hrv, hitSway: _hs, hitSwayVel: _hsv,
+           anchorDeploy: _ad, ...p }) => p as OtherPlayer,
       ),
     );
   }
@@ -419,7 +475,37 @@ export class MultiplayerService {
       const firedSide: 'port' | 'stbd' = localX < 0 ? 'port' : 'stbd';
       const dir = firedSide === 'port' ? 1 : -1;
       closest.recoilRollVel += dir * this.RECOIL_IMPULSE;
+      closest.recoilSwayVel += dir * this.RECOIL_SWAY_IMPULSE;   // lateral shudder
+      // Kick the firing side's gun barrels too (game port → model 'P', matches local).
+      closest.controller?.addGunRecoil(firedSide === 'port' ? 'P' : 'S');
     }
+  }
+
+  /**
+   * Cosmetic cannon-hit test: returns the displayed pose of the nearest remote ship
+   * whose hull (an oriented ellipse ~18 m × 7 m) contains the world point (bx,bz),
+   * or null. Uses the smoothed DISPLAYED transform so it matches what's on screen.
+   */
+  shipHitAt(bx: number, bz: number): { x: number; z: number; heading: number; id: string } | null {
+    for (const e of this.players.values()) {
+      const dx = bx - e.dispX, dz = bz - e.dispZ;
+      const hr = e.dispHeading;                       // radians
+      const lat = dx * Math.cos(hr) - dz * Math.sin(hr);   // beam axis
+      const lon = dx * Math.sin(hr) + dz * Math.cos(hr);   // fore-aft axis
+      if ((lat * lat) / 12.25 + (lon * lon) / 81.0 <= 1.0) {
+        return { x: e.dispX, z: e.dispZ, heading: e.dispHeading * 180 / Math.PI, id: e.id };
+      }
+    }
+    return null;
+  }
+
+  /** Heavy shudder on a remote ship (id) that was struck on the given side. */
+  applyHitShudder(id: string, side: 'port' | 'stbd'): void {
+    const e = this.players.get(id);
+    if (!e) return;
+    const dir = side === 'port' ? 1 : -1;
+    e.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
+    e.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
   }
 
   /** Shortest-arc difference a→b for angles in radians. */
@@ -526,6 +612,28 @@ export class MultiplayerService {
     entry.root.rotation.x = entry.pitchRad;
     // rotation.z gets wave roll here; tickRecoil adds cannon recoil on top.
     entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll;
+
+    // Rig animation: rudder reflects the broadcast yaw; flag/pennant flutter downwind;
+    // sail furl + anchor ease toward the broadcast state so they animate like the local ship.
+    if (entry.controller) {
+      const rudder = Math.max(-1, Math.min(1, (newest.turnRate || 0) / 20));
+      entry.controller.setRudder(rudder);
+      const wind = this.weatherService.weather();
+      if (wind) {
+        const headingDeg = entry.dispHeading * 180 / Math.PI;
+        const windLocalRad = (((wind.wind.fromBearingDeg + 180) % 360) - headingDeg) * Math.PI / 180;
+        entry.controller.idleWind(windLocalRad, Math.min(1.2, wind.wind.speed / 8), t);
+      }
+      entry.controller.applySailState(entry.sailState);   // sets furl target; eases below
+
+      const side: 'S' | 'P' = entry.anchorSide === 'P' ? 'P' : 'S';
+      entry.anchorDeploy += ((entry.anchored ? 1 : 0) - entry.anchorDeploy) * Math.min(1, dt * 2.5);
+      entry.controller.dropAnchor('S', side === 'S' ? entry.anchorDeploy : 0);
+      entry.controller.dropAnchor('P', side === 'P' ? entry.anchorDeploy : 0);
+
+      // Last: ease trim/boom/furl AND re-prepare the skeleton from all posed bone nodes.
+      entry.controller.tickRig(dt);
+    }
   }
 
   private tickRecoil(entry: OtherPlayerEntry, dt: number): void {
@@ -538,20 +646,60 @@ export class MultiplayerService {
       entry.recoilRoll = 0;
       entry.recoilRollVel = 0;
     }
-    // Combine cannon recoil with the wave-induced roll set by tickRemoteMotion (runs
-    // first) so neither overwrites the other.
-    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll;
+    // Heavy hit shudder (separate channel, own caps) — a struck ship rocks violently.
+    const hitRollAcc = -this.HIT_SPRING * entry.hitRoll - this.HIT_DAMPING * entry.hitRollVel;
+    entry.hitRollVel += hitRollAcc * dt;
+    entry.hitRoll += entry.hitRollVel * dt;
+    if (entry.hitRoll >  this.HIT_MAX_ROLL) entry.hitRoll =  this.HIT_MAX_ROLL;
+    if (entry.hitRoll < -this.HIT_MAX_ROLL) entry.hitRoll = -this.HIT_MAX_ROLL;
+    if (Math.abs(entry.hitRoll) < 0.0002 && Math.abs(entry.hitRollVel) < 0.0002) {
+      entry.hitRoll = 0; entry.hitRollVel = 0;
+    }
+
+    // Combine cannon recoil + hit shudder with the wave-induced roll set by
+    // tickRemoteMotion (runs first) so neither overwrites the other.
+    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll;
+
+    // Lateral shudder: damped sideways lurch away from the firing side, layered on
+    // top of the interpolated display position (dispX/dispZ set by tickRemoteMotion).
+    const swayAcc = -this.RECOIL_SWAY_SPRING * entry.recoilSway - this.RECOIL_SWAY_DAMPING * entry.recoilSwayVel;
+    entry.recoilSwayVel += swayAcc * dt;
+    entry.recoilSway += entry.recoilSwayVel * dt;
+    if (entry.recoilSway >  this.RECOIL_SWAY_MAX) entry.recoilSway =  this.RECOIL_SWAY_MAX;
+    if (entry.recoilSway < -this.RECOIL_SWAY_MAX) entry.recoilSway = -this.RECOIL_SWAY_MAX;
+    if (Math.abs(entry.recoilSway) < 0.0005 && Math.abs(entry.recoilSwayVel) < 0.0005) {
+      entry.recoilSway = 0;
+      entry.recoilSwayVel = 0;
+    }
+    const hitSwayAcc = -this.HIT_SPRING * entry.hitSway - this.HIT_DAMPING * entry.hitSwayVel;
+    entry.hitSwayVel += hitSwayAcc * dt;
+    entry.hitSway += entry.hitSwayVel * dt;
+    if (entry.hitSway >  this.HIT_MAX_SWAY) entry.hitSway =  this.HIT_MAX_SWAY;
+    if (entry.hitSway < -this.HIT_MAX_SWAY) entry.hitSway = -this.HIT_MAX_SWAY;
+    if (Math.abs(entry.hitSway) < 0.0005 && Math.abs(entry.hitSwayVel) < 0.0005) {
+      entry.hitSway = 0; entry.hitSwayVel = 0;
+    }
+
+    const totalSway = entry.recoilSway + entry.hitSway;
+    if (totalSway !== 0) {
+      const h = entry.dispHeading;   // radians; +sway = toward starboard
+      entry.root.position.x = entry.dispX + totalSway * Math.cos(h);
+      entry.root.position.z = entry.dispZ - totalSway * Math.sin(h);
+    }
   }
 
   // ── Visibility ────────────────────────────────────────────────────────────
 
-  /** Rotate a remote vessel's boom pivot to match its broadcast sail trim — identical
-   *  math to VesselService: swingSide·(sheetAngle−90) about Y. */
+  /** Drive a remote vessel's yards + boom/gaff to match its broadcast sail trim —
+   *  identical math to VesselService (yards braced from sheet angle, boom/gaff swung
+   *  to the leeward side per tack). */
   private applyRemoteTrim(entry: OtherPlayerEntry): void {
-    if (!entry.boomPivot) return;
-    const swingDeg  = entry.sheetAngle ?? 30;
+    if (!entry.controller) return;
+    const sheet = entry.sheetAngle ?? 30;
+    const braced = Math.max(0, Math.min(1, (88 - sheet) / 83));
+    entry.controller.setTrim(braced);
     const swingSide = entry.isPortTack ? -1 : 1;
-    entry.boomPivot.rotation.y = swingSide * (swingDeg - 90) * Math.PI / 180;
+    entry.controller.setBoomSwing(swingSide * (sheet - 90) * Math.PI / 180);
   }
 
   private applyVisibility(entry: OtherPlayerEntry): void {
@@ -575,61 +723,54 @@ export class MultiplayerService {
   ): Promise<void> {
     const prefix  = 'rp_' + playerId + '_';
 
-    // Instantiate from the shared cache instead of re-importing per player:
-    // the GLB is fetched + parsed once for the whole session (by whichever
-    // vessel — local or remote — needs it first) and cheaply cloned here.
-    // The 180° Y-flip, parenting, and renderingGroupId 2 happen in instantiate().
-    const loadGLB = async (
-      filename: string, parent: TransformNode,
-    ): Promise<TransformNode | null> => {
-      const root = await this.assetCache.instantiate(filename, scene, parent);
-      if (root) for (const m of root.getChildMeshes(false)) m.isPickable = false;
-      return root;
-    };
+    // Instantiate the single rigged GLB from the shared cache (fetched + parsed once
+    // per session, then cheaply cloned per vessel with its own skeleton/clips/morphs).
+    // 180° Y flip so the bow faces +Z = forward (matches VesselService); parenting +
+    // renderingGroupId 2 happen in the cache.
+    const { glb, manifest: manifestFile } = glbForSlug(slug);
+    const [rigged, manifest] = await Promise.all([
+      this.assetCache.instantiateRigged(glb, scene, entry.root, true),
+      this.assetCache.loadManifest(manifestFile),
+    ]);
+    if (!rigged) { console.warn('[Multiplayer] rigged vessel failed to load for', playerId); return; }
 
-    // Hull (includes mast — same as local vessel)
-    await loadGLB('sloop-hull.glb', entry.root);
+    for (const m of rigged.root.getChildMeshes(false)) m.isPickable = false;
+    entry.controller = new SloopController(rigged.entries, rigged.root, manifest, scene);
 
-    // Boom pivot — the boom + sails attach here so they rotate together with sail trim.
-    const boomPivot = new TransformNode(prefix + 'boom', scene);
-    boomPivot.parent = entry.root;
-    entry.boomPivot = boomPivot;
-
-    // Boom GLB (parity with local vessel) + sails — all on the pivot so trim rotates them.
-    await loadGLB('sloop-boom.glb', boomPivot);
-    entry.sailFullRoot    = await loadGLB('sloop-sail.glb',         boomPivot);
-    entry.sailReducedRoot = await loadGLB('sloop-sail-reduced.glb', boomPivot);
-
-    // Apply the trim we already know (state updates may have arrived before the mesh).
+    // Apply the sail state + trim we already know (updates may have arrived pre-build).
+    entry.controller.applySailState(entry.sailState, true);   // snap initial pose
     this.applyRemoteTrim(entry);
 
-    // Apply initial sail state (async build may land after several state updates)
-    entry.sailFullRoot?.setEnabled(entry.sailState === 'full');
-    entry.sailReducedRoot?.setEnabled(entry.sailState === 'topsails');
-
-    // Snapshot of hull+sail meshes before the label is added (for shadow casting +
+    // Snapshot of vessel meshes before the label is added (for shadow casting +
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
     // Callsign label (billboard above masthead)
     this.buildCallsignLabel(prefix + 'label', callsign, entry.root, scene);
 
-    // Shadows — remote vessels cast onto the water/terrain and receive island shadows,
-    // just like the local ship.
-    const sg = this.sceneService.shadowGenerator;
-    if (sg) {
-      for (const m of vesselMeshes) {
-        sg.addShadowCaster(m, true);
-        m.receiveShadows = true;
-      }
-    }
-
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
-    // through the water (matches VesselService). Without this they looked "pasted on"
-    // up close — no reflection, no waterline interaction.
+    // through the water (matches VesselService).
     for (const m of vesselMeshes) {
       this.oceanService.addToRenderList(m);
+    }
+
+    // Shadows + WebGPU varying budget (mirrors VesselService): the rigged GLB's PBR
+    // materials carry more vertex varyings than the old split parts, so with the SSAO
+    // prePass + shadow receipt + fog + ocean reflection clip-plane they exceed WebGPU's
+    // 16 inter-stage limit and invalidate every pipeline (black screen). Cast shadows
+    // but don't receive them, drop fog, and exclude the materials from the prePass.
+    const sg = this.sceneService.shadowGenerator;
+    const seenMats = new Set<Material>();
+    for (const m of vesselMeshes) {
+      sg?.addShadowCaster(m, true);
+      m.receiveShadows = false;
+      const mat = m.material;
+      if (mat && !seenMats.has(mat)) {
+        seenMats.add(mat);
+        mat.fogEnabled = false;
+        this.sceneService.excludeFromPrePass(mat);
+      }
     }
   }
 

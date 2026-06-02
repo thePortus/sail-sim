@@ -1,9 +1,11 @@
 import { Injectable } from '@angular/core';
 import {
   AssetContainer, SceneLoader, Scene, TransformNode, Quaternion, Vector3,
+  InstantiatedEntries,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { Settings } from '../../app.settings';
+import { RiggedManifest } from '../models';
 
 /**
  * Loads each vessel GLB **once** into an {@link AssetContainer}, then hands out
@@ -24,6 +26,9 @@ export class VesselAssetCacheService {
   /** filename → in-flight or resolved container load. Promise is cached so
    *  concurrent callers for the same file dedupe onto one network request. */
   private readonly containers = new Map<string, Promise<AssetContainer>>();
+
+  /** filename → in-flight or resolved rigged-manifest fetch (companion JSON). */
+  private readonly manifests = new Map<string, Promise<RiggedManifest>>();
 
   /** Cache-busting token appended as ?v=<version> to GLB URLs. 0 = no token
    *  (normal browser caching). Bumped by reloadAssets() so the browser refetches
@@ -59,10 +64,12 @@ export class VesselAssetCacheService {
    * and tagging every instantiated mesh with renderingGroupId 2 (the world
    * layer used by terrain/ocean/vessels).
    *
+   * @param flipY  apply the legacy 180° Y-flip (true for the old split GLBs whose bow
+   *               faced -Z; false for models already authored +Z=bow, e.g. the rigged sloop).
    * @returns the instantiated root TransformNode, or null on load failure.
    */
   async instantiate(
-    filename: string, scene: Scene, parent: TransformNode,
+    filename: string, scene: Scene, parent: TransformNode, flipY = true,
   ): Promise<TransformNode | null> {
     try {
       const container = await this.getContainer(filename, scene);
@@ -73,16 +80,7 @@ export class VesselAssetCacheService {
       const root = entries.rootNodes[0] as TransformNode | undefined;
       if (!root) return null;
 
-      // Compound the 180° Y-flip onto the loader's coordinate-conversion
-      // rotation, exactly as the previous per-mesh import did.
-      const flipY = Quaternion.RotationAxis(Vector3.Up(), Math.PI);
-      root.rotationQuaternion = root.rotationQuaternion
-        ? flipY.multiply(root.rotationQuaternion)
-        : flipY;
-
-      root.parent = parent;
-      for (const m of root.getChildMeshes(false)) m.renderingGroupId = 2;
-
+      this.orient(root, parent, flipY);
       return root;
     } catch (err) {
       console.warn(`[VesselAssetCache] instantiate failed: ${filename}`, err);
@@ -90,11 +88,66 @@ export class VesselAssetCacheService {
     }
   }
 
-  /** Dispose all cached containers (e.g. for a future /reloadassets command). */
+  /**
+   * Like {@link instantiate} but returns the FULL InstantiatedEntries (cloned skeleton,
+   * animation groups, morph managers) so the caller can build a SloopController. Used for
+   * single-file rigged vessels. Default flipY=false — the rigged model is authored +Z=bow.
+   */
+  async instantiateRigged(
+    filename: string, scene: Scene, parent: TransformNode, flipY = false,
+  ): Promise<{ root: TransformNode; entries: InstantiatedEntries } | null> {
+    try {
+      const container = await this.getContainer(filename, scene);
+      const entries = container.instantiateModelsToScene((n) => n, false);
+      const root = entries.rootNodes[0] as TransformNode | undefined;
+      if (!root) return null;
+
+      this.orient(root, parent, flipY);
+      return { root, entries };
+    } catch (err) {
+      console.warn(`[VesselAssetCache] instantiateRigged failed: ${filename}`, err);
+      return null;
+    }
+  }
+
+  /** Fetch + cache a rigged vessel's companion manifest JSON (once per session). */
+  loadManifest(filename: string): Promise<RiggedManifest> {
+    let pending = this.manifests.get(filename);
+    if (!pending) {
+      const url = this.version
+        ? `${this.baseUrl}${filename}?v=${this.version}`
+        : `${this.baseUrl}${filename}`;
+      pending = fetch(url)
+        .then((r) => {
+          if (!r.ok) throw new Error(`manifest ${filename}: HTTP ${r.status}`);
+          return r.json() as Promise<RiggedManifest>;
+        })
+        .catch((err) => { this.manifests.delete(filename); throw err; });
+      this.manifests.set(filename, pending);
+    }
+    return pending;
+  }
+
+  /** Apply optional 180° Y-flip, parent, and renderingGroupId=2 on the deep subtree. */
+  private orient(root: TransformNode, parent: TransformNode, flipY: boolean): void {
+    if (flipY) {
+      // Compound the 180° Y-flip onto the loader's coordinate-conversion rotation,
+      // exactly as the previous per-mesh import did.
+      const flip = Quaternion.RotationAxis(Vector3.Up(), Math.PI);
+      root.rotationQuaternion = root.rotationQuaternion
+        ? flip.multiply(root.rotationQuaternion)
+        : flip;
+    }
+    root.parent = parent;
+    for (const m of root.getChildMeshes(false)) m.renderingGroupId = 2;
+  }
+
+  /** Dispose all cached containers + manifests (e.g. for the /reloadassets command). */
   clearCache(): void {
     for (const pending of this.containers.values()) {
       pending.then((c) => c.dispose()).catch(() => { /* load failed; nothing to dispose */ });
     }
     this.containers.clear();
+    this.manifests.clear();
   }
 }

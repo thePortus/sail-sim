@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* improve ocean https://github.com/Popov72/OceanDemo
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD
 * Make emissive lights cast light on
 * Fix weird ocean dark shapes
@@ -17,6 +18,7 @@
 * Add sailors on deck
 * Add ship names
 * Add lost server connection detection
+* Add ping to admin debug readout next to FPS, and enable readout for non-admins
 * encrypt websocket server? wss instead of ws?
 
 # TODO Items by Module

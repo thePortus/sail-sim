@@ -2,6 +2,7 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Scene, Mesh, MeshBuilder, Vector3, Color3, Color4,
   StandardMaterial, DynamicTexture, ParticleSystem, PointLight,
+  NoiseProceduralTexture,
 } from '@babylonjs/core';
 import { SceneService }       from './scene.service';
 import { OceanService }       from './ocean.service';
@@ -20,21 +21,24 @@ const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
 const MUZZLE_V   = 55;                   // fixed muzzle velocity (m/s)
 const STAGGER    = 0.06;                 // seconds between the 3 cannons of a broadside
 const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
+const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
 
 // Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
 // x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
 // (Model gunports are mirrored+flipped by the 180° instantiate flip — tune at runtime.)
+// y lowered from the gunport-rim values so balls/blast emit from the barrel mouth,
+// not above it.
 type Muz = { x: number; y: number; z: number };
 const MUZZLES: Record<'port' | 'stbd', Muz[]> = {
   port: [
-    { x: -1.98, y: 2.05, z: 1.36 },
-    { x: -1.87, y: 2.20, z: 2.40 },
-    { x: -1.72, y: 2.45, z: 3.44 },
+    { x: -1.98, y: 1.50, z: 1.36 },
+    { x: -1.87, y: 1.65, z: 2.40 },
+    { x: -1.72, y: 1.90, z: 3.44 },
   ],
   stbd: [
-    { x: 1.98, y: 2.05, z: 1.36 },
-    { x: 1.87, y: 2.20, z: 2.40 },
-    { x: 1.72, y: 2.45, z: 3.44 },
+    { x: 1.98, y: 1.50, z: 1.36 },
+    { x: 1.87, y: 1.65, z: 2.40 },
+    { x: 1.72, y: 1.90, z: 3.44 },
   ],
 };
 
@@ -104,22 +108,35 @@ export class CannonService {
   private flameStbdEmit  = new Vector3(0, 0, 0);
   private flameCutoffT   = -1;
 
-  // Smoke particle systems
+  // Smoke "fountain" particle systems — the directional belch right at the muzzle
   private smokePortPS!:  ParticleSystem;
   private smokeStbdPS!:  ParticleSystem;
   private smokePortEmit  = new Vector3(0, 0, 0);
   private smokeStbdEmit  = new Vector3(0, 0, 0);
   private smokeCutoffT   = -1;
 
+  // Lingering smoke-cloud systems — slow, billowing, persists ~5s then fades over ~10s
+  private lingerPortPS!:  ParticleSystem;
+  private lingerStbdPS!:  ParticleSystem;
+  private lingerPortEmit  = new Vector3(0, 0, 0);
+  private lingerStbdEmit  = new Vector3(0, 0, 0);
+  private lingerCutoffT   = -1;
+
+  // Shared turbulence noise for all smoke systems (one texture, assigned to many PS)
+  private smokeNoise!: NoiseProceduralTexture;
+
   // Remote shot effects — dedicated systems so they never conflict with local fire
   private flashRemote!:       PointLight;
   private flashRemoteEndT   = -1;
   private remoteFlamePS!:    ParticleSystem;
   private remoteSmokePS!:    ParticleSystem;
+  private remoteLingerPS!:   ParticleSystem;
   private remoteFlameEmit    = new Vector3(0, 0, 0);
   private remoteSmokeEmit    = new Vector3(0, 0, 0);
+  private remoteLingerEmit   = new Vector3(0, 0, 0);
   private remoteFlameCutoffT = -1;
   private remoteSmokeCutoffT = -1;
+  private remoteLingerCutoffT = -1;
 
   // Impact particle systems
   private splashPS!:     ParticleSystem;
@@ -145,10 +162,12 @@ export class CannonService {
     this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
 
     this.buildParticleTex();
+    this.buildSmokeNoise();
     this.buildBallPool();
     this.buildFlashLights();
     this.buildFlameParticles();
     this.buildSmokeParticles();
+    this.buildLingerParticles();
     this.buildImpactParticles();
     this.setupInput();
 
@@ -179,8 +198,10 @@ export class CannonService {
     for (const ps of [
       this.flamePortPS, this.flameStbdPS, this.remoteFlamePS,
       this.smokePortPS, this.smokeStbdPS, this.remoteSmokePS,
+      this.lingerPortPS, this.lingerStbdPS, this.remoteLingerPS,
       this.splashPS, this.dirtPS,
     ]) { ps?.stop(); ps?.dispose(); }
+    this.smokeNoise?.dispose();
     this.sfx.releaseMaster(this.sfxMaster);
     this.sfxMaster = null;
     this.sfxCtx?.close().catch(() => {});
@@ -259,27 +280,42 @@ export class CannonService {
     }
   }
 
-  // ── Muzzle blast (flame) particle systems ─────────────────────────────────
+  // ── Shared turbulence noise for smoke ─────────────────────────────────────
+
+  private buildSmokeNoise(): void {
+    const n = new NoiseProceduralTexture('cannonSmokeNoise', 128, this.scene);
+    n.animationSpeedFactor = 4;
+    n.persistence          = 0.8;
+    n.brightness           = 0.55;
+    n.octaves              = 4;
+    this.smokeNoise = n;
+  }
+
+  // ── Muzzle blast (flame core) particle systems ────────────────────────────
+  //
+  // The bright, fast, additive jet of fire right at the barrel mouth. Many small
+  // particles, brief, growing slightly as they leave the muzzle.
 
   private buildFlameParticles(): void {
     const makeFlame = (name: string, emitVec: Vector3) => {
-      const ps = new ParticleSystem(name, 140, this.scene);
+      const ps = new ParticleSystem(name, 520, this.scene);
       ps.particleTexture = this.blobTex;
       ps.emitter    = emitVec;
-      ps.minEmitBox = new Vector3(-0.15, -0.10, -0.15);
-      ps.maxEmitBox = new Vector3( 0.15,  0.10,  0.15);
-      ps.color1     = new Color4(1.00, 0.98, 0.80, 1.00);
-      ps.color2     = new Color4(1.00, 0.50, 0.06, 0.90);
-      ps.colorDead  = new Color4(0.55, 0.18, 0.01, 0.00);
-      ps.minSize      = 0.50;  ps.maxSize      = 2.20;
-      ps.minLifeTime  = 0.14;  ps.maxLifeTime  = 0.45;
-      ps.minEmitPower = 8;     ps.maxEmitPower = 22;
-      ps.updateSpeed  = 0.016;
-      ps.direction1   = new Vector3(-1, 0.05, 0);
+      ps.minEmitBox = new Vector3(-0.12, -0.10, -0.12);
+      ps.maxEmitBox = new Vector3( 0.12,  0.10,  0.12);
+      ps.color1     = new Color4(1.00, 0.95, 0.72, 1.00);
+      ps.color2     = new Color4(1.00, 0.52, 0.10, 0.95);
+      ps.colorDead  = new Color4(0.50, 0.14, 0.01, 0.00);
+      ps.minLifeTime  = 0.22;  ps.maxLifeTime  = 0.72;
+      ps.minEmitPower = 11;    ps.maxEmitPower = 30;
+      ps.updateSpeed  = 0.014;
+      ps.addSizeGradient(0.0, 0.50, 1.10);   // bigger at the muzzle…
+      ps.addSizeGradient(1.0, 3.00, 4.50);   // …blooming much larger as it shoots out
+      ps.direction1   = new Vector3(-1, 0.04, 0);
       ps.direction2   = new Vector3(-1, 0.30, 0);
-      ps.gravity      = new Vector3(0, -0.8, 0);
+      ps.gravity      = new Vector3(0, -0.5, 0);
       ps.blendMode    = ParticleSystem.BLENDMODE_ADD;
-      ps.renderingGroupId = 1;
+      ps.renderingGroupId = 3;   // above ALL ocean LODs (far=0, lod1=1, lod0/near=2)
       ps.emitRate     = 0;
       ps.start();
       return ps;
@@ -289,27 +325,41 @@ export class CannonService {
     this.remoteFlamePS = makeFlame('flameRemote', this.remoteFlameEmit);
   }
 
-  // ── Smoke particle systems ────────────────────────────────────────────────
+  // ── Smoke "fountain" particle systems ─────────────────────────────────────
+  //
+  // The dense directional belch: many small particles blasting out the beam,
+  // warm-tinted at birth (fire amid the smoke) cooling to grey, DECELERATING via
+  // a velocity-over-life gradient so they pile up into a cloud instead of flying
+  // straight, GROWING via a size gradient, and ROILING via the shared noise.
 
   private buildSmokeParticles(): void {
     const makeSmoke = (name: string, emitVec: Vector3) => {
-      const ps = new ParticleSystem(name, 160, this.scene);
+      const ps = new ParticleSystem(name, 900, this.scene);
       ps.particleTexture = this.blobTex;
       ps.emitter    = emitVec;
-      ps.minEmitBox = new Vector3(-0.22, -0.10, -0.22);
-      ps.maxEmitBox = new Vector3( 0.22,  0.10,  0.22);
-      ps.color1     = new Color4(0.65, 0.60, 0.52, 0.85);
-      ps.color2     = new Color4(0.45, 0.42, 0.38, 0.70);
-      ps.colorDead  = new Color4(0.28, 0.28, 0.28, 0.00);
-      ps.minSize      = 1.2;   ps.maxSize      = 5.0;
-      ps.minLifeTime  = 1.0;   ps.maxLifeTime  = 3.0;
-      ps.minEmitPower = 0.8;   ps.maxEmitPower = 3.5;
-      ps.updateSpeed  = 0.016;
-      ps.direction1   = new Vector3(-0.5, 0.3, -0.5);
-      ps.direction2   = new Vector3( 0.5, 1.5,  0.5);
-      ps.gravity      = new Vector3(0, 0.9, 0);
+      ps.minEmitBox = new Vector3(-0.14, -0.12, -0.14);
+      ps.maxEmitBox = new Vector3( 0.14,  0.12,  0.14);
+      // colour-over-life: warm fire core → grey smoke → fade
+      ps.addColorGradient(0.00, new Color4(1.00, 0.78, 0.34, 0.00));
+      ps.addColorGradient(0.06, new Color4(1.00, 0.66, 0.24, 1.00));
+      ps.addColorGradient(0.25, new Color4(0.58, 0.50, 0.44, 0.95));
+      ps.addColorGradient(0.70, new Color4(0.44, 0.42, 0.40, 0.78));
+      ps.addColorGradient(1.00, new Color4(0.32, 0.32, 0.32, 0.00));
+      // grow as it billows — larger swell
+      ps.addSizeGradient(0.00, 0.60, 1.30);
+      ps.addSizeGradient(1.00, 5.00, 7.50);
+      // fast out the muzzle, then decelerate hard and hang
+      ps.addVelocityGradient(0.00, 1.00);
+      ps.addVelocityGradient(0.18, 0.35);
+      ps.addVelocityGradient(1.00, 0.05);
+      ps.minLifeTime  = 1.4;   ps.maxLifeTime  = 3.4;
+      ps.minEmitPower = 10;    ps.maxEmitPower = 27;
+      ps.updateSpeed  = 0.012;
+      ps.gravity      = new Vector3(0, 1.2, 0);   // smoke rises as it slows
       ps.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
-      ps.renderingGroupId = 1;
+      ps.renderingGroupId = 3;   // above ALL ocean LODs (far=0, lod1=1, lod0/near=2)
+      ps.noiseTexture = this.smokeNoise;
+      ps.noiseStrength = new Vector3(6, 8, 6);
       ps.emitRate     = 0;
       ps.start();
       return ps;
@@ -317,6 +367,47 @@ export class CannonService {
     this.smokePortPS  = makeSmoke('smokePort',   this.smokePortEmit);
     this.smokeStbdPS  = makeSmoke('smokeStbd',   this.smokeStbdEmit);
     this.remoteSmokePS = makeSmoke('smokeRemote', this.remoteSmokeEmit);
+  }
+
+  // ── Lingering smoke-cloud particle systems ────────────────────────────────
+  //
+  // The hanging pall left after the shot: few-but-large, slow-rising, long-lived
+  // billows whose alpha HOLDS for ~5s then fades over ~10s (lifetime 10–15s).
+
+  private buildLingerParticles(): void {
+    const makeLinger = (name: string, emitVec: Vector3) => {
+      const ps = new ParticleSystem(name, 500, this.scene);
+      ps.particleTexture = this.blobTex;
+      ps.emitter    = emitVec;
+      ps.minEmitBox = new Vector3(-0.40, -0.20, -0.40);
+      ps.maxEmitBox = new Vector3( 0.40,  0.40,  0.40);
+      // alpha climbs fast, HOLDS through ~1/3 of life (~5s of 15s), then fades to 0
+      ps.addColorGradient(0.00, new Color4(0.50, 0.48, 0.45, 0.00));
+      ps.addColorGradient(0.08, new Color4(0.48, 0.46, 0.43, 0.62));
+      ps.addColorGradient(0.33, new Color4(0.45, 0.44, 0.42, 0.55));
+      ps.addColorGradient(1.00, new Color4(0.40, 0.40, 0.40, 0.00));
+      // swell over the whole life
+      ps.addSizeGradient(0.00, 1.50, 2.50);
+      ps.addSizeGradient(0.40, 5.00, 7.00);
+      ps.addSizeGradient(1.00, 8.00, 11.0);
+      ps.addVelocityGradient(0.00, 1.00);
+      ps.addVelocityGradient(0.30, 0.20);
+      ps.addVelocityGradient(1.00, 0.02);
+      ps.minLifeTime  = 10.0;  ps.maxLifeTime  = 15.0;
+      ps.minEmitPower = 1.5;   ps.maxEmitPower = 4.5;
+      ps.updateSpeed  = 0.012;
+      ps.gravity      = new Vector3(0, 0.5, 0);   // slow drift upward
+      ps.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+      ps.renderingGroupId = 3;   // above ALL ocean LODs (far=0, lod1=1, lod0/near=2)
+      ps.noiseTexture = this.smokeNoise;
+      ps.noiseStrength = new Vector3(2.0, 2.5, 2.0);
+      ps.emitRate     = 0;
+      ps.start();
+      return ps;
+    };
+    this.lingerPortPS  = makeLinger('lingerPort',   this.lingerPortEmit);
+    this.lingerStbdPS  = makeLinger('lingerStbd',   this.lingerStbdEmit);
+    this.remoteLingerPS = makeLinger('lingerRemote', this.remoteLingerEmit);
   }
 
   // ── Impact particle systems ───────────────────────────────────────────────
@@ -337,6 +428,7 @@ export class CannonService {
     this.splashPS.direction2   = new Vector3( 2, 18,  2);
     this.splashPS.gravity      = new Vector3(0, -9.81, 0);
     this.splashPS.blendMode    = ParticleSystem.BLENDMODE_ADD;
+    this.splashPS.renderingGroupId = 3;   // above all ocean LODs (else the near water hides the splash)
     this.splashPS.emitRate     = 0;
     this.splashPS.start();
 
@@ -355,6 +447,7 @@ export class CannonService {
     this.dirtPS.direction2   = new Vector3( 1.5, 12, 1.5);
     this.dirtPS.gravity      = new Vector3(0, -9.81, 0);
     this.dirtPS.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    this.dirtPS.renderingGroupId = 3;   // above all ocean LODs
     this.dirtPS.emitRate     = 0;
     this.dirtPS.start();
   }
@@ -496,6 +589,11 @@ export class CannonService {
       this.smokeStbdPS.emitRate = 0;
       this.smokeCutoffT = -1;
     }
+    if (this.lingerCutoffT > 0 && this.elapsed >= this.lingerCutoffT) {
+      this.lingerPortPS.emitRate = 0;
+      this.lingerStbdPS.emitRate = 0;
+      this.lingerCutoffT = -1;
+    }
     if (this.splashCutoffT > 0 && this.elapsed >= this.splashCutoffT) {
       this.splashPS.emitRate = 0;
       this.splashCutoffT = -1;
@@ -512,6 +610,10 @@ export class CannonService {
       this.remoteSmokePS.emitRate = 0;
       this.remoteSmokeCutoffT = -1;
     }
+    if (this.remoteLingerCutoffT > 0 && this.elapsed >= this.remoteLingerCutoffT) {
+      this.remoteLingerPS.emitRate = 0;
+      this.remoteLingerCutoffT = -1;
+    }
   }
 
   private decayFlash(light: PointLight, endT: number): void {
@@ -519,7 +621,7 @@ export class CannonService {
       if (light) light.intensity = 0;
       return;
     }
-    const env = (endT - this.elapsed) / 0.45;
+    const env = (endT - this.elapsed) / FLASH_DUR;
     light.intensity = env * 8.0 * (0.85 + 0.15 * Math.random());
   }
 
@@ -551,31 +653,44 @@ export class CannonService {
     this.playCannonSound();
   }
 
-  /** Flash + flame + smoke at a muzzle, blasting out the beam direction. */
+  /** Flash + flame core + smoke fountain + lingering cloud, blasting out the beam. */
   private muzzleEffect(side: 'port' | 'stbd', mwx: number, mwy: number, mwz: number, dirX: number, dirZ: number): void {
-    const fSpread = 0.18, sSpread = 0.40;
-    const isPort  = side === 'port';
-    const flamePS = isPort ? this.flamePortPS : this.flameStbdPS;
-    const smokePS = isPort ? this.smokePortPS : this.smokeStbdPS;
-    const flash   = isPort ? this.flashPort   : this.flashStbd;
-    const fEmit   = isPort ? this.flamePortEmit : this.flameStbdEmit;
-    const sEmit   = isPort ? this.smokePortEmit : this.smokeStbdEmit;
+    const isPort   = side === 'port';
+    const flamePS  = isPort ? this.flamePortPS  : this.flameStbdPS;
+    const smokePS  = isPort ? this.smokePortPS  : this.smokeStbdPS;
+    const lingerPS = isPort ? this.lingerPortPS : this.lingerStbdPS;
+    const flash    = isPort ? this.flashPort    : this.flashStbd;
+    const fEmit    = isPort ? this.flamePortEmit  : this.flameStbdEmit;
+    const sEmit    = isPort ? this.smokePortEmit  : this.smokeStbdEmit;
+    const lEmit    = isPort ? this.lingerPortEmit : this.lingerStbdEmit;
 
+    // Muzzle-flash point light (a touch longer than before).
     flash.position.set(mwx, mwy, mwz);
-    if (isPort) this.flashPortEndT = this.elapsed + 0.45;
-    else        this.flashStbdEndT = this.elapsed + 0.45;
+    if (isPort) this.flashPortEndT = this.elapsed + FLASH_DUR;
+    else        this.flashStbdEndT = this.elapsed + FLASH_DUR;
 
-    flamePS.direction1.set(dirX - fSpread, 0.06, dirZ - fSpread);
-    flamePS.direction2.set(dirX + fSpread, 0.32, dirZ + fSpread);
-    smokePS.direction1.set(dirX - sSpread, 0.18, dirZ - sSpread);
-    smokePS.direction2.set(dirX + sSpread, 1.10, dirZ + sSpread);
+    // 1) Flame core — tight, fast jet right out the barrel.
+    const fSpread = 0.16;
+    flamePS.direction1.set(dirX - fSpread, 0.04, dirZ - fSpread);
+    flamePS.direction2.set(dirX + fSpread, 0.30, dirZ + fSpread);
     fEmit.set(mwx, mwy, mwz);
-    sEmit.set(mwx, mwy, mwz);
+    flamePS.emitRate  = 1800;
+    this.flameCutoffT = this.elapsed + 0.22;
 
-    flamePS.emitRate = 450;
-    smokePS.emitRate = 110;
-    this.flameCutoffT = this.elapsed + 0.18;
-    this.smokeCutoffT = this.elapsed + 1.4;
+    // 2) Smoke fountain — dense directional belch (emitted slightly ahead of the mouth).
+    const sSpread = 0.32;
+    smokePS.direction1.set(dirX * 1.0 - sSpread, 0.12, dirZ * 1.0 - sSpread);
+    smokePS.direction2.set(dirX * 1.5 + sSpread, 0.55, dirZ * 1.5 + sSpread);
+    sEmit.set(mwx + dirX * 0.3, mwy, mwz + dirZ * 0.3);
+    smokePS.emitRate  = 850;
+    this.smokeCutoffT = this.elapsed + 0.55;
+
+    // 3) Lingering cloud — slow billows that hang in the air for many seconds.
+    lEmit.set(mwx + dirX * 0.9, mwy + 0.3, mwz + dirZ * 0.9);
+    lingerPS.direction1.set(dirX * 0.3 - 0.3, 0.40, dirZ * 0.3 - 0.3);
+    lingerPS.direction2.set(dirX * 0.6 + 0.3, 1.00, dirZ * 0.6 + 0.3);
+    lingerPS.emitRate  = 120;
+    this.lingerCutoffT = this.elapsed + 0.55;
   }
 
   private fireRemoteEffect(
@@ -588,23 +703,30 @@ export class CannonService {
 
     // Muzzle flash
     this.flashRemote.position.set(ox, oy, oz);
-    this.flashRemoteEndT = this.elapsed + 0.45;
+    this.flashRemoteEndT = this.elapsed + FLASH_DUR;
 
-    // Flame particles directed along shot vector
-    const fSpread = 0.18;
-    this.remoteFlamePS.direction1.set(dx - fSpread, 0.06, dz - fSpread);
-    this.remoteFlamePS.direction2.set(dx + fSpread, 0.32, dz + fSpread);
+    // 1) Flame core — tight, fast jet along the shot vector
+    const fSpread = 0.16;
+    this.remoteFlamePS.direction1.set(dx - fSpread, 0.04, dz - fSpread);
+    this.remoteFlamePS.direction2.set(dx + fSpread, 0.30, dz + fSpread);
     this.remoteFlameEmit.set(ox, oy, oz);
-    this.remoteFlamePS.emitRate = 450;
-    this.remoteFlameCutoffT = this.elapsed + 0.18;
+    this.remoteFlamePS.emitRate = 1800;
+    this.remoteFlameCutoffT = this.elapsed + 0.22;
 
-    // Smoke particles
-    const sSpread = 0.40;
-    this.remoteSmokePS.direction1.set(dx - sSpread, 0.18, dz - sSpread);
-    this.remoteSmokePS.direction2.set(dx + sSpread, 1.10, dz + sSpread);
-    this.remoteSmokeEmit.set(ox, oy, oz);
-    this.remoteSmokePS.emitRate = 110;
-    this.remoteSmokeCutoffT = this.elapsed + 1.4;
+    // 2) Smoke fountain — dense directional belch
+    const sSpread = 0.32;
+    this.remoteSmokePS.direction1.set(dx * 1.0 - sSpread, 0.12, dz * 1.0 - sSpread);
+    this.remoteSmokePS.direction2.set(dx * 1.5 + sSpread, 0.55, dz * 1.5 + sSpread);
+    this.remoteSmokeEmit.set(ox + dx * 0.3, oy, oz + dz * 0.3);
+    this.remoteSmokePS.emitRate = 850;
+    this.remoteSmokeCutoffT = this.elapsed + 0.55;
+
+    // 3) Lingering cloud — slow billows that hang for many seconds
+    this.remoteLingerEmit.set(ox + dx * 0.9, oy + 0.3, oz + dz * 0.9);
+    this.remoteLingerPS.direction1.set(dx * 0.3 - 0.3, 0.40, dz * 0.3 - 0.3);
+    this.remoteLingerPS.direction2.set(dx * 0.6 + 0.3, 1.00, dz * 0.6 + 0.3);
+    this.remoteLingerPS.emitRate = 120;
+    this.remoteLingerCutoffT = this.elapsed + 0.55;
 
     // Recoil on the firing vessel
     this.multiplayerService.applyRemoteRecoil(ox, oz);

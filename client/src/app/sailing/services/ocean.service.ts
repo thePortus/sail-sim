@@ -29,6 +29,7 @@ uniform float u_Time;
 uniform vec2  u_WorldOffset;
 uniform float u_MeshHalfSize;
 uniform float u_DisplaceScale;
+uniform float u_edgeFade;        // 1 = fade displacement to 0 at mesh edge; 0 = full waves to edge
 uniform float u_WaveDepth;
 uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
@@ -123,13 +124,14 @@ void main() {
   float wx = position.x + u_WorldOffset.x;
   float wz = position.z + u_WorldOffset.y;
 
-  // Edge-fade: blend displacement to zero near mesh boundary to hide seam.
-  float d    = max(abs(position.x), abs(position.z));
-  float fade = u_DisplaceScale * (1.0 - smoothstep(
-    u_MeshHalfSize * 0.80,
-    u_MeshHalfSize * 0.97,
-    d
-  ));
+  // Edge-fade: optionally blend displacement to zero near mesh boundary. Enabled
+  // (u_edgeFade=1) only for the LOD that meets a FLAT outer LOD (LOD1→FAR); for
+  // LODs whose neighbour continues the wave field (near→LOD0, LOD0→LOD1) it is
+  // disabled (u_edgeFade=0) so full waves run to the edge and the inner LOD's
+  // footprint is hard-cut out of the outer via u_innerCull — no interpenetration.
+  float d        = max(abs(position.x), abs(position.z));
+  float edgeF    = 1.0 - smoothstep(u_MeshHalfSize * 0.80, u_MeshHalfSize * 0.97, d);
+  float fade     = u_DisplaceScale * mix(1.0, edgeF, u_edgeFade);
 
   vec3  pos = position;
 
@@ -157,6 +159,7 @@ uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
+uniform float u_innerCull;      // >0: discard frags within this chebyshev half-size of the boat (inner-LOD footprint)
 uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
 uniform float u_wakeCount;      // number of valid points in u_wakePath
 uniform sampler2D u_reflectionSampler;
@@ -427,6 +430,14 @@ float rainField(vec2 p, float t){
 }
 
 void main() {
+  // Inner-LOD cull: discard fragments that fall inside the boat-centred near patch
+  // so this (outer) LOD never co-renders with the denser inner one — a clean hard
+  // cut that replaces the old interpenetrating displacement fade.
+  if (u_innerCull > 0.0 &&
+      max(abs(v_worldPos.x - u_BoatPos.x), abs(v_worldPos.z - u_BoatPos.y)) < u_innerCull) {
+    discard;
+  }
+
   float depth = u_WaveDepth;
   vec2 worldXZ = v_worldPos.xz;
 
@@ -664,6 +675,7 @@ uniform u_Time: f32;
 uniform u_WorldOffset: vec2f;
 uniform u_MeshHalfSize: f32;
 uniform u_DisplaceScale: f32;
+uniform u_edgeFade: f32;        // 1 = fade displacement to 0 at mesh edge; 0 = full waves to edge
 uniform u_WaveDepth: f32;
 uniform u_WaveFreq: f32;
 uniform u_BoatPos: vec2f;
@@ -759,12 +771,9 @@ fn main(input: VertexInputs) -> FragmentInputs {
   let wx = input.position.x + uniforms.u_WorldOffset.x;
   let wz = input.position.z + uniforms.u_WorldOffset.y;
 
-  let d = max(abs(input.position.x), abs(input.position.z));
-  let fade = uniforms.u_DisplaceScale * (1.0 - smoothstep(
-    uniforms.u_MeshHalfSize * 0.80,
-    uniforms.u_MeshHalfSize * 0.97,
-    d
-  ));
+  let d     = max(abs(input.position.x), abs(input.position.z));
+  let edgeF = 1.0 - smoothstep(uniforms.u_MeshHalfSize * 0.80, uniforms.u_MeshHalfSize * 0.97, d);
+  let fade  = uniforms.u_DisplaceScale * mix(1.0, edgeF, uniforms.u_edgeFade);
 
   var pos = input.position;
 
@@ -790,6 +799,7 @@ uniform u_WaveFreq: f32;
 uniform u_BoatPos: vec2f;
 uniform u_BoatDir: vec2f;
 uniform u_BoatSpeed: f32;
+uniform u_innerCull: f32;               // >0: discard frags within this chebyshev half-size of the boat
 uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
 uniform u_wakeCount: f32;               // number of valid points in u_wakePath
 var u_reflectionSamplerSampler: sampler;
@@ -1048,6 +1058,14 @@ fn rainField(p: vec2f, t: f32) -> f32 {
 
 @fragment
 fn main(input: FragmentInputs) -> FragmentOutputs {
+  // Inner-LOD cull: discard fragments inside the boat-centred near patch so this
+  // (outer) LOD never co-renders with the denser inner one — clean hard cut.
+  if (uniforms.u_innerCull > 0.0 &&
+      max(abs(input.v_worldPos.x - uniforms.u_BoatPos.x),
+          abs(input.v_worldPos.z - uniforms.u_BoatPos.y)) < uniforms.u_innerCull) {
+    discard;
+  }
+
   let depth = uniforms.u_WaveDepth;
   let worldXZ = input.v_worldPos.xz;
 
@@ -1459,7 +1477,8 @@ export class OceanService {
       width: this.FAR_SIZE, height: this.FAR_SIZE, subdivisions: this.FAR_SUB,
     }, scene);
     this.oceanMeshFar.renderingGroupId = 0;
-    this.oceanMatFar = this.buildOceanMaterial(scene, 'oceanMatFar', 0.0, this.FAR_SIZE / 2, -1);
+    // FAR: flat (displaceScale 0), so edge fade is moot; no inner cull.
+    this.oceanMatFar = this.buildOceanMaterial(scene, 'oceanMatFar', 0.0, this.FAR_SIZE / 2, -1, 1, 0);
     this.oceanMeshFar.material = this.oceanMatFar;
   }
 
@@ -1469,7 +1488,8 @@ export class OceanService {
     }, scene);
     this.oceanMesh1.renderingGroupId = 1;
     this.oceanMesh1.position.y       = 0.002;
-    this.oceanMat1 = this.buildOceanMaterial(scene, 'oceanMat1', 1.0, this.LOD1_SIZE / 2, 1);
+    // LOD1: fade displacement to 0 at its edge so it blends into the FLAT far ocean.
+    this.oceanMat1 = this.buildOceanMaterial(scene, 'oceanMat1', 1.0, this.LOD1_SIZE / 2, 1, 1, 0);
     this.oceanMesh1.material = this.oceanMat1;
   }
 
@@ -1479,7 +1499,11 @@ export class OceanService {
     }, scene);
     this.oceanMesh0.renderingGroupId = 2;
     this.oceanMesh0.position.y       = 0.004;
-    this.oceanMat0 = this.buildOceanMaterial(scene, 'oceanMat0', 1.0, this.LOD0_SIZE / 2, 2);
+    // LOD0: full waves to its edge (LOD1 continues the field beneath it, no fade
+    // needed), and hard-cut the near patch out of it so the two group-2 surfaces
+    // never interpenetrate. Cull just inside the near edge (40 m) for a safe seam.
+    this.oceanMat0 = this.buildOceanMaterial(
+      scene, 'oceanMat0', 1.0, this.LOD0_SIZE / 2, 2, 0, this.NEAR_SIZE / 2 - 0.5);
     this.oceanMesh0.material = this.oceanMat0;
   }
 
@@ -1498,7 +1522,9 @@ export class OceanService {
     }, scene);
     this.oceanMeshNear.renderingGroupId = 2;
     this.oceanMeshNear.position.y       = 0.006;   // above LOD0 (0.004) — wins depth test
-    this.oceanMatNear = this.buildOceanMaterial(scene, 'oceanMatNear', 1.0, this.NEAR_SIZE / 2, 2);
+    // NEAR: full waves all the way to its edge (no fade); LOD0 is hard-cut beneath
+    // it, so its edge hands straight over to LOD0's identical wave field.
+    this.oceanMatNear = this.buildOceanMaterial(scene, 'oceanMatNear', 1.0, this.NEAR_SIZE / 2, 2, 0, 0);
     this.oceanMeshNear.material = this.oceanMatNear;
   }
 
@@ -1510,6 +1536,8 @@ export class OceanService {
     displaceScale: number,
     meshHalfSize:  number,
     maxCascade:    number,
+    edgeFade:      number,   // 1 = fade displacement to 0 at edge (meets a flat outer LOD); 0 = full waves
+    innerCull:     number,   // >0 = discard frags within this chebyshev half-size of the boat (inner footprint)
   ): ShaderMaterial {
     const useWgsl = this.sceneService.isWebGPU;
     const mat = new ShaderMaterial(name, scene,
@@ -1521,7 +1549,7 @@ export class OceanService {
         attributes: ['position'],
         uniforms: [
           'world', 'worldViewProjection',
-          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale',
+          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale', 'u_edgeFade', 'u_innerCull',
           'u_Time', 'u_WaveDepth', 'u_WaveFreq',
           'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
           'u_cameraPosition', 'view',
@@ -1541,6 +1569,8 @@ export class OceanService {
 
     mat.setFloat('u_DisplaceScale', displaceScale);
     mat.setFloat('u_MeshHalfSize',  meshHalfSize);
+    mat.setFloat('u_edgeFade',      edgeFade);
+    mat.setFloat('u_innerCull',     innerCull);
     mat.setFloat('u_WaveDepth',   waveDepth);
     mat.setFloat('u_WaveFreq',    this.WAVE_FREQ);
 

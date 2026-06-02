@@ -11,10 +11,12 @@ import {
 } from '@babylonjs/core';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
 import { Weather } from '../models';
+import { TelemetryService } from './telemetry.service';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
   private zone = inject(NgZone);
+  private telemetry = inject(TelemetryService);
 
   engine!:    WebGPUEngine | Engine;
   scene!:     Scene;
@@ -962,8 +964,10 @@ export class SceneService {
       if (fpsEl.style.display !== 'none' && (perfFrame++ % 15) === 0) {
         const ms = (c: { lastSecAverage: number }) => c.lastSecAverage.toFixed(1);
         const gpuMs = (eInstr.gpuFrameTimeCounter.lastSecAverage / 1e6) || 0;
+        const ping = this.telemetry.ping();
+        const pingStr = ping < 0 ? 'offline' : `${ping} ms`;
         fpsEl.textContent =
-          `${this.engine.getFps().toFixed(0)} FPS   (${sInstr.frameTimeCounter.lastSecAverage.toFixed(1)} ms/frame)\n` +
+          `${this.engine.getFps().toFixed(0)} FPS   (${sInstr.frameTimeCounter.lastSecAverage.toFixed(1)} ms/frame)   ping ${pingStr}\n` +
           `gpu        ${gpuMs ? gpuMs.toFixed(1) + ' ms' : 'n/a'}\n` +
           `evalMeshes ${ms(sInstr.activeMeshesEvaluationTimeCounter)} ms\n` +
           `renderTgts ${ms(sInstr.renderTargetsRenderTimeCounter)} ms\n` +

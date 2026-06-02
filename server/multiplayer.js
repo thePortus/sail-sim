@@ -360,7 +360,10 @@ function attachMultiplayer(server) {
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
 
-      if (msg.type === 'update') {
+      if (msg.type === 'ping') {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong', t: msg.t }));
+
+      } else if (msg.type === 'update') {
         const prevCallsign = players.get(id)?.state?.callsign;
         const state = {
           x:          +msg.x          || 0,
@@ -532,9 +535,21 @@ function attachMultiplayer(server) {
               const sunkName = victim.state?.callsign || 'a ship';
               sysReply(victim.ws, `You were sunk by ${sinker}.`);
               sysReply(me?.ws, `You sank ${sunkName}!`);
-              const sunkMsg = JSON.stringify({ type: 'combat_sunk', victimId: hit.victimId, shooterId: id });
+              const sunkMsg = JSON.stringify({
+                type: 'combat_sunk', victimId: hit.victimId, shooterId: id, shooterName: sinker,
+              });
               for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
             }
+          }
+        }
+
+      } else if (msg.type === 'combat_reset') {
+        // Player acknowledged a sinking → restore their hull to full.
+        const me = players.get(id);
+        if (me && me.combat) {
+          me.combat = combat.newCombatState();
+          if (me.ws.readyState === 1) {
+            me.ws.send(JSON.stringify({ type: 'combat_state', zones: me.combat.zones }));
           }
         }
 

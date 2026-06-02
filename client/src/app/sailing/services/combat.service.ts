@@ -13,9 +13,23 @@ export class CombatService {
   /** Per-zone HP, or null until the first hit syncs state. */
   readonly zones = signal<ZoneState | null>(null);
 
+  /** True while the local ship is sunk (shows the sunk overlay until confirmed). */
+  readonly sunk   = signal(false);
+  readonly sunkBy = signal<string>('');
+
   /** Apply an authoritative hull state from the server. */
   setLocalZones(z: ZoneState): void {
     this.zoneNg.run(() => this.zones.set({ ...z }));
+  }
+
+  /** Local ship was sunk by `by` (callsign). */
+  markSunk(by: string): void {
+    this.zoneNg.run(() => { this.sunk.set(true); this.sunkBy.set(by || 'another ship'); });
+  }
+
+  /** Dismiss the sunk overlay (after the server has restored full HP). */
+  clearSunk(): void {
+    this.zoneNg.run(() => this.sunk.set(false));
   }
 
   /** Severity band for a zone (drives the HUD colour). */

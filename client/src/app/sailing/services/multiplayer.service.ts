@@ -10,6 +10,7 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
+import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
@@ -67,6 +68,7 @@ export class MultiplayerService {
   private assetCache     = inject(VesselAssetCacheService);
   private vesselService  = inject(VesselService);
   private combatService  = inject(CombatService);
+  private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -100,6 +102,7 @@ export class MultiplayerService {
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
   private updateTimer: ReturnType<typeof setInterval> | null = null;
+  private pingTimer:   ReturnType<typeof setInterval> | null = null;
 
   private readonly VISIBILITY_RADIUS = 15_000;
   private readonly REMOTE_DRAFT      = 0.0;  // matches VesselService FLOAT_DRAFT (model origin = waterline)
@@ -155,6 +158,12 @@ export class MultiplayerService {
                 vx: number, vy: number, vz: number, seq: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
+  }
+
+  /** Ask the server to restore our hull to full (after acknowledging a sinking). */
+  requestCombatReset(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'combat_reset' }));
+    this.combatService.clearSunk();
   }
 
   /** Our own server-assigned id (for combat targeting). */
@@ -219,6 +228,12 @@ export class MultiplayerService {
 
     this.ws.addEventListener('open', () => {
       this.updateTimer = setInterval(() => this.sendUpdate(), 100);
+      // Round-trip ping for the debug overlay (everyone, backtick).
+      this.pingTimer = setInterval(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+        }
+      }, 2000);
     });
 
     this.ws.addEventListener('message', (evt) => {
@@ -229,6 +244,8 @@ export class MultiplayerService {
 
     this.ws.addEventListener('close', () => {
       if (this.updateTimer) clearInterval(this.updateTimer);
+      if (this.pingTimer) clearInterval(this.pingTimer);
+      this.telemetry.ping.set(-1);
     });
   }
 
@@ -244,6 +261,8 @@ export class MultiplayerService {
 
   disconnect(): void {
     if (this.updateTimer) clearInterval(this.updateTimer);
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.telemetry.ping.set(-1);
     if (this.recoilTickFn) {
       this.sceneService.scene?.unregisterBeforeRender(this.recoilTickFn);
       this.recoilTickFn = null;
@@ -296,11 +315,14 @@ export class MultiplayerService {
       else                            this.applyHitShudder(String(msg.victimId), side);
       this.onCombatHit?.(msg as CombatHitMsg);
 
+    } else if (msg.type === 'pong') {
+      this.telemetry.ping.set(Math.round(performance.now() - (+msg.t || 0)));
+
     } else if (msg.type === 'combat_state') {
       this.combatService.setLocalZones(msg.zones as ZoneState);
 
     } else if (msg.type === 'combat_sunk') {
-      // Messages are delivered via system chat by the server; nothing extra to do yet.
+      if (msg.victimId === this.myId) this.combatService.markSunk(String(msg.shooterName ?? ''));
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;

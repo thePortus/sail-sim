@@ -86,6 +86,35 @@ export class CannonService {
   readonly portReloadFrac = signal(0);   // 0..1 reload progress
   readonly stbdReloadFrac = signal(0);
 
+  // ── Gun elevation / targeting ───────────────────────────────────────────────
+  // Elevation is the launch angle (deg). Flat (low) keeps the ball in the hull band
+  // → hull hits; high lobs it up → mast hits. Shift raises, Control lowers; the
+  // Hull/Mast buttons jump to presets. The shot velocity carries the angle, so the
+  // server adjudicates any elevation correctly (no broadcast needed).
+  private readonly ELEV_MIN  = 0;
+  private readonly ELEV_MAX  = 18;
+  private readonly ELEV_HULL = 3;
+  private readonly ELEV_MAST = 12;
+  readonly gunElevDeg = signal(this.ELEV_HULL);
+  readonly targetMode = signal<'hull' | 'mast'>('hull');
+
+  /** Nudge the elevation (deg); Shift = +, Control = −. */
+  elevate(deltaDeg: number): void {
+    const v = Math.max(this.ELEV_MIN, Math.min(this.ELEV_MAX, this.gunElevDeg() + deltaDeg));
+    this.zone.run(() => {
+      this.gunElevDeg.set(v);
+      this.targetMode.set(v >= (this.ELEV_HULL + this.ELEV_MAST) / 2 ? 'mast' : 'hull');
+    });
+  }
+
+  /** Jump to a targeting preset (Hull = flat, Mast = high lob). */
+  setTargetMode(mode: 'hull' | 'mast'): void {
+    this.zone.run(() => {
+      this.targetMode.set(mode);
+      this.gunElevDeg.set(mode === 'mast' ? this.ELEV_MAST : this.ELEV_HULL);
+    });
+  }
+
   // ── Private state ─────────────────────────────────────────────────────────
   private scene!:   Scene;
   private canvas!:  HTMLCanvasElement;
@@ -618,6 +647,9 @@ export class CannonService {
     this.keyHandler = (e: KeyboardEvent) => {
       if (document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement) return;
+      // Elevation: Shift raises, Control lowers (allow key-repeat for smooth aim).
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevate(+1); return; }
+      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevate(-1); return; }
       if (e.repeat) return;
       if (e.code === 'KeyZ')      this.armOrFire('port');
       else if (e.code === 'KeyC') this.armOrFire('stbd');
@@ -824,8 +856,9 @@ export class CannonService {
     // Beam direction (perpendicular to the hull): port = (-cosH, sinH), stbd = (cosH, -sinH).
     const dirX = side === 'port' ? -cosH :  cosH;
     const dirZ = side === 'port' ?  sinH : -sinH;
-    const vh   = MUZZLE_V * Math.cos(ELEV_RAD);
-    const vy   = MUZZLE_V * Math.sin(ELEV_RAD);
+    const elevRad = this.gunElevDeg() * Math.PI / 180;
+    const vh   = MUZZLE_V * Math.cos(elevRad);
+    const vy   = MUZZLE_V * Math.sin(elevRad);
     const bvx  = dirX * vh;
     const bvz  = dirZ * vh;
 

@@ -142,13 +142,35 @@ export class CannonService {
   private remoteSmokeCutoffT = -1;
   private remoteLingerCutoffT = -1;
 
-  // Impact particle systems
-  private splashPS!:     ParticleSystem;
+  // Impact particle systems.
+  // Water spouts use a small POOL so a 3-ball broadside produces 3 independent
+  // spouts (each delayed to its own rebound) instead of one shared system whose
+  // emitter/timer gets overwritten by the next impact.
+  private readonly SPLASH_FX_POOL = 4;
+  private splashFx: { ps: ParticleSystem; emit: Vector3; startT: number; cutoffT: number }[] = [];
   private dirtPS!:       ParticleSystem;
-  private splashEmit     = new Vector3(0, 0, 0);
   private dirtEmit       = new Vector3(0, 0, 0);
-  private splashCutoffT  = -1;
   private dirtCutoffT    = -1;
+
+  // Lingering land dust/smoke cloud (the slow pall after a land hit)
+  private landSmokePS!:    ParticleSystem;
+  private landSmokeEmit    = new Vector3(0, 0, 0);
+  private landSmokeCutoffT = -1;
+
+  // Ship-hit impact: wood splinters + a quick fire gust + flash (reuses dirt/landSmoke
+  // for the dust pall).
+  private shipDebrisPS!:   ParticleSystem;
+  private shipDebrisEmit   = new Vector3(0, 0, 0);
+  private shipDebrisCutoffT = -1;
+  private shipFirePS!:     ParticleSystem;
+  private shipFireEmit     = new Vector3(0, 0, 0);
+  private shipFireCutoffT  = -1;
+  private shipFlash!:      PointLight;
+  private shipFlashEndT    = -1;
+  // Black sooty smoke that hangs over the impact for a while (separate from the dust).
+  private shipSmokePS!:    ParticleSystem;
+  private shipSmokeEmit    = new Vector3(0, 0, 0);
+  private shipSmokeCutoffT = -1;
 
   // Web Audio context for sound effects, routed through a shared SFX master gain.
   private sfxCtx: AudioContext | null = null;
@@ -205,11 +227,13 @@ export class CannonService {
     this.flashPort?.dispose();
     this.flashStbd?.dispose();
     this.flashRemote?.dispose();
+    this.shipFlash?.dispose();
     for (const ps of [
       this.flamePortPS, this.flameStbdPS, this.remoteFlamePS,
       this.smokePortPS, this.smokeStbdPS, this.remoteSmokePS,
       this.lingerPortPS, this.lingerStbdPS, this.remoteLingerPS,
-      this.splashPS, this.dirtPS,
+      ...this.splashFx.map(f => f.ps),
+      this.dirtPS, this.landSmokePS, this.shipDebrisPS, this.shipFirePS, this.shipSmokePS,
     ]) { ps?.stop(); ps?.dispose(); }
     this.smokeNoise?.dispose();
     this.cannonBus = null;   // torn down with the context below
@@ -268,6 +292,7 @@ export class CannonService {
     this.flashPort   = make('cannonFlashPort');
     this.flashStbd   = make('cannonFlashStbd');
     this.flashRemote = make('cannonFlashRemote');
+    this.shipFlash   = make('cannonShipHitFlash');
 
     // Exclude large scene meshes so the muzzle flash doesn't incorrectly
     // illuminate the entire terrain or distant islands.
@@ -284,7 +309,7 @@ export class CannonService {
   private excludeMeshFromFlashLights(meshName: string): void {
     const mesh = this.scene.getMeshByName(meshName);
     if (!mesh) return;
-    for (const light of [this.flashPort, this.flashStbd, this.flashRemote]) {
+    for (const light of [this.flashPort, this.flashStbd, this.flashRemote, this.shipFlash]) {
       if (light && !light.excludedMeshes.includes(mesh)) {
         light.excludedMeshes.push(mesh);
       }
@@ -426,43 +451,161 @@ export class CannonService {
   // ── Impact particle systems ───────────────────────────────────────────────
 
   private buildImpactParticles(): void {
-    this.splashPS = new ParticleSystem('cannonSplash', 350, this.scene);
-    this.splashPS.particleTexture = this.blobTex;
-    this.splashPS.emitter    = this.splashEmit;
-    this.splashPS.minEmitBox = new Vector3(-0.3, 0, -0.3);
-    this.splashPS.maxEmitBox = new Vector3( 0.3, 0.1,  0.3);
-    this.splashPS.color1     = new Color4(0.85, 0.95, 1.00, 0.92);
-    this.splashPS.color2     = new Color4(1.00, 1.00, 1.00, 0.75);
-    this.splashPS.colorDead  = new Color4(1.00, 1.00, 1.00, 0.00);
-    this.splashPS.minSize      = 0.35;  this.splashPS.maxSize      = 1.60;
-    this.splashPS.minLifeTime  = 0.50;  this.splashPS.maxLifeTime  = 2.00;
-    this.splashPS.minEmitPower = 7;     this.splashPS.maxEmitPower = 22;
-    this.splashPS.direction1   = new Vector3(-2, 8,  -2);
-    this.splashPS.direction2   = new Vector3( 2, 18,  2);
-    this.splashPS.gravity      = new Vector3(0, -9.81, 0);
-    this.splashPS.blendMode    = ParticleSystem.BLENDMODE_ADD;
-    this.splashPS.renderingGroupId = 3;   // above all ocean LODs (else the near water hides the splash)
-    this.splashPS.emitRate     = 0;
-    this.splashPS.start();
+    // Water geyser — a big sheet of spray. Direction is set per-impact (biased back
+    // along the ball's entry), here we just configure the body: many particles that
+    // grow as they fly and fall back under heavy gravity.
+    for (let i = 0; i < this.SPLASH_FX_POOL; i++) {
+      const emit = new Vector3(0, 0, 0);
+      this.splashFx.push({ ps: this.makeSplash(`cannonSplash${i}`, emit), emit, startT: -1, cutoffT: -1 });
+    }
 
-    this.dirtPS = new ParticleSystem('cannonDirt', 200, this.scene);
+    // Land impact — big puffy smoke + dust. Dust-brown at birth settling to grey
+    // smoke, growing large and roiling (shared noise). Direction set per-impact.
+    this.dirtPS = new ParticleSystem('cannonDirt', 700, this.scene);
     this.dirtPS.particleTexture = this.blobTex;
     this.dirtPS.emitter    = this.dirtEmit;
-    this.dirtPS.minEmitBox = new Vector3(-0.2, 0, -0.2);
-    this.dirtPS.maxEmitBox = new Vector3( 0.2, 0.2,  0.2);
-    this.dirtPS.color1     = new Color4(0.62, 0.44, 0.18, 0.95);
-    this.dirtPS.color2     = new Color4(0.78, 0.62, 0.28, 0.75);
-    this.dirtPS.colorDead  = new Color4(0.55, 0.38, 0.12, 0.00);
-    this.dirtPS.minSize      = 0.25;  this.dirtPS.maxSize      = 1.20;
-    this.dirtPS.minLifeTime  = 0.70;  this.dirtPS.maxLifeTime  = 2.50;
-    this.dirtPS.minEmitPower = 3;     this.dirtPS.maxEmitPower = 12;
-    this.dirtPS.direction1   = new Vector3(-1.5, 5, -1.5);
+    this.dirtPS.minEmitBox = new Vector3(-0.3, 0, -0.3);
+    this.dirtPS.maxEmitBox = new Vector3( 0.3, 0.3,  0.3);
+    this.dirtPS.addColorGradient(0.00, new Color4(0.55, 0.42, 0.22, 0.00));
+    this.dirtPS.addColorGradient(0.08, new Color4(0.60, 0.46, 0.26, 0.95));
+    this.dirtPS.addColorGradient(0.45, new Color4(0.50, 0.45, 0.38, 0.82));
+    this.dirtPS.addColorGradient(1.00, new Color4(0.42, 0.40, 0.37, 0.00));
+    this.dirtPS.addSizeGradient(0.0, 0.50, 1.20);
+    this.dirtPS.addSizeGradient(1.0, 3.50, 5.50);
+    this.dirtPS.minLifeTime  = 0.80;  this.dirtPS.maxLifeTime  = 1.50;
+    this.dirtPS.minEmitPower = 6;     this.dirtPS.maxEmitPower = 20;
+    this.dirtPS.direction1   = new Vector3(-1.5, 5, -1.5);  // overwritten per impact
     this.dirtPS.direction2   = new Vector3( 1.5, 12, 1.5);
-    this.dirtPS.gravity      = new Vector3(0, -9.81, 0);
+    this.dirtPS.gravity      = new Vector3(0, -20, 0);      // heavy: dust kicks up then drops fast
     this.dirtPS.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
     this.dirtPS.renderingGroupId = 3;   // above all ocean LODs
+    this.dirtPS.noiseTexture = this.smokeNoise;
+    this.dirtPS.noiseStrength = new Vector3(3, 3, 3);
     this.dirtPS.emitRate     = 0;
     this.dirtPS.start();
+
+    // Lingering land dust — the slow pall left after a land hit (like the cannon's
+    // lingering smoke, but dusty browns instead of grey). Spreads OUT from the impact
+    // along the ground, swells, then hangs for several seconds before fading.
+    this.landSmokePS = new ParticleSystem('cannonLandSmoke', 700, this.scene);
+    this.landSmokePS.particleTexture = this.blobTex;
+    this.landSmokePS.emitter    = this.landSmokeEmit;
+    this.landSmokePS.minEmitBox = new Vector3(-1.0, 0, -1.0);
+    this.landSmokePS.maxEmitBox = new Vector3( 1.0, 0.4,  1.0);
+    // dusty brown at birth → settling grey-brown → fade; alpha holds then fades
+    this.landSmokePS.addColorGradient(0.00, new Color4(0.54, 0.45, 0.30, 0.00));
+    this.landSmokePS.addColorGradient(0.10, new Color4(0.52, 0.44, 0.31, 0.58));
+    this.landSmokePS.addColorGradient(0.40, new Color4(0.47, 0.43, 0.37, 0.50));
+    this.landSmokePS.addColorGradient(1.00, new Color4(0.41, 0.39, 0.37, 0.00));
+    this.landSmokePS.addSizeGradient(0.00, 1.20, 2.20);
+    this.landSmokePS.addSizeGradient(0.40, 4.00, 6.00);
+    this.landSmokePS.addSizeGradient(1.00, 6.50, 9.00);
+    this.landSmokePS.addVelocityGradient(0.00, 1.00);
+    this.landSmokePS.addVelocityGradient(0.06, 0.20);   // spread out fast, then hang
+    this.landSmokePS.addVelocityGradient(1.00, 0.02);
+    this.landSmokePS.minLifeTime  = 6.0;  this.landSmokePS.maxLifeTime  = 11.0;
+    this.landSmokePS.minEmitPower = 6;    this.landSmokePS.maxEmitPower = 16;
+    this.landSmokePS.gravity      = new Vector3(0, 0.4, 0);   // slow drift upward
+    this.landSmokePS.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    this.landSmokePS.renderingGroupId = 3;
+    this.landSmokePS.noiseTexture = this.smokeNoise;
+    this.landSmokePS.noiseStrength = new Vector3(2.5, 2.5, 2.5);
+    this.landSmokePS.emitRate     = 0;
+    this.landSmokePS.start();
+
+    // Wood splinters for a ship hit — lots of small, sharp, dark-brown chunks flung
+    // out fast under heavy gravity for a brief moment (shattering hull timber).
+    this.shipDebrisPS = new ParticleSystem('shipDebris', 900, this.scene);
+    this.shipDebrisPS.particleTexture = this.blobTex;
+    this.shipDebrisPS.emitter    = this.shipDebrisEmit;
+    this.shipDebrisPS.minEmitBox = new Vector3(-0.25, 0, -0.25);
+    this.shipDebrisPS.maxEmitBox = new Vector3( 0.25, 0.25, 0.25);
+    this.shipDebrisPS.color1     = new Color4(0.46, 0.33, 0.18, 1.00);
+    this.shipDebrisPS.color2     = new Color4(0.28, 0.19, 0.10, 1.00);
+    this.shipDebrisPS.colorDead  = new Color4(0.22, 0.15, 0.08, 0.00);
+    this.shipDebrisPS.minSize      = 0.09;  this.shipDebrisPS.maxSize      = 0.36;
+    this.shipDebrisPS.minLifeTime  = 0.45;  this.shipDebrisPS.maxLifeTime  = 1.30;
+    this.shipDebrisPS.minEmitPower = 9;     this.shipDebrisPS.maxEmitPower = 24;
+    this.shipDebrisPS.direction1   = new Vector3(-1, 3, -1);   // overwritten per hit
+    this.shipDebrisPS.direction2   = new Vector3( 1, 7,  1);
+    this.shipDebrisPS.gravity      = new Vector3(0, -30, 0);    // chunks fall fast
+    this.shipDebrisPS.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    this.shipDebrisPS.renderingGroupId = 3;
+    this.shipDebrisPS.emitRate     = 0;
+    this.shipDebrisPS.start();
+
+    // Quick gust of fire at the impact — a brief bright additive flame burst, like
+    // the powder/timber flaring on the hit.
+    this.shipFirePS = new ParticleSystem('shipFire', 320, this.scene);
+    this.shipFirePS.particleTexture = this.blobTex;
+    this.shipFirePS.emitter    = this.shipFireEmit;
+    this.shipFirePS.minEmitBox = new Vector3(-0.2, 0, -0.2);
+    this.shipFirePS.maxEmitBox = new Vector3( 0.2, 0.2,  0.2);
+    this.shipFirePS.color1     = new Color4(1.00, 0.92, 0.55, 1.00);
+    this.shipFirePS.color2     = new Color4(1.00, 0.46, 0.10, 0.95);
+    this.shipFirePS.colorDead  = new Color4(0.45, 0.12, 0.01, 0.00);
+    this.shipFirePS.addSizeGradient(0.0, 0.40, 0.90);
+    this.shipFirePS.addSizeGradient(1.0, 1.80, 2.80);
+    this.shipFirePS.minLifeTime  = 0.12;  this.shipFirePS.maxLifeTime  = 0.42;
+    this.shipFirePS.minEmitPower = 7;     this.shipFirePS.maxEmitPower = 20;
+    this.shipFirePS.direction1   = new Vector3(-1, 2, -1);   // overwritten per hit
+    this.shipFirePS.direction2   = new Vector3( 1, 6,  1);
+    this.shipFirePS.gravity      = new Vector3(0, 3, 0);     // fire lifts a touch
+    this.shipFirePS.blendMode    = ParticleSystem.BLENDMODE_ADD;
+    this.shipFirePS.renderingGroupId = 3;
+    this.shipFirePS.emitRate     = 0;
+    this.shipFirePS.start();
+
+    // Black sooty smoke that hangs over the strike for several seconds — darker than
+    // the brown dust, rising slowly and swelling, alpha holding then fading.
+    this.shipSmokePS = new ParticleSystem('shipSmoke', 600, this.scene);
+    this.shipSmokePS.particleTexture = this.blobTex;
+    this.shipSmokePS.emitter    = this.shipSmokeEmit;
+    this.shipSmokePS.minEmitBox = new Vector3(-0.5, 0, -0.5);
+    this.shipSmokePS.maxEmitBox = new Vector3( 0.5, 0.4,  0.5);
+    this.shipSmokePS.addColorGradient(0.00, new Color4(0.09, 0.08, 0.07, 0.00));
+    this.shipSmokePS.addColorGradient(0.10, new Color4(0.11, 0.10, 0.09, 0.74));
+    this.shipSmokePS.addColorGradient(0.45, new Color4(0.14, 0.13, 0.12, 0.62));
+    this.shipSmokePS.addColorGradient(1.00, new Color4(0.17, 0.17, 0.17, 0.00));
+    this.shipSmokePS.addSizeGradient(0.00, 1.00, 2.00);
+    this.shipSmokePS.addSizeGradient(0.40, 4.00, 6.00);
+    this.shipSmokePS.addSizeGradient(1.00, 6.50, 9.50);
+    this.shipSmokePS.addVelocityGradient(0.00, 1.00);
+    this.shipSmokePS.addVelocityGradient(0.12, 0.20);
+    this.shipSmokePS.addVelocityGradient(1.00, 0.02);
+    this.shipSmokePS.minLifeTime  = 5.0;  this.shipSmokePS.maxLifeTime  = 9.0;
+    this.shipSmokePS.minEmitPower = 4;    this.shipSmokePS.maxEmitPower = 12;
+    this.shipSmokePS.gravity      = new Vector3(0, 0.8, 0);   // hot smoke rises slowly
+    this.shipSmokePS.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    this.shipSmokePS.renderingGroupId = 3;
+    this.shipSmokePS.noiseTexture = this.smokeNoise;
+    this.shipSmokePS.noiseStrength = new Vector3(2.5, 3.0, 2.5);
+    this.shipSmokePS.emitRate     = 0;
+    this.shipSmokePS.start();
+  }
+
+  /** Factory for one water-spout particle system (pooled so impacts don't share one). */
+  private makeSplash(name: string, emit: Vector3): ParticleSystem {
+    const ps = new ParticleSystem(name, 600, this.scene);
+    ps.particleTexture = this.blobTex;
+    ps.emitter    = emit;
+    ps.minEmitBox = new Vector3(-0.4, 0, -0.4);
+    ps.maxEmitBox = new Vector3( 0.4, 0.2,  0.4);
+    ps.color1     = new Color4(0.82, 0.91, 1.00, 0.95);
+    ps.color2     = new Color4(0.92, 0.97, 1.00, 0.80);
+    ps.colorDead  = new Color4(0.86, 0.93, 1.00, 0.00);
+    ps.addSizeGradient(0.0, 0.22, 0.45);   // small droplets
+    ps.addSizeGradient(1.0, 1.10, 1.90);
+    ps.minLifeTime  = 0.55;  ps.maxLifeTime  = 1.80;
+    ps.minEmitPower = 7;     ps.maxEmitPower = 15;
+    ps.direction1   = new Vector3(-2, 5,  -2);   // overwritten per impact
+    ps.direction2   = new Vector3( 2, 10,  2);
+    ps.gravity      = new Vector3(0, -46, 0);
+    ps.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    ps.renderingGroupId = 3;
+    ps.emitRate     = 0;
+    ps.start();
+    return ps;
   }
 
   // ── Input ─────────────────────────────────────────────────────────────────
@@ -534,7 +677,7 @@ export class CannonService {
       // Fire the 3 cannons in sequence with a randomized human gap; one full
       // hull-roll impulse on the first.
       while (g.shotsFired < 3 && g.shotTimer >= g.nextShotAt) {
-        if (g.shotsFired === 0) this.vesselService.addCannonRecoil(side);
+        this.vesselService.addCannonRecoil(side);   // hull shudder per shot (3 lurches)
         this.fireOneCannon(side, g.shotsFired);
         this.vesselService.addGunRecoilKick(side);
         g.shotsFired++;
@@ -581,8 +724,20 @@ export class CannonService {
       ball.mesh.position.set(bx, by, bz);
       ball.mesh.rotation.z += dt * 5;
 
+      // Ship hit — only after the ball has cleared the firing vessel (t>0.35), so a
+      // freshly-fired ball never registers a hit on its own ship at the muzzle.
+      if (ball.t > 0.35) {
+        const ship = this.shipHitTest(bx, by, bz);
+        if (ship) {
+          this.onShipImpact(bx, by, bz, ball.vx, ball.vy - G * ball.t, ball.vz, ship);
+          ball.alive = false;
+          ball.mesh.setEnabled(false);
+          continue;
+        }
+      }
+
       if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
-        this.onImpact(bx, bz);
+        this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
         ball.alive = false;
         ball.mesh.setEnabled(false);
       }
@@ -592,6 +747,7 @@ export class CannonService {
     this.decayFlash(this.flashPort,   this.flashPortEndT);
     this.decayFlash(this.flashStbd,   this.flashStbdEndT);
     this.decayFlash(this.flashRemote, this.flashRemoteEndT);
+    this.decayFlash(this.shipFlash,   this.shipFlashEndT);
 
     // ── Particle burst cutoffs ────────────────────────────────────────────────
     if (this.flameCutoffT > 0 && this.elapsed >= this.flameCutoffT) {
@@ -609,13 +765,36 @@ export class CannonService {
       this.lingerStbdPS.emitRate = 0;
       this.lingerCutoffT = -1;
     }
-    if (this.splashCutoffT > 0 && this.elapsed >= this.splashCutoffT) {
-      this.splashPS.emitRate = 0;
-      this.splashCutoffT = -1;
+    for (const fx of this.splashFx) {
+      if (fx.startT > 0 && this.elapsed >= fx.startT) {
+        fx.ps.emitRate = 3500;                  // begin this spout on its rebound
+        fx.cutoffT = this.elapsed + 0.16;
+        fx.startT = -1;
+      }
+      if (fx.cutoffT > 0 && this.elapsed >= fx.cutoffT) {
+        fx.ps.emitRate = 0;
+        fx.cutoffT = -1;
+      }
+    }
+    if (this.shipDebrisCutoffT > 0 && this.elapsed >= this.shipDebrisCutoffT) {
+      this.shipDebrisPS.emitRate = 0;
+      this.shipDebrisCutoffT = -1;
+    }
+    if (this.shipFireCutoffT > 0 && this.elapsed >= this.shipFireCutoffT) {
+      this.shipFirePS.emitRate = 0;
+      this.shipFireCutoffT = -1;
+    }
+    if (this.shipSmokeCutoffT > 0 && this.elapsed >= this.shipSmokeCutoffT) {
+      this.shipSmokePS.emitRate = 0;
+      this.shipSmokeCutoffT = -1;
     }
     if (this.dirtCutoffT > 0 && this.elapsed >= this.dirtCutoffT) {
       this.dirtPS.emitRate = 0;
       this.dirtCutoffT = -1;
+    }
+    if (this.landSmokeCutoffT > 0 && this.elapsed >= this.landSmokeCutoffT) {
+      this.landSmokePS.emitRate = 0;
+      this.landSmokeCutoffT = -1;
     }
     if (this.remoteFlameCutoffT > 0 && this.elapsed >= this.remoteFlameCutoffT) {
       this.remoteFlamePS.emitRate = 0;
@@ -915,62 +1094,330 @@ export class CannonService {
     }
   }
 
-  private playSplashSound(): void {
+  /** A one-shot white-noise buffer source of `secs` length. */
+  private noiseSource(secs: number): AudioBufferSourceNode | null {
     const ctx = this.sfxCtx;
-    if (!ctx) return;
-    if (ctx.state === 'suspended') ctx.resume();
-    const t = ctx.currentTime;
-    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.55), ctx.sampleRate);
+    if (!ctx) return null;
+    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * secs)), ctx.sampleRate);
     const d = buf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
     const src = ctx.createBufferSource(); src.buffer = buf;
-    const hpf = ctx.createBiquadFilter(); hpf.type = 'highpass'; hpf.frequency.value = 180;
-    const bpf = ctx.createBiquadFilter(); bpf.type = 'bandpass';
-    bpf.frequency.setValueAtTime(900, t); bpf.frequency.exponentialRampToValueAtTime(300, t + 0.4); bpf.Q.value = 0.6;
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.85, t); gain.gain.exponentialRampToValueAtTime(0.001, t + 0.50);
-    src.connect(hpf); hpf.connect(bpf); bpf.connect(gain); gain.connect(this.sfxMaster ?? ctx.destination);
-    src.start(t); src.stop(t + 0.56);
+    return src;
   }
 
-  private playLandImpactSound(): void {
+  // Water impact: a heavy GOOSH (resonant pitch-dropping plunge + low whoomp + sub)
+  // followed by a FOAMY SPRAY hiss that swells just after and rains back down.
+  private playSplashSound(vol = 1.0): void {
     const ctx = this.sfxCtx;
     if (!ctx) return;
     if (ctx.state === 'suspended') ctx.resume();
-    const t = ctx.currentTime;
-    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.3), ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-    const src = ctx.createBufferSource(); src.buffer = buf;
-    const lpf = ctx.createBiquadFilter(); lpf.type = 'lowpass';
-    lpf.frequency.setValueAtTime(3500, t); lpf.frequency.exponentialRampToValueAtTime(250, t + 0.25);
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(1.0, t); noiseGain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
-    src.connect(lpf); lpf.connect(noiseGain); noiseGain.connect(this.sfxMaster ?? ctx.destination);
-    src.start(t); src.stop(t + 0.30);
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
 
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(100, t); osc.frequency.exponentialRampToValueAtTime(28, t + 0.22);
-    const thudGain = ctx.createGain();
-    thudGain.gain.setValueAtTime(0.65, t); thudGain.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
-    osc.connect(thudGain); thudGain.connect(this.sfxMaster ?? ctx.destination);
-    osc.start(t); osc.stop(t + 0.25);
+    // resonant "gloop" — bandpass noise sweeping down (the watery plunge)
+    {
+      const src = this.noiseSource(0.5); if (!src) return;
+      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 4.0;
+      bp.frequency.setValueAtTime(rnd(520, 640), t);
+      bp.frequency.exponentialRampToValueAtTime(120, t + 0.30);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.5 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.48);
+      src.connect(bp); bp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 0.5);
+    }
+    // low whoomp — displaced water mass
+    {
+      const src = this.noiseSource(0.5); if (!src) return;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(700, t);
+      lp.frequency.exponentialRampToValueAtTime(110, t + 0.32);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.1 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 0.5);
+    }
+    // sub thump — the impact weight
+    {
+      const osc = ctx.createOscillator(); osc.type = 'sine';
+      osc.frequency.setValueAtTime(rnd(85, 100), t);
+      osc.frequency.exponentialRampToValueAtTime(34, t + 0.22);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.85 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.40);
+      osc.connect(g); g.connect(out);
+      osc.start(t); osc.stop(t + 0.42);
+    }
+    // foamy spray — bright bubbly hiss that swells in then rains down (~1 s)
+    {
+      const src = this.noiseSource(1.2); if (!src) return;
+      const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 2400;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass';  lp.frequency.value = 8500;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, t);
+      g.gain.linearRampToValueAtTime(0.55 * vol, t + 0.10);
+      g.gain.setTargetAtTime(0.0, t + 0.24, 0.34);
+      src.connect(hp); hp.connect(lp); lp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 1.2);
+    }
+  }
+
+  // Land impact: a hard THUD (sub drop + gritty crack) then a CLATTER of debris —
+  // a scatter of short filtered ticks settling over ~0.9 s.
+  private playLandImpactSound(vol = 1.0): void {
+    const ctx = this.sfxCtx;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+
+    // hard thud — sub sine drop
+    {
+      const osc = ctx.createOscillator(); osc.type = 'sine';
+      osc.frequency.setValueAtTime(rnd(120, 140), t);
+      osc.frequency.exponentialRampToValueAtTime(32, t + 0.18);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.35 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+      osc.connect(g); g.connect(out);
+      osc.start(t); osc.stop(t + 0.36);
+    }
+    // gritty crack of the strike
+    {
+      const src = this.noiseSource(0.18); if (!src) return;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(2800, t);
+      lp.frequency.exponentialRampToValueAtTime(400, t + 0.12);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.1 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(t); src.stop(t + 0.18);
+    }
+    // clatter — a scatter of short ticks (falling debris) over ~0.9 s
+    {
+      for (let k = 0; k < 9; k++) {
+        const dt  = rnd(0.06, 0.85);
+        const src = this.noiseSource(0.06); if (!src) continue;
+        const bp  = ctx.createBiquadFilter(); bp.type = 'bandpass';
+        bp.frequency.value = rnd(800, 3200); bp.Q.value = rnd(2, 6);
+        const g = ctx.createGain();
+        const amp = rnd(0.12, 0.40) * vol * (1 - dt);   // later ticks softer
+        g.gain.setValueAtTime(0.0, t + dt);
+        g.gain.linearRampToValueAtTime(Math.max(0.02, amp), t + dt + 0.002);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dt + 0.05);
+        src.connect(bp); bp.connect(g); g.connect(out);
+        src.start(t + dt); src.stop(t + dt + 0.07);
+      }
+    }
+  }
+
+  // Ship hit: the hard land-impact sound PLUS a timber CRACK and a longer shatter of
+  // woody splinter ticks — the sound of multiple pieces of hull breaking apart.
+  private playShipHitSound(vol = 1.0): void {
+    const ctx = this.sfxCtx;
+    if (!ctx) return;
+    this.playLandImpactSound(vol);   // base hard impact (thud + debris clatter)
+    if (ctx.state === 'suspended') ctx.resume();
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+
+    // CRUNCH — the ball crushing into the planking: a dense, crackly burst (sparse
+    // sharp clicks packed together) band-passed into the woody range and decaying.
+    // Two passes (the hit, then the timber giving way) for a hit-then-break read.
+    const crunch = (delay: number, secs: number, fLo: number, fHi: number, gain: number) => {
+      const buf = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * secs)), ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) {
+        const env   = Math.pow(1 - i / d.length, 1.6);
+        const spike = Math.random() < 0.07 ? (Math.random() * 2 - 1) : (Math.random() * 2 - 1) * 0.22;
+        d[i] = spike * env;
+      }
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const bp  = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.8;
+      bp.frequency.setValueAtTime(fHi, t + delay);
+      bp.frequency.exponentialRampToValueAtTime(fLo, t + delay + secs * 0.8);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(gain * vol, t + delay);
+      g.gain.exponentialRampToValueAtTime(0.001, t + delay + secs);
+      src.connect(bp); bp.connect(g); g.connect(out);
+      src.start(t + delay); src.stop(t + delay + secs + 0.02);
+    };
+    crunch(0.00, 0.30, 240, 1100, 1.5);   // crushing impact
+    crunch(0.10, 0.34, 180,  800, 1.0);   // planking caving in
+
+    // sharp splintering crack(s) — the timber giving way
+    for (let k = 0; k < 4; k++) {
+      const dt  = k * 0.045;
+      const src = this.noiseSource(0.10); if (!src) continue;
+      const bp  = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.2;
+      bp.frequency.setValueAtTime(rnd(900, 1500), t + dt);
+      bp.frequency.exponentialRampToValueAtTime(rnd(300, 500), t + dt + 0.09);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, t + dt);
+      g.gain.linearRampToValueAtTime(0.9 * vol, t + dt + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dt + 0.10);
+      src.connect(bp); bp.connect(g); g.connect(out);
+      src.start(t + dt); src.stop(t + dt + 0.11);
+    }
+    // shattering wood pieces — many short woody ticks over ~1.1 s
+    for (let k = 0; k < 18; k++) {
+      const dt  = rnd(0.02, 1.10);
+      const src = this.noiseSource(0.05); if (!src) continue;
+      const bp  = ctx.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = rnd(260, 1900); bp.Q.value = rnd(3, 9);
+      const g = ctx.createGain();
+      const amp = rnd(0.10, 0.35) * vol * (1 - dt / 1.2);
+      g.gain.setValueAtTime(0.0, t + dt);
+      g.gain.linearRampToValueAtTime(Math.max(0.02, amp), t + dt + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dt + 0.05);
+      src.connect(bp); bp.connect(g); g.connect(out);
+      src.start(t + dt); src.stop(t + dt + 0.07);
+    }
+  }
+
+  // ── Ship hit (cosmetic) ─────────────────────────────────────────────────────
+
+  /**
+   * Local ship + remote ships hull test. Returns the hit ship's pose plus which ship
+   * it was ('local' or a remote player id) so we can shudder the right vessel, or null.
+   */
+  private shipHitTest(bx: number, by: number, bz: number):
+    { x: number; z: number; heading: number; target: 'local' | string } | null {
+    if (by < -1.0 || by > 6.0) return null;   // outside the hull/deck height band
+    const vs = this.vesselService.state();
+    if (this.hullContains(bx, bz, vs.x, vs.z, vs.heading)) {
+      return { x: vs.x, z: vs.z, heading: vs.heading, target: 'local' };
+    }
+    const remote = this.multiplayerService.shipHitAt(bx, bz);
+    return remote ? { x: remote.x, z: remote.z, heading: remote.heading, target: remote.id } : null;
+  }
+
+  /** Oriented-ellipse hull test (~18 m × 7 m) around a ship at (sx,sz,headingDeg). */
+  private hullContains(bx: number, bz: number, sx: number, sz: number, headingDeg: number): boolean {
+    const dx = bx - sx, dz = bz - sz;
+    const hr = headingDeg * Math.PI / 180;
+    const lat = dx * Math.cos(hr) - dz * Math.sin(hr);
+    const lon = dx * Math.sin(hr) + dz * Math.cos(hr);
+    return (lat * lat) / 12.25 + (lon * lon) / 81.0 <= 1.0;
+  }
+
+  /** Unit reverse of a ball's incoming velocity (its entry direction + angle, flipped). */
+  private reverseDir(vx: number, vyImpact: number, vz: number): [number, number, number] {
+    const l = Math.hypot(vx, vyImpact, vz) || 1;
+    return [-vx / l, -vyImpact / l, -vz / l];
+  }
+
+  /** Aim a particle system's emission cone along (rx,ry,rz): throw speed `spd`,
+   *  horizontal spread `spr`, vertical spread `sprY`, plus an extra upward bias. */
+  private setCone(
+    ps: ParticleSystem, rx: number, ry: number, rz: number,
+    spd: number, spr: number, sprY: number, upBias = 0,
+  ): void {
+    ps.direction1.set(rx * spd - spr, ry * spd + upBias - sprY, rz * spd - spr);
+    ps.direction2.set(rx * spd + spr, ry * spd + upBias + sprY, rz * spd + spr);
+  }
+
+  /** Cannonball strikes a hull: wood splinters + fire gust + flash + dust + smoke,
+   *  oriented to the hit, and a heavy shudder on the struck ship (local or remote). */
+  private onShipImpact(
+    bx: number, by: number, bz: number, vx: number, vyImpact: number, vz: number,
+    ship: { x: number; z: number; heading: number; target: 'local' | string },
+  ): void {
+    const vs   = this.vesselService.state();
+    const dist = Math.hypot(bx - vs.x, bz - vs.z);
+    const vol  = Math.max(0, 1 - dist / 800);
+
+    // Emit everything from the actual strike point on the hull.
+    this.shipDebrisEmit.set(bx, by, bz);
+    this.dirtEmit.set(bx, by, bz);
+    this.landSmokeEmit.set(bx, by, bz);
+
+    // Spray back along the REVERSE of the ball's incoming velocity (its exact entry
+    // direction AND angle, flipped) — splinters/dust blast back out of the entry
+    // toward where the ball came from, not straight up.
+    const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);   // unit reverse-incoming
+    // Short throw — it's reverse-incoming, it bursts back out of the entry, close in.
+    this.setCone(this.shipDebrisPS, rx, ry, rz, 1.1, 0.65, 0.45);   // splinters back out the entry
+    this.setCone(this.dirtPS,       rx, ry, rz, 0.85, 0.55, 0.40);  // dust back along the entry line
+    this.setCone(this.landSmokePS,  rx, ry, rz, 0.45, 0.35, 0.25);  // pall drifts back then hangs
+
+    this.shipDebrisPS.emitRate = 3200;
+    this.shipDebrisCutoffT     = this.elapsed + 0.14;
+    this.dirtPS.emitRate       = 2200;
+    this.dirtCutoffT           = this.elapsed + 0.14;
+    this.landSmokePS.emitRate  = 200;
+    this.landSmokeCutoffT      = this.elapsed + 0.5;
+
+    // Black sooty smoke that hangs over the strike — leans slightly back along the
+    // entry, then rises and lingers for several seconds.
+    this.shipSmokeEmit.set(bx, by + 0.4, bz);
+    this.shipSmokePS.direction1.set(rx * 0.7 - 0.5, 0.7, rz * 0.7 - 0.5);
+    this.shipSmokePS.direction2.set(rx * 0.7 + 0.5, 1.8, rz * 0.7 + 0.5);
+    this.shipSmokePS.emitRate  = 170;
+    this.shipSmokeCutoffT      = this.elapsed + 0.6;
+
+    // Quick gust of fire + a flash of light at the strike point (fire flares back
+    // out the entry along the same reverse-incoming cone).
+    this.shipFireEmit.set(bx, by, bz);
+    this.setCone(this.shipFirePS, rx, ry, rz, 0.75, 0.45, 0.35);
+    this.shipFirePS.emitRate = 1600;
+    this.shipFireCutoffT     = this.elapsed + 0.10;
+    this.shipFlash.position.set(bx, by, bz);
+    this.shipFlashEndT       = this.elapsed + FLASH_DUR;
+
+    // Heavy shudder on whichever ship was struck. The struck SIDE (from the impact's
+    // lateral offset) sets which way it heels/lurches — away from the blow.
+    const hr  = ship.heading * Math.PI / 180;
+    const lat = (bx - ship.x) * Math.cos(hr) - (bz - ship.z) * Math.sin(hr);
+    const struckSide: 'port' | 'stbd' = lat < 0 ? 'port' : 'stbd';
+    if (ship.target === 'local') this.vesselService.addHitShudder(struckSide);
+    else                         this.multiplayerService.applyHitShudder(ship.target, struckSide);
+
+    if (vol > 0.01) this.playShipHitSound(vol);
   }
 
   // ── Impact ────────────────────────────────────────────────────────────────
 
-  private onImpact(wx: number, wz: number): void {
+  private onImpact(wx: number, wz: number, vx: number, vyImpact: number, vz: number): void {
+    // Reverse-incoming cone: ejecta sprays back along the ball's entry angle, flipped.
+    const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);
+
+    // Distance-attenuate the impact sound by how far it landed from the player.
+    const vs   = this.vesselService.state();
+    const dist = Math.hypot(wx - vs.x, wz - vs.z);
+    const vol  = Math.max(0, 1 - dist / 800);
+
     const isLand = this.terrainService.isOnLand(wx, wz);
     if (isLand) {
-      this.dirtEmit.set(wx, 1.5, wz);
-      this.dirtPS.emitRate = 1200;
-      this.dirtCutoffT     = this.elapsed + 0.12;
-      this.playLandImpactSound();
+      // Dust thrown BACK along the entry line (plus a little lift), not a vertical column.
+      this.setCone(this.dirtPS, rx, ry, rz, 1.2, 0.65, 0.45, 0.5);
+      this.dirtEmit.set(wx, 0.6, wz);
+      this.dirtPS.emitRate = 2400;
+      this.dirtCutoffT     = this.elapsed + 0.16;
+      // Lingering dust pall: drifts back along the entry then hangs (dusty browns).
+      this.setCone(this.landSmokePS, rx, ry, rz, 0.5, 0.35, 0.25, 0.2);
+      this.landSmokeEmit.set(wx, 0.7, wz);
+      this.landSmokePS.emitRate  = 220;
+      this.landSmokeCutoffT      = this.elapsed + 0.5;
+      if (vol > 0.01) this.playLandImpactSound(vol);
     } else {
-      this.splashEmit.set(wx, 0.3, wz);
-      this.splashPS.emitRate = 900;
-      this.splashCutoffT     = this.elapsed + 0.12;
-      this.playSplashSound();
+      // Spray thrown BACK along the entry (toward where the ball came from) plus an
+      // upward bias so it still reads as a spout; strong gravity arcs it back down.
+      const fx = this.splashFx.find(f => f.startT < 0 && f.cutoffT < 0) ?? this.splashFx[0];
+      this.setCone(fx.ps, rx, ry, rz, 1.1, 0.65, 0.7, 1.1);
+      fx.emit.set(wx, 0.25, wz);
+      // Spout rises only as the crater REBOUNDS. The surface dwells in its dip
+      // longer, so wait until it starts bouncing back (~0.35 s) before erupting.
+      fx.startT = this.elapsed + 0.35;
+      // Punch the actual ocean surface (crater first, then geyser); shown the same on
+      // every client (each simulates the ball locally).
+      this.oceanService.addSplash(wx, wz);
+      if (vol > 0.01) this.playSplashSound(vol);
     }
   }
 }

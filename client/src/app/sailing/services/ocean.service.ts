@@ -37,6 +37,8 @@ uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
 uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
 uniform float u_wakeCount;      // number of valid points in u_wakePath
+uniform vec4  u_splashData[8];  // cannonball water impacts: xy = world pos, z = age (s)
+uniform float u_splashCount;    // number of active splashes
 
 #define DRAG_MULT 0.38
 #define ITERATIONS 24
@@ -106,6 +108,32 @@ float wakeDisplacement(vec2 worldPos) {
   return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
+// Cannonball water impacts: a brief geyser column + an expanding rebound ring that
+// punch the surface where a ball strikes, fading over ~1.6 s. Each client simulates
+// the ball, so u_splashData (updated CPU-side) is identical on every machine.
+float splashDisplacement(vec2 worldPos) {
+  if (u_splashCount < 0.5) return 0.0;
+  float sum = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (float(i) >= u_splashCount) break;
+    vec2  c   = u_splashData[i].xy;
+    float age = u_splashData[i].z;
+    float life = 1.0 - age / 1.6;
+    if (life <= 0.0) continue;
+    float r = length(worldPos - c);
+    // Impact ORDER: the surface is punched DOWN into a crater first (peaks ~0.07s),
+    // THEN rebounds UP into a geyser column (peaks ~0.34s); a ring ripples outward.
+    float qc = (age - 0.16) / 0.22;
+    float qg = (age - 0.62) / 0.24;
+    float crater = -exp(-(r * r) / 5.0)  * exp(-qc * qc) * 3.0;   // wider, deeper, longer-dwelling dip
+    float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;   // rebound UP (delayed)
+    float ringR  = age * 6.0;
+    float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
+    sum += crater + geyser + ring;
+  }
+  return sum;
+}
+
 float wakeMask(vec2 worldPos) {
   vec2 rel = worldPos - u_BoatPos;
   float along = dot(rel, -u_BoatDir);
@@ -142,6 +170,7 @@ void main() {
     pos.y += h * fade;
   }
 
+  pos.y += splashDisplacement(vec2(wx, wz));   // transient cannonball impacts (always on)
   v_wakeMask  = wakeMask(vec2(wx, wz));
   v_worldPos   = (world * vec4(pos, 1.0)).xyz;
   gl_Position  = worldViewProjection * vec4(pos, 1.0);
@@ -162,6 +191,8 @@ uniform float u_BoatSpeed;
 uniform float u_innerCull;      // >0: discard frags within this chebyshev half-size of the boat (inner-LOD footprint)
 uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
 uniform float u_wakeCount;      // number of valid points in u_wakePath
+uniform vec4  u_splashData[8];  // cannonball water impacts: xy = world pos, z = age (s)
+uniform float u_splashCount;    // number of active splashes
 uniform sampler2D u_reflectionSampler;
 uniform sampler2D u_terrainShadowMask;
 uniform vec2  u_terrainShadowCenter;
@@ -262,6 +293,32 @@ float wakeDisplacement(vec2 worldPos) {
   return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
+// Cannonball water impacts: a brief geyser column + an expanding rebound ring that
+// punch the surface where a ball strikes, fading over ~1.6 s. Each client simulates
+// the ball, so u_splashData (updated CPU-side) is identical on every machine.
+float splashDisplacement(vec2 worldPos) {
+  if (u_splashCount < 0.5) return 0.0;
+  float sum = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (float(i) >= u_splashCount) break;
+    vec2  c   = u_splashData[i].xy;
+    float age = u_splashData[i].z;
+    float life = 1.0 - age / 1.6;
+    if (life <= 0.0) continue;
+    float r = length(worldPos - c);
+    // Impact ORDER: the surface is punched DOWN into a crater first (peaks ~0.07s),
+    // THEN rebounds UP into a geyser column (peaks ~0.34s); a ring ripples outward.
+    float qc = (age - 0.16) / 0.22;
+    float qg = (age - 0.62) / 0.24;
+    float crater = -exp(-(r * r) / 5.0)  * exp(-qc * qc) * 3.0;   // wider, deeper, longer-dwelling dip
+    float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;   // rebound UP (delayed)
+    float ringR  = age * 6.0;
+    float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
+    sum += crater + geyser + ring;
+  }
+  return sum;
+}
+
 float wakeMask(vec2 worldPos) {
   vec2 rel = worldPos - u_BoatPos;
   float along = dot(rel, -u_BoatDir);
@@ -277,7 +334,7 @@ float wakeMask(vec2 worldPos) {
 }
 
 float waveHeightWithWake(vec2 worldPos, float depth) {
-  return (getwaves(worldPos * u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9;
+  return (getwaves(worldPos * u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9 + splashDisplacement(worldPos);
 }
 
 vec3 normal(vec2 worldPos, float e, float depth) {
@@ -683,6 +740,8 @@ uniform u_BoatDir: vec2f;
 uniform u_BoatSpeed: f32;
 uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
 uniform u_wakeCount: f32;               // number of valid points in u_wakePath
+uniform u_splashData: array<vec4f, 8>;  // cannonball water impacts: xy = world pos, z = age (s)
+uniform u_splashCount: f32;             // number of active splashes
 
 const DRAG_MULT: f32 = 0.38;
 const ITERATIONS: i32 = 24;
@@ -750,6 +809,29 @@ fn wakeDisplacement(worldPos: vec2f) -> f32 {
   return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
+// Cannonball water impacts (same as GLSL): geyser column + expanding rebound ring.
+fn splashDisplacement(worldPos: vec2f) -> f32 {
+  if (uniforms.u_splashCount < 0.5) { return 0.0; }
+  var sum = 0.0;
+  for (var i: i32 = 0; i < 8; i = i + 1) {
+    if (f32(i) >= uniforms.u_splashCount) { break; }
+    let c   = uniforms.u_splashData[i].xy;
+    let age = uniforms.u_splashData[i].z;
+    let life = 1.0 - age / 1.6;
+    if (life <= 0.0) { continue; }
+    let r = length(worldPos - c);
+    // Crater DOWN first (~0.07s), then rebound geyser UP (~0.34s); ring ripples out.
+    let qc = (age - 0.16) / 0.22;
+    let qg = (age - 0.62) / 0.24;
+    let crater = -exp(-(r * r) / 5.0)  * exp(-qc * qc) * 3.0;
+    let geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
+    let ringR  = age * 6.0;
+    let ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
+    sum = sum + crater + geyser + ring;
+  }
+  return sum;
+}
+
 fn wakeMask(worldPos: vec2f) -> f32 {
   let rel = worldPos - uniforms.u_BoatPos;
   let along = dot(rel, -uniforms.u_BoatDir);
@@ -784,6 +866,7 @@ fn main(input: VertexInputs) -> FragmentInputs {
     pos.y += h * fade;
   }
 
+  pos.y = pos.y + splashDisplacement(vec2f(wx, wz));   // transient cannonball impacts
   vertexOutputs.v_wakeMask = wakeMask(vec2f(wx, wz));
   vertexOutputs.v_worldPos = (uniforms.world * vec4f(pos, 1.0)).xyz;
   vertexOutputs.position = uniforms.worldViewProjection * vec4f(pos, 1.0);
@@ -802,6 +885,8 @@ uniform u_BoatSpeed: f32;
 uniform u_innerCull: f32;               // >0: discard frags within this chebyshev half-size of the boat
 uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
 uniform u_wakeCount: f32;               // number of valid points in u_wakePath
+uniform u_splashData: array<vec4f, 8>;  // cannonball water impacts: xy = world pos, z = age (s)
+uniform u_splashCount: f32;             // number of active splashes
 var u_reflectionSamplerSampler: sampler;
 var u_reflectionSampler: texture_2d<f32>;
 var u_terrainShadowMaskSampler: sampler;
@@ -896,6 +981,29 @@ fn wakeDisplacement(worldPos: vec2f) -> f32 {
   return (-0.22 + chop * 0.80) * pow(wake, 1.6);
 }
 
+// Cannonball water impacts (same as GLSL): geyser column + expanding rebound ring.
+fn splashDisplacement(worldPos: vec2f) -> f32 {
+  if (uniforms.u_splashCount < 0.5) { return 0.0; }
+  var sum = 0.0;
+  for (var i: i32 = 0; i < 8; i = i + 1) {
+    if (f32(i) >= uniforms.u_splashCount) { break; }
+    let c   = uniforms.u_splashData[i].xy;
+    let age = uniforms.u_splashData[i].z;
+    let life = 1.0 - age / 1.6;
+    if (life <= 0.0) { continue; }
+    let r = length(worldPos - c);
+    // Crater DOWN first (~0.07s), then rebound geyser UP (~0.34s); ring ripples out.
+    let qc = (age - 0.16) / 0.22;
+    let qg = (age - 0.62) / 0.24;
+    let crater = -exp(-(r * r) / 5.0)  * exp(-qc * qc) * 3.0;
+    let geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
+    let ringR  = age * 6.0;
+    let ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
+    sum = sum + crater + geyser + ring;
+  }
+  return sum;
+}
+
 fn wakeMask(worldPos: vec2f) -> f32 {
   let rel = worldPos - uniforms.u_BoatPos;
   let along = dot(rel, -uniforms.u_BoatDir);
@@ -913,7 +1021,7 @@ fn wakeMask(worldPos: vec2f) -> f32 {
 }
 
 fn waveHeightWithWake(worldPos: vec2f, depth: f32) -> f32 {
-  return (getwaves(worldPos * uniforms.u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9;
+  return (getwaves(worldPos * uniforms.u_WaveFreq) - 0.5) * depth + wakeDisplacement(worldPos) * 1.9 + splashDisplacement(worldPos);
 }
 
 fn normal(worldPos: vec2f, e: f32, depth: f32) -> vec3f {
@@ -1345,6 +1453,12 @@ export class OceanService {
   private wakeLastX = 0;
   private wakeLastZ = 0;
 
+  // Transient cannonball water impacts → a geyser+ring displacement on the surface.
+  private readonly SPLASH_MAX  = 8;      // matches the shader array size
+  private readonly SPLASH_LIFE = 1.6;    // seconds before a splash fully settles
+  private splashData = new Float32Array(this.SPLASH_MAX * 4);  // xy = pos, z = age
+  private splashCount = 0;
+
   // Small weather coupling: stormy seas slightly amplify wave depth.
   private waveDepthScale = 1.0;
 
@@ -1557,7 +1671,7 @@ export class OceanService {
           'u_shoreMapCenter', 'u_shoreMapSize',
           'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir',
           'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter',
-          'u_wakePath', 'u_wakeCount',
+          'u_wakePath', 'u_wakeCount', 'u_splashData', 'u_splashCount',
         ],
         samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth', 'u_refraction'],
         needAlphaBlending: false,
@@ -1608,6 +1722,8 @@ export class OceanService {
     mat.setVector3('u_sunDir', new Vector3(0, 1, 0));
     mat.setArray4('u_wakePath', Array(this.WAKE_PATH_MAX * 4).fill(0));
     mat.setFloat('u_wakeCount', 0);
+    mat.setArray4('u_splashData', Array(this.SPLASH_MAX * 4).fill(0));
+    mat.setFloat('u_splashCount', 0);
     // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
     // until the scene's depth map exists — harmless because its colour values are
     // < the water's camera-space Z, so dz is negative and no foam is drawn.
@@ -1655,12 +1771,14 @@ export class OceanService {
       }
 
       this.updateWakePath(dt);
+      this.updateSplashes(dt);
 
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
       const boatPos = new Vector2(this.boatX, this.boatZ);
       const boatSpeedAbs = Math.abs(this.boatSpeed) * 4.0;
       const wakePathArr = this.wakePath as unknown as number[];
+      const splashArr   = this.splashData as unknown as number[];
 
       const depthMap = this.sceneService.oceanDepthMap;
       for (const mat of allMats) {
@@ -1674,6 +1792,8 @@ export class OceanService {
         mat.setVector3('u_sunDir', this.sceneService.getSunDirection());
         mat.setArray4('u_wakePath', wakePathArr);
         mat.setFloat('u_wakeCount', this.wakePathCount);
+        mat.setArray4('u_splashData', splashArr);
+        mat.setFloat('u_splashCount', this.splashCount);
         if (depthMap) mat.setTexture('u_sceneDepth', depthMap);
       }
 
@@ -1685,6 +1805,34 @@ export class OceanService {
    * from the front, and appends a new point each time the boat has travelled far
    * enough while moving. The shader turns this into a path-following, fading wake.
    */
+  /** Register a cannonball water impact at (x,z) — drives the surface geyser+ring. */
+  addSplash(x: number, z: number): void {
+    const N = 4;
+    if (this.splashCount >= this.SPLASH_MAX) {
+      this.splashData.copyWithin(0, N, this.SPLASH_MAX * N);   // drop the oldest
+      this.splashCount = this.SPLASH_MAX - 1;
+    }
+    const idx = this.splashCount * N;
+    this.splashData[idx]     = x;
+    this.splashData[idx + 1] = z;
+    this.splashData[idx + 2] = 0;   // age
+    this.splashData[idx + 3] = 0;
+    this.splashCount++;
+  }
+
+  /** Age active splashes and drop settled ones (oldest are at the front). */
+  private updateSplashes(dt: number): void {
+    const buf = this.splashData;
+    const N = 4;
+    for (let i = 0; i < this.splashCount; i++) buf[i * N + 2] += dt;
+    let drop = 0;
+    while (drop < this.splashCount && buf[drop * N + 2] > this.SPLASH_LIFE) drop++;
+    if (drop > 0) {
+      buf.copyWithin(0, drop * N, this.splashCount * N);
+      this.splashCount -= drop;
+    }
+  }
+
   private updateWakePath(dt: number): void {
     const buf = this.wakePath;
     const N = 4;

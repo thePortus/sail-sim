@@ -84,13 +84,44 @@ export class VesselService {
   private recoilRollVel = 0;
   private readonly RECOIL_SPRING = 7.2;
   private readonly RECOIL_DAMPING = 5.8;
-  private readonly RECOIL_IMPULSE = 0.46;   // rad/s
-  private readonly RECOIL_MAX_ROLL = 0.12;  // ~6.9° hard safety cap
+  private readonly RECOIL_IMPULSE = 0.40;   // rad/s heel kick PER shot
+  private readonly RECOIL_MAX_ROLL = 0.17;  // ~9.7° hard safety cap
+
+  // Lateral shudder: a damped sideways lurch AWAY from the firing side (fire
+  // starboard → hull jolts to port), layered on top of the sim position.
+  private recoilSway = 0;
+  private recoilSwayVel = 0;
+  private readonly RECOIL_SWAY_SPRING  = 9.0;
+  private readonly RECOIL_SWAY_DAMPING = 6.0;
+  private readonly RECOIL_SWAY_IMPULSE = 0.95;  // m/s lateral kick PER shot
+  private readonly RECOIL_SWAY_MAX     = 0.95;  // m hard cap
+
+  // Hit shudder — a SEPARATE, much heavier roll+sway transient for taking a cannonball
+  // (so it reads as violent without changing the tuned firing recoil).
+  private hitRoll = 0;
+  private hitRollVel = 0;
+  private hitSway = 0;
+  private hitSwayVel = 0;
+  private readonly HIT_SPRING       = 8.5;
+  private readonly HIT_DAMPING      = 4.6;
+  private readonly HIT_ROLL_IMPULSE = 1.1;   // rad/s — violent heel
+  private readonly HIT_SWAY_IMPULSE = 2.6;   // m/s — violent lurch
+  private readonly HIT_MAX_ROLL     = 0.34;  // ~19° cap
+  private readonly HIT_MAX_SWAY     = 1.8;   // m cap
+
+  /** Heavy shudder from taking a cannonball on the given struck side. */
+  addHitShudder(side: 'port' | 'stbd'): void {
+    const dir = side === 'port' ? 1 : -1;
+    this.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
+    this.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
+  }
 
   addCannonRecoil(side: 'port' | 'stbd'): void {
-    // Port broadside should initially roll starboard (+Z roll), and vice versa.
+    // Reaction shoves the hull AWAY from the firing side: a port broadside heels +
+    // lurches to starboard (+Z roll, +sway), a starboard broadside to port.
     const dir = side === 'port' ? 1 : -1;
     this.recoilRollVel += dir * this.RECOIL_IMPULSE;
+    this.recoilSwayVel += dir * this.RECOIL_SWAY_IMPULSE;
   }
 
   // ── Gunnery animation delegators (CannonService → SloopController) ──────────
@@ -695,6 +726,46 @@ export class VesselService {
       this.recoilRollVel = 0;
     }
 
+    // Cannon recoil sway: a damped sideways lurch away from the firing side, layered
+    // on top of the sim position so the hull visibly shudders sideways as it fires.
+    const swayAcc = -this.RECOIL_SWAY_SPRING * this.recoilSway - this.RECOIL_SWAY_DAMPING * this.recoilSwayVel;
+    this.recoilSwayVel += swayAcc * dt;
+    this.recoilSway += this.recoilSwayVel * dt;
+    if (this.recoilSway >  this.RECOIL_SWAY_MAX) this.recoilSway =  this.RECOIL_SWAY_MAX;
+    if (this.recoilSway < -this.RECOIL_SWAY_MAX) this.recoilSway = -this.RECOIL_SWAY_MAX;
+    if (Math.abs(this.recoilSway) < 0.0005 && Math.abs(this.recoilSwayVel) < 0.0005) {
+      this.recoilSway = 0;
+      this.recoilSwayVel = 0;
+    }
+
+    // Hit shudder (taking a cannonball): a separate, heavier spring-damper on its own
+    // caps, added on top of the firing recoil.
+    const hitRollAcc = -this.HIT_SPRING * this.hitRoll - this.HIT_DAMPING * this.hitRollVel;
+    this.hitRollVel += hitRollAcc * dt;
+    this.hitRoll += this.hitRollVel * dt;
+    if (this.hitRoll >  this.HIT_MAX_ROLL) this.hitRoll =  this.HIT_MAX_ROLL;
+    if (this.hitRoll < -this.HIT_MAX_ROLL) this.hitRoll = -this.HIT_MAX_ROLL;
+    if (Math.abs(this.hitRoll) < 0.0002 && Math.abs(this.hitRollVel) < 0.0002) {
+      this.hitRoll = 0; this.hitRollVel = 0;
+    }
+    const hitSwayAcc = -this.HIT_SPRING * this.hitSway - this.HIT_DAMPING * this.hitSwayVel;
+    this.hitSwayVel += hitSwayAcc * dt;
+    this.hitSway += this.hitSwayVel * dt;
+    if (this.hitSway >  this.HIT_MAX_SWAY) this.hitSway =  this.HIT_MAX_SWAY;
+    if (this.hitSway < -this.HIT_MAX_SWAY) this.hitSway = -this.HIT_MAX_SWAY;
+    if (Math.abs(this.hitSway) < 0.0005 && Math.abs(this.hitSwayVel) < 0.0005) {
+      this.hitSway = 0; this.hitSwayVel = 0;
+    }
+
+    // Apply the combined sway (firing recoil + hit shudder) along the hull's beam
+    // (starboard) axis, overriding the plain sim position set earlier this frame.
+    const totalSway = this.recoilSway + this.hitSway;
+    if (totalSway !== 0) {
+      const swayHRad = this.heading * Math.PI / 180;
+      this.root.position.x = this.x + totalSway * Math.cos(swayHRad);
+      this.root.position.z = this.z - totalSway * Math.sin(swayHRad);
+    }
+
     // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess
     // rather than a hard snap-to.  The 0.55 m tolerance already absorbs most
     // momentary corner submersion, so a light blend is enough to prevent the
@@ -704,7 +775,7 @@ export class VesselService {
     this.root.position.y = FLOAT_DRAFT + heaveApplied;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
-    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll;
+    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll;
     this.root.rotation.x = buoy.pitchRad;
 
     // ── Rigged vessel drive (single GLB: skeleton clips + free bones) ─────────

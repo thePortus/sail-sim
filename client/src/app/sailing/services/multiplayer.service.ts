@@ -34,6 +34,12 @@ interface OtherPlayerEntry extends OtherPlayer {
   controller:      SloopController | null;  // drives this remote's trim/sail/rudder/flag
   recoilRoll:      number;
   recoilRollVel:   number;
+  recoilSway:      number;
+  recoilSwayVel:   number;
+  hitRoll:         number;
+  hitRollVel:      number;
+  hitSway:         number;
+  hitSwayVel:      number;
   anchorDeploy:    number;                  // animated 0=stowed .. 1=lowered
 
   // ── Movement smoothing (interpolation + dead-reckoning) ──────────────────
@@ -96,8 +102,20 @@ export class MultiplayerService {
   private readonly REMOTE_DRAFT      = 0.0;  // matches VesselService FLOAT_DRAFT (model origin = waterline)
   private readonly RECOIL_SPRING     = 7.2;
   private readonly RECOIL_DAMPING    = 5.8;
-  private readonly RECOIL_IMPULSE    = 0.46;   // rad/s
-  private readonly RECOIL_MAX_ROLL   = 0.12;   // ~6.9° cap
+  private readonly RECOIL_IMPULSE    = 0.40;   // rad/s heel kick PER shot (matches VesselService)
+  private readonly RECOIL_MAX_ROLL   = 0.17;   // ~9.7° cap
+  // Lateral shudder — mirrors VesselService so remotes lurch away from their guns too.
+  private readonly RECOIL_SWAY_SPRING  = 9.0;
+  private readonly RECOIL_SWAY_DAMPING = 6.0;
+  private readonly RECOIL_SWAY_IMPULSE = 0.95;  // m/s lateral kick PER shot
+  private readonly RECOIL_SWAY_MAX     = 0.95;  // m hard cap
+  // Heavy hit shudder — mirrors VesselService so a struck remote ship rocks violently.
+  private readonly HIT_SPRING       = 8.5;
+  private readonly HIT_DAMPING      = 4.6;
+  private readonly HIT_ROLL_IMPULSE = 1.1;
+  private readonly HIT_SWAY_IMPULSE = 2.6;
+  private readonly HIT_MAX_ROLL     = 0.34;
+  private readonly HIT_MAX_SWAY     = 1.8;
 
   // ── Remote movement smoothing ──────────────────────────────────────────────
   // We render remote vessels this many ms BEHIND the newest snapshot, so there's
@@ -314,6 +332,12 @@ export class MultiplayerService {
         controller:      null,
         recoilRoll:      0,
         recoilRollVel:   0,
+        recoilSway:      0,
+        recoilSwayVel:   0,
+        hitRoll:         0,
+        hitRollVel:      0,
+        hitSway:         0,
+        hitSwayVel:      0,
         anchorDeploy:    0,
         id:         data.id,
         x:          sx, z: sz, heading: sHeading, speed: sSpeed,
@@ -421,7 +445,10 @@ export class MultiplayerService {
   private publishSignal(): void {
     this.otherPlayers.set(
       Array.from(this.players.values()).map(
-        ({ root: _r, controller: _c, recoilRoll: _rr, recoilRollVel: _rv, anchorDeploy: _ad, ...p }) => p as OtherPlayer,
+        ({ root: _r, controller: _c, recoilRoll: _rr, recoilRollVel: _rv,
+           recoilSway: _rs, recoilSwayVel: _rsv,
+           hitRoll: _hr, hitRollVel: _hrv, hitSway: _hs, hitSwayVel: _hsv,
+           anchorDeploy: _ad, ...p }) => p as OtherPlayer,
       ),
     );
   }
@@ -448,9 +475,37 @@ export class MultiplayerService {
       const firedSide: 'port' | 'stbd' = localX < 0 ? 'port' : 'stbd';
       const dir = firedSide === 'port' ? 1 : -1;
       closest.recoilRollVel += dir * this.RECOIL_IMPULSE;
+      closest.recoilSwayVel += dir * this.RECOIL_SWAY_IMPULSE;   // lateral shudder
       // Kick the firing side's gun barrels too (game port → model 'P', matches local).
       closest.controller?.addGunRecoil(firedSide === 'port' ? 'P' : 'S');
     }
+  }
+
+  /**
+   * Cosmetic cannon-hit test: returns the displayed pose of the nearest remote ship
+   * whose hull (an oriented ellipse ~18 m × 7 m) contains the world point (bx,bz),
+   * or null. Uses the smoothed DISPLAYED transform so it matches what's on screen.
+   */
+  shipHitAt(bx: number, bz: number): { x: number; z: number; heading: number; id: string } | null {
+    for (const e of this.players.values()) {
+      const dx = bx - e.dispX, dz = bz - e.dispZ;
+      const hr = e.dispHeading;                       // radians
+      const lat = dx * Math.cos(hr) - dz * Math.sin(hr);   // beam axis
+      const lon = dx * Math.sin(hr) + dz * Math.cos(hr);   // fore-aft axis
+      if ((lat * lat) / 12.25 + (lon * lon) / 81.0 <= 1.0) {
+        return { x: e.dispX, z: e.dispZ, heading: e.dispHeading * 180 / Math.PI, id: e.id };
+      }
+    }
+    return null;
+  }
+
+  /** Heavy shudder on a remote ship (id) that was struck on the given side. */
+  applyHitShudder(id: string, side: 'port' | 'stbd'): void {
+    const e = this.players.get(id);
+    if (!e) return;
+    const dir = side === 'port' ? 1 : -1;
+    e.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
+    e.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
   }
 
   /** Shortest-arc difference a→b for angles in radians. */
@@ -591,9 +646,46 @@ export class MultiplayerService {
       entry.recoilRoll = 0;
       entry.recoilRollVel = 0;
     }
-    // Combine cannon recoil with the wave-induced roll set by tickRemoteMotion (runs
-    // first) so neither overwrites the other.
-    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll;
+    // Heavy hit shudder (separate channel, own caps) — a struck ship rocks violently.
+    const hitRollAcc = -this.HIT_SPRING * entry.hitRoll - this.HIT_DAMPING * entry.hitRollVel;
+    entry.hitRollVel += hitRollAcc * dt;
+    entry.hitRoll += entry.hitRollVel * dt;
+    if (entry.hitRoll >  this.HIT_MAX_ROLL) entry.hitRoll =  this.HIT_MAX_ROLL;
+    if (entry.hitRoll < -this.HIT_MAX_ROLL) entry.hitRoll = -this.HIT_MAX_ROLL;
+    if (Math.abs(entry.hitRoll) < 0.0002 && Math.abs(entry.hitRollVel) < 0.0002) {
+      entry.hitRoll = 0; entry.hitRollVel = 0;
+    }
+
+    // Combine cannon recoil + hit shudder with the wave-induced roll set by
+    // tickRemoteMotion (runs first) so neither overwrites the other.
+    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll;
+
+    // Lateral shudder: damped sideways lurch away from the firing side, layered on
+    // top of the interpolated display position (dispX/dispZ set by tickRemoteMotion).
+    const swayAcc = -this.RECOIL_SWAY_SPRING * entry.recoilSway - this.RECOIL_SWAY_DAMPING * entry.recoilSwayVel;
+    entry.recoilSwayVel += swayAcc * dt;
+    entry.recoilSway += entry.recoilSwayVel * dt;
+    if (entry.recoilSway >  this.RECOIL_SWAY_MAX) entry.recoilSway =  this.RECOIL_SWAY_MAX;
+    if (entry.recoilSway < -this.RECOIL_SWAY_MAX) entry.recoilSway = -this.RECOIL_SWAY_MAX;
+    if (Math.abs(entry.recoilSway) < 0.0005 && Math.abs(entry.recoilSwayVel) < 0.0005) {
+      entry.recoilSway = 0;
+      entry.recoilSwayVel = 0;
+    }
+    const hitSwayAcc = -this.HIT_SPRING * entry.hitSway - this.HIT_DAMPING * entry.hitSwayVel;
+    entry.hitSwayVel += hitSwayAcc * dt;
+    entry.hitSway += entry.hitSwayVel * dt;
+    if (entry.hitSway >  this.HIT_MAX_SWAY) entry.hitSway =  this.HIT_MAX_SWAY;
+    if (entry.hitSway < -this.HIT_MAX_SWAY) entry.hitSway = -this.HIT_MAX_SWAY;
+    if (Math.abs(entry.hitSway) < 0.0005 && Math.abs(entry.hitSwayVel) < 0.0005) {
+      entry.hitSway = 0; entry.hitSwayVel = 0;
+    }
+
+    const totalSway = entry.recoilSway + entry.hitSway;
+    if (totalSway !== 0) {
+      const h = entry.dispHeading;   // radians; +sway = toward starboard
+      entry.root.position.x = entry.dispX + totalSway * Math.cos(h);
+      entry.root.position.z = entry.dispZ - totalSway * Math.sin(h);
+    }
   }
 
   // ── Visibility ────────────────────────────────────────────────────────────

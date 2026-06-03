@@ -103,6 +103,38 @@ p {
     transform: translateX(-50%);
     padding: 10px 14px;
   }
+  // Hull damage diagram, right edge, vertically centred.
+  &.damage-diagram {
+    top: 50%;
+    right: 1.25rem;
+    transform: translateY(-50%);
+    padding: 10px 12px;
+  }
+}
+
+// ── Hull damage diagram ───────────────────────────────────────────────────────
+.damage-diagram {
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  &:active { cursor: grabbing; }
+  // When dragged, explicit left/top (bound inline) take over from the centred default.
+  &.dd-dragged { right: auto; transform: none; }
+  .dd-title {
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: rgba(207, 227, 245, 0.55);
+    text-align: center;
+    margin-bottom: 6px;
+  }
+  .dd-svg {
+    width: 76px;
+    height: auto;
+    display: block;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+  }
+  .dd-label text { font-size: 9px; font-family: ui-monospace, monospace; opacity: 0.7; }
 }
 
 // ── Gunnery buttons (reuse .sail-btn; add a reload progress bar) ───────────────
@@ -118,6 +150,23 @@ p {
   border-radius: 2px;
   transition: width 0.1s linear;
   pointer-events: none;
+}
+// Hull/Mast target preset toggles
+.tgt-btn {
+  padding: 2px 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(207, 227, 245, 0.7);
+  font: 600 11px ui-monospace, monospace;
+  cursor: pointer;
+  transition: all 0.12s;
+  &:hover { background: rgba(255, 255, 255, 0.10); }
+  &.tgt-btn--active {
+    background: rgba(245, 158, 11, 0.22);
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #fbbf24;
+  }
 }
 
 // ── Sail buttons ──────────────────────────────────────────────────────────────

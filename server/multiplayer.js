@@ -44,6 +44,9 @@ const JOIN_LEAVE_MAX_PLAYERS = 30;
 // so every client — and every admin override — sees identical conditions.
 const weatherState = require('./weather-state');
 
+// ── Server-authoritative ship-to-ship combat ─────────────────────────────────
+const combat = require('./combat');
+
 /**
  * Split a command argument string into a target callsign and the remaining text.
  * Callsigns containing spaces must be wrapped in double quotes; an unquoted target
@@ -339,7 +342,7 @@ function attachMultiplayer(server) {
 
   wss.on('connection', (ws) => {
     const id = String(nextId++);
-    players.set(id, { ws, state: null, friends: [] });
+    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState() });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
     ws.send(JSON.stringify(currentWaveState()));
@@ -357,7 +360,10 @@ function attachMultiplayer(server) {
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
 
-      if (msg.type === 'update') {
+      if (msg.type === 'ping') {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'pong', t: msg.t }));
+
+      } else if (msg.type === 'update') {
         const prevCallsign = players.get(id)?.state?.callsign;
         const state = {
           x:          +msg.x          || 0,
@@ -486,16 +492,75 @@ function attachMultiplayer(server) {
         })();
 
       } else if (msg.type === 'cannon_shot') {
-        const shot = JSON.stringify({
-          type: 'cannon_shot', id,
+        const me = players.get(id);
+        const shotData = {
           ox: +msg.ox || 0, oy: +msg.oy || 0, oz: +msg.oz || 0,
           vx: +msg.vx || 0, vy: +msg.vy || 0, vz: +msg.vz || 0,
-        });
-        let forwarded = 0;
-        for (const [pid, p] of players) {
-          if (pid !== id && p.ws.readyState === 1) { p.ws.send(shot); forwarded++; }
+        };
+        const seq = +msg.seq || 0;
+        const now = Date.now();
+
+        // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
+        if (!combat.validateShot(shotData, me?.state) || !combat.allowShot(me?.combat, now)) {
+          return;
         }
-        console.log(`[WS] cannon_shot from ${id} forwarded to ${forwarded} player(s)`);
+
+        // Relay the flight visual to everyone else (carries the shot seq).
+        const shot = JSON.stringify({ type: 'cannon_shot', id, seq, ...shotData });
+        for (const [pid, p] of players) {
+          if (pid !== id && p.ws.readyState === 1) p.ws.send(shot);
+        }
+
+        // ── Authority: re-fly the shot against server poses and adjudicate ───────
+        const hit = combat.simulateShot(shotData, id, players);
+        if (hit) {
+          const victim = players.get(hit.victimId);
+          if (victim && victim.combat) {
+            const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
+
+            // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
+            const hitMsg = JSON.stringify({
+              type: 'combat_hit', shooterId: id, victimId: hit.victimId, seq,
+              zone: hit.zone, hx: hit.hx, hy: hit.hy, hz: hit.hz, side: hit.side,
+            });
+            for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hitMsg);
+
+            // Broadcast the victim's authoritative hull state to everyone: it drives the
+            // victim's own HUD diagram AND every client's damage-listing tilt for that ship.
+            const stateMsg = JSON.stringify({
+              type: 'combat_state', playerId: hit.victimId, zones: victim.combat.zones,
+            });
+            for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+
+            if (justSunk) {
+              const sinker = me?.state?.callsign || 'an unknown ship';
+              const sunkName = victim.state?.callsign || 'a ship';
+              sysReply(victim.ws, `You were sunk by ${sinker}.`);
+              sysReply(me?.ws, `You sank ${sunkName}!`);
+              const sunkMsg = JSON.stringify({
+                type: 'combat_sunk', victimId: hit.victimId, shooterId: id, shooterName: sinker,
+              });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
+            }
+          }
+        }
+
+      } else if (msg.type === 'combat_reset') {
+        // Player acknowledged a sinking → restore their hull to full.
+        const me = players.get(id);
+        if (me && me.combat) {
+          me.combat = combat.newCombatState();
+          // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
+          const stateMsg = JSON.stringify({
+            type: 'combat_state', playerId: id, zones: me.combat.zones,
+          });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+          // Tell everyone else this ship is repaired so they clear its scorch decals.
+          const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
+          for (const [pid, p] of players) {
+            if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
+        }
 
       } else if (msg.type === 'gun_state') {
         // Relay a ship's gun run-out/stow so others see its ports + barrels animate.

@@ -17,6 +17,7 @@ import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
+import { CombatService }       from '../sailing/services/combat.service';
 import { MusicService }        from '../sailing/services/music.service';
 import { AuthService }        from '../services/auth.service';
 
@@ -92,10 +93,35 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-admin-panel #adminPanel />
           <div class="admin-hint">Press <kbd>&#96;</kbd> for admin controls</div>
         }
+
+        <!-- Sunk overlay — acknowledge to restore the hull to full -->
+        @if (combatService.sunk()) {
+          <div class="sunk-backdrop">
+            <div class="sunk-card">
+              <div class="sunk-icon">🌊</div>
+              <div class="sunk-title">Your ship was sunk</div>
+              <div class="sunk-text">Sent to the depths by {{ combatService.sunkBy() }}.</div>
+              <button class="sunk-btn" (click)="onConfirmSunk()">Repair &amp; Sail On</button>
+            </div>
+          </div>
+        }
       }
     </div>
   `,
   styles: [`
+    .sunk-backdrop { position: absolute; inset: 0; z-index: 220; display: flex;
+                     align-items: center; justify-content: center;
+                     background: rgba(4, 10, 20, 0.78); backdrop-filter: blur(5px); }
+    .sunk-card { background: rgba(10, 20, 34, 0.96); border: 1px solid rgba(248,81,73,0.35);
+                 border-radius: 16px; padding: 32px 40px; text-align: center; max-width: 380px;
+                 box-shadow: 0 18px 60px rgba(0,0,0,0.6); }
+    .sunk-icon  { font-size: 3rem; margin-bottom: 8px; }
+    .sunk-title { color: #f85149; font-size: 1.4rem; font-weight: 600; margin-bottom: 8px; }
+    .sunk-text  { color: #cfe3f5; opacity: 0.8; margin-bottom: 22px; font-family: ui-monospace, monospace; }
+    .sunk-btn   { padding: 10px 22px; border-radius: 10px; border: 1px solid rgba(96,165,250,0.5);
+                  background: rgba(59,130,246,0.22); color: #dbeafe; font-weight: 600; cursor: pointer;
+                  transition: all 0.15s; }
+    .sunk-btn:hover { background: rgba(59,130,246,0.38); }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                    opacity: 0; transition: opacity 0.8s ease; }
@@ -128,6 +154,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
   private multiplayerService = inject(MultiplayerService);
+  protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
@@ -365,6 +392,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onResume(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+  }
+
+  /** Acknowledge a sinking → ask the server to restore the hull to full. */
+  onConfirmSunk(): void {
+    this.multiplayerService.requestCombatReset();
   }
 
   /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */

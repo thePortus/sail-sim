@@ -1400,6 +1400,18 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
+      // ── 0. Noise-dithered waterline dissolve ──────────────────────────────
+      // The beach edge stipples away into the sea over its first ~1.3 m: a world-space noise
+      // discards more pixels the closer they are to the waterline, and the discarded pixels
+      // reveal the shallow water behind — so the shoreline cross-fades terrain → sea with a
+      // ragged, natural edge instead of a clean line. Stays in the OPAQUE pass (discard, not
+      // alpha-blend) so there's no transparent-sorting cost. Faded out just below the
+      // waterline so the submerged seabed stays intact in the refraction RTT.
+      float dStipple  = fract(sin(dot(floor(vPositionW.xz * 64.0), vec2(127.1, 311.7))) * 43758.5453);
+      float dDissolve = (1.0 - smoothstep(0.0, 0.6, vPositionW.y))
+                      * smoothstep(-0.25, 0.04, vPositionW.y) * 0.92;
+      if (dStipple < dDissolve) { discard; }
+
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
       float macroMod = 0.75 + macroLum * 0.50;  // [0.75 .. 1.25]
@@ -1579,10 +1591,15 @@ export class TerrainService {
       // wet-sand cue), with a faint fresnel sheen toward the sky colour to fake
       // the wet gloss. Strongest at the water, fading up the beach over ~3.5 m;
       // the ocean's shoreline foam sits on top of this band.
-      float wetBand = (1.0 - smoothstep(0.0, 3.5, vPositionW.y)) * wSand;
+      // Only darken the wet sand ABOVE the waterline. Below it, the seabed is darkened by the
+      // ocean's own shallow shading; double-darkening it there makes the submerged sand read
+      // darker than this wet band and leaves a line at the seam. belowFade kills it underwater
+      // so both sides land on the same tone where they meet.
+      float wetBand = (1.0 - smoothstep(0.0, 3.5, vPositionW.y))
+                    * smoothstep(-1.0, 0.3, vPositionW.y) * wSand;
       if (wetBand > 0.001) {
         float wetLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
-        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.62;  // damp & darker
+        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.82;  // lightly damp (was 0.62 — too dark, made the dissolve stipple read as black specks)
         baseColor.rgb = mix(baseColor.rgb, wetCol, wetBand);
         vec3  Vw   = normalize(vEyePosition.xyz - vPositionW);
         float fres = pow(1.0 - clamp(dot(Vw, nW), 0.0, 1.0), 4.0);

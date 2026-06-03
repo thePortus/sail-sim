@@ -128,7 +128,7 @@ export class OceanFFTMaterial {
     }
     const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePaths);
     if (hasWake) {
-      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + transparency)
+      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + deep-water transparency halo)
       mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
       mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
       mat.AddUniform('_WakeBoatCount', 'float', '');
@@ -324,8 +324,10 @@ export class OceanFFTMaterial {
     const shoreFn = shore0 ? `
       float _shoreProx(vec2 wxz) {
         vec2 uv = (wxz - _ShoreCenter) / _ShoreSize + 0.5;
-        if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) return 0.0;
-        return texture2D(_ShoreMap, uv).r;
+        // Sample unconditionally (uniform control flow) then mask — texture2D after an early
+        // return is an illegal non-uniform textureSample on WebGPU (same trap as _waterShadow).
+        float inB = step(0.001, uv.x) * step(uv.x, 0.999) * step(0.001, uv.y) * step(uv.y, 0.999);
+        return texture2D(_ShoreMap, clamp(uv, 0.001, 0.999)).r * inB;
       }
     ` : '';
     // Drifting fish silhouettes on the seabed (ported from the procedural ocean): one fish
@@ -333,21 +335,21 @@ export class OceanFFTMaterial {
     const fishFn = hasRefraction ? `
       float fishHash(vec2 id) { return fract(sin(dot(id, vec2(41.3, 289.1))) * 43758.5453); }
       float fishField(vec2 p, float t) {
-        float scale = 0.085;
+        float scale = 0.15;                     // smaller cells (~6.7 m) → many more fish
         vec2  id  = floor(p * scale);
         float rnd = fishHash(id);
-        if (rnd <= 0.76) return 0.0;
+        if (rnd <= 0.45) return 0.0;            // ~55% of cells hold a fish (was ~24%)
         float szr = fishHash(id + 31.7);
         float ph  = rnd * 53.0;
         float sp1 = 0.30 + rnd * 0.55;
         float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
         vec2  cellC = (id + 0.5) / scale;
-        vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+        vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 2.6;
         vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
         vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
         vec2  rel   = p - fishC;
         vec2  local = vec2(dot(rel, fwd), dot(rel, vec2(-fwd.y, fwd.x)));
-        local /= (0.5 + szr * 0.7);
+        local /= (0.22 + szr * 0.30);   // much smaller fish (< half the old size)
         float fx = local.x;
         float fy = abs(local.y);
         float shape = 0.0;
@@ -497,16 +499,8 @@ export class OceanFFTMaterial {
         jacobian += _ContactFoam * saturate(max(0.0, foam - depthDifference) * 5.0) * 0.9;
       #endif
 
-      #ifdef HAS_SHORE
-        // Breaking-wave surf hugging the waterline — but broken up by two scrolling foam
-        // samples so it reads as textured foam, not a flat white band, and kept subtle.
-        float proxF = _shoreProx(vWorldUV);
-        float surfBand = smoothstep(0.60, 0.71, proxF) * (1.0 - smoothstep(0.73, 0.85, proxF));
-        float fA = texture2D(_FoamTexture, vWorldUV * 0.06 + _Time * 0.6).r;
-        float fB = texture2D(_FoamTexture, vWorldUV * 0.13 - _Time * 0.4).r;
-        float surf = surfBand * smoothstep(0.45, 0.95, fA * 0.6 + fB * 0.6);
-        jacobian = max(jacobian, surf * 0.45);
-      #endif
+      // (Shoreline foam removed — the coast is handled by a water→sand transparency runoff
+      //  in the colour-composition stage instead.)
 
       #ifdef HAS_WAKE
         // Wake foam: bright churned core + thin diverging bow-wave lines, broken up by a
@@ -522,6 +516,12 @@ export class OceanFFTMaterial {
       #ifdef HAS_SPLASH
         // Foam at the geyser column + the expanding rebound ring.
         jacobian = max(jacobian, clamp(_splashFoam(vWorldUV), 0.0, 1.0));
+      #endif
+
+      #ifdef HAS_SHORE
+        // Calm the whitecap foam as the water shallows toward the beach so the shoreline isn't
+        // ringed by a bright foamy band (the seabed shows clear instead).
+        jacobian *= 1.0 - smoothstep(0.30, 0.66, _shoreProx(vWorldUV)) * 0.8;
       #endif
 
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
@@ -547,31 +547,50 @@ export class OceanFFTMaterial {
 
     mat.Fragment_Before_FinalColorComposition(`
       vec3 waterCol = color * (1.0 - fresnel);
+      // Water→sand runoff: 0 in open water, ramping to 1 right at the shoreline so the water
+      // dissolves into the seabed and there's no obvious line where it starts/ends.
+      float shoreFade = 0.0;
+      float shoalReveal = 0.0;   // how much seabed shows (set in the refraction stage) — dims surface glint
       #ifdef HAS_SHORE
         float prox = _shoreProx(vWorldUV);
-        // Shallow turquoise water-column tint as the seabed rises toward the beach.
-        float shallowF = smoothstep(0.42, 0.70, prox);
-        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shallowF * 0.55);
+        shoreFade = smoothstep(0.82, 0.99, prox);
+        // Shallow turquoise water-column tint as the seabed rises toward the beach. It's
+        // emissive (unaffected by scene lighting), so without a day factor it glows brightly
+        // (Shallow turquoise water-column tint removed — the shallows now read purely from the
+        //  revealed seabed below, for a clear-water look.)
         #ifdef HAS_REFRACTION
           // True transparency: blend in the seabed colour (scene-minus-ocean RTT), revealed
           // more as the water shallows. Refracted slightly by the wave normal.
           // Shallow seabed reveal, plus a strong boost right around the hull so the submerged
           // hull/keel shows through the water near the boat (where the refraction RTT has it),
           // plus a faint global baseline.
-          float reveal = smoothstep(0.50, 0.78, prox);
+          // Wide ramp so the whole shallow zone reads as transparent — you see the sea floor
+          // (and the boat's shadow/keel on it) right across the shallows, not just at the very
+          // edge — plus a strong near-hull boost and a faint deep-water baseline.
+          float reveal = smoothstep(0.18, 0.55, prox);
           #ifdef HAS_WAKE
             reveal = max(reveal, 0.75 * (1.0 - smoothstep(2.0, 14.0, length(vWorldUV - _BoatPos))));
           #endif
           reveal = max(reveal, 0.12);
+          shoalReveal = reveal;   // shared with the reflection stage to dim glint over the shallows
           vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
-          vec3 seabed = texture2D(_Refraction, refrUV).rgb * vec3(0.42, 0.52, 0.58);
+          vec3 refr = texture2D(_Refraction, refrUV).rgb;
           // Drifting fish on the seabed — only with the camera above water (_Time is /10, so ×10).
           if (_WorldSpaceCameraPos.y > 0.05) {
             float fish = fishField(vWorldUV, _Time * 10.0);
-            seabed *= (1.0 - fish * 0.5);
+            refr *= (1.0 - fish * 0.5);
           }
-          waterCol = mix(waterCol, seabed, reveal * 0.92);
+          // Broad shallows: reveal the sandy bottom so you can SEE the sea floor through the
+          // water. Kept on the wet/darker side so the submerged sand matches the wet sand the
+          // terrain paints at the waterline (rather than reading lighter).
+          vec3 seabedSand = refr * vec3(0.62, 0.62, 0.55);
+          // Reveal the sandy bottom across the shallows; at the very shoreline ramp it to full
+          // so the water dissolves into the matching beach sand — no hard line, no teal ring.
+          waterCol = mix(waterCol, seabedSand, max(reveal * 0.96, shoreFade));
         #endif
+        // Subtle turquoise band at the OUTER edge of the shallows (the deep→shallow transition).
+        float shoalRing = smoothstep(0.12, 0.26, prox) * (1.0 - smoothstep(0.28, 0.46, prox));
+        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shoalRing * 0.18 * sunUp);
       #endif
       #ifdef HAS_REFLECTION
         // Planar mirror reflection (skybox + islands + vessels), rippled by the wave normal,
@@ -580,7 +599,9 @@ export class OceanFFTMaterial {
         reflUV += normalW.xz * 0.04;
         reflUV = clamp(reflUV, vec2(0.002), vec2(0.998));
         vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
-        waterCol += planarRefl * fresnel * _ReflStrength;
+        // Dim the surface glint over the clear shallows so the wet sandy bottom shows through
+        // (a bright reflection here makes the submerged sand read lighter than the wet beach).
+        waterCol += planarRefl * fresnel * _ReflStrength * (1.0 - shoreFade) * (1.0 - shoalReveal * 0.7);
       #endif
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);

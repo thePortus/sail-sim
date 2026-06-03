@@ -2,13 +2,6 @@
 
 # General or Current TODO Items
 
-* tone down turquoise island ring at night
-* fix wbgl ocean
-* add froth at beach and ship waterline (and blur)
-* make more fishes but smaller
-* no ambient occlusion from boat?
-* add cannon flash effect on NEARBY landscape and water
-* make raindrops more noticeable
 * try more improved clouds https://playground.babylonjs.com/#MAONNT#13 https://www.shadertoy.com/view/4dSBDt
 * dolphins?
 * improve ground asset scattering https://forum.babylonjs.com/t/grass-butterflies-and-trees-with-instancing/45646 https://github.com/barthpaleologue/AssetScattering

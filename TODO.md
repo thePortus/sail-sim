@@ -3,14 +3,16 @@
 # General or Current TODO Items
 
 * white ocean and ship load in on live site
+* resolve bug of ship losing texture sometimes when a nearby other ship of same type loads in.. or perhaps leaves,, yes leaves... triggers it
 * remove zero wind bugs
 * tone down sss at night and whitecapes
 * wake size responds to speed
 * ensure cannon ball travel isn't instant...misses aren't, but hits are calculated that way
-* resolve bug of ship losing texture sometimes when a nearby other ship of same type loads in.. or perhaps leaves,, yes leaves... triggers it
 * fix wbgl ocean
-* try more improved clouds https://playground.babylonjs.com/#MAONNT#13 https://www.shadertoy.com/view/4dSBDt
 * add froth at beach and ship waterline (and blur)
+* make more fishes but smaller
+* no ambient occlusion from boat?
+* try more improved clouds https://playground.babylonjs.com/#MAONNT#13 https://www.shadertoy.com/view/4dSBDt
 * dolphins?
 * improve ground asset scattering https://forum.babylonjs.com/t/grass-butterflies-and-trees-with-instancing/45646 https://github.com/barthpaleologue/AssetScattering
 * improve rain from https://playground.babylonjs.com/#XQ8H3C#0

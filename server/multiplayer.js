@@ -633,6 +633,12 @@ function attachMultiplayer(server) {
       const closingCallsign = players.get(id)?.state?.callsign;
       players.delete(id);
 
+      // If this player was the admin holding an active weather override, clear it so a
+      // pinned (possibly becalmed, windSpeed-0) sky doesn't outlive their session and
+      // strand everyone who logs in next. onChange → broadcastWeather pushes the resumed
+      // natural weather to all remaining clients immediately.
+      if (closingCallsign) weatherState.clearOverrideForOwner(closingCallsign);
+
       // Notify any connected player whose mutuals changed because this player left
       if (closingCallsign) {
         for (const [, p] of players) {

@@ -1298,6 +1298,9 @@ export class TerrainService {
     material.disableLighting = false;
     material.specularColor   = Color3.Black();  // fully matte
     material.specularPower   = 256;
+    // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby flash
+    // can light the beach/cliffs without displacing the sun (which would darken the terrain).
+    material.maxSimultaneousLights = 6;
 
     // ── Helper: load a server-generated terrain map (png) ────────────────────
     const loadTerrainTex = (path: string, label: string): Texture => {

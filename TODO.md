@@ -9,6 +9,7 @@
 * improve landscape performance with dynamic terrain? https://github.com/BabylonJS/Extensions/blob/master/DynamicTerrain/documentation/dynamicTerrainDocumentation.md
 * improve landscape with https://medium.com/@trushkinsimon/semi-procedural-landscape-with-babylonjs-e9373bc3091d
 * add in damage morph targets
+* fix steering wheel bones
 * add player ship collision
 * add improved land collision
 * add damage from collisions and aground
@@ -22,7 +23,9 @@
 * Add repairing
 * Add sailors on deck
 * Add ship names
+* Add /teleport playername x y and /teleportTo playername to admins
 * Add lost server connection detection
+* Add server side checking of movement, to prevent shenanigans
 * encrypt websocket server? wss instead of ws?
 
 # TODO Items by Module

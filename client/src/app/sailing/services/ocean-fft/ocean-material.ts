@@ -41,6 +41,8 @@ export interface OceanMaterialDeps {
   getWakePaths: (() => { paths: Float32Array; meta: Float32Array; count: number }) | null;
   /** Active cannonball water impacts (vec4×8: x,z,age,_) + count, for splash displacement. */
   getSplashData: (() => { data: Float32Array; count: number }) | null;
+  /** Active cannon muzzle flashes (vec4×6: x,z,age,_) + count + life, for a brief warm emissive glow. */
+  getCannonFlash: (() => { data: Float32Array; count: number; life: number }) | null;
   /** Island shadow mask + transform + strength + cloud cover, for shadows on the water. */
   getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number }) | null;
   /** All vessel positions (local + remote) for boat shadows: vec4×8 (x,z,_,_) + count. */
@@ -138,6 +140,12 @@ export class OceanFFTMaterial {
       mat.AddUniform('_SplashData[8]', 'vec4', '');   // x, z, age, _
       mat.AddUniform('_SplashCount', 'float', '');
     }
+    const hasFlash = !!this._deps.getCannonFlash;
+    if (hasFlash) {
+      mat.AddUniform('_FlashData[6]', 'vec4', '');    // x, z, age, _
+      mat.AddUniform('_FlashCount', 'float', '');
+      mat.AddUniform('_FlashLife', 'float', '');
+    }
     const shadow0 = this._deps.getWaterShadow?.() ?? null;
     const hasShadows = !!shadow0;
     if (shadow0) {
@@ -167,6 +175,7 @@ export class OceanFFTMaterial {
     const refrDef = hasRefraction ? '#define HAS_REFRACTION' : '';
     const wakeDef = hasWake ? '#define HAS_WAKE' : '';
     const splashDef = hasSplash ? '#define HAS_SPLASH' : '';
+    const flashDef = hasFlash ? '#define HAS_FLASH' : '';
     const shadowDef = hasShadows ? '#define HAS_SHADOWS' : '';
     const boatShadowDef = hasBoatShadows ? '#define HAS_BOATSHADOWS' : '';
     const rainDef = hasRain ? '#define HAS_RAIN' : '';
@@ -275,6 +284,34 @@ export class OceanFFTMaterial {
         return f;
       }
     ` : '';
+    // Cannon muzzle-flash: a brief, local warm glow added to the sea's emissive colour, so the
+    // water lights up when a broadside fires (a scene point light can't light the emissive ocean).
+    const flashFn = hasFlash ? `
+      vec3 _cannonFlashGlow(vec2 wxz) {
+        if (_FlashCount < 0.5) return vec3(0.0);
+        vec3 sum = vec3(0.0);
+        for (int i = 0; i < 6; i++) {
+          if (float(i) >= _FlashCount) break;
+          vec2 c = _FlashData[i].xy;
+          float age = _FlashData[i].z;
+          float t01 = age / max(_FlashLife, 0.001);
+          if (t01 >= 1.0) continue;
+          // Instant onset, quick fade (sharp at ignition, gone within FLASH_LIFE).
+          float env = (1.0 - t01) * (1.0 - t01);
+          float r = length(wxz - c);
+          // ~16 m soft pool of light, fading with distance — stays local to the firing ship.
+          float fall = exp(-(r * r) / 110.0);
+          // Hull occlusion: the muzzle sits on the firing side, the keel runs perpendicular to the
+          // beam direction D. Mask the glow to the firing side of the keel centreline (~2.5 m
+          // inboard of the muzzle) so the hull blocks the far side — port fire doesn't light stbd.
+          vec2 D = vec2(cos(_FlashData[i].w), sin(_FlashData[i].w));
+          float sFrag = dot(wxz - c, D) + 2.5;   // >0 firing side, ramps negative across the keel
+          float sideMask = mix(0.08, 1.0, smoothstep(-1.5, 1.5, sFrag));
+          sum += vec3(1.0, 0.52, 0.18) * env * fall * sideMask;
+        }
+        return sum;
+      }
+    ` : '';
     // Wake along the boat's actual (curved) CPU track: find the nearest point on the path
     // polyline, then build a turbulent core + a pair of diverging bow-wave edges that spread
     // as the wake ages. Following the track means the wake bends through turns. Returns
@@ -377,9 +414,9 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${flashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
     mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${shadowFn}\n${rainFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -469,7 +506,7 @@ export class OceanFFTMaterial {
             float n0 = _rainField(rp, rt);
             vec2  grad = vec2(_rainField(rp + vec2(e, 0.0), rt) - n0,
                               _rainField(rp + vec2(0.0, e), rt) - n0) / e;
-            normalW = normalize(normalW + vec3(grad.x, 0.0, grad.y) * (0.18 * _RainIntensity * nearF));
+            normalW = normalize(normalW + vec3(grad.x, 0.0, grad.y) * (0.65 * _RainIntensity * nearF));
           }
         }
       #endif
@@ -523,6 +560,8 @@ export class OceanFFTMaterial {
         // a bright foamy band — the shallows are shoal-calmed clear water, so no whitecaps.
         jacobian *= 1.0 - smoothstep(0.12, 0.48, _shoreProx(vWorldUV)) * 0.96;
       #endif
+
+      // (Rain reads purely as the dimpled surface NORMAL — see HAS_RAIN above — no white foam.)
 
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
 
@@ -624,6 +663,11 @@ export class OceanFFTMaterial {
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
       #endif
       finalEmissive = mix(waterCol, vec3(0.0), jacobian);
+      #ifdef HAS_FLASH
+        // Warm muzzle-flash glow on the sea — added on top (lights foam too) so a broadside
+        // visibly illuminates the surrounding water.
+        finalEmissive += _cannonFlashGlow(vWorldUV);
+      #endif
     `);
 
     // Per-frame uniforms (camera pos, ping-ponged turbulence, time, light dir).
@@ -659,6 +703,12 @@ export class OceanFFTMaterial {
       if (splash) {
         eff.setArray4('_SplashData', splash.data as unknown as number[]);
         eff.setFloat('_SplashCount', splash.count);
+      }
+      const flash = this._deps.getCannonFlash?.();
+      if (flash) {
+        eff.setArray4('_FlashData', flash.data as unknown as number[]);
+        eff.setFloat('_FlashCount', flash.count);
+        eff.setFloat('_FlashLife', flash.life);
       }
       const sh = this._deps.getWaterShadow?.();
       if (sh) {

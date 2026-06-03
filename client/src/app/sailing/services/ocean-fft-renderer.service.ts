@@ -69,6 +69,7 @@ export class OceanFFTRenderer {
         count: this._wakeTracker.boatCount,
       }),
       getSplashData: () => this.oceanService.getSplashData(),
+      getCannonFlash: () => this.oceanService.getCannonFlash(),
       getWaterShadow: () => this.oceanService.getWaterShadowInfo(),
       getRain: () => this.oceanService.getRainIntensity(),
       getChoppiness: () => this.fft.choppiness,

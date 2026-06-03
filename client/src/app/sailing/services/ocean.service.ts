@@ -1441,6 +1441,13 @@ export class OceanService {
   private splashData = new Float32Array(this.SPLASH_MAX * 4);  // xy = pos, z = age
   private splashCount = 0;
 
+  // ── Cannon muzzle-flash glow on the water (emissive — a point light can't light the
+  //    emissive sea). xy = world pos, z = age (s). Brief, warm, local. ──────────────
+  private readonly FLASH_MAX  = 6;       // matches the FFT material array size
+  private readonly FLASH_LIFE = 0.45;    // seconds before the flash glow fades
+  private flashData = new Float32Array(this.FLASH_MAX * 4);
+  private flashCount = 0;
+
   // Small weather coupling: stormy seas slightly amplify wave depth.
   private waveDepthScale = 1.0;
 
@@ -1759,6 +1766,7 @@ export class OceanService {
 
       this.updateWakePath(dt);
       this.updateSplashes(dt);
+      this.updateCannonFlashes(dt);
 
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
@@ -1818,6 +1826,44 @@ export class OceanService {
       buf.copyWithin(0, drop * N, this.splashCount * N);
       this.splashCount -= drop;
     }
+  }
+
+  /**
+   * Register a cannon muzzle flash at world (x,z) — drives a brief warm emissive glow on the sea.
+   * (dirX,dirZ) is the unit OUTWARD beam direction (the way the cannon points); the shader uses it
+   * to mask the glow to the firing side of the keel, so the hull "occludes" the far side (a port
+   * cannonade no longer glows on starboard) — far cheaper than a real shadow-casting light.
+   */
+  addCannonFlash(x: number, z: number, dirX: number, dirZ: number): void {
+    const N = 4;
+    if (this.flashCount >= this.FLASH_MAX) {
+      this.flashData.copyWithin(0, N, this.FLASH_MAX * N);   // drop the oldest
+      this.flashCount = this.FLASH_MAX - 1;
+    }
+    const idx = this.flashCount * N;
+    this.flashData[idx]     = x;
+    this.flashData[idx + 1] = z;
+    this.flashData[idx + 2] = 0;                       // age
+    this.flashData[idx + 3] = Math.atan2(dirZ, dirX);  // firing-beam angle (unpacked to a dir in-shader)
+    this.flashCount++;
+  }
+
+  /** Age active flashes and drop expired ones (oldest are at the front). */
+  private updateCannonFlashes(dt: number): void {
+    const buf = this.flashData;
+    const N = 4;
+    for (let i = 0; i < this.flashCount; i++) buf[i * N + 2] += dt;
+    let drop = 0;
+    while (drop < this.flashCount && buf[drop * N + 2] > this.FLASH_LIFE) drop++;
+    if (drop > 0) {
+      buf.copyWithin(0, drop * N, this.flashCount * N);
+      this.flashCount -= drop;
+    }
+  }
+
+  /** Snapshot for the FFT ocean material: warm emissive flash positions + ages. */
+  getCannonFlash(): { data: Float32Array; count: number; life: number } {
+    return { data: this.flashData, count: this.flashCount, life: this.FLASH_LIFE };
   }
 
   private updateWakePath(dt: number): void {

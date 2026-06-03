@@ -1,7 +1,7 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Scene, Mesh, MeshBuilder, Vector3, Color3, Color4,
-  StandardMaterial, DynamicTexture, ParticleSystem, PointLight,
+  StandardMaterial, DynamicTexture, ParticleSystem, PointLight, Light,
   NoiseProceduralTexture, Ray, AbstractMesh, TransformNode,
 } from '@babylonjs/core';
 import type { CombatHitMsg } from './combat.constants';
@@ -78,6 +78,18 @@ interface SideGun {
   shotTimer:  number;   // stagger accumulator within firing
   nextShotAt: number;   // shotTimer threshold at which the next cannon fires (randomized)
   timer:      number;   // dwell (firing) / countdown (reloading)
+}
+
+/** One self-contained remote muzzle rig: a flash light + flame/smoke/linger plumes, pooled and
+ *  assigned per remote shooter so concurrent broadsides don't share (and overwrite) one rig. */
+interface RemoteMuzzleRig {
+  light:        PointLight;
+  lightEndT:    number;
+  flamePS:      ParticleSystem;  flameEmit:   Vector3;  flameCutoffT:  number;
+  smokePS:      ParticleSystem;  smokeEmit:   Vector3;  smokeCutoffT:  number;
+  lingerPS:     ParticleSystem;  lingerEmit:  Vector3;  lingerCutoffT: number;
+  shooterId:    string | null;   // which remote player currently owns this rig (null = free)
+  lastUsed:     number;          // remoteRigClock stamp at last assignment (LRU)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,18 +194,13 @@ export class CannonService {
   // Shared turbulence noise for all smoke systems (one texture, assigned to many PS)
   private smokeNoise!: NoiseProceduralTexture;
 
-  // Remote shot effects — dedicated systems so they never conflict with local fire
-  private flashRemote!:       PointLight;
-  private flashRemoteEndT   = -1;
-  private remoteFlamePS!:    ParticleSystem;
-  private remoteSmokePS!:    ParticleSystem;
-  private remoteLingerPS!:   ParticleSystem;
-  private remoteFlameEmit    = new Vector3(0, 0, 0);
-  private remoteSmokeEmit    = new Vector3(0, 0, 0);
-  private remoteLingerEmit   = new Vector3(0, 0, 0);
-  private remoteFlameCutoffT = -1;
-  private remoteSmokeCutoffT = -1;
-  private remoteLingerCutoffT = -1;
+  // Remote shot effects — a POOL of independent muzzle rigs (light + flame/smoke/linger), one
+  // assigned per remote shooter (sticky, LRU-evicted), so several ships firing at once each get
+  // their OWN flash, smoke & light instead of fighting over one shared rig.
+  private readonly REMOTE_RIG_COUNT = 4;
+  private remoteRigs: RemoteMuzzleRig[] = [];
+  private remoteRigByShooter = new Map<string, number>();
+  private remoteRigClock = 0;   // ticks up on each assignment — drives LRU eviction
 
   // Impact particle systems.
   // Water spouts use a small POOL so a 3-ball broadside produces 3 independent
@@ -259,7 +266,7 @@ export class CannonService {
     // Wire remote-shot + combat callbacks (avoids circular injection with MultiplayerService)
     this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq) => {
       this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
-      this.fireRemoteEffect(ox, oy, oz, vx, vz);
+      this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
     };
     this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
     // A repaired ship (server `combat_reset`) clears its accumulated scorch decals.
@@ -291,12 +298,17 @@ export class CannonService {
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
     this.flashStbd?.dispose();
-    this.flashRemote?.dispose();
     this.shipFlash?.dispose();
+    for (const rig of this.remoteRigs) {
+      rig.light?.dispose();
+      for (const ps of [rig.flamePS, rig.smokePS, rig.lingerPS]) { ps?.stop(); ps?.dispose(); }
+    }
+    this.remoteRigs = [];
+    this.remoteRigByShooter.clear();
     for (const ps of [
-      this.flamePortPS, this.flameStbdPS, this.remoteFlamePS,
-      this.smokePortPS, this.smokeStbdPS, this.remoteSmokePS,
-      this.lingerPortPS, this.lingerStbdPS, this.remoteLingerPS,
+      this.flamePortPS, this.flameStbdPS,
+      this.smokePortPS, this.smokeStbdPS,
+      this.lingerPortPS, this.lingerStbdPS,
       ...this.splashFx.map(f => f.ps),
       this.dirtPS, this.landSmokePS, this.shipDebrisPS, this.shipFirePS, this.shipSmokePS,
     ]) { ps?.stop(); ps?.dispose(); }
@@ -351,34 +363,36 @@ export class CannonService {
       l.diffuse   = new Color3(1.0, 0.72, 0.22);
       l.specular  = new Color3(1.0, 0.50, 0.08);
       l.intensity = 0;
-      l.range     = 40;   // enough to light nearby hull / water nicely
+      // Reach far enough to wash distant cliffs and enemy ships (~1 km), but with a STANDARD
+      // (quadratic-to-zero) falloff so it's bright at the firing ship and fades to a faint hint
+      // at the edge — rather than the default inverse-square, which dies within ~50 m.
+      l.range        = 1150;
+      l.falloffType  = Light.FALLOFF_STANDARD;
+      // Sort BELOW the scene's base lights (sun/moon/ambient, priority 0): the forward renderer
+      // caps lights per mesh, so this guarantees a flash never displaces the sun (which would
+      // momentarily darken a ship/terrain when guns fire).
+      l.renderPriority = -1;
       return l;
     };
     this.flashPort   = make('cannonFlashPort');
     this.flashStbd   = make('cannonFlashStbd');
-    this.flashRemote = make('cannonFlashRemote');
     this.shipFlash   = make('cannonShipHitFlash');
 
-    // Exclude large scene meshes so the muzzle flash doesn't incorrectly
-    // illuminate the entire terrain or distant islands.
-    this.excludeMeshFromFlashLights('terrain_heightfield');
-
-    // Island meshes are loaded asynchronously — wire them up as they arrive.
-    this.scene.onNewMeshAddedObservable.add((mesh) => {
-      if (mesh.name.startsWith('island_') || mesh.name === 'terrain_heightfield') {
-        this.excludeMeshFromFlashLights(mesh.name);
-      }
-    });
-  }
-
-  private excludeMeshFromFlashLights(meshName: string): void {
-    const mesh = this.scene.getMeshByName(meshName);
-    if (!mesh) return;
-    for (const light of [this.flashPort, this.flashStbd, this.flashRemote, this.shipFlash]) {
-      if (light && !light.excludedMeshes.includes(mesh)) {
-        light.excludedMeshes.push(mesh);
-      }
+    // Pool of independent remote rigs — each gets its own flash light here; its flame/smoke/linger
+    // plumes are filled in by the particle builders below (which run after this).
+    for (let i = 0; i < this.REMOTE_RIG_COUNT; i++) {
+      this.remoteRigs.push({
+        light: make(`cannonFlashRemote${i}`), lightEndT: -1,
+        flamePS:  null as unknown as ParticleSystem, flameEmit:  new Vector3(0, 0, 0), flameCutoffT:  -1,
+        smokePS:  null as unknown as ParticleSystem, smokeEmit:  new Vector3(0, 0, 0), smokeCutoffT:  -1,
+        lingerPS: null as unknown as ParticleSystem, lingerEmit: new Vector3(0, 0, 0), lingerCutoffT: -1,
+        shooterId: null, lastUsed: 0,
+      });
     }
+
+    // The flash lights terrain, distant cliffs and other ships within ~1 km (STANDARD falloff
+    // fades it with distance). The water is lit separately via an emissive glow in the ocean
+    // shader (a point light can't light the emissive sea).
   }
 
   // ── Shared turbulence noise for smoke ─────────────────────────────────────
@@ -423,7 +437,9 @@ export class CannonService {
     };
     this.flamePortPS  = makeFlame('flamePort',   this.flamePortEmit);
     this.flameStbdPS  = makeFlame('flameStbd',   this.flameStbdEmit);
-    this.remoteFlamePS = makeFlame('flameRemote', this.remoteFlameEmit);
+    for (let i = 0; i < this.remoteRigs.length; i++) {
+      this.remoteRigs[i].flamePS = makeFlame(`flameRemote${i}`, this.remoteRigs[i].flameEmit);
+    }
   }
 
   // ── Smoke "fountain" particle systems ─────────────────────────────────────
@@ -467,7 +483,9 @@ export class CannonService {
     };
     this.smokePortPS  = makeSmoke('smokePort',   this.smokePortEmit);
     this.smokeStbdPS  = makeSmoke('smokeStbd',   this.smokeStbdEmit);
-    this.remoteSmokePS = makeSmoke('smokeRemote', this.remoteSmokeEmit);
+    for (let i = 0; i < this.remoteRigs.length; i++) {
+      this.remoteRigs[i].smokePS = makeSmoke(`smokeRemote${i}`, this.remoteRigs[i].smokeEmit);
+    }
   }
 
   // ── Lingering smoke-cloud particle systems ────────────────────────────────
@@ -510,7 +528,9 @@ export class CannonService {
     };
     this.lingerPortPS  = makeLinger('lingerPort',   this.lingerPortEmit);
     this.lingerStbdPS  = makeLinger('lingerStbd',   this.lingerStbdEmit);
-    this.remoteLingerPS = makeLinger('lingerRemote', this.remoteLingerEmit);
+    for (let i = 0; i < this.remoteRigs.length; i++) {
+      this.remoteRigs[i].lingerPS = makeLinger(`lingerRemote${i}`, this.remoteRigs[i].lingerEmit);
+    }
   }
 
   // ── Impact particle systems ───────────────────────────────────────────────
@@ -892,8 +912,8 @@ export class CannonService {
     // ── Muzzle flash lights decay ─────────────────────────────────────────────
     this.decayFlash(this.flashPort,   this.flashPortEndT);
     this.decayFlash(this.flashStbd,   this.flashStbdEndT);
-    this.decayFlash(this.flashRemote, this.flashRemoteEndT);
     this.decayFlash(this.shipFlash,   this.shipFlashEndT);
+    for (const rig of this.remoteRigs) this.decayFlash(rig.light, rig.lightEndT);
 
     // ── Particle burst cutoffs ────────────────────────────────────────────────
     if (this.flameCutoffT > 0 && this.elapsed >= this.flameCutoffT) {
@@ -942,17 +962,20 @@ export class CannonService {
       this.landSmokePS.emitRate = 0;
       this.landSmokeCutoffT = -1;
     }
-    if (this.remoteFlameCutoffT > 0 && this.elapsed >= this.remoteFlameCutoffT) {
-      this.remoteFlamePS.emitRate = 0;
-      this.remoteFlameCutoffT = -1;
-    }
-    if (this.remoteSmokeCutoffT > 0 && this.elapsed >= this.remoteSmokeCutoffT) {
-      this.remoteSmokePS.emitRate = 0;
-      this.remoteSmokeCutoffT = -1;
-    }
-    if (this.remoteLingerCutoffT > 0 && this.elapsed >= this.remoteLingerCutoffT) {
-      this.remoteLingerPS.emitRate = 0;
-      this.remoteLingerCutoffT = -1;
+    // Remote rig plume cutoffs — each pooled rig ages independently.
+    for (const rig of this.remoteRigs) {
+      if (rig.flameCutoffT > 0 && this.elapsed >= rig.flameCutoffT) {
+        rig.flamePS.emitRate = 0;
+        rig.flameCutoffT = -1;
+      }
+      if (rig.smokeCutoffT > 0 && this.elapsed >= rig.smokeCutoffT) {
+        rig.smokePS.emitRate = 0;
+        rig.smokeCutoffT = -1;
+      }
+      if (rig.lingerCutoffT > 0 && this.elapsed >= rig.lingerCutoffT) {
+        rig.lingerPS.emitRate = 0;
+        rig.lingerCutoffT = -1;
+      }
     }
   }
 
@@ -962,7 +985,9 @@ export class CannonService {
       return;
     }
     const env = (endT - this.elapsed) / FLASH_DUR;
-    light.intensity = env * 8.0 * (0.85 + 0.15 * Math.random());
+    // Peak intensity (tunable): the long-range STANDARD falloff spreads this across the whole
+    // ~1 km radius, so distant cliffs / enemy ships catch a fading wash of it when guns fire.
+    light.intensity = env * 6.0 * (0.85 + 0.15 * Math.random());
   }
 
   // ── Fire one cannon of a broadside (fixed beam direction, no aiming) ────────
@@ -1011,6 +1036,9 @@ export class CannonService {
     flash.position.set(mwx, mwy, mwz);
     if (isPort) this.flashPortEndT = this.elapsed + FLASH_DUR;
     else        this.flashStbdEndT = this.elapsed + FLASH_DUR;
+    // Warm glow on the sea below the muzzle (the point light can't light the emissive ocean).
+    // Pass the beam direction so the hull masks the glow to the firing side (no cross-deck bleed).
+    this.oceanService.addCannonFlash(mwx, mwz, dirX, dirZ);
 
     // 1) Flame core — tight, fast jet right out the barrel.
     const fSpread = 0.16;
@@ -1037,40 +1065,72 @@ export class CannonService {
     this.lingerCutoffT = this.elapsed + 0.55;
   }
 
+  /**
+   * Get the muzzle rig owning this remote shooter, assigning one on first fire. Sticky per shooter
+   * (so a ship's staggered broadside reuses its own rig); when the pool is exhausted the least
+   * recently used rig is recycled.
+   */
+  private acquireRemoteRig(shooterId: string): RemoteMuzzleRig {
+    const owned = this.remoteRigByShooter.get(shooterId);
+    if (owned !== undefined) {
+      this.remoteRigs[owned].lastUsed = ++this.remoteRigClock;
+      return this.remoteRigs[owned];
+    }
+    // Prefer a free rig; otherwise evict the least-recently-used one.
+    let idx = this.remoteRigs.findIndex(r => r.shooterId === null);
+    if (idx < 0) {
+      idx = 0;
+      for (let i = 1; i < this.remoteRigs.length; i++) {
+        if (this.remoteRigs[i].lastUsed < this.remoteRigs[idx].lastUsed) idx = i;
+      }
+      const evicted = this.remoteRigs[idx].shooterId;
+      if (evicted !== null) this.remoteRigByShooter.delete(evicted);
+    }
+    const rig = this.remoteRigs[idx];
+    rig.shooterId = shooterId;
+    rig.lastUsed  = ++this.remoteRigClock;
+    this.remoteRigByShooter.set(shooterId, idx);
+    return rig;
+  }
+
   private fireRemoteEffect(
-    ox: number, oy: number, oz: number, vx: number, vz: number,
+    shooterId: string, ox: number, oy: number, oz: number, vx: number, vz: number,
   ): void {
     const hLen = Math.sqrt(vx * vx + vz * vz);
     if (hLen < 0.001) return;
     const dx = vx / hLen;
     const dz = vz / hLen;
 
+    const rig = this.acquireRemoteRig(shooterId);
+
     // Muzzle flash
-    this.flashRemote.position.set(ox, oy, oz);
-    this.flashRemoteEndT = this.elapsed + FLASH_DUR;
+    rig.light.position.set(ox, oy, oz);
+    rig.lightEndT = this.elapsed + FLASH_DUR;
+    // Warm glow on the sea below the remote muzzle too (dx,dz is the unit beam direction).
+    this.oceanService.addCannonFlash(ox, oz, dx, dz);
 
     // 1) Flame core — tight, fast jet along the shot vector
     const fSpread = 0.16;
-    this.remoteFlamePS.direction1.set(dx - fSpread, 0.04, dz - fSpread);
-    this.remoteFlamePS.direction2.set(dx + fSpread, 0.30, dz + fSpread);
-    this.remoteFlameEmit.set(ox, oy, oz);
-    this.remoteFlamePS.emitRate = 1800;
-    this.remoteFlameCutoffT = this.elapsed + 0.22;
+    rig.flamePS.direction1.set(dx - fSpread, 0.04, dz - fSpread);
+    rig.flamePS.direction2.set(dx + fSpread, 0.30, dz + fSpread);
+    rig.flameEmit.set(ox, oy, oz);
+    rig.flamePS.emitRate = 1800;
+    rig.flameCutoffT = this.elapsed + 0.22;
 
     // 2) Smoke fountain — dense directional belch
     const sSpread = 0.32;
-    this.remoteSmokePS.direction1.set(dx * 1.0 - sSpread, 0.12, dz * 1.0 - sSpread);
-    this.remoteSmokePS.direction2.set(dx * 1.5 + sSpread, 0.55, dz * 1.5 + sSpread);
-    this.remoteSmokeEmit.set(ox + dx * 0.3, oy, oz + dz * 0.3);
-    this.remoteSmokePS.emitRate = 850;
-    this.remoteSmokeCutoffT = this.elapsed + 0.55;
+    rig.smokePS.direction1.set(dx * 1.0 - sSpread, 0.12, dz * 1.0 - sSpread);
+    rig.smokePS.direction2.set(dx * 1.5 + sSpread, 0.55, dz * 1.5 + sSpread);
+    rig.smokeEmit.set(ox + dx * 0.3, oy, oz + dz * 0.3);
+    rig.smokePS.emitRate = 850;
+    rig.smokeCutoffT = this.elapsed + 0.55;
 
     // 3) Lingering cloud — same wide spread as the fountain (covers the plume footprint)
-    this.remoteLingerEmit.set(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3);
-    this.remoteLingerPS.direction1.set(dx * 1.0 - sSpread, 0.10, dz * 1.0 - sSpread);
-    this.remoteLingerPS.direction2.set(dx * 1.5 + sSpread, 0.65, dz * 1.5 + sSpread);
-    this.remoteLingerPS.emitRate = 120;
-    this.remoteLingerCutoffT = this.elapsed + 0.55;
+    rig.lingerEmit.set(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3);
+    rig.lingerPS.direction1.set(dx * 1.0 - sSpread, 0.10, dz * 1.0 - sSpread);
+    rig.lingerPS.direction2.set(dx * 1.5 + sSpread, 0.65, dz * 1.5 + sSpread);
+    rig.lingerPS.emitRate = 120;
+    rig.lingerCutoffT = this.elapsed + 0.55;
 
     // Recoil on the firing vessel
     this.multiplayerService.applyRemoteRecoil(ox, oz);

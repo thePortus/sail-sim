@@ -2,12 +2,14 @@
 
 # General or Current TODO Items
 
-* highlighted rectable showing firing path when guns run out
-* improve ocean https://github.com/Popov72/OceanDemo
-* fix webgl ocean
+* improve ground asset scattering https://forum.babylonjs.com/t/grass-butterflies-and-trees-with-instancing/45646 https://github.com/barthpaleologue/AssetScattering
+* improve rain from https://playground.babylonjs.com/#XQ8H3C#0
+* improve landscape performance with dynamic terrain? https://github.com/BabylonJS/Extensions/blob/master/DynamicTerrain/documentation/dynamicTerrainDocumentation.md
+* improve landscape with https://medium.com/@trushkinsimon/semi-procedural-landscape-with-babylonjs-e9373bc3091d
+* add in damage morph targets
+* fix wbgl ocean
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD
 * Make emissive lights cast light on
-* Fix weird ocean dark shapes
 * Bring DRACO compression in, remove any CDNs
 * Add in more ambient sounds... wind, water... ships bells at certain hours?
 * Improve landscape/bathyscape by improved land generation methods

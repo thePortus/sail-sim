@@ -32,3 +32,5 @@ Go to the port for the angular container specified in the docker compose and you
 # Credits
 
 Some textures from Polyhaven
+
+Following [Popov72](https://github.com/Popov72/OceanDemo) for the ocean shader

@@ -530,7 +530,11 @@ export class MultiplayerService {
     // pile up in the RTT across many join/leaves.
     entry.root.getChildMeshes(false).forEach(m => {
       this.oceanService.removeFromRenderList(m);
-      (m as Mesh).dispose(false, true);
+      // dispose(doNotRecurse=false, disposeMaterialAndTextures=FALSE): vessels are
+      // instantiated with cloneMaterials=false, so every ship (local + remote) shares ONE
+      // material + texture set owned by the asset container. Disposing them here would strip
+      // the texture off the local ship and all other remotes — leaving a flat grey model.
+      (m as Mesh).dispose(false, false);
     });
     entry.root.getChildTransformNodes(false).forEach(n => n.dispose());
     entry.root.dispose();

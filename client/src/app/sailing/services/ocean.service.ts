@@ -2050,6 +2050,23 @@ export class OceanService {
     return { data: this.wakePath, count: this.wakePathCount };
   }
 
+  /** Active cannonball water impacts (vec4 ×8: x, z, age(s), _) + count, for splash displacement. */
+  getSplashData(): { data: Float32Array; count: number } {
+    return { data: this.splashData, count: this.splashCount };
+  }
+
+  /** Top-down terrain (island) shadow mask + transform + strength + live cloud cover, for the
+   *  FFT ocean to cast island/cloud shadows on the water. Black placeholder until terrain sets it. */
+  getWaterShadowInfo(): { map: Texture; center: Vector2; size: number; strength: number; cloud: number } {
+    return {
+      map: this.terrainShadowMask ?? this.shoreMapBlackTexture ?? this.reflectionRTT,
+      center: this.terrainShadowCenter,
+      size: this.terrainShadowSize > 0 ? this.terrainShadowSize : 1e9,
+      strength: this.terrainShadowStrength,
+      cloud: this._cloudCoverage,
+    };
+  }
+
   /**
    * Shore/elevation map for the FFT ocean (shoaling + shallow shading). R = clamp((elev+15)/20).
    * Returns a black placeholder + huge size until terrain sets the real map (so the FFT ocean

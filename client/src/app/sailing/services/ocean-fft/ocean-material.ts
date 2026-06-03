@@ -37,6 +37,12 @@ export interface OceanMaterialDeps {
   getBoatWake: (() => { x: number; z: number; dirX: number; dirZ: number; speed: number }) | null;
   /** The CPU wake track (vec4×24: x,z,age,_) + count — gives the wake its curved trail. */
   getWakePath: (() => { data: Float32Array; count: number }) | null;
+  /** Active cannonball water impacts (vec4×8: x,z,age,_) + count, for splash displacement. */
+  getSplashData: (() => { data: Float32Array; count: number }) | null;
+  /** Island shadow mask + transform + strength + cloud cover, for shadows on the water. */
+  getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number }) | null;
+  /** All vessel positions (local + remote) for boat shadows: vec4×8 (x,z,_,_) + count. */
+  getBoatShadows: (() => { data: Float32Array; count: number }) | null;
 }
 
 export class OceanFFTMaterial {
@@ -120,6 +126,26 @@ export class OceanFFTMaterial {
       mat.AddUniform('_WakePath[24]', 'vec4', '');   // x, z, age, _ — set per frame via setArray4
       mat.AddUniform('_WakeCount', 'float', '');
     }
+    const hasSplash = !!this._deps.getSplashData;
+    if (hasSplash) {
+      mat.AddUniform('_SplashData[8]', 'vec4', '');   // x, z, age, _
+      mat.AddUniform('_SplashCount', 'float', '');
+    }
+    const shadow0 = this._deps.getWaterShadow?.() ?? null;
+    const hasShadows = !!shadow0;
+    if (shadow0) {
+      mat.AddUniform('_TerrainShadowMask', 'sampler2D', shadow0.map);
+      mat.AddUniform('_TShadowCenter', 'vec2', shadow0.center);
+      mat.AddUniform('_TShadowSize', 'float', shadow0.size);
+      mat.AddUniform('_TShadowStrength', 'float', 0);
+      mat.AddUniform('_CloudCover', 'float', 0);
+      mat.AddUniform('_SunDir', 'vec3', new Vector3(0, 1, 0));
+    }
+    const hasBoatShadows = !!(shadow0 && this._deps.getBoatShadows);
+    if (hasBoatShadows) {
+      mat.AddUniform('_BoatShadowData[8]', 'vec4', '');   // x, z, _, _
+      mat.AddUniform('_BoatShadowCount', 'float', '');
+    }
 
     const defines: string[] = [];
     if (useMid) { defines.push('#define MID'); }
@@ -129,6 +155,92 @@ export class OceanFFTMaterial {
     const shoreDef = shore0 ? '#define HAS_SHORE' : '';
     const refrDef = hasRefraction ? '#define HAS_REFRACTION' : '';
     const wakeDef = hasWake ? '#define HAS_WAKE' : '';
+    const splashDef = hasSplash ? '#define HAS_SPLASH' : '';
+    const shadowDef = hasShadows ? '#define HAS_SHADOWS' : '';
+    const boatShadowDef = hasBoatShadows ? '#define HAS_BOATSHADOWS' : '';
+    // Island + cloud shadows on the water (world-space, so they darken our emissive water
+    // which PBR's own shadow path can't reach). Cloud shadows: drifting value noise projected
+    // down-sun. Plus a soft round shadow under the local boat.
+    const shadowFn = hasShadows ? `
+      float _hashS(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float _vnoiseS(vec2 p){
+        vec2 i = floor(p); vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        float a = _hashS(i), b = _hashS(i + vec2(1.,0.)), c = _hashS(i + vec2(0.,1.)), d = _hashS(i + vec2(1.,1.));
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
+      float _waterShadow(vec2 wxz) {
+        float sh = 0.0;
+        float halfSize = max(1.0, _TShadowSize * 0.5);
+        vec2 tuv = (wxz - _TShadowCenter) / (halfSize * 2.0) + 0.5;
+        if (tuv.x > 0.0 && tuv.x < 1.0 && tuv.y > 0.0 && tuv.y < 1.0) {
+          sh = texture2D(_TerrainShadowMask, tuv).r * _TShadowStrength;
+        }
+        if (_SunDir.y > 0.03 && _CloudCover > 0.02) {
+          vec2 cloudUV = (wxz + _SunDir.xz / max(_SunDir.y, 0.2) * 900.0) * 0.004;
+          vec2 drift = vec2(_Time * 1.8, _Time * 1.2);
+          float cf = _vnoiseS(cloudUV + drift) * 0.6 + _vnoiseS(cloudUV * 2.3 - drift * 1.7) * 0.4;
+          float cs = smoothstep(0.60 - _CloudCover * 0.45, 0.70 - _CloudCover * 0.30, cf);
+          cs *= _CloudCover * smoothstep(0.03, 0.18, _SunDir.y);
+          sh = max(sh, cs);
+        }
+        #ifdef HAS_BOATSHADOWS
+          // Soft shadow under every vessel (local + remote), cast down-sun.
+          if (_SunDir.y > 0.03 && _BoatShadowCount > 0.5) {
+            vec2 off = _SunDir.xz / max(_SunDir.y, 0.35) * 2.0;
+            float gate = smoothstep(0.03, 0.22, _SunDir.y) * 0.5;
+            for (int i = 0; i < 8; i++) {
+              if (float(i) >= _BoatShadowCount) break;
+              float bd = length(wxz - (_BoatShadowData[i].xy - off));
+              sh = max(sh, (1.0 - smoothstep(5.5, 11.0, bd)) * gate);
+            }
+          }
+        #endif
+        return sh;
+      }
+    ` : '';
+    // Cannonball water impact: crater punches down (~0.16s), rebounds into a geyser column
+    // (~0.62s), and an expanding ring ripples out — fading over ~1.6s. Pure vertical
+    // displacement, added on top of the swell so the spout rides the waves.
+    const splashFn = hasSplash ? `
+      float _splashDisp(vec2 wxz) {
+        if (_SplashCount < 0.5) return 0.0;
+        float sum = 0.0;
+        for (int i = 0; i < 8; i++) {
+          if (float(i) >= _SplashCount) break;
+          vec2 c = _SplashData[i].xy;
+          float age = _SplashData[i].z;
+          float life = 1.0 - age / 1.6;
+          if (life <= 0.0) continue;
+          float r = length(wxz - c);
+          float qc = (age - 0.16) / 0.22;
+          float qg = (age - 0.62) / 0.24;
+          float crater = -exp(-(r * r) / 5.0)  * exp(-qc * qc) * 3.0;
+          float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
+          float ringR  = age * 6.0;
+          float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
+          sum += crater + geyser + ring;
+        }
+        return sum;
+      }
+      float _splashFoam(vec2 wxz) {
+        if (_SplashCount < 0.5) return 0.0;
+        float f = 0.0;
+        for (int i = 0; i < 8; i++) {
+          if (float(i) >= _SplashCount) break;
+          vec2 c = _SplashData[i].xy;
+          float age = _SplashData[i].z;
+          float life = 1.0 - age / 1.6;
+          if (life <= 0.0) continue;
+          float r = length(wxz - c);
+          float col  = exp(-(r * r) / 4.0) * smoothstep(0.0, 0.25, age) * life;   // churned column
+          float ringR = age * 6.0;
+          float ring  = exp(-((r - ringR) * (r - ringR)) / 3.0) * life * 0.8;      // foam ring
+          f = max(f, max(col, ring));
+        }
+        return f;
+      }
+    ` : '';
     // Wake along the boat's actual (curved) CPU track: find the nearest point on the path
     // polyline, then build a turbulent core + a pair of diverging bow-wave edges that spread
     // as the wake ages. Following the track means the wake bends through turns. Returns
@@ -214,9 +326,9 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}`;
-    mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}`);
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${shadowDef}`;
+    mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${shadowFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -259,6 +371,11 @@ export class OceanFFTMaterial {
         vec2 wcv = _wakeCV(vWorldUV);
         displacement *= (1.0 - 0.65 * wcv.x);
         displacement.y += -0.80 * wcv.x + 0.70 * wcv.y;
+      #endif
+
+      #ifdef HAS_SPLASH
+        // Transient cannonball impacts ride on top of the swell (not flattened by wake/shore).
+        displacement.y += _splashDisp(vWorldUV);
       #endif
 
       worldPos.xyz += displacement;
@@ -329,6 +446,11 @@ export class OceanFFTMaterial {
         jacobian = max(jacobian, clamp(wakeFoam, 0.0, 1.0));
       #endif
 
+      #ifdef HAS_SPLASH
+        // Foam at the geyser column + the expanding rebound ring.
+        jacobian = max(jacobian, clamp(_splashFoam(vWorldUV), 0.0, 1.0));
+      #endif
+
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
 
       vec3 viewDir = normalize(vViewVector);
@@ -376,6 +498,9 @@ export class OceanFFTMaterial {
         vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
         waterCol += planarRefl * fresnel * _ReflStrength;
       #endif
+      #ifdef HAS_SHADOWS
+        waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
+      #endif
       finalEmissive = mix(waterCol, vec3(0.0), jacobian);
     `);
 
@@ -403,6 +528,25 @@ export class OceanFFTMaterial {
         eff.setFloat('_BoatSpeed', wake.speed);
         eff.setArray4('_WakePath', path.data as unknown as number[]);
         eff.setFloat('_WakeCount', path.count);
+      }
+      const splash = this._deps.getSplashData?.();
+      if (splash) {
+        eff.setArray4('_SplashData', splash.data as unknown as number[]);
+        eff.setFloat('_SplashCount', splash.count);
+      }
+      const sh = this._deps.getWaterShadow?.();
+      if (sh) {
+        eff.setTexture('_TerrainShadowMask', sh.map as Texture);
+        eff.setFloat2('_TShadowCenter', sh.center.x, sh.center.y);
+        eff.setFloat('_TShadowSize', sh.size);
+        eff.setFloat('_TShadowStrength', sh.strength);
+        eff.setFloat('_CloudCover', sh.cloud);
+        eff.setVector3('_SunDir', this._deps.getSunDir());
+      }
+      const boats = this._deps.getBoatShadows?.();
+      if (boats) {
+        eff.setArray4('_BoatShadowData', boats.data as unknown as number[]);
+        eff.setFloat('_BoatShadowCount', boats.count);
       }
     });
 

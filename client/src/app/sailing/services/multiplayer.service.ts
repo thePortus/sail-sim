@@ -181,6 +181,22 @@ export class MultiplayerService {
   /** The root TransformNode of a remote vessel, or null. */
   getRemoteRoot(id: string): TransformNode | null { return this.players.get(id)?.root ?? null; }
 
+  /** Fill remote vessel display positions (x,z) into `out` (vec4 stride) from index `start`,
+   *  up to `max` total entries. Returns how many were written. For the FFT ocean boat shadows. */
+  fillVesselPositions(out: Float32Array, start: number, max: number): number {
+    let n = 0;
+    for (const e of this.players.values()) {
+      const i = start + n;
+      if (i >= max) { break; }
+      out[i * 4 + 0] = e.dispX;
+      out[i * 4 + 1] = e.dispZ;
+      out[i * 4 + 2] = 0;
+      out[i * 4 + 3] = 0;
+      n++;
+    }
+    return n;
+  }
+
   /** Broadcast a gun-deploy change so other players see this ship's ports/run-out.
    *  deploy: 1 = arming/ready (ports open, gun out), 0 = stowing/reloaded (ports shut). */
   broadcastGunState(side: 'port' | 'stbd', deploy: 0 | 1): void {

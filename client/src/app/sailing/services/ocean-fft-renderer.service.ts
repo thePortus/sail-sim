@@ -14,6 +14,8 @@ import { Observer, Scene, Material, Mesh, PBRMaterial, Color3 } from '@babylonjs
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { OceanFFTEngine } from './ocean-fft-engine.service';
+import { CannonService } from './cannon.service';
+import { MultiplayerService } from './multiplayer.service';
 import { OceanGeometry } from './ocean-fft/ocean-geometry';
 import { OceanFFTMaterial } from './ocean-fft/ocean-material';
 
@@ -22,6 +24,11 @@ export class OceanFFTRenderer {
   private sceneService = inject(SceneService);
   private oceanService = inject(OceanService);
   private fft = inject(OceanFFTEngine);
+  private cannonService = inject(CannonService);
+  private multiplayerService = inject(MultiplayerService);
+
+  /** Reusable buffer for boat-shadow positions (local at 0, then remotes). vec4 ×8. */
+  private readonly _boatShadowBuf = new Float32Array(8 * 4);
 
   private _geometry: OceanGeometry | null = null;
   private _material: OceanFFTMaterial | null = null;
@@ -61,6 +68,15 @@ export class OceanFFTRenderer {
       getShore: () => this.oceanService.getShoreInfo(),
       getBoatWake: () => this.oceanService.getBoatWake(),
       getWakePath: () => this.oceanService.getWakePath(),
+      getSplashData: () => this.oceanService.getSplashData(),
+      getWaterShadow: () => this.oceanService.getWaterShadowInfo(),
+      getBoatShadows: () => {
+        const buf = this._boatShadowBuf;
+        const local = this.oceanService.getBoatWake();
+        buf[0] = local.x; buf[1] = local.z; buf[2] = 0; buf[3] = 0;
+        const n = 1 + this.multiplayerService.fillVesselPositions(buf, 1, 8);
+        return { data: buf, count: n };
+      },
       getSunDir: () => this.sceneService.getSunDirection(),
       getTime: () => performance.now() / 1000 - this._startTime,
     });
@@ -165,6 +181,11 @@ export class OceanFFTRenderer {
       else if (e.code === 'KeyP') { e.preventDefault(); this.togglePlain(); }
       else if (e.code === 'KeyD') { e.preventDefault(); this.fft.debugReadback(); }
       else if (e.code === 'KeyI') { e.preventDefault(); this.fft.toggleDebugSkipIFFT(); }
+      else if (e.code === 'KeyM') {
+        e.preventDefault();
+        this.cannonService.suppressSplashFx = !this.cannonService.suppressSplashFx;
+        console.log(`[OceanFFT] splash particles ${this.cannonService.suppressSplashFx ? 'OFF' : 'ON'}`);
+      }
     };
     window.addEventListener('keydown', this._keyHandler);
   }

@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture,
+  MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture, Color4,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -1531,7 +1531,12 @@ export class OceanService {
     // shader "sees past" the keel to the seabed and sand shows through the hull.
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_');
+      !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_') &&
+      m.name !== 'skybox';   // exclude the sky: where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+    // Clear to a sandy tan so where the seabed drops off (no terrain behind the water) the
+    // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
+    // the deep→shallow boundary into the beach colour.
+    this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
     this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
     scene.customRenderTargets.push(this.refractionRTT);
 

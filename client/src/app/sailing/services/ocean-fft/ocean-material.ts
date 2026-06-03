@@ -41,12 +41,16 @@ export interface OceanMaterialDeps {
   getWakePaths: (() => { paths: Float32Array; meta: Float32Array; count: number }) | null;
   /** Active cannonball water impacts (vec4×8: x,z,age,_) + count, for splash displacement. */
   getSplashData: (() => { data: Float32Array; count: number }) | null;
+  /** Active cannon muzzle flashes (vec4×6: x,z,age,_) + count + life, for a brief warm emissive glow. */
+  getCannonFlash: (() => { data: Float32Array; count: number; life: number }) | null;
   /** Island shadow mask + transform + strength + cloud cover, for shadows on the water. */
   getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number }) | null;
   /** All vessel positions (local + remote) for boat shadows: vec4×8 (x,z,_,_) + count. */
   getBoatShadows: (() => { data: Float32Array; count: number }) | null;
   /** Rain intensity 0..1 — peppers the near surface with raindrop ripples. */
   getRain: (() => number) | null;
+  /** Sea choppiness 0..1 — trims whitecap foam in heavy seas so it doesn't over-foam. */
+  getChoppiness?: (() => number) | null;
 }
 
 export class OceanFFTMaterial {
@@ -83,6 +87,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
     mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
     mat.AddUniform('_FoamBiasLOD2', 'float', 2.80);
+    mat.AddUniform('_Choppiness', 'float', 0.3);   // sea state 0..1 — trims foam in heavy seas
 
     mat.AddUniform('_SSSColor', 'vec3', new Vector3(0.1541919, 0.8857628, 0.990566));
     mat.AddUniform('_SSSStrength', 'float', 0.205);   // back-lit glow (between demo 0.15 and 0.26)
@@ -125,7 +130,7 @@ export class OceanFFTMaterial {
     }
     const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePaths);
     if (hasWake) {
-      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + transparency)
+      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + deep-water transparency halo)
       mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
       mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
       mat.AddUniform('_WakeBoatCount', 'float', '');
@@ -134,6 +139,12 @@ export class OceanFFTMaterial {
     if (hasSplash) {
       mat.AddUniform('_SplashData[8]', 'vec4', '');   // x, z, age, _
       mat.AddUniform('_SplashCount', 'float', '');
+    }
+    const hasFlash = !!this._deps.getCannonFlash;
+    if (hasFlash) {
+      mat.AddUniform('_FlashData[6]', 'vec4', '');    // x, z, age, _
+      mat.AddUniform('_FlashCount', 'float', '');
+      mat.AddUniform('_FlashLife', 'float', '');
     }
     const shadow0 = this._deps.getWaterShadow?.() ?? null;
     const hasShadows = !!shadow0;
@@ -164,6 +175,7 @@ export class OceanFFTMaterial {
     const refrDef = hasRefraction ? '#define HAS_REFRACTION' : '';
     const wakeDef = hasWake ? '#define HAS_WAKE' : '';
     const splashDef = hasSplash ? '#define HAS_SPLASH' : '';
+    const flashDef = hasFlash ? '#define HAS_FLASH' : '';
     const shadowDef = hasShadows ? '#define HAS_SHADOWS' : '';
     const boatShadowDef = hasBoatShadows ? '#define HAS_BOATSHADOWS' : '';
     const rainDef = hasRain ? '#define HAS_RAIN' : '';
@@ -202,9 +214,11 @@ export class OceanFFTMaterial {
         float sh = 0.0;
         float halfSize = max(1.0, _TShadowSize * 0.5);
         vec2 tuv = (wxz - _TShadowCenter) / (halfSize * 2.0) + 0.5;
-        if (tuv.x > 0.0 && tuv.x < 1.0 && tuv.y > 0.0 && tuv.y < 1.0) {
-          sh = texture2D(_TerrainShadowMask, tuv).r * _TShadowStrength;
-        }
+        // Sample unconditionally (uniform control flow) — texture2D inside a branch is an
+        // illegal non-uniform textureSample on WebGPU and kills the fragment pipeline.
+        // Mask the result to the in-bounds region instead of gating the sample itself.
+        float inBounds = step(0.0, tuv.x) * step(tuv.x, 1.0) * step(0.0, tuv.y) * step(tuv.y, 1.0);
+        sh = texture2D(_TerrainShadowMask, clamp(tuv, 0.0, 1.0)).r * _TShadowStrength * inBounds;
         if (_SunDir.y > 0.03 && _CloudCover > 0.02) {
           vec2 cloudUV = (wxz + _SunDir.xz / max(_SunDir.y, 0.2) * 900.0) * 0.004;
           vec2 drift = vec2(_Time * 1.8, _Time * 1.2);
@@ -270,6 +284,34 @@ export class OceanFFTMaterial {
         return f;
       }
     ` : '';
+    // Cannon muzzle-flash: a brief, local warm glow added to the sea's emissive colour, so the
+    // water lights up when a broadside fires (a scene point light can't light the emissive ocean).
+    const flashFn = hasFlash ? `
+      vec3 _cannonFlashGlow(vec2 wxz) {
+        if (_FlashCount < 0.5) return vec3(0.0);
+        vec3 sum = vec3(0.0);
+        for (int i = 0; i < 6; i++) {
+          if (float(i) >= _FlashCount) break;
+          vec2 c = _FlashData[i].xy;
+          float age = _FlashData[i].z;
+          float t01 = age / max(_FlashLife, 0.001);
+          if (t01 >= 1.0) continue;
+          // Instant onset, quick fade (sharp at ignition, gone within FLASH_LIFE).
+          float env = (1.0 - t01) * (1.0 - t01);
+          float r = length(wxz - c);
+          // ~16 m soft pool of light, fading with distance — stays local to the firing ship.
+          float fall = exp(-(r * r) / 110.0);
+          // Hull occlusion: the muzzle sits on the firing side, the keel runs perpendicular to the
+          // beam direction D. Mask the glow to the firing side of the keel centreline (~2.5 m
+          // inboard of the muzzle) so the hull blocks the far side — port fire doesn't light stbd.
+          vec2 D = vec2(cos(_FlashData[i].w), sin(_FlashData[i].w));
+          float sFrag = dot(wxz - c, D) + 2.5;   // >0 firing side, ramps negative across the keel
+          float sideMask = mix(0.08, 1.0, smoothstep(-1.5, 1.5, sFrag));
+          sum += vec3(1.0, 0.52, 0.18) * env * fall * sideMask;
+        }
+        return sum;
+      }
+    ` : '';
     // Wake along the boat's actual (curved) CPU track: find the nearest point on the path
     // polyline, then build a turbulent core + a pair of diverging bow-wave edges that spread
     // as the wake ages. Following the track means the wake bends through turns. Returns
@@ -285,6 +327,7 @@ export class OceanFFTMaterial {
           int base = b * ${WAKE_POINTS};
           float bestD = 1.0e9;
           float bestAge = 0.0;
+          float bestSpd = 0.0;
           for (int i = 0; i < ${WAKE_POINTS - 1}; i++) {
             if (float(i) >= bmeta.z - 1.0) break;
             vec2 a = _WakePaths[base + i].xy;
@@ -293,14 +336,22 @@ export class OceanFFTMaterial {
             float L2 = max(dot(ab, ab), 1.0e-3);
             float t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
             float d = length(wxz - (a + ab * t));
-            if (d < bestD) { bestD = d; bestAge = mix(_WakePaths[base + i].z, _WakePaths[base + i + 1].z, t); }
+            if (d < bestD) {
+              bestD = d;
+              bestAge = mix(_WakePaths[base + i].z, _WakePaths[base + i + 1].z, t);
+              bestSpd = mix(_WakePaths[base + i].w, _WakePaths[base + i + 1].w, t);   // laydown speed
+            }
           }
           float ageFade = 1.0 - smoothstep(0.0, ${(WAKE_LIFE - 1).toFixed(1)}, bestAge);
           if (ageFade <= 0.001) continue;
-          float width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bmeta.w * 0.30);
+          // Strength + width scale with how fast the ship was when it laid this segment
+          // (bestSpd = abs(m/s)×4): a crawling ship leaves a faint, narrow trail; one at
+          // speed a broad, bright one. Old fast wakes stay strong even after the ship slows.
+          float speedFac = mix(0.08, 1.0, smoothstep(3.0, 16.0, bestSpd));
+          float width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bestSpd * 0.30);
           float coreW = max(1.5, width * 0.40);
-          float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade;
-          float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade;
+          float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade * speedFac;
+          float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade * speedFac;
           res = max(res, vec2(core, edge));
         }
         return res;
@@ -310,8 +361,10 @@ export class OceanFFTMaterial {
     const shoreFn = shore0 ? `
       float _shoreProx(vec2 wxz) {
         vec2 uv = (wxz - _ShoreCenter) / _ShoreSize + 0.5;
-        if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) return 0.0;
-        return texture2D(_ShoreMap, uv).r;
+        // Sample unconditionally (uniform control flow) then mask — texture2D after an early
+        // return is an illegal non-uniform textureSample on WebGPU (same trap as _waterShadow).
+        float inB = step(0.001, uv.x) * step(uv.x, 0.999) * step(0.001, uv.y) * step(uv.y, 0.999);
+        return texture2D(_ShoreMap, clamp(uv, 0.001, 0.999)).r * inB;
       }
     ` : '';
     // Drifting fish silhouettes on the seabed (ported from the procedural ocean): one fish
@@ -319,21 +372,21 @@ export class OceanFFTMaterial {
     const fishFn = hasRefraction ? `
       float fishHash(vec2 id) { return fract(sin(dot(id, vec2(41.3, 289.1))) * 43758.5453); }
       float fishField(vec2 p, float t) {
-        float scale = 0.085;
+        float scale = 0.15;                     // smaller cells (~6.7 m) → many more fish
         vec2  id  = floor(p * scale);
         float rnd = fishHash(id);
-        if (rnd <= 0.76) return 0.0;
+        if (rnd <= 0.45) return 0.0;            // ~55% of cells hold a fish (was ~24%)
         float szr = fishHash(id + 31.7);
         float ph  = rnd * 53.0;
         float sp1 = 0.30 + rnd * 0.55;
         float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
         vec2  cellC = (id + 0.5) / scale;
-        vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+        vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 2.6;
         vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
         vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
         vec2  rel   = p - fishC;
         vec2  local = vec2(dot(rel, fwd), dot(rel, vec2(-fwd.y, fwd.x)));
-        local /= (0.5 + szr * 0.7);
+        local /= (0.22 + szr * 0.30);   // much smaller fish (< half the old size)
         float fx = local.x;
         float fy = abs(local.y);
         float shape = 0.0;
@@ -361,9 +414,9 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${flashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
     mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${shadowFn}\n${rainFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -453,20 +506,24 @@ export class OceanFFTMaterial {
             float n0 = _rainField(rp, rt);
             vec2  grad = vec2(_rainField(rp + vec2(e, 0.0), rt) - n0,
                               _rainField(rp + vec2(0.0, e), rt) - n0) / e;
-            normalW = normalize(normalW + vec3(grad.x, 0.0, grad.y) * (0.18 * _RainIntensity * nearF));
+            normalW = normalize(normalW + vec3(grad.x, 0.0, grad.y) * (0.65 * _RainIntensity * nearF));
           }
         }
       #endif
 
+      // Choppy seas have far more turbulence variance, so a wide area dips below the foam
+      // bias → whitecaps everywhere. Trim the bias as choppiness rises so heavy seas don't
+      // over-foam; calm water (chop≈0) is left exactly as before. (Lower bias ⇒ less foam.)
+      float foamChop = 1.0 - _Choppiness * 0.32;
       #if defined(CLOSE)
         float jacobian = texture2D(_Turbulence_c0, uv0).x + texture2D(_Turbulence_c1, uv1).x + texture2D(_Turbulence_c2, uv2).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD2) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD2 * foamChop) * _FoamScale));
       #elif defined(MID)
         float jacobian = texture2D(_Turbulence_c0, uv0).x + texture2D(_Turbulence_c1, uv1).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD1) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD1 * foamChop) * _FoamScale));
       #else
         float jacobian = texture2D(_Turbulence_c0, uv0).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD0) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD0 * foamChop) * _FoamScale));
       #endif
 
       #ifdef HAS_DEPTH
@@ -479,16 +536,8 @@ export class OceanFFTMaterial {
         jacobian += _ContactFoam * saturate(max(0.0, foam - depthDifference) * 5.0) * 0.9;
       #endif
 
-      #ifdef HAS_SHORE
-        // Breaking-wave surf hugging the waterline — but broken up by two scrolling foam
-        // samples so it reads as textured foam, not a flat white band, and kept subtle.
-        float proxF = _shoreProx(vWorldUV);
-        float surfBand = smoothstep(0.60, 0.71, proxF) * (1.0 - smoothstep(0.73, 0.85, proxF));
-        float fA = texture2D(_FoamTexture, vWorldUV * 0.06 + _Time * 0.6).r;
-        float fB = texture2D(_FoamTexture, vWorldUV * 0.13 - _Time * 0.4).r;
-        float surf = surfBand * smoothstep(0.45, 0.95, fA * 0.6 + fB * 0.6);
-        jacobian = max(jacobian, surf * 0.45);
-      #endif
+      // (Shoreline foam removed — the coast is handled by a water→sand transparency runoff
+      //  in the colour-composition stage instead.)
 
       #ifdef HAS_WAKE
         // Wake foam: bright churned core + thin diverging bow-wave lines, broken up by a
@@ -506,11 +555,23 @@ export class OceanFFTMaterial {
         jacobian = max(jacobian, clamp(_splashFoam(vWorldUV), 0.0, 1.0));
       #endif
 
+      #ifdef HAS_SHORE
+        // Calm the whitecap foam across the whole shallow zone so the shoreline isn't ringed by
+        // a bright foamy band — the shallows are shoal-calmed clear water, so no whitecaps.
+        jacobian *= 1.0 - smoothstep(0.12, 0.48, _shoreProx(vWorldUV)) * 0.96;
+      #endif
+
+      // (Rain reads purely as the dimpled surface NORMAL — see HAS_RAIN above — no white foam.)
+
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
 
       vec3 viewDir = normalize(vViewVector);
       vec3 H = normalize(-normalW + lightDirection);
-      float ViewDotH = pow5(saturate(dot(viewDir, -H))) * 30.0 * _SSSStrength;
+      // Back-lit subsurface glow is SUN-driven — fade it out as the sun sets so the sea
+      // doesn't keep glowing turquoise after dark (lightDirection.y > 0 ⇒ sun above horizon,
+      // same convention the shadow pass uses).
+      float sunUp = smoothstep(0.0, 0.12, lightDirection.y);
+      float ViewDotH = pow5(saturate(dot(viewDir, -H))) * 30.0 * _SSSStrength * sunUp;
       vec3 color = mix(_Color, saturate(_Color + _SSSColor.rgb * ViewDotH * vLodScales.w), vLodScales.z);
 
       float fresnel = dot(normalW, viewDir);
@@ -521,35 +582,70 @@ export class OceanFFTMaterial {
     mat.Fragment_Custom_MetallicRoughness(`
       float distanceGloss = mix(1.0 - metallicRoughness.g, _MaxGloss, 1.0 / (1.0 + length(vViewVector) * _RoughnessScale));
       metallicRoughness.g = 1.0 - mix(distanceGloss, 0.0, jacobian);
+      #ifdef HAS_SHORE
+        // Drive the shoal-calmed shallows fully MATTE so the sun/sky specular can't form a
+        // bright band along the shore — the glossy default (roughness ~0.09 at distance) was
+        // mirroring the sky at the grazing angle. Reaches full roughness by the outer shallows.
+        metallicRoughness.g = mix(metallicRoughness.g, 1.0, smoothstep(0.0, 0.28, _shoreProx(vWorldUV)));
+      #endif
     `);
 
     mat.Fragment_Before_FinalColorComposition(`
       vec3 waterCol = color * (1.0 - fresnel);
+      // Water→sand runoff: 0 in open water, ramping to 1 right at the shoreline so the water
+      // dissolves into the seabed and there's no obvious line where it starts/ends.
+      float shoreFade = 0.0;
+      float shoalReveal = 0.0;   // how much seabed shows (set in the refraction stage) — dims surface glint
+      float shoreReflCut = 1.0;  // cuts sky reflection across the shallows (kills the blue ring offshore)
       #ifdef HAS_SHORE
         float prox = _shoreProx(vWorldUV);
-        // Shallow turquoise water-column tint as the seabed rises toward the beach.
-        float shallowF = smoothstep(0.42, 0.70, prox);
-        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shallowF * 0.55);
+        shoreFade = smoothstep(0.70, 0.95, prox);
+        shoreReflCut = 1.0 - smoothstep(0.0, 0.40, prox) * 0.99;   // suppress the sky glint across the shallows
+        // Shallow turquoise water-column tint as the seabed rises toward the beach. It's
+        // emissive (unaffected by scene lighting), so without a day factor it glows brightly
+        // (Shallow turquoise water-column tint removed — the shallows now read purely from the
+        //  revealed seabed below, for a clear-water look.)
         #ifdef HAS_REFRACTION
           // True transparency: blend in the seabed colour (scene-minus-ocean RTT), revealed
           // more as the water shallows. Refracted slightly by the wave normal.
           // Shallow seabed reveal, plus a strong boost right around the hull so the submerged
           // hull/keel shows through the water near the boat (where the refraction RTT has it),
           // plus a faint global baseline.
-          float reveal = smoothstep(0.50, 0.78, prox);
+          // Wide ramp so the whole shallow zone reads as transparent — you see the sea floor
+          // (and the boat's shadow/keel on it) right across the shallows, not just at the very
+          // edge — plus a strong near-hull boost and a faint deep-water baseline.
+          float reveal = smoothstep(0.40, 0.82, prox);   // pulled in, but a wide ramp so the shallows' edge gives way gradually
           #ifdef HAS_WAKE
             reveal = max(reveal, 0.75 * (1.0 - smoothstep(2.0, 14.0, length(vWorldUV - _BoatPos))));
           #endif
-          reveal = max(reveal, 0.12);
+          reveal = max(reveal, 0.06);
           vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
-          vec3 seabed = texture2D(_Refraction, refrUV).rgb * vec3(0.42, 0.52, 0.58);
+          vec3 refr = texture2D(_Refraction, refrUV).rgb;
+          // Only reveal where there's actually a seabed behind the water — the refraction RTT
+          // clears to black where the seabed has dropped off, so gate by its brightness to
+          // avoid a band there (the water just shows its own deep colour instead).
+          reveal *= smoothstep(0.02, 0.16, max(refr.r, max(refr.g, refr.b)));
+          shoalReveal = reveal;   // shared with the reflection stage to dim glint over the shallows
           // Drifting fish on the seabed — only with the camera above water (_Time is /10, so ×10).
           if (_WorldSpaceCameraPos.y > 0.05) {
             float fish = fishField(vWorldUV, _Time * 10.0);
-            seabed *= (1.0 - fish * 0.5);
+            refr *= (1.0 - fish * 0.5);
           }
-          waterCol = mix(waterCol, seabed, reveal * 0.92);
+          // Broad shallows: reveal the sandy bottom so you can SEE the sea floor through the
+          // water. Kept on the wet/darker side so the submerged sand matches the wet sand the
+          // terrain paints at the waterline (rather than reading lighter).
+          // The revealed seabed is emissive; the lit terrain darkens with the scene but the
+          // refraction's flat tan clear-colour does not, so it glows after dark. Day-gate it
+          // (sunUp: 0 below horizon → 1 in daylight) so the shallows fade to dark at night.
+          vec3 seabedSand = refr * vec3(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
+          // Reveal the sandy bottom across the shallows; at the very shoreline ramp it to full
+          // so the water dissolves into the matching beach sand — no hard line, no teal ring.
+          waterCol = mix(waterCol, seabedSand, max(reveal * 0.85, shoreFade));
         #endif
+        // Subtle turquoise ring at the OUTER edge of the shallows (deep → shallow transition),
+        // sun-gated so it doesn't glow at night.
+        float shoalRing = smoothstep(0.16, 0.30, prox) * (1.0 - smoothstep(0.34, 0.52, prox));
+        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shoalRing * 0.16 * sunUp);
       #endif
       #ifdef HAS_REFLECTION
         // Planar mirror reflection (skybox + islands + vessels), rippled by the wave normal,
@@ -558,12 +654,20 @@ export class OceanFFTMaterial {
         reflUV += normalW.xz * 0.04;
         reflUV = clamp(reflUV, vec2(0.002), vec2(0.998));
         vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
-        waterCol += planarRefl * fresnel * _ReflStrength;
+        // Strongly dim the surface glint over the clear shallows so the wet sandy bottom shows
+        // through as SAND, not a turquoise sky reflection — this is what makes the dissolved
+        // shoreline blend to sand rather than reading teal.
+        waterCol += planarRefl * fresnel * _ReflStrength * (1.0 - shoreFade) * shoreReflCut;
       #endif
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
       #endif
       finalEmissive = mix(waterCol, vec3(0.0), jacobian);
+      #ifdef HAS_FLASH
+        // Warm muzzle-flash glow on the sea — added on top (lights foam too) so a broadside
+        // visibly illuminates the surrounding water.
+        finalEmissive += _cannonFlashGlow(vWorldUV);
+      #endif
     `);
 
     // Per-frame uniforms (camera pos, ping-ponged turbulence, time, light dir).
@@ -600,6 +704,12 @@ export class OceanFFTMaterial {
         eff.setArray4('_SplashData', splash.data as unknown as number[]);
         eff.setFloat('_SplashCount', splash.count);
       }
+      const flash = this._deps.getCannonFlash?.();
+      if (flash) {
+        eff.setArray4('_FlashData', flash.data as unknown as number[]);
+        eff.setFloat('_FlashCount', flash.count);
+        eff.setFloat('_FlashLife', flash.life);
+      }
       const sh = this._deps.getWaterShadow?.();
       if (sh) {
         eff.setTexture('_TerrainShadowMask', sh.map as Texture);
@@ -616,6 +726,8 @@ export class OceanFFTMaterial {
       }
       const rain = this._deps.getRain?.();
       if (rain !== undefined && rain !== null) { eff.setFloat('_RainIntensity', rain); }
+      const chop = this._deps.getChoppiness?.();
+      if (chop !== undefined && chop !== null) { eff.setFloat('_Choppiness', chop); }
     });
 
     return mat;

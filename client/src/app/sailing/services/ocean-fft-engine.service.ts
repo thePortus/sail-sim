@@ -41,6 +41,10 @@ export class OceanFFTEngine {
   private _lastWindMs = -1;   // last applied wind speed (m/s)
   private _lastDirDeg = -999;
   private _lastChop = -1;
+  private _choppiness = 0.3;   // latest sea-state 0..1 (drives foam trim in the material)
+
+  /** Latest sea choppiness (0..1) from the weather system. */
+  get choppiness(): number { return this._choppiness; }
 
   /** True when the GPU FFT pipeline is live (WebGPU + initialised). */
   get isActive(): boolean { return this._active; }
@@ -107,6 +111,7 @@ export class OceanFFTEngine {
     const dir       = wind.fromBearingDeg;
     const chop      = Math.max(0.05, Math.min(1, sea.choppiness));
     const beaufortT = Math.max(0, Math.min(1, (wind.beaufort ?? 0) / 12));
+    this._choppiness = chop;   // exposed to the material so heavy seas foam less
 
     const s = this._settings;
     // Wind-driven sea (the dominant, locally-generated chop + waves).

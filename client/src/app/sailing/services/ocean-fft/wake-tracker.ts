@@ -13,7 +13,7 @@ export const WAKE_LIFE = 12;       // seconds before a wake point fades out
 const WAKE_STEP = 3;               // metres travelled between recorded points
 
 interface Track {
-  path: Float32Array;   // vec4 ×WAKE_POINTS: x, z, age, _
+  path: Float32Array;   // vec4 ×WAKE_POINTS: x, z, age, speed-at-laydown
   count: number;
   lastX: number; lastZ: number;   // last recorded point
   curX: number; curZ: number;     // current position (for culling)
@@ -53,7 +53,9 @@ export class WakeTracker {
       if (Math.abs(b.speed) > 0.2 && dx * dx + dz * dz >= WAKE_STEP * WAKE_STEP) {
         if (tr.count >= WAKE_POINTS) { tr.path.copyWithin(0, 4, WAKE_POINTS * 4); tr.count = WAKE_POINTS - 1; }
         const idx = tr.count * 4;
-        tr.path[idx] = b.x; tr.path[idx + 1] = b.z; tr.path[idx + 2] = 0; tr.path[idx + 3] = 0;
+        // 4th channel = speed at the moment this point was laid (abs(m/s)×4), so the wake's
+        // strength/width can reflect how fast the ship was HERE, not its current speed.
+        tr.path[idx] = b.x; tr.path[idx + 1] = b.z; tr.path[idx + 2] = 0; tr.path[idx + 3] = b.speed;
         tr.count++; tr.lastX = b.x; tr.lastZ = b.z;
       }
     }

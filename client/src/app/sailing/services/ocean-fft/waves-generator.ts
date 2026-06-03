@@ -43,15 +43,6 @@ export class WavesGenerator {
     this.initializeCascades();
   }
 
-  getCascade(i: number): WavesCascade { return this._cascades[i]; }
-
-  /** Debug: the raw gaussian noise texture (rg32f). */
-  get debugNoise(): RawTexture { return this._noise; }
-
-  /** Debug: skip the IFFTs on every cascade (DxDz then holds the raw spectrum). */
-  setDebugSkipIFFT(skip: boolean): void {
-    for (const c of this._cascades) { c.debugSkipIFFT = skip; }
-  }
 
   /** Rebuild every cascade's static spectrum (call after weather/settings change). */
   initializeCascades(): void {

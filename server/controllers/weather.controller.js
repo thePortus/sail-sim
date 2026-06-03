@@ -26,7 +26,11 @@ exports.setOverride = (req, res) => {
   if (cloudiness !== undefined && (typeof cloudiness !== 'number' || cloudiness < 0 || cloudiness > 1)) {
     return res.status(400).json({ error: 'cloudiness must be 0–1 when provided' });
   }
-  weatherState.setOverride({ windSpeed, fromBearingDeg, cloudiness });
+  // Tag the override with the admin's callsign (from the verified JWT) so it can be
+  // auto-cleared when they disconnect — a stale windSpeed-0 override otherwise becalms
+  // everyone who logs in afterward.
+  const owner = req.user && typeof req.user.callsign === 'string' ? req.user.callsign : null;
+  weatherState.setOverride({ windSpeed, fromBearingDeg, cloudiness, owner });
   res.json({ ok: true, snapshot: weatherState.snapshot() });
 };
 

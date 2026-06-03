@@ -42,6 +42,7 @@ const state = {
 
   // Admin
   override:      null,   // { bearing, speed, cloud } | null
+  overrideOwner: null,   // callsign of the admin who set the active override (auto-clear on their logout)
   timeOffsetSec: 0,      // added to the day/night clock for everyone
 
   t: 0,                  // seconds since start
@@ -118,12 +119,13 @@ function snapshot() {
 
 // ── Admin controls ──────────────────────────────────────────────────────────
 
-function setOverride({ windSpeed, fromBearingDeg, cloudiness }) {
+function setOverride({ windSpeed, fromBearingDeg, cloudiness, owner }) {
   state.override = {
     bearing: ((fromBearingDeg % 360) + 360) % 360,
     speed:   clamp(windSpeed, 0, 35),
     cloud:   cloudiness != null ? clamp(cloudiness, 0, 1) : null,
   };
+  state.overrideOwner = typeof owner === 'string' && owner ? owner : null;
   // Seed live values so clearing later resumes smoothly from the overridden look.
   state.bearing = state.override.bearing;
   state.speed   = state.override.speed;
@@ -131,7 +133,20 @@ function setOverride({ windSpeed, fromBearingDeg, cloudiness }) {
   emitChange();
 }
 
-function clearOverride() { state.override = null; emitChange(); }
+function clearOverride() { state.override = null; state.overrideOwner = null; emitChange(); }
+
+/**
+ * Clear the active override only if it was set by `owner` (a callsign). Called when an
+ * admin disconnects so their pinned weather (which can becalm everyone at windSpeed 0)
+ * doesn't outlive their session. Returns true if an override was actually cleared.
+ */
+function clearOverrideForOwner(owner) {
+  if (state.override && state.overrideOwner && state.overrideOwner === owner) {
+    clearOverride();
+    return true;
+  }
+  return false;
+}
 
 function setTimeOffset(secs) {
   state.timeOffsetSec = ((Number(secs) % 1440) + 1440) % 1440;   // 24 game-min cycle
@@ -142,5 +157,6 @@ function clearTimeOffset() { state.timeOffsetSec = 0; emitChange(); }
 function onChange(cb) { changeListeners.push(cb); }
 
 module.exports = {
-  tick, snapshot, setOverride, clearOverride, setTimeOffset, clearTimeOffset, onChange,
+  tick, snapshot, setOverride, clearOverride, clearOverrideForOwner,
+  setTimeOffset, clearTimeOffset, onChange,
 };

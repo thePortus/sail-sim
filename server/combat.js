@@ -78,39 +78,55 @@ function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
 }
 
 /**
- * Re-fly a shot and return the first hull hit, or null (miss).
- * @param shot     {ox,oy,oz,vx,vy,vz} world-space origin + velocity
- * @param players  the server players Map (id -> { state, combat, ... })
- * @returns {victimId, zone, hx,hy,hz, side, dmg} | null
+ * "Wait-and-see" adjudication. Instead of predicting the whole flight at fire time, the
+ * server flies each shot over WALL-CLOCK time (driven by a step loop) and tests it against
+ * each victim's ACTUAL, current pose — so a ship that manoeuvres during the ball's flight
+ * genuinely dodges it. This advances one shot across the real-time sub-interval (tFrom,tTo]
+ * (flight-seconds since launch) and returns the first hull hit found in that window.
+ *
+ * Victim poses are their latest reported `state`, micro-dead-reckoned only over the small
+ * lag since their last `update` (≤~100 ms) — NOT extrapolated across the full flight.
+ *
+ * @param shot     {ox,oy,oz,vx,vy,vz, shooterId} world-space origin + velocity
+ * @param tFrom    flight-seconds already tested (exclusive)
+ * @param tTo      flight-seconds now reached (inclusive)
+ * @param players  the server players Map (id -> { state, combat, lastUpdateMs, ... })
+ * @param nowMs    current server time (Date.now()) for the victim lag calc
+ * @returns {victimId, zone, hx,hy,hz, side, dmg, tof} on hit · {expired:true} once the ball
+ *          hits the sea or outlives SIM_MAX_T · null if still in flight with no hit yet.
  */
-function simulateShot(shot, shooterId, players) {
+function stepShot(shot, tFrom, tTo, players, nowMs) {
+  if (tFrom >= C.SIM_MAX_T) return { expired: true };
+
   const victims = [];
   for (const [pid, p] of players) {
-    if (pid === shooterId || !p.state || !p.combat || p.combat.sunk) continue;
-    victims.push({ pid, p });
+    if (pid === shot.shooterId || !p.state || !p.combat || p.combat.sunk) continue;
+    const lag = Math.min(0.2, Math.max(0, (nowMs - (p.lastUpdateMs || nowMs)) / 1000));
+    victims.push({ pid, pose: deadReckon(p.state, lag) });
   }
-  if (!victims.length) return null;
 
   const { ox, oy, oz, vx, vy, vz } = shot;
   const reach2 = (C.HALF_LEN + C.BROADPHASE_PAD) * (C.HALF_LEN + C.BROADPHASE_PAD);
 
-  for (let t = 0; t <= C.SIM_MAX_T; t += C.SIM_DT) {
+  // Sub-step the ball through the freshly-elapsed window so a fast ball can't tunnel a hull.
+  const tEnd = Math.min(tTo, C.SIM_MAX_T);
+  for (let t = Math.max(tFrom, 0) + C.SIM_DT; t <= tEnd + 1e-6; t += C.SIM_DT) {
     const bx = ox + vx * t;
     const by = oy + vy * t - 0.5 * C.G * t * t;
     const bz = oz + vz * t;
-    if (by < C.SIM_WATER_Y && t > 0.1) break;                // into the sea → miss
+    if (by < C.SIM_WATER_Y && t > 0.1) return { expired: true };   // into the sea → miss
 
     for (const v of victims) {
-      const pose = deadReckon(v.p.state, t);
+      const pose = v.pose;
       const ddx = bx - pose.x, ddz = bz - pose.z;
-      if (ddx * ddx + ddz * ddz > reach2) continue;          // broad-phase reject
+      if (ddx * ddx + ddz * ddz > reach2) continue;                // broad-phase reject
       const lat = ddx * Math.cos(pose.hr) - ddz * Math.sin(pose.hr);
       const lon = ddx * Math.sin(pose.hr) + ddz * Math.cos(pose.hr);
       const zone = zoneAtLocal(lat, lon, by);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
       const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by);
-      return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg };
+      return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg, tof: t };
     }
   }
   return null;
@@ -149,5 +165,5 @@ function applyDamage(combat, zone, dmg) {
 
 module.exports = {
   newCombatState, zoneAtLocal, deadReckon, computeDamage,
-  simulateShot, validateShot, allowShot, applyDamage,
+  stepShot, validateShot, allowShot, applyDamage,
 };

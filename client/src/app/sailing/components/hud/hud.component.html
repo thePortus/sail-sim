@@ -254,6 +254,20 @@
         <span class="gun-reload" [style.width.%]="cannonService.stbdReloadFrac() * 100"></span>
       </button>
     </div>
+
+    <!-- Elevation + target preset -->
+    <div class="flex items-center justify-between gap-3 mt-2 font-mono text-xs">
+      <span class="text-slate-400">Elev <span class="text-orange-300">{{ cannonService.gunElevDeg() }}°</span></span>
+      <div class="flex gap-1">
+        <button (click)="cannonService.setTargetMode('hull')"
+                [class]="'tgt-btn ' + (cannonService.targetMode() === 'hull' ? 'tgt-btn--active' : '')">Hull</button>
+        <button (click)="cannonService.setTargetMode('mast')"
+                [class]="'tgt-btn ' + (cannonService.targetMode() === 'mast' ? 'tgt-btn--active' : '')">Mast</button>
+      </div>
+    </div>
+    <div class="text-slate-500 text-[10px] font-mono text-center mt-1">
+      <kbd>Shift</kbd>/<kbd>Ctrl</kbd> raise/lower
+    </div>
   </div>
 
   <!-- ── Controls reminder (bottom-center) ─────────────────────────────── -->
@@ -266,6 +280,9 @@
       <span class="text-orange-400/60"><kbd>Z</kbd>/<kbd>C</kbd> Fire · <kbd>Esc</kbd> Stand down</span>
     </div>
   </div>
+
+  <!-- ── Hull damage diagram (right-center) ────────────────────────────── -->
+  <app-damage-diagram />
 
   <!-- ── Chat panel (left-center) ──────────────────────────────────────── -->
   <app-chat />

@@ -6,11 +6,12 @@ import { SceneService } from '../../services/scene.service';
 import { CannonService } from '../../services/cannon.service';
 import { SailState } from '../../models';
 import { ChatComponent } from '../chat/chat.component';
+import { DamageDiagramComponent } from './damage-diagram.component';
 
 @Component({
   selector: 'app-hud',
   standalone: true,
-  imports: [CommonModule, ChatComponent],
+  imports: [CommonModule, ChatComponent, DamageDiagramComponent],
   templateUrl: './hud.component.html',
 })
 export class HudComponent implements OnInit, OnDestroy {

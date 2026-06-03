@@ -9,6 +9,9 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { SloopController } from './rigged-vessel.controller';
+import { CombatService } from './combat.service';
+import { TelemetryService } from './telemetry.service';
+import { CombatHitMsg, ZoneState, listingFor } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -55,6 +58,10 @@ interface OtherPlayerEntry extends OtherPlayer {
   heaveY:    number;           // smoothed vertical offset (m)
   pitchRad:  number;           // smoothed bow-up/down
   rollWaveRad: number;         // smoothed wave-induced roll (added to recoil roll)
+
+  // ── Damage listing (eased toward the target tilt from this ship's hull state) ──
+  listRoll:  number;           // smoothed extra roll from beam damage
+  listPitch: number;           // smoothed extra pitch from bow/stern damage
 }
 
 @Injectable({ providedIn: 'root' })
@@ -64,6 +71,8 @@ export class MultiplayerService {
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
   private vesselService  = inject(VesselService);
+  private combatService  = inject(CombatService);
+  private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
@@ -96,7 +105,10 @@ export class MultiplayerService {
   private ws:          WebSocket | null = null;
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
+  /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
+  private remoteZones  = new Map<string, ZoneState>();
   private updateTimer: ReturnType<typeof setInterval> | null = null;
+  private pingTimer:   ReturnType<typeof setInterval> | null = null;
 
   private readonly VISIBILITY_RADIUS = 15_000;
   private readonly REMOTE_DRAFT      = 0.0;  // matches VesselService FLOAT_DRAFT (model origin = waterline)
@@ -122,6 +134,7 @@ export class MultiplayerService {
   // almost always a newer snapshot to interpolate toward (eliminates the per-update
   // teleport). ~2 updates of slack at the 10 Hz (100 ms) send rate.
   private readonly INTERP_DELAY_MS = 110;
+  private readonly LIST_EASE = 0.04;   // per-frame ease toward the damage-listing tilt (slow settle)
   // Beyond this gap with no new snapshot we DEAD-RECKON (extrapolate) instead of
   // freezing — covers a lagging/stalled sender — capped so a vanished player doesn't
   // sail off to infinity.
@@ -141,15 +154,32 @@ export class MultiplayerService {
   private readonly LABEL_HEIGHT = 1.8;
   private readonly LABEL_Y      = 9;
 
-  // ── Cannon shot callbacks ─────────────────────────────────────────────────
+  // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
-                  vx: number, vy: number, vz: number) => void) | null = null;
+                  vx: number, vy: number, vz: number,
+                  shooterId: string, seq: number) => void) | null = null;
+  /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
+  onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
+  /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
+  onCombatRepair: ((playerId: string) => void) | null = null;
 
   broadcastShot(ox: number, oy: number, oz: number,
-                vx: number, vy: number, vz: number): void {
+                vx: number, vy: number, vz: number, seq: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
   }
+
+  /** Ask the server to restore our hull to full (after acknowledging a sinking). */
+  requestCombatReset(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'combat_reset' }));
+    this.combatService.clearSunk();
+    if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
+  }
+
+  /** Our own server-assigned id (for combat targeting). */
+  getMyId(): string | null { return this.myId; }
+  /** The root TransformNode of a remote vessel, or null. */
+  getRemoteRoot(id: string): TransformNode | null { return this.players.get(id)?.root ?? null; }
 
   /** Broadcast a gun-deploy change so other players see this ship's ports/run-out.
    *  deploy: 1 = arming/ready (ports open, gun out), 0 = stowing/reloaded (ports shut). */
@@ -208,6 +238,12 @@ export class MultiplayerService {
 
     this.ws.addEventListener('open', () => {
       this.updateTimer = setInterval(() => this.sendUpdate(), 100);
+      // Round-trip ping for the debug overlay (everyone, backtick).
+      this.pingTimer = setInterval(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+        }
+      }, 2000);
     });
 
     this.ws.addEventListener('message', (evt) => {
@@ -218,6 +254,8 @@ export class MultiplayerService {
 
     this.ws.addEventListener('close', () => {
       if (this.updateTimer) clearInterval(this.updateTimer);
+      if (this.pingTimer) clearInterval(this.pingTimer);
+      this.telemetry.ping.set(-1);
     });
   }
 
@@ -233,6 +271,8 @@ export class MultiplayerService {
 
   disconnect(): void {
     if (this.updateTimer) clearInterval(this.updateTimer);
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.telemetry.ping.set(-1);
     if (this.recoilTickFn) {
       this.sceneService.scene?.unregisterBeforeRender(this.recoilTickFn);
       this.recoilTickFn = null;
@@ -275,7 +315,30 @@ export class MultiplayerService {
 
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
-      this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz);
+      this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
+                          String(msg.id), +msg.seq || 0);
+
+    } else if (msg.type === 'combat_hit') {
+      // Authoritative ship hit: shudder the struck ship + play the cosmetic.
+      const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
+      if (msg.victimId === this.myId) this.vesselService.addHitShudder(side);
+      else                            this.applyHitShudder(String(msg.victimId), side);
+      this.onCombatHit?.(msg as CombatHitMsg);
+
+    } else if (msg.type === 'pong') {
+      this.telemetry.ping.set(Math.round(performance.now() - (+msg.t || 0)));
+
+    } else if (msg.type === 'combat_state') {
+      const pid = String(msg.playerId ?? '');
+      if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState);
+      else                            this.remoteZones.set(pid, msg.zones as ZoneState);
+
+    } else if (msg.type === 'combat_sunk') {
+      if (msg.victimId === this.myId) this.combatService.markSunk(String(msg.shooterName ?? ''));
+
+    } else if (msg.type === 'combat_repair') {
+      // A remote ship was restored to full → clear its persistent battle damage.
+      this.onCombatRepair?.(String(msg.playerId));
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;
@@ -351,8 +414,13 @@ export class MultiplayerService {
         heaveY:      this.REMOTE_DRAFT,   // seed near the waterline (avoids spawn rise from y=0)
         pitchRad:    0,
         rollWaveRad: 0,
+        listRoll:    0,
+        listPitch:   0,
       };
       this.players.set(data.id, entry);
+      // Seed any hull state we already heard about before this ship's mesh existed.
+      const known = this.remoteZones.get(data.id);
+      if (known) { const l = listingFor(known); entry.listRoll = l.roll; entry.listPitch = l.pitch; }
 
       const callsign = String(data.callsign ?? '').slice(0, 32);
       const slug     = String(data.vesselSlug ?? 'sloop').slice(0, 64);
@@ -400,6 +468,7 @@ export class MultiplayerService {
     if (!entry) return;
     this.disposeEntry(entry);
     this.players.delete(id);
+    this.remoteZones.delete(id);
     this.publishSignal();
   }
 
@@ -656,9 +725,15 @@ export class MultiplayerService {
       entry.hitRoll = 0; entry.hitRollVel = 0;
     }
 
-    // Combine cannon recoil + hit shudder with the wave-induced roll set by
-    // tickRemoteMotion (runs first) so neither overwrites the other.
-    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll;
+    // Damage listing: ease toward the tilt implied by this ship's hull state.
+    const list = listingFor(this.remoteZones.get(entry.id));
+    entry.listRoll  += (list.roll  - entry.listRoll)  * this.LIST_EASE;
+    entry.listPitch += (list.pitch - entry.listPitch) * this.LIST_EASE;
+
+    // Combine cannon recoil + hit shudder + damage list with the wave-induced roll/pitch
+    // set by tickRemoteMotion (runs first) so neither channel overwrites the other.
+    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll + entry.listRoll;
+    entry.root.rotation.x = entry.pitchRad + entry.listPitch;
 
     // Lateral shudder: damped sideways lurch away from the firing side, layered on
     // top of the interpolated display position (dispX/dispZ set by tickRemoteMotion).

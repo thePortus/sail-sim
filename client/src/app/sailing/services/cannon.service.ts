@@ -2,8 +2,9 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Scene, Mesh, MeshBuilder, Vector3, Color3, Color4,
   StandardMaterial, DynamicTexture, ParticleSystem, PointLight,
-  NoiseProceduralTexture,
+  NoiseProceduralTexture, Ray, AbstractMesh, TransformNode,
 } from '@babylonjs/core';
+import type { CombatHitMsg } from './combat.constants';
 import { SceneService }       from './scene.service';
 import { OceanService }       from './ocean.service';
 import { VesselService }      from './vessel.service';
@@ -25,6 +26,16 @@ const STAGGER_MIN = 0.18;
 const STAGGER_MAX = 0.42;
 const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
 const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
+
+// Aiming-aid trajectory tube. Fixed sample count so the tube can be updated in place
+// (CreateTube `instance`) every frame as the ship turns / elevation changes.
+const AIM_SAMPLES = 40;
+const AIM_WATER_Y = 0.5;                 // stop the predicted arc at the sea surface
+const AIM_RADIUS  = 0.30;                // tube thickness (m)
+
+// Persistent battle damage: charred scorch decals projected onto the struck hull/mast.
+// They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
+const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this many accrue
 
 // Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
 // x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
@@ -53,6 +64,7 @@ interface Ball {
   vx:    number; vy: number; vz: number;  // world-space velocity (m/s)
   t:     number;                           // elapsed seconds since launch
   alive: boolean;
+  key:   string;                           // `${shooterId}:${seq}` — matches server combat_hit
 }
 
 /** Per-side gunnery cycle. */
@@ -84,10 +96,48 @@ export class CannonService {
   readonly portReloadFrac = signal(0);   // 0..1 reload progress
   readonly stbdReloadFrac = signal(0);
 
+  // ── Gun elevation / targeting ───────────────────────────────────────────────
+  // Elevation is the launch angle (deg). Flat (low) keeps the ball in the hull band
+  // → hull hits; high lobs it up → mast hits. Shift raises, Control lowers; the
+  // Hull/Mast buttons jump to presets. The shot velocity carries the angle, so the
+  // server adjudicates any elevation correctly (no broadcast needed).
+  private readonly ELEV_MIN  = 0;
+  private readonly ELEV_MAX  = 18;
+  private readonly ELEV_HULL = 3;
+  private readonly ELEV_MAST = 12;
+  readonly gunElevDeg = signal(this.ELEV_HULL);
+  readonly targetMode = signal<'hull' | 'mast'>('hull');
+
+  /** Nudge the elevation (deg); Shift = +, Control = −. */
+  elevate(deltaDeg: number): void {
+    const v = Math.max(this.ELEV_MIN, Math.min(this.ELEV_MAX, this.gunElevDeg() + deltaDeg));
+    this.zone.run(() => {
+      this.gunElevDeg.set(v);
+      this.targetMode.set(v >= (this.ELEV_HULL + this.ELEV_MAST) / 2 ? 'mast' : 'hull');
+    });
+  }
+
+  /** Jump to a targeting preset (Hull = flat, Mast = high lob). */
+  setTargetMode(mode: 'hull' | 'mast'): void {
+    this.zone.run(() => {
+      this.targetMode.set(mode);
+      this.gunElevDeg.set(mode === 'mast' ? this.ELEV_MAST : this.ELEV_HULL);
+    });
+  }
+
   // ── Private state ─────────────────────────────────────────────────────────
   private scene!:   Scene;
   private canvas!:  HTMLCanvasElement;
   private elapsed = 0;
+
+  // Persistent scorch decals, keyed by the victim player's id (own id for local ship).
+  private scorchMat: StandardMaterial | null = null;
+  private readonly decals = new Map<string, Mesh[]>();
+
+  // Aiming aid: a translucent red trajectory tube per side, shown only while that side's
+  // guns are run out and ready to fire (not stowed, arming, firing or reloading).
+  private aimMat: StandardMaterial | null = null;
+  private readonly aimTube: Record<'port' | 'stbd', Mesh | null> = { port: null, stbd: null };
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
@@ -98,6 +148,7 @@ export class CannonService {
 
   // Cannonball pool
   private balls: Ball[] = [];
+  private shotSeq = 0;   // per-client shot counter; echoed by the server in combat_hit
 
   // Muzzle-flash point lights (one per cannon, reused across shots)
   private flashPort!:    PointLight;
@@ -203,12 +254,14 @@ export class CannonService {
     this.buildImpactParticles();
     this.setupInput();
 
-    // Wire remote-shot callback (avoids circular injection with MultiplayerService)
-    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz) => {
-      console.log('[Cannon] fireRemoteEffect called', ox, oy, oz, vx, vy, vz);
-      this.launchBall(ox, oy, oz, vx, vy, vz);
+    // Wire remote-shot + combat callbacks (avoids circular injection with MultiplayerService)
+    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq) => {
+      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
       this.fireRemoteEffect(ox, oy, oz, vx, vz);
     };
+    this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
+    // A repaired ship (server `combat_reset`) clears its accumulated scorch decals.
+    this.multiplayerService.onCombatRepair = (playerId) => this.clearShipDecals(playerId);
 
     this.scene.registerBeforeRender(() => {
       const dt = Math.min(this.scene.getEngine().getDeltaTime() * 0.001, 0.05);
@@ -222,6 +275,16 @@ export class CannonService {
       this.keyHandler = null;
     }
     this.multiplayerService.onRemoteShot = null;
+    this.multiplayerService.onCombatHit = null;
+    this.multiplayerService.onCombatRepair = null;
+
+    for (const list of this.decals.values()) for (const d of list) d.dispose();
+    this.decals.clear();
+    this.scorchMat?.dispose();
+
+    this.aimTube.port?.dispose();
+    this.aimTube.stbd?.dispose();
+    this.aimMat?.dispose();
 
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
@@ -274,7 +337,7 @@ export class CannonService {
       m.setEnabled(false);
       this.sceneService.shadowGenerator?.addShadowCaster(m);
       this.oceanService.addToRenderList(m);
-      this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false });
+      this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
     }
   }
 
@@ -614,6 +677,9 @@ export class CannonService {
     this.keyHandler = (e: KeyboardEvent) => {
       if (document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement) return;
+      // Elevation: Shift raises, Control lowers (allow key-repeat for smooth aim).
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevate(+1); return; }
+      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevate(-1); return; }
       if (e.repeat) return;
       if (e.code === 'KeyZ')      this.armOrFire('port');
       else if (e.code === 'KeyC') this.armOrFire('stbd');
@@ -705,6 +771,80 @@ export class CannonService {
     }
   }
 
+  // ── Aiming aid (predicted trajectory) ───────────────────────────────────────
+
+  /** Show/update a translucent red arc for each side that's run out and ready; hide otherwise. */
+  private updateAimArcs(): void {
+    for (const side of ['port', 'stbd'] as const) {
+      const ready = this.gun[side].state === 'ready';
+      if (!ready) { this.aimTube[side]?.setEnabled(false); continue; }
+
+      const path = this.buildArcPath(side);
+      const prev = this.aimTube[side];
+      if (prev) {
+        // Reuse the geometry — same sample count, so update in place (cheap).
+        this.aimTube[side] = MeshBuilder.CreateTube('aim_' + side, { path, instance: prev }, this.scene);
+        prev.setEnabled(true);
+      } else {
+        const tube = MeshBuilder.CreateTube('aim_' + side, {
+          path, radius: AIM_RADIUS, tessellation: 8, cap: Mesh.NO_CAP, updatable: true,
+        }, this.scene);
+        tube.material         = this.aimMaterial();
+        tube.isPickable       = false;
+        tube.renderingGroupId = 3;        // draw over the water like the cannon FX
+        tube.alphaIndex       = 0;        // behind the smoke/flame within the group
+        this.aimTube[side]    = tube;
+      }
+    }
+  }
+
+  /** Sample the cannonball trajectory this side would fly right now (ship pose + elevation). */
+  private buildArcPath(side: 'port' | 'stbd'): Vector3[] {
+    const vs   = this.vesselService.state();
+    const hRad = vs.heading * Math.PI / 180;
+    const sinH = Math.sin(hRad), cosH = Math.cos(hRad);
+
+    // Mirror fireOneCannon exactly so the preview matches the real shot.
+    const dirX    = side === 'port' ? -cosH :  cosH;
+    const dirZ    = side === 'port' ?  sinH : -sinH;
+    const elevRad = this.gunElevDeg() * Math.PI / 180;
+    const vh      = MUZZLE_V * Math.cos(elevRad);
+    const vy0     = MUZZLE_V * Math.sin(elevRad);
+    const bvx     = dirX * vh, bvz = dirZ * vh;
+
+    const muz = MUZZLES[side][1] ?? MUZZLES[side][0];   // centre gun, representative
+    const ox  = vs.x + muz.x * cosH + muz.z * sinH;
+    const oy  = muz.y;
+    const oz  = vs.z - muz.x * sinH + muz.z * cosH;
+
+    // Solve oy + vy0·t − ½·g·t² = waterline for the splash-down time.
+    const a = 0.5 * G, b = -vy0, c = AIM_WATER_Y - oy;
+    const disc = b * b - 4 * a * c;
+    let tEnd = disc > 0 ? (-b + Math.sqrt(disc)) / (2 * a) : 2.0;
+    tEnd = Math.max(0.3, Math.min(tEnd, 6.0));
+
+    const path: Vector3[] = [];
+    for (let i = 0; i < AIM_SAMPLES; i++) {
+      const t = (tEnd * i) / (AIM_SAMPLES - 1);
+      path.push(new Vector3(ox + bvx * t, oy + vy0 * t - 0.5 * G * t * t, oz + bvz * t));
+    }
+    return path;
+  }
+
+  /** Shared mostly-transparent red, self-lit so it reads at any time of day. */
+  private aimMaterial(): StandardMaterial {
+    if (this.aimMat) return this.aimMat;
+    const m = new StandardMaterial('aimMat', this.scene);
+    m.emissiveColor   = new Color3(0.95, 0.12, 0.10);
+    m.diffuseColor    = new Color3(0, 0, 0);
+    m.specularColor   = new Color3(0, 0, 0);
+    m.disableLighting = true;
+    m.alpha           = 0.26;
+    m.backFaceCulling = false;
+    this.aimMat = m;
+    return m;
+  }
+
   // ── Main tick ─────────────────────────────────────────────────────────────
 
   private tick(dt: number): void {
@@ -713,6 +853,9 @@ export class CannonService {
     // ── Per-side gunnery state machines ──────────────────────────────────────
     this.tickGun('port', dt);
     this.tickGun('stbd', dt);
+
+    // ── Aiming aid: live trajectory preview for any run-out, ready side ────────
+    this.updateAimArcs();
 
     // ── Active cannonball arcs ────────────────────────────────────────────────
     for (const ball of this.balls) {
@@ -724,18 +867,8 @@ export class CannonService {
       ball.mesh.position.set(bx, by, bz);
       ball.mesh.rotation.z += dt * 5;
 
-      // Ship hit — only after the ball has cleared the firing vessel (t>0.35), so a
-      // freshly-fired ball never registers a hit on its own ship at the muzzle.
-      if (ball.t > 0.35) {
-        const ship = this.shipHitTest(bx, by, bz);
-        if (ship) {
-          this.onShipImpact(bx, by, bz, ball.vx, ball.vy - G * ball.t, ball.vz, ship);
-          ball.alive = false;
-          ball.mesh.setEnabled(false);
-          continue;
-        }
-      }
-
+      // Ship hits are adjudicated by the SERVER (combat_hit despawns the matching ball
+      // and plays the cosmetic). Here we only handle misses into water/land.
       if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
         this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
         ball.alive = false;
@@ -830,8 +963,9 @@ export class CannonService {
     // Beam direction (perpendicular to the hull): port = (-cosH, sinH), stbd = (cosH, -sinH).
     const dirX = side === 'port' ? -cosH :  cosH;
     const dirZ = side === 'port' ?  sinH : -sinH;
-    const vh   = MUZZLE_V * Math.cos(ELEV_RAD);
-    const vy   = MUZZLE_V * Math.sin(ELEV_RAD);
+    const elevRad = this.gunElevDeg() * Math.PI / 180;
+    const vh   = MUZZLE_V * Math.cos(elevRad);
+    const vy   = MUZZLE_V * Math.sin(elevRad);
     const bvx  = dirX * vh;
     const bvz  = dirZ * vh;
 
@@ -841,8 +975,10 @@ export class CannonService {
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;
 
-    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz);
-    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz);
+    const seq = ++this.shotSeq;
+    const myId = this.multiplayerService.getMyId() ?? 'local';
+    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq);
+    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq);
     this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
     this.playCannonSound();
   }
@@ -936,10 +1072,11 @@ export class CannonService {
   launchBall(
     ox: number, oy: number, oz: number,
     vx: number, vy: number, vz: number,
+    shooterId = 'local', seq = 0,
   ): void {
     const ball = this.balls.find(b => !b.alive);
     if (!ball) return;
-    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true });
+    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, key: `${shooterId}:${seq}` });
     ball.mesh.position.set(ox, oy, oz);
     ball.mesh.rotation.setAll(0);
     ball.mesh.setEnabled(true);
@@ -1280,30 +1417,173 @@ export class CannonService {
     }
   }
 
-  // ── Ship hit (cosmetic) ─────────────────────────────────────────────────────
+  // ── Server-adjudicated ship hit (authoritative) ─────────────────────────────
 
   /**
-   * Local ship + remote ships hull test. Returns the hit ship's pose plus which ship
-   * it was ('local' or a remote player id) so we can shudder the right vessel, or null.
+   * A server-confirmed hit: refine the impact onto the actual hull surface (mesh
+   * raycast along the ball's incoming line), play the cosmetic there, and despawn the
+   * matching in-flight ball so it doesn't go on to splash. The shudder on the struck
+   * ship is applied by MultiplayerService when the message arrives.
    */
-  private shipHitTest(bx: number, by: number, bz: number):
-    { x: number; z: number; heading: number; target: 'local' | string } | null {
-    if (by < -1.0 || by > 6.0) return null;   // outside the hull/deck height band
-    const vs = this.vesselService.state();
-    if (this.hullContains(bx, bz, vs.x, vs.z, vs.heading)) {
-      return { x: vs.x, z: vs.z, heading: vs.heading, target: 'local' };
+  private onCombatHit(msg: CombatHitMsg): void {
+    const myId = this.multiplayerService.getMyId();
+    const shipRoot: TransformNode | null = msg.victimId === myId
+      ? this.vesselService.getRoot()
+      : this.multiplayerService.getRemoteRoot(msg.victimId);
+
+    // Incoming direction from the matching ball (then despawn it); else shooter→impact.
+    let dirX = 0, dirY = -1, dirZ = 0;
+    const ball = this.balls.find(b => b.alive && b.key === `${msg.shooterId}:${msg.seq}`);
+    if (ball) {
+      const vyi = ball.vy - G * ball.t;
+      const l = Math.hypot(ball.vx, vyi, ball.vz) || 1;
+      dirX = ball.vx / l; dirY = vyi / l; dirZ = ball.vz / l;
+      ball.alive = false;
+      ball.mesh.setEnabled(false);
+    } else {
+      const sRoot = msg.shooterId === myId
+        ? this.vesselService.getRoot()
+        : this.multiplayerService.getRemoteRoot(msg.shooterId);
+      if (sRoot) {
+        const dx = msg.hx - sRoot.position.x, dy = msg.hy - sRoot.position.y, dz = msg.hz - sRoot.position.z;
+        const l = Math.hypot(dx, dy, dz) || 1;
+        dirX = dx / l; dirY = dy / l; dirZ = dz / l;
+      }
     }
-    const remote = this.multiplayerService.shipHitAt(bx, bz);
-    return remote ? { x: remote.x, z: remote.z, heading: remote.heading, target: remote.id } : null;
+
+    // Raycast onto the hull for the exact surface point; fall back to the server point.
+    let px = msg.hx, py = msg.hy, pz = msg.hz;
+    if (shipRoot) {
+      const start = new Vector3(px - dirX * 6, py - dirY * 6, pz - dirZ * 6);
+      const pick = this.scene.pickWithRay(
+        new Ray(start, new Vector3(dirX, dirY, dirZ), 12),
+        (m) => this.isUnder(m, shipRoot),
+      );
+      if (pick?.hit && pick.pickedPoint) {
+        px = pick.pickedPoint.x; py = pick.pickedPoint.y; pz = pick.pickedPoint.z;
+        // Burn a lasting scorch mark onto the actual surface we struck.
+        if (pick.pickedMesh) {
+          const n = pick.getNormal(true) ?? new Vector3(-dirX, -dirY, -dirZ);
+          const small = msg.zone === 'masts';
+          this.addScorchDecal(String(msg.victimId), pick.pickedMesh, pick.pickedPoint, n, small);
+        }
+      }
+    }
+
+    this.playShipHitCosmetic(px, py, pz, dirX, dirY, dirZ);
   }
 
-  /** Oriented-ellipse hull test (~18 m × 7 m) around a ship at (sx,sz,headingDeg). */
-  private hullContains(bx: number, bz: number, sx: number, sz: number, headingDeg: number): boolean {
-    const dx = bx - sx, dz = bz - sz;
-    const hr = headingDeg * Math.PI / 180;
-    const lat = dx * Math.cos(hr) - dz * Math.sin(hr);
-    const lon = dx * Math.sin(hr) + dz * Math.cos(hr);
-    return (lat * lat) / 12.25 + (lon * lon) / 81.0 <= 1.0;
+  /**
+   * Project a charred scorch decal onto the struck mesh at `point`, facing `normal`.
+   * Parented to the mesh so it sails with the ship; persists until the ship is repaired.
+   * Oldest decals fade off once a ship accrues more than `DECAL_MAX_PER_SHIP`.
+   */
+  private addScorchDecal(
+    victimId: string, target: AbstractMesh, point: Vector3, normal: Vector3, small: boolean,
+  ): void {
+    this.ensureScorchMat();
+    if (!this.scorchMat) return;
+
+    const base = small ? 0.55 : 1.35;
+    const s = base * (0.82 + Math.random() * 0.36);
+    let decal: Mesh;
+    try {
+      decal = MeshBuilder.CreateDecal('scorch', target as Mesh, {
+        position: point,
+        normal,
+        size: new Vector3(s, s, Math.max(0.6, s * 0.7)),
+        angle: Math.random() * Math.PI * 2,
+        cullBackFaces: true,
+      });
+    } catch {
+      return; // skinned/degenerate target the projector can't handle — skip the mark
+    }
+    decal.material        = this.scorchMat;
+    decal.isPickable      = false;
+    decal.receiveShadows  = true;
+    decal.renderingGroupId = target.renderingGroupId;
+    decal.setParent(target);   // follow the hull as it moves
+
+    const list = this.decals.get(victimId) ?? [];
+    list.push(decal);
+    while (list.length > DECAL_MAX_PER_SHIP) list.shift()?.dispose();
+    this.decals.set(victimId, list);
+  }
+
+  /** Remove every scorch decal on a ship (called when that ship repairs to full). */
+  private clearShipDecals(victimId: string): void {
+    const list = this.decals.get(victimId);
+    if (!list) return;
+    for (const d of list) d.dispose();
+    this.decals.delete(victimId);
+  }
+
+  /** Lazily build the shared scorch material: charred radial albedo + a dented normal map. */
+  private ensureScorchMat(): void {
+    if (this.scorchMat) return;
+    const S = 128, cx = S / 2, cy = S / 2;
+
+    // Albedo — overlapping ragged char blotches with an alpha falloff to the rim.
+    const alb = new DynamicTexture('scorchAlb', { width: S, height: S }, this.scene, true);
+    const ctx = alb.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, S, S);
+    for (let i = 0; i < 5; i++) {
+      const a  = (i / 5) * Math.PI * 2;
+      const ox = cx + Math.cos(a) * S * 0.10, oy = cy + Math.sin(a) * S * 0.10;
+      const r  = S * (0.34 + Math.random() * 0.10);
+      const g  = ctx.createRadialGradient(ox, oy, 0, ox, oy, r);
+      g.addColorStop(0,    'rgba(8,6,5,0.96)');
+      g.addColorStop(0.5,  'rgba(20,15,12,0.78)');
+      g.addColorStop(0.85, 'rgba(36,27,20,0.30)');
+      g.addColorStop(1,    'rgba(40,30,22,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(ox, oy, r, 0, Math.PI * 2); ctx.fill();
+    }
+    // Faint warm rim to read as a singed, raised lip around the burn.
+    const rim = ctx.createRadialGradient(cx, cy, S * 0.18, cx, cy, S * 0.30);
+    rim.addColorStop(0,   'rgba(0,0,0,0)');
+    rim.addColorStop(0.6, 'rgba(74,42,20,0.20)');
+    rim.addColorStop(1,   'rgba(0,0,0,0)');
+    ctx.fillStyle = rim; ctx.fillRect(0, 0, S, S);
+    alb.hasAlpha = true;
+    alb.update();
+
+    // Normal map — a central pit so light catches a shallow dent in the planking.
+    const bump = new DynamicTexture('scorchBump', { width: S, height: S }, this.scene, false);
+    const bctx = bump.getContext() as CanvasRenderingContext2D;
+    const img  = bctx.createImageData(S, S);
+    const R2   = (S * 0.42) * (S * 0.42);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const dx = x - cx, dy = y - cy, r = Math.hypot(dx, dy);
+      const slope = (2 / R2) * Math.exp(-(r * r) / R2);   // |d height / d r| of a Gaussian pit
+      let nx = r > 0.001 ? (dx / r) * slope * 38 : 0;
+      let ny = r > 0.001 ? (dy / r) * slope * 38 : 0;
+      const inv = 1 / Math.hypot(nx, ny, 1);
+      nx *= inv; ny *= inv;
+      const o = (y * S + x) * 4;
+      img.data[o]     = Math.round((nx * 0.5 + 0.5) * 255);
+      img.data[o + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+      img.data[o + 2] = Math.round((inv * 0.5 + 0.5) * 255);
+      img.data[o + 3] = 255;
+    }
+    bctx.putImageData(img, 0, 0);
+    bump.update();
+
+    const mat = new StandardMaterial('scorchMat', this.scene);
+    mat.diffuseTexture            = alb;
+    mat.diffuseColor              = new Color3(1, 1, 1);
+    mat.specularColor             = new Color3(0.03, 0.03, 0.03);
+    mat.bumpTexture               = bump;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.zOffset                   = -2;   // lift off the hull to beat z-fighting
+    this.scorchMat = mat;
+  }
+
+  /** True if `mesh` is `root` or one of its descendants. */
+  private isUnder(mesh: AbstractMesh, root: TransformNode): boolean {
+    let n: TransformNode | null = mesh;
+    while (n) { if (n === root) return true; n = n.parent as TransformNode | null; }
+    return false;
   }
 
   /** Unit reverse of a ball's incoming velocity (its entry direction + angle, flipped). */
@@ -1322,29 +1602,22 @@ export class CannonService {
     ps.direction2.set(rx * spd + spr, ry * spd + upBias + sprY, rz * spd + spr);
   }
 
-  /** Cannonball strikes a hull: wood splinters + fire gust + flash + dust + smoke,
-   *  oriented to the hit, and a heavy shudder on the struck ship (local or remote). */
-  private onShipImpact(
-    bx: number, by: number, bz: number, vx: number, vyImpact: number, vz: number,
-    ship: { x: number; z: number; heading: number; target: 'local' | string },
-  ): void {
+  /** Wood splinters + fire gust + flash + dust + smoke for a ship hit at a world point,
+   *  sprayed back along the reverse of the ball's incoming direction (dirX,dirY,dirZ). */
+  private playShipHitCosmetic(px: number, py: number, pz: number, dirX: number, dirY: number, dirZ: number): void {
     const vs   = this.vesselService.state();
-    const dist = Math.hypot(bx - vs.x, bz - vs.z);
+    const dist = Math.hypot(px - vs.x, pz - vs.z);
     const vol  = Math.max(0, 1 - dist / 800);
 
-    // Emit everything from the actual strike point on the hull.
-    this.shipDebrisEmit.set(bx, by, bz);
-    this.dirtEmit.set(bx, by, bz);
-    this.landSmokeEmit.set(bx, by, bz);
+    this.shipDebrisEmit.set(px, py, pz);
+    this.dirtEmit.set(px, py, pz);
+    this.landSmokeEmit.set(px, py, pz);
 
-    // Spray back along the REVERSE of the ball's incoming velocity (its exact entry
-    // direction AND angle, flipped) — splinters/dust blast back out of the entry
-    // toward where the ball came from, not straight up.
-    const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);   // unit reverse-incoming
-    // Short throw — it's reverse-incoming, it bursts back out of the entry, close in.
-    this.setCone(this.shipDebrisPS, rx, ry, rz, 1.1, 0.65, 0.45);   // splinters back out the entry
-    this.setCone(this.dirtPS,       rx, ry, rz, 0.85, 0.55, 0.40);  // dust back along the entry line
-    this.setCone(this.landSmokePS,  rx, ry, rz, 0.45, 0.35, 0.25);  // pall drifts back then hangs
+    // Reverse-incoming: splinters/dust burst back out of the entry, close in.
+    const rx = -dirX, ry = -dirY, rz = -dirZ;
+    this.setCone(this.shipDebrisPS, rx, ry, rz, 1.1, 0.65, 0.45);
+    this.setCone(this.dirtPS,       rx, ry, rz, 0.85, 0.55, 0.40);
+    this.setCone(this.landSmokePS,  rx, ry, rz, 0.45, 0.35, 0.25);
 
     this.shipDebrisPS.emitRate = 3200;
     this.shipDebrisCutoffT     = this.elapsed + 0.14;
@@ -1353,30 +1626,20 @@ export class CannonService {
     this.landSmokePS.emitRate  = 200;
     this.landSmokeCutoffT      = this.elapsed + 0.5;
 
-    // Black sooty smoke that hangs over the strike — leans slightly back along the
-    // entry, then rises and lingers for several seconds.
-    this.shipSmokeEmit.set(bx, by + 0.4, bz);
+    // Black sooty smoke that hangs over the strike for several seconds.
+    this.shipSmokeEmit.set(px, py + 0.4, pz);
     this.shipSmokePS.direction1.set(rx * 0.7 - 0.5, 0.7, rz * 0.7 - 0.5);
     this.shipSmokePS.direction2.set(rx * 0.7 + 0.5, 1.8, rz * 0.7 + 0.5);
     this.shipSmokePS.emitRate  = 170;
     this.shipSmokeCutoffT      = this.elapsed + 0.6;
 
-    // Quick gust of fire + a flash of light at the strike point (fire flares back
-    // out the entry along the same reverse-incoming cone).
-    this.shipFireEmit.set(bx, by, bz);
+    // Quick gust of fire + a flash of light at the strike point.
+    this.shipFireEmit.set(px, py, pz);
     this.setCone(this.shipFirePS, rx, ry, rz, 0.75, 0.45, 0.35);
     this.shipFirePS.emitRate = 1600;
     this.shipFireCutoffT     = this.elapsed + 0.10;
-    this.shipFlash.position.set(bx, by, bz);
+    this.shipFlash.position.set(px, py, pz);
     this.shipFlashEndT       = this.elapsed + FLASH_DUR;
-
-    // Heavy shudder on whichever ship was struck. The struck SIDE (from the impact's
-    // lateral offset) sets which way it heels/lurches — away from the blow.
-    const hr  = ship.heading * Math.PI / 180;
-    const lat = (bx - ship.x) * Math.cos(hr) - (bz - ship.z) * Math.sin(hr);
-    const struckSide: 'port' | 'stbd' = lat < 0 ? 'port' : 'stbd';
-    if (ship.target === 'local') this.vesselService.addHitShudder(struckSide);
-    else                         this.multiplayerService.applyHitShudder(ship.target, struckSide);
 
     if (vol > 0.01) this.playShipHitSound(vol);
   }

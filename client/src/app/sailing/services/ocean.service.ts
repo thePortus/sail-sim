@@ -2029,4 +2029,12 @@ export class OceanService {
   }
 
   getOceanMesh(): Mesh { return this.oceanMesh0; }
+
+  /** Hide/show the procedural ocean meshes (so the FFT ocean can take over on WebGPU). */
+  setHidden(hidden: boolean): void {
+    this.oceanMeshNear?.setEnabled(!hidden);
+    this.oceanMesh0?.setEnabled(!hidden);
+    this.oceanMesh1?.setEnabled(!hidden);
+    this.oceanMeshFar?.setEnabled(!hidden);
+  }
 }

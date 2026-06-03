@@ -47,6 +47,8 @@ export interface OceanMaterialDeps {
   getBoatShadows: (() => { data: Float32Array; count: number }) | null;
   /** Rain intensity 0..1 — peppers the near surface with raindrop ripples. */
   getRain: (() => number) | null;
+  /** Sea choppiness 0..1 — trims whitecap foam in heavy seas so it doesn't over-foam. */
+  getChoppiness?: (() => number) | null;
 }
 
 export class OceanFFTMaterial {
@@ -83,6 +85,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
     mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
     mat.AddUniform('_FoamBiasLOD2', 'float', 2.80);
+    mat.AddUniform('_Choppiness', 'float', 0.3);   // sea state 0..1 — trims foam in heavy seas
 
     mat.AddUniform('_SSSColor', 'vec3', new Vector3(0.1541919, 0.8857628, 0.990566));
     mat.AddUniform('_SSSStrength', 'float', 0.205);   // back-lit glow (between demo 0.15 and 0.26)
@@ -460,15 +463,19 @@ export class OceanFFTMaterial {
         }
       #endif
 
+      // Choppy seas have far more turbulence variance, so a wide area dips below the foam
+      // bias → whitecaps everywhere. Trim the bias as choppiness rises so heavy seas don't
+      // over-foam; calm water (chop≈0) is left exactly as before. (Lower bias ⇒ less foam.)
+      float foamChop = 1.0 - _Choppiness * 0.32;
       #if defined(CLOSE)
         float jacobian = texture2D(_Turbulence_c0, uv0).x + texture2D(_Turbulence_c1, uv1).x + texture2D(_Turbulence_c2, uv2).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD2) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD2 * foamChop) * _FoamScale));
       #elif defined(MID)
         float jacobian = texture2D(_Turbulence_c0, uv0).x + texture2D(_Turbulence_c1, uv1).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD1) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD1 * foamChop) * _FoamScale));
       #else
         float jacobian = texture2D(_Turbulence_c0, uv0).x;
-        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD0) * _FoamScale));
+        jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD0 * foamChop) * _FoamScale));
       #endif
 
       #ifdef HAS_DEPTH
@@ -512,7 +519,11 @@ export class OceanFFTMaterial {
 
       vec3 viewDir = normalize(vViewVector);
       vec3 H = normalize(-normalW + lightDirection);
-      float ViewDotH = pow5(saturate(dot(viewDir, -H))) * 30.0 * _SSSStrength;
+      // Back-lit subsurface glow is SUN-driven — fade it out as the sun sets so the sea
+      // doesn't keep glowing turquoise after dark (lightDirection.y > 0 ⇒ sun above horizon,
+      // same convention the shadow pass uses).
+      float sunUp = smoothstep(0.0, 0.12, lightDirection.y);
+      float ViewDotH = pow5(saturate(dot(viewDir, -H))) * 30.0 * _SSSStrength * sunUp;
       vec3 color = mix(_Color, saturate(_Color + _SSSColor.rgb * ViewDotH * vLodScales.w), vLodScales.z);
 
       float fresnel = dot(normalW, viewDir);
@@ -618,6 +629,8 @@ export class OceanFFTMaterial {
       }
       const rain = this._deps.getRain?.();
       if (rain !== undefined && rain !== null) { eff.setFloat('_RainIntensity', rain); }
+      const chop = this._deps.getChoppiness?.();
+      if (chop !== undefined && chop !== null) { eff.setFloat('_Choppiness', chop); }
     });
 
     return mat;

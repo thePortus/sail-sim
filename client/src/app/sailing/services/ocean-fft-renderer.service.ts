@@ -71,6 +71,7 @@ export class OceanFFTRenderer {
       getSplashData: () => this.oceanService.getSplashData(),
       getWaterShadow: () => this.oceanService.getWaterShadowInfo(),
       getRain: () => this.oceanService.getRainIntensity(),
+      getChoppiness: () => this.fft.choppiness,
       getBoatShadows: () => {
         const buf = this._boatShadowBuf;
         const local = this.oceanService.getBoatWake();

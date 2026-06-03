@@ -11,6 +11,8 @@ import { catchError, of } from 'rxjs';
 
 import { SceneService }       from '../sailing/services/scene.service';
 import { OceanService }       from '../sailing/services/ocean.service';
+import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.service';
+import { OceanFFTRenderer }    from '../sailing/services/ocean-fft-renderer.service';
 import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
@@ -149,6 +151,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private authService        = inject(AuthService);
   private sceneService       = inject(SceneService);
   private oceanService       = inject(OceanService);
+  private oceanFftEngine      = inject(OceanFFTEngine);
+  private oceanFftRenderer     = inject(OceanFFTRenderer);
   private terrainService     = inject(TerrainService);
   private vesselService      = inject(VesselService);
   private weatherService     = inject(WeatherService);
@@ -200,11 +204,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     effect(() => {
       const w = this.weatherService.weather();
       if (!w) return;
-      this.oceanService.updateWeather(w.wind, w.sea);
+      // Gameplay-critical first: the vessel MUST get its wind every tick or it can't sail.
       this.vesselService.updateWeather(w.wind, w.sea);
+      this.oceanService.updateWeather(w.wind, w.sea);
       this.sceneService.updateSkyFromWeather(w);
       this.sceneService.updateFogDensity(w.fog.density);
       this.cloudService.updateWeather(w);
+      // FFT ocean spectrum is cosmetic — never let it abort the effect above.
+      try { this.oceanFftEngine.updateWeather(w.wind, w.sea); }
+      catch (err) { console.warn('[OceanFFT] updateWeather failed (ignored):', err); }
     });
 
     // Day/night clock is server-authoritative — apply the server's offset so every
@@ -269,6 +277,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       // 2. Build ocean + atmosphere
       await this.runInitStep('init-ocean-clouds', 'Preparing the ocean…', async () => {
         await this.oceanService.init();
+        // FFT ocean compute core (WebGPU only; no-op on WebGL). Phase 1: runs the cascades
+        // live so the pipeline is verifiable — the render swap that consumes it is Phase 3.
+        this.oceanFftEngine.init();
+        // Build the FFT ocean surface (clipmap + PBR material), disabled. Ctrl+Shift+O
+        // A/Bs it against the procedural ocean while the rewrite is in progress.
+        this.oceanFftRenderer.init();
         this.cloudService.init();
       });
 

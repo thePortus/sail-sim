@@ -432,7 +432,12 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         '/export — download all user accounts as a backup JSON',
       );
     }
-    lines.push('Tip: wrap callsigns containing spaces in double quotes, e.g. /t "Red Sail" ahoy');
+    lines.push(
+      '— Shortcuts —',
+      '`  (backtick) — toggle the FPS / ping readout',
+      'Ctrl+Shift+O — switch between the new (FFT) and classic ocean',
+      'Tip: wrap callsigns containing spaces in double quotes, e.g. /t "Red Sail" ahoy',
+    );
     this.addSystemMessage(lines.join('\n'));
   }
 

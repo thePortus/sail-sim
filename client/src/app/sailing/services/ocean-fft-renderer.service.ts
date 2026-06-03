@@ -59,6 +59,8 @@ export class OceanFFTRenderer {
       reflectionTexture: this.oceanService.getReflectionTexture(),
       refractionTexture: this.oceanService.getRefractionTexture(),
       getShore: () => this.oceanService.getShoreInfo(),
+      getBoatWake: () => this.oceanService.getBoatWake(),
+      getWakePath: () => this.oceanService.getWakePath(),
       getSunDir: () => this.sceneService.getSunDirection(),
       getTime: () => performance.now() / 1000 - this._startTime,
     });

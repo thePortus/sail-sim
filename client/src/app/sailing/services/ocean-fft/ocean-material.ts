@@ -33,6 +33,10 @@ export interface OceanMaterialDeps {
   getShore: (() => { map: BaseTexture; center: Vector2; size: number }) | null;
   /** Seabed colour RTT (scene minus ocean) for shallow-water transparency. Null = none. */
   refractionTexture: BaseTexture | null;
+  /** Live boat pose for the wake (dir = heading unit vector, speed scaled). Null = no wake. */
+  getBoatWake: (() => { x: number; z: number; dirX: number; dirZ: number; speed: number }) | null;
+  /** The CPU wake track (vec4×24: x,z,age,_) + count — gives the wake its curved trail. */
+  getWakePath: (() => { data: Float32Array; count: number }) | null;
 }
 
 export class OceanFFTMaterial {
@@ -109,6 +113,13 @@ export class OceanFFTMaterial {
     if (hasRefraction) {
       mat.AddUniform('_Refraction', 'sampler2D', this._deps.refractionTexture);
     }
+    const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePath);
+    if (hasWake) {
+      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));
+      mat.AddUniform('_BoatSpeed', 'float', 0);
+      mat.AddUniform('_WakePath[24]', 'vec4', '');   // x, z, age, _ — set per frame via setArray4
+      mat.AddUniform('_WakeCount', 'float', '');
+    }
 
     const defines: string[] = [];
     if (useMid) { defines.push('#define MID'); }
@@ -117,6 +128,37 @@ export class OceanFFTMaterial {
     const reflDef = this._deps.reflectionTexture ? '#define HAS_REFLECTION' : '';
     const shoreDef = shore0 ? '#define HAS_SHORE' : '';
     const refrDef = hasRefraction ? '#define HAS_REFRACTION' : '';
+    const wakeDef = hasWake ? '#define HAS_WAKE' : '';
+    // Wake along the boat's actual (curved) CPU track: find the nearest point on the path
+    // polyline, then build a turbulent core + a pair of diverging bow-wave edges that spread
+    // as the wake ages. Following the track means the wake bends through turns. Returns
+    // (core, edge); both fade with the track point's age.
+    const wakeFn = hasWake ? `
+      vec2 _wakeCV(vec2 wxz) {
+        if (_WakeCount < 2.0) return vec2(0.0);
+        if (dot(wxz - _BoatPos, wxz - _BoatPos) > 45000.0) return vec2(0.0);   // ~210 m cull
+        float bestD = 1.0e9;
+        float bestAge = 0.0;
+        for (int i = 0; i < 23; i++) {
+          if (float(i) >= _WakeCount - 1.0) break;
+          vec2 a = _WakePath[i].xy;          // (x, z)
+          vec2 b = _WakePath[i + 1].xy;
+          vec2 ab = b - a;
+          float L2 = max(dot(ab, ab), 1.0e-3);
+          float t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
+          float d = length(wxz - (a + ab * t));
+          if (d < bestD) { bestD = d; bestAge = mix(_WakePath[i].z, _WakePath[i + 1].z, t); }
+        }
+        float ageFade = 1.0 - smoothstep(0.0, 7.0, bestAge);
+        if (ageFade <= 0.001) return vec2(0.0);
+        // The wake spreads as it ages → diverging V that follows the curved track.
+        float width = 1.6 + bestAge * 1.5 + min(6.0, _BoatSpeed * 0.30);
+        float coreW = max(1.5, width * 0.40);
+        float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade;
+        float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade;
+        return vec2(core, edge);
+      }
+    ` : '';
     // Shared shore-proximity helper (R = land elevation; ~0.75 = waterline). 0 outside the map.
     const shoreFn = shore0 ? `
       float _shoreProx(vec2 wxz) {
@@ -172,9 +214,9 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}`;
-    mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}`);
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}`;
+    mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -209,6 +251,14 @@ export class OceanFFTMaterial {
         float shoal = 1.0 - smoothstep(0.52, 0.73, _shoreProx(vWorldUV));
         displacement *= shoal;
         largeWavesBias *= shoal;
+      #endif
+
+      #ifdef HAS_WAKE
+        // Wake riding on the swell: flatten the FFT chop in the churned core (the boat
+        // smooths the water), carve a trough there, and raise the diverging bow-wave crests.
+        vec2 wcv = _wakeCV(vWorldUV);
+        displacement *= (1.0 - 0.65 * wcv.x);
+        displacement.y += -0.80 * wcv.x + 0.70 * wcv.y;
       #endif
 
       worldPos.xyz += displacement;
@@ -266,6 +316,17 @@ export class OceanFFTMaterial {
         float fB = texture2D(_FoamTexture, vWorldUV * 0.13 - _Time * 0.4).r;
         float surf = surfBand * smoothstep(0.45, 0.95, fA * 0.6 + fB * 0.6);
         jacobian = max(jacobian, surf * 0.45);
+      #endif
+
+      #ifdef HAS_WAKE
+        // Wake foam: bright churned core + thin diverging bow-wave lines, broken up by a
+        // scrolling foam texture so it reads as turbulent froth rather than a painted band.
+        vec2 wcvF = _wakeCV(vWorldUV);
+        float wakeFoam = wcvF.x * 0.95 + wcvF.y * 0.85;
+        float wfTex = texture2D(_FoamTexture, vWorldUV * 0.09 + _Time * 1.4).r
+                    * texture2D(_FoamTexture, vWorldUV * 0.21 - _Time * 0.9).r;
+        wakeFoam *= smoothstep(0.05, 0.45, wfTex + 0.18);
+        jacobian = max(jacobian, clamp(wakeFoam, 0.0, 1.0));
       #endif
 
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
@@ -334,6 +395,14 @@ export class OceanFFTMaterial {
         eff.setTexture('_ShoreMap', shore.map as Texture);
         eff.setFloat2('_ShoreCenter', shore.center.x, shore.center.y);
         eff.setFloat('_ShoreSize', shore.size);
+      }
+      const wake = this._deps.getBoatWake?.();
+      const path = this._deps.getWakePath?.();
+      if (wake && path) {
+        eff.setFloat2('_BoatPos', wake.x, wake.z);
+        eff.setFloat('_BoatSpeed', wake.speed);
+        eff.setArray4('_WakePath', path.data as unknown as number[]);
+        eff.setFloat('_WakeCount', path.count);
       }
     });
 

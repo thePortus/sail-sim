@@ -2036,6 +2036,20 @@ export class OceanService {
   /** Seabed-only colour RTT (scene minus ocean), for the FFT ocean's shallow-water transparency. */
   getRefractionTexture(): RenderTargetTexture { return this.refractionRTT; }
 
+  /** Boat pose + speed for the FFT ocean's wake (dir = heading unit vector; speed scaled ×4). */
+  getBoatWake(): { x: number; z: number; dirX: number; dirZ: number; speed: number } {
+    return {
+      x: this.boatX, z: this.boatZ,
+      dirX: Math.sin(this.boatHdgR), dirZ: Math.cos(this.boatHdgR),
+      speed: Math.abs(this.boatSpeed) * 4.0,
+    };
+  }
+
+  /** The CPU wake track (vec4 ×24: x, z, age(s), _) + valid-point count, for a curved wake. */
+  getWakePath(): { data: Float32Array; count: number } {
+    return { data: this.wakePath, count: this.wakePathCount };
+  }
+
   /**
    * Shore/elevation map for the FFT ocean (shoaling + shallow shading). R = clamp((elev+15)/20).
    * Returns a black placeholder + huge size until terrain sets the real map (so the FFT ocean

@@ -204,12 +204,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     effect(() => {
       const w = this.weatherService.weather();
       if (!w) return;
-      this.oceanService.updateWeather(w.wind, w.sea);
-      this.oceanFftEngine.updateWeather(w.wind, w.sea);
+      // Gameplay-critical first: the vessel MUST get its wind every tick or it can't sail.
       this.vesselService.updateWeather(w.wind, w.sea);
+      this.oceanService.updateWeather(w.wind, w.sea);
       this.sceneService.updateSkyFromWeather(w);
       this.sceneService.updateFogDensity(w.fog.density);
       this.cloudService.updateWeather(w);
+      // FFT ocean spectrum is cosmetic — never let it abort the effect above.
+      try { this.oceanFftEngine.updateWeather(w.wind, w.sea); }
+      catch (err) { console.warn('[OceanFFT] updateWeather failed (ignored):', err); }
     });
 
     // Day/night clock is server-authoritative — apply the server's offset so every

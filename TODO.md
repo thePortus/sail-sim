@@ -2,9 +2,8 @@
 
 # General or Current TODO Items
 
-* highlighted rectable showing firing path when guns run out
-* improve ocean https://github.com/Popov72/OceanDemo
-* fix webgl ocean
+* boat cast shadow on ocean?
+* fix wbgl ocean
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD
 * Make emissive lights cast light on
 * Fix weird ocean dark shapes

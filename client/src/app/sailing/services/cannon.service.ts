@@ -27,6 +27,12 @@ const STAGGER_MAX = 0.42;
 const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
 const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
 
+// Aiming-aid trajectory tube. Fixed sample count so the tube can be updated in place
+// (CreateTube `instance`) every frame as the ship turns / elevation changes.
+const AIM_SAMPLES = 40;
+const AIM_WATER_Y = 0.5;                 // stop the predicted arc at the sea surface
+const AIM_RADIUS  = 0.30;                // tube thickness (m)
+
 // Persistent battle damage: charred scorch decals projected onto the struck hull/mast.
 // They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
 const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this many accrue
@@ -127,6 +133,11 @@ export class CannonService {
   // Persistent scorch decals, keyed by the victim player's id (own id for local ship).
   private scorchMat: StandardMaterial | null = null;
   private readonly decals = new Map<string, Mesh[]>();
+
+  // Aiming aid: a translucent red trajectory tube per side, shown only while that side's
+  // guns are run out and ready to fire (not stowed, arming, firing or reloading).
+  private aimMat: StandardMaterial | null = null;
+  private readonly aimTube: Record<'port' | 'stbd', Mesh | null> = { port: null, stbd: null };
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
@@ -270,6 +281,10 @@ export class CannonService {
     for (const list of this.decals.values()) for (const d of list) d.dispose();
     this.decals.clear();
     this.scorchMat?.dispose();
+
+    this.aimTube.port?.dispose();
+    this.aimTube.stbd?.dispose();
+    this.aimMat?.dispose();
 
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
@@ -756,6 +771,80 @@ export class CannonService {
     }
   }
 
+  // ── Aiming aid (predicted trajectory) ───────────────────────────────────────
+
+  /** Show/update a translucent red arc for each side that's run out and ready; hide otherwise. */
+  private updateAimArcs(): void {
+    for (const side of ['port', 'stbd'] as const) {
+      const ready = this.gun[side].state === 'ready';
+      if (!ready) { this.aimTube[side]?.setEnabled(false); continue; }
+
+      const path = this.buildArcPath(side);
+      const prev = this.aimTube[side];
+      if (prev) {
+        // Reuse the geometry — same sample count, so update in place (cheap).
+        this.aimTube[side] = MeshBuilder.CreateTube('aim_' + side, { path, instance: prev }, this.scene);
+        prev.setEnabled(true);
+      } else {
+        const tube = MeshBuilder.CreateTube('aim_' + side, {
+          path, radius: AIM_RADIUS, tessellation: 8, cap: Mesh.NO_CAP, updatable: true,
+        }, this.scene);
+        tube.material         = this.aimMaterial();
+        tube.isPickable       = false;
+        tube.renderingGroupId = 3;        // draw over the water like the cannon FX
+        tube.alphaIndex       = 0;        // behind the smoke/flame within the group
+        this.aimTube[side]    = tube;
+      }
+    }
+  }
+
+  /** Sample the cannonball trajectory this side would fly right now (ship pose + elevation). */
+  private buildArcPath(side: 'port' | 'stbd'): Vector3[] {
+    const vs   = this.vesselService.state();
+    const hRad = vs.heading * Math.PI / 180;
+    const sinH = Math.sin(hRad), cosH = Math.cos(hRad);
+
+    // Mirror fireOneCannon exactly so the preview matches the real shot.
+    const dirX    = side === 'port' ? -cosH :  cosH;
+    const dirZ    = side === 'port' ?  sinH : -sinH;
+    const elevRad = this.gunElevDeg() * Math.PI / 180;
+    const vh      = MUZZLE_V * Math.cos(elevRad);
+    const vy0     = MUZZLE_V * Math.sin(elevRad);
+    const bvx     = dirX * vh, bvz = dirZ * vh;
+
+    const muz = MUZZLES[side][1] ?? MUZZLES[side][0];   // centre gun, representative
+    const ox  = vs.x + muz.x * cosH + muz.z * sinH;
+    const oy  = muz.y;
+    const oz  = vs.z - muz.x * sinH + muz.z * cosH;
+
+    // Solve oy + vy0·t − ½·g·t² = waterline for the splash-down time.
+    const a = 0.5 * G, b = -vy0, c = AIM_WATER_Y - oy;
+    const disc = b * b - 4 * a * c;
+    let tEnd = disc > 0 ? (-b + Math.sqrt(disc)) / (2 * a) : 2.0;
+    tEnd = Math.max(0.3, Math.min(tEnd, 6.0));
+
+    const path: Vector3[] = [];
+    for (let i = 0; i < AIM_SAMPLES; i++) {
+      const t = (tEnd * i) / (AIM_SAMPLES - 1);
+      path.push(new Vector3(ox + bvx * t, oy + vy0 * t - 0.5 * G * t * t, oz + bvz * t));
+    }
+    return path;
+  }
+
+  /** Shared mostly-transparent red, self-lit so it reads at any time of day. */
+  private aimMaterial(): StandardMaterial {
+    if (this.aimMat) return this.aimMat;
+    const m = new StandardMaterial('aimMat', this.scene);
+    m.emissiveColor   = new Color3(0.95, 0.12, 0.10);
+    m.diffuseColor    = new Color3(0, 0, 0);
+    m.specularColor   = new Color3(0, 0, 0);
+    m.disableLighting = true;
+    m.alpha           = 0.26;
+    m.backFaceCulling = false;
+    this.aimMat = m;
+    return m;
+  }
+
   // ── Main tick ─────────────────────────────────────────────────────────────
 
   private tick(dt: number): void {
@@ -764,6 +853,9 @@ export class CannonService {
     // ── Per-side gunnery state machines ──────────────────────────────────────
     this.tickGun('port', dt);
     this.tickGun('stbd', dt);
+
+    // ── Aiming aid: live trajectory preview for any run-out, ready side ────────
+    this.updateAimArcs();
 
     // ── Active cannonball arcs ────────────────────────────────────────────────
     for (const ball of this.balls) {

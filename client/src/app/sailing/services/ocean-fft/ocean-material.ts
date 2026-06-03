@@ -78,14 +78,14 @@ export class OceanFFTMaterial {
     mat.AddUniform('_LOD_scale', 'float', 7.13);
 
     mat.AddUniform('_FoamColor', 'vec3', new Vector3(1, 1, 1));
-    mat.AddUniform('_FoamScale', 'float', 2.4);
+    mat.AddUniform('_FoamScale', 'float', 2.6);   // whitecap contrast (between demo 2.4 and 2.8)
     mat.AddUniform('_ContactFoam', 'float', this._deps.depthTexture ? 1 : 0);
-    mat.AddUniform('_FoamBiasLOD0', 'float', 0.84);
-    mat.AddUniform('_FoamBiasLOD1', 'float', 1.83);
-    mat.AddUniform('_FoamBiasLOD2', 'float', 2.72);
+    mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
+    mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
+    mat.AddUniform('_FoamBiasLOD2', 'float', 2.80);
 
     mat.AddUniform('_SSSColor', 'vec3', new Vector3(0.1541919, 0.8857628, 0.990566));
-    mat.AddUniform('_SSSStrength', 'float', 0.15);
+    mat.AddUniform('_SSSStrength', 'float', 0.205);   // back-lit glow (between demo 0.15 and 0.26)
     mat.AddUniform('_SSSBase', 'float', -0.261);
     mat.AddUniform('_SSSScale', 'float', 4.7);
 
@@ -571,9 +571,13 @@ export class OceanFFTMaterial {
       const eff = mat.getEffect();
       if (!eff) { return; }
       eff.setVector3('_WorldSpaceCameraPos', camera.position);
-      const t0 = fft.getTurbulenceTex(0); if (t0) { eff.setTexture('_Turbulence_c0', t0 as Texture); }
-      const t1 = fft.getTurbulenceTex(1); if (t1) { eff.setTexture('_Turbulence_c1', t1 as Texture); }
-      const t2 = fft.getTurbulenceTex(2); if (t2) { eff.setTexture('_Turbulence_c2', t2 as Texture); }
+      // Re-bind ALL cascade textures every frame so a live grid-size change (Ultra toggle,
+      // which rebuilds the generator) is picked up transparently.
+      for (let c = 0; c < 3; c++) {
+        const d = fft.getDisplacementTex(c); if (d) { eff.setTexture('_Displacement_c' + c, d as Texture); }
+        const dv = fft.getDerivativesTex(c); if (dv) { eff.setTexture('_Derivatives_c' + c, dv as Texture); }
+        const tb = fft.getTurbulenceTex(c); if (tb) { eff.setTexture('_Turbulence_c' + c, tb as Texture); }
+      }
       eff.setFloat('_Time', this._deps.getTime() / 10);
       eff.setVector3('lightDirection', this._deps.getSunDir());
       // Keep the shore map live (terrain may restream as you sail).

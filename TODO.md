@@ -2,7 +2,10 @@
 
 # General or Current TODO Items
 
+* improve ground asset scattering https://forum.babylonjs.com/t/grass-butterflies-and-trees-with-instancing/45646 https://github.com/barthpaleologue/AssetScattering
 * improve rain from https://playground.babylonjs.com/#XQ8H3C#0
+* improve landscape performance with dynamic terrain? https://github.com/BabylonJS/Extensions/blob/master/DynamicTerrain/documentation/dynamicTerrainDocumentation.md
+* improve landscape with https://medium.com/@trushkinsimon/semi-procedural-landscape-with-babylonjs-e9373bc3091d
 * add in damage morph targets
 * fix wbgl ocean
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD

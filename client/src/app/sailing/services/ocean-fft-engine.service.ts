@@ -16,11 +16,11 @@ import { SceneService } from './scene.service';
 import { Wind, SeaConditions } from '../models';
 import { WavesGenerator } from './ocean-fft/waves-generator';
 import { WavesSettings } from './ocean-fft/waves-settings';
-import { ComputeHelper } from './ocean-fft/compute-helper';
 
 /** Grid size presets. N must be a power of two. */
 export const FFT_SIZE_DEFAULT = 128;   // standard quality
 export const FFT_SIZE_ULTRA   = 256;   // "Ultra" toggle
+const ULTRA_KEY = 'ignis_ocean_ultra';
 
 @Injectable({ providedIn: 'root' })
 export class OceanFFTEngine {
@@ -51,16 +51,14 @@ export class OceanFFTEngine {
    * Initialise the FFT pipeline. No-op (and stays inactive) on WebGL. Safe to call once
    * the scene exists. `size` overrides the default (use FFT_SIZE_ULTRA for ultra).
    */
-  init(size: number = FFT_SIZE_DEFAULT): void {
+  init(size?: number): void {
     if (this._active) { return; }
-    if (!this.sceneService.isWebGPU) {
-      console.log('[OceanFFT] WebGL engine — FFT ocean disabled (procedural ocean stays active)');
-      return;
-    }
+    if (!this.sceneService.isWebGPU) { return; }   // WebGL: procedural ocean stays active
 
     this._engine = this.sceneService.engine as WebGPUEngine;
     this._scene = this.sceneService.scene;
-    this._size = this._pow2(size);
+    const persisted = localStorage.getItem(ULTRA_KEY) === '1' ? FFT_SIZE_ULTRA : FFT_SIZE_DEFAULT;
+    this._size = this._pow2(size ?? persisted);
     this._startTime = performance.now() / 1000;
 
     try {
@@ -74,7 +72,15 @@ export class OceanFFTEngine {
     // Drive the cascades every frame. Runs before the ocean material binds its textures.
     this._tickObserver = this._scene.onBeforeRenderObservable.add(() => this._tick());
     this._active = true;
-    console.log(`[OceanFFT] active — ${this._size}² grid, 3 cascades`);
+  }
+
+  /** True when the FFT grid is at the high-detail "Ultra" resolution. */
+  get ultra(): boolean { return this._size >= FFT_SIZE_ULTRA; }
+
+  /** Toggle the "Ultra" (256²) vs standard (128²) grid; persisted across sessions. */
+  setUltra(on: boolean): void {
+    localStorage.setItem(ULTRA_KEY, on ? '1' : '0');
+    this.setSize(on ? FFT_SIZE_ULTRA : FFT_SIZE_DEFAULT);
   }
 
   /** Change the grid resolution (rebuilds the pipeline). Stable presets only. */
@@ -83,6 +89,7 @@ export class OceanFFTEngine {
     if (n === this._size && this._generator) { return; }
     this._size = n;
     if (!this._active) { return; }
+    this._heightMap = null;   // stale (old resolution)
     this._generator?.dispose();
     this._generator = new WavesGenerator(this._size, this._settings, this._engine!, this._startTime);
   }
@@ -172,54 +179,6 @@ export class OceanFFTEngine {
     tex.readPixels(undefined, undefined, undefined, undefined, true)
       .then((buf) => { if (buf) { this._heightMap = new Uint16Array(buf.buffer); } this._readbackPending = false; })
       .catch(() => { this._readbackPending = false; });
-  }
-
-  private _debugSkipIFFT = false;
-  /** Debug: toggle skipping the IFFTs (so DxDz holds the raw pre-IFFT spectrum). */
-  toggleDebugSkipIFFT(): void {
-    this._debugSkipIFFT = !this._debugSkipIFFT;
-    this._generator?.setDebugSkipIFFT(this._debugSkipIFFT);
-    console.log(`[OceanFFT] debug skip-IFFT = ${this._debugSkipIFFT} (now press Ctrl+Shift+D)`);
-  }
-
-  /**
-   * Debug: read back cascade-0 displacement and log the height (and dx/dz) range. Tells us
-   * whether the FFT compute is actually producing waves (non-zero) or outputting nothing.
-   */
-  async debugReadback(): Promise<void> {
-    ComputeHelper.logReadiness();
-    if (!this._generator) { console.log('[OceanFFT] debug: no generator'); return; }
-    const c0 = this._generator.getCascade(0);
-    console.log(`[OceanFFT] settings: windSpeed=${this._settings.local.windSpeed.toFixed(2)}m/s scale=${this._settings.local.scale} lengthScale0=${this.getLengthScale(0)}`);
-    // Walk the chain: zero first appears at the broken stage.
-    console.log('  noise     ' + await this._stats(this._generator.debugNoise, false));
-    console.log('  H0 spectr ' + await this._stats(c0.debugInitialSpectrum, false));
-    console.log('  DxDz(IFFT)' + await this._stats(c0.debugDxDz, false));
-    console.log('  displace  ' + await this._stats(this.getDisplacementTex(0), true));
-  }
-
-  /** Read a texture back and summarise its scalar range. half=true for rgba16float. */
-  private async _stats(tex: { readPixels: (...a: never[]) => Promise<ArrayBufferView | null> } | null, half: boolean): Promise<string> {
-    if (!tex) { return 'null texture'; }
-    let raw: ArrayBufferView | null;
-    try {
-      raw = await (tex as { readPixels: (f?: number, l?: number, b?: undefined, fr?: boolean, nd?: boolean) => Promise<ArrayBufferView | null> })
-        .readPixels(undefined, undefined, undefined, undefined, true);
-    } catch (err) {
-      return 'readPixels failed: ' + err;
-    }
-    if (!raw) { return 'null data'; }
-    const vals: number[] = [];
-    if (half) {
-      const u = new Uint16Array(raw.buffer);
-      for (let i = 0; i < u.length; i++) { vals.push(TextureTools.FromHalfFloat(u[i])); }
-    } else {
-      const f = new Float32Array(raw.buffer);
-      for (let i = 0; i < f.length; i++) { vals.push(f[i]); }
-    }
-    let mn = 1e9, mx = -1e9, s = 0;
-    for (const v of vals) { mn = Math.min(mn, v); mx = Math.max(mx, v); s += Math.abs(v); }
-    return `min=${mn.toExponential(2)} max=${mx.toExponential(2)} meanAbs=${(s / vals.length).toExponential(2)}`;
   }
 
   dispose(): void {

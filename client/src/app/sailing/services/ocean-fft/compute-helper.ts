@@ -15,17 +15,6 @@ export class ComputeHelper {
   /** Cached per-shader [x,y,z] workgroup sizes (parsed from the WGSL source). */
   private static _wg = new WeakMap<ComputeShader, [number, number, number]>();
 
-  /** Every shader created, for debug readiness reporting. */
-  private static _all: ComputeShader[] = [];
-
-  /** Log each compute shader's compile/ready state — a non-ready one never dispatched. */
-  static logReadiness(): void {
-    console.log(`[OceanFFT] ${ComputeHelper._all.length} compute shaders:`);
-    for (const cs of ComputeHelper._all) {
-      console.log(`  ${cs.isReady() ? '✓' : '✗ NOT READY'}  ${cs.name}`);
-    }
-  }
-
   private static _copy4: ComputeShader | null = null;
   private static _copy2: ComputeShader | null = null;
   private static _copy4Params: UniformBuffer | null = null;
@@ -40,7 +29,6 @@ export class ComputeHelper {
       entryPoint,
     });
     ComputeHelper._wg.set(cs, ComputeHelper._parseWorkgroup(source, entryPoint));
-    ComputeHelper._all.push(cs);
     return cs;
   }
 

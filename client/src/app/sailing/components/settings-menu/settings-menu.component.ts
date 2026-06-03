@@ -6,6 +6,7 @@ import { TerrainService } from '../../services/terrain.service';
 import { CloudService } from '../../services/cloud.service';
 import { SceneService } from '../../services/scene.service';
 import { OceanService } from '../../services/ocean.service';
+import { OceanFFTEngine } from '../../services/ocean-fft-engine.service';
 
 /**
  * Settings panel — opened from the pause menu's "Settings" button. Houses all
@@ -90,6 +91,15 @@ import { OceanService } from '../../services/ocean.service';
                     (click)="toggleTransparency()">{{ transparencyOn ? 'On' : 'Off' }}</button>
           </div>
           <div class="q-hint">See-through shallows over sand. Off is faster — drops a terrain render pass.</div>
+
+          @if (oceanDetailAvailable) {
+            <div class="q-row" style="margin-top:0.7rem">
+              <span class="q-label">Ocean Detail</span>
+              <button class="toggle-btn" [class.toggle-btn--on]="oceanUltra"
+                      (click)="toggleOceanDetail()">{{ oceanUltra ? 'Ultra' : 'Standard' }}</button>
+            </div>
+            <div class="q-hint">FFT wave-simulation grid. Ultra (256²) is crisper but heavier; Standard (128²) is faster.</div>
+          }
         </div>
 
         <!-- ── Audio ────────────────────────────────────────────────────── -->
@@ -193,6 +203,7 @@ export class SettingsMenuComponent {
   private readonly cloudSvc = inject(CloudService);
   private readonly sceneSvc = inject(SceneService);
   private readonly ocean    = inject(OceanService);
+  private readonly oceanFft = inject(OceanFFTEngine);
 
   readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
   readonly cloudLabels  = ['Low', 'Medium', 'High', 'Ultra'];
@@ -204,6 +215,9 @@ export class SettingsMenuComponent {
   renderScale   = this.sceneSvc.getRenderScale();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
+  // FFT-ocean grid detail (WebGPU only — the FFT engine is inactive on WebGL).
+  oceanDetailAvailable = this.oceanFft.isActive;
+  oceanUltra = this.oceanFft.ultra;
 
   // ── Graphics presets ───────────────────────────────────────────────────────
   // Each bundles every graphics dial. Tweaking an individual control afterwards
@@ -263,6 +277,10 @@ export class SettingsMenuComponent {
     this.transparencyOn = !this.transparencyOn;
     this.ocean.setWaterTransparencyEnabled(this.transparencyOn);
     this.markCustom();
+  }
+  toggleOceanDetail(): void {
+    this.oceanUltra = !this.oceanUltra;
+    this.oceanFft.setUltra(this.oceanUltra);
   }
 
   applyPreset(name: string): void {

@@ -90,9 +90,6 @@ export class CannonService {
   private sfx                = inject(SfxService);
   private zone               = inject(NgZone);
 
-  /** Debug: suppress the cannonball water-impact spray particles (to inspect the surface splash). */
-  suppressSplashFx = false;
-
   // ── Public signals (consumed by HUD) — per-side gun state + reload progress ──
   readonly portGunState  = signal<GunState>('stowed');
   readonly stbdGunState  = signal<GunState>('stowed');
@@ -1675,15 +1672,12 @@ export class CannonService {
     } else {
       // Spray thrown BACK along the entry (toward where the ball came from) plus an
       // upward bias so it still reads as a spout; strong gravity arcs it back down.
-      // (Suppressible via `suppressSplashFx` to inspect the bare ocean-surface splash.)
-      if (!this.suppressSplashFx) {
-        const fx = this.splashFx.find(f => f.startT < 0 && f.cutoffT < 0) ?? this.splashFx[0];
-        this.setCone(fx.ps, rx, ry, rz, 1.1, 0.65, 0.7, 1.1);
-        fx.emit.set(wx, 0.25, wz);
-        // Spout rises only as the crater REBOUNDS. The surface dwells in its dip
-        // longer, so wait until it starts bouncing back (~0.35 s) before erupting.
-        fx.startT = this.elapsed + 0.35;
-      }
+      const fx = this.splashFx.find(f => f.startT < 0 && f.cutoffT < 0) ?? this.splashFx[0];
+      this.setCone(fx.ps, rx, ry, rz, 1.1, 0.65, 0.7, 1.1);
+      fx.emit.set(wx, 0.25, wz);
+      // Spout rises only as the crater REBOUNDS. The surface dwells in its dip
+      // longer, so wait until it starts bouncing back (~0.35 s) before erupting.
+      fx.startT = this.elapsed + 0.35;
       // Punch the actual ocean surface (crater first, then geyser); shown the same on
       // every client (each simulates the ball locally).
       this.oceanService.addSplash(wx, wz);

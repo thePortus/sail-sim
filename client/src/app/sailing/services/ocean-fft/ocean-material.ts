@@ -202,9 +202,11 @@ export class OceanFFTMaterial {
         float sh = 0.0;
         float halfSize = max(1.0, _TShadowSize * 0.5);
         vec2 tuv = (wxz - _TShadowCenter) / (halfSize * 2.0) + 0.5;
-        if (tuv.x > 0.0 && tuv.x < 1.0 && tuv.y > 0.0 && tuv.y < 1.0) {
-          sh = texture2D(_TerrainShadowMask, tuv).r * _TShadowStrength;
-        }
+        // Sample unconditionally (uniform control flow) — texture2D inside a branch is an
+        // illegal non-uniform textureSample on WebGPU and kills the fragment pipeline.
+        // Mask the result to the in-bounds region instead of gating the sample itself.
+        float inBounds = step(0.0, tuv.x) * step(tuv.x, 1.0) * step(0.0, tuv.y) * step(tuv.y, 1.0);
+        sh = texture2D(_TerrainShadowMask, clamp(tuv, 0.0, 1.0)).r * _TShadowStrength * inBounds;
         if (_SunDir.y > 0.03 && _CloudCover > 0.02) {
           vec2 cloudUV = (wxz + _SunDir.xz / max(_SunDir.y, 0.2) * 900.0) * 0.004;
           vec2 drift = vec2(_Time * 1.8, _Time * 1.2);

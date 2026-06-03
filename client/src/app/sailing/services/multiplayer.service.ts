@@ -344,10 +344,9 @@ export class MultiplayerService {
                           String(msg.id), +msg.seq || 0);
 
     } else if (msg.type === 'combat_hit') {
-      // Authoritative ship hit: shudder the struck ship + play the cosmetic.
-      const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
-      if (msg.victimId === this.myId) this.vesselService.addHitShudder(side);
-      else                            this.applyHitShudder(String(msg.victimId), side);
+      // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)
+      // until the matching ball actually arrives (server tof), so it lands in sync with the
+      // visible shot rather than instantly at the muzzle.
       this.onCombatHit?.(msg as CombatHitMsg);
 
     } else if (msg.type === 'pong') {

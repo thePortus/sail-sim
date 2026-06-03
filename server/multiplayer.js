@@ -340,6 +340,63 @@ function attachMultiplayer(server) {
   // happens, so the whole server updates at once instead of waiting for the next tick.
   weatherState.onChange(broadcastWeather);
 
+  // ── Combat: "wait-and-see" shot adjudication ──────────────────────────────────
+  // Each fired shot is registered here and flown over real wall-clock time by the step
+  // loop below, tested against each victim's CURRENT pose. A ship that manoeuvres during
+  // the ball's multi-second flight actually dodges it (unlike fire-time prediction).
+  const activeShots = [];   // { shooterId, seq, ox,oy,oz, vx,vy,vz, fireTime, lastT }
+
+  /** Apply a resolved hit: damage the victim and broadcast the cosmetics / hull state. */
+  const resolveHit = (shot, hit) => {
+    const shooter = players.get(shot.shooterId);
+    const victim  = players.get(hit.victimId);
+    if (!victim || !victim.combat) return;
+
+    const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
+
+    // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
+    const hitMsg = JSON.stringify({
+      type: 'combat_hit', shooterId: shot.shooterId, victimId: hit.victimId, seq: shot.seq,
+      zone: hit.zone, hx: hit.hx, hy: hit.hy, hz: hit.hz, side: hit.side, tof: hit.tof,
+    });
+    for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hitMsg);
+
+    // Victim's authoritative hull state → drives their HUD diagram + everyone's listing tilt.
+    const stateMsg = JSON.stringify({
+      type: 'combat_state', playerId: hit.victimId, zones: victim.combat.zones,
+    });
+    for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+
+    if (justSunk) {
+      const sinker   = shooter?.state?.callsign || 'an unknown ship';
+      const sunkName = victim.state?.callsign || 'a ship';
+      sysReply(victim.ws, `You were sunk by ${sinker}.`);
+      if (shooter) sysReply(shooter.ws, `You sank ${sunkName}!`);
+      const sunkMsg = JSON.stringify({
+        type: 'combat_sunk', victimId: hit.victimId, shooterId: shot.shooterId, shooterName: sinker,
+      });
+      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
+    }
+  };
+
+  // Step every active shot forward in real time and resolve hits / expiries (~30 Hz).
+  setInterval(() => {
+    if (!activeShots.length) return;
+    const now = Date.now();
+    for (let i = activeShots.length - 1; i >= 0; i--) {
+      const s = activeShots[i];
+      const tNow = (now - s.fireTime) / 1000;
+      const result = combat.stepShot(s, s.lastT, tNow, players, now);
+      s.lastT = tNow;
+      if (result && result.victimId) {
+        resolveHit(s, result);
+        activeShots.splice(i, 1);
+      } else if (result && result.expired) {
+        activeShots.splice(i, 1);
+      }
+    }
+  }, 33);
+
   wss.on('connection', (ws) => {
     const id = String(nextId++);
     players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState() });
@@ -381,6 +438,7 @@ function attachMultiplayer(server) {
           callsign:   String(msg.callsign   ?? '').slice(0, 32),
         };
         players.get(id).state = state;
+        players.get(id).lastUpdateMs = Date.now();   // for combat victim-pose lag compensation
 
         // On first callsign assignment: load friends from DB
         if (state.callsign && state.callsign !== prevCallsign) {
@@ -511,39 +569,11 @@ function attachMultiplayer(server) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(shot);
         }
 
-        // ── Authority: re-fly the shot against server poses and adjudicate ───────
-        const hit = combat.simulateShot(shotData, id, players);
-        if (hit) {
-          const victim = players.get(hit.victimId);
-          if (victim && victim.combat) {
-            const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
-
-            // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
-            const hitMsg = JSON.stringify({
-              type: 'combat_hit', shooterId: id, victimId: hit.victimId, seq,
-              zone: hit.zone, hx: hit.hx, hy: hit.hy, hz: hit.hz, side: hit.side,
-            });
-            for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hitMsg);
-
-            // Broadcast the victim's authoritative hull state to everyone: it drives the
-            // victim's own HUD diagram AND every client's damage-listing tilt for that ship.
-            const stateMsg = JSON.stringify({
-              type: 'combat_state', playerId: hit.victimId, zones: victim.combat.zones,
-            });
-            for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
-
-            if (justSunk) {
-              const sinker = me?.state?.callsign || 'an unknown ship';
-              const sunkName = victim.state?.callsign || 'a ship';
-              sysReply(victim.ws, `You were sunk by ${sinker}.`);
-              sysReply(me?.ws, `You sank ${sunkName}!`);
-              const sunkMsg = JSON.stringify({
-                type: 'combat_sunk', victimId: hit.victimId, shooterId: id, shooterName: sinker,
-              });
-              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
-            }
-          }
-        }
+        // ── Authority: register the shot for "wait-and-see" adjudication ─────────
+        // The step loop flies it over real time and tests it against each victim's ACTUAL
+        // evolving pose, so manoeuvring during the flight genuinely dodges it. fireTime is
+        // `now` (when the muzzle data is valid); lastT tracks how far it's been tested.
+        activeShots.push({ shooterId: id, seq, ...shotData, fireTime: now, lastT: 0 });
 
       } else if (msg.type === 'combat_reset') {
         // Player acknowledged a sinking → restore their hull to full.

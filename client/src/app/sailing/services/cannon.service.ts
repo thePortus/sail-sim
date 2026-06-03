@@ -65,6 +65,8 @@ interface Ball {
   t:     number;                           // elapsed seconds since launch
   alive: boolean;
   key:   string;                           // `${shooterId}:${seq}` — matches server combat_hit
+  pendingHit?: CombatHitMsg | null;        // server-confirmed hit, played when this ball arrives
+  hitAt?: number;                          // flight-time (s) at which to play pendingHit (server tof)
 }
 
 /** Per-side gunnery cycle. */
@@ -868,8 +870,18 @@ export class CannonService {
       ball.mesh.position.set(bx, by, bz);
       ball.mesh.rotation.z += dt * 5;
 
-      // Ship hits are adjudicated by the SERVER (combat_hit despawns the matching ball
-      // and plays the cosmetic). Here we only handle misses into water/land.
+      // Ship hits are adjudicated by the SERVER (combat_hit). We defer the cosmetic until
+      // THIS ball has flown the server's time-of-flight, so the impact lands in sync with
+      // the visible ball arriving (not instantly at the muzzle). Such a ball never splashes.
+      if (ball.pendingHit) {
+        if (ball.t >= (ball.hitAt ?? 0)) {
+          this.executeShipHit(ball.pendingHit, ball);
+          ball.pendingHit = null;
+        }
+        continue;
+      }
+
+      // Misses into water/land.
       if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
         this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
         ball.alive = false;
@@ -1077,7 +1089,7 @@ export class CannonService {
   ): void {
     const ball = this.balls.find(b => !b.alive);
     if (!ball) return;
-    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, key: `${shooterId}:${seq}` });
+    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, key: `${shooterId}:${seq}`, pendingHit: null, hitAt: 0 });
     ball.mesh.position.set(ox, oy, oz);
     ball.mesh.rotation.setAll(0);
     ball.mesh.setEnabled(true);
@@ -1421,12 +1433,33 @@ export class CannonService {
   // ── Server-adjudicated ship hit (authoritative) ─────────────────────────────
 
   /**
-   * A server-confirmed hit: refine the impact onto the actual hull surface (mesh
-   * raycast along the ball's incoming line), play the cosmetic there, and despawn the
-   * matching in-flight ball so it doesn't go on to splash. The shudder on the struck
-   * ship is applied by MultiplayerService when the message arrives.
+   * A server-confirmed hit. The server's adjudication already accounts for the ball's
+   * flight time, so we DEFER the cosmetic until the matching in-flight ball has actually
+   * flown that long (`tof`) — the impact then lands in sync with the visible ball arriving,
+   * instead of instantly at the muzzle while a sibling miss splashes seconds later. If the
+   * ball is missing or already past its tof (e.g. high latency), play it immediately.
    */
   private onCombatHit(msg: CombatHitMsg): void {
+    const ball = this.balls.find(b => b.alive && b.key === `${msg.shooterId}:${msg.seq}`);
+    if (ball && typeof msg.tof === 'number' && ball.t < msg.tof) {
+      ball.pendingHit = msg;          // fired from the tick once ball.t reaches tof
+      ball.hitAt = msg.tof;
+      return;
+    }
+    this.executeShipHit(msg, ball ?? null);
+  }
+
+  /**
+   * Play the authoritative ship-hit reaction: shudder the struck ship, refine the impact
+   * onto the actual hull surface (mesh raycast along the ball's incoming line), burn a
+   * scorch mark, play the splinter/fire cosmetic, and despawn the matching ball.
+   */
+  private executeShipHit(msg: CombatHitMsg, ball: Ball | null): void {
+    // Shudder the struck ship — deferred to here so the lurch coincides with the impact.
+    const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
+    if (msg.victimId === this.multiplayerService.getMyId()) this.vesselService.addHitShudder(side);
+    else                                                     this.multiplayerService.applyHitShudder(String(msg.victimId), side);
+
     const myId = this.multiplayerService.getMyId();
     const shipRoot: TransformNode | null = msg.victimId === myId
       ? this.vesselService.getRoot()
@@ -1434,7 +1467,6 @@ export class CannonService {
 
     // Incoming direction from the matching ball (then despawn it); else shooter→impact.
     let dirX = 0, dirY = -1, dirZ = 0;
-    const ball = this.balls.find(b => b.alive && b.key === `${msg.shooterId}:${msg.seq}`);
     if (ball) {
       const vyi = ball.vy - G * ball.t;
       const l = Math.hypot(ball.vx, vyi, ball.vz) || 1;

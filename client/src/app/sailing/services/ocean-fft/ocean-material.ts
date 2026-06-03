@@ -290,6 +290,7 @@ export class OceanFFTMaterial {
           int base = b * ${WAKE_POINTS};
           float bestD = 1.0e9;
           float bestAge = 0.0;
+          float bestSpd = 0.0;
           for (int i = 0; i < ${WAKE_POINTS - 1}; i++) {
             if (float(i) >= bmeta.z - 1.0) break;
             vec2 a = _WakePaths[base + i].xy;
@@ -298,14 +299,22 @@ export class OceanFFTMaterial {
             float L2 = max(dot(ab, ab), 1.0e-3);
             float t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
             float d = length(wxz - (a + ab * t));
-            if (d < bestD) { bestD = d; bestAge = mix(_WakePaths[base + i].z, _WakePaths[base + i + 1].z, t); }
+            if (d < bestD) {
+              bestD = d;
+              bestAge = mix(_WakePaths[base + i].z, _WakePaths[base + i + 1].z, t);
+              bestSpd = mix(_WakePaths[base + i].w, _WakePaths[base + i + 1].w, t);   // laydown speed
+            }
           }
           float ageFade = 1.0 - smoothstep(0.0, ${(WAKE_LIFE - 1).toFixed(1)}, bestAge);
           if (ageFade <= 0.001) continue;
-          float width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bmeta.w * 0.30);
+          // Strength + width scale with how fast the ship was when it laid this segment
+          // (bestSpd = abs(m/s)×4): a crawling ship leaves a faint, narrow trail; one at
+          // speed a broad, bright one. Old fast wakes stay strong even after the ship slows.
+          float speedFac = mix(0.08, 1.0, smoothstep(3.0, 16.0, bestSpd));
+          float width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bestSpd * 0.30);
           float coreW = max(1.5, width * 0.40);
-          float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade;
-          float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade;
+          float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade * speedFac;
+          float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade * speedFac;
           res = max(res, vec2(core, edge));
         }
         return res;

@@ -139,6 +139,41 @@ export class OceanFFTEngine {
   getTurbulenceTex(cascade: number) { return this._generator?.turbulenceTex(cascade) ?? null; }
   getLengthScale(cascade: number): number { return this._generator?.lengthScale[cascade] ?? 0; }
 
+  // ── CPU height readback (buoyancy) ──────────────────────────────────────────
+  private _heightMap: Uint16Array | null = null;   // cascade-0 displacement (rgba16f), CPU copy
+  private _readbackPending = false;
+
+  /**
+   * World-surface height at (wx, wz) from the read-back cascade-0 displacement (the broad
+   * swell — the cascade buoyancy cares about). Returns NaN until the first readback lands so
+   * callers can fall back. Bilinear, wrapping on the cascade's length scale.
+   */
+  getHeightAt(wx: number, wz: number): number {
+    const map = this._heightMap;
+    if (!map) { return NaN; }
+    const N = this._size, mask = N - 1;
+    const ls = this.getLengthScale(0) || 250;
+    const fx = (wx / ls) * N, fz = (wz / ls) * N;
+    const x0 = Math.floor(fx), z0 = Math.floor(fz);
+    const tx = fx - x0, tz = fz - z0;
+    const ix0 = x0 & mask, iz0 = z0 & mask, ix1 = (x0 + 1) & mask, iz1 = (z0 + 1) & mask;
+    // Height is channel 1 (G) of the displacement texture (the merger packs y there).
+    const h = (ix: number, iz: number) => TextureTools.FromHalfFloat(map[(iz * N + ix) * 4 + 1]);
+    const a = h(ix0, iz0), b = h(ix1, iz0), c = h(ix0, iz1), d = h(ix1, iz1);
+    return (a + (b - a) * tx) * (1 - tz) + (c + (d - c) * tx) * tz;
+  }
+
+  /** Kick off an async readback of cascade-0 displacement (no GPU stall; lands in ~1-2 frames). */
+  private _readbackHeight(): void {
+    if (this._readbackPending) { return; }
+    const tex = this.getDisplacementTex(0);
+    if (!tex) { return; }
+    this._readbackPending = true;
+    tex.readPixels(undefined, undefined, undefined, undefined, true)
+      .then((buf) => { if (buf) { this._heightMap = new Uint16Array(buf.buffer); } this._readbackPending = false; })
+      .catch(() => { this._readbackPending = false; });
+  }
+
   private _debugSkipIFFT = false;
   /** Debug: toggle skipping the IFFTs (so DxDz holds the raw pre-IFFT spectrum). */
   toggleDebugSkipIFFT(): void {
@@ -201,6 +236,7 @@ export class OceanFFTEngine {
     if (!this._generator) { return; }
     try {
       this._generator.update(performance.now() / 1000);
+      this._readbackHeight();
     } catch (err) {
       // A GPU/validation fault would otherwise throw every frame — disable cleanly once.
       console.warn('[OceanFFT] tick failed — disabling FFT ocean:', err);

@@ -18,6 +18,7 @@ import { CannonService } from './cannon.service';
 import { MultiplayerService } from './multiplayer.service';
 import { OceanGeometry } from './ocean-fft/ocean-geometry';
 import { OceanFFTMaterial } from './ocean-fft/ocean-material';
+import { WakeTracker } from './ocean-fft/wake-tracker';
 
 @Injectable({ providedIn: 'root' })
 export class OceanFFTRenderer {
@@ -29,6 +30,9 @@ export class OceanFFTRenderer {
 
   /** Reusable buffer for boat-shadow positions (local at 0, then remotes). vec4 ×8. */
   private readonly _boatShadowBuf = new Float32Array(8 * 4);
+
+  /** Per-vessel wake path tracker (local + remotes) → curved wakes for every ship. */
+  private readonly _wakeTracker = new WakeTracker();
 
   private _geometry: OceanGeometry | null = null;
   private _material: OceanFFTMaterial | null = null;
@@ -67,9 +71,14 @@ export class OceanFFTRenderer {
       refractionTexture: this.oceanService.getRefractionTexture(),
       getShore: () => this.oceanService.getShoreInfo(),
       getBoatWake: () => this.oceanService.getBoatWake(),
-      getWakePath: () => this.oceanService.getWakePath(),
+      getWakePaths: () => ({
+        paths: this._wakeTracker.paths,
+        meta: this._wakeTracker.meta,
+        count: this._wakeTracker.boatCount,
+      }),
       getSplashData: () => this.oceanService.getSplashData(),
       getWaterShadow: () => this.oceanService.getWaterShadowInfo(),
+      getRain: () => this.oceanService.getRainIntensity(),
       getBoatShadows: () => {
         const buf = this._boatShadowBuf;
         const local = this.oceanService.getBoatWake();
@@ -100,7 +109,10 @@ export class OceanFFTRenderer {
     this._geometry.root.setEnabled(false);
 
     this._tick = scene.onBeforeRenderObservable.add(() => {
-      if (this._enabled) { this._geometry!.update(); }
+      if (this._enabled) {
+        this._geometry!.update();
+        this._updateWakes(scene);
+      }
     });
 
     this._installToggleKey();
@@ -108,6 +120,17 @@ export class OceanFFTRenderer {
   }
 
   /** Toggle the real FFT ocean. Pre-compiles and aborts safely (with a logged error) on failure. */
+  /** Record/extend every ship's wake path, then pack the nearest few for the material. */
+  private _updateWakes(scene: Scene): void {
+    const dt = Math.min(scene.getEngine().getDeltaTime() * 0.001, 0.05);
+    const local = this.oceanService.getBoatWake();
+    const boats = [{ id: 'local', x: local.x, z: local.z, speed: local.speed }];
+    for (const r of this.multiplayerService.getVesselWakeSources()) { boats.push(r); }
+    this._wakeTracker.update(dt, boats);
+    const cam = this.sceneService.camera.position;
+    this._wakeTracker.assemble(cam.x, cam.z);
+  }
+
   async toggleFFT(): Promise<void> {
     if (!this._geometry || !this._material) { return; }
     if (this._mode === 'fft') { this._disable(); return; }
@@ -152,6 +175,19 @@ export class OceanFFTRenderer {
     this._enabled = true;
     this._geometry.root.setEnabled(true);
     this.oceanService.setHidden(true);
+    // Float the boat on the actual FFT surface (only the real FFT ocean, not the plain test).
+    // Apply the same boat-footprint calming as the material so the boat agrees with the
+    // visible (calmed) water around the hull.
+    this.oceanService.setHeightProvider(mode === 'fft'
+      ? (x, z) => {
+          const h = this.fft.getHeightAt(x, z);
+          if (Number.isNaN(h)) { return h; }
+          const b = this.oceanService.getBoatWake();
+          const d = Math.hypot(x - b.x, z - b.z);
+          const s = Math.max(0, Math.min(1, (d - 6) / (16 - 6)));   // smoothstep(6,16)
+          return h * (0.45 + 0.55 * (s * s * (3 - 2 * s)));
+        }
+      : null);
     console.log(`[OceanFFT] ${mode === 'fft' ? 'FFT ocean' : 'plain clipmap'} ON`);
   }
 
@@ -161,6 +197,7 @@ export class OceanFFTRenderer {
     this._mode = 'off';
     this._geometry.root.setEnabled(false);
     this.oceanService.setHidden(false);
+    this.oceanService.setHeightProvider(null);   // back to the procedural height model
     console.log('[OceanFFT] procedural ocean restored');
   }
 

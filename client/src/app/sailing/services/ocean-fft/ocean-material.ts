@@ -16,6 +16,7 @@ import {
 } from '@babylonjs/core';
 import { PBRCustomMaterial } from '@babylonjs/materials';
 import type { OceanFFTEngine } from '../ocean-fft-engine.service';
+import { WAKE_POINTS, WAKE_MAX_BOATS, WAKE_LIFE } from './wake-tracker';
 
 export interface OceanMaterialDeps {
   scene: Scene;
@@ -35,14 +36,17 @@ export interface OceanMaterialDeps {
   refractionTexture: BaseTexture | null;
   /** Live boat pose for the wake (dir = heading unit vector, speed scaled). Null = no wake. */
   getBoatWake: (() => { x: number; z: number; dirX: number; dirZ: number; speed: number }) | null;
-  /** The CPU wake track (vec4×24: x,z,age,_) + count — gives the wake its curved trail. */
-  getWakePath: (() => { data: Float32Array; count: number }) | null;
+  /** Per-vessel wake paths (local + remotes): flat `paths` (vec4 ×WAKE_MAX_BOATS·WAKE_POINTS),
+   *  `meta` (vec4 ×WAKE_MAX_BOATS: x,z,count,speed), and active boat count. Curved wakes for all. */
+  getWakePaths: (() => { paths: Float32Array; meta: Float32Array; count: number }) | null;
   /** Active cannonball water impacts (vec4×8: x,z,age,_) + count, for splash displacement. */
   getSplashData: (() => { data: Float32Array; count: number }) | null;
   /** Island shadow mask + transform + strength + cloud cover, for shadows on the water. */
   getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number }) | null;
   /** All vessel positions (local + remote) for boat shadows: vec4×8 (x,z,_,_) + count. */
   getBoatShadows: (() => { data: Float32Array; count: number }) | null;
+  /** Rain intensity 0..1 — peppers the near surface with raindrop ripples. */
+  getRain: (() => number) | null;
 }
 
 export class OceanFFTMaterial {
@@ -119,12 +123,12 @@ export class OceanFFTMaterial {
     if (hasRefraction) {
       mat.AddUniform('_Refraction', 'sampler2D', this._deps.refractionTexture);
     }
-    const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePath);
+    const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePaths);
     if (hasWake) {
-      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));
-      mat.AddUniform('_BoatSpeed', 'float', 0);
-      mat.AddUniform('_WakePath[24]', 'vec4', '');   // x, z, age, _ — set per frame via setArray4
-      mat.AddUniform('_WakeCount', 'float', '');
+      mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + transparency)
+      mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
+      mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
+      mat.AddUniform('_WakeBoatCount', 'float', '');
     }
     const hasSplash = !!this._deps.getSplashData;
     if (hasSplash) {
@@ -146,6 +150,10 @@ export class OceanFFTMaterial {
       mat.AddUniform('_BoatShadowData[8]', 'vec4', '');   // x, z, _, _
       mat.AddUniform('_BoatShadowCount', 'float', '');
     }
+    const hasRain = !!this._deps.getRain;
+    if (hasRain) {
+      mat.AddUniform('_RainIntensity', 'float', 0);
+    }
 
     const defines: string[] = [];
     if (useMid) { defines.push('#define MID'); }
@@ -158,6 +166,27 @@ export class OceanFFTMaterial {
     const splashDef = hasSplash ? '#define HAS_SPLASH' : '';
     const shadowDef = hasShadows ? '#define HAS_SHADOWS' : '';
     const boatShadowDef = hasBoatShadows ? '#define HAS_BOATSHADOWS' : '';
+    const rainDef = hasRain ? '#define HAS_RAIN' : '';
+    // Raindrop ripples: one jittered drop per cell — a sharp central plip + an expanding ring
+    // — whose gradient dimples the surface normal so the rain reads as impacts on the water.
+    const rainFn = hasRain ? `
+      float _rvHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float _rainField(vec2 p, float t){
+        vec2 cell = floor(p);
+        vec2 f = fract(p);
+        float h1 = _rvHash(cell), h2 = _rvHash(cell + 5.7), h3 = _rvHash(cell + 11.3), h4 = _rvHash(cell + 19.1);
+        vec2 center = vec2(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+        float rate = mix(1.0, 3.2, h3);
+        float life = fract(t * rate + h1 * 7.0);
+        float r = length(f - center);
+        float sz = mix(0.16, 0.42, h4);
+        float impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+        float ringR = life * sz * 1.6;
+        float ring = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+        ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+        return impact + ring * 0.6;
+      }
+    ` : '';
     // Island + cloud shadows on the water (world-space, so they darken our emissive water
     // which PBR's own shadow path can't reach). Cloud shadows: drifting value noise projected
     // down-sun. Plus a soft round shadow under the local boat.
@@ -247,28 +276,34 @@ export class OceanFFTMaterial {
     // (core, edge); both fade with the track point's age.
     const wakeFn = hasWake ? `
       vec2 _wakeCV(vec2 wxz) {
-        if (_WakeCount < 2.0) return vec2(0.0);
-        if (dot(wxz - _BoatPos, wxz - _BoatPos) > 45000.0) return vec2(0.0);   // ~210 m cull
-        float bestD = 1.0e9;
-        float bestAge = 0.0;
-        for (int i = 0; i < 23; i++) {
-          if (float(i) >= _WakeCount - 1.0) break;
-          vec2 a = _WakePath[i].xy;          // (x, z)
-          vec2 b = _WakePath[i + 1].xy;
-          vec2 ab = b - a;
-          float L2 = max(dot(ab, ab), 1.0e-3);
-          float t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
-          float d = length(wxz - (a + ab * t));
-          if (d < bestD) { bestD = d; bestAge = mix(_WakePath[i].z, _WakePath[i + 1].z, t); }
+        vec2 res = vec2(0.0);
+        for (int b = 0; b < ${WAKE_MAX_BOATS}; b++) {
+          if (float(b) >= _WakeBoatCount) break;
+          vec4 bmeta = _WakeMeta[b];                                    // x, z, count, speed
+          if (dot(wxz - bmeta.xy, wxz - bmeta.xy) > 45000.0) continue;  // ~210 m cull per ship
+          if (bmeta.z < 2.0) continue;
+          int base = b * ${WAKE_POINTS};
+          float bestD = 1.0e9;
+          float bestAge = 0.0;
+          for (int i = 0; i < ${WAKE_POINTS - 1}; i++) {
+            if (float(i) >= bmeta.z - 1.0) break;
+            vec2 a = _WakePaths[base + i].xy;
+            vec2 c = _WakePaths[base + i + 1].xy;
+            vec2 ab = c - a;
+            float L2 = max(dot(ab, ab), 1.0e-3);
+            float t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
+            float d = length(wxz - (a + ab * t));
+            if (d < bestD) { bestD = d; bestAge = mix(_WakePaths[base + i].z, _WakePaths[base + i + 1].z, t); }
+          }
+          float ageFade = 1.0 - smoothstep(0.0, ${(WAKE_LIFE - 1).toFixed(1)}, bestAge);
+          if (ageFade <= 0.001) continue;
+          float width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bmeta.w * 0.30);
+          float coreW = max(1.5, width * 0.40);
+          float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade;
+          float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade;
+          res = max(res, vec2(core, edge));
         }
-        float ageFade = 1.0 - smoothstep(0.0, 7.0, bestAge);
-        if (ageFade <= 0.001) return vec2(0.0);
-        // The wake spreads as it ages → diverging V that follows the curved track.
-        float width = 1.6 + bestAge * 1.5 + min(6.0, _BoatSpeed * 0.30);
-        float coreW = max(1.5, width * 0.40);
-        float core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade;
-        float edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade;
-        return vec2(core, edge);
+        return res;
       }
     ` : '';
     // Shared shore-proximity helper (R = land elevation; ~0.75 = waterline). 0 outside the map.
@@ -326,9 +361,9 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${shadowDef}`;
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
     mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${shadowFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${shadowFn}\n${rainFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -366,6 +401,10 @@ export class OceanFFTMaterial {
       #endif
 
       #ifdef HAS_WAKE
+        // Boat-footprint calming: damp the swell right around the hull so wave crests can't
+        // rise up through the deck. Matched on the CPU (height provider) so buoyancy agrees.
+        displacement *= (0.45 + 0.55 * smoothstep(6.0, 16.0, length(vWorldUV - _BoatPos)));
+
         // Wake riding on the swell: flatten the FFT chop in the churned core (the boat
         // smooths the water), carve a trough there, and raise the diverging bow-wave crests.
         vec2 wcv = _wakeCV(vWorldUV);
@@ -402,6 +441,22 @@ export class OceanFFTMaterial {
 
       vec2 slope = vec2(derivatives.x / (1.0 + derivatives.z), derivatives.y / (1.0 + derivatives.w));
       normalW = normalize(vec3(-slope.x, 1.0, -slope.y));
+
+      #ifdef HAS_RAIN
+        // Dimple the normal with raindrop ripples near the camera, scaled by rain intensity.
+        if (_RainIntensity > 0.01) {
+          float nearF = 1.0 - smoothstep(25.0, 180.0, length(vViewVector));
+          if (nearF > 0.001) {
+            float rt = _Time * 10.0;
+            vec2  rp = vWorldUV * 2.2;
+            float e  = 0.18;
+            float n0 = _rainField(rp, rt);
+            vec2  grad = vec2(_rainField(rp + vec2(e, 0.0), rt) - n0,
+                              _rainField(rp + vec2(0.0, e), rt) - n0) / e;
+            normalW = normalize(normalW + vec3(grad.x, 0.0, grad.y) * (0.18 * _RainIntensity * nearF));
+          }
+        }
+      #endif
 
       #if defined(CLOSE)
         float jacobian = texture2D(_Turbulence_c0, uv0).x + texture2D(_Turbulence_c1, uv1).x + texture2D(_Turbulence_c2, uv2).x;
@@ -478,7 +533,14 @@ export class OceanFFTMaterial {
         #ifdef HAS_REFRACTION
           // True transparency: blend in the seabed colour (scene-minus-ocean RTT), revealed
           // more as the water shallows. Refracted slightly by the wave normal.
+          // Shallow seabed reveal, plus a strong boost right around the hull so the submerged
+          // hull/keel shows through the water near the boat (where the refraction RTT has it),
+          // plus a faint global baseline.
           float reveal = smoothstep(0.50, 0.78, prox);
+          #ifdef HAS_WAKE
+            reveal = max(reveal, 0.75 * (1.0 - smoothstep(2.0, 14.0, length(vWorldUV - _BoatPos))));
+          #endif
+          reveal = max(reveal, 0.12);
           vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
           vec3 seabed = texture2D(_Refraction, refrUV).rgb * vec3(0.42, 0.52, 0.58);
           // Drifting fish on the seabed — only with the camera above water (_Time is /10, so ×10).
@@ -522,12 +584,12 @@ export class OceanFFTMaterial {
         eff.setFloat('_ShoreSize', shore.size);
       }
       const wake = this._deps.getBoatWake?.();
-      const path = this._deps.getWakePath?.();
-      if (wake && path) {
-        eff.setFloat2('_BoatPos', wake.x, wake.z);
-        eff.setFloat('_BoatSpeed', wake.speed);
-        eff.setArray4('_WakePath', path.data as unknown as number[]);
-        eff.setFloat('_WakeCount', path.count);
+      if (wake) { eff.setFloat2('_BoatPos', wake.x, wake.z); }
+      const wp = this._deps.getWakePaths?.();
+      if (wp) {
+        eff.setArray4('_WakePaths', wp.paths as unknown as number[]);
+        eff.setArray4('_WakeMeta', wp.meta as unknown as number[]);
+        eff.setFloat('_WakeBoatCount', wp.count);
       }
       const splash = this._deps.getSplashData?.();
       if (splash) {
@@ -548,6 +610,8 @@ export class OceanFFTMaterial {
         eff.setArray4('_BoatShadowData', boats.data as unknown as number[]);
         eff.setFloat('_BoatShadowCount', boats.count);
       }
+      const rain = this._deps.getRain?.();
+      if (rain !== undefined && rain !== null) { eff.setFloat('_RainIntensity', rain); }
     });
 
     return mat;

@@ -54,9 +54,11 @@ const HEAVE_TAU = 1.5;
 // The torque-normalisation formula (pitchTorq / armFwd2) was designed for
 // smooth sinusoidal waves.  Voronoi crests are sharp and tall, so the raw
 // value reaches ≈1.5 rad (90°) in heavy seas — wildly unrealistic.
-// PITCH_SCALE = 0.20 reduces a raw 1.5 rad result to ≈0.30 rad (17°),
-// which is dramatic but physically plausible for a 10 m sloop in B6–B7.
-const PITCH_SCALE = 0.20;
+// PITCH_SCALE = 0.20 reduces a raw 1.5 rad result to ≈0.30 rad (17°).
+// Lowered to 0.14 for the FFT ocean (taller, real swell drives more tilt than the old
+// procedural model), and hard-capped by MAX_TILT so a big swell can't dunk the deck.
+const PITCH_SCALE = 0.14;
+const MAX_TILT    = 0.20;   // rad (~11.5°) — ceiling on wave-induced pitch/roll
 
 // Scaling constants — tuned for "arcade with dramatic feel"
 const SURF_SCALE    = 0.30;   // max ±30 % speed change from wave slope
@@ -129,6 +131,9 @@ export class VesselBuoyancyService {
     const pAlpha = Math.min(1, PITCH_SMOOTH + dt * 2.5);
     this.pitchFiltered += (pitchRaw - this.pitchFiltered) * pAlpha;
     this.rollFiltered  += (rollRaw  - this.rollFiltered)  * pAlpha;
+    // Hard ceiling so even a heavy FFT swell can't tilt the deck into the water.
+    this.pitchFiltered = Math.max(-MAX_TILT, Math.min(MAX_TILT, this.pitchFiltered));
+    this.rollFiltered  = Math.max(-MAX_TILT, Math.min(MAX_TILT, this.rollFiltered));
 
     // ── Anti-sink floor ────────────────────────────────────────────────────
     // The smoothed heave always lags the instantaneous wave, and pitch/roll

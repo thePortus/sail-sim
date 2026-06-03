@@ -1446,7 +1446,7 @@ export class OceanService {
   // appended at the end. The shader computes froth/turbulence from distance-to-
   // path + age, so the wake follows the exact route sailed and fades behind.
   private readonly WAKE_PATH_MAX  = 24;     // matches the shader array size
-  private readonly WAKE_PATH_STEP = 6;      // metres travelled between recorded points
+  private readonly WAKE_PATH_STEP = 3;      // metres travelled between recorded points (denser = smoother curve)
   private readonly WAKE_PATH_LIFE = 7.0;    // seconds before a point fully fades
   private wakePath = new Float32Array(this.WAKE_PATH_MAX * 4);
   private wakePathCount = 0;
@@ -1882,6 +1882,7 @@ export class OceanService {
 
   /** Current cloud coverage (0–1) — shared with the terrain so its cloud shadows match. */
   getCloudCoverage(): number { return this._cloudCoverage; }
+  getRainIntensity(): number { return this._rainIntensity; }
   /** Current shader time (same clock that drifts the ocean's cloud shadows). */
   getOceanTime(): number { return this.elapsed; }
 
@@ -1906,7 +1907,18 @@ export class OceanService {
    *
    * Shader-faithful CPU height path (from Babylon playground 7KGC8J).
    */
+  /** When set (FFT ocean active), all height queries come from here instead of the
+   *  procedural model — so the boat floats on the actual FFT surface. NaN = not ready. */
+  private heightProvider: ((wx: number, wz: number) => number) | null = null;
+  setHeightProvider(fn: ((wx: number, wz: number) => number) | null): void {
+    this.heightProvider = fn;
+  }
+
   getVisualHeightAt(wx: number, wz: number, t: number): number {
+    if (this.heightProvider) {
+      const h = this.heightProvider(wx, wz);
+      if (!Number.isNaN(h)) { return h; }   // NaN → FFT map not ready yet, fall back
+    }
     const px = wx * this.WAVE_FREQ;
     const py = wz * this.WAVE_FREQ;
     const h = (_getWaves(px, py, t) - 0.5) * this.WAVE_DEPTH_NEAR * this.waveDepthScale;

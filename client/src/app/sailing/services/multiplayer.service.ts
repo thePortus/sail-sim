@@ -181,6 +181,15 @@ export class MultiplayerService {
   /** The root TransformNode of a remote vessel, or null. */
   getRemoteRoot(id: string): TransformNode | null { return this.players.get(id)?.root ?? null; }
 
+  /** Remote vessels as wake sources (id + display position + scaled speed) for the FFT ocean. */
+  getVesselWakeSources(): { id: string; x: number; z: number; speed: number }[] {
+    const out: { id: string; x: number; z: number; speed: number }[] = [];
+    for (const [id, e] of this.players) {
+      out.push({ id, x: e.dispX, z: e.dispZ, speed: Math.abs(e.speed) * 4.0 });
+    }
+    return out;
+  }
+
   /** Fill remote vessel display positions (x,z) into `out` (vec4 stride) from index `start`,
    *  up to `max` total entries. Returns how many were written. For the FFT ocean boat shadows. */
   fillVesselPositions(out: Float32Array, start: number, max: number): number {

@@ -10,17 +10,10 @@ import { SeaConditions, Wind } from '../models';
 const OCEAN_VERT = `
 precision highp float;
 
-#ifdef WEBGPU
-layout(location = 0) in vec3 position;
-layout(location = 0) out vec3 v_worldPos;
-layout(location = 1) out vec4 v_projPos;
-layout(location = 2) out float v_wakeMask;
-#else
 attribute vec3 position;
 varying vec3  v_worldPos;
 varying vec4  v_projPos;
 varying float v_wakeMask;
-#endif
 
 uniform mat4 worldViewProjection;
 uniform mat4 world;
@@ -29,7 +22,7 @@ uniform float u_Time;
 uniform vec2  u_WorldOffset;
 uniform float u_MeshHalfSize;
 uniform float u_DisplaceScale;
-uniform float u_edgeFade;        // 1 = fade displacement to 0 at mesh edge; 0 = full waves to edge
+uniform float u_edgeFade;        // 1 = fade displacement to 0 at mesh edge, 0 = full waves to edge
 uniform float u_WaveDepth;
 uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
@@ -212,16 +205,9 @@ uniform mat4  view;              // auto-bound by Babylon — world→view (came
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 uniform sampler2D u_refraction;  // seabed (terrain) colour for true shallow-water transparency
 
-#ifdef WEBGPU
-layout(location = 0) in vec3 v_worldPos;
-layout(location = 1) in vec4 v_projPos;
-layout(location = 2) in float v_wakeMask;
-layout(location = 0) out vec4 fragmentColor;
-#else
 varying vec3 v_worldPos;
 varying vec4 v_projPos;
 varying float v_wakeMask;
-#endif
 
 #define DRAG_MULT 0.38
 #define ITERATIONS u_normalIter   // FRAGMENT normal count, set PER-LOD via
@@ -711,11 +697,7 @@ void main() {
   color *= dayLight;
 
   vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
-#ifdef WEBGPU
-  fragmentColor = outCol;
-#else
   gl_FragColor = outCol;
-#endif
 }
 `;
 

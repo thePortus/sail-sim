@@ -225,7 +225,8 @@ export class OceanGeometry {
 
   private _instantiate(name: string, mesh: Mesh, mat: Material, clone = false): Mesh {
     if (clone) { mesh = mesh.clone(''); }
-    mesh.name = name;
+    // 'ocean_' prefix keeps these out of the refraction/depth RTTs (which exclude 'ocean_*').
+    mesh.name = 'ocean_fft_' + name;
     mesh.material = mat;
     mesh.parent = this._root;
     mesh.receiveShadows = true;

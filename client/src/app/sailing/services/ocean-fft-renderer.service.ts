@@ -56,6 +56,9 @@ export class OceanFFTRenderer {
       // in this build (pre-existing pipeline error), and binding it can poison the draw.
       // Re-enabled in Phase 5 once that RTT is sorted.
       depthTexture: null,
+      reflectionTexture: this.oceanService.getReflectionTexture(),
+      refractionTexture: this.oceanService.getRefractionTexture(),
+      getShore: () => this.oceanService.getShoreInfo(),
       getSunDir: () => this.sceneService.getSunDirection(),
       getTime: () => performance.now() / 1000 - this._startTime,
     });

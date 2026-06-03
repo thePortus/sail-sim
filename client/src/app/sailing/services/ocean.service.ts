@@ -2030,6 +2030,25 @@ export class OceanService {
 
   getOceanMesh(): Mesh { return this.oceanMesh0; }
 
+  /** The shared planar reflection RTT (skybox + islands + vessels), for the FFT ocean to reuse. */
+  getReflectionTexture(): MirrorTexture { return this.reflectionRTT; }
+
+  /** Seabed-only colour RTT (scene minus ocean), for the FFT ocean's shallow-water transparency. */
+  getRefractionTexture(): RenderTargetTexture { return this.refractionRTT; }
+
+  /**
+   * Shore/elevation map for the FFT ocean (shoaling + shallow shading). R = clamp((elev+15)/20).
+   * Returns a black placeholder + huge size until terrain sets the real map (so the FFT ocean
+   * reads "open ocean" everywhere in the meantime). center/size are live (terrain may restream).
+   */
+  getShoreInfo(): { map: Texture; center: Vector2; size: number } {
+    return {
+      map: this.shoreMap ?? this.shoreMapBlackTexture ?? this.reflectionRTT,
+      center: this.shoreMapCenter,
+      size: this.shoreMapSize > 0 ? this.shoreMapSize : 1e9,
+    };
+  }
+
   /** Hide/show the procedural ocean meshes (so the FFT ocean can take over on WebGPU). */
   setHidden(hidden: boolean): void {
     this.oceanMeshNear?.setEnabled(!hidden);

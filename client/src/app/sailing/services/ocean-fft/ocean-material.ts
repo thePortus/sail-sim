@@ -12,7 +12,7 @@
  * (Phase 5) are grafted into these same hooks afterwards.
  */
 import {
-  Scene, Camera, Vector3, Vector4, Texture, DynamicTexture, BaseTexture,
+  Scene, Camera, Vector2, Vector3, Vector4, Texture, DynamicTexture, BaseTexture,
 } from '@babylonjs/core';
 import { PBRCustomMaterial } from '@babylonjs/materials';
 import type { OceanFFTEngine } from '../ocean-fft-engine.service';
@@ -27,6 +27,12 @@ export interface OceanMaterialDeps {
   getSunDir: () => Vector3;
   /** Shared ocean elapsed-time seconds. */
   getTime: () => number;
+  /** Planar reflection RTT (skybox + islands + vessels), sampled by screen UV. Null = none. */
+  reflectionTexture: BaseTexture | null;
+  /** Live shore/elevation map for shoaling + shallow shading (R = clamp((elev+15)/20)). */
+  getShore: (() => { map: BaseTexture; center: Vector2; size: number }) | null;
+  /** Seabed colour RTT (scene minus ocean) for shallow-water transparency. Null = none. */
+  refractionTexture: BaseTexture | null;
 }
 
 export class OceanFFTMaterial {
@@ -89,26 +95,86 @@ export class OceanFFTMaterial {
     if (this._deps.depthTexture) {
       mat.AddUniform('_CameraDepthTexture', 'sampler2D', this._deps.depthTexture);
     }
+    if (this._deps.reflectionTexture) {
+      mat.AddUniform('_Reflection', 'sampler2D', this._deps.reflectionTexture);
+      mat.AddUniform('_ReflStrength', 'float', 0.9);
+    }
+    const shore0 = this._deps.getShore?.() ?? null;
+    if (shore0) {
+      mat.AddUniform('_ShoreMap', 'sampler2D', shore0.map);
+      mat.AddUniform('_ShoreCenter', 'vec2', shore0.center);
+      mat.AddUniform('_ShoreSize', 'float', shore0.size);
+    }
+    const hasRefraction = !!(shore0 && this._deps.refractionTexture);
+    if (hasRefraction) {
+      mat.AddUniform('_Refraction', 'sampler2D', this._deps.refractionTexture);
+    }
 
     const defines: string[] = [];
     if (useMid) { defines.push('#define MID'); }
     if (useClose) { defines.push('#define CLOSE'); }
     const depthDef = this._deps.depthTexture ? '#define HAS_DEPTH' : '';
+    const reflDef = this._deps.reflectionTexture ? '#define HAS_REFLECTION' : '';
+    const shoreDef = shore0 ? '#define HAS_SHORE' : '';
+    const refrDef = hasRefraction ? '#define HAS_REFRACTION' : '';
+    // Shared shore-proximity helper (R = land elevation; ~0.75 = waterline). 0 outside the map.
+    const shoreFn = shore0 ? `
+      float _shoreProx(vec2 wxz) {
+        vec2 uv = (wxz - _ShoreCenter) / _ShoreSize + 0.5;
+        if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) return 0.0;
+        return texture2D(_ShoreMap, uv).r;
+      }
+    ` : '';
+    // Drifting fish silhouettes on the seabed (ported from the procedural ocean): one fish
+    // per ~12 m cell wandering a Lissajous path, body aligned to its heading.
+    const fishFn = hasRefraction ? `
+      float fishHash(vec2 id) { return fract(sin(dot(id, vec2(41.3, 289.1))) * 43758.5453); }
+      float fishField(vec2 p, float t) {
+        float scale = 0.085;
+        vec2  id  = floor(p * scale);
+        float rnd = fishHash(id);
+        if (rnd <= 0.76) return 0.0;
+        float szr = fishHash(id + 31.7);
+        float ph  = rnd * 53.0;
+        float sp1 = 0.30 + rnd * 0.55;
+        float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
+        vec2  cellC = (id + 0.5) / scale;
+        vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+        vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
+        vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
+        vec2  rel   = p - fishC;
+        vec2  local = vec2(dot(rel, fwd), dot(rel, vec2(-fwd.y, fwd.x)));
+        local /= (0.5 + szr * 0.7);
+        float fx = local.x;
+        float fy = abs(local.y);
+        float shape = 0.0;
+        if (fx > -0.45 && fx < 0.85) {
+          float bs = (fx + 0.45) / 1.30;
+          float w  = max(0.045, 0.34 * sin(bs * 3.14159));
+          shape = max(shape, 1.0 - smoothstep(w * 0.45, w, fy));
+        }
+        if (fx > -1.15 && fx <= -0.35) {
+          float ts = (-0.35 - fx) / 0.80;
+          float tw = 0.05 + ts * 0.34;
+          shape = max(shape, (1.0 - smoothstep(tw * 0.45, tw, fy)) * 0.88);
+        }
+        return shape * (0.70 + rnd * 0.30);
+      }
+    ` : '';
 
     // WebGPU caps vertex→fragment varyings at 16 (PBR already uses ~11), so keep these
-    // minimal: per-cascade UVs are recomputed in the fragment; clip coords only when depth
-    // contact-foam is on.
+    // minimal: per-cascade UVs are recomputed in the fragment. vClipCoords (4th) feeds the
+    // screen-space reflection + depth foam → 4 custom = 15 total, under the limit.
     const varyings = `
       varying vec2 vWorldUV;
       varying vec3 vViewVector;
       varying vec4 vLodScales;
-      #ifdef HAS_DEPTH
-        varying vec4 vClipCoords;
-      #endif
+      varying vec4 vClipCoords;
     `;
 
-    mat.Vertex_Definitions(`${defines.join('\n')}\n${depthDef}\n${varyings}`);
-    mat.Fragment_Definitions(`${defines.join('\n')}\n${depthDef}\n${varyings}`);
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}`;
+    mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -137,15 +203,21 @@ export class OceanFFTMaterial {
         displacement += texture2D(_Displacement_c2, uv2).xyz * lod_c2;
       #endif
 
+      #ifdef HAS_SHORE
+        // Shoaling: flatten the swell into the beach. Full height in deep water, →0 at the
+        // waterline (~0.73) — this also stops wave crests popping up through low-lying land.
+        float shoal = 1.0 - smoothstep(0.52, 0.73, _shoreProx(vWorldUV));
+        displacement *= shoal;
+        largeWavesBias *= shoal;
+      #endif
+
       worldPos.xyz += displacement;
 
       vLodScales = vec4(lod_c0, lod_c1, lod_c2, max(displacement.y - largeWavesBias * 0.8 - _SSSBase, 0.) / _SSSScale);
     `);
 
     mat.Vertex_MainEnd(`
-      #ifdef HAS_DEPTH
-        vClipCoords = gl_Position;
-      #endif
+      vClipCoords = gl_Position;
     `);
 
     mat.Fragment_Before_Lights(`
@@ -185,6 +257,17 @@ export class OceanFFTMaterial {
         jacobian += _ContactFoam * saturate(max(0.0, foam - depthDifference) * 5.0) * 0.9;
       #endif
 
+      #ifdef HAS_SHORE
+        // Breaking-wave surf hugging the waterline — but broken up by two scrolling foam
+        // samples so it reads as textured foam, not a flat white band, and kept subtle.
+        float proxF = _shoreProx(vWorldUV);
+        float surfBand = smoothstep(0.60, 0.71, proxF) * (1.0 - smoothstep(0.73, 0.85, proxF));
+        float fA = texture2D(_FoamTexture, vWorldUV * 0.06 + _Time * 0.6).r;
+        float fB = texture2D(_FoamTexture, vWorldUV * 0.13 - _Time * 0.4).r;
+        float surf = surfBand * smoothstep(0.45, 0.95, fA * 0.6 + fB * 0.6);
+        jacobian = max(jacobian, surf * 0.45);
+      #endif
+
       surfaceAlbedo = mix(vec3(0.0), _FoamColor, jacobian);
 
       vec3 viewDir = normalize(vViewVector);
@@ -203,7 +286,36 @@ export class OceanFFTMaterial {
     `);
 
     mat.Fragment_Before_FinalColorComposition(`
-      finalEmissive = mix(color * (1.0 - fresnel), vec3(0.0), jacobian);
+      vec3 waterCol = color * (1.0 - fresnel);
+      #ifdef HAS_SHORE
+        float prox = _shoreProx(vWorldUV);
+        // Shallow turquoise water-column tint as the seabed rises toward the beach.
+        float shallowF = smoothstep(0.42, 0.70, prox);
+        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shallowF * 0.55);
+        #ifdef HAS_REFRACTION
+          // True transparency: blend in the seabed colour (scene-minus-ocean RTT), revealed
+          // more as the water shallows. Refracted slightly by the wave normal.
+          float reveal = smoothstep(0.50, 0.78, prox);
+          vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
+          vec3 seabed = texture2D(_Refraction, refrUV).rgb * vec3(0.42, 0.52, 0.58);
+          // Drifting fish on the seabed — only with the camera above water (_Time is /10, so ×10).
+          if (_WorldSpaceCameraPos.y > 0.05) {
+            float fish = fishField(vWorldUV, _Time * 10.0);
+            seabed *= (1.0 - fish * 0.5);
+          }
+          waterCol = mix(waterCol, seabed, reveal * 0.92);
+        #endif
+      #endif
+      #ifdef HAS_REFLECTION
+        // Planar mirror reflection (skybox + islands + vessels), rippled by the wave normal,
+        // strongest at grazing angles (Fresnel). Sampled in screen space.
+        vec2 reflUV = vClipCoords.xy / vClipCoords.w * 0.5 + 0.5;
+        reflUV += normalW.xz * 0.04;
+        reflUV = clamp(reflUV, vec2(0.002), vec2(0.998));
+        vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
+        waterCol += planarRefl * fresnel * _ReflStrength;
+      #endif
+      finalEmissive = mix(waterCol, vec3(0.0), jacobian);
     `);
 
     // Per-frame uniforms (camera pos, ping-ponged turbulence, time, light dir).
@@ -216,6 +328,13 @@ export class OceanFFTMaterial {
       const t2 = fft.getTurbulenceTex(2); if (t2) { eff.setTexture('_Turbulence_c2', t2 as Texture); }
       eff.setFloat('_Time', this._deps.getTime() / 10);
       eff.setVector3('lightDirection', this._deps.getSunDir());
+      // Keep the shore map live (terrain may restream as you sail).
+      const shore = this._deps.getShore?.();
+      if (shore) {
+        eff.setTexture('_ShoreMap', shore.map as Texture);
+        eff.setFloat2('_ShoreCenter', shore.center.x, shore.center.y);
+        eff.setFloat('_ShoreSize', shore.size);
+      }
     });
 
     return mat;

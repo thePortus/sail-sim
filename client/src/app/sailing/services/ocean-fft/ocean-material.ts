@@ -30,6 +30,9 @@ export interface OceanMaterialDeps {
   getTime: () => number;
   /** Planar reflection RTT (skybox + islands + vessels), sampled by screen UV. Null = none. */
   reflectionTexture: BaseTexture | null;
+  /** Live sky-reflection state: the colour the water reflects when the planar reflection is off, and
+   *  the planar reflection strength (0 → reflections off → analytic sky only, no flat-dark water). */
+  getSkyReflect?: (() => { color: Vector3; strength: number }) | null;
   /** Live shore/elevation map for shoaling + shallow shading (R = clamp((elev+15)/20)). */
   getShore: (() => { map: BaseTexture; center: Vector2; size: number }) | null;
   /** Seabed colour RTT (scene minus ocean) for shallow-water transparency. Null = none. */
@@ -117,6 +120,9 @@ export class OceanFFTMaterial {
     if (this._deps.reflectionTexture) {
       mat.AddUniform('_Reflection', 'sampler2D', this._deps.reflectionTexture);
       mat.AddUniform('_ReflStrength', 'float', 0.9);
+      // Colour the water reflects when the planar reflection is off (reflections toggled off / the
+      // mirror RTT stops rendering). Driven per-frame from the sky/fog hue so it stays day-night aware.
+      mat.AddUniform('_SkyColor', 'vec3', new Vector3(0.45, 0.62, 0.82));
     }
     const shore0 = this._deps.getShore?.() ?? null;
     if (shore0) {
@@ -667,6 +673,9 @@ export class OceanFFTMaterial {
         // through as SAND, not a turquoise sky reflection — this is what makes the dissolved
         // shoreline blend to sand rather than reading teal.
         waterCol += planarRefl * fresnel * _ReflStrength * (1.0 - shoreFade) * shoreReflCut;
+        // Analytic sky fallback — fades in as the planar reflection fades out (reflections off / RTT
+        // dead) so the water still catches sky light at grazing angles instead of reading flat-dark.
+        waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * (1.0 - shoreFade) * shoreReflCut;
       #endif
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
@@ -693,6 +702,9 @@ export class OceanFFTMaterial {
       }
       eff.setFloat('_Time', this._deps.getTime() / 10);
       eff.setVector3('lightDirection', this._deps.getSunDir());
+      // Sky reflection state — colour the water reflects + planar strength (0 when reflections off).
+      const sky = this._deps.getSkyReflect?.();
+      if (sky) { eff.setVector3('_SkyColor', sky.color); eff.setFloat('_ReflStrength', sky.strength); }
       // Keep the shore map live (terrain may restream as you sail).
       const shore = this._deps.getShore?.();
       if (shore) {

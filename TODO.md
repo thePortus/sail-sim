@@ -2,7 +2,7 @@
 
 # General or Current TODO Items
 
-* Add seaweed and reed coastal scattering
+* Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
 * dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)
@@ -24,6 +24,7 @@
 * Add repairing
 * Add sailors on deck
 * Add ship names
+* Improved asset scattereing
 * Add /teleport playername x y and /teleportTo playername to admins
 * Add lost server connection detection
 * Add server side checking of movement, to prevent shenanigans

@@ -13,14 +13,17 @@ import { IPatch } from './i-patch';
  */
 export class PatchManager {
   private readonly meshesFromLod: TransformNode[];
+  private readonly lodFractions: number[];
   private readonly patches: [IPatch, number][] = [];
   private readonly queue: Array<{ newLOD: number; patch: IPatch }> = [];
   private readonly computeLodLevel: (patch: IPatch) => number;
   private patchUpdateRate = 1;
 
-  constructor(meshesFromLod: Mesh[], computeLodLevel: (patch: IPatch) => number = () => 0) {
+  /** @param lodFractions per-LoD instance fraction (0..1) — thins distant tiers. Defaults to all 1. */
+  constructor(meshesFromLod: Mesh[], computeLodLevel: (patch: IPatch) => number = () => 0, lodFractions?: number[]) {
     this.meshesFromLod = meshesFromLod;
     this.computeLodLevel = computeLodLevel;
+    this.lodFractions = lodFractions ?? meshesFromLod.map(() => 1);
   }
 
   addPatch(patch: IPatch): void {
@@ -60,7 +63,7 @@ export class PatchManager {
     for (let i = 0; i < n; i++) {
       const head = this.queue.shift();
       if (head === undefined) { break; }
-      head.patch.createInstances(this.meshesFromLod[head.newLOD]);
+      head.patch.createInstances(this.meshesFromLod[head.newLOD], this.lodFractions[head.newLOD]);
     }
   }
 

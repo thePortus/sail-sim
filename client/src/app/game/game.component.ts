@@ -285,7 +285,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         // Build the FFT ocean surface (clipmap + PBR material), disabled. Ctrl+Shift+O
         // A/Bs it against the procedural ocean while the rewrite is in progress.
         this.oceanFftRenderer.init();
-        this.cloudService.init();
+        // PERF DIAGNOSTIC: ?noclouds skips the volumetric clouds (raymarch) to isolate their cost.
+        if (!location.search.includes('noclouds')) { this.cloudService.init(); }
       });
 
       // 3. Load terrain
@@ -294,8 +295,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
 
       // 3b. Asset scattering (grass/trees/butterflies) — needs the terrain ready.
+      // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
       await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
-        await this.scatterService.init();
+        if (!location.search.includes('noscatter')) { await this.scatterService.init(); }
       });
 
       // 4. Fetch vessel
@@ -368,7 +370,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       // Build the physical atmosphere LAST — after every scene material has compiled — so its
       // construction can't corrupt their WebGPU GLSL→SPIR-V compile (varying-location failures).
       // Fire-and-forget: it waits for scene-ready internally and falls back to the Preetham sky.
-      void this.sceneService.activateAtmosphere();
+      // PERF DIAGNOSTIC: ?noatmo skips the physical atmosphere (keeps the cheaper Preetham sky).
+      if (!location.search.includes('noatmo')) { void this.sceneService.activateAtmosphere(); }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);

@@ -6,7 +6,7 @@
  * between it and the classic procedural ocean.
  */
 import { Injectable, inject } from '@angular/core';
-import { Observer, Scene, Material, Mesh } from '@babylonjs/core';
+import { Observer, Scene, Material, Mesh, Vector3 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { OceanFFTEngine } from './ocean-fft-engine.service';
@@ -61,6 +61,14 @@ export class OceanFFTRenderer {
       depthTexture: null,
       reflectionTexture: this.oceanService.getReflectionTexture(),
       refractionTexture: this.oceanService.getRefractionTexture(),
+      // When reflections are off the mirror RTT stops rendering, so feed the shader the sky/fog hue
+      // to reflect analytically (strength 0 → planar reflection off, sky fallback full) instead of a
+      // dead-black RTT — keeps the shallows see-through and the water from reading flat-dark.
+      getSkyReflect: () => {
+        const fog = this.sceneService.scene?.fogColor;
+        const color = fog ? new Vector3(fog.r, fog.g, fog.b).scaleInPlace(1.25) : new Vector3(0.45, 0.62, 0.82);
+        return { color, strength: this.oceanService.isReflectionsEnabled() ? 0.9 : 0 };
+      },
       getShore: () => this.oceanService.getShoreInfo(),
       getBoatWake: () => this.oceanService.getBoatWake(),
       getWakePaths: () => ({

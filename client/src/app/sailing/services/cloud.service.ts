@@ -647,8 +647,13 @@ export class CloudService {
     // Drive the volumetric clouds from the SMOOTHED weather so they morph gradually:
     // coverage, storm type (calm cumulus → towering cumulonimbus), and vertical development
     // (storms build taller and lower their bases for a heavier, more oppressive deck).
+    // Gamma the coverage so a "clear" sky (cloudiness ≤ ~0.28) reads as nearly-empty — just a few
+    // scattered clouds — while overcast/storm (→1) is left essentially unchanged. Without this the
+    // raw threshold still fills a lot of the sky at low coverage. Reused for the ocean reflection
+    // so the water mirrors the same amount of cloud.
+    const effCloud = Math.pow(this.cloudiness, 1.8);
     if (this.volClouds) {
-      this.volClouds.updateCoverage(this.cloudiness);
+      this.volClouds.updateCoverage(effCloud);
       this.volClouds.cloudType       = 0.40 + this.storminess * 0.55;
       this.volClouds.cloudThickness  = 600 + this.storminess * 700;   // 600 → 1300 m
       this.volClouds.cloudBaseHeight = 900 - this.storminess * 220;   // 900 → 680 m
@@ -665,7 +670,7 @@ export class CloudService {
 
     // Keep ocean reflection in sync with current sky coverage and sun position.
     const sunEl = this.sceneService.getSunDirection().y;
-    this.oceanService.setCloudReflection(this.cloudiness, sunEl);
+    this.oceanService.setCloudReflection(effCloud, sunEl);
 
     // Feed the live cloud coverage field to the ocean so the water casts REAL cloud shadows
     // (tracing the actual clouds) instead of a stand-in noise.

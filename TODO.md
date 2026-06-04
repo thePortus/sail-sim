@@ -2,12 +2,9 @@
 
 # General or Current TODO Items
 
-* sand is too dark since atmo upgrade
-* sand ring around island should go....
-* teal ring and shallows around boat? No, I only want little transparency around boat, not removing water shader
+* bloom lighting and improved sun ring?
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
-* dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods
-* improve ground asset scattering https://forum.babylonjs.com/t/grass-butterflies-and-trees-with-instancing/45646 https://github.com/barthpaleologue/AssetScattering
+* dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)
 * improve rain from https://playground.babylonjs.com/#XQ8H3C#0
 * improve landscape performance with dynamic terrain? https://github.com/BabylonJS/Extensions/blob/master/DynamicTerrain/documentation/dynamicTerrainDocumentation.md
 * improve landscape with https://medium.com/@trushkinsimon/semi-procedural-landscape-with-babylonjs-e9373bc3091d

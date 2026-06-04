@@ -1405,17 +1405,9 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
-      // ── 0. Noise-dithered waterline dissolve ──────────────────────────────
-      // The beach edge stipples away into the sea over its first ~1.3 m: a world-space noise
-      // discards more pixels the closer they are to the waterline, and the discarded pixels
-      // reveal the shallow water behind — so the shoreline cross-fades terrain → sea with a
-      // ragged, natural edge instead of a clean line. Stays in the OPAQUE pass (discard, not
-      // alpha-blend) so there's no transparent-sorting cost. Faded out just below the
-      // waterline so the submerged seabed stays intact in the refraction RTT.
-      float dStipple  = fract(sin(dot(floor(vPositionW.xz * 64.0), vec2(127.1, 311.7))) * 43758.5453);
-      float dDissolve = (1.0 - smoothstep(0.0, 0.6, vPositionW.y))
-                      * smoothstep(-0.25, 0.04, vPositionW.y) * 0.92;
-      if (dStipple < dDissolve) { discard; }
+      // (The noise-dithered waterline dissolve that used to stipple the beach edge into the sea was
+      //  removed — it read as an unnaturally bright sand band. The seam is now softened from the
+      //  water side by the ocean's water→sand runoff, which dissolves the shallows into the beach.)
 
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -1604,7 +1596,7 @@ export class TerrainService {
                     * smoothstep(-1.0, 0.3, vPositionW.y) * wSand;
       if (wetBand > 0.001) {
         float wetLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
-        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.82;  // lightly damp (was 0.62 — too dark, made the dissolve stipple read as black specks)
+        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.62;  // damp wet-sand tone (the stipple that forced this lighter is gone)
         baseColor.rgb = mix(baseColor.rgb, wetCol, wetBand);
         vec3  Vw   = normalize(vEyePosition.xyz - vPositionW);
         float fres = pow(1.0 - clamp(dot(Vw, nW), 0.0, 1.0), 4.0);

@@ -155,7 +155,8 @@ export class SceneService {
 
       // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
       const FORCE_WEBGL = false;
-      const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined' && !!navigator.gpu;
+      const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined'
+        && !!(navigator as { gpu?: unknown }).gpu;
 
       if (gpuSupported) {
         try {

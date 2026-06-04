@@ -362,6 +362,11 @@ export class CloudService {
         renderScale: 0.82,
       },
     );
+
+    // Couple cloud lighting to the physical atmosphere (when active): the clouds adopt the
+    // atmosphere's sun & sky colour temperature so they match the sky at sunrise/sunset/night.
+    this.volClouds.getAtmoSun = () => this.sceneService.getAtmosphereSunColor();
+    this.volClouds.getAtmoSky = () => this.sceneService.getAtmosphereSkyColor();
   }
 
   // --------------------------------------------------------------------------

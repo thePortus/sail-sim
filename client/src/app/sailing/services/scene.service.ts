@@ -682,6 +682,23 @@ export class SceneService {
   /** Returns a unit vector pointing FROM the scene origin TOWARD the sun. */
   getSunDirection(): Vector3 { return this.computeSunDir(); }
 
+  /** The atmosphere-driven physical sun colour (hue) when active, else null. The atmosphere sets
+   *  the sun light's diffuse each frame from real scattering (warm at the horizon, white at noon).
+   *  Consumers use it as a HUE (magnitude is theirs) so they match the physical sky's temperature. */
+  getAtmosphereSunColor(): Vector3 | null {
+    if (!this.atmosphere) { return null; }
+    const d = this.sun.diffuse;
+    return new Vector3(d.r, d.g, d.b);
+  }
+
+  /** The atmosphere's diffuse sky irradiance (hue) when active, else null. The addon writes it to
+   *  scene.ambientColor each frame. */
+  getAtmosphereSkyColor(): Vector3 | null {
+    if (!this.atmosphere || !this.scene) { return null; }
+    const a = this.scene.ambientColor;
+    return new Vector3(a.r, a.g, a.b);
+  }
+
   updateFogDensity(density: number): void {
     if (this.scene) this.scene.fogDensity = density;
   }
@@ -940,6 +957,27 @@ export class SceneService {
     // Heavier cloud washes the fog more fully toward the (now darker) overcast, so distant
     // islands don't read brighter than the dark storm sky behind them.
     fog = Color3.Lerp(fog, overcast, Math.min(0.92, cloud * (0.45 + stormDark * 0.45)));
+
+    // Match the fog to the physical sky's horizon when the atmosphere is active: keep the tuned
+    // brightness (the day/dusk/night + overcast curve above) but swap the HUE to the atmosphere's
+    // sky colour, warmed toward the sun colour as the sun nears the horizon (golden-hour haze).
+    // Storm overcast keeps its own grey (cloud high → atmosphere tint backed off).
+    const atmoSky = this.getAtmosphereSkyColor();
+    const atmoSun = this.getAtmosphereSunColor();
+    if (atmoSky && atmoSun) {
+      const lowSun = Math.max(0, Math.min(1, 1 - h / 0.30));     // 1 at/below horizon → 0 by h=0.3
+      const w = 0.6 * lowSun;                                     // warm-sun blend at low sun
+      const hueR = (atmoSky.x + (atmoSun.x - atmoSky.x) * w);
+      const hueG = (atmoSky.y + (atmoSun.y - atmoSky.y) * w);
+      const hueB = (atmoSky.z + (atmoSun.z - atmoSky.z) * w);
+      const hueL = hueR * 0.30 + hueG * 0.59 + hueB * 0.11;
+      if (hueL > 0.01) {                                          // skip in near-black (deep night)
+        const clear = Math.max(0, 1 - cloud * 1.4);              // back the tint off under overcast
+        const fogL  = fog.r * 0.30 + fog.g * 0.59 + fog.b * 0.11;
+        const tinted = new Color3(fogL * hueR / hueL, fogL * hueG / hueL, fogL * hueB / hueL);
+        fog = Color3.Lerp(fog, tinted, clear);
+      }
+    }
 
     this.scene.fogColor   = fog;
     this.scene.clearColor = new Color4(fog.r * 0.20, fog.g * 0.20, fog.b * 0.30, 1);

@@ -837,6 +837,12 @@ export class VolumetricCloudsPlugin {
   // true → procedural grey value-noise weather map (Shadertoy-style); false → pebbles.png.
   private readonly useGreyNoiseWeather = true;
 
+  // Optional hooks (set by CloudService) returning the physical atmosphere's sun & sky COLOUR
+  // (hue) so the clouds adopt the atmospheric scattering's colour temperature — warm at the
+  // horizon, blue at noon — while keeping their own tuned brightness. Null → use the built-in curves.
+  getAtmoSun: (() => Vector3 | null) | null = null;
+  getAtmoSky: (() => Vector3 | null) | null = null;
+
   // NOTE: P3 temporal reprojection was attempted and removed — it can't work cleanly in
   // Babylon's auto-managed camera post-process chain (persistent cross-frame history
   // capture fights the pooled pass outputs; an off-chain capture pass crashes at
@@ -1063,6 +1069,17 @@ export class VolumetricCloudsPlugin {
       stormDim * (0.15 + 1.9 * el) + night * 0.12,
       stormDim * (0.20 + 2.0 * el) + night * 0.16,
     );
+
+    // Couple to the physical atmosphere: re-tint the sun & sky colour to the atmosphere's HUE
+    // (keeping our own luminance/brightness) so clouds match the sky's colour temperature.
+    const tintToAtmo = (col: Vector3, atmo: Vector3 | null): void => {
+      if (!atmo) { return; }
+      const al = Math.max(1e-4, atmo.x * 0.30 + atmo.y * 0.59 + atmo.z * 0.11);   // atmo luminance
+      const cl = col.x * 0.30 + col.y * 0.59 + col.z * 0.11;                       // keep our lum
+      col.set(cl * atmo.x / al, cl * atmo.y / al, cl * atmo.z / al);
+    };
+    tintToAtmo(sunColor, this.getAtmoSun?.() ?? null);
+    tintToAtmo(skyColor, this.getAtmoSky?.() ?? null);
 
     effect.setVector3('sunColor', sunColor);
     effect.setVector3('skyColor',  skyColor);

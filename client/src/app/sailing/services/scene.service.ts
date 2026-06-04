@@ -263,6 +263,12 @@ export class SceneService {
       atm.isLinearSpaceComposition = true;  // we composite in HDR linear → pipeline ACES tonemaps
       atm.isLinearSpaceLight       = true;  // PBR materials expect linear light
       atm.skyRenderingGroup        = 0;     // sky behind everything (where the skybox drew)
+      // Sky-look tuning lifted verbatim from the reference playground (#K1Y1Q8#96) the look was
+      // signed off against — a touch of extra ambient, a multiple-scattering floor so shadows
+      // aren't pitch-black, and a softer Mie peak so the sun's halo isn't a harsh hotspot.
+      atm.additionalDiffuseSkyIrradianceIntensity = 0.01;
+      atm.minimumMultiScatteringIntensity         = 0.1;
+      atm.physicalProperties.peakMieScattering     = new Vector3(0.2, 0.2, 0.2);
       this.atmosphere = atm;
 
       // The atmosphere auto-registers a PBR material plugin ("atmo-pbr") that injects
@@ -604,7 +610,7 @@ export class SceneService {
     this.pipeline.imageProcessing.toneMappingEnabled       = true;
     this.pipeline.imageProcessing.toneMappingType          = 2;     // ACES filmic
     this.pipeline.imageProcessing.vignetteEnabled          = true;
-    this.pipeline.imageProcessing.vignetteWeight           = 0.60;
+    this.pipeline.imageProcessing.vignetteWeight           = 0.40;   // was 0.60 — lighter; corners read too dark
     this.pipeline.imageProcessing.contrast                 = 1.10;
     this.pipeline.imageProcessing.exposure                 = 1.0;
 
@@ -861,7 +867,10 @@ export class SceneService {
       // real-time during the transition window, invisible at the rate the sky moves).
       const newExposure = isNight
         ? 0.72    // was 0.58 — too dark to see terrain at all at night
-        : Math.max(0.52, 1.0 + horizon * 0.40 - cloud * 0.16 - nightBlend * 0.38);
+        // Daytime base raised 1.0 → 1.35 to match the reference atmosphere look (its 1.5, minus a
+        // little since the sun=π change already brightens). horizon term softened so golden hour
+        // doesn't blow out on top of the brighter base.
+        : Math.max(0.6, 1.35 + horizon * 0.22 - cloud * 0.18 - nightBlend * 0.70);
       const newContrast = isNight
         ? 1.06
         : Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
@@ -888,6 +897,14 @@ export class SceneService {
         Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
       );
       this.sun.specular = this.sun.diffuse;
+    } else {
+      // The atmosphere addon READS the sun light's intensity to scale both the sky in-scattering
+      // AND the surface sunlight; it sets the light's COLOUR (transmittance, which reddens/dims at
+      // the horizon physically) but never its intensity. Left at the DirectionalLight default of
+      // 1.0, the whole world reads dim — so drive it to Math.PI (the reference playground's value)
+      // at full day, knocked down by cloud cover. The transmittance LUT handles the day/dusk fade,
+      // so a constant daytime magnitude is correct.
+      this.sun.intensity = Math.PI * (1.0 - cloud * 0.5);
     }
 
     // ── Moonlight (directional, opposite the sun, only at night) ─────────────

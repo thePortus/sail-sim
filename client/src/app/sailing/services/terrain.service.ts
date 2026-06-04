@@ -80,6 +80,7 @@ export class TerrainService {
   } | null = null;
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
+  private _inRefractionPass = false;   // true while the terrain renders into the ocean's seabed RTT
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -394,12 +395,10 @@ export class TerrainService {
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
-    // Distant forests = the green CANOPY painted into the terrain shader (§8d); there are
-    // NO 3-D forest trees (rendering 42k of them, even near-culled, was the FPS wall). The
-    // ONLY real 3-D trees are sparse PALMS dotted along the beaches, rendered only within
-    // ~200 m of the camera — so you get actual trees + shadows when you land on a shore for
-    // almost no cost (few exist, fewer enabled). buildTreeFoliage (forest trees) is unused.
-    this.buildBeachPalms(scene, manifest);
+    // Distant forests = the green CANOPY painted into the terrain shader (§8d). Beach palms (and
+    // now inland forest trees) are handled by the new camera-following ScatterService (thin
+    // instances + LoD + quality tiers), so the old per-patch beach-palm system is retired here.
+    // this.buildBeachPalms(scene, manifest);   // → ScatterService 'scatter_palms' layer
     // Ground scatter (rocks/grass/driftwood/dead trees) is implemented but
     // DISABLED pending a live debug: placement works (instances are created with
     // valid positions, per console logs) but nothing renders via either thin
@@ -1388,6 +1387,16 @@ export class TerrainService {
     material.AddUniform('uCloudTime',     'float',   null);   // (legacy) cloud-shadow drift clock
     material.AddUniform('uCloudDrift',    'vec2',    null);   // real cloud wind drift (matches ocean)
     material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
+    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = dither shoreline (main view), 0 = off (refraction RTT)
+
+    // The waterline dither discards sand pixels — but it must NOT run when the terrain renders into
+    // the ocean's refraction (seabed) RTT, or the holes get filled with that pass's bright clear-
+    // colour and read as a bright band. Flag the refraction pass so the bind below can switch it off.
+    const refr = this.oceanService.getRefractionTexture?.();
+    if (refr) {
+      refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
+      refr.onAfterRenderObservable.add(() => { this._inRefractionPass = false; });
+    }
 
     // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
     const peakH = manifest.targetPeakElevation ?? 920;
@@ -1405,17 +1414,16 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
-      // ── 0. Noise-dithered waterline dissolve ──────────────────────────────
-      // The beach edge stipples away into the sea over its first ~1.3 m: a world-space noise
-      // discards more pixels the closer they are to the waterline, and the discarded pixels
-      // reveal the shallow water behind — so the shoreline cross-fades terrain → sea with a
-      // ragged, natural edge instead of a clean line. Stays in the OPAQUE pass (discard, not
-      // alpha-blend) so there's no transparent-sorting cost. Faded out just below the
-      // waterline so the submerged seabed stays intact in the refraction RTT.
-      float dStipple  = fract(sin(dot(floor(vPositionW.xz * 64.0), vec2(127.1, 311.7))) * 43758.5453);
-      float dDissolve = (1.0 - smoothstep(0.0, 0.6, vPositionW.y))
-                      * smoothstep(-0.25, 0.04, vPositionW.y) * 0.92;
-      if (dStipple < dDissolve) { discard; }
+      // ── 0. Noise-dithered waterline ───────────────────────────────────────
+      // Break up the clean sand↔water contour: in a thin band right at the waterline, a world-space
+      // noise discards sand pixels — more the closer to the edge — so the ocean behind shows through
+      // the gaps and the shoreline reads ragged/natural. Opaque-pass discard (no transparency sort).
+      float wlNoise = fract(sin(dot(floor(vPositionW.xz * 80.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlBand  = (1.0 - smoothstep(0.0, 0.55, vPositionW.y))   // fades out ~0.55 m up the beach
+                    * smoothstep(-0.20, 0.04, vPositionW.y)         // fades in from just below water
+                    * 0.85                                          // max discard fraction at the very edge
+                    * u_waterlineDither;                            // 0 in the refraction RTT → seabed stays solid
+      if (wlNoise < wlBand) { discard; }
 
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -1604,7 +1612,7 @@ export class TerrainService {
                     * smoothstep(-1.0, 0.3, vPositionW.y) * wSand;
       if (wetBand > 0.001) {
         float wetLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
-        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.82;  // lightly damp (was 0.62 — too dark, made the dissolve stipple read as black specks)
+        vec3  wetCol = mix(baseColor.rgb, vec3(wetLum), 0.25) * 0.62;  // damp wet-sand tone (the stipple that forced this lighter is gone)
         baseColor.rgb = mix(baseColor.rgb, wetCol, wetBand);
         vec3  Vw   = normalize(vEyePosition.xyz - vPositionW);
         float fres = pow(1.0 - clamp(dot(Vw, nW), 0.0, 1.0), 4.0);
@@ -1766,6 +1774,8 @@ export class TerrainService {
       const fx = material.getEffect();
       if (!fx) return;
       fx.setFloat('uPeakH', peakH);
+      // Switch the shoreline dither OFF for the refraction (seabed) pass so the seabed stays solid.
+      fx.setFloat('u_waterlineDither', this._inRefractionPass ? 0 : 1);
       // Haze tint tracks the current sky/fog colour (day/dusk/night/storm aware).
       fx.setColor3('uHazeColor', scene.fogColor);
       // Cloud shadows — pull the SAME coverage, sun dir and clock the ocean uses so the

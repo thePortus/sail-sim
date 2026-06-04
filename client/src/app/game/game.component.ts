@@ -357,6 +357,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
 
       this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
       this.phase.set('sailing');
+
+      // Build the physical atmosphere LAST — after every scene material has compiled — so its
+      // construction can't corrupt their WebGPU GLSL→SPIR-V compile (varying-location failures).
+      // Fire-and-forget: it waits for scene-ready internally and falls back to the Preetham sky.
+      void this.sceneService.activateAtmosphere();
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);

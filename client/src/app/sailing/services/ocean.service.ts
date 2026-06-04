@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
-  MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture,
+  MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture, Color4,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -10,17 +10,10 @@ import { SeaConditions, Wind } from '../models';
 const OCEAN_VERT = `
 precision highp float;
 
-#ifdef WEBGPU
-layout(location = 0) in vec3 position;
-layout(location = 0) out vec3 v_worldPos;
-layout(location = 1) out vec4 v_projPos;
-layout(location = 2) out float v_wakeMask;
-#else
 attribute vec3 position;
 varying vec3  v_worldPos;
 varying vec4  v_projPos;
 varying float v_wakeMask;
-#endif
 
 uniform mat4 worldViewProjection;
 uniform mat4 world;
@@ -29,7 +22,7 @@ uniform float u_Time;
 uniform vec2  u_WorldOffset;
 uniform float u_MeshHalfSize;
 uniform float u_DisplaceScale;
-uniform float u_edgeFade;        // 1 = fade displacement to 0 at mesh edge; 0 = full waves to edge
+uniform float u_edgeFade;        // 1 = fade displacement to 0 at mesh edge, 0 = full waves to edge
 uniform float u_WaveDepth;
 uniform float u_WaveFreq;
 uniform vec2  u_BoatPos;
@@ -212,16 +205,9 @@ uniform mat4  view;              // auto-bound by Babylon — world→view (came
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 uniform sampler2D u_refraction;  // seabed (terrain) colour for true shallow-water transparency
 
-#ifdef WEBGPU
-layout(location = 0) in vec3 v_worldPos;
-layout(location = 1) in vec4 v_projPos;
-layout(location = 2) in float v_wakeMask;
-layout(location = 0) out vec4 fragmentColor;
-#else
 varying vec3 v_worldPos;
 varying vec4 v_projPos;
 varying float v_wakeMask;
-#endif
 
 #define DRAG_MULT 0.38
 #define ITERATIONS u_normalIter   // FRAGMENT normal count, set PER-LOD via
@@ -711,11 +697,7 @@ void main() {
   color *= dayLight;
 
   vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
-#ifdef WEBGPU
-  fragmentColor = outCol;
-#else
   gl_FragColor = outCol;
-#endif
 }
 `;
 
@@ -1459,6 +1441,13 @@ export class OceanService {
   private splashData = new Float32Array(this.SPLASH_MAX * 4);  // xy = pos, z = age
   private splashCount = 0;
 
+  // ── Cannon muzzle-flash glow on the water (emissive — a point light can't light the
+  //    emissive sea). xy = world pos, z = age (s). Brief, warm, local. ──────────────
+  private readonly FLASH_MAX  = 6;       // matches the FFT material array size
+  private readonly FLASH_LIFE = 0.45;    // seconds before the flash glow fades
+  private flashData = new Float32Array(this.FLASH_MAX * 4);
+  private flashCount = 0;
+
   // Small weather coupling: stormy seas slightly amplify wave depth.
   private waveDepthScale = 1.0;
 
@@ -1549,7 +1538,12 @@ export class OceanService {
     // shader "sees past" the keel to the seabed and sand shows through the hull.
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_');
+      !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_') &&
+      m.name !== 'skybox';   // exclude the sky: where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+    // Clear to a sandy tan so where the seabed drops off (no terrain behind the water) the
+    // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
+    // the deep→shallow boundary into the beach colour.
+    this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
     this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
     scene.customRenderTargets.push(this.refractionRTT);
 
@@ -1772,6 +1766,7 @@ export class OceanService {
 
       this.updateWakePath(dt);
       this.updateSplashes(dt);
+      this.updateCannonFlashes(dt);
 
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
@@ -1833,6 +1828,44 @@ export class OceanService {
     }
   }
 
+  /**
+   * Register a cannon muzzle flash at world (x,z) — drives a brief warm emissive glow on the sea.
+   * (dirX,dirZ) is the unit OUTWARD beam direction (the way the cannon points); the shader uses it
+   * to mask the glow to the firing side of the keel, so the hull "occludes" the far side (a port
+   * cannonade no longer glows on starboard) — far cheaper than a real shadow-casting light.
+   */
+  addCannonFlash(x: number, z: number, dirX: number, dirZ: number): void {
+    const N = 4;
+    if (this.flashCount >= this.FLASH_MAX) {
+      this.flashData.copyWithin(0, N, this.FLASH_MAX * N);   // drop the oldest
+      this.flashCount = this.FLASH_MAX - 1;
+    }
+    const idx = this.flashCount * N;
+    this.flashData[idx]     = x;
+    this.flashData[idx + 1] = z;
+    this.flashData[idx + 2] = 0;                       // age
+    this.flashData[idx + 3] = Math.atan2(dirZ, dirX);  // firing-beam angle (unpacked to a dir in-shader)
+    this.flashCount++;
+  }
+
+  /** Age active flashes and drop expired ones (oldest are at the front). */
+  private updateCannonFlashes(dt: number): void {
+    const buf = this.flashData;
+    const N = 4;
+    for (let i = 0; i < this.flashCount; i++) buf[i * N + 2] += dt;
+    let drop = 0;
+    while (drop < this.flashCount && buf[drop * N + 2] > this.FLASH_LIFE) drop++;
+    if (drop > 0) {
+      buf.copyWithin(0, drop * N, this.flashCount * N);
+      this.flashCount -= drop;
+    }
+  }
+
+  /** Snapshot for the FFT ocean material: warm emissive flash positions + ages. */
+  getCannonFlash(): { data: Float32Array; count: number; life: number } {
+    return { data: this.flashData, count: this.flashCount, life: this.FLASH_LIFE };
+  }
+
   private updateWakePath(dt: number): void {
     const buf = this.wakePath;
     const N = 4;
@@ -1873,11 +1906,23 @@ export class OceanService {
   private _cloudCoverage = 0;
   private _sunElevation  = 0;
   private _rainIntensity = 0;
+  // Live cloud coverage state (wind drift + coverage threshold + base) for real cloud shadows.
+  private _cloudShadow: { drift: Vector2; covThresh: number; cloudBase: number } | null = null;
 
   /** Call each frame from CloudService so the water mirrors current sky state. */
   setCloudReflection(coverage: number, sunElevation: number): void {
     this._cloudCoverage = coverage;
     this._sunElevation  = sunElevation;
+  }
+
+  /** Call each frame from CloudService — the cloud coverage state for real water cloud shadows. */
+  setCloudShadowField(field: { drift: Vector2; covThresh: number; cloudBase: number } | null): void {
+    this._cloudShadow = field;
+  }
+
+  /** Shared with the terrain so its cloud shadows trace the same clouds. */
+  getCloudShadowField(): { drift: Vector2; covThresh: number; cloudBase: number } | null {
+    return this._cloudShadow;
   }
 
   /** Current cloud coverage (0–1) — shared with the terrain so its cloud shadows match. */
@@ -2069,13 +2114,20 @@ export class OceanService {
 
   /** Top-down terrain (island) shadow mask + transform + strength + live cloud cover, for the
    *  FFT ocean to cast island/cloud shadows on the water. Black placeholder until terrain sets it. */
-  getWaterShadowInfo(): { map: Texture; center: Vector2; size: number; strength: number; cloud: number } {
+  getWaterShadowInfo(): {
+    map: Texture; center: Vector2; size: number; strength: number; cloud: number;
+    cloudDrift: Vector2; cloudCovThresh: number; cloudBase: number;
+  } {
     return {
       map: this.terrainShadowMask ?? this.shoreMapBlackTexture ?? this.reflectionRTT,
       center: this.terrainShadowCenter,
       size: this.terrainShadowSize > 0 ? this.terrainShadowSize : 1e9,
       strength: this.terrainShadowStrength,
       cloud: this._cloudCoverage,
+      // Real cloud-shadow state. covThresh 999 (no shadow) until the cloud plugin is ready.
+      cloudDrift:     this._cloudShadow?.drift      ?? new Vector2(0, 0),
+      cloudCovThresh: this._cloudShadow?.covThresh  ?? 999.0,
+      cloudBase:      this._cloudShadow?.cloudBase  ?? 900,
     };
   }
 

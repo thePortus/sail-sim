@@ -32,9 +32,6 @@ export class WavesCascade {
   private _DyxDyz: BaseTexture;
   private _DxxDzz: BaseTexture;
 
-  /** Debug: when true, skip the IFFTs so DxDz holds the raw time-dependent spectrum. */
-  public debugSkipIFFT = false;
-
   private _merger: ComputeShader;
   private _mergerParams: UniformBuffer;
   private _displacement: BaseTexture;
@@ -46,10 +43,6 @@ export class WavesCascade {
   get displacement() { return this._displacement; }
   get derivatives() { return this._derivatives; }
   get turbulence() { return this._pingPong ? this._turbulence2 : this._turbulence; }
-
-  // Debug taps.
-  get debugInitialSpectrum() { return this._initialSpectrum.initialSpectrum; }  // H0 (rgba32f)
-  get debugDxDz() { return this._DxDz; }                                        // post-IFFT spatial (rg32f)
 
   constructor(size: number, noise: BaseTexture, fft: FFT, engine: WebGPUEngine) {
     this._engine = engine;
@@ -128,12 +121,10 @@ export class WavesCascade {
     this._timeParams.update();
     ComputeHelper.dispatch(this._timeDependentSpectrum, this._size, this._size, 1);
 
-    if (!this.debugSkipIFFT) {
-      this._fft.IFFT2D(this._DxDz, this._buffer);
-      this._fft.IFFT2D(this._DyDxz, this._buffer);
-      this._fft.IFFT2D(this._DyxDyz, this._buffer);
-      this._fft.IFFT2D(this._DxxDzz, this._buffer);
-    }
+    this._fft.IFFT2D(this._DxDz, this._buffer);
+    this._fft.IFFT2D(this._DyDxz, this._buffer);
+    this._fft.IFFT2D(this._DyxDyz, this._buffer);
+    this._fft.IFFT2D(this._DxxDzz, this._buffer);
 
     let deltaTime = this._engine.getDeltaTime() / 1000;
     if (deltaTime > 0.5) { deltaTime = 0.5; }

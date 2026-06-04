@@ -4,6 +4,7 @@ import {
 } from '@babylonjs/core';
 import { RiggedManifest, SailState } from '../models';
 import { SailBillowPlugin } from './sail-billow.plugin';
+import { BakedAOPlugin } from './baked-ao.plugin';
 
 /**
  * Per-vessel animation driver for a single rigged GLB (e.g. bermuda_sloop_rigged.glb).
@@ -121,6 +122,16 @@ export class SloopController {
         if (!plugin) plugin = new SailBillowPlugin(mat);
         const bb = mesh.getBoundingInfo().boundingBox;
         plugin.configure(bb.minimum, bb.maximum);
+      }
+
+      // Surface the GLB's baked AO (ORM occlusion) on every PBR part — Babylon only applies it
+      // to (absent) IBL, so without this the bake is invisible. Shared material → attach once.
+      if (mesh.material instanceof PBRMaterial &&
+          !mesh.material.pluginManager?.getPlugin('BakedAO')) {
+        new BakedAOPlugin(mesh.material);
+        // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby
+        // broadside lights this hull without displacing the sun (which would darken the ship).
+        mesh.material.maxSimultaneousLights = 6;
       }
     }
 

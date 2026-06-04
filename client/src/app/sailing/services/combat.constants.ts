@@ -30,6 +30,7 @@ export interface CombatHitMsg {
   zone:      Zone;
   hx: number; hy: number; hz: number;   // world impact point
   side: 'port' | 'stbd';                // struck side (for the shudder)
+  tof?: number;                         // server time-of-flight (s) — defer the hit FX to ball arrival
 }
 
 /** Server → ALL clients: a ship's authoritative hull state. Drives the victim's HUD

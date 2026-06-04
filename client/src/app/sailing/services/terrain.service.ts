@@ -139,36 +139,41 @@ export class TerrainService {
 
     this.buildTerrainMesh();
 
-    // P4b: ?terrainclip swaps the static mesh for a camera-centric clipmap rendered with the REAL
-    // terrain material (GPU height displacement + Sobel normals). Behind a flag for A/B vs the static
-    // mesh until P4c flips it on by default.
-    if (new URLSearchParams(location.search).has('terrainclip')) {
-      this.buildClipmap();
-    }
   }
 
-  // ── P4b: terrain clipmap (real biome material) ──────────────────────────────
+  // ── Terrain clipmap (camera-centric LoD, GPU displacement + Sobel normals) ───
   private clipmap: TerrainClipmap | null = null;
   private clipmapObserver: import('@babylonjs/core').Observer<Scene> | null = null;
 
-  /** Build the camera-centric clipmap and render it with the real terrain material in clipmap mode
-   *  (vertex height displacement + fragment Sobel normals). Hides the static mesh. */
+  /** Build the camera-centric clipmap and render it with the terrain material in clipmap mode
+   *  (vertex height displacement + fragment Sobel normals). This IS the terrain render — no static
+   *  ground mesh. Enrolls each ring in the ocean RTTs so the seabed feeds the water transparency. */
   private buildClipmap(): void {
     const scene = this.sceneService.scene;
     const cam = this.sceneService.camera;
     const m = this.manifest;
     if (!scene || !cam || !m || !this.heightfield) { return; }
 
-    const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode
+    // Dispose any prior clipmap (e.g. a quality-driven rebuild).
+    if (this.clipmapObserver) { scene.onBeforeRenderObservable.remove(this.clipmapObserver); this.clipmapObserver = null; }
+    this.clipmap?.dispose();
+    this.clipmap = null;
+
+    const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode: GPU displace + Sobel normals
+    mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
 
     this.clipmap = new TerrainClipmap(cam, scene);
     this.clipmap.setMaterial(mat);
     this.clipmap.initializeMeshes();
     this.clipmap.update();
+    // Enroll every clipmap mesh in the ocean RTTs (the submerged seabed feeds the depth-based water
+    // transparency + refraction + reflection) and exclude from glow. receiveShadows is set in the
+    // clipmap; the terrain intentionally does NOT cast shadows (see the old note — self-shadow moiré).
+    for (const cm of this.clipmap.allMeshes()) {
+      this.oceanService.addToRenderList(cm);
+      this.sceneService.excludeFromGlow(cm);
+    }
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
-
-    if (this.terrainMesh) { this.terrainMesh.setEnabled(false); }   // hide the static mesh
-    console.info('[Terrain] clipmap (real material) active (?terrainclip) — static mesh hidden');
   }
 
   isReady(): boolean {
@@ -304,152 +309,15 @@ export class TerrainService {
     const manifest = this.manifest;
     if (!scene || !manifest || !this.heightfield) return;
 
-    if (this.terrainMesh) {
-      this.terrainMesh.dispose();
-      this.terrainMesh = null;
-    }
     this.disposeFoliage();
 
-    const worldWidth = manifest.worldBounds.maxX - manifest.worldBounds.minX;
-    const worldDepth = manifest.worldBounds.maxZ - manifest.worldBounds.minZ;
-    const centerX = (manifest.worldBounds.minX + manifest.worldBounds.maxX) * 0.5;
-    const centerZ = (manifest.worldBounds.minZ + manifest.worldBounds.maxZ) * 0.5;
-    // Cap at 1500 → ~33 m/polygon at 50 km.  The 0.42 multiplier always
-    // exceeds the cap for any source ≥ 3600 px, so the cap is the only knob.
-    // 1500×1500 ≈ 4.5 M triangles — good balance of quality and GPU cost.
-    // Raising to 2000 (8 M triangles) halved framerate on mid-range hardware;
-    // the normal-map micro-detail compensates visually.
-    const subdivisions = Math.max(
-      420,
-      Math.min(1500, Math.floor(Math.max(manifest.width, manifest.height) * 0.42)),
-    );
-
-    const mesh = MeshBuilder.CreateGround('terrain_heightfield', {
-      width: worldWidth,
-      height: worldDepth,
-      subdivisions,
-      updatable: true,
-    }, scene);
-    mesh.position.set(centerX, 0, centerZ);
-    mesh.renderingGroupId = 2;
-
-    const positions = mesh.getVerticesData(VertexBuffer.PositionKind)!;
-    const numVerts   = (subdivisions + 1) * (subdivisions + 1);
-    const gridW      = subdivisions + 1;
-    const colors: number[] = [];
-
-    // ── Pass 1: sample heightfield → raw vertex Y values ─────────────────────
-    // underwaterY[i] stores the seabed depth (≤ 0) for ocean vertices,
-    // pre-computed here so the smoothing write-back can reuse it cheaply.
-    const rawY       = new Float32Array(numVerts);
-    const underwaterY = new Float32Array(numVerts);
-    for (let i = 0; i < numVerts; i++) {
-      const wx = centerX + positions[i * 3];
-      const wz = centerZ + positions[i * 3 + 2];
-      rawY[i] = this.getElevation(wx, wz);
-      if (rawY[i] > 0) {
-        positions[i * 3 + 1] = rawY[i];
-      } else {
-        underwaterY[i]        = this.sampleUnderwaterDepth(wx, wz);
-        positions[i * 3 + 1] = underwaterY[i];
-      }
-    }
-
-    // ── Pass 2: Iterative Gaussian 3×3 smoothing on land heights ─────────────
-    // Three consecutive passes of the 1-2-1 kernel are equivalent to a single
-    // ~7-wide Gaussian — enough to round off coarse polygon steps on hillsides
-    // and cliffs without flattening genuine peaks.
-    // Ocean-floor vertices (y ≤ 0) are held fixed throughout and excluded from
-    // neighbour averages so the waterline is never dragged downward.
-    //
-    // BEACH PROTECTION: any land vertex whose rawY sits in the coastal-grading
-    // zone (0 < rawY ≤ BEACH_H_M) must never be raised by smoothing.  Without
-    // this guard, mountain neighbours at 200–500 m pull the 5 m beach cells up
-    // to 200–400 m after three passes, putting them in the rock biome and
-    // hiding the sandy texture entirely.  The clamp below preserves the beach
-    // profile while still letting the kernel round off genuine cliffs.
-    const SMOOTH_PASSES = 3;
-    const BEACH_H_M = 5.0;   // must match applyCoastalGrading BEACH_H
-    // Work on a copy so rawY stays intact for biome colour sampling below.
-    let currentY = rawY.slice();
-    for (let pass = 0; pass < SMOOTH_PASSES; pass++) {
-      const nextY = new Float32Array(numVerts);
-      for (let gz = 0; gz < gridW; gz++) {
-        for (let gx = 0; gx < gridW; gx++) {
-          const ci = gz * gridW + gx;
-          const cy = currentY[ci];
-          if (cy <= 0) { nextY[ci] = cy; continue; }   // keep ocean fixed
-
-          let sum = 0, wt = 0;
-          for (let dz = -1; dz <= 1; dz++) {
-            const nz = gz + dz;
-            if (nz < 0 || nz >= gridW) continue;
-            for (let dx = -1; dx <= 1; dx++) {
-              const nx = gx + dx;
-              if (nx < 0 || nx >= gridW) continue;
-              const ny = currentY[nz * gridW + nx];
-              if (ny <= 0) continue;                    // don't blend in ocean
-              const w = (2 - Math.abs(dx)) * (2 - Math.abs(dz)); // 1-2-1 kernel
-              sum += ny * w;
-              wt  += w;
-            }
-          }
-          const smoothed = wt > 0 ? sum / wt : cy;
-          // Beach cells: smoothing may only lower (blend out polygon steps toward
-          // water), never raise.  Mountain neighbours must not contaminate them.
-          nextY[ci] = (rawY[ci] > 0 && rawY[ci] <= BEACH_H_M)
-            ? Math.min(rawY[ci], smoothed)
-            : smoothed;
-        }
-      }
-      currentY = nextY;
-    }
-
-    // Write smoothed Y back and build vertex colours (colours use rawY so
-    // biome bands stay aligned with the source heightfield, not the smoothed mesh).
-    // Ocean vertices use the pre-computed exponential depth rather than a flat plane.
-    for (let i = 0; i < numVerts; i++) {
-      positions[i * 3 + 1] = currentY[i] > 0 ? currentY[i] : underwaterY[i];
-    }
-
-    for (let i = 0; i < numVerts; i++) {
-      const elev = rawY[i];
-      if (elev <= 0) {
-        colors.push(0.06, 0.14, 0.28, 1.0);
-      } else {
-        const t = elev / manifest.targetPeakElevation;
-        let r = 0.18, g = 0.35, b = 0.14;
-        if      (t < 0.03) { r = 0.78; g = 0.71; b = 0.54; }
-        else if (t < 0.25) { r = 0.22; g = 0.44; b = 0.16; }
-        else if (t < 0.55) { r = 0.34; g = 0.30; b = 0.22; }
-        else if (t < 0.80) { r = 0.24; g = 0.21; b = 0.19; }
-        else               { r = 0.16; g = 0.14; b = 0.14; }
-        colors.push(r, g, b, 1.0);
-      }
-    }
-
-    mesh.updateVerticesData(VertexBuffer.PositionKind, positions, false);
-    mesh.setVerticesData(VertexBuffer.ColorKind, colors, false);
-    mesh.createNormals(true);
-    mesh.refreshBoundingInfo();
-
-    const material = this.buildTerrainMaterial(scene, manifest);
-    material.zOffset = 4;
-    mesh.material = material;
-    mesh.useVertexColors = false;
-
-    this.oceanService.addToRenderList(mesh);
-    // NOTE: the terrain is intentionally NOT added as a shadow caster. At this
-    // world scale the far shadow cascades have huge texels, so the terrain
-    // shadowing itself produced moving diagonal moiré (self-shadow acne) on
-    // steep slopes, worst at noon. Leaving it out of the shadow map means it can
-    // never self-shadow. It still RECEIVES shadows (trees, boat) via
-    // receiveShadows below, and large-scale terrain shadows are handled by the
-    // dedicated raymarched terrainShadowMask system.
-    this.sceneService.excludeFromGlow(mesh);
-    mesh.receiveShadows = true;
-
-    this.terrainMesh = mesh;
+    // The terrain renders as a camera-centric CLIPMAP — flat LOD-ring grids displaced and
+    // normal-mapped on the GPU from the heightfield texture — replacing the old static 1500²-cap
+    // ground mesh (detail follows the player: crisp near, cheap to the horizon). buildClipmap()
+    // also enrolls the rings in the ocean RTTs and sets receiveShadows / glow exclusion. The terrain
+    // is intentionally NOT a shadow caster (self-shadow moiré at this world scale); large-scale
+    // terrain shadows come from the raymarched terrainShadowMask below.
+    this.buildClipmap();
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));

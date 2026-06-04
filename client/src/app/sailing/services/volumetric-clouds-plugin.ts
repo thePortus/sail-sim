@@ -95,6 +95,12 @@ uniform float atlasCols;      // slices per atlas row
 
 #define PI 3.14159265
 
+// Spherical-shell atmosphere radius (Shadertoy uses real earth 6.3e6, but that
+// loses float32 precision at our meter scale → shell jitter). Scaled down to keep
+// precision while still curving the cloud deck down to the horizon. Tunable: larger
+// = gentler, more distant horizon curve; smaller = tighter "small planet" curve.
+#define EARTH_RADIUS 2000000.0
+
 // ── Prefixed helpers (avoids collision with Babylon.js preamble) ─────────────
 
 float vc_sat(float x) { return clamp(x, 0.0, 1.0); }
@@ -148,7 +154,63 @@ float vc_noise3D(vec3 uvw) {
     return mix(s0, s1, zf);
 }
 
-// ── Cloud density ─────────────────────────────────────────────────────────────
+// ── Shadertoy 4dSBDt cloud-model helpers (faithful port) ──────────────────────
+//
+// vc_noise3D tiles every 1.0 in uvw; the Shadertoy's noise(vec3 x) tiles every
+// noiseSliceDim (32) units of x, so we map x -> (x+0.5)/noiseSliceDim to match its
+// frequency convention before sampling the same 32-cube atlas.
+float vc_noiseST(vec3 x) {
+    return vc_noise3D((x + 0.5) / noiseSliceDim);
+}
+
+// Three-octave fractional Brownian motion with the Shadertoy's rotation matrix.
+float vc_fbm(vec3 p) {
+    mat3 m = mat3( 0.00,  0.80,  0.60,
+                  -0.80,  0.36, -0.48,
+                  -0.60, -0.48,  0.64);
+    float f  = 0.5000 * vc_noiseST(p); p = m * p * 2.02;
+    f       += 0.2500 * vc_noiseST(p); p = m * p * 2.03;
+    f       += 0.1250 * vc_noiseST(p);
+    return f;
+}
+
+// Fitted numerical Mie phase (from shadertoy 4sjBDG) — sharp forward scatter + glow.
+float vc_mieFit(float costh) {
+    const float p0 = 9.805233e-06, p1 = -6.500000e+01, p2 = -5.500000e+01,
+                p3 = 8.194068e-01, p4 =  1.388198e-01, p5 = -8.370334e+01,
+                p6 = 7.810083e+00, p7 =  2.054747e-03, p8 =  2.600563e-02,
+                p9 = -4.552125e-12;
+    float pp = costh + p3;
+    vec4 expValues = exp(vec4(p1 * costh + p2, p5 * pp * pp, p6 * costh, p9 * costh));
+    vec4 expValWeight = vec4(p0, p4, p7, p8);
+    return dot(expValues, expValWeight);
+}
+
+// Ray/sphere intersection (returns nearest positive hit distance, or -1.0).
+float vc_intersectSphere(vec3 origin, vec3 dir, vec3 spherePos, float sphereRad) {
+    vec3  oc = origin - spherePos;
+    float b  = 2.0 * dot(dir, oc);
+    float c  = dot(oc, oc) - sphereRad * sphereRad;
+    float disc = b * b - 4.0 * c;
+    if (disc < 0.0) return -1.0;
+    float q  = (-b + ((b < 0.0) ? -sqrt(disc) : sqrt(disc))) / 2.0;
+    float t0 = q;
+    float t1 = c / q;
+    if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+    if (t1 < 0.0) return -1.0;
+    return (t0 < 0.0) ? t1 : t0;
+}
+
+// ── Cloud density (faithful Shadertoy 4dSBDt clouds() on a spherical shell) ────
+
+// Earth centre tracks the camera horizontally so the cloud deck always curves away
+// from wherever the player is (the Shadertoy keeps its camera near origin; we sail
+// a large world, so a fixed centre would push us to the sphere's edge).
+float vc_cloudHeight(vec3 p) {
+    vec3  center     = vec3(cameraPosition.x, -EARTH_RADIUS, cameraPosition.z);
+    float atmoHeight = length(p - center) - EARTH_RADIUS;   // metres above the (curved) sea
+    return vc_sat((atmoHeight - cloudBase) / max(cloudTop - cloudBase, 1.0));
+}
 
 float vc_heightFrac(float y) { return vc_remap(y, cloudBase, cloudTop); }
 
@@ -163,60 +225,78 @@ float vc_heightGrad(float h) {
                 * (1.0 - vc_remap(h, topEnd * 0.5, topEnd)));   // round off below the top
 }
 
+// Faithful port of the Shadertoy clouds(): two-scale weather-texture coverage ×
+// vertical profile × pow() shape × two-octave fbm erosion. lod>=1.5 takes the cheap
+// "fast" path (used by the light march). cloudCoverage shifts the weather threshold so
+// the same field ranges clear → overcast.
 float vc_getDensity(vec3 p, float lod) {
-    float h = vc_heightFrac(p.y);
-    if (h < 0.0 || h > 1.0) return 0.0;
+    float ch = vc_cloudHeight(p);
+    if (ch <= 0.0 || ch >= 1.0) return 0.0;
 
-    float hg = vc_heightGrad(h);
-    if (hg < 0.001) return 0.0;
+    // Storm factor from cloudType (0.40 calm cumulus → 0.95 towering cumulonimbus).
+    float storm = smoothstep(0.40, 0.95, cloudType);
 
-    // Wind advection offset.
-    float wt = time * windSpeed * 0.08;
-    vec2  wd = windDir * wt;
+    // Wind drift — offset the sample position so the cloud pattern travels with the wind to
+    // match the game's wind convention (same sign the prior cloud system used). Plus a slow,
+    // wind-independent vertical "boil" so clouds evolve in place, not just translate. KNOBS:
+    // drift rate 0.08, boil rate 3.0.
+    vec2  wd    = windDir * (time * windSpeed * 0.08);
+    vec2  pzx   = p.zx + wd.yx;
+    vec3  drift = vec3(wd.x, 0.0, wd.y);
+    float evo   = time * 3.0;
 
-    // 2-D weather map drives spatial coverage. The +0.37 shifts the sampling domain
-    // off world origin: without it, the weather-texture wrap boundary AND the noise
-    // fract() boundaries all coincide at (0,0), producing a visible seam there.
-    vec2  wuv = p.xz * 0.000012 + wd * 0.00002 + 0.37;
-    float wc  = texture2D(weatherSampler, wuv).r;
-    float cov = vc_sat(cloudCoverage + wc - 0.5);
-    if (cov < 0.01) return 0.0;
+    float largeWeather = clamp((texture2D(weatherSampler, -0.00005 * pzx).r - 0.18) * 5.0, 0.0, 2.0);
+    // covThresh lowers with coverage AND storminess → storms fill the sky.
+    float covThresh    = 0.28 - (cloudCoverage - 0.5) * 0.5 - storm * 0.05;
+    float weather      = largeWeather * max(0.0, texture2D(weatherSampler, 0.0002 * pzx).r - covThresh) / 0.72;
+    weather *= smoothstep(0.0, 0.5, ch) * smoothstep(1.0, 0.5, ch);   // vertical fade in/out
+    float cloudShape = pow(weather, 0.3 + 1.5 * smoothstep(0.2, 0.5, ch));
+    if (cloudShape <= 0.0) return 0.0;
 
-    // Low-frequency base shape. +0.37 (xz) keeps the fract() tile boundary off origin.
-    vec3 np   = p * 0.000075 + vec3(wd.x, 0.0, wd.y) * 0.00004 + vec3(0.37, 0.0, 0.37);
-    // lod is used to scale the noise coordinates for a coarser sample.
-    float ns  = vc_noise3D(np * (1.0 + lod * 0.5));
-    float shp = vc_remap(ns, 1.0 - cov, 1.0) * hg;
-    if (shp < 0.001) return 0.0;
+    // First erosion octave (low-freq lumps), drifting with the wind.
+    float den = max(0.0, cloudShape - 0.7 * vc_fbm((p + drift) * 0.01));
+    if (den <= 0.0) return 0.0;
 
-    // High-frequency detail erosion (skipped at high LOD).
-    if (lod < 1.5) {
-        vec3  dp  = p * 0.00038 + vec3(wd.x, 0.0, wd.y) * 0.00012 + vec3(0.37, 0.0, 0.37);
-        float det = vc_noise3D(dp * 3.0);
-        float ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
-        // Erode more for puffy/storm types (broken cauliflower edges), less for stratus
-        // (smoother continuous sheet).
-        shp = vc_remap(shp, ero * mix(0.10, 0.32, cloudType), 1.0);
-    }
+    // Density scale rises with storminess → thicker, self-shadowing, darker-based storm cloud.
+    float dScale = mix(0.20, 0.32, storm);
 
-    return vc_sat(shp) * cloudDensity;
+    // Light-march / coarse path stops here (the Shadertoy 'fast' branch).
+    if (lod >= 1.5) return largeWeather * dScale * min(1.0, 5.0 * den);
+
+    // Second erosion octave (high-freq cauliflower detail) — drifts + boils; full path only.
+    den = max(0.0, den - 0.2 * vc_fbm((p + drift + vec3(0.0, evo, 0.0)) * 0.05));
+    return largeWeather * dScale * min(1.0, 5.0 * den);
 }
 
-// ── Light march (cone from sample toward sun) ─────────────────────────────────
+// ── Light march toward the sun (faithful Shadertoy lightRay) ──────────────────
 
-float vc_lightMarch(vec3 p) {
-    float slabH = cloudTop - cloudBase;
-    float step  = slabH / float(lightSteps);
-    float acc   = 0.0;
+float vc_hash1(float n) { return fract(sin(n) * 43758.5453); }
 
-    for (int i = 0; i < lightSteps; i++) {
-        p   += sunDirection * step;
-        acc += vc_getDensity(p, 2.0) * step;
+// Returns the sun radiance reaching sample p: multi-term Beer-Lambert (direct + two
+// scattered lobes) × Mie phase × a thin-cloud silver-lining boost. dC = density at p,
+// mu = dot(viewDir, sunDir), phase = vc_mieFit(mu).
+float vc_lightMarch(vec3 p, float phase, float dC, float mu) {
+    float ch    = vc_cloudHeight(p);
+    float zMaxl = cloudTop - cloudBase;
+    float stepL = zMaxl / float(lightSteps);
+    float den   = 0.0;
+
+    // Jitter the cone start to break up shadow banding (position-based, NOT time-based, so it
+    // doesn't twinkle frame-to-frame), then accumulate density up-sun.
+    vec3 q = p + sunDirection * stepL * vc_hash1(dot(p, vec3(12.256, 2.646, 6.356)));
+    for (int j = 0; j < lightSteps; j++) {
+        den += vc_getDensity(q + sunDirection * float(j) * stepL, 2.0);
     }
 
-    float beer   = exp(-acc * absorptionCoeff);
-    float powder = 1.0 - exp(-acc * absorptionCoeff * 2.0);
-    return beer * mix(1.0, powder * 2.0, 0.25);
+    // More in-scatter when looking away from the sun (low/negative mu).
+    float scatterAmount = mix(0.008, 1.0, smoothstep(0.96, 0.0, mu));
+    float beersLaw = exp(-stepL * den)
+                   + 0.5 * scatterAmount * exp(-0.1  * stepL * den)
+                   + 0.4 * scatterAmount * exp(-0.02 * stepL * den);
+
+    // Silver-lining boost on thin cloud (low local density), fading as the cone fills in.
+    return beersLaw * phase
+         * mix(0.05 + 1.5 * pow(min(1.0, dC * 8.5), 0.3 + 5.5 * ch), 1.0, clamp(den * 0.4, 0.0, 1.0));
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -231,22 +311,14 @@ void main(void) {
     vec4 wF  = invViewProjection * vec4(ndc, 1.0, 1.0);  wF /= wF.w;
     vec3 rd  = normalize(wF.xyz - cameraPosition);
 
-    // Find ray / cloud-slab intersections.
-    float camY = cameraPosition.y;
-    float t0   = vc_slabT(cameraPosition, rd, cloudBase);
-    float t1   = vc_slabT(cameraPosition, rd, cloudTop);
+    // Spherical cloud shell: the camera sails well below the deck, so each upward ray
+    // exits the inner shell (cloudBase) at tNear and the outer shell (cloudTop) at tFar.
+    // Near-horizon rays graze for huge distances and are fogged out anyway — skip them.
+    vec3  shellCenter = vec3(cameraPosition.x, -EARTH_RADIUS, cameraPosition.z);
+    float tNear = vc_intersectSphere(cameraPosition, rd, shellCenter, EARTH_RADIUS + cloudBase);
+    float tFar  = vc_intersectSphere(cameraPosition, rd, shellCenter, EARTH_RADIUS + cloudTop);
 
-    float tNear, tFar;
-    if (camY < cloudBase) {
-        tNear = t0; tFar = t1;
-    } else if (camY < cloudTop) {
-        tNear = 0.01;
-        tFar  = rd.y > 0.0 ? t1 : t0;
-    } else {
-        tNear = t1; tFar = t0;
-    }
-
-    if (tNear < 0.0 || tNear >= tFar) {
+    if (rd.y < 0.02 || tNear < 0.0 || tFar <= tNear) {
         gl_FragColor = scene;
         return;
     }
@@ -276,15 +348,14 @@ void main(void) {
     float dist = max(tFar - tNear, 0.0);
     float step = dist / float(marchSteps);
 
-    // Time-varying jitter to break up banding.
-    float jit = fract(sin(dot(vUV + fract(time * 0.1), vec2(127.1, 311.7))) * 43758.5) * step;
+    // Static per-pixel jitter to break up banding. NOT time-varying: an animated jitter
+    // makes the march noise crawl/twinkle every frame, and we have no TAA to average it out —
+    // a fixed screen-space dither lets the spatial denoise settle it instead.
+    float jit = fract(sin(dot(vUV, vec2(127.1, 311.7))) * 43758.5) * step;
 
-    // Dual-lobe phase: a broad lobe for overall forward scatter + a sharp forward
-    // lobe that lights the cloud edge facing the sun — the "silver lining".
-    float cosA    = dot(rd, sunDirection);
-    float phaseBroad = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
-    float phaseFwd   = vc_hgPhase(cosA, 0.92);   // tight forward spike
-    float phaseV     = phaseBroad + phaseFwd * 1.6;
+    // Fitted Mie phase — sharp forward-scatter spike (silver lining) + soft glow.
+    float cosA  = dot(rd, sunDirection);
+    float phase = vc_mieFit(cosA);
 
     float transmit = 1.0;
     vec3  scatter  = vec3(0.0);
@@ -310,26 +381,25 @@ void main(void) {
         }
 
         if (rho > 0.001) {
-            float lt  = vc_lightMarch(p);
-            float hf  = vc_heightFrac(p.y);
-            // Sky irradiance: strong at cloud top (open sky above), moderate at
-            // base (shadowed by the cloud mass itself). Primary daytime whitening.
-            float amb = 0.25 + 0.45 * hf;
-            // Multi-scatter approximation: thin/edge regions (high light transmit)
-            // glow with extra forward-scattered sun — boosts the silver lining and
-            // keeps deep cloud cores from going flat-black.
-            float ms  = (0.35 + 0.65 * lt);
-            // Ground/ocean bounce: faint upward light tints the shadowed cloud bases.
-            vec3  bounce = groundColor * (1.0 - hf) * 0.5;
-            vec3  lum = sunColor * lt * phaseV * ms
-                      + skyColor * amb
-                      + bounce;
+            // lt already includes the Mie phase + Beer + silver-lining (see vc_lightMarch).
+            float lt = vc_lightMarch(p, phase, rho, cosA);
+            float ch = vc_cloudHeight(p);
+            // Ambient: blue sky irradiance (stronger toward the open top) + a soft fill on the
+            // base so undersides aren't black + ocean/terrain bounce. Tint/brightness come from
+            // our time/weather-aware sky & ground uniforms. KNOBS: 0.34 / 0.10 / 0.45 (raised to
+            // lift the shadows and tame the light-vs-dark contrast).
+            vec3 ambient = skyColor    * (0.5 + 0.6 * ch) * 0.34
+                         + skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
+                         + groundColor * (1.0 - ch) * 0.45;
+            // Sun term — Mie phase is small so this needs gain; KNOB 15.0 (lowered from 25 to pull
+            // the blown highlights down). ≈ the Shadertoy's SUN_POWER rescaled to our exposure.
+            vec3 radiance = ambient + sunColor * 15.0 * lt;
 
-            // Energy-conserving integration.
-            float sT   = exp(-rho * absorptionCoeff * step);
-            float inte = (1.0 - sT) / max(rho * absorptionCoeff, 1e-5);
-            scatter   += transmit * lum * rho * absorptionCoeff * inte;
-            transmit  *= sT;
+            // Energy-conserving scatter integration (Sebastien Hillaire). Extinction is the
+            // density itself over the step length (no separate absorption coeff — faithful).
+            float sT = exp(-rho * step);
+            scatter  += transmit * radiance * (1.0 - sT);
+            transmit *= sT;
         }
 
         t += step;
@@ -424,6 +494,9 @@ uniform atlasH: f32;
 uniform atlasCols: f32;
 
 const PI: f32 = 3.14159265;
+// Scaled-down earth radius for the spherical cloud shell (see GLSL note) — keeps
+// float32 precision while curving the deck to the horizon. Tunable.
+const EARTH_RADIUS: f32 = 2000000.0;
 
 fn vc_fmod(a: f32, b: f32) -> f32 { return a - floor(a / b) * b; }
 fn vc_sat(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
@@ -467,6 +540,57 @@ fn vc_noise3D(uvw_in: vec3f) -> f32 {
     return mix(s0, s1, zf);
 }
 
+// ── Shadertoy 4dSBDt cloud-model helpers (faithful port) ──────────────────────
+// vc_noise3D tiles every 1.0; the Shadertoy noise(vec3) tiles every noiseSliceDim
+// units, so map x -> (x+0.5)/noiseSliceDim to match its frequency convention.
+fn vc_noiseST(x: vec3f) -> f32 {
+    return vc_noise3D((x + 0.5) / uniforms.noiseSliceDim);
+}
+
+fn vc_fbm(p_in: vec3f) -> f32 {
+    let m = mat3x3f( 0.00,  0.80,  0.60,
+                    -0.80,  0.36, -0.48,
+                    -0.60, -0.48,  0.64);
+    var p = p_in;
+    var f = 0.5000 * vc_noiseST(p); p = m * p * 2.02;
+    f    += 0.2500 * vc_noiseST(p); p = m * p * 2.03;
+    f    += 0.1250 * vc_noiseST(p);
+    return f;
+}
+
+fn vc_mieFit(costh: f32) -> f32 {
+    let p0 = 9.805233e-06; let p1 = -6.500000e+01; let p2 = -5.500000e+01;
+    let p3 = 8.194068e-01; let p4 =  1.388198e-01; let p5 = -8.370334e+01;
+    let p6 = 7.810083e+00; let p7 =  2.054747e-03; let p8 =  2.600563e-02;
+    let p9 = -4.552125e-12;
+    let pp = costh + p3;
+    let expValues = exp(vec4f(p1 * costh + p2, p5 * pp * pp, p6 * costh, p9 * costh));
+    let expValWeight = vec4f(p0, p4, p7, p8);
+    return dot(expValues, expValWeight);
+}
+
+fn vc_intersectSphere(origin: vec3f, dir: vec3f, spherePos: vec3f, sphereRad: f32) -> f32 {
+    let oc = origin - spherePos;
+    let b  = 2.0 * dot(dir, oc);
+    let c  = dot(oc, oc) - sphereRad * sphereRad;
+    let disc = b * b - 4.0 * c;
+    if (disc < 0.0) { return -1.0; }
+    let q  = (-b + select(sqrt(disc), -sqrt(disc), b < 0.0)) / 2.0;
+    var t0 = q;
+    var t1 = c / q;
+    if (t0 > t1) { let tmp = t0; t0 = t1; t1 = tmp; }
+    if (t1 < 0.0) { return -1.0; }
+    return select(t0, t1, t0 < 0.0);
+}
+
+// Earth centre tracks the camera horizontally (see GLSL note) so the deck curves away
+// from the player wherever they sail.
+fn vc_cloudHeight(p: vec3f) -> f32 {
+    let center     = vec3f(uniforms.cameraPosition.x, -EARTH_RADIUS, uniforms.cameraPosition.z);
+    let atmoHeight = length(p - center) - EARTH_RADIUS;
+    return vc_sat((atmoHeight - uniforms.cloudBase) / max(uniforms.cloudTop - uniforms.cloudBase, 1.0));
+}
+
 fn vc_heightFrac(y: f32) -> f32 {
     return vc_remap(y, uniforms.cloudBase, uniforms.cloudTop);
 }
@@ -479,53 +603,59 @@ fn vc_heightGrad(h: f32) -> f32 {
     return vc_sat(vc_remap(h, 0.0, baseW) * (1.0 - vc_remap(h, topEnd * 0.5, topEnd)));
 }
 
+// Faithful port of the Shadertoy clouds() — see GLSL twin for the commentary.
 fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
-    let h = vc_heightFrac(p.y);
-    if (h < 0.0 || h > 1.0) { return 0.0; }
+    let ch = vc_cloudHeight(p);
+    if (ch <= 0.0 || ch >= 1.0) { return 0.0; }
 
-    let hg = vc_heightGrad(h);
-    if (hg < 0.001) { return 0.0; }
+    // Storm factor (0.40 calm → 0.95 cumulonimbus). See GLSL twin for the commentary.
+    let storm = smoothstep(0.40, 0.95, uniforms.cloudType);
 
-    let wt = uniforms.time * uniforms.windSpeed * 0.08;
-    let wd = uniforms.windDir * wt;
+    let wd    = uniforms.windDir * (uniforms.time * uniforms.windSpeed * 0.08);
+    let pzx   = p.zx + wd.yx;
+    let drift = vec3f(wd.x, 0.0, wd.y);
+    let evo   = uniforms.time * 3.0;
 
-    // +0.37 shifts the sampling domain off world origin (see GLSL note): otherwise the
-    // weather-wrap and noise fract() boundaries all coincide at (0,0) → visible seam.
-    let wuv = p.xz * 0.000012 + wd * 0.00002 + vec2f(0.37);
-    let wc  = textureSampleLevel(weatherSampler, weatherSamplerSampler, wuv, 0.0).r;
-    let cov = vc_sat(uniforms.cloudCoverage + wc - 0.5);
-    if (cov < 0.01) { return 0.0; }
+    let largeWeather = clamp((textureSampleLevel(weatherSampler, weatherSamplerSampler, -0.00005 * pzx, 0.0).r - 0.18) * 5.0, 0.0, 2.0);
+    let covThresh    = 0.28 - (uniforms.cloudCoverage - 0.5) * 0.5 - storm * 0.05;
+    var weather      = largeWeather * max(0.0, textureSampleLevel(weatherSampler, weatherSamplerSampler, 0.0002 * pzx, 0.0).r - covThresh) / 0.72;
+    weather = weather * smoothstep(0.0, 0.5, ch) * smoothstep(1.0, 0.5, ch);
+    let cloudShape = pow(weather, 0.3 + 1.5 * smoothstep(0.2, 0.5, ch));
+    if (cloudShape <= 0.0) { return 0.0; }
 
-    let np  = p * 0.000075 + vec3f(wd.x, 0.0, wd.y) * 0.00004 + vec3f(0.37, 0.0, 0.37);
-    let ns  = vc_noise3D(np * (1.0 + lod * 0.5));
-    var shp = vc_remap(ns, 1.0 - cov, 1.0) * hg;
-    if (shp < 0.001) { return 0.0; }
+    var den = max(0.0, cloudShape - 0.7 * vc_fbm((p + drift) * 0.01));
+    if (den <= 0.0) { return 0.0; }
 
-    if (lod < 1.5) {
-        let dp  = p * 0.00038 + vec3f(wd.x, 0.0, wd.y) * 0.00012 + vec3f(0.37, 0.0, 0.37);
-        let det = vc_noise3D(dp * 3.0);
-        let ero = mix(det, 1.0 - det, vc_sat(h * 8.0));
-        // More erosion for puffy/storm types, less for stratus (smoother sheet).
-        shp = vc_remap(shp, ero * mix(0.10, 0.32, uniforms.cloudType), 1.0);
-    }
+    let dScale = mix(0.20, 0.32, storm);
 
-    return vc_sat(shp) * uniforms.cloudDensity;
+    if (lod >= 1.5) { return largeWeather * dScale * min(1.0, 5.0 * den); }
+
+    den = max(0.0, den - 0.2 * vc_fbm((p + drift + vec3f(0.0, evo, 0.0)) * 0.05));
+    return largeWeather * dScale * min(1.0, 5.0 * den);
 }
 
-fn vc_lightMarch(p_in: vec3f) -> f32 {
-    let slabH     = uniforms.cloudTop - uniforms.cloudBase;
-    let step_size = slabH / f32(uniforms.lightSteps);
-    var acc: f32  = 0.0;
-    var p = p_in;
+fn vc_hash1(n: f32) -> f32 { return fract(sin(n) * 43758.5453); }
 
-    for (var i: i32 = 0; i < uniforms.lightSteps; i++) {
-        p   += uniforms.sunDirection * step_size;
-        acc += vc_getDensity(p, 2.0) * step_size;
+// Faithful Shadertoy lightRay — see GLSL twin for commentary.
+fn vc_lightMarch(p: vec3f, phase: f32, dC: f32, mu: f32) -> f32 {
+    let ch    = vc_cloudHeight(p);
+    let zMaxl = uniforms.cloudTop - uniforms.cloudBase;
+    let stepL = zMaxl / f32(uniforms.lightSteps);
+    var den: f32 = 0.0;
+
+    let q = p + uniforms.sunDirection * stepL
+              * vc_hash1(dot(p, vec3f(12.256, 2.646, 6.356)));
+    for (var j: i32 = 0; j < uniforms.lightSteps; j++) {
+        den += vc_getDensity(q + uniforms.sunDirection * f32(j) * stepL, 2.0);
     }
 
-    let beer   = exp(-acc * uniforms.absorptionCoeff);
-    let powder = 1.0 - exp(-acc * uniforms.absorptionCoeff * 2.0);
-    return beer * mix(1.0, powder * 2.0, 0.25);
+    let scatterAmount = mix(0.008, 1.0, smoothstep(0.96, 0.0, mu));
+    let beersLaw = exp(-stepL * den)
+                 + 0.5 * scatterAmount * exp(-0.1  * stepL * den)
+                 + 0.4 * scatterAmount * exp(-0.02 * stepL * den);
+
+    return beersLaw * phase
+         * mix(0.05 + 1.5 * pow(min(1.0, dC * 8.5), 0.3 + 5.5 * ch), 1.0, clamp(den * 0.4, 0.0, 1.0));
 }
 
 @fragment
@@ -539,22 +669,13 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     wF     /= wF.w;
     let rd  = normalize(wF.xyz - uniforms.cameraPosition);
 
-    let camY = uniforms.cameraPosition.y;
-    let t0   = vc_slabT(uniforms.cameraPosition, rd, uniforms.cloudBase);
-    let t1   = vc_slabT(uniforms.cameraPosition, rd, uniforms.cloudTop);
+    // Spherical cloud shell (see GLSL twin): upward rays exit the inner shell (cloudBase)
+    // at tNear and the outer shell (cloudTop) at tFar; near-horizon rays are skipped.
+    let shellCenter = vec3f(uniforms.cameraPosition.x, -EARTH_RADIUS, uniforms.cameraPosition.z);
+    var tNear = vc_intersectSphere(uniforms.cameraPosition, rd, shellCenter, EARTH_RADIUS + uniforms.cloudBase);
+    var tFar  = vc_intersectSphere(uniforms.cameraPosition, rd, shellCenter, EARTH_RADIUS + uniforms.cloudTop);
 
-    var tNear: f32;
-    var tFar:  f32;
-    if (camY < uniforms.cloudBase) {
-        tNear = t0; tFar = t1;
-    } else if (camY < uniforms.cloudTop) {
-        tNear = 0.01;
-        tFar  = select(t0, t1, rd.y > 0.0);
-    } else {
-        tNear = t1; tFar = t0;
-    }
-
-    if (tNear < 0.0 || tNear >= tFar) {
+    if (rd.y < 0.02 || tNear < 0.0 || tFar <= tNear) {
         fragmentOutputs.color = scene_color;
         return fragmentOutputs;
     }
@@ -579,15 +700,13 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     let dist      = max(tFar - tNear, 0.0);
     let step_size = dist / f32(uniforms.marchSteps);
 
-    // Time-varying jitter to break up ray-march banding.
-    let jit_uv = input.vUV + fract(uniforms.time * 0.1);
-    let jit    = fract(sin(dot(jit_uv, vec2f(127.1, 311.7))) * 43758.5) * step_size;
+    // Static per-pixel jitter (see GLSL note): not time-varying, so the march noise doesn't
+    // crawl/twinkle without TAA — the spatial denoise settles the fixed dither instead.
+    let jit = fract(sin(dot(input.vUV, vec2f(127.1, 311.7))) * 43758.5) * step_size;
 
     // Dual-lobe phase: broad forward scatter + a tight forward spike (silver lining).
-    let cosA       = dot(rd, uniforms.sunDirection);
-    let phaseBroad = mix(vc_hgPhase(cosA, 0.6), vc_hgPhase(cosA, -0.3), 0.3);
-    let phaseFwd   = vc_hgPhase(cosA, 0.92);
-    let phaseV     = phaseBroad + phaseFwd * 1.6;
+    let cosA  = dot(rd, uniforms.sunDirection);
+    let phase = vc_mieFit(cosA);
 
     var transmit: f32  = 1.0;
     var scatter:  vec3f = vec3f(0.0);
@@ -611,21 +730,20 @@ fn main(input: FragmentInputs)->FragmentOutputs {
         }
 
         if (rho > 0.001) {
-            let lt  = vc_lightMarch(p);
-            let hf  = vc_heightFrac(p.y);
-            // Sky irradiance: strong at cloud top, moderate at base. Primary whitening.
-            let amb = 0.25 + 0.45 * hf;
-            // Multi-scatter approx: thin/edge regions glow with extra forward sun.
-            let ms  = (0.35 + 0.65 * lt);
-            // Ground/ocean bounce: faint upward light tints shadowed cloud bases.
-            let bounce = uniforms.groundColor * (1.0 - hf) * 0.5;
-            let lum = uniforms.sunColor * lt * phaseV * ms
-                    + uniforms.skyColor * amb
-                    + bounce;
+            // lt already includes the Mie phase + Beer + silver-lining (see vc_lightMarch).
+            let lt = vc_lightMarch(p, phase, rho, cosA);
+            let ch = vc_cloudHeight(p);
+            // Ambient (sky + base fill + ground bounce); tint/brightness from our uniforms.
+            // KNOBS 0.34 / 0.10 / 0.45 — raised to lift shadows and tame the contrast.
+            let ambient = uniforms.skyColor    * (0.5 + 0.6 * ch) * 0.34
+                        + uniforms.skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
+                        + uniforms.groundColor * (1.0 - ch) * 0.45;
+            // Sun term — gain lowered 25 → 15 to pull down the blown highlights.
+            let radiance = ambient + uniforms.sunColor * 15.0 * lt;
 
-            let sT   = exp(-rho * uniforms.absorptionCoeff * step_size);
-            let inte = (1.0 - sT) / max(rho * uniforms.absorptionCoeff, 1e-5);
-            scatter  += transmit * lum * rho * uniforms.absorptionCoeff * inte;
+            // Energy-conserving integration; extinction = density × step (faithful, no abs coeff).
+            let sT = exp(-rho * step_size);
+            scatter  += transmit * radiance * (1.0 - sT);
             transmit *= sT;
         }
 
@@ -716,6 +834,14 @@ export class VolumetricCloudsPlugin {
   private denoisePass:  PostProcess | null = null;
   private weatherTex:  Texture    | null = null;
   private noiseTex:    RawTexture | null = null;
+  // true → procedural grey value-noise weather map (Shadertoy-style); false → pebbles.png.
+  private readonly useGreyNoiseWeather = true;
+
+  // Optional hooks (set by CloudService) returning the physical atmosphere's sun & sky COLOUR
+  // (hue) so the clouds adopt the atmospheric scattering's colour temperature — warm at the
+  // horizon, blue at noon — while keeping their own tuned brightness. Null → use the built-in curves.
+  getAtmoSun: (() => Vector3 | null) | null = null;
+  getAtmoSky: (() => Vector3 | null) | null = null;
 
   // NOTE: P3 temporal reprojection was attempted and removed — it can't work cleanly in
   // Babylon's auto-managed camera post-process chain (persistent cross-frame history
@@ -919,13 +1045,14 @@ export class VolumetricCloudsPlugin {
     // sunDir.y is sin(elevation): +1 = noon zenith, 0 = horizon, -1 = midnight.
     const el = Math.max(0, sunDir.y);   // 0 at/below horizon, 1 at zenith
 
-    // Direct sun beam — warm, bright during day, near-zero below the horizon.
-    // Values intentionally >1 at noon (HDR) so even a partially-shadowed cloud
-    // (lt ≈ 0.4–0.6) still contributes perceptible warm colour.
+    // Direct sun beam — golden/orange near the horizon (sunrise & sunset), cooling to a
+    // bright near-white at noon. Values >1 at noon (HDR) so lit cloud reads bright through
+    // ACES. The blue & green channels drop hardest at low sun, giving warm low-angle light.
+    const sunBright = 0.05 + 1.7 * el;
     const sunColor = new Vector3(
-      0.08 + 1.7 * el,
-      0.08 + 1.6 * el,
-      0.10 + 1.2 * el,
+      sunBright,
+      sunBright * (0.52 + 0.48 * el),
+      sunBright * (0.34 + 0.62 * el),
     );
 
     // Sky irradiance — the diffuse light from the whole atmosphere that
@@ -934,11 +1061,25 @@ export class VolumetricCloudsPlugin {
     //   coverage 0.00–0.45 → full sky irradiance (scattered cumulus → white)
     //   coverage 0.45–1.00 → progressively dimmer (overcast / storm → dark grey)
     const stormDim = Math.max(0.08, 1.0 - Math.max(0, this.cloudCoverage - 0.45) * 1.5);
+    // Cool moonlight floor after dark (sunDir.y < 0 ⇒ the moon, anti-solar, is up) so night
+    // clouds read as faint silver-blue against the dark sky instead of going black.
+    const night = Math.max(0, -sunDir.y);
     const skyColor = new Vector3(
-      stormDim * (0.12 + 1.8 * el),
-      stormDim * (0.15 + 1.9 * el),
-      stormDim * (0.20 + 2.0 * el),
+      stormDim * (0.12 + 1.8 * el) + night * 0.10,
+      stormDim * (0.15 + 1.9 * el) + night * 0.12,
+      stormDim * (0.20 + 2.0 * el) + night * 0.16,
     );
+
+    // Couple to the physical atmosphere: re-tint the sun & sky colour to the atmosphere's HUE
+    // (keeping our own luminance/brightness) so clouds match the sky's colour temperature.
+    const tintToAtmo = (col: Vector3, atmo: Vector3 | null): void => {
+      if (!atmo) { return; }
+      const al = Math.max(1e-4, atmo.x * 0.30 + atmo.y * 0.59 + atmo.z * 0.11);   // atmo luminance
+      const cl = col.x * 0.30 + col.y * 0.59 + col.z * 0.11;                       // keep our lum
+      col.set(cl * atmo.x / al, cl * atmo.y / al, cl * atmo.z / al);
+    };
+    tintToAtmo(sunColor, this.getAtmoSun?.() ?? null);
+    tintToAtmo(skyColor, this.getAtmoSky?.() ?? null);
 
     effect.setVector3('sunColor', sunColor);
     effect.setVector3('skyColor',  skyColor);
@@ -1003,14 +1144,21 @@ export class VolumetricCloudsPlugin {
 
   private loadTextures(weatherUrl: string, noiseUrl: string): void {
     // 2-D coverage / weather texture.
-    this.weatherTex = new Texture(
-      weatherUrl, this.scene,
-      /*noMipmap=*/false, /*invertY=*/true, Texture.TRILINEAR_SAMPLINGMODE,
-    );
-    // MIRROR (not WRAP): reflected tiling is C0-continuous across tile boundaries, so
-    // even the distant weather-map seam disappears instead of showing a hard line.
-    this.weatherTex.wrapU = Texture.MIRROR_ADDRESSMODE;
-    this.weatherTex.wrapV = Texture.MIRROR_ADDRESSMODE;
+    if (this.useGreyNoiseWeather) {
+      // Procedural smooth value-noise FBM — matches the character of the Shadertoy's
+      // "Grey Noise Medium" iChannel0 (smoother / less structured than the pebbles photo),
+      // generated locally so we don't fetch a second asset. Toggle off to use pebbles.png.
+      this.weatherTex = this.buildGreyNoise2D(256);
+    } else {
+      this.weatherTex = new Texture(
+        weatherUrl, this.scene,
+        /*noMipmap=*/false, /*invertY=*/true, Texture.TRILINEAR_SAMPLINGMODE,
+      );
+      // MIRROR (not WRAP): reflected tiling is C0-continuous across tile boundaries, so
+      // even the distant weather-map seam disappears instead of showing a hard line.
+      this.weatherTex.wrapU = Texture.MIRROR_ADDRESSMODE;
+      this.weatherTex.wrapV = Texture.MIRROR_ADDRESSMODE;
+    }
 
     // 3-D grey-noise bin → repacked as 2-D atlas.
     fetch(noiseUrl)
@@ -1027,6 +1175,58 @@ export class VolumetricCloudsPlugin {
       .catch(err => {
         console.warn('[VolumetricClouds] Could not load 3D noise:', err);
       });
+  }
+
+  /**
+   * Generates a seamless tiling grey value-noise FBM texture (R8) to use as the cloud
+   * weather/coverage map — the character of the Shadertoy's "Grey Noise Medium" iChannel0.
+   * All octave periods divide `size`, so the texture tiles seamlessly under MIRROR/WRAP.
+   */
+  private buildGreyNoise2D(size: number): RawTexture {
+    const data = new Uint8Array(size * size);
+
+    // Integer-lattice hash, periodic in `period` so each octave tiles seamlessly.
+    const hash = (ix: number, iy: number, period: number): number => {
+      const x = ((ix % period) + period) % period;
+      const y = ((iy % period) + period) % period;
+      let h = (x * 374761393 + y * 668265263) | 0;
+      h = (h ^ (h >>> 13)) * 1274126177;
+      h = h ^ (h >>> 16);
+      return (h >>> 0) / 4294967295;
+    };
+    const fade = (t: number): number => t * t * (3 - 2 * t);
+    const valNoise = (fx: number, fy: number, period: number): number => {
+      const x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const tx = fade(fx - x0), ty = fade(fy - y0);
+      const v00 = hash(x0, y0, period),     v10 = hash(x0 + 1, y0, period);
+      const v01 = hash(x0, y0 + 1, period), v11 = hash(x0 + 1, y0 + 1, period);
+      const a = v00 + (v10 - v00) * tx;
+      const b = v01 + (v11 - v01) * tx;
+      return a + (b - a) * ty;
+    };
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const u = x / size, v = y / size;
+        let f = 0, amp = 0.5, sum = 0, period = 4;
+        for (let o = 0; o < 4; o++) {
+          f   += amp * valNoise(u * period, v * period, period);
+          sum += amp;
+          amp *= 0.5;
+          period *= 2;
+        }
+        data[y * size + x] = Math.max(0, Math.min(255, Math.round((f / sum) * 255)));
+      }
+    }
+
+    const tex = new RawTexture(
+      data, size, size, Constants.TEXTUREFORMAT_R, this.scene,
+      /*generateMipMaps=*/false, /*invertY=*/false,
+      Texture.BILINEAR_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE,
+    );
+    tex.wrapU = Texture.MIRROR_ADDRESSMODE;
+    tex.wrapV = Texture.MIRROR_ADDRESSMODE;
+    return tex;
   }
 
   /**
@@ -1102,6 +1302,26 @@ export class VolumetricCloudsPlugin {
     const n = direction.normalize();
     this.windDirection.copyFrom(n);
     this.windSpeed = Math.max(1, speed);
+  }
+
+  /**
+   * Snapshot of the live cloud coverage state so the ocean & terrain shaders can cast cloud
+   * shadows that match the actual clouds — the current wind drift (precomputed to match the
+   * cloud shader's `wd`), the coverage/storm threshold, and the cloud base altitude. The surface
+   * shaders reproduce the coverage field procedurally (no extra texture sampler — the FFT ocean
+   * is already at the WebGPU 16-texture limit), so shadows drift in sync and track density.
+   */
+  getCloudShadowField(): { drift: Vector2; covThresh: number; cloudBase: number } | null {
+    if (!this._enabled) { return null; }
+    const k = this.elapsedSecs * this.windSpeed * 0.08;             // matches the shader's wd
+    const st = Math.max(0, Math.min(1, (this.cloudType - 0.40) / (0.95 - 0.40)));
+    const storm = st * st * (3 - 2 * st);                           // smoothstep(0.40, 0.95)
+    const covThresh = 0.28 - (this.cloudCoverage - 0.5) * 0.5 - storm * 0.05;
+    return {
+      drift: new Vector2(this.windDirection.x * k, this.windDirection.z * k),
+      covThresh,
+      cloudBase: this.cloudBaseHeight,
+    };
   }
 
   setEnabled(enabled: boolean): void {

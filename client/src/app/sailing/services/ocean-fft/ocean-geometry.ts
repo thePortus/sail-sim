@@ -229,7 +229,12 @@ export class OceanGeometry {
     mesh.name = 'ocean_fft_' + name;
     mesh.material = mat;
     mesh.parent = this._root;
-    mesh.receiveShadows = true;
+    // receiveShadows = false: the FFT material is at the WebGPU 16 inter-stage-varying limit, and
+    // the cascaded-shadow receive path's varyings tip it over when other systems (e.g. the
+    // Atmosphere addon) add even one more → the surface shader fails to compile (ocean vanishes).
+    // The water already has its OWN shadows — island mask (_TerrainShadowMask), boat shadows
+    // (_BoatShadowData) and cloud shadows — so Babylon's cascaded shadow on it is redundant.
+    mesh.receiveShadows = false;
     return mesh;
   }
 

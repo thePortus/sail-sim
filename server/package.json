@@ -12,11 +12,11 @@
   ],
   "scripts": {
     "start": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && npx apidoc -i . -o pages/docs/ && NODE_ENV=production node server.js",
+    "terrain": "node scripts/make-world.mjs",
     "fetch:terrain-sources": "node scripts/fetch-terrain-sources.mjs",
     "build:terrain-region": "node scripts/build-terrain-region.mjs",
-    "build:terrain-geometry": "node scripts/build-terrain.js",
     "download:terrain-tiles": "node scripts/download-terrain-tiles.js",
-    "build:terrain": "npm run build:terrain-geometry && npm run download:terrain-tiles",
+    "build:terrain": "npm run download:terrain-tiles && npm run terrain",
     "test": "cross-env NODE_ENV=test jest --collect-coverage --testTimeout=10000 --detectOpenHandles",
     "pretest": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && cross-env NODE_ENV=test npm run migrate:reset --env=test",
     "migrate:reset": "npx sequelize-cli db:migrate:undo:all --env=production && npm run migrate --env=production",

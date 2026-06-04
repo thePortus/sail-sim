@@ -2,7 +2,10 @@
 
 # General or Current TODO Items
 
-* way to add wave function to transparency noise of water on shore's edge? Want to add a lapping effect... even better if in the direction of the wind
+* all rain drops hit at the same time.... even pattern
+* still looks super blue behind the boat int he shallows (probably the environment reflection)
+* I can see through the boat? (I can see the coastline anyway, and water rippling through it)
+* ship seems dark when camera far off
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
@@ -10,8 +13,6 @@
 * dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)
 * add back in butterfly scattering?
 * improve rain from https://playground.babylonjs.com/#XQ8H3C#0
-* improve landscape performance with dynamic terrain? https://github.com/BabylonJS/Extensions/blob/master/DynamicTerrain/documentation/dynamicTerrainDocumentation.md
-* improve landscape with https://medium.com/@trushkinsimon/semi-procedural-landscape-with-babylonjs-e9373bc3091d
 * improve trees and rocks... textures and alpha for leaves... procudral noise for normals on rocks
 * improve noise where shallows transparency meet deep water
 * add in damage morph targets
@@ -19,6 +20,7 @@
 * add player ship collision
 * add improved land collision
 * add damage from collisions and aground
+* add camera clipping to prevent going underwater but especially under terrain
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD
 * Make emissive lights cast light on
 * Bring DRACO compression in, remove any CDNs

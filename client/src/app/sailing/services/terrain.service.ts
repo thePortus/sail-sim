@@ -69,6 +69,9 @@ export class TerrainService {
   private manifest: TerrainManifest | null = null;
   /** Quantized value of the waterline (y = 0); 0 for legacy land-only manifests. See init(). */
   private waterlineQ = 0;
+  /** True while the terrain renders into the ocean's seabed (refraction) RTT — the ragged-waterline
+   *  discard is switched off there so the revealed seabed stays solid (no clear-colour speckles). */
+  private _inRefractionPass = false;
   private heightfield: Uint16Array | null = null;
 
   // Computed once after chunk load; drives beach grading + underwater depth.
@@ -82,7 +85,6 @@ export class TerrainService {
   } | null = null;
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
-  private _inRefractionPass = false;   // true while the terrain renders into the ocean's seabed RTT
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -1403,11 +1405,11 @@ export class TerrainService {
     material.AddUniform('uCloudTime',     'float',   null);   // (legacy) cloud-shadow drift clock
     material.AddUniform('uCloudDrift',    'vec2',    null);   // real cloud wind drift (matches ocean)
     material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
-    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = dither shoreline (main view), 0 = off (refraction RTT)
+    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = ragged shoreline (main view), 0 = off (refraction RTT)
 
-    // The waterline dither discards sand pixels — but it must NOT run when the terrain renders into
-    // the ocean's refraction (seabed) RTT, or the holes get filled with that pass's bright clear-
-    // colour and read as a bright band. Flag the refraction pass so the bind below can switch it off.
+    // The ragged-waterline discard must NOT run when the terrain renders into the ocean's seabed
+    // (refraction) RTT, or the holes fill with that pass's clear-colour and read as bright specks in
+    // the depth-revealed seabed. Flag the refraction pass so the bind below can switch it off.
     const refr = this.oceanService.getRefractionTexture?.();
     if (refr) {
       refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
@@ -1430,16 +1432,36 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
-      // ── 0. Noise-dithered waterline ───────────────────────────────────────
-      // Break up the clean sand↔water contour: in a thin band right at the waterline, a world-space
-      // noise discards sand pixels — more the closer to the edge — so the ocean behind shows through
-      // the gaps and the shoreline reads ragged/natural. Opaque-pass discard (no transparency sort).
-      float wlNoise = fract(sin(dot(floor(vPositionW.xz * 80.0), vec2(127.1, 311.7))) * 43758.5453);
-      float wlBand  = (1.0 - smoothstep(0.0, 0.55, vPositionW.y))   // fades out ~0.55 m up the beach
-                    * smoothstep(-0.20, 0.04, vPositionW.y)         // fades in from just below water
-                    * 0.85                                          // max discard fraction at the very edge
+      // ── 0. Ragged, undulating, anti-aliased waterline ─────────────────────
+      // Scallop the sand↔water edge so it isn't a clean contour: in a thin band right at the
+      // waterline, a SMOOTH world-space value-noise (~1.4 m lobes, not fine grain) discards sand
+      // pixels — so the depth-transparent shallows behind show through in uneven bites. The band
+      // EBBS & FLOWS over time (wash running up the beach), and the cutout is anti-aliased via a
+      // derivative-feathered edge + interleaved-gradient dither (FXAA then resolves it). Off in the
+      // refraction RTT (u_waterlineDither = 0) so the revealed seabed stays solid.
+      vec2  wlP = vPositionW.xz * 0.70;                  // ~1.4 m feature size
+      vec2  wlI = floor(wlP), wlF = fract(wlP);
+      vec2  wlU = wlF * wlF * (3.0 - 2.0 * wlF);
+      float wlA = fract(sin(dot(wlI,                  vec2(127.1, 311.7))) * 43758.5453);
+      float wlB = fract(sin(dot(wlI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlC = fract(sin(dot(wlI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlD = fract(sin(dot(wlI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlNoise = mix(mix(wlA, wlB, wlU.x), mix(wlC, wlD, wlU.x), wlU.y);
+      wlNoise = wlNoise * 0.75 + fract(sin(dot(floor(vPositionW.xz * 2.3), vec2(127.1, 311.7))) * 43758.5453) * 0.25;
+      // Ebb & flow: shift the effective waterline up/down ~±0.18 m on a ~8 s wash, varying along shore.
+      float wlEbb = sin(uCloudTime * 0.8 + vPositionW.x * 0.13 + vPositionW.z * 0.09) * 0.12
+                  + sin(uCloudTime * 1.3 - vPositionW.z * 0.18) * 0.06;
+      float wlY = vPositionW.y - wlEbb;
+      float wlBand  = (1.0 - smoothstep(0.0, 0.7, wlY))            // fades out ~0.7 m up the beach
+                    * smoothstep(-0.30, 0.05, wlY)                 // fades in from just below water
+                    * 0.9                                          // max discard fraction at the very edge
                     * u_waterlineDither;                            // 0 in the refraction RTT → seabed stays solid
-      if (wlNoise < wlBand) { discard; }
+      // Anti-aliased cutout: soft ~1-px coverage from the noise-vs-band gradient, resolved with an
+      // interleaved-gradient screen dither (stable, low sparkle) that the pipeline FXAA smooths.
+      float wlEdge = wlNoise - wlBand;                   // ≥0 keep, <0 cut
+      float wlCov  = clamp(wlEdge / max(fwidth(wlEdge), 1e-4) + 0.5, 0.0, 1.0);
+      float wlIGN  = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      if (wlCov < wlIGN) { discard; }
 
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));

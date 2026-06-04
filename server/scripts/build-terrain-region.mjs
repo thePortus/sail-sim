@@ -26,6 +26,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import terrainConfig from '../config/terrain.config.js';
 import { SOURCES, regionById } from '../data/region-catalog.mjs';
+import { deriveAugment } from '../data/augment.mjs';
+import { hydraulicErode, thermalErode, addDetail } from '../data/erode.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCES_DIR = join(__dirname, '..', 'assets', 'maps', 'sources');
@@ -40,6 +42,10 @@ const numArg = (name, def) => {
 const OUT = numArg('res', 2048);          // square output grid edge (texels)
 const VSCALE = numArg('vscale', 1.0);     // vertical exaggeration (1 = real metres)
 const SEA_THRESH = numArg('sea', 0.8);    // COP30 height (m) above which a cell is treated as land
+const SEED = args.some((a) => a.startsWith('--seed=')) ? numArg('seed', 0) : null;   // null → identity
+const ERODE   = args.includes('--no-erode')   ? 0 : numArg('erode', 120000);   // hydraulic droplet count
+const THERMAL = args.includes('--no-thermal') ? 0 : numArg('thermal', 3);      // talus relax iterations
+const DETAIL  = args.includes('--no-detail')  ? 0 : numArg('detail', 2.5);     // fBm micro-relief amp (m)
 
 if (!regionId) { console.error('Usage: build-terrain-region.mjs <regionId> [--res=] [--vscale=] [--sea=]'); process.exit(1); }
 const region = regionById(regionId);
@@ -86,31 +92,47 @@ async function run() {
   // World ↔ geographic mapping. The land tif's actual extent defines the region window; the world
   // (square, ±worldBounds) maps 1:1 onto it. Row 0 = north = worldBounds.maxZ (matches getElevation).
   const [W, S, E, N] = land.bbox;
+  const DEEP = -60;                                           // open-ocean fallback for out-of-window samples
+  const aug = SEED != null ? deriveAugment(SEED, region.archetype) : null;
+  if (aug) console.log(`  augment seed ${SEED}: ${aug.label}`);
   const field = new Float32Array(OUT * OUT);
-  let minY = Infinity, maxY = -Infinity, landCells = 0;
+  let landCells = 0;
 
   for (let oz = 0; oz < OUT; oz++) {
-    const tz = oz / (OUT - 1);
-    const lat = N - tz * (N - S);
     for (let ox = 0; ox < OUT; ox++) {
-      const tx = ox / (OUT - 1);
-      const lon = W + tx * (E - W);
-      const l = sampleGeo(land, lon, lat, 0);                 // metres, ocean ≈ 0, nodata → 0 (sea)
+      // Normalised output coords → (optionally augmented) → geographic lon/lat.
+      let u = ox / (OUT - 1), v = oz / (OUT - 1);
+      if (aug) { [u, v] = aug.transform(u, v); }
+      const lon = W + u * (E - W);
+      const lat = N - v * (N - S);                            // v=0 → north
+      const l = sampleGeo(land, lon, lat, 0);                 // metres, ocean ≈ 0 / OOB → 0 (sea)
       let y;
       if (l > SEA_THRESH) {                                   // sharp real land from Copernicus
         y = l;
         landCells++;
-      } else {                                                // real ocean depth from GEBCO (clamp ≤ 0)
-        y = Math.min(0, sampleGeo(bathy, lon, lat, 0));
+      } else {                                                // real ocean depth from GEBCO (OOB → deep)
+        y = Math.min(0, sampleGeo(bathy, lon, lat, DEEP));
       }
       y *= VSCALE;
+      if (aug) y += aug.seaLevel;                             // sea-level shift (land & seabed together)
       field[oz * OUT + ox] = y;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
     }
   }
+
+  // ── Erosion + detail touch-up (Phase 2b) — gentle, land-only; enhances the real terrain ─────
+  const cellM = (worldBounds.maxX - worldBounds.minX) / (OUT - 1);
+  if (ERODE)   { hydraulicErode(field, OUT, SEED ?? 1, { droplets: ERODE, seaLevel: 0 }); console.log(`  hydraulic erosion: ${ERODE} droplets`); }
+  if (THERMAL) { thermalErode(field, OUT, { iterations: THERMAL, talus: Math.tan(38 * Math.PI / 180) * cellM, seaLevel: 0 }); console.log(`  thermal erosion: ${THERMAL} iters (talus ${(Math.tan(38 * Math.PI / 180) * cellM).toFixed(1)} m/cell)`); }
+  if (DETAIL)  { addDetail(field, OUT, SEED ?? 1, { amp: DETAIL, worldM: worldBounds.maxX - worldBounds.minX, seaLevel: 0 }); console.log(`  detail touch-up: ±${DETAIL} m fBm`); }
+
+  let minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < field.length; i++) { const y = field[i]; if (y < minY) minY = y; if (y > maxY) maxY = y; }
   if (maxY <= minY) { console.error('Degenerate elevation range — bad source data?'); process.exit(1); }
   console.log(`\n  elevation range [${minY.toFixed(1)}, ${maxY.toFixed(1)}] m  ·  land ${(100 * landCells / (OUT * OUT)).toFixed(1)}%`);
+
+  mkdirSync(terrainConfig.outputDir, { recursive: true });
+  writeFieldPreview(field, OUT, minY, maxY, join(terrainConfig.outputDir, 'preview.png'));
+  console.log(`  preview.png written`);
 
   // ── Quantize + chunk (Uint16LE, signed range encoded via minY..maxY) ─────────
   mkdirSync(outputDir, { recursive: true });
@@ -156,6 +178,9 @@ async function run() {
     targetPeakElevation: +Math.max(1, maxY).toFixed(3),   // kept for legacy biome-colour banding
     seaLevel: 0,
     verticalScale: VSCALE,
+    seed: SEED,
+    augment: aug ? { mirror: aug.mirror, rot: +aug.rot.toFixed(4), zoom: +aug.zoom.toFixed(3),
+      panU: +aug.panU.toFixed(3), panV: +aug.panV.toFixed(3), seaLevel: +aug.seaLevel.toFixed(2), label: aug.label } : null,
     worldBounds,
     spawns,
   };
@@ -171,6 +196,43 @@ async function run() {
 
   console.log(`  ${chunkCountX}×${chunkCountZ} chunks + manifest + neutral ao_map written → ${outputDir}`);
   console.log(`  ${spawns.length} spawn point(s).\nDone.`);
+}
+
+/** Colorized, hill-shaded preview of the final signed field (land ramp + bathy ramp), ~600 px. */
+function writeFieldPreview(field, OUT, minY, maxY, path) {
+  const { PNG } = pngjs;
+  const PV = 600;
+  const scale = Math.max(1, Math.ceil(OUT / PV));
+  const ow = Math.floor(OUT / scale), oh = Math.floor(OUT / scale);
+  const png = new PNG({ width: ow, height: oh });
+  const at = (x, y) => field[Math.min(OUT - 1, Math.max(0, y)) * OUT + Math.min(OUT - 1, Math.max(0, x))];
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const cl = (x) => Math.max(0, Math.min(1, x));
+  for (let oy = 0; oy < oh; oy++) {
+    for (let ox = 0; ox < ow; ox++) {
+      const sx = ox * scale, sy = oy * scale, h = at(sx, sy);
+      let rgb;
+      if (h <= 0) {
+        const d = cl(h / (minY || -1));                          // 0 surface → 1 deepest
+        rgb = [lerp(170, 8, d), lerp(225, 20, d), lerp(240, 70, d)];
+      } else {
+        const t = cl(h / (maxY || 1));
+        const ramp = [[0, [216, 200, 150]], [0.12, [70, 120, 55]], [0.45, [110, 95, 70]], [0.78, [90, 80, 72]], [1, [235, 235, 240]]];
+        let c = ramp[ramp.length - 1][1];
+        for (let i = 1; i < ramp.length; i++) { if (t <= ramp[i][0]) { const f = (t - ramp[i - 1][0]) / (ramp[i][0] - ramp[i - 1][0] || 1); c = [0, 1, 2].map((k) => lerp(ramp[i - 1][1][k], ramp[i][1][k], f)); break; } }
+        // hillshade
+        const ex = 6;
+        let nx = -((at(sx + scale, sy) - at(sx - scale, sy)) / (scale * 2)) * ex;
+        let ny = -((at(sx, sy + scale) - at(sx, sy - scale)) / (scale * 2)) * ex;
+        const inv = 1 / Math.hypot(nx, ny, 1); nx *= inv; ny *= inv;
+        const lit = cl(0.5 + 0.8 * (nx * -0.5 + ny * -0.7 + inv * 0.5));
+        rgb = c.map((v) => v * lit);
+      }
+      const idx = (oy * ow + ox) * 4;
+      png.data[idx] = rgb[0]; png.data[idx + 1] = rgb[1]; png.data[idx + 2] = rgb[2]; png.data[idx + 3] = 255;
+    }
+  }
+  writeFileSync(path, PNG.sync.write(png));
 }
 
 /** Pick spread-out spawn points in navigable water (−40…−4 m) within ~1.5 km of land. */

@@ -117,6 +117,10 @@ export class OceanFFTMaterial {
     if (this._deps.depthTexture) {
       mat.AddUniform('_CameraDepthTexture', 'sampler2D', this._deps.depthTexture);
     }
+    // Depth-based transparency reach: how far (metres of through-water path) you can see down into the
+    // water before it reads fully opaque. Drives the unified seabed/hull reveal (replaces the old
+    // coastal-proximity ramp + boat oval). ~8 m ≈ 26 ft of visibility.
+    mat.AddUniform('_SeeDepth', 'float', 8.0);
     if (this._deps.reflectionTexture) {
       mat.AddUniform('_Reflection', 'sampler2D', this._deps.reflectionTexture);
       mat.AddUniform('_ReflStrength', 'float', 0.9);
@@ -608,92 +612,49 @@ export class OceanFFTMaterial {
 
     mat.Fragment_Before_FinalColorComposition(`
       vec3 waterCol = color * (1.0 - fresnel);
-      // Water→sand runoff: 0 in open water, ramping to 1 right at the shoreline so the water
-      // dissolves into the seabed and there's no obvious line where it starts/ends.
-      float shoreFade = 0.0;
-      float shoalReveal = 0.0;   // how much seabed shows (set in the refraction stage) — dims surface glint
-      float shoreReflCut = 1.0;  // cuts sky reflection across the shallows (kills the blue ring offshore)
-      #ifdef HAS_SHORE
-        float prox = _shoreProx(vWorldUV);
-        // Ragged shoreline: jitter the shore proximity with a small value-noise (~1.4 m lobes) so the
-        // water→sand edge breaks into a natural lobed line — revealing the sand beneath unevenly —
-        // instead of a clean contour. Pairs with the terrain-side waterline dither.
-        vec2 wlW = vWorldUV * 0.7;
-        vec2 wlI = floor(wlW); vec2 wlF = fract(wlW);
-        vec2 wlU = wlF * wlF * (3.0 - 2.0 * wlF);
-        float wlA = fract(sin(dot(wlI,                  vec2(127.1, 311.7))) * 43758.5453);
-        float wlB = fract(sin(dot(wlI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
-        float wlC = fract(sin(dot(wlI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
-        float wlD = fract(sin(dot(wlI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
-        float wlNoise = mix(mix(wlA, wlB, wlU.x), mix(wlC, wlD, wlU.x), wlU.y);
-        float proxR = prox + (wlNoise - 0.5) * 0.18;
-        shoreFade = smoothstep(0.70, 0.95, proxR);
-        shoreReflCut = 1.0 - smoothstep(0.0, 0.40, prox) * 0.99;   // suppress the sky glint across the shallows
-        // Shallow turquoise water-column tint as the seabed rises toward the beach. It's
-        // emissive (unaffected by scene lighting), so without a day factor it glows brightly
-        // (Shallow turquoise water-column tint removed — the shallows now read purely from the
-        //  revealed seabed below, for a clear-water look.)
-        #ifdef HAS_REFRACTION
-          // True transparency: blend in the seabed colour (scene-minus-ocean RTT), revealed
-          // more as the water shallows. Refracted slightly by the wave normal.
-          // Shallow seabed reveal, plus a strong boost right around the hull so the submerged
-          // hull/keel shows through the water near the boat (where the refraction RTT has it),
-          // plus a faint global baseline.
-          // Wide ramp so the whole shallow zone reads as transparent — you see the sea floor
-          // (and the boat's shadow/keel on it) right across the shallows, not just at the very
-          // edge — plus a strong near-hull boost and a faint deep-water baseline.
-          float reveal = smoothstep(0.40, 0.82, proxR);   // jittered → ragged seabed reveal matching the shoreline
-          #ifdef HAS_WAKE
-            // Hull-reveal: an ellipse hugging the hull (long along the heading, narrow across) so the
-            // submerged hull sides show in the band of water just outside the boat. The residual
-            // seabed in that band can't be fully removed without the scene depth buffer (off in this
-            // build) — kept fairly tight + at moderate strength so the floor stays faint.
-            vec2 hrRel = vWorldUV - _BoatPos;
-            vec2 hrFwd = _BoatDir;
-            vec2 hrSide = vec2(-hrFwd.y, hrFwd.x);
-            float hrAlong = dot(hrRel, hrFwd) / 11.0;    // ~11 m half-length (bow↔stern)
-            float hrCross = dot(hrRel, hrSide) / 3.5;    // ~3.5 m half-width
-            float hrE = sqrt(hrAlong * hrAlong + hrCross * hrCross);   // 1.0 at the ellipse edge
-            // Depth cutoff: only reveal where the geometry behind the water is SHALLOW (the hull,
-            // just under the surface) — not the deeper seabed. dz = through-water distance from the
-            // surface to the opaque geometry (camera-space Z; small for the hull, large for the floor).
-            float hrGate = 1.0;
-            #ifdef HAS_DEPTH
-              vec2 hrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5, vec2(0.001), vec2(0.999));
-              float hrBgZ = texture2D(_CameraDepthTexture, hrUV).r;   // eye-distance to geometry behind (1e8 = open water)
-              float hrDz = hrBgZ - vClipCoords.w;                     // through-water distance
-              hrGate = 1.0 - smoothstep(4.0, 9.0, hrDz);              // 1 ≈ hull (shallow) → 0 ≈ seabed (deep)
-            #endif
-            reveal = max(reveal, 0.9 * (1.0 - smoothstep(0.5, 1.0, hrE)) * hrGate);
-          #endif
-          reveal = max(reveal, 0.06);
-          vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
-          vec3 refr = texture2D(_Refraction, refrUV).rgb;
-          // Only reveal where there's actually a seabed behind the water — the refraction RTT
-          // clears to black where the seabed has dropped off, so gate by its brightness to
-          // avoid a band there (the water just shows its own deep colour instead).
-          reveal *= smoothstep(0.02, 0.16, max(refr.r, max(refr.g, refr.b)));
-          shoalReveal = reveal;   // shared with the reflection stage to dim glint over the shallows
-          // Drifting fish on the seabed — only with the camera above water (_Time is /10, so ×10).
-          if (_WorldSpaceCameraPos.y > 0.05) {
-            float fish = fishField(vWorldUV, _Time * 10.0);
-            refr *= (1.0 - fish * 0.5);
-          }
-          // Broad shallows: reveal the sandy bottom so you can SEE the sea floor through the
-          // water. Kept on the wet/darker side so the submerged sand matches the wet sand the
-          // terrain paints at the waterline (rather than reading lighter).
-          // The revealed seabed is emissive; the lit terrain darkens with the scene but the
-          // refraction's flat tan clear-colour does not, so it glows after dark. Day-gate it
-          // (sunUp: 0 below horizon → 1 in daylight) so the shallows fade to dark at night.
-          vec3 seabedSand = refr * vec3(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
-          // Reveal the sandy bottom across the shallows; at the very shoreline ramp it to full
-          // so the water dissolves into the matching beach sand — no hard line, no teal ring.
-          waterCol = mix(waterCol, seabedSand, max(reveal * 0.85, shoreFade));
-        #endif
-        // Subtle turquoise ring at the OUTER edge of the shallows (deep → shallow transition),
-        // sun-gated so it doesn't glow at night.
-        float shoalRing = smoothstep(0.16, 0.30, prox) * (1.0 - smoothstep(0.34, 0.52, prox));
-        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shoalRing * 0.16 * sunUp);
+
+      // ── Depth-based transparency ─────────────────────────────────────────────────
+      // One unified rule, now that the seabed is real geometry: you can see ~_SeeDepth metres DOWN
+      // into the water everywhere. reveal (0 = opaque deep water -> 1 = bottom fully visible) is
+      // driven purely by how close the opaque geometry behind the surface is — the real seabed in the
+      // shallows OR the hull right by the boat — so it replaces BOTH the old coastal-proximity
+      // transparency ramp AND the boat-shaped reveal oval with a single physical depth fade.
+      float reveal = 0.0;
+      float shallow = 0.0;   // broad shallow-water factor (1 in the shallows → 0 in deep water);
+                             // suppresses the blue water terms (sky reflection, shoal tint) over sand
+      #if defined(HAS_DEPTH) && defined(HAS_REFRACTION)
+        vec2 dUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5, vec2(0.001), vec2(0.999));
+        float bgZ = texture2D(_CameraDepthTexture, dUV).r;        // eye-distance to geometry behind (1e8 = open water)
+        float dz  = max(0.0, bgZ - vClipCoords.w);                // through-water path length (metres)
+        // Visibility falls off with VIEW distance too (scattering/haze through the water column), so
+        // far water always reads opaque — this also kills false reveals at the grazing horizon where
+        // the background depth gets unreliable. Full reach up close, gone by ~400 m.
+        float distFade = 1.0 - smoothstep(150.0, 400.0, vClipCoords.w);
+        reveal = (1.0 - smoothstep(0.0, _SeeDepth, dz)) * distFade;
+        shallow = (1.0 - smoothstep(0.0, _SeeDepth * 2.2, dz)) * distFade;   // wider than the crisp reveal
+        vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
+        vec3 refr = texture2D(_Refraction, refrUV).rgb;
+        // Only reveal where the refraction RTT actually has seabed (it clears to ~black past a dropoff).
+        reveal *= smoothstep(0.02, 0.16, max(refr.r, max(refr.g, refr.b)));
+        // Revealed seabed is emissive (the refraction clear-colour doesn't darken with the scene),
+        // so day-gate it (sunUp) to fade the bottom to dark at night.
+        vec3 seabedSand = refr * vec3(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
+        waterCol = mix(waterCol, seabedSand, reveal * 0.9);
+
+        // Shoal water-column tint: a turquoise ring in the band just BEYOND the clear-view depth
+        // (deep enough that the bottom has faded out, so it never tints the visible sand — that was
+        // reading as a blue glow over the shadowed shallows). Gated past the reveal, sun-gated.
+        float shoal = smoothstep(_SeeDepth, _SeeDepth * 1.8, dz)
+                    * (1.0 - smoothstep(_SeeDepth * 1.8, _SeeDepth * 3.5, dz)) * distFade * (1.0 - reveal);
+        waterCol = mix(waterCol, vec3(0.10, 0.48, 0.50) * (1.0 - fresnel), shoal * 0.10 * sunUp);
+
+        // Drifting fish across the shallows — dark shapes in the water column, visible through the
+        // whole shoal band (not just where the sand is crisply revealed). Camera above water only.
+        if (_WorldSpaceCameraPos.y > 0.05) {
+          float shallowsVis = (1.0 - smoothstep(0.0, _SeeDepth * 2.2, dz)) * distFade;
+          float fish = fishField(vWorldUV, _Time * 10.0);
+          waterCol *= 1.0 - fish * 0.35 * shallowsVis * sunUp;
+        }
       #endif
       #ifdef HAS_REFLECTION
         // Planar mirror reflection (skybox + islands + vessels), rippled by the wave normal,
@@ -702,13 +663,14 @@ export class OceanFFTMaterial {
         reflUV += normalW.xz * 0.04;
         reflUV = clamp(reflUV, vec2(0.002), vec2(0.998));
         vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
-        // Strongly dim the surface glint over the clear shallows so the wet sandy bottom shows
-        // through as SAND, not a turquoise sky reflection — this is what makes the dissolved
-        // shoreline blend to sand rather than reading teal.
-        waterCol += planarRefl * fresnel * _ReflStrength * (1.0 - shoreFade) * shoreReflCut;
+        // Dim the surface glint across the WHOLE shallows (not just where the bottom is crisply
+        // revealed), so transparent shallow water reads as wet sand rather than mirroring the sky —
+        // that sky-blue over the sand was the "glowing blue sea" in the dusk shadows.
+        float reflCut = 1.0 - max(reveal, shallow) * 0.9;
+        waterCol += planarRefl * fresnel * _ReflStrength * reflCut;
         // Analytic sky fallback — fades in as the planar reflection fades out (reflections off / RTT
         // dead) so the water still catches sky light at grazing angles instead of reading flat-dark.
-        waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * (1.0 - shoreFade) * shoreReflCut;
+        waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * reflCut;
       #endif
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);

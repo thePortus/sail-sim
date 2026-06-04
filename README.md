@@ -29,7 +29,14 @@ Go into container, build terrain files and run server migrations
 
 ``` sh
 docker exec -it sail-sim-nodejs sh
-npm run build:terrain
+npm run download:terrain-tiles
+# now to build...
+# random region + random seed
+npm run terrain -- cyclades_naxos	that region, random seed
+# OR specific seed
+npm run terrain -- 42
+# OR a specific region with a specific seed
+npm run terrain -- cyclades_naxos 42
 npm run migrate
 ```
 

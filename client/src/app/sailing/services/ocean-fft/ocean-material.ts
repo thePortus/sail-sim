@@ -614,7 +614,19 @@ export class OceanFFTMaterial {
       float shoreReflCut = 1.0;  // cuts sky reflection across the shallows (kills the blue ring offshore)
       #ifdef HAS_SHORE
         float prox = _shoreProx(vWorldUV);
-        shoreFade = smoothstep(0.70, 0.95, prox);
+        // Ragged shoreline: jitter the shore proximity with a small value-noise (~1.4 m lobes) so the
+        // water→sand edge breaks into a natural lobed line — revealing the sand beneath unevenly —
+        // instead of a clean contour. Pairs with the terrain-side waterline dither.
+        vec2 wlW = vWorldUV * 0.7;
+        vec2 wlI = floor(wlW); vec2 wlF = fract(wlW);
+        vec2 wlU = wlF * wlF * (3.0 - 2.0 * wlF);
+        float wlA = fract(sin(dot(wlI,                  vec2(127.1, 311.7))) * 43758.5453);
+        float wlB = fract(sin(dot(wlI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+        float wlC = fract(sin(dot(wlI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+        float wlD = fract(sin(dot(wlI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+        float wlNoise = mix(mix(wlA, wlB, wlU.x), mix(wlC, wlD, wlU.x), wlU.y);
+        float proxR = prox + (wlNoise - 0.5) * 0.18;
+        shoreFade = smoothstep(0.70, 0.95, proxR);
         shoreReflCut = 1.0 - smoothstep(0.0, 0.40, prox) * 0.99;   // suppress the sky glint across the shallows
         // Shallow turquoise water-column tint as the seabed rises toward the beach. It's
         // emissive (unaffected by scene lighting), so without a day factor it glows brightly
@@ -629,7 +641,7 @@ export class OceanFFTMaterial {
           // Wide ramp so the whole shallow zone reads as transparent — you see the sea floor
           // (and the boat's shadow/keel on it) right across the shallows, not just at the very
           // edge — plus a strong near-hull boost and a faint deep-water baseline.
-          float reveal = smoothstep(0.40, 0.82, prox);   // pulled in, but a wide ramp so the shallows' edge gives way gradually
+          float reveal = smoothstep(0.40, 0.82, proxR);   // jittered → ragged seabed reveal matching the shoreline
           #ifdef HAS_WAKE
             reveal = max(reveal, 0.75 * (1.0 - smoothstep(2.0, 14.0, length(vWorldUV - _BoatPos))));
           #endif

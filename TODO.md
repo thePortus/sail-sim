@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* transparency oval around boat sometimes too big, can see ocean floor while in depths
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making

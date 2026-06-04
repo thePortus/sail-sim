@@ -80,6 +80,7 @@ export class TerrainService {
   } | null = null;
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
+  private _inRefractionPass = false;   // true while the terrain renders into the ocean's seabed RTT
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -1388,6 +1389,16 @@ export class TerrainService {
     material.AddUniform('uCloudTime',     'float',   null);   // (legacy) cloud-shadow drift clock
     material.AddUniform('uCloudDrift',    'vec2',    null);   // real cloud wind drift (matches ocean)
     material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
+    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = dither shoreline (main view), 0 = off (refraction RTT)
+
+    // The waterline dither discards sand pixels — but it must NOT run when the terrain renders into
+    // the ocean's refraction (seabed) RTT, or the holes get filled with that pass's bright clear-
+    // colour and read as a bright band. Flag the refraction pass so the bind below can switch it off.
+    const refr = this.oceanService.getRefractionTexture?.();
+    if (refr) {
+      refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
+      refr.onAfterRenderObservable.add(() => { this._inRefractionPass = false; });
+    }
 
     // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
     const peakH = manifest.targetPeakElevation ?? 920;
@@ -1405,9 +1416,16 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
-      // (The noise-dithered waterline dissolve that used to stipple the beach edge into the sea was
-      //  removed — it read as an unnaturally bright sand band. The seam is now softened from the
-      //  water side by the ocean's water→sand runoff, which dissolves the shallows into the beach.)
+      // ── 0. Noise-dithered waterline ───────────────────────────────────────
+      // Break up the clean sand↔water contour: in a thin band right at the waterline, a world-space
+      // noise discards sand pixels — more the closer to the edge — so the ocean behind shows through
+      // the gaps and the shoreline reads ragged/natural. Opaque-pass discard (no transparency sort).
+      float wlNoise = fract(sin(dot(floor(vPositionW.xz * 80.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlBand  = (1.0 - smoothstep(0.0, 0.55, vPositionW.y))   // fades out ~0.55 m up the beach
+                    * smoothstep(-0.20, 0.04, vPositionW.y)         // fades in from just below water
+                    * 0.85                                          // max discard fraction at the very edge
+                    * u_waterlineDither;                            // 0 in the refraction RTT → seabed stays solid
+      if (wlNoise < wlBand) { discard; }
 
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -1758,6 +1776,8 @@ export class TerrainService {
       const fx = material.getEffect();
       if (!fx) return;
       fx.setFloat('uPeakH', peakH);
+      // Switch the shoreline dither OFF for the refraction (seabed) pass so the seabed stays solid.
+      fx.setFloat('u_waterlineDither', this._inRefractionPass ? 0 : 1);
       // Haze tint tracks the current sky/fog colour (day/dusk/night/storm aware).
       fx.setColor3('uHazeColor', scene.fogColor);
       // Cloud shadows — pull the SAME coverage, sun dir and clock the ocean uses so the

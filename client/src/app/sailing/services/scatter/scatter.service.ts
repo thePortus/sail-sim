@@ -9,6 +9,8 @@ import { PatchManager } from './instancing/patch-manager';
 import { createGrassBlade } from './grass/grass-blade';
 import { createRock } from './props/rock';
 import { createDriftwood } from './props/driftwood';
+import { createTree } from './props/tree';
+import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 
 const EMPTY = new Float32Array(0);
@@ -146,6 +148,23 @@ export class ScatterService {
       { stacks: 2, nearerThan: 90,       fraction: 1.0 },
       { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
     ], (cx, cz) => this.buildDriftwood(cx, cz), createDriftwood, true));
+
+    // Forest trees — stylised low-poly trees (baked vertex colours: brown trunk + green canopy) in
+    // the inland forest-mask zone. White diffuse so the vertex colours show; no wind sway. LoD: full
+    // detail near, low-poly + thinned far.
+    // solid:false → double-sided + two-sided lighting + matte, so the thin leaves/fronds read from
+    // any angle (not one-sided) and shade like foliage.
+    this.layers.push(this.makeLayer(scene, 'scatter_trees', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 110,      fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.6 },
+    ], (cx, cz) => this.buildTrees(cx, cz), createTree, false));
+
+    // Beach palms — low-poly vertex-coloured palms (feathered fronds) in coastal stands (groves),
+    // replacing the old terrain beach-palm system. Full detail + coconuts near, simpler far.
+    this.layers.push(this.makeLayer(scene, 'scatter_palms', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 130,      fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
+    ], (cx, cz) => this.buildPalms(cx, cz), createPalm, false));
 
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
@@ -445,6 +464,78 @@ export class ScatterService {
       }
     }
     return this.finish(matTmp, kept, colTmp);
+  }
+
+  /** Build one patch's forest trees: clustered in the inland forest-mask zone (mid elevation, gentle
+   *  slope), broken into stands by low-freq noise with clearings. Sparse — trees are big. */
+  private buildTrees(cx: number, cz: number): PatchData {
+    const res = 16, size = this.PATCH, cell = size / res, E = 3.0;
+    const tmp = new Float32Array(res * res * 16);
+    const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const scaleV = this._scaleV, posV = this._posV, up = this._up;
+    let kept = 0;
+
+    for (let x = 0; x < res; x++) {
+      for (let z = 0; z < res; z++) {
+        const px = cx + (x + Math.random()) * cell - size / 2;
+        const pz = cz + (z + Math.random()) * cell - size / 2;
+        const y = getY(px, pz);
+        if (y < 7 || y > 80) { continue; }                 // inland band, below the rocky uplands
+        const slope = this.slopeAt(px, pz, y, E);
+        if (slope > 0.5) { continue; }                     // trees on gentle ground only
+
+        // Big forest stands (low-freq) with clearings inside (mid-freq) → grouped woods, open gaps.
+        const stand = fbm2(px / 45, pz / 45);
+        const clearing = fbm2(px / 13 + 9, pz / 13 - 4);
+        const dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
+          * (1 - slope * 0.8) * 0.6 * this.densityMul;
+        if (Math.random() > dens) { continue; }
+
+        const s = 0.8 + Math.random() * 0.6;               // ~4–7 m trees
+        const w = s * (0.85 + Math.random() * 0.3);
+        scaleV.set(w, s, w);
+        posV.set(px, y - 0.1, pz);
+        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, Math.random() * Math.PI * 2), posV)
+          .copyToArray(tmp, kept * 16);
+        kept++;
+      }
+    }
+    return this.finish(tmp, kept);
+  }
+
+  /** Build one patch's beach palms: clustered into coastal STANDS (groves) by low-freq noise, on the
+   *  sand/low-coastal band. Sparse — most beach is open, with the occasional grove. */
+  private buildPalms(cx: number, cz: number): PatchData {
+    const res = 14, size = this.PATCH, cell = size / res, E = 2.5;
+    const tmp = new Float32Array(res * res * 16);
+    const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const scaleV = this._scaleV, posV = this._posV, up = this._up;
+    let kept = 0;
+
+    for (let x = 0; x < res; x++) {
+      for (let z = 0; z < res; z++) {
+        const px = cx + (x + Math.random()) * cell - size / 2;
+        const pz = cz + (z + Math.random()) * cell - size / 2;
+        const y = getY(px, pz);
+        if (y < 0.5 || y > 8) { continue; }                // sand + low coastal band
+        const slope = this.slopeAt(px, pz, y, E);
+        if (slope > 0.5) { continue; }
+
+        // Groves: a high, sharp threshold on a low-freq field → rare clustered stands, open between.
+        const stand = fbm2(px / 28 + 60, pz / 28 - 40);
+        const dens = smoothstep(0.58, 0.84, stand) * (1 - slope * 0.6) * 0.4 * this.densityMul;
+        if (Math.random() > dens) { continue; }
+
+        const s = 0.6 + Math.random() * 0.45;              // ~5.5–9.5 m palms
+        const w = s * (0.9 + Math.random() * 0.2);
+        scaleV.set(w, s, w);
+        posV.set(px, y - 0.1, pz);
+        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, Math.random() * Math.PI * 2), posV)
+          .copyToArray(tmp, kept * 16);
+        kept++;
+      }
+    }
+    return this.finish(tmp, kept);
   }
 
   dispose(): void {

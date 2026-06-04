@@ -294,7 +294,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         await this.terrainService.init();
       });
 
-      // 3b. Asset scattering (grass/trees/butterflies) — needs the terrain ready.
+      // 3b. Asset scattering (grass/rocks/driftwood/trees/palms) — needs the terrain ready.
       // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
       await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
         if (!location.search.includes('noscatter')) { await this.scatterService.init(); }

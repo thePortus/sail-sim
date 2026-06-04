@@ -395,12 +395,10 @@ export class TerrainService {
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
-    // Distant forests = the green CANOPY painted into the terrain shader (§8d); there are
-    // NO 3-D forest trees (rendering 42k of them, even near-culled, was the FPS wall). The
-    // ONLY real 3-D trees are sparse PALMS dotted along the beaches, rendered only within
-    // ~200 m of the camera — so you get actual trees + shadows when you land on a shore for
-    // almost no cost (few exist, fewer enabled). buildTreeFoliage (forest trees) is unused.
-    this.buildBeachPalms(scene, manifest);
+    // Distant forests = the green CANOPY painted into the terrain shader (§8d). Beach palms (and
+    // now inland forest trees) are handled by the new camera-following ScatterService (thin
+    // instances + LoD + quality tiers), so the old per-patch beach-palm system is retired here.
+    // this.buildBeachPalms(scene, manifest);   // → ScatterService 'scatter_palms' layer
     // Ground scatter (rocks/grass/driftwood/dead trees) is implemented but
     // DISABLED pending a live debug: placement works (instances are created with
     // valid positions, per console logs) but nothing renders via either thin

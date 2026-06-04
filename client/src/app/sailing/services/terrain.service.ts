@@ -18,7 +18,6 @@ import {
   Matrix,
   VertexData,
   RawTexture,
-  ShaderMaterial,
   Vector2,
   Vector4,
   Constants,
@@ -140,94 +139,27 @@ export class TerrainService {
 
     this.buildTerrainMesh();
 
-    // P4a smoke test: ?terrainclip swaps the static mesh for a camera-centric clipmap displaced by
-    // a heightfield texture in the vertex shader (validates the WebGPU vertex texture-fetch path).
+    // P4b: ?terrainclip swaps the static mesh for a camera-centric clipmap rendered with the REAL
+    // terrain material (GPU height displacement + Sobel normals). Behind a flag for A/B vs the static
+    // mesh until P4c flips it on by default.
     if (new URLSearchParams(location.search).has('terrainclip')) {
-      this.buildClipmapSmokeTest();
+      this.buildClipmap();
     }
   }
 
-  // ── P4a: terrain clipmap smoke test ─────────────────────────────────────────
+  // ── P4b: terrain clipmap (real biome material) ──────────────────────────────
   private clipmap: TerrainClipmap | null = null;
   private clipmapObserver: import('@babylonjs/core').Observer<Scene> | null = null;
 
-  /** Upload the heightfield as a GPU texture, build the clipmap, displace it with a throwaway test
-   *  material (height-coloured), and follow the camera. Hides the static mesh. Isolated behind a flag
-   *  so it can't break normal play while we de-risk the WebGPU vertex height-fetch. */
-  private buildClipmapSmokeTest(): void {
+  /** Build the camera-centric clipmap and render it with the real terrain material in clipmap mode
+   *  (vertex height displacement + fragment Sobel normals). Hides the static mesh. */
+  private buildClipmap(): void {
     const scene = this.sceneService.scene;
     const cam = this.sceneService.camera;
     const m = this.manifest;
     if (!scene || !cam || !m || !this.heightfield) { return; }
-    const minE = m.minElevation ?? 0, maxE = m.maxElevation ?? m.targetPeakElevation;
 
-    // Heightfield (Uint16 quantized) → Float32 metres → single-channel float texture.
-    const n = m.width * m.height;
-    const data = new Float32Array(n);
-    const span = (maxE - minE) / m.quantizationLevels;
-    for (let i = 0; i < n; i++) { data[i] = this.heightfield[i] * span + minE; }
-    const heightTex = new RawTexture(
-      data, m.width, m.height, Constants.TEXTUREFORMAT_R, scene,
-      false, false, Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,
-    );
-    heightTex.wrapU = Texture.CLAMP_ADDRESSMODE;
-    heightTex.wrapV = Texture.CLAMP_ADDRESSMODE;
-
-    const wb = m.worldBounds;
-    const mat = new ShaderMaterial('terrain_clip_test', scene, {
-      vertexSource: `
-        precision highp float;
-        attribute vec3 position;
-        uniform mat4 world;
-        uniform mat4 viewProjection;
-        uniform sampler2D heightTex;
-        uniform vec4 wbounds;            // minX, minZ, sizeX, sizeZ
-        uniform vec2 texSize;            // heightfield width, height (texels)
-        varying vec3 vWorldPos;
-        // Manual bilinear via integer texel fetches — works on non-filterable R32F (WebGPU may not
-        // hardware-filter float textures). Clamped to the edge.
-        float sampleHeight(vec2 uv) {
-          vec2 tc = uv * texSize - 0.5;
-          vec2 f = fract(tc);
-          ivec2 i0 = ivec2(floor(tc));
-          ivec2 mx = ivec2(texSize) - 1;
-          ivec2 a = clamp(i0,                ivec2(0), mx);
-          ivec2 b = clamp(i0 + ivec2(1, 0),  ivec2(0), mx);
-          ivec2 c = clamp(i0 + ivec2(0, 1),  ivec2(0), mx);
-          ivec2 d = clamp(i0 + ivec2(1, 1),  ivec2(0), mx);
-          float h00 = texelFetch(heightTex, a, 0).r;
-          float h10 = texelFetch(heightTex, b, 0).r;
-          float h01 = texelFetch(heightTex, c, 0).r;
-          float h11 = texelFetch(heightTex, d, 0).r;
-          return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
-        }
-        void main() {
-          vec4 wp = world * vec4(position, 1.0);
-          float u = (wp.x - wbounds.x) / wbounds.z;
-          float v = (wbounds.y + wbounds.w - wp.z) / wbounds.w;   // row 0 = north (maxZ)
-          wp.y = sampleHeight(vec2(u, v));
-          vWorldPos = wp.xyz;
-          gl_Position = viewProjection * wp;
-        }`,
-      fragmentSource: `
-        precision highp float;
-        varying vec3 vWorldPos;
-        void main() {
-          float h = vWorldPos.y;
-          vec3 c;
-          if (h < 0.0) { c = mix(vec3(0.05,0.18,0.32), vec3(0.10,0.32,0.42), clamp(h/-60.0+1.0,0.0,1.0)); }
-          else { float t = clamp(h/800.0, 0.0, 1.0); c = mix(vec3(0.78,0.72,0.52), mix(vec3(0.22,0.44,0.18), vec3(0.62,0.62,0.64), smoothstep(0.1,0.9,t)), smoothstep(0.0,0.06,t)); }
-          gl_FragColor = vec4(c, 1.0);
-        }`,
-    }, {
-      attributes: ['position'],
-      uniforms: ['world', 'viewProjection', 'wbounds', 'texSize'],
-      samplers: ['heightTex'],
-    });
-    mat.setTexture('heightTex', heightTex);
-    mat.setVector4('wbounds', new Vector4(wb.minX, wb.minZ, wb.maxX - wb.minX, wb.maxZ - wb.minZ));
-    mat.setVector2('texSize', new Vector2(m.width, m.height));
-    mat.backFaceCulling = true;
+    const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode
 
     this.clipmap = new TerrainClipmap(cam, scene);
     this.clipmap.setMaterial(mat);
@@ -236,7 +168,7 @@ export class TerrainService {
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
 
     if (this.terrainMesh) { this.terrainMesh.setEnabled(false); }   // hide the static mesh
-    console.info('[Terrain] clipmap smoke test active (?terrainclip) — static mesh hidden');
+    console.info('[Terrain] clipmap (real material) active (?terrainclip) — static mesh hidden');
   }
 
   isReady(): boolean {
@@ -1402,7 +1334,7 @@ export class TerrainService {
     this.scatterTypes = [];
   }
 
-  private buildTerrainMaterial(scene: any, manifest: TerrainManifest): CustomMaterial {
+  private buildTerrainMaterial(scene: any, manifest: TerrainManifest, clipmap = false): CustomMaterial {
     this.terrainMaterial?.dispose();
     this.terrainMaterial = null;
     for (const texture of this.terrainTextures) {
@@ -1517,6 +1449,49 @@ export class TerrainService {
     material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
     material.AddUniform('u_waterlineDither', 'float', null);  // 1 = ragged shoreline (main view), 0 = off (refraction RTT)
 
+    // ── Clipmap mode (P4b): GPU height displacement + Sobel normals ──────────────
+    // The terrain renders as a camera-centric clipmap of FLAT grids; the heightfield is uploaded as a
+    // texture and sampled in the VERTEX shader to displace Y, and in the FRAGMENT shader to recompute
+    // the world normal (Sobel) — replacing the baked mesh heights/normals. Manual bilinear via
+    // texelFetch (R32F isn't HW-filterable on WebGPU).
+    if (clipmap) {
+      this.createClipHeightTexture(scene, manifest);
+      material.AddUniform('heightTex', 'sampler2D', null);
+      material.AddUniform('wbounds',   'vec4', null);   // minX, minZ, sizeX, sizeZ
+      material.AddUniform('texSize',   'vec2', null);   // heightfield texels (w, h)
+      material.Vertex_Definitions(`
+        float _clipH(vec2 uv) {
+          vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+          ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+          float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+          float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+          float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+          float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+          return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+        }
+        float _clipHW(vec2 wxz) {
+          return _clipH(vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w));
+        }
+      `);
+      material.Vertex_Before_PositionUpdated(`
+        vec3 _cw = (world * vec4(positionUpdated, 1.0)).xyz;
+        positionUpdated.y = _clipHW(_cw.xz);
+      `);
+      material.Fragment_Definitions(`
+        float _clipHF(vec2 wxz) {
+          vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
+          ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
+          return texelFetch(heightTex, t, 0).r;
+        }
+        vec3 _clipNormal(vec2 wxz) {
+          float e = wbounds.z / texSize.x;   // 1 texel in world metres
+          float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
+          float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
+          return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
+        }
+      `);
+    }
+
     // The ragged-waterline discard must NOT run when the terrain renders into the ocean's seabed
     // (refraction) RTT, or the holes fill with that pass's clear-colour and read as bright specks in
     // the depth-revealed seabed. Flag the refraction pass so the bind below can switch it off.
@@ -1578,7 +1553,9 @@ export class TerrainService {
       float macroMod = 0.75 + macroLum * 0.50;  // [0.75 .. 1.25]
 
       // ── 2. Triplanar blend weights ────────────────────────────────────────
-      vec3 nW   = normalize(vNormalW);
+      // Clipmap mode recomputes the world normal from the heightfield (the flat-grid vNormalW is
+      // meaningless once the vertex shader displaces Y); the static mesh uses its baked normals.
+      vec3 nW   = ${clipmap ? '_clipNormal(vPositionW.xz)' : 'normalize(vNormalW)'};
       vec3 triW = abs(nW);
       triW      = triW * triW * triW * triW * triW * triW;  // pow 6 — no built-in
       triW     /= (triW.x + triW.y + triW.z);               // normalise to sum = 1
@@ -1946,10 +1923,39 @@ export class TerrainService {
       fx.setTexture('uSandNor',    sandNorTex);
       fx.setTexture('uGrassNor',   grassNorTex);
       fx.setTexture('uRockNor',    rockNorTex);
+      if (clipmap && this.clipHeightTex) {
+        fx.setTexture('heightTex', this.clipHeightTex);
+        fx.setVector4('wbounds', this.clipWBounds);
+        fx.setVector2('texSize', this.clipTexSize);
+      }
     });
 
     this.terrainMaterial = material;
     return material;
+  }
+
+  // ── P4b: clipmap height texture (heightfield → GPU R32F) ─────────────────────
+  private clipHeightTex: RawTexture | null = null;
+  private clipWBounds = new Vector4(0, 0, 1, 1);
+  private clipTexSize = new Vector2(1, 1);
+
+  private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
+    if (this.clipHeightTex || !this.heightfield) { return; }
+    const minE = m.minElevation ?? 0, maxE = m.maxElevation ?? m.targetPeakElevation;
+    const n = m.width * m.height;
+    const data = new Float32Array(n);
+    const span = (maxE - minE) / m.quantizationLevels;
+    for (let i = 0; i < n; i++) { data[i] = this.heightfield[i] * span + minE; }
+    const tex = new RawTexture(
+      data, m.width, m.height, Constants.TEXTUREFORMAT_R, scene,
+      false, false, Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,
+    );
+    tex.wrapU = Texture.CLAMP_ADDRESSMODE;
+    tex.wrapV = Texture.CLAMP_ADDRESSMODE;
+    this.clipHeightTex = tex;
+    this.clipWBounds = new Vector4(m.worldBounds.minX, m.worldBounds.minZ,
+      m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
+    this.clipTexSize = new Vector2(m.width, m.height);
   }
 
   // ── Coastal grading ───────────────────────────────────────────────────────

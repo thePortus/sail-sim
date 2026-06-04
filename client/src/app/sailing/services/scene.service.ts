@@ -10,6 +10,8 @@ import {
   VolumetricLightScatteringPostProcess,
 } from '@babylonjs/core';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
+import { Atmosphere } from '@babylonjs/addons/atmosphere';
+import { UnregisterMaterialPlugin } from '@babylonjs/core/Materials/materialPluginManager';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
 
@@ -27,6 +29,11 @@ export class SceneService {
 
   private skyMat!:    SkyMaterial;
   private skyMesh:    any;
+  // Physically-based atmospheric scattering (Babylon 9 addon). When active it renders the sky
+  // and drives the sun light's colour/intensity, superseding the Preetham skybox + manual sun
+  // curves. Flag lets us A/B against the old sky and fall back if unsupported.
+  private readonly useAtmosphere = true;
+  private atmosphere: Atmosphere | null = null;
   private sun!:       DirectionalLight;
   private moonLight!: DirectionalLight;
   private ambient!:   HemisphericLight;
@@ -203,6 +210,9 @@ export class SceneService {
       this.buildCelestialBodies();
       this.buildStars();
       this.buildCamera(canvas);
+      // NOTE: the atmosphere is built LATER via activateAtmosphere() — after the rest of the
+      // scene's materials have compiled — because constructing it corrupts the WebGPU GLSL→SPIR-V
+      // compile of any custom material built around/after it (varying-location failures).
       this.buildPostProcessing();
       this.buildOceanDepthRenderer();
       this.startRenderLoop();
@@ -230,6 +240,48 @@ export class SceneService {
     skybox.renderingGroupId = 0;
     skybox.isPickable       = false;
     this.skyMesh = skybox;
+  }
+
+  // ── Physically-based atmosphere (Babylon addon) ───────────────────────────────
+
+  /**
+   * Build the physical atmosphere. Call this AFTER the full scene has loaded and its materials
+   * have compiled — constructing the atmosphere earlier corrupts the WebGPU GLSL→SPIR-V compile
+   * of custom materials built around it. Waits for the scene to be ready first.
+   */
+  async activateAtmosphere(): Promise<void> {
+    if (!this.useAtmosphere || !this.scene || this.atmosphere) { return; }
+    await this.scene.whenReadyAsync();
+    try {
+      if (!Atmosphere.IsSupported(this.engine)) {
+        console.info('[Scene] Atmosphere addon unsupported on this engine — keeping Preetham sky.');
+        return;
+      }
+      // The atmosphere illuminates from the sun DirectionalLight; we keep driving its DIRECTION
+      // from the day/night clock and let the atmosphere set its colour + intensity physically.
+      const atm = new Atmosphere('atmosphere', this.scene, [this.sun]);
+      atm.isLinearSpaceComposition = true;  // we composite in HDR linear → pipeline ACES tonemaps
+      atm.isLinearSpaceLight       = true;  // PBR materials expect linear light
+      atm.skyRenderingGroup        = 0;     // sky behind everything (where the skybox drew)
+      this.atmosphere = atm;
+
+      // The atmosphere auto-registers a PBR material plugin ("atmo-pbr") that injects
+      // aerial-perspective/sky-IBL code into EVERY PBRMaterial-classed material — including our
+      // boat (PBRMaterial) and FFT ocean (PBRCustomMaterial, which inherits that class name).
+      // Its injected GLSL uses `#include` directives that the WebGPU GLSL→SPIR-V path can't
+      // resolve, so those materials fail to compile (boat invisible, ocean off). We don't need
+      // atmospheric scattering on these near-camera surfaces (our own fog/haze covers distance),
+      // so unregister the auto-attach. The sky render + physical sun-light driving are separate
+      // and unaffected.
+      UnregisterMaterialPlugin('atmo-pbr');
+
+      // Retire the Preetham skybox — the atmosphere renders the sky now.
+      this.skyMesh?.setEnabled(false);
+      console.info('[Scene] Atmosphere addon active — physical sky + sun lighting.');
+    } catch (e) {
+      console.warn('[Scene] Atmosphere init failed — keeping Preetham sky.', e);
+      this.atmosphere = null;
+    }
   }
 
   // ── Lights ───────────────────────────────────────────────────────────────────
@@ -668,16 +720,19 @@ export class SceneService {
     this.skyCloudiness += (this.targetSkyCloudiness - this.skyCloudiness) * Math.min(1, dt * 0.35);
     const cloud = this.skyCloudiness;
 
-    // inclination: 0 = at horizon, 0.45 ≈ high noon, negative = below horizon.
-    this.skyMat.inclination = h * 0.45;
-    this.skyMat.azimuth = (this.gameHours / 24 * 0.5 + 0.1) % 1;
+    // The Preetham sky is only driven when the physical atmosphere is NOT active.
+    if (!this.atmosphere) {
+      // inclination: 0 = at horizon, 0.45 ≈ high noon, negative = below horizon.
+      this.skyMat.inclination = h * 0.45;
+      this.skyMat.azimuth = (this.gameHours / 24 * 0.5 + 0.1) % 1;
 
-    // Blend time-of-day haze with weather cloudiness to emulate overcast skies.
-    this.skyMat.turbidity = Math.min(10, 2.0 + horizon * 4.0 + cloud * 4.0);
-    this.skyMat.mieCoefficient = Math.min(0.03, 0.005 + horizon * 0.01 + cloud * 0.02);
-    this.skyMat.mieDirectionalG = 0.97 - horizon * 0.07;
-    this.skyMat.rayleigh = Math.max(0.5, 2.2 - cloud * 1.2);
-    this.skyMat.luminance = Math.max(0.35, 1.0 - cloud * 0.35);
+      // Blend time-of-day haze with weather cloudiness to emulate overcast skies.
+      this.skyMat.turbidity = Math.min(10, 2.0 + horizon * 4.0 + cloud * 4.0);
+      this.skyMat.mieCoefficient = Math.min(0.03, 0.005 + horizon * 0.01 + cloud * 0.02);
+      this.skyMat.mieDirectionalG = 0.97 - horizon * 0.07;
+      this.skyMat.rayleigh = Math.max(0.5, 2.2 - cloud * 1.2);
+      this.skyMat.luminance = Math.max(0.35, 1.0 - cloud * 0.35);
+    }
 
     if (this.camera) {
       const sunPos = this.camera.position.add(dir.scale(65000));
@@ -804,14 +859,19 @@ export class SceneService {
     }
 
     // ── Directional (sun) light ────────────────────────────────────────────────
+    // Direction is always driven from the day clock. When the atmosphere is active it sets the
+    // sun's colour + intensity PHYSICALLY each frame (warm/dim at the horizon, bright at noon),
+    // so we skip the hand-tuned curves below.
     this.sun.direction = dir.negate();
-    this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
-    this.sun.diffuse   = new Color3(
-      1.0,
-      Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
-      Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
-    );
-    this.sun.specular = this.sun.diffuse;
+    if (!this.atmosphere) {
+      this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
+      this.sun.diffuse   = new Color3(
+        1.0,
+        Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
+        Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
+      );
+      this.sun.specular = this.sun.diffuse;
+    }
 
     // ── Moonlight (directional, opposite the sun, only at night) ─────────────
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.

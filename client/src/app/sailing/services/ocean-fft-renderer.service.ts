@@ -55,10 +55,10 @@ export class OceanFFTRenderer {
       scene,
       camera,
       fft: this.fft,
-      // Depth-based contact foam disabled for now: the scene depth RTT is currently invalid
-      // in this build (pre-existing pipeline error), and binding it can poison the draw.
-      // Re-enabled in Phase 5 once that RTT is sorted.
-      depthTexture: null,
+      // Scene depth (camera-space Z of opaque geom, ocean excluded) — the same live DepthRenderer
+      // the procedural ocean uses. Used here to depth-cut the near-boat hull reveal so it shows the
+      // submerged hull but not the deeper seabed behind it. (Contact foam stays off — _ContactFoam=0.)
+      depthTexture: this.sceneService.oceanDepthMap,
       reflectionTexture: this.oceanService.getReflectionTexture(),
       refractionTexture: this.oceanService.getRefractionTexture(),
       // When reflections are off the mirror RTT stops rendering, so feed the shader the sky/fog hue

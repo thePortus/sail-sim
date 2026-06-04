@@ -86,7 +86,7 @@ export class OceanFFTMaterial {
 
     mat.AddUniform('_FoamColor', 'vec3', new Vector3(1, 1, 1));
     mat.AddUniform('_FoamScale', 'float', 2.6);   // whitecap contrast (between demo 2.4 and 2.8)
-    mat.AddUniform('_ContactFoam', 'float', this._deps.depthTexture ? 1 : 0);
+    mat.AddUniform('_ContactFoam', 'float', 0);   // contact foam kept off; the depth tex is used only for the hull-reveal cutoff
     mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
     mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
     mat.AddUniform('_FoamBiasLOD2', 'float', 2.80);
@@ -137,6 +137,7 @@ export class OceanFFTMaterial {
     const hasWake = !!(this._deps.getBoatWake && this._deps.getWakePaths);
     if (hasWake) {
       mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + deep-water transparency halo)
+      mat.AddUniform('_BoatDir', 'vec2', new Vector2(0, 1));   // local boat heading (for the hull-shaped hull-reveal ellipse)
       mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
       mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
       mat.AddUniform('_WakeBoatCount', 'float', '');
@@ -643,7 +644,27 @@ export class OceanFFTMaterial {
           // edge — plus a strong near-hull boost and a faint deep-water baseline.
           float reveal = smoothstep(0.40, 0.82, proxR);   // jittered → ragged seabed reveal matching the shoreline
           #ifdef HAS_WAKE
-            reveal = max(reveal, 0.75 * (1.0 - smoothstep(2.0, 14.0, length(vWorldUV - _BoatPos))));
+            // Hull-reveal: an ellipse hugging the hull (long along the heading, narrow across) so the
+            // submerged hull sides show in the band of water just outside the boat. The residual
+            // seabed in that band can't be fully removed without the scene depth buffer (off in this
+            // build) — kept fairly tight + at moderate strength so the floor stays faint.
+            vec2 hrRel = vWorldUV - _BoatPos;
+            vec2 hrFwd = _BoatDir;
+            vec2 hrSide = vec2(-hrFwd.y, hrFwd.x);
+            float hrAlong = dot(hrRel, hrFwd) / 11.0;    // ~11 m half-length (bow↔stern)
+            float hrCross = dot(hrRel, hrSide) / 3.5;    // ~3.5 m half-width
+            float hrE = sqrt(hrAlong * hrAlong + hrCross * hrCross);   // 1.0 at the ellipse edge
+            // Depth cutoff: only reveal where the geometry behind the water is SHALLOW (the hull,
+            // just under the surface) — not the deeper seabed. dz = through-water distance from the
+            // surface to the opaque geometry (camera-space Z; small for the hull, large for the floor).
+            float hrGate = 1.0;
+            #ifdef HAS_DEPTH
+              vec2 hrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5, vec2(0.001), vec2(0.999));
+              float hrBgZ = texture2D(_CameraDepthTexture, hrUV).r;   // eye-distance to geometry behind (1e8 = open water)
+              float hrDz = hrBgZ - vClipCoords.w;                     // through-water distance
+              hrGate = 1.0 - smoothstep(4.0, 9.0, hrDz);              // 1 ≈ hull (shallow) → 0 ≈ seabed (deep)
+            #endif
+            reveal = max(reveal, 0.9 * (1.0 - smoothstep(0.5, 1.0, hrE)) * hrGate);
           #endif
           reveal = max(reveal, 0.06);
           vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
@@ -725,7 +746,7 @@ export class OceanFFTMaterial {
         eff.setFloat('_ShoreSize', shore.size);
       }
       const wake = this._deps.getBoatWake?.();
-      if (wake) { eff.setFloat2('_BoatPos', wake.x, wake.z); }
+      if (wake) { eff.setFloat2('_BoatPos', wake.x, wake.z); eff.setFloat2('_BoatDir', wake.dirX, wake.dirZ); }
       const wp = this._deps.getWakePaths?.();
       if (wp) {
         eff.setArray4('_WakePaths', wp.paths as unknown as number[]);

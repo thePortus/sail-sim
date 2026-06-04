@@ -2,7 +2,8 @@
 
 # General or Current TODO Items
 
-* transparency oval around boat sometimes too big, can see ocean floor while in depths
+* way to add wave function to transparency noise of water on shore's edge? Want to add a lapping effect... even better if in the direction of the wind
+* add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
@@ -32,3 +33,19 @@
 * encrypt websocket server? wss instead of ws?
 
 # TODO Items by Module
+
+Okay, I want to plan another major upgrade: this time, landscape generation..... let me tell you a few thigns as background.
+
+We already tried to do a simple landscape generation, where I had you generate elevation levels for a bunch of islands. It was fine, but it did not look good.... everything was too blocky, not fine detailed enough... and frankly having you draw islands like an SVG was always going to lead to something boring
+
+To combat that, I tried to come up with a pipeline to generate geometry from real world heightmaps.... this is our current system. It is far better, and the islands are more believeable. But the terrain elevation data seems clunky, and didn't build into super realistic worlds in our pipeline... often there isn't enough gradation of height, especially at the non-macro scale. Island often end up all being vertiginous mountains, with very little low lying or moderate territory
+
+I am asking for a plan to drastically improve our landscape generation... it can be via using online resources (if so, suggest some) to find good elevation and bathymetry data (for water depths), and use those as starting points.... or... it can be to use a fully procedural solution, though one that hopefully stacks multiple procedural methods and shaders to create a truly relastic variation in landscape.... or... some combination of both. I want ultra realistic landscapes... rather than the boring mush I have....
+
+Feel free to run searches for any material you want to find on how to produce realistic looking landscapes...
+
+Keep in mind we will mostly want an archapelago... but within that we want variation... some should have large volcanic mountains, other atolls... even within an island there is variation.. low lying bays vrs highlands or plains....
+
+And I'd like to make sure it looks interesting both a distance and close up. Which means posssibly using procedural LoD
+
+Right now, this is the brainstorm and plan phase. What are you thinking?

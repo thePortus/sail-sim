@@ -17,6 +17,7 @@ import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
+import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -157,6 +158,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
+  private scatterService     = inject(ScatterService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -289,6 +291,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       // 3. Load terrain
       await this.runInitStep('init-terrain', 'Surveying the coastline…', async () => {
         await this.terrainService.init();
+      });
+
+      // 3b. Asset scattering (grass/trees/butterflies) — needs the terrain ready.
+      await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
+        await this.scatterService.init();
       });
 
       // 4. Fetch vessel

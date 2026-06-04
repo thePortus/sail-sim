@@ -1906,11 +1906,23 @@ export class OceanService {
   private _cloudCoverage = 0;
   private _sunElevation  = 0;
   private _rainIntensity = 0;
+  // Live cloud coverage state (wind drift + coverage threshold + base) for real cloud shadows.
+  private _cloudShadow: { drift: Vector2; covThresh: number; cloudBase: number } | null = null;
 
   /** Call each frame from CloudService so the water mirrors current sky state. */
   setCloudReflection(coverage: number, sunElevation: number): void {
     this._cloudCoverage = coverage;
     this._sunElevation  = sunElevation;
+  }
+
+  /** Call each frame from CloudService — the cloud coverage state for real water cloud shadows. */
+  setCloudShadowField(field: { drift: Vector2; covThresh: number; cloudBase: number } | null): void {
+    this._cloudShadow = field;
+  }
+
+  /** Shared with the terrain so its cloud shadows trace the same clouds. */
+  getCloudShadowField(): { drift: Vector2; covThresh: number; cloudBase: number } | null {
+    return this._cloudShadow;
   }
 
   /** Current cloud coverage (0–1) — shared with the terrain so its cloud shadows match. */
@@ -2102,13 +2114,20 @@ export class OceanService {
 
   /** Top-down terrain (island) shadow mask + transform + strength + live cloud cover, for the
    *  FFT ocean to cast island/cloud shadows on the water. Black placeholder until terrain sets it. */
-  getWaterShadowInfo(): { map: Texture; center: Vector2; size: number; strength: number; cloud: number } {
+  getWaterShadowInfo(): {
+    map: Texture; center: Vector2; size: number; strength: number; cloud: number;
+    cloudDrift: Vector2; cloudCovThresh: number; cloudBase: number;
+  } {
     return {
       map: this.terrainShadowMask ?? this.shoreMapBlackTexture ?? this.reflectionRTT,
       center: this.terrainShadowCenter,
       size: this.terrainShadowSize > 0 ? this.terrainShadowSize : 1e9,
       strength: this.terrainShadowStrength,
       cloud: this._cloudCoverage,
+      // Real cloud-shadow state. covThresh 999 (no shadow) until the cloud plugin is ready.
+      cloudDrift:     this._cloudShadow?.drift      ?? new Vector2(0, 0),
+      cloudCovThresh: this._cloudShadow?.covThresh  ?? 999.0,
+      cloudBase:      this._cloudShadow?.cloudBase  ?? 900,
     };
   }
 

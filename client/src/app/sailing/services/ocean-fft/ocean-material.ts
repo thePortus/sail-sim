@@ -44,7 +44,7 @@ export interface OceanMaterialDeps {
   /** Active cannon muzzle flashes (vec4×6: x,z,age,_) + count + life, for a brief warm emissive glow. */
   getCannonFlash: (() => { data: Float32Array; count: number; life: number }) | null;
   /** Island shadow mask + transform + strength + cloud cover, for shadows on the water. */
-  getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number }) | null;
+  getWaterShadow: (() => { map: BaseTexture; center: Vector2; size: number; strength: number; cloud: number; cloudDrift: Vector2; cloudCovThresh: number; cloudBase: number }) | null;
   /** All vessel positions (local + remote) for boat shadows: vec4×8 (x,z,_,_) + count. */
   getBoatShadows: (() => { data: Float32Array; count: number }) | null;
   /** Rain intensity 0..1 — peppers the near surface with raindrop ripples. */
@@ -155,6 +155,11 @@ export class OceanFFTMaterial {
       mat.AddUniform('_TShadowStrength', 'float', 0);
       mat.AddUniform('_CloudCover', 'float', 0);
       mat.AddUniform('_SunDir', 'vec3', new Vector3(0, 1, 0));
+      // Live cloud-shadow state (matches the volumetric clouds: wind drift, coverage threshold,
+      // base altitude) so the water's cloud shadows trace and drift with the real clouds.
+      mat.AddUniform('_CloudDrift', 'vec2', new Vector2(0, 0));
+      mat.AddUniform('_CloudCovThresh', 'float', 999.0);
+      mat.AddUniform('_CloudBaseH', 'float', 900.0);
     }
     const hasBoatShadows = !!(shadow0 && this._deps.getBoatShadows);
     if (hasBoatShadows) {
@@ -220,12 +225,16 @@ export class OceanFFTMaterial {
         float inBounds = step(0.0, tuv.x) * step(tuv.x, 1.0) * step(0.0, tuv.y) * step(tuv.y, 1.0);
         sh = texture2D(_TerrainShadowMask, clamp(tuv, 0.0, 1.0)).r * _TShadowStrength * inBounds;
         if (_SunDir.y > 0.03 && _CloudCover > 0.02) {
-          vec2 cloudUV = (wxz + _SunDir.xz / max(_SunDir.y, 0.2) * 900.0) * 0.004;
-          vec2 drift = vec2(_Time * 1.8, _Time * 1.2);
-          float cf = _vnoiseS(cloudUV + drift) * 0.6 + _vnoiseS(cloudUV * 2.3 - drift * 1.7) * 0.4;
-          float cs = smoothstep(0.60 - _CloudCover * 0.45, 0.70 - _CloudCover * 0.30, cf);
-          cs *= _CloudCover * smoothstep(0.03, 0.18, _SunDir.y);
-          sh = max(sh, cs);
+          // Cloud shadow: project the surface point up-sun to the cloud layer, then sample a
+          // cloud-scaled coverage noise that DRIFTS in sync with the real clouds (_CloudDrift)
+          // and at the real base altitude (_CloudBaseH). Threshold falls with coverage → more
+          // cloud, more & darker dappling.
+          vec2 cloudXZ = wxz + _SunDir.xz / max(_SunDir.y, 0.15) * _CloudBaseH;
+          vec2 sp = cloudXZ + _CloudDrift;
+          float cf = _vnoiseS(sp * 0.0013) * 0.65 + _vnoiseS(sp * 0.0037) * 0.35;
+          float cs = smoothstep(0.58 - _CloudCover * 0.45, 0.70 - _CloudCover * 0.30, cf);
+          cs *= smoothstep(0.05, 0.35, _CloudCover) * smoothstep(0.03, 0.18, _SunDir.y);
+          sh = max(sh, cs * 0.85);
         }
         #ifdef HAS_BOATSHADOWS
           // Soft shadow under every vessel (local + remote), cast down-sun.
@@ -718,6 +727,9 @@ export class OceanFFTMaterial {
         eff.setFloat('_TShadowStrength', sh.strength);
         eff.setFloat('_CloudCover', sh.cloud);
         eff.setVector3('_SunDir', this._deps.getSunDir());
+        eff.setFloat2('_CloudDrift', sh.cloudDrift.x, sh.cloudDrift.y);
+        eff.setFloat('_CloudCovThresh', sh.cloudCovThresh);
+        eff.setFloat('_CloudBaseH', sh.cloudBase);
       }
       const boats = this._deps.getBoatShadows?.();
       if (boats) {

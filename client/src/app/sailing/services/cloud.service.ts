@@ -283,12 +283,11 @@ export class CloudService {
     this.windZ = Math.cos(bearingRad);
     this.windSpeed = Math.max(2, weather.wind.speed);
 
-    // Keep volumetric layer in sync.
+    // Wind goes straight through (the server + WeatherService already evolve it gradually).
+    // Coverage / cloud-type / vertical development are driven per-frame from the SMOOTHED
+    // cloudiness & storminess in tick() so they morph gradually rather than snapping on each
+    // ~1 s weather snapshot.
     if (this.volClouds) {
-      this.volClouds.updateCoverage(this.targetCloudiness);
-      // Cloud TYPE follows the weather: calm skies → fair-weather cumulus, storms →
-      // towering cumulonimbus (taller, darker-based, more broken).
-      this.volClouds.cloudType = 0.40 + this.targetStorminess * 0.55;
       this.volClouds.updateWind(
         new Vector3(this.windX, 0, this.windZ),
         this.windSpeed,
@@ -640,6 +639,16 @@ export class CloudService {
     this.cloudiness += (this.targetCloudiness - this.cloudiness) * Math.min(1, dt * 0.70);
     this.storminess += (this.targetStorminess - this.storminess) * Math.min(1, dt * 0.55);
 
+    // Drive the volumetric clouds from the SMOOTHED weather so they morph gradually:
+    // coverage, storm type (calm cumulus → towering cumulonimbus), and vertical development
+    // (storms build taller and lower their bases for a heavier, more oppressive deck).
+    if (this.volClouds) {
+      this.volClouds.updateCoverage(this.cloudiness);
+      this.volClouds.cloudType       = 0.40 + this.storminess * 0.55;
+      this.volClouds.cloudThickness  = 600 + this.storminess * 700;   // 600 → 1300 m
+      this.volClouds.cloudBaseHeight = 900 - this.storminess * 220;   // 900 → 680 m
+    }
+
     const camera = this.sceneService.camera;
     const camX = camera?.position.x ?? 0;
     const camZ = camera?.position.z ?? 0;
@@ -652,6 +661,10 @@ export class CloudService {
     // Keep ocean reflection in sync with current sky coverage and sun position.
     const sunEl = this.sceneService.getSunDirection().y;
     this.oceanService.setCloudReflection(this.cloudiness, sunEl);
+
+    // Feed the live cloud coverage field to the ocean so the water casts REAL cloud shadows
+    // (tracing the actual clouds) instead of a stand-in noise.
+    this.oceanService.setCloudShadowField(this.volClouds?.getCloudShadowField() ?? null);
   }
 
   private tickSprites(dt: number, camX: number, camZ: number): void {

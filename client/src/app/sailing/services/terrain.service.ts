@@ -1385,7 +1385,9 @@ export class TerrainService {
     material.AddUniform('uHazeColor',   'vec3',      null);   // aerial-perspective tint (= sky/fog colour)
     material.AddUniform('uCloudCoverage', 'float',   null);   // cloud-shadow strength (matches ocean)
     material.AddUniform('uSunDir',        'vec3',    null);   // unit vector toward the sun
-    material.AddUniform('uCloudTime',     'float',   null);   // drives cloud-shadow drift
+    material.AddUniform('uCloudTime',     'float',   null);   // (legacy) cloud-shadow drift clock
+    material.AddUniform('uCloudDrift',    'vec2',    null);   // real cloud wind drift (matches ocean)
+    material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
 
     // Peak height from config — used in shader to normalise vPositionW.y → [0,1]
     const peakH = manifest.targetPeakElevation ?? 920;
@@ -1733,18 +1735,18 @@ export class TerrainService {
       // Same projection + value-noise field + drift as ocean.service so shadows line
       // up across the shoreline. Applied to the lit colour, before the distance haze.
       if (uSunDir.y > 0.03 && uCloudCoverage > 0.02) {
-        vec2 cuv = (vPositionW.xz + uSunDir.xz / max(uSunDir.y, 0.2) * 900.0) * 0.004;
-        vec2 cdr = vec2(uCloudTime * 0.18, uCloudTime * 0.12);
-        vec2 i0 = floor(cuv + cdr);     vec2 f0 = fract(cuv + cdr);
-        vec2 i1 = floor(cuv*2.3 - cdr*1.7); vec2 f1 = fract(cuv*2.3 - cdr*1.7);
-        // hash-based value noise (matches ocean rVNoise character)
+        // Project up-sun to the REAL cloud base and sample the same value-noise field at the
+        // same scales + wind drift the ocean uses, so land & sea shadows line up across the
+        // shoreline and drift in sync with the actual clouds.
+        vec2 sp = vPositionW.xz + uSunDir.xz / max(uSunDir.y, 0.15) * uCloudBaseH + uCloudDrift;
         #define VCH(p) fract(sin(dot((p), vec2(127.1,311.7))) * 43758.5453)
-        f0 = f0*f0*(3.0-2.0*f0); f1 = f1*f1*(3.0-2.0*f1);
+        vec2 a0 = sp * 0.0013; vec2 i0 = floor(a0); vec2 f0 = fract(a0); f0 = f0*f0*(3.0-2.0*f0);
         float n0 = mix(mix(VCH(i0),VCH(i0+vec2(1.,0.)),f0.x), mix(VCH(i0+vec2(0.,1.)),VCH(i0+vec2(1.,1.)),f0.x), f0.y);
+        vec2 a1 = sp * 0.0037; vec2 i1 = floor(a1); vec2 f1 = fract(a1); f1 = f1*f1*(3.0-2.0*f1);
         float n1 = mix(mix(VCH(i1),VCH(i1+vec2(1.,0.)),f1.x), mix(VCH(i1+vec2(0.,1.)),VCH(i1+vec2(1.,1.)),f1.x), f1.y);
-        float cf = n0 * 0.6 + n1 * 0.4;
-        float cShadow = smoothstep(0.60 - uCloudCoverage * 0.45, 0.70 - uCloudCoverage * 0.30, cf);
-        cShadow *= uCloudCoverage * smoothstep(0.03, 0.18, uSunDir.y);
+        float cf = n0 * 0.65 + n1 * 0.35;
+        float cShadow = smoothstep(0.58 - uCloudCoverage * 0.45, 0.70 - uCloudCoverage * 0.30, cf);
+        cShadow *= smoothstep(0.05, 0.35, uCloudCoverage) * smoothstep(0.03, 0.18, uSunDir.y);
         color.rgb *= 1.0 - cShadow * 0.55;
       }
 
@@ -1771,6 +1773,11 @@ export class TerrainService {
       fx.setVector3('uSunDir', this.sceneService.getSunDirection());
       fx.setFloat('uCloudCoverage', this.oceanService.getCloudCoverage());
       fx.setFloat('uCloudTime', this.oceanService.getOceanTime());
+      // Real cloud drift + base, shared from the cloud plugin via the ocean, so terrain shadows
+      // sync to the actual clouds (and match the water exactly at the shoreline).
+      const csf = this.oceanService.getCloudShadowField();
+      fx.setFloat2('uCloudDrift', csf?.drift.x ?? 0, csf?.drift.y ?? 0);
+      fx.setFloat('uCloudBaseH', csf?.cloudBase ?? 900);
       fx.setTexture('uSandDiff',   sandTex);
       fx.setTexture('uGrassDiff',  grassTex);
       fx.setTexture('uGrass2Diff', grass2Tex);

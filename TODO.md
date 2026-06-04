@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* Add seaweed and reed coastal scattering
 * bloom lighting and improved sun ring?
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
 * dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)

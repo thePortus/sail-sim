@@ -6,8 +6,17 @@ Thumbs.db
 certbot/
 */coverage/
 
+# === Local secrets / env ===
+# Real keys live in .env (gitignored); .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
 # generated terrain files
 server/assets/terrain/
+
+# downloaded terrain source rasters (re-fetchable via npm run fetch:terrain-sources)
+server/assets/maps/sources/
 
 # user info
 server/seeders/import/**/*

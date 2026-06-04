@@ -67,6 +67,8 @@ export class TerrainService {
   private oceanService = inject(OceanService);
 
   private manifest: TerrainManifest | null = null;
+  /** Quantized value of the waterline (y = 0); 0 for legacy land-only manifests. See init(). */
+  private waterlineQ = 0;
   private heightfield: Uint16Array | null = null;
 
   // Computed once after chunk load; drives beach grading + underwater depth.
@@ -115,6 +117,11 @@ export class TerrainService {
       );
 
       this.manifest = manifest;
+      // Quantized waterline level (y = 0). For the signed unified field the waterline sits at a
+      // positive quantized value (minElevation < 0); legacy land-only manifests store ocean as 0.
+      this.waterlineQ = (manifest.minElevation != null && manifest.maxElevation != null)
+        ? Math.round(((0 - manifest.minElevation) / (manifest.maxElevation - manifest.minElevation)) * manifest.quantizationLevels)
+        : 0;
       this.heightfield = new Uint16Array(manifest.width * manifest.height);
       await this.loadAllChunks();
       // Grade beaches and compute coastal distance data while heightfield
@@ -191,6 +198,13 @@ export class TerrainService {
     const h1 = h01 + (h11 - h01) * tx;
     const hq = h0 + (h1 - h0) * tz;
 
+    // Signed unified field (real-data regions): decode across [minElevation, maxElevation] so the
+    // seabed (negative) and land (positive) share one continuous field. Legacy PNG manifests have no
+    // minElevation and decode land-only 0..targetPeakElevation.
+    const { minElevation, maxElevation } = this.manifest;
+    if (minElevation != null && maxElevation != null) {
+      return (hq / quantizationLevels) * (maxElevation - minElevation) + minElevation;
+    }
     return (hq / quantizationLevels) * targetPeakElevation;
   }
 
@@ -539,7 +553,9 @@ export class TerrainService {
     const hf = this.heightfield!;
     const px = Math.round(((wx - m.worldBounds.minX) / (m.worldBounds.maxX - m.worldBounds.minX)) * (m.width  - 1));
     const pz = Math.round(((m.worldBounds.maxZ - wz)  / (m.worldBounds.maxZ - m.worldBounds.minZ)) * (m.height - 1));
-    return hf[Math.max(0, Math.min(m.height - 1, pz)) * m.width + Math.max(0, Math.min(m.width - 1, px))] > 0;
+    // Land = quantized height strictly above the waterline (waterlineQ is 0 for legacy manifests, a
+    // positive level for the signed unified field).
+    return hf[Math.max(0, Math.min(m.height - 1, pz)) * m.width + Math.max(0, Math.min(m.width - 1, px))] > this.waterlineQ;
   }
 
   private updateShoreMap(): void {
@@ -1822,10 +1838,17 @@ export class TerrainService {
    * Returns the coast data structure consumed by buildTerrainMesh().
    */
   private applyCoastalGrading(): NonNullable<TerrainService['coastData']> {
-    const { width, height, worldBounds, quantizationLevels, targetPeakElevation } = this.manifest!;
+    const { width, height, worldBounds, quantizationLevels, targetPeakElevation, minElevation, maxElevation } = this.manifest!;
     const hf       = this.heightfield!;
     const n        = width * height;
     const cellSizeM = (worldBounds.maxX - worldBounds.minX) / (width - 1);
+
+    // Ocean test. Legacy PNG fields stored ocean as exactly 0. The signed unified field stores the
+    // waterline (y = 0) at a POSITIVE quantized value (since minElevation < 0), so a cell is ocean
+    // when its quantized height is at/below that waterline level.
+    const signed = minElevation != null && maxElevation != null;
+    const waterQ = signed ? Math.round(((0 - minElevation!) / (maxElevation! - minElevation!)) * quantizationLevels) : 0;
+    const isWater = (q: number) => (signed ? q <= waterQ : q === 0);
 
     // ── 1. Distance transforms ────────────────────────────────────────────────
     const MAX16  = 0xFFFF;
@@ -1833,8 +1856,8 @@ export class TerrainService {
     const distL  = new Uint16Array(n).fill(MAX16);   // water cell → nearest land
 
     for (let i = 0; i < n; i++) {
-      if (hf[i] === 0) distW[i] = 0;
-      else             distL[i] = 0;
+      if (isWater(hf[i])) distW[i] = 0;
+      else                distL[i] = 0;
     }
 
     // Forward pass (top-left → bottom-right)
@@ -1866,19 +1889,24 @@ export class TerrainService {
     //           slope ≈ BEACH_H / BEACH_M = 5/200 = 2.5 % — very walkable.
     // PROFILE:  exponent < 1 → concave curve: flat near water, gently rising
     //           inland.  A natural beach cross-section.
-    const BEACH_M   = 200;
-    const BEACH_H   = 5.0;
-    const PROFILE   = 0.55;
-    const beachCells = Math.ceil(BEACH_M / cellSizeM);
-    const maxBeachQ  = Math.round((BEACH_H / targetPeakElevation) * quantizationLevels);
+    // Signed real-data fields keep their true coastlines (cliffs, headlands) — the artificial sandy
+    // bevel was only needed for the old hand-drawn heightmap, and its land-only quantization math
+    // (0..targetPeakElevation) would corrupt the signed encoding. So skip it entirely when signed.
+    if (!signed) {
+      const BEACH_M   = 200;
+      const BEACH_H   = 5.0;
+      const PROFILE   = 0.55;
+      const beachCells = Math.ceil(BEACH_M / cellSizeM);
+      const maxBeachQ  = Math.round((BEACH_H / targetPeakElevation) * quantizationLevels);
 
-    for (let i = 0; i < n; i++) {
-      if (hf[i] === 0) continue;                     // skip ocean
-      const d = distW[i];
-      if (d >= beachCells) continue;                 // outside beach zone
-      const t   = d / beachCells;                    // 0 = waterline, 1 = inner edge
-      const cap = Math.round(Math.pow(t, PROFILE) * maxBeachQ);
-      if (hf[i] > cap) hf[i] = cap;
+      for (let i = 0; i < n; i++) {
+        if (hf[i] === 0) continue;                     // skip ocean
+        const d = distW[i];
+        if (d >= beachCells) continue;                 // outside beach zone
+        const t   = d / beachCells;                    // 0 = waterline, 1 = inner edge
+        const cap = Math.round(Math.pow(t, PROFILE) * maxBeachQ);
+        if (hf[i] > cap) hf[i] = cap;
+      }
     }
 
     // distW goes out of scope here and will be GC'd.
@@ -2013,6 +2041,11 @@ export class TerrainService {
     const cd = this.coastData;
     const m  = this.manifest;
     if (!cd || !m) return -2.2;
+
+    // Signed unified field: the seabed depth IS the elevation (it's already negative underwater), so
+    // there's no separate depth model — just return the real bathymetry. This collapses the mesh
+    // builder's land/sea split to a single source and retires the fake exponential depth LUT.
+    if (m.minElevation != null) return this.getElevation(worldX, worldZ);
 
     const { width, height, worldBounds } = m;
     const px  = Math.round(((worldX - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX)) * (width  - 1));

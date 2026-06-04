@@ -2,7 +2,17 @@
 
 const path = require('path');
 
+// Load the repo-root .env so host-run build scripts (e.g. the terrain source fetcher) pick up
+// OPENTOPO_API_KEY regardless of the directory they're launched from. Vars already present in the
+// environment (e.g. set by docker-compose) take precedence — dotenv never overrides them.
+require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
+
 module.exports = {
+  // ── External data sources ──────────────────────────────────────────────────
+  // OpenTopography API key for fetching Copernicus GLO-30 elevation tiles.
+  // Set it in the repo-root .env (copy from .env.example) — NOT here. Blank if unset.
+  openTopoApiKey: process.env.OPENTOPO_API_KEY || '',
+
   // Source grayscale elevation map image.
   // This must be a HEIGHT MAP (bright = high, dark = low / ocean).
   // Do NOT point this at a normal map — that will produce meaningless terrain.

@@ -19,6 +19,12 @@ Build the docker images
 docker compose up --build -d
 ```
 
+Download opentopo files for terrain generation
+
+```
+Edit .env.example, change it to .env.... and put in your opentopography.org API key (you have to sign up for an account)
+```
+
 Go into container, build terrain files and run server migrations
 
 ``` sh

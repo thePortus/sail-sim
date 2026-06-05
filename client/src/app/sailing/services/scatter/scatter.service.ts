@@ -113,6 +113,8 @@ export class ScatterService {
   private readonly _scaleV = new Vector3();
   private readonly _posV = new Vector3();
   private readonly _up = Vector3.UpReadOnly;
+  private readonly _q = new Quaternion();            // scratch — avoid per-instance allocation in build loops
+  private readonly _mat = new Matrix();
   private readonly _stride = new Float32Array(16);   // scratch for the instance shuffle
 
   // ── Tuning ──────────────────────────────────────────────────────────────────
@@ -285,6 +287,9 @@ export class ScatterService {
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
+      // Freeze: the wind animates via the plugin's bindForSubMesh (which still runs when frozen), so this
+      // just stops the per-submesh readiness re-checks across every palm patch clone — free CPU.
+      full.material.freeze();
 
       const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
       const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height);
@@ -317,6 +322,7 @@ export class ScatterService {
       new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
+      full.material.freeze();   // wind still animates (plugin bind runs when frozen); skips readiness re-checks
 
       const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
       const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h);
@@ -531,8 +537,9 @@ export class ScatterService {
   private compose(buf: Float32Array, idx: number, px: number, y: number, pz: number, sx: number, sy: number, sz: number): void {
     this._scaleV.set(sx, sy, sz);
     this._posV.set(px, y, pz);
-    Matrix.Compose(this._scaleV, Quaternion.RotationAxis(this._up, Math.random() * Math.PI * 2), this._posV)
-      .copyToArray(buf, idx * 16);
+    Quaternion.RotationAxisToRef(this._up, Math.random() * Math.PI * 2, this._q);
+    Matrix.ComposeToRef(this._scaleV, this._q, this._posV, this._mat);
+    this._mat.copyToArray(buf, idx * 16);
   }
 
   /** Slice the kept instances and shuffle them (matrix + optional colour in lockstep), so ANY prefix
@@ -591,8 +598,9 @@ export class ScatterService {
       const s = 0.7 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.9;   // ~0.7–1.6× clump scale
       scaleV.set(s, s, s);
       posV.set(px, y - 0.02, pz);
-      Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
-        .copyToArray(matTmp, kept * 16);
+      Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
+      Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
+      this._mat.copyToArray(matTmp, kept * 16);
       const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
       const ci = kept * 4;
       colTmp[ci]     = Math.max(0, c[0] + (hash2(px * 8.1, pz * 8.3) - 0.5) * 0.08);
@@ -725,11 +733,12 @@ export class ScatterService {
           base * (0.60 + hash2(px * 1.3, pz * 7.7) * 0.40),
           base * (0.85 + hash2(px * 3.7, pz * 9.1) * 0.35));
         posV.set(px, y - base * 0.1, pz);                  // settle slightly into the sand
-        const q = Quaternion.RotationYawPitchRoll(
+        Quaternion.RotationYawPitchRollToRef(
           hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
           (hash2(px * 2.3, pz * 5.1) - 0.5) * 0.5,
-          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.5);
-        Matrix.Compose(scaleV, q, posV).copyToArray(matTmp, kept * 16);
+          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.5, this._q);
+        Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
+        this._mat.copyToArray(matTmp, kept * 16);
 
         // Per-instance stone tint: pick a palette entry, jitter each channel (multiplies AO × albedo).
         const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
@@ -782,11 +791,12 @@ export class ScatterService {
           : 0.45 + hash2(px * 6.1 + 9, pz * 6.1 - 9) * 0.25;           // small twigs (0.45–0.7×)
         scaleV.set(s, s, s);
         posV.set(px, y - 0.03, pz);                          // settle into the sand
-        const q = Quaternion.RotationYawPitchRoll(
+        Quaternion.RotationYawPitchRollToRef(
           hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
           (hash2(px * 2.3, pz * 5.1) - 0.5) * 0.3,
-          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.3);
-        Matrix.Compose(scaleV, q, posV).copyToArray(matTmp, kept * 16);
+          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.3, this._q);
+        Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
+        this._mat.copyToArray(matTmp, kept * 16);
 
         const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
         const ci = kept * 4;
@@ -832,8 +842,9 @@ export class ScatterService {
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         posV.set(px, y - 0.1, pz);
-        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
-          .copyToArray(tmp, kept * 16);
+        Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
+        Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
+        this._mat.copyToArray(tmp, kept * 16);
         kept++;
       }
     }
@@ -872,8 +883,9 @@ export class ScatterService {
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         posV.set(px, y - 0.1, pz);
-        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
-          .copyToArray(tmp, kept * 16);
+        Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
+        Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
+        this._mat.copyToArray(tmp, kept * 16);
         kept++;
       }
     }

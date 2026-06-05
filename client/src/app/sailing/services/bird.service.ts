@@ -8,6 +8,7 @@ import { TerrainService } from './terrain.service';
 import { VesselService } from './vessel.service';
 import { MultiplayerService } from './multiplayer.service';
 import { SfxService } from './sfx.service';
+import { WeatherService } from './weather.service';
 import { BirdFlapPlugin } from './scatter/props/bird-flap.plugin';
 import { loadScatterGeometry, scatterTextureUrl } from './scatter/asset-loader';
 
@@ -79,6 +80,10 @@ export class BirdService {
   private vesselService  = inject(VesselService);
   private multiplayer    = inject(MultiplayerService);
   private sfx            = inject(SfxService);
+  private weather        = inject(WeatherService);
+
+  /** Birds tolerate fair weather + light drizzle; rain/storm drives them off (and silences their cries). */
+  private birdsWelcome = true;
 
   // Procedural gull-cry audio (Web Audio, routed through the shared SFX master → respects the SFX slider).
   private audioCtx: AudioContext | null = null;
@@ -104,6 +109,8 @@ export class BirdService {
   private readonly _scaleV = new Vector3();
   private readonly _posV = new Vector3();
   private readonly _up = Vector3.UpReadOnly;
+  private readonly _quat = new Quaternion();   // scratch — avoids a per-bird per-frame allocation
+  private readonly _mat = new Matrix();
 
   // ── Asset config ─────────────────────────────────────────────────────────────
   private static readonly VARIANTS = [
@@ -241,18 +248,32 @@ export class BirdService {
     if (!cam) { return; }
     const camX = cam.position.x, camZ = cam.position.z;
 
+    // Weather gate: gulls flee rain & storms (the heavier it blows, the faster they go). While they're
+    // unwelcome we stop spawning AND drive the existing flocks off, so the sky empties out before/during
+    // the squall and refills once it clears.
+    const storm = this.storminess();
+    this.birdsWelcome = storm < 0.35;
+
     // Recycle flocks that have drifted out of range.
     for (let i = this.flocks.length - 1; i >= 0; i--) {
       const f = this.flocks[i];
       if (Math.hypot(f.cx - camX, f.cz - camZ) > this.DESPAWN) { this.flocks.splice(i, 1); }
     }
-    // Top up toward maxFlocks at the wildlife tier's spawn RATE: at most one new flock per spawnInterval
-    // seconds, so flocks fade into the coastline gradually instead of all popping in at once.
-    this._spawnTimer += dt;
-    if (this.flocks.length < this.maxFlocks && this._spawnTimer >= this.spawnInterval) {
-      this._spawnTimer = 0;
-      const spot = this.findCoastalSpot(camX, camZ);
-      if (spot) { this.flocks.push(this.makeFlock(spot.x, spot.z)); }
+
+    if (this.birdsWelcome) {
+      // Top up toward maxFlocks at the wildlife tier's spawn RATE: at most one new flock per spawnInterval
+      // seconds, so flocks fade into the coastline gradually instead of all popping in at once.
+      this._spawnTimer += dt;
+      if (this.flocks.length < this.maxFlocks && this._spawnTimer >= this.spawnInterval) {
+        this._spawnTimer = 0;
+        const spot = this.findCoastalSpot(camX, camZ);
+        if (spot) { this.flocks.push(this.makeFlock(spot.x, spot.z)); }
+      }
+    } else {
+      // Bad weather: send every flock away. They take off (silently) and their orbit anchor drifts off
+      // from the camera, so they recede out of DESPAWN range and vanish — and aren't replaced.
+      const departSpeed = 4 + storm * 8;   // m/s; faster in heavier weather
+      for (const f of this.flocks) { this.departFlock(f, dt, departSpeed, camX, camZ); }
     }
 
     // Collect every ship position once (local + remote) for the startle checks.
@@ -333,6 +354,29 @@ export class BirdService {
     }
   }
 
+  // ── Weather departure ───────────────────────────────────────────────────────────
+
+  /** 0 (fair / light drizzle) → 1 (heavy storm). Rain & storms drive the gulls off; gales add to it. */
+  private storminess(): number {
+    const w = this.weather.weather();
+    if (!w) { return 0; }
+    const p = w.precipitation;
+    const wet = p === 'storm' ? 1 : p === 'rain' ? 0.7 : p === 'drizzle' ? 0.2 : 0;
+    const gale = Math.max(0, ((w.wind?.speed ?? 0) - 20) / 8);
+    return Math.min(1, Math.max(wet, gale));
+  }
+
+  /** Send a flock away: resting rafts take off (silently), then the orbit anchor drifts off from the
+   *  camera so the whole flock recedes out of range and is recycled — and not replaced while it's stormy. */
+  private departFlock(f: Flock, dt: number, speed: number, camX: number, camZ: number): void {
+    if (f.state === 'RESTING') { this.beginTakeoff(f); }
+    let ax = f.anchorX - camX, az = f.anchorZ - camZ;
+    const d = Math.hypot(ax, az) || 1;
+    f.anchorX += (ax / d) * speed * dt;
+    f.anchorZ += (az / d) * speed * dt;
+    f.cruiseAlt = Math.min(70, f.cruiseAlt + dt * 4);   // climb a little as they head off
+  }
+
   // ── Startle (ship approach + cannon fire) ───────────────────────────────────────
 
   /** Flatten every ship position (local player + remote vessels) into the scratch [x,z,…] array. */
@@ -359,7 +403,7 @@ export class BirdService {
     f.nearShipDist = minD;
     if (minD < this.IMMINENT_RADIUS || (closing && minD < this.STARTLE_RADIUS)) {
       this.beginTakeoff(f);
-      this.cryBurst(f);
+      if (this.birdsWelcome) { this.cryBurst(f); }   // no alarm calls once they're fleeing the weather
     }
   }
 
@@ -370,7 +414,7 @@ export class BirdService {
     for (const f of this.flocks) {
       if (f.state !== 'RESTING') { continue; }
       const dx = f.cx - x, dz = f.cz - z;
-      if (dx * dx + dz * dz <= r2) { this.beginTakeoff(f); this.cryBurst(f); }
+      if (dx * dx + dz * dz <= r2) { this.beginTakeoff(f); if (this.birdsWelcome) { this.cryBurst(f); } }
     }
   }
 
@@ -452,7 +496,7 @@ export class BirdService {
   /** Occasional relaxed call from the flock nearest the CAMERA (covers the zoomed-out, ship-far case). */
   private updateAmbientCalls(dt: number): void {
     const cam = this.sceneService.camera;
-    if (!cam || this.flocks.length === 0) { return; }
+    if (!cam || this.flocks.length === 0 || !this.birdsWelcome) { return; }   // silent once they're leaving
     this._ambientTimer -= dt;
     if (this._ambientTimer > 0) { return; }
     this._ambientTimer = 2.5 + Math.random() * 5;       // next relaxed call in a few seconds
@@ -524,8 +568,9 @@ export class BirdService {
 
     this._scaleV.set(m.scale, m.scale, m.scale);
     this._posV.set(wx, wy, wz);
-    Matrix.Compose(this._scaleV, Quaternion.RotationAxis(this._up, yaw), this._posV)
-      .copyToArray(this.matBufs[v], n * 16);
+    Quaternion.RotationAxisToRef(this._up, yaw, this._quat);
+    Matrix.ComposeToRef(this._scaleV, this._quat, this._posV, this._mat);
+    this._mat.copyToArray(this.matBufs[v], n * 16);
     const ci = n * 4;
     const t = m.tint;
     this.colBufs[v][ci] = t.r; this.colBufs[v][ci + 1] = t.g; this.colBufs[v][ci + 2] = t.b; this.colBufs[v][ci + 3] = 1;

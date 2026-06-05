@@ -2,8 +2,9 @@
 
 # General or Current TODO Items
 
+* add sound of canvas flapping in the wind
 * make sure asset scattering of non imposters actually follows landscape... noticing I only see rocks and driftwood right near waterline
-* clouds don't move so much as jitter
+* clouds don't seem to meet water at horizon.. not for spherical world?
 * AO problem still affects sails
 * check landscape hit detection... make sure balls don't go through land
 * switching from geometry to clip map raised all the shallows to super shallow on many different maps

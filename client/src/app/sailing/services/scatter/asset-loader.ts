@@ -1,5 +1,5 @@
 import {
-  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, PBRMaterial, Scene, SceneLoader,
+  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, Scene, SceneLoader,
   StandardMaterial, Texture,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
@@ -122,22 +122,23 @@ export function createCrossImpostor(scene: Scene, name: string, tex: Texture, wi
 }
 
 /**
- * Build the shared normal-mapped stone PBR material for the rocks. The rock GLBs are GEOMETRY-ONLY and
+ * Build the shared normal-mapped stone material for the rocks/driftwood. The GLBs are GEOMETRY-ONLY and
  * all share these two textures (neutral-gray albedo + tileable rocky normal), so we load them ONCE here
  * and assign this one material to every shape + LOD. Per-instance tint (thin-instance colour buffer)
  * multiplies on top of the baked-AO vertex colour, turning the neutral stone into granite/sandstone/etc.
+ *
+ * StandardMaterial — NOT PBR — because with the Atmosphere addon every PBR fragment does physical-sky +
+ * sun lighting, which is far too costly across the many rock/driftwood instances. Matte stone reads fine
+ * under StandardMaterial's simpler lighting, and it's a big GPU saving.
  */
-export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, normalFile: string): PBRMaterial {
-  const mat = new PBRMaterial(name, scene);
-  mat.albedoTexture = new Texture(scatterTextureUrl(albedoFile), scene);
-  mat.bumpTexture = new Texture(scatterTextureUrl(normalFile), scene, false, false);  // linear
-  mat.metallic = 0.0;
-  mat.roughness = 0.9;
-  mat.invertNormalMapY = false;   // OpenGL-convention normal map (green = +Y)
-  mat.invertNormalMapX = false;
+export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, normalFile: string): StandardMaterial {
+  const mat = new StandardMaterial(name, scene);
+  mat.diffuseTexture = new Texture(scatterTextureUrl(albedoFile), scene);
+  mat.bumpTexture = new Texture(scatterTextureUrl(normalFile), scene, false, false);   // linear normal map
+  mat.specularColor = new Color3(0.04, 0.04, 0.04);   // matte stone (no shiny highlight)
   // Rocks/driftwood never change → freeze so Babylon stops re-checking material readiness every frame for
   // each of the (many) patch submeshes. The effect still compiles on first render (the freeze only caches
-  // afterwards), and per-instance tint comes from the colour buffer, which freezing doesn't affect.
+  // afterwards); per-instance tint (colour buffer) + baked AO (vertex colour) both still apply.
   mat.freeze();
   return mat;
 }

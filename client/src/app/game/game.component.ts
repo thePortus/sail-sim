@@ -20,6 +20,7 @@ import { CloudService }       from '../sailing/services/cloud.service';
 import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
+import { DolphinService }      from '../sailing/services/dolphin.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -163,6 +164,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private oceanAudioService  = inject(OceanAudioService);
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
+  private dolphinService     = inject(DolphinService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -307,6 +309,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         // Coastal birds — flocks of gulls near land (rafts on the water + circling overhead). Own
         // service (they move, unlike static scatter). PERF DIAGNOSTIC: ?nobirds skips them.
         if (!location.search.includes('nobirds')) { await this.birdService.init(); }
+        // A single pod of dolphins that frolics around the boat. PERF DIAGNOSTIC: ?nodolphins skips it.
+        if (!location.search.includes('nodolphins')) { await this.dolphinService.init(); }
       });
 
       // 4. Fetch vessel
@@ -422,6 +426,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.musicService.dispose();
     this.cloudService.dispose();
     this.oceanAudioService.dispose();
+    this.dolphinService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();

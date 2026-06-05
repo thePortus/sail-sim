@@ -207,7 +207,12 @@ export class OceanFFTMaterial {
     // Raindrop ripples: one jittered drop per cell — a sharp central plip + an expanding ring
     // — whose gradient dimples the surface normal so the rain reads as impacts on the water.
     const rainFn = hasRain ? `
-      float _rvHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      // Wrap the cell coords into a small range BEFORE the sin: rp uses raw world XZ (±tens of
+      // thousands), at which magnitude float32 sin(dot(...)*43758) loses all precision and collapses
+      // to a few banded values — so every cell drew the SAME drop position, rate and phase (a uniform
+      // grid all rippling in lockstep). mod 512 keeps the sin argument precise; the pattern repeats
+      // every 512/2.2 ≈ 233 m, beyond the ~180 m rain radius, so the repeat is never visible.
+      float _rvHash(vec2 p){ p = mod(p, 512.0); return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
       float _rainField(vec2 p, float t){
         vec2 cell = floor(p);
         vec2 f = fract(p);

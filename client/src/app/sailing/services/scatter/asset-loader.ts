@@ -116,6 +116,7 @@ export function createCrossImpostor(scene: Scene, name: string, tex: Texture, wi
   mat.alphaCutOff = 0.4;
   mat.backFaceCulling = false;
   mat.useAlphaFromDiffuseTexture = true;
+  mat.freeze();                            // unlit, static impostor → no per-frame material re-checks
   merged.material = mat;
   return merged;
 }
@@ -134,6 +135,10 @@ export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, 
   mat.roughness = 0.9;
   mat.invertNormalMapY = false;   // OpenGL-convention normal map (green = +Y)
   mat.invertNormalMapX = false;
+  // Rocks/driftwood never change → freeze so Babylon stops re-checking material readiness every frame for
+  // each of the (many) patch submeshes. The effect still compiles on first render (the freeze only caches
+  // afterwards), and per-instance tint comes from the colour buffer, which freezing doesn't affect.
+  mat.freeze();
   return mat;
 }
 

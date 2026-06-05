@@ -210,6 +210,10 @@ export class BirdService {
       // copy per patch). We thin-instance the base mesh directly, so it MUST be visible to render.
       mesh.isVisible = true;
       mesh.alwaysSelectAsActiveMesh = true;   // birds roam far from origin — don't let origin-box culling drop them
+      // The world layers depth by rendering group (depth is cleared between groups). The boat, near ocean
+      // and remote ships are group 2; birds must share that group or the boat paints over gulls flying
+      // between it and the camera. Group 2 shares one depth buffer, so they sort against each other.
+      mesh.renderingGroupId = 2;
       this.matBufs[v] = new Float32Array(BirdService.MAX_PER_VARIANT * 16);
       this.colBufs[v] = new Float32Array(BirdService.MAX_PER_VARIANT * 4);
       mesh.thinInstanceSetBuffer('matrix', this.matBufs[v], 16, false);

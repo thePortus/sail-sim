@@ -50,6 +50,13 @@ export class ThinInstancePatch implements IPatch {
     // frustum can cull it when it's off-screen — essential for perf, since otherwise the whole 360°
     // ring of patches around the camera draws every frame (only a ~90° wedge is ever visible).
     this.baseMesh.thinInstanceRefreshBoundingInfo(true);
+
+    // A patch never moves once placed: its instances live at fixed world positions and the base mesh
+    // itself stays at the origin. So skip the per-frame world-matrix recompute and bounding-info sync, and
+    // take it out of picking — pure CPU savings across the hundreds of live patch meshes, no visual change.
+    this.baseMesh.isPickable = false;
+    this.baseMesh.doNotSyncBoundingInfo = true;
+    this.baseMesh.freezeWorldMatrix();
   }
 
   getNbInstances(): number {

@@ -715,6 +715,32 @@ export class OceanFFTMaterial {
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
       #endif
+      #ifdef HAS_REFRACTION
+        // Faint hull hint in DEEP water. The reveal above only fires in the shallows (it keys on seabed
+        // depth), so over open water the surface fully hides submerged hulls. Blend the water toward
+        // min(water, refraction) in a small disc around each boat: the refraction RTT contains the
+        // hulls, and min() only ever DARKENS — so a dark submerged hull shows through a little while the
+        // surrounding open water (brighter refraction) is left untouched, with no boat-shaped halo.
+        // Applied AFTER reflection so the glint doesn't wash it out; distFade keeps it near the camera.
+        // KNOBS: 6/14 = disc inner/outer radius (m), 0.6 = how strongly the hull shows.
+        float hullHint = 0.0;
+        #ifdef HAS_BOATSHADOWS
+          // Every boat (local is index 0, remotes follow) — _BoatShadowData[i].xy is its world x,z.
+          for (int hbi = 0; hbi < 8; hbi++) {
+            if (float(hbi) >= _BoatShadowCount) break;
+            float hd = length(vWorldUV - _BoatShadowData[hbi].xy);
+            hullHint = max(hullHint, 1.0 - smoothstep(6.0, 14.0, hd));
+          }
+        #else
+          // Fallback when boat shadows are off: local boat only, hull-oriented ellipse via _BoatPos/Dir.
+          vec2  hf = normalize(_BoatDir + vec2(1e-5, 0.0));
+          vec2  hr = vec2(hf.y, -hf.x);
+          vec2  hb = vWorldUV - _BoatPos;
+          hullHint = 1.0 - smoothstep(0.5, 1.0, length(vec2(dot(hb, hf) / 12.0, dot(hb, hr) / 4.0)));
+        #endif
+        hullHint *= distFade * (1.0 - reveal);
+        waterCol = mix(waterCol, min(waterCol, refr), hullHint * 0.6);
+      #endif
       finalEmissive = mix(waterCol, vec3(0.0), jacobian);
       #ifdef HAS_FLASH
         // Warm muzzle-flash glow on the sea — added on top (lights foam too) so a broadside

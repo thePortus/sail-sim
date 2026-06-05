@@ -1,10 +1,13 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  Color3, Material, Matrix, Mesh, Observer, PBRMaterial, Quaternion, Scene, Texture, Vector3,
+  Color3, Material, Matrix, Mesh, Observer, Quaternion, Scene, StandardMaterial, Texture, Vector3,
 } from '@babylonjs/core';
 import '@babylonjs/core/Meshes/thinInstanceMesh';
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
+import { VesselService } from './vessel.service';
+import { MultiplayerService } from './multiplayer.service';
+import { SfxService } from './sfx.service';
 import { BirdFlapPlugin } from './scatter/props/bird-flap.plugin';
 import { loadScatterGeometry, scatterTextureUrl } from './scatter/asset-loader';
 
@@ -54,6 +57,7 @@ interface Flock {
   cruiseAlt: number;                             // target flying altitude (m)
   orbitR: number; orbitAng: number; orbitW: number;  // orbit radius, angle, angular speed (rad/s)
   driftX: number; driftZ: number;                // RESTING: slow surface drift (m/s)
+  nearShipDist: number;                          // nearest-ship distance last frame (−1 = re-initialise)
   members: Member[];
 }
 
@@ -72,6 +76,15 @@ function lerpAngle(a: number, b: number, t: number): number {
 export class BirdService {
   private sceneService   = inject(SceneService);
   private terrainService = inject(TerrainService);
+  private vesselService  = inject(VesselService);
+  private multiplayer    = inject(MultiplayerService);
+  private sfx            = inject(SfxService);
+
+  // Procedural gull-cry audio (Web Audio, routed through the shared SFX master → respects the SFX slider).
+  private audioCtx: AudioContext | null = null;
+  private audioMaster: GainNode | null = null;
+  private _ambientTimer = 1.5;          // countdown to the next relaxed ambient call
+  private readonly AUDIBLE = 320;       // metres a cry carries (distance attenuation range)
 
   private enabled = false;
   private loaded = false;                 // base meshes successfully loaded
@@ -134,6 +147,13 @@ export class BirdService {
   private readonly GROUND_CLEARANCE = 9; // min metres an airborne bird stays above the land beneath it
   private readonly TAKEOFF_TIME = 2.6;  // seconds to climb from water to cruise
   private readonly LAND_TIME = 3.4;     // seconds to descend back to the water (gentler than takeoff)
+  // Startle: a resting raft flushes when a ship APPROACHES within STARTLE_RADIUS (closing distance — a
+  // ship merely parked nearby is tolerated, so gulls happily settle beside an idle boat), OR when any
+  // ship comes within IMMINENT_RADIUS (driving right onto them), OR a cannon fires within CANNON_RADIUS.
+  private readonly STARTLE_RADIUS = 65;
+  private readonly IMMINENT_RADIUS = 26;
+  private readonly CANNON_RADIUS = 130;
+  private readonly _shipXZ: number[] = [];   // scratch: flattened [x,z,x,z,…] ship positions this frame
 
   /** Current wildlife level (0 Off … 4 Ultra) — for the settings slider. */
   getWildlifeQuality(): number { return this._quality; }
@@ -166,14 +186,16 @@ export class BirdService {
     const cam = this.sceneService.camera;
     if (!scene || !cam) { return; }
 
-    // One shared atlas texture; one PBR material per variant (so each can carry its own flap ampScale).
+    // One shared atlas texture; one matte StandardMaterial per variant (so each can carry its own flap
+    // ampScale). StandardMaterial — NOT PBR — because with the Atmosphere addon active every PBR fragment
+    // does physical-sky + sun lighting; far too costly for hundreds of small, double-sided bird cards.
     const atlas = new Texture(scatterTextureUrl('bird_atlas.png'), scene);
     for (let v = 0; v < BirdService.VARIANTS.length; v++) {
       const cfg = BirdService.VARIANTS[v];
-      const mat = new PBRMaterial(`scatter_bird_${v}_mat`, scene);
-      mat.albedoTexture = atlas;
-      mat.metallic = 0.0;
-      mat.roughness = 0.62;
+      const mat = new StandardMaterial(`scatter_bird_${v}_mat`, scene);
+      mat.diffuseTexture = atlas;
+      mat.specularColor = new Color3(0, 0, 0);          // matte feathers (no shiny highlight)
+      mat.emissiveColor = new Color3(0.16, 0.17, 0.19); // lift the shaded undersides off pure black
       mat.backFaceCulling = false;     // thin wing cards
       mat.twoSidedLighting = true;     // shade wing undersides (no black backs)
       new BirdFlapPlugin(mat, { ampScale: cfg.ampScale });
@@ -229,10 +251,14 @@ export class BirdService {
       if (spot) { this.flocks.push(this.makeFlock(spot.x, spot.z)); }
     }
 
+    // Collect every ship position once (local + remote) for the startle checks.
+    const ships = this.gatherShips();
+
     // Advance each flock, then write its members into the per-variant thin-instance buffers.
     const counts = [0, 0, 0];
     for (const f of this.flocks) {
       this.advanceFlock(f, dt);
+      if (f.state === 'RESTING') { this.checkShipStartle(f, ships); }
       if (f.state === 'RESTING') { this.updateRestPoses(f, dt); }
       for (const m of f.members) { this.writeBird(f, m, counts); }
     }
@@ -245,6 +271,8 @@ export class BirdService {
         mesh.thinInstanceBufferUpdated('color');
       }
     }
+
+    this.updateAmbientCalls(dt);
   }
 
   /** Advance the flock's state machine + centre. RESTING drifts on the water; TAKEOFF/LANDING ramp the
@@ -272,9 +300,11 @@ export class BirdService {
         f.lift = Math.max(0, f.lift - dt / this.LAND_TIME);
         this.orbit(f, dt);
         if (f.lift <= 0) {
-          // Settle: resume drifting from wherever the spiral set down, and rest a while.
+          // Settle: resume drifting from wherever the spiral set down, and rest a while. Re-initialise the
+          // approach detector (−1) so a ship that's merely parked nearby doesn't read as "closing" and
+          // immediately flush a raft that deliberately landed beside it.
           f.state = 'RESTING'; f.stateTimer = 0; f.dwell = 9 + Math.random() * 14;
-          f.cx = f.anchorX; f.cz = f.anchorZ;
+          f.cx = f.anchorX; f.cz = f.anchorZ; f.nearShipDist = -1;
         }
         break;
     }
@@ -296,6 +326,145 @@ export class BirdService {
       } else {
         m.restTimer = 4 + Math.random() * 10;   // keep sitting folded
       }
+    }
+  }
+
+  // ── Startle (ship approach + cannon fire) ───────────────────────────────────────
+
+  /** Flatten every ship position (local player + remote vessels) into the scratch [x,z,…] array. */
+  private gatherShips(): number[] {
+    const out = this._shipXZ;
+    out.length = 0;
+    const me = this.vesselService.state();
+    if (me) { out.push(me.x, me.z); }
+    for (const r of this.multiplayer.getVesselWakeSources()) { out.push(r.x, r.z); }
+    return out;
+  }
+
+  /** Flush a resting raft when a ship APPROACHES (distance closing) within STARTLE_RADIUS, or any ship is
+   *  within IMMINENT_RADIUS. A ship merely sitting nearby doesn't qualify (no closing), so gulls tolerate
+   *  an idle boat — but one bearing down on them takes off. */
+  private checkShipStartle(f: Flock, ships: number[]): void {
+    let minD = Infinity;
+    for (let i = 0; i < ships.length; i += 2) {
+      const d = Math.hypot(ships[i] - f.cx, ships[i + 1] - f.cz);
+      if (d < minD) { minD = d; }
+    }
+    if (f.nearShipDist < 0) { f.nearShipDist = minD; return; }   // freshly settled/spawned: just sample
+    const closing = minD < f.nearShipDist - 0.3;                 // distance shrinking (ship coming at them)
+    f.nearShipDist = minD;
+    if (minD < this.IMMINENT_RADIUS || (closing && minD < this.STARTLE_RADIUS)) {
+      this.beginTakeoff(f);
+      this.cryBurst(f);
+    }
+  }
+
+  /** Public startle: flush every resting raft within `radius` of (x,z) — e.g. a cannon going off. */
+  startleAt(x: number, z: number, radius = this.CANNON_RADIUS): void {
+    if (!this.enabled) { return; }
+    const r2 = radius * radius;
+    for (const f of this.flocks) {
+      if (f.state !== 'RESTING') { continue; }
+      const dx = f.cx - x, dz = f.cz - z;
+      if (dx * dx + dz * dz <= r2) { this.beginTakeoff(f); this.cryBurst(f); }
+    }
+  }
+
+  // ── Gull-cry audio ───────────────────────────────────────────────────────────
+
+  /** Lazily create the audio context + SFX-master routing (on first cry, after the user gesture). */
+  private ensureAudio(): boolean {
+    if (this.audioCtx) { return true; }
+    try {
+      this.audioCtx = new AudioContext();
+      this.audioMaster = this.sfx.createMaster(this.audioCtx);
+      if (this.audioCtx.state === 'suspended') { void this.audioCtx.resume(); }
+      return true;
+    } catch { this.audioCtx = null; return false; }
+  }
+
+  /** Distance falloff for a cry heard from the camera (0 beyond AUDIBLE, → 1 up close). */
+  private gainForDistance(d: number): number {
+    if (d >= this.AUDIBLE) { return 0; }
+    const t = 1 - d / this.AUDIBLE;
+    return t * t;
+  }
+
+  /** Play one synthesized gull cry at a world position: a reedy band-passed sawtooth with a rising→falling
+   *  pitch contour and a fast tremolo "laugh", attenuated + panned by the camera. */
+  private playCry(wx: number, wy: number, wz: number, level: number, pitch: number, delay = 0): void {
+    if (!this.ensureAudio()) { return; }
+    const cam = this.sceneService.camera;
+    if (!cam) { return; }
+    const ctx = this.audioCtx!, master = this.audioMaster!;
+    const d = Math.hypot(cam.position.x - wx, cam.position.y - wy, cam.position.z - wz);
+    const gain = this.gainForDistance(d) * level;
+    if (gain < 0.012) { return; }                       // inaudible → don't build nodes
+
+    // Pan by the source's left/right position in camera (view) space.
+    const view = cam.getViewMatrix();
+    const vx = wx * view.m[0] + wy * view.m[4] + wz * view.m[8]  + view.m[12];
+    const vz = wx * view.m[2] + wy * view.m[6] + wz * view.m[10] + view.m[14];
+    const pan = Math.max(-1, Math.min(1, vx / Math.max(8, Math.abs(vz))));
+
+    const t0 = ctx.currentTime + delay;
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(pitch * 0.95, t0);
+    osc.frequency.linearRampToValueAtTime(pitch * 1.22, t0 + 0.07);
+    osc.frequency.linearRampToValueAtTime(pitch * 0.80, t0 + 0.34);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = pitch * 1.8; bp.Q.value = 3.5;
+
+    const trem = ctx.createGain(); trem.gain.value = 0.7;
+    const lfo = ctx.createOscillator(); lfo.type = 'square'; lfo.frequency.value = 12 + Math.random() * 7;
+    const lfoDepth = ctx.createGain(); lfoDepth.gain.value = 0.3;
+    lfo.connect(lfoDepth).connect(trem.gain);
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, t0);
+    env.gain.linearRampToValueAtTime(gain, t0 + 0.02);
+    env.gain.exponentialRampToValueAtTime(Math.max(0.0008, gain * 0.5), t0 + 0.18);
+    env.gain.exponentialRampToValueAtTime(0.0006, t0 + 0.42);
+
+    const panner = ctx.createStereoPanner(); panner.pan.value = pan;
+    osc.connect(bp).connect(trem).connect(env).connect(panner).connect(master);
+    osc.start(t0); lfo.start(t0);
+    osc.stop(t0 + 0.48); lfo.stop(t0 + 0.48);
+  }
+
+  /** A flurry of cries from a startled raft — numerous gulls at varied pitches + small time offsets. */
+  private cryBurst(f: Flock): void {
+    const n = 5 + Math.floor(Math.random() * 8);        // 5–12 cries
+    for (let i = 0; i < n; i++) {
+      const jx = f.cx + (Math.random() - 0.5) * 22;
+      const jz = f.cz + (Math.random() - 0.5) * 22;
+      const pitch = 760 + Math.random() * 620;          // varied pitches
+      this.playCry(jx, 1.5, jz, 0.5 + Math.random() * 0.4, pitch, Math.random() * 1.3);
+    }
+  }
+
+  /** Occasional relaxed call from the flock nearest the CAMERA (covers the zoomed-out, ship-far case). */
+  private updateAmbientCalls(dt: number): void {
+    const cam = this.sceneService.camera;
+    if (!cam || this.flocks.length === 0) { return; }
+    this._ambientTimer -= dt;
+    if (this._ambientTimer > 0) { return; }
+    this._ambientTimer = 2.5 + Math.random() * 5;       // next relaxed call in a few seconds
+
+    // Nearest flock to the camera.
+    let best: Flock | null = null, bestD = Infinity;
+    for (const f of this.flocks) {
+      const d = Math.hypot(cam.position.x - f.cx, cam.position.z - f.cz);
+      if (d < bestD) { bestD = d; best = f; }
+    }
+    if (!best || bestD > this.AUDIBLE * 0.85) { return; }
+    const calls = Math.random() < 0.3 ? 2 : 1;          // usually a lone call, sometimes a pair
+    for (let i = 0; i < calls; i++) {
+      const jx = best.cx + (Math.random() - 0.5) * 18;
+      const jz = best.cz + (Math.random() - 0.5) * 18;
+      this.playCry(jx, best.cy + 1, jz, 0.28 + Math.random() * 0.22, 780 + Math.random() * 560, i * 0.35);
     }
   }
 
@@ -343,10 +512,10 @@ export class BirdService {
       const ground = this.terrainService.getElevation(wx, wz);
       if (ground > 0.5) { wy = Math.max(wy, ground + this.GROUND_CLEARANCE); }
     }
-    // Babylon's RotationY sends local +X (the gull's nose) to (cos, −sin) in world space, so the facing
-    // yaw is the NEGATED travel heading (the formation-offset rotation above already matches this). A
-    // small symmetric per-bird jitter keeps the flock from facing in perfect lockstep.
-    const flyYaw = -f.heading + Math.sin(m.yaw) * 0.12;
+    // Facing: Babylon's RotationY sends local +X to (cos, −sin), so the travel heading negates (fixes the
+    // handedness). The baked gull model actually noses along −X (wings are ±Z), so add π to point the beak
+    // — not the tail — along the path. A small symmetric per-bird jitter avoids perfect lockstep.
+    const flyYaw = -f.heading + Math.PI + Math.sin(m.yaw) * 0.12;
     const yaw = lerpAngle(m.yaw, flyYaw, lift);
 
     this._scaleV.set(m.scale, m.scale, m.scale);
@@ -396,6 +565,7 @@ export class BirdService {
       orbitAng: Math.random() * Math.PI * 2,
       orbitW: (Math.random() < 0.5 ? 1 : -1) * (0.12 + Math.random() * 0.10),  // rad/s
       driftX: Math.cos(dang) * drift, driftZ: Math.sin(dang) * drift,
+      nearShipDist: -1,
       members,
     };
   }
@@ -434,5 +604,7 @@ export class BirdService {
     this.meshes = []; this.materials = []; this.matBufs = []; this.colBufs = [];
     this.flocks = [];
     this.enabled = false;
+    if (this.audioMaster) { this.sfx.releaseMaster(this.audioMaster); this.audioMaster = null; }
+    if (this.audioCtx) { void this.audioCtx.close(); this.audioCtx = null; }
   }
 }

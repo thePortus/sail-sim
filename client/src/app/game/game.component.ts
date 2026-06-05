@@ -17,6 +17,7 @@ import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
+import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
@@ -159,6 +160,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
+  private oceanAudioService  = inject(OceanAudioService);
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
   private multiplayerService = inject(MultiplayerService);
@@ -289,6 +291,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.oceanFftRenderer.init();
         // PERF DIAGNOSTIC: ?noclouds skips the volumetric clouds (raymarch) to isolate their cost.
         if (!location.search.includes('noclouds')) { this.cloudService.init(); }
+        // Weather-driven ambient sea bed (filtered-noise wash + whitecap hiss).
+        this.oceanAudioService.init();
       });
 
       // 3. Load terrain
@@ -417,6 +421,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cannonService.dispose();
     this.musicService.dispose();
     this.cloudService.dispose();
+    this.oceanAudioService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();

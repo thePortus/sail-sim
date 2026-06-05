@@ -17,7 +17,7 @@
 
 import {
   Scene, Camera, PostProcess, Effect, Texture, RawTexture,
-  Vector2, Vector3, Matrix, Constants,
+  Vector2, Vector3, Vector4, Matrix, Constants,
 } from '@babylonjs/core';
 import { ShaderStore } from '@babylonjs/core/Engines/shaderStore';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
@@ -53,6 +53,14 @@ uniform sampler2D weatherSampler;
 // Linear depth map from Babylon's DepthRenderer (same camera).
 // Stores (eyeZ - nearZ) / (farZ - nearZ) in the R channel.
 uniform sampler2D depthSampler;
+
+// Terrain heightfield (R32F metres) for cloud-vs-mountain occlusion — marched directly along the ray
+// (the depth renderer can't see the clipmap's vertex displacement). bounds = (minX, minZ, sizeX, sizeZ).
+uniform sampler2D terrainHeightSampler;
+uniform vec4  terrainBounds;
+uniform vec2  terrainTexSize;
+uniform float terrainMaxAlt;
+uniform float terrainHasField;
 
 // Camera.
 uniform mat4  invViewProjection;
@@ -344,6 +352,38 @@ void main(void) {
         tFar = min(tFar, geoT);
     }
 
+    // Terrain occlusion: march the heightfield along the ray and ask "is a mountain in the way?".
+    // If terrain rises above the ray before the cloud, clip the slab to it (or skip the cloud).
+    // Bounded: stop once an ascending ray climbs above the tallest terrain. texelFetch (nearest) —
+    // the R32F heightfield isn't hardware-filterable on WebGPU.
+    if (terrainHasField > 0.5) {
+        float tt = 1.0;
+        for (int it = 0; it < 160; it++) {
+            vec3 pT = cameraPosition + rd * tt;
+            if ((pT.y > terrainMaxAlt + 5.0 && rd.y >= 0.0) || tt > tFar) break;
+            // Bilinear terrain height (smooths the 24 m texels → no blocky silhouette).
+            vec2 uvT = vec2((pT.x - terrainBounds.x) / terrainBounds.z,
+                            (terrainBounds.y + terrainBounds.w - pT.z) / terrainBounds.w);
+            float hT = -1.0e4;
+            if (uvT.x >= 0.0 && uvT.x <= 1.0 && uvT.y >= 0.0 && uvT.y <= 1.0) {
+                vec2 tc = uvT * terrainTexSize - 0.5; vec2 fr = fract(tc);
+                ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(terrainTexSize) - 1;
+                float h00 = texelFetch(terrainHeightSampler, clamp(i0,            ivec2(0), mx), 0).r;
+                float h10 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+                float h01 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+                float h11 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+                hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
+            }
+            float gap = pT.y - hT;                                  // clearance above the terrain
+            if (gap < 1.0) {                                        // grazed/hit the surface
+                if (tt <= tNear) { gl_FragColor = scene; return; }
+                tFar = min(tFar, tt);
+                break;
+            }
+            tt += max(25.0, gap * 0.5);                             // sphere-trace: step ∝ clearance
+        }
+    }
+
     // Ray march.
     float dist = max(tFar - tNear, 0.0);
     float step = dist / float(marchSteps);
@@ -467,8 +507,16 @@ var weatherSampler: texture_2d<f32>;
 var depthSamplerSampler: sampler;
 var depthSampler: texture_2d<f32>;
 
+// Terrain heightfield (R32F metres) for cloud-vs-mountain occlusion (marched along the ray).
+var terrainHeightSamplerSampler: sampler;
+var terrainHeightSampler: texture_2d<f32>;
+
 uniform invViewProjection: mat4x4f;
 uniform cameraPosition: vec3f;
+uniform terrainBounds: vec4f;
+uniform terrainTexSize: vec2f;
+uniform terrainMaxAlt: f32;
+uniform terrainHasField: f32;
 uniform cameraForward: vec3f;
 uniform sunDirection: vec3f;
 uniform sunColor: vec3f;
@@ -697,6 +745,37 @@ fn main(input: FragmentInputs)->FragmentOutputs {
         tFar = min(tFar, geoT);
     }
 
+    // Terrain occlusion: march the heightfield along the ray — clip the cloud where a mountain blocks
+    // it (the depth renderer can't see the clipmap's vertex displacement). textureLoad (nearest).
+    if (uniforms.terrainHasField > 0.5) {
+        var tt: f32 = 1.0;
+        for (var it: i32 = 0; it < 160; it = it + 1) {
+            let pT = uniforms.cameraPosition + rd * tt;
+            if ((pT.y > uniforms.terrainMaxAlt + 5.0 && rd.y >= 0.0) || tt > tFar) { break; }
+            let uvT = vec2f((pT.x - uniforms.terrainBounds.x) / uniforms.terrainBounds.z,
+                            (uniforms.terrainBounds.y + uniforms.terrainBounds.w - pT.z) / uniforms.terrainBounds.w);
+            var hT: f32 = -1.0e4;
+            if (uvT.x >= 0.0 && uvT.x <= 1.0 && uvT.y >= 0.0 && uvT.y <= 1.0) {
+                let tc = uvT * uniforms.terrainTexSize - vec2f(0.5);
+                let fr = fract(tc);
+                let i0 = vec2<i32>(floor(tc));
+                let mx = vec2<i32>(uniforms.terrainTexSize) - vec2<i32>(1, 1);
+                let h00 = textureLoad(terrainHeightSampler, clamp(i0,                  vec2<i32>(0), mx), 0).r;
+                let h10 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), mx), 0).r;
+                let h01 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), mx), 0).r;
+                let h11 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), mx), 0).r;
+                hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
+            }
+            let gap = pT.y - hT;
+            if (gap < 1.0) {
+                if (tt <= tNear) { fragmentOutputs.color = scene_color; return fragmentOutputs; }
+                tFar = min(tFar, tt);
+                break;
+            }
+            tt = tt + max(25.0, gap * 0.5);
+        }
+    }
+
     let dist      = max(tFar - tNear, 0.0);
     let step_size = dist / f32(uniforms.marchSteps);
 
@@ -855,6 +934,7 @@ export class VolumetricCloudsPlugin {
   private noisePlaceholder:   RawTexture | null = null;
   private weatherPlaceholder: RawTexture | null = null;
   private depthPlaceholder:   RawTexture | null = null;
+  private terrainPlaceholder: RawTexture | null = null;
 
   // Babylon.js DepthRenderer: stores linear (eye-Z) depth for the scene camera.
   private depthRenderer: DepthRenderer | null = null;
@@ -932,6 +1012,14 @@ export class VolumetricCloudsPlugin {
       this.scene, false, false,
       Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE,
     );
+
+    // Terrain height: a deep negative value (R32F) so the placeholder never registers a hit until the
+    // real heightfield is published. Must be FLOAT to match the terrain texture's textureLoad type.
+    this.terrainPlaceholder = new RawTexture(
+      new Float32Array([-1.0e4]), 1, 1, Constants.TEXTUREFORMAT_R,
+      this.scene, false, false,
+      Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,
+    );
   }
 
   /**
@@ -976,8 +1064,9 @@ export class VolumetricCloudsPlugin {
         'time', 'windDir', 'windSpeed',
         'nearZ', 'farZ', 'marchSteps', 'lightSteps',
         'noiseSliceDim', 'noiseDepth', 'atlasW', 'atlasH', 'atlasCols',
+        'terrainBounds', 'terrainTexSize', 'terrainMaxAlt', 'terrainHasField',
       ],
-      /* samplers */ ['noiseSampler', 'weatherSampler', 'depthSampler'],
+      /* samplers */ ['noiseSampler', 'weatherSampler', 'depthSampler', 'terrainHeightSampler'],
       /* scale    */ renderScale,
       /* camera   */ this.camera,
       /* samplingMode */ undefined,
@@ -1138,6 +1227,23 @@ export class VolumetricCloudsPlugin {
       'depthSampler',
       depthMap?.isReady() ? depthMap : this.depthPlaceholder,
     );
+
+    // Terrain heightfield (published by TerrainService via scene.metadata) for cloud-vs-mountain
+    // occlusion. Fall back to the deep-negative placeholder (= never occludes) until it's ready.
+    const thf = (this.scene.metadata as { terrainHeightField?: {
+      tex: Texture; bounds: Vector4; texSize: Vector2; maxAlt: number } } | null)?.terrainHeightField;
+    const haveTerrain = !!(thf && thf.tex?.isReady());
+    effect.setTexture('terrainHeightSampler', haveTerrain ? thf!.tex : this.terrainPlaceholder);
+    effect.setFloat('terrainHasField', haveTerrain ? 1 : 0);
+    if (haveTerrain) {
+      effect.setVector4('terrainBounds', thf!.bounds);
+      effect.setVector2('terrainTexSize', thf!.texSize);
+      effect.setFloat('terrainMaxAlt', thf!.maxAlt);
+    } else {
+      effect.setVector4('terrainBounds', new Vector4(0, 0, 1, 1));
+      effect.setVector2('terrainTexSize', new Vector2(1, 1));
+      effect.setFloat('terrainMaxAlt', 0);
+    }
   }
 
   // ── Texture loading ───────────────────────────────────────────────────────
@@ -1340,5 +1446,6 @@ export class VolumetricCloudsPlugin {
     this.noisePlaceholder?.dispose();   this.noisePlaceholder   = null;
     this.weatherPlaceholder?.dispose(); this.weatherPlaceholder = null;
     this.depthPlaceholder?.dispose();   this.depthPlaceholder   = null;
+    this.terrainPlaceholder?.dispose(); this.terrainPlaceholder = null;
   }
 }

@@ -9,6 +9,7 @@
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
+* introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
 * dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)
 * add back in butterfly scattering?

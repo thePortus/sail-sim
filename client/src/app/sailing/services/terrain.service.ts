@@ -162,6 +162,15 @@ export class TerrainService {
     const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode: GPU displace + Sobel normals
     mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
 
+    // Publish the heightfield so the volumetric clouds can march it for terrain occlusion (the clipmap
+    // displaces in the vertex shader, which the depth renderers can't see → clouds need the heights).
+    // Brokered via scene.metadata so neither service has to depend on the other.
+    const meta = (scene.metadata = scene.metadata || {});
+    meta.terrainHeightField = this.clipHeightTex ? {
+      tex: this.clipHeightTex, bounds: this.clipWBounds, texSize: this.clipTexSize,
+      maxAlt: m.maxElevation ?? m.targetPeakElevation,
+    } : null;
+
     this.clipmap = new TerrainClipmap(cam, scene);
     this.clipmap.setMaterial(mat);
     this.clipmap.initializeMeshes();
@@ -173,6 +182,7 @@ export class TerrainService {
       this.oceanService.addToRenderList(cm);
       this.sceneService.excludeFromGlow(cm);
     }
+
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
   }
 

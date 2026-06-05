@@ -114,13 +114,22 @@ export class OceanFFTMaterial {
     mat.AddUniform('_Time', 'float', 0);
     mat.AddUniform('_CameraData', 'vec4', new Vector4(camera.minZ, camera.maxZ, camera.maxZ - camera.minZ, 0));
     mat.AddUniform('_FoamTexture', 'sampler2D', this._foamTexture);
-    if (this._deps.depthTexture) {
-      mat.AddUniform('_CameraDepthTexture', 'sampler2D', this._deps.depthTexture);
-    }
+    // NOTE: the scene depth map (_CameraDepthTexture) was removed — Metal caps a fragment stage at 16
+    // samplers and the ocean was at the limit. Contact foam + the seabed reveal now both read the TRUE
+    // seabed depth from the terrain heightfield (_TerrainHeightTex, below) via _seabedWaterDepth(), so
+    // the depth map is no longer needed (it rendered the displaced clipmap flat anyway).
     // Depth-based transparency reach: how far (metres of through-water path) you can see down into the
     // water before it reads fully opaque. Drives the unified seabed/hull reveal (replaces the old
     // coastal-proximity ramp + boat oval). ~8 m ≈ 26 ft of visibility.
     mat.AddUniform('_SeeDepth', 'float', 8.0);
+    // Terrain heightfield (R32F metres, published by TerrainService via scene.metadata) — gives the
+    // TRUE seabed depth per water fragment. The clipmap displaces in its vertex shader, which the
+    // depth renderer can't see (it renders the seabed flat at y=0), so the depth-map dz reads all
+    // water as shallow; sampling the heightfield directly fixes that. Placeholder until published.
+    mat.AddUniform('_TerrainHeightTex', 'sampler2D', this._foamTexture);
+    mat.AddUniform('_TerrainBounds', 'vec4', new Vector4(0, 0, 1, 1));   // minX, minZ, sizeX, sizeZ
+    mat.AddUniform('_TerrainTexSize', 'vec2', new Vector2(1, 1));
+    mat.AddUniform('_TerrainHasField', 'float', 0);
     if (this._deps.reflectionTexture) {
       mat.AddUniform('_Reflection', 'sampler2D', this._deps.reflectionTexture);
       mat.AddUniform('_ReflStrength', 'float', 0.9);
@@ -434,9 +443,30 @@ export class OceanFFTMaterial {
       varying vec4 vClipCoords;
     `;
 
+    // TRUE vertical water depth (metres, ≥0) at a world XZ, read straight from the terrain heightfield
+    // — the single source of seabed depth for BOTH contact foam and the see-into-water reveal, now that
+    // the scene depth map is gone (Metal's 16-sampler cap). Returns 1e4 (= deep/opaque, no foam) when
+    // there's no field or the point is outside it. R32F isn't HW-filterable on WebGPU → manual bilinear.
+    const seabedFn = `
+      float _seabedWaterDepth(vec2 worldXZ) {
+        if (_TerrainHasField <= 0.5) return 1.0e4;
+        vec2 sUV = vec2((worldXZ.x - _TerrainBounds.x) / _TerrainBounds.z,
+                        (_TerrainBounds.y + _TerrainBounds.w - worldXZ.y) / _TerrainBounds.w);
+        if (sUV.x < 0.0 || sUV.x > 1.0 || sUV.y < 0.0 || sUV.y > 1.0) return 1.0e4;
+        vec2 stc = sUV * _TerrainTexSize - 0.5; vec2 sf = fract(stc);
+        ivec2 si = ivec2(floor(stc)); ivec2 smx = ivec2(_TerrainTexSize) - 1;
+        float b00 = texelFetch(_TerrainHeightTex, clamp(si,            ivec2(0), smx), 0).r;
+        float b10 = texelFetch(_TerrainHeightTex, clamp(si+ivec2(1,0), ivec2(0), smx), 0).r;
+        float b01 = texelFetch(_TerrainHeightTex, clamp(si+ivec2(0,1), ivec2(0), smx), 0).r;
+        float b11 = texelFetch(_TerrainHeightTex, clamp(si+ivec2(1,1), ivec2(0), smx), 0).r;
+        float seabedY = mix(mix(b00, b10, sf.x), mix(b01, b11, sf.x), sf.y);
+        return max(0.0, -seabedY);
+      }
+    `;
+
     const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${flashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
     mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${seabedFn}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -546,15 +576,13 @@ export class OceanFFTMaterial {
         jacobian = min(1.0, max(0.0, (-jacobian + _FoamBiasLOD0 * foamChop) * _FoamScale));
       #endif
 
-      #ifdef HAS_DEPTH
-        vec2 screenUV = vClipCoords.xy / vClipCoords.w;
-        screenUV = screenUV * 0.5 + 0.5;
-        float backgroundDepth = texture2D(_CameraDepthTexture, screenUV).r * _CameraData.y;
-        float surfaceDepth = vClipCoords.z;
-        float depthDifference = max(0.0, (backgroundDepth - surfaceDepth) - 0.5);
+      // Contact foam where the water shoals against the shore, from the true seabed depth (the scene
+      // depth map is gone). Small depthDifference means foam; 1e4 (open ocean) means none. Off with no field.
+      {
+        float depthDifference = max(0.0, _seabedWaterDepth(vWorldUV) - 0.5);
         float foam = texture2D(_FoamTexture, vWorldUV * 0.5 + _Time * 2.).r;
         jacobian += _ContactFoam * saturate(max(0.0, foam - depthDifference) * 5.0) * 0.9;
-      #endif
+      }
 
       // (Shoreline foam removed — the coast is handled by a water→sand transparency runoff
       //  in the colour-composition stage instead.)
@@ -622,10 +650,10 @@ export class OceanFFTMaterial {
       float reveal = 0.0;
       float shallow = 0.0;   // broad shallow-water factor (1 in the shallows → 0 in deep water);
                              // suppresses the blue water terms (sky reflection, shoal tint) over sand
-      #if defined(HAS_DEPTH) && defined(HAS_REFRACTION)
-        vec2 dUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5, vec2(0.001), vec2(0.999));
-        float bgZ = texture2D(_CameraDepthTexture, dUV).r;        // eye-distance to geometry behind (1e8 = open water)
-        float dz  = max(0.0, bgZ - vClipCoords.w);                // through-water path length (metres)
+      #ifdef HAS_REFRACTION
+        // TRUE vertical water depth from the heightfield (the clipmap displaces in its vertex shader,
+        // which a depth renderer can't see — it'd render the seabed flat and read ALL water as shallow).
+        float dz = _seabedWaterDepth(vWorldUV);                   // vertical water depth in metres (1e4 is open ocean)
         // Visibility falls off with VIEW distance too (scattering/haze through the water column), so
         // far water always reads opaque — this also kills false reveals at the grazing horizon where
         // the background depth gets unreliable. Full reach up close, gone by ~400 m.
@@ -634,8 +662,11 @@ export class OceanFFTMaterial {
         shallow = (1.0 - smoothstep(0.0, _SeeDepth * 2.2, dz)) * distFade;   // wider than the crisp reveal
         vec2 refrUV = clamp(vClipCoords.xy / vClipCoords.w * 0.5 + 0.5 + normalW.xz * 0.02, vec2(0.002), vec2(0.998));
         vec3 refr = texture2D(_Refraction, refrUV).rgb;
-        // Only reveal where the refraction RTT actually has seabed (it clears to ~black past a dropoff).
-        reveal *= smoothstep(0.02, 0.16, max(refr.r, max(refr.g, refr.b)));
+        // NOTE: the reveal is now driven purely by the TRUE seabed depth (dz). The old refraction-
+        // brightness gate is gone: it killed the reveal wherever the refraction was dark, so the boat
+        // (hull, mast and rigging, all dark in the refraction RTT) punched the deep-water BLUE through
+        // the shallows in a boat-shaped ghost. With true depth we just trust dz, so the boat now reads
+        // as its dark refraction (a natural shadow over the tan sand).
         // Revealed seabed is emissive (the refraction clear-colour doesn't darken with the scene),
         // so day-gate it (sunUp) to fade the bottom to dark at night.
         vec3 seabedSand = refr * vec3(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
@@ -663,10 +694,12 @@ export class OceanFFTMaterial {
         reflUV += normalW.xz * 0.04;
         reflUV = clamp(reflUV, vec2(0.002), vec2(0.998));
         vec3 planarRefl = texture2D(_Reflection, reflUV).rgb;
-        // Dim the surface glint across the WHOLE shallows (not just where the bottom is crisply
-        // revealed), so transparent shallow water reads as wet sand rather than mirroring the sky —
-        // that sky-blue over the sand was the "glowing blue sea" in the dusk shadows.
-        float reflCut = 1.0 - max(reveal, shallow) * 0.9;
+        // Kill the surface glint ENTIRELY across the shallows (not just dim it): transparent shallow
+        // water reads as wet sand, never mirroring the sky. The old 0.9 factor left ~10% of bright
+        // sky-blue, which traced a blue halo around the boat (the planar reflection of its silhouette
+        // peeking out in screen space). Over-drive the cut so it hits 0 once the water is clearly
+        // shallow, while open/deep water (reveal=shallow=0) keeps full reflection.
+        float reflCut = clamp(1.0 - max(reveal, shallow) * 1.6, 0.0, 1.0);
         waterCol += planarRefl * fresnel * _ReflStrength * reflCut;
         // Analytic sky fallback — fades in as the planar reflection fades out (reflections off / RTT
         // dead) so the water still catches sky light at grazing angles instead of reading flat-dark.
@@ -700,6 +733,18 @@ export class OceanFFTMaterial {
       // Sky reflection state — colour the water reflects + planar strength (0 when reflections off).
       const sky = this._deps.getSkyReflect?.();
       if (sky) { eff.setVector3('_SkyColor', sky.color); eff.setFloat('_ReflStrength', sky.strength); }
+      // Terrain heightfield for the TRUE seabed depth (published by TerrainService via scene.metadata).
+      const thf = (scene.metadata as { terrainHeightField?: {
+        tex: Texture; bounds: Vector4; texSize: Vector2; maxAlt: number } } | null)?.terrainHeightField;
+      if (thf && thf.tex?.isReady()) {
+        eff.setTexture('_TerrainHeightTex', thf.tex);
+        eff.setVector4('_TerrainBounds', thf.bounds);
+        eff.setVector2('_TerrainTexSize', thf.texSize);
+        eff.setFloat('_TerrainHasField', 1);
+      } else {
+        eff.setTexture('_TerrainHeightTex', this._foamTexture);   // placeholder (not sampled)
+        eff.setFloat('_TerrainHasField', 0);
+      }
       // Keep the shore map live (terrain may restream as you sail).
       const shore = this._deps.getShore?.();
       if (shore) {

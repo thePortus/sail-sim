@@ -128,6 +128,9 @@ export class SloopController {
       // to (absent) IBL, so without this the bake is invisible. Shared material → attach once.
       if (mesh.material instanceof PBRMaterial &&
           !mesh.material.pluginManager?.getPlugin('BakedAO')) {
+        // Full-strength baked AO up close; the plugin itself fades it out with camera distance so the
+        // occlusion map's coarse (darker) mips can't drive the ship toward black at range — see
+        // BakedAOPlugin.bindForSubMesh.
         new BakedAOPlugin(mesh.material);
         // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby
         // broadside lights this hull without displacing the sun (which would darken the ship).

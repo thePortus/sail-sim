@@ -1,6 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  Color3, Material, Matrix, Mesh, Observer, Quaternion, Scene, StandardMaterial, Texture, Vector3,
+  Color3, DynamicTexture, Material, Matrix, Mesh, MeshBuilder, Observer, Quaternion, Scene,
+  StandardMaterial, Texture, Vector3,
 } from '@babylonjs/core';
 import { SceneService } from '../scene.service';
 import { TerrainService } from '../terrain.service';
@@ -15,6 +16,7 @@ import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
+import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
 import {
   loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR, buildGrassMaterial,
   scatterTextureUrl, setScatterVersion, clearScatterCache,
@@ -83,6 +85,9 @@ interface Layer {
   build: (cx: number, cz: number) => PatchData;
   /** Hidden base/LoD meshes this layer thin-instances — disposed on teardown (/reloadassets rebuild). */
   baseMeshes: Mesh[];
+  /** Optional smaller patch ring (in cells) — used by the fake-shadow layers so blobs only build/keep
+   *  within a near radius around the camera (cheap). Undefined → the full scatter RADIUS. */
+  maxRing?: number;
 }
 
 /** A patch's instance data: the N×16 matrix buffer, and an optional N×4 per-instance colour buffer. */
@@ -108,6 +113,15 @@ export class ScatterService {
   private layers: Layer[] = [];
   private observer: Observer<Scene> | null = null;
   private _palmTime = 0;   // palm wind clock (advanced each frame from the weather wind)
+
+  // Fake-shadow blobs (shared flat disc + dark decal material, thin-instanced under each land asset).
+  private _shadowDisc: Mesh | null = null;
+  private _shadowMat: StandardMaterial | null = null;
+  private shadowRing = 3;                            // near ring (cells) the blobs build within
+  private _sunAcc = 1;                               // throttle the sun-drive recompute (the sun crawls)
+  private static readonly SHADOWS_ENABLED = true;
+  private static readonly SHADOW_LIFT = 0.06;        // raise the decal off the ground (z-fight guard)
+  private readonly _shadowQ = new Quaternion();      // identity — blobs aren't rotated per-instance
 
   // Reusable temporaries (avoid per-instance allocation in the build loops).
   private readonly _scaleV = new Vector3();
@@ -174,6 +188,21 @@ export class ScatterService {
       this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
       PalmWindPlugin.WIND.time = this._palmTime;
       TreeWindPlugin.WIND.time = this._palmTime;
+      // Fake-shadow blobs: point them away from the sun, lengthen as it lowers, fade out at night.
+      // Per-instance matrices stay baked; only this handful of uniforms + the material alpha change.
+      // The sun crawls, so recompute a few times a second rather than every frame.
+      this._sunAcc += scene.getEngine().getDeltaTime() / 1000;
+      if (this._shadowMat && this._sunAcc >= 0.5) {
+        this._sunAcc = 0;
+        const sun = this.sceneService.getSunDirection();
+        let hx = -sun.x, hz = -sun.z;
+        const hl = Math.hypot(hx, hz);
+        if (hl > 1e-3) { hx /= hl; hz /= hl; } else { hx = 0; hz = 1; }
+        ShadowBlobPlugin.SHADOW.dirX = hx;
+        ShadowBlobPlugin.SHADOW.dirZ = hz;
+        ShadowBlobPlugin.SHADOW.stretch = Math.max(1, Math.min(3.5, 1 / Math.max(sun.y, 0.30)));
+        this._shadowMat.alpha = 0.34 * smoothstep(0.0, 0.16, sun.y);
+      }
       this.ensurePatches();
       for (const l of this.layers) { l.manager.update(); }
     });
@@ -196,6 +225,13 @@ export class ScatterService {
     await this.registerDriftwood(scene);
     await this.registerBeeches(scene);
     await this.registerPalms(scene);
+
+    // Cheap fake shadows: a flat dark blob under each static land asset, near-ring only. Skipped on
+    // Potato (no scatter) and via ?noshadows. Must come AFTER the asset layers so the asset placement
+    // exists to mirror.
+    if (this.enabled && ScatterService.SHADOWS_ENABLED && !location.search.includes('noshadows')) {
+      this.registerShadows(scene);
+    }
   }
 
   /** Dispose every layer's patches, manager, base meshes and materials (deduped — rocks/driftwood
@@ -212,6 +248,7 @@ export class ScatterService {
     for (const m of meshes) { m.dispose(); }
     for (const mm of mats) { mm.dispose(); }
     this.layers = [];
+    this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
   }
 
   /** /reloadassets: bump the cache-bust version, drop the cached containers, tear down the live layers
@@ -347,6 +384,70 @@ export class ScatterService {
     }, [1, 1]);
     manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
     return { mat: full.material as Material, manager, patches: new Map(), build, baseMeshes: [imp, full] };
+  }
+
+  // ── Fake shadow blobs (cheap cast-shadow decals for the static land assets) ──
+
+  /** Build the shared shadow decal (a flat soft-edged dark disc) and register one near-ring shadow
+   *  layer per land asset TYPE. Each reuses that type's existing placement in "shadow mode" (variant
+   *  -1 → keep every candidate), so the blobs are a single source of truth with the assets — one disc
+   *  per palm/tree/rock/log. The `ShadowBlobPlugin` stretches each round disc away from the sun. */
+  private registerShadows(scene: Scene): void {
+    // Soft radial-gradient alpha (opaque centre → transparent rim) → a vague blurry blob.
+    const grad = new DynamicTexture('scatter_shadow_grad', 64, scene, false);
+    const ctx = grad.getContext() as CanvasRenderingContext2D;
+    const g = ctx.createRadialGradient(32, 32, 2, 32, 32, 31);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(0.55, 'rgba(255,255,255,0.7)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+    grad.update();
+    grad.hasAlpha = true;
+
+    const mat = new StandardMaterial('scatter_shadow_mat', scene);
+    mat.diffuseColor = new Color3(0, 0, 0);
+    mat.specularColor = new Color3(0, 0, 0);
+    mat.emissiveColor = new Color3(0, 0, 0);
+    mat.disableLighting = true;            // flat black; the disc darkens the ground beneath it
+    mat.opacityTexture = grad;             // radial alpha → soft edge
+    mat.alpha = 0.3;                       // base opacity (modulated each frame by sun elevation)
+    mat.backFaceCulling = false;
+    mat.disableDepthWrite = true;          // a decal: blend over the terrain, don't fight other blobs
+    new ShadowBlobPlugin(mat);             // stretch away from the sun (GLSL + WGSL)
+    this.sceneService.excludeFromPrePass(mat);
+    this._shadowMat = mat;
+
+    // Unit ground quad in XZ (the plugin works in this disc's local space). Name `scatter_…` so the
+    // patch clones inherit the ocean-refraction / glow exclusions (shadows never show underwater).
+    const disc = MeshBuilder.CreateGround('scatter_shadow_disc', { width: 1, height: 1 }, scene);
+    disc.material = mat;
+    disc.isVisible = false;
+    disc.isPickable = false;
+    this.sceneService.excludeFromGlow(disc);
+    this._shadowDisc = disc;
+
+    // One near-ring shadow layer per asset type (all share the disc + material + manager-clone path).
+    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildRocks(cx, cz, -1, true)));
+    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildDriftwood(cx, cz, -1, true)));
+    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildTrees(cx, cz, -1, true)));
+    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildPalms(cx, cz, -1, true)));
+  }
+
+  /** A shadow sub-layer: a single-LoD (no distance swap) manager over the shared disc, capped to the
+   *  near shadow ring so distant blobs are never built. */
+  private makeShadowLayer(disc: Mesh, build: (cx: number, cz: number) => PatchData): Layer {
+    const manager = new PatchManager([disc], () => 0, [1]);
+    manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
+    return { mat: disc.material as Material, manager, patches: new Map(), build, baseMeshes: [disc], maxRing: this.shadowRing };
+  }
+
+  /** Compose one flat shadow-disc instance: a round decal of the given footprint radius laid on the
+   *  ground at (px,pz). No rotation (the plugin handles the sun-direction stretch). */
+  private composeShadow(buf: Float32Array, idx: number, px: number, groundY: number, pz: number, radius: number): void {
+    this._scaleV.set(radius * 2, 1, radius * 2);   // ground quad is 1×1 → scale = diameter
+    this._posV.set(px, groundY + ScatterService.SHADOW_LIFT, pz);
+    Matrix.ComposeToRef(this._scaleV, this._shadowQ, this._posV, this._mat);
+    this._mat.copyToArray(buf, idx * 16);
   }
 
   /** Fallback: the old procedural-primitive palm as a single (all-variant) scatter layer. */
@@ -522,6 +623,8 @@ export class ScatterService {
         for (const l of this.layers) {
           if (built >= this.MAX_BUILDS_PER_FRAME) { break; }
           if (l.patches.has(key)) { continue; }
+          // Shadow (and any capped) layers only build within their near ring around the camera cell.
+          if (l.maxRing !== undefined && (Math.abs(ix - cx) > l.maxRing || Math.abs(iz - cz) > l.maxRing)) { continue; }
           const data = l.build(ix * this.PATCH, iz * this.PATCH);
           built++;
           if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
@@ -536,8 +639,8 @@ export class ScatterService {
 
     // Cull only when the cell moved (the cull boundary is relative to it) — otherwise nothing left the ring.
     if (cellChanged) {
-      const cull = R + 1;
       for (const l of this.layers) {
+        const cull = (l.maxRing ?? R) + 1;   // shadow layers cull back to their near ring
         for (const [key, p] of l.patches) {
           const c = key.split(',');
           if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
@@ -701,13 +804,14 @@ export class ScatterService {
     this.enabled = t.enabled;
     this.densityMul = t.density;
     this.RADIUS = Math.max(1, t.radius);
+    this.shadowRing = Math.min(this.RADIUS, 3);   // blobs only near the camera (~120 m)
     GrassFadePlugin.fade.end   = (this.RADIUS - 0.4) * this.PATCH;
     GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 110);
   }
 
   /** Build one patch's beach rocks: scattered on the sand/low-dune band, mostly small with some
    *  bigger ones and the rare boulder, each a random size, tumble orientation and stone colour. */
-  private buildRocks(cx: number, cz: number, variant: number): PatchData {
+  private buildRocks(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 24, size = this.PATCH, cell = size / res, E = 2.0;
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
@@ -749,6 +853,7 @@ export class ScatterService {
           base * (0.85 + hash2(px * 7.7, pz * 1.3) * 0.35),
           base * (0.60 + hash2(px * 1.3, pz * 7.7) * 0.40),
           base * (0.85 + hash2(px * 3.7, pz * 9.1) * 0.35));
+        if (shadow) { this.composeShadow(matTmp, kept, px, y, pz, Math.max(scaleV.x, scaleV.z) * 1.15); kept++; continue; }
         posV.set(px, y - base * 0.1, pz);                  // settle slightly into the sand
         Quaternion.RotationYawPitchRollToRef(
           hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
@@ -767,12 +872,12 @@ export class ScatterService {
         kept++;
       }
     }
-    return this.finish(matTmp, kept, colTmp);
+    return this.finish(matTmp, kept, shadow ? null : colTmp);
   }
 
   /** Build one patch's driftwood: weathered logs lying flat near the tide line — occasional, varied
    *  length/thickness, random yaw with a slight settle, bleached wood colours. */
-  private buildDriftwood(cx: number, cz: number, variant: number): PatchData {
+  private buildDriftwood(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 20, size = this.PATCH, cell = size / res, E = 2.0;
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
@@ -807,6 +912,7 @@ export class ScatterService {
           : r < 0.70 ? 0.7 + hash2(px * 1.9 + 3, pz * 1.9 - 3) * 0.5   // medium (0.7–1.2×)
           : 0.45 + hash2(px * 6.1 + 9, pz * 6.1 - 9) * 0.25;           // small twigs (0.45–0.7×)
         scaleV.set(s, s, s);
+        if (shadow) { this.composeShadow(matTmp, kept, px, y, pz, s * 1.15); kept++; continue; }
         posV.set(px, y - 0.03, pz);                          // settle into the sand
         Quaternion.RotationYawPitchRollToRef(
           hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
@@ -824,12 +930,12 @@ export class ScatterService {
         kept++;
       }
     }
-    return this.finish(matTmp, kept, colTmp);
+    return this.finish(matTmp, kept, shadow ? null : colTmp);
   }
 
   /** Build one patch's forest trees: clustered in the inland forest-mask zone (mid elevation, gentle
    *  slope), broken into stands by low-freq noise with clearings. Sparse — trees are big. */
-  private buildTrees(cx: number, cz: number, variant: number): PatchData {
+  private buildTrees(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 16, size = this.PATCH, cell = size / res, E = 3.0;
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -858,6 +964,7 @@ export class ScatterService {
 
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
+        if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
         posV.set(px, y - 0.1, pz);
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
@@ -873,7 +980,7 @@ export class ScatterService {
    *  Math.random) so all three variant calls see the SAME candidates and partition them by a position
    *  hash — equal total density, mixed varieties per grove. `variant < 0` keeps every candidate (the
    *  single-mesh primitive fallback). The GLB palms are real metres, so scale is a gentle ±8 % only. */
-  private buildPalms(cx: number, cz: number, variant: number): PatchData {
+  private buildPalms(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 14, size = this.PATCH, cell = size / res, E = 2.5;
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -899,6 +1006,7 @@ export class ScatterService {
 
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
+        if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }
         posV.set(px, y - 0.1, pz);
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);

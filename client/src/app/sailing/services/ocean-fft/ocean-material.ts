@@ -54,6 +54,9 @@ export interface OceanMaterialDeps {
   getRain: (() => number) | null;
   /** Sea choppiness 0..1 — trims whitecap foam in heavy seas so it doesn't over-foam. */
   getChoppiness?: (() => number) | null;
+  /** Live fish-startle vector (xy = recent cannon-shot pos, w = flee strength) — the drifting fish
+   *  silhouettes scatter away from it. Null/undefined → no scatter. */
+  getFishStartle?: (() => Vector4) | null;
 }
 
 export class OceanFFTMaterial {
@@ -112,6 +115,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_Derivatives_c2', 'sampler2D', fft.getDerivativesTex(2));
     mat.AddUniform('_Turbulence_c2', 'sampler2D', fft.getTurbulenceTex(2));
     mat.AddUniform('_Time', 'float', 0);
+    mat.AddUniform('_FishStartle', 'vec4', new Vector4(0, 0, 0, 0));   // xy = cannon-shot pos, w = flee strength
     mat.AddUniform('_CameraData', 'vec4', new Vector4(camera.minZ, camera.maxZ, camera.maxZ - camera.minZ, 0));
     mat.AddUniform('_FoamTexture', 'sampler2D', this._foamTexture);
     // NOTE: the scene depth map (_CameraDepthTexture) was removed — Metal caps a fragment stage at 16
@@ -418,6 +422,11 @@ export class OceanFFTMaterial {
         float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
         vec2  cellC = (id + 0.5) / scale;
         vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 2.6;
+        // Cannon startle: shove this fish away from a recent nearby shot (_FishStartle.xy = pos, .w = strength).
+        vec2  sOff  = fishC - _FishStartle.xy;
+        float sLen  = length(sOff) + 1e-4;
+        float sFall = _FishStartle.w * (1.0 - smoothstep(0.0, 24.0, sLen));
+        fishC += (sOff / sLen) * sFall * 8.0;
         vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
         vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
         vec2  rel   = p - fishC;
@@ -763,6 +772,8 @@ export class OceanFFTMaterial {
       }
       eff.setFloat('_Time', this._deps.getTime() / 10);
       eff.setVector3('lightDirection', this._deps.getSunDir());
+      const fishStartle = this._deps.getFishStartle?.();
+      if (fishStartle) { eff.setVector4('_FishStartle', fishStartle); }
       // Sky reflection state — colour the water reflects + planar strength (0 when reflections off).
       const sky = this._deps.getSkyReflect?.();
       if (sky) { eff.setVector3('_SkyColor', sky.color); eff.setFloat('_ReflStrength', sky.strength); }

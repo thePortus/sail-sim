@@ -12,6 +12,7 @@ import { TerrainService }     from './terrain.service';
 import { MultiplayerService } from './multiplayer.service';
 import { SfxService }         from './sfx.service';
 import { BirdService }        from './bird.service';
+import { DolphinService }     from './dolphin.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -104,6 +105,7 @@ export class CannonService {
   private multiplayerService = inject(MultiplayerService);
   private sfx                = inject(SfxService);
   private birds              = inject(BirdService);
+  private dolphins           = inject(DolphinService);
   private zone               = inject(NgZone);
 
   // ── Public signals (consumed by HUD) — per-side gun state + reload progress ──
@@ -270,6 +272,8 @@ export class CannonService {
       this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
       this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
       this.birds.startleAt(ox, oz);   // a remote ship's broadside startles gulls near its muzzle too
+      this.dolphins.scatterFrom(ox, oz);   // …and scatters any nearby dolphins
+      this.oceanService.startleFish(ox, oz);   // …and the shallow-water fish
     };
     this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
     // A repaired ship (server `combat_reset`) clears its accumulated scorch decals.
@@ -1021,6 +1025,8 @@ export class CannonService {
     this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq);
     this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq);
     this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
+    this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting
+    this.oceanService.startleFish(mwx, mwz);   // …and scatters the drifting shallow-water fish
     this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
     this.playCannonSound();
   }

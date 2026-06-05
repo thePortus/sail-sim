@@ -3,13 +3,8 @@
 # General or Current TODO Items
 
 * add sound of canvas flapping in the wind
-* make sure asset scattering of non imposters actually follows landscape... noticing I only see rocks and driftwood right near waterline
 * clouds don't seem to meet water at horizon.. not for spherical world?
-* AO problem still affects sails
 * check landscape hit detection... make sure balls don't go through land
-* switching from geometry to clip map raised all the shallows to super shallow on many different maps
-* fix boat back windows bleeding through
-* fix no boat transparency in deep water
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * add full sinking & capsize animation
 * made cannon elevation aiming smooth and by decimals

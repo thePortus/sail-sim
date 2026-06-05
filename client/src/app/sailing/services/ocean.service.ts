@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
+  MeshBuilder, Vector2, Vector3, Vector4, AbstractMesh, Mesh, ShaderMaterial, Scene,
   MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture, Color4,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
@@ -201,6 +201,7 @@ uniform float u_reflectionStrength;  // 1 = RTT reflections on, 0 = analytic-sky
 uniform float u_seabedStrength;      // 1 = shallow-water transparency on, 0 = off (Water-transparency setting)
 uniform int u_normalIter;            // per-LOD fragment normal detail (near hi, far lo)
 uniform vec3  u_sunDir;          // unit vector toward the sun (boat shadow on water)
+uniform vec4  u_fishStartle;     // xy = recent cannon-shot pos, w = flee strength (fish scatter)
 uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 uniform sampler2D u_refraction;  // seabed (terrain) colour for true shallow-water transparency
@@ -413,6 +414,11 @@ float fishField(vec2 p, float t) {
   float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
   vec2  cellC = (id + 0.5) / scale;
   vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;  // wander within the cell
+  // Cannon startle: shove this fish away from a recent nearby shot (u_fishStartle.xy = pos, .w = strength).
+  vec2  sOff  = fishC - u_fishStartle.xy;
+  float sLen  = length(sOff) + 1e-4;
+  float sFall = u_fishStartle.w * (1.0 - smoothstep(0.0, 24.0, sLen));            // only fish within ~24 m flee
+  fishC += (sOff / sLen) * sFall * 8.0;                                           // dart up to ~8 m outward
   vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));     // heading + speed
   vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
   vec2  rel   = p - fishC;
@@ -887,6 +893,7 @@ uniform u_reflectionStrength: f32; // 1 = RTT reflections on, 0 = analytic-sky o
 uniform u_seabedStrength: f32;     // 1 = shallow-water transparency on, 0 = off
 uniform u_normalIter: i32;         // per-LOD fragment normal detail (near hi, far lo)
 uniform u_sunDir: vec3f;           // unit vector toward the sun (boat shadow on water)
+uniform u_fishStartle: vec4f;      // xy = recent cannon-shot pos, w = flee strength (fish scatter)
 uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
 var u_sceneDepthSampler: sampler;
 var u_sceneDepth: texture_2d<f32>; // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
@@ -1094,7 +1101,12 @@ fn fishField(p: vec2f, t: f32) -> f32 {
   let sp1 = 0.30 + rnd * 0.55;
   let sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
   let cellC = (id + vec2f(0.5)) / scale;
-  let fishC = cellC + vec2f(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+  var fishC = cellC + vec2f(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+  // Cannon startle: shove this fish away from a recent nearby shot (u_fishStartle.xy = pos, .w = strength).
+  let sOff  = fishC - uniforms.u_fishStartle.xy;
+  let sLen  = length(sOff) + 1e-4;
+  let sFall = uniforms.u_fishStartle.w * (1.0 - smoothstep(0.0, 24.0, sLen));
+  fishC += (sOff / sLen) * sFall * 8.0;
   let vel   = vec2f(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
   let fwd   = normalize(vel + vec2f(1e-4, 0.0));
   let rel   = p - fishC;
@@ -1418,6 +1430,12 @@ export class OceanService {
   private shoreMapSize = 3000;  // correct world width; placeholder is always black
 
   private elapsed    = 0;
+
+  // Fish startle: a recent cannon shot the drifting-fish silhouettes scatter away from. xy = world pos,
+  // w = flee strength (a quick-rise / smooth-decay envelope on the CPU, so the two oceans needn't share
+  // a clock). _fishStartleAge < 0 means idle.
+  private readonly _fishStartle = new Vector4(0, 0, 0, 0);
+  private _fishStartleAge = -1;
   private boatX      = 0;
   private boatZ      = 0;
   private boatHdgR   = 0;
@@ -1663,7 +1681,7 @@ export class OceanService {
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
-          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir',
+          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir', 'u_fishStartle',
           'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter',
           'u_wakePath', 'u_wakeCount', 'u_splashData', 'u_splashCount',
         ],
@@ -1706,6 +1724,7 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setVector4('u_fishStartle', this._fishStartle);
     mat.setFloat('u_reflectionStrength', this._reflectionsEnabled ? 1 : 0);
     mat.setFloat('u_seabedStrength',     this._transparencyEnabled ? 1 : 0);
     // Per-LOD fragment-normal detail: near/LOD0 stay smooth (reflections read clearly),
@@ -1767,6 +1786,7 @@ export class OceanService {
       this.updateWakePath(dt);
       this.updateSplashes(dt);
       this.updateCannonFlashes(dt);
+      this.updateFishStartle(dt);
 
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
@@ -1785,6 +1805,7 @@ export class OceanService {
         mat.setFloat('u_sunElevation',  this._sunElevation);
         mat.setFloat('u_rainIntensity', this._rainIntensity);
         mat.setVector3('u_sunDir', this.sceneService.getSunDirection());
+        mat.setVector4('u_fishStartle', this._fishStartle);
         mat.setArray4('u_wakePath', wakePathArr);
         mat.setFloat('u_wakeCount', this.wakePathCount);
         mat.setArray4('u_splashData', splashArr);
@@ -1930,6 +1951,26 @@ export class OceanService {
   getRainIntensity(): number { return this._rainIntensity; }
   /** Current shader time (same clock that drifts the ocean's cloud shadows). */
   getOceanTime(): number { return this.elapsed; }
+
+  /** A cannon shot near (x,z): the drifting fish silhouettes scatter away from it for a few seconds.
+   *  Tracks only the latest shot (one uniform). Mirror of BirdService.startleAt / DolphinService.scatterFrom. */
+  startleFish(x: number, z: number): void {
+    this._fishStartle.x = x; this._fishStartle.y = z;
+    this._fishStartleAge = 0;
+  }
+
+  /** The live fish-startle vector (xy = pos, w = strength) — also read by the FFT ocean material. */
+  getFishStartle(): Vector4 { return this._fishStartle; }
+
+  /** Advance the startle envelope: a quick rise (~0.18 s) then a smooth decay (~1.6 s), zeroed when spent. */
+  private updateFishStartle(dt: number): void {
+    if (this._fishStartleAge < 0) { return; }
+    this._fishStartleAge += dt;
+    const a = this._fishStartleAge;
+    const strength = Math.min(1, a / 0.18) * Math.exp(-a / 1.6);
+    if (a > 6 || strength < 0.002) { this._fishStartleAge = -1; this._fishStartle.w = 0; return; }
+    this._fishStartle.w = strength;
+  }
 
   /** Call each frame from CloudService — drives the surface rain-ripple normals. */
   setRainIntensity(intensity: number): void {

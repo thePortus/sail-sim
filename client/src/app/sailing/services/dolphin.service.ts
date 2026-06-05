@@ -49,6 +49,13 @@ export class DolphinService {
   private active = false;
   private _swimTime = 0;
 
+  // Cannon-fire panic: while this counts down the pod bolts away from the shot, fast, on a relaxed leash —
+  // then settles back. They never despawn (presence preserved); they just scatter for a few seconds.
+  private _panic = 0;
+  private _panicX = 0;
+  private _panicZ = 0;
+  private static readonly PANIC_TIME = 5.5;
+
   // Orientation conventions (flip if needed): a roll about the forward axis rights the side-lying model;
   // FACE_OFFSET aims the nose. (Match the surfaced version we were tuning.)
   private static readonly UPRIGHT = Math.PI / 2;
@@ -121,6 +128,10 @@ export class DolphinService {
     else if (!inShallows && this.active) { this.despawn(); }
     if (!this.active) { return; }
 
+    if (this._panic > 0) { this._panic = Math.max(0, this._panic - dt); }
+    const panicking = this._panic > 0;
+    const leash = panicking ? DolphinService.LEASH * 1.7 : DolphinService.LEASH;   // let them scatter wide
+
     const t = this._swimTime;
     for (let i = 0; i < this.pod.length; i++) {
       const d = this.pod[i];
@@ -138,7 +149,7 @@ export class DolphinService {
       // Leash: if it strays too far from the boat, steer home.
       const dxB = bx - d.x, dzB = bz - d.z;
       const distB = Math.hypot(dxB, dzB);
-      if (distB > DolphinService.LEASH) { d.targetTheta = Math.atan2(dzB, dxB); }
+      if (distB > leash) { d.targetTheta = Math.atan2(dzB, dxB); }
 
       // Don't shoal into land: if the water AHEAD gets too shallow, veer hard back toward deeper water
       // (toward the boat, which is in the navigable shallows).
@@ -148,10 +159,14 @@ export class DolphinService {
       if (avoiding) {
         d.targetTheta = Math.atan2(dzB, dxB);
         d.targetSpeed = Math.min(d.targetSpeed, 2.5);
+      } else if (panicking && distB <= leash) {
+        // Bolt away from the shot (a stable per-dolphin angular offset fans the pod out), fast.
+        d.targetTheta = Math.atan2(d.z - this._panicZ, d.x - this._panicX) + (d.depthPhase - Math.PI) * 0.15;
+        d.targetSpeed = 6.5 + Math.random() * 2.0;
       }
 
-      // Ease heading + speed (turn sharply when avoiding the shallows), then swim forward.
-      d.theta += this.angDiff(d.targetTheta, d.theta) * Math.min(1, dt * (avoiding ? 3.5 : 1.4));
+      // Ease heading + speed (turn sharply when avoiding the shallows or fleeing), then swim forward.
+      d.theta += this.angDiff(d.targetTheta, d.theta) * Math.min(1, dt * (avoiding ? 3.5 : panicking ? 3.0 : 1.4));
       d.speed += (d.targetSpeed - d.speed) * Math.min(1, dt * 1.5);
       d.x += Math.cos(d.theta) * d.speed * dt;
       d.z += Math.sin(d.theta) * d.speed * dt;
@@ -173,6 +188,21 @@ export class DolphinService {
       this._mat.copyToArray(this.matBuf, i * 16);
     }
     mesh.thinInstanceBufferUpdated('matrix');
+  }
+
+  /**
+   * Spook the pod with a cannon shot near (x,z): they bolt away from it, fast, for a few seconds, then
+   * settle back. Does NOT despawn them — their presence is preserved. No-op if no pod is currently out.
+   */
+  scatterFrom(x: number, z: number): void {
+    if (!this.active) { return; }
+    this._panic = DolphinService.PANIC_TIME;
+    this._panicX = x; this._panicZ = z;
+    for (const d of this.pod) {
+      d.targetTheta = Math.atan2(d.z - z, d.x - x) + (d.depthPhase - Math.PI) * 0.15;
+      d.targetSpeed = 6.5 + Math.random() * 2.0;
+      d.retarget = Math.max(d.retarget, 1.5);   // don't let a wander decision immediately override the bolt
+    }
   }
 
   /** Shortest-arc difference b−a. */

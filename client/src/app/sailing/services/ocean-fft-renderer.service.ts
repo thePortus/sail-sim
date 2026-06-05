@@ -90,6 +90,7 @@ export class OceanFFTRenderer {
       },
       getSunDir: () => this.sceneService.getSunDirection(),
       getTime: () => performance.now() / 1000 - this._startTime,
+      getFishStartle: () => this.oceanService.getFishStartle(),
     });
 
     this._realMaterials = [

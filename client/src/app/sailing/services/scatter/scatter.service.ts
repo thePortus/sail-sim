@@ -15,7 +15,10 @@ import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
-import { loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR } from './asset-loader';
+import {
+  loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR,
+  scatterTextureUrl, setScatterVersion, clearScatterCache,
+} from './asset-loader';
 
 const EMPTY = new Float32Array(0);
 const EMPTY_PATCH: PatchData = { matrix: EMPTY, color: null };
@@ -72,6 +75,8 @@ interface Layer {
   manager: PatchManager;
   patches: Map<string, ThinInstancePatch | null>;
   build: (cx: number, cz: number) => PatchData;
+  /** Hidden base/LoD meshes this layer thin-instances — disposed on teardown (/reloadassets rebuild). */
+  baseMeshes: Mesh[];
 }
 
 /** A patch's instance data: the N×16 matrix buffer, and an optional N×4 per-instance colour buffer. */
@@ -132,35 +137,7 @@ export class ScatterService {
 
     this.applyQualityParams(this._quality);   // radius / density / enabled + fade band (no rebuild yet)
 
-    // Land grass — green. swayMul 0 → the wind-sway maths is compiled out of the shader (barely
-    // visible at this scale, not worth the per-vertex cost). Multi-tier LoD: full detail+density up
-    // close, then flat blades at progressively thinned density with distance (most patches are far).
-    // (Names start with `scatter_` so the ocean refraction RTT's exclusion predicate skips foliage.)
-    this.layers.push(this.makeLayer(scene, 'scatter_grass', new Color3(0.10, 0.26, 0.05), 0, [
-      { stacks: 4, nearerThan: 50,       fraction: 1.0 },
-      { stacks: 1, nearerThan: 150,      fraction: 0.45 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.22 },
-    ], (cx, cz) => this.buildGrass(cx, cz)));
-
-    // Beach rocks — authored geometry-only GLB shapes (5), ONE shared normal-mapped stone material,
-    // per-instance size (pebble → boulder) + tint, real decimated *_lod.glb as the far-LOD. Replaces
-    // the old procedural-primitive rocks. Falls back to the primitive rock if a GLB fails to load.
-    await this.registerRocks(scene);
-
-    // Driftwood — authored geometry-only GLB shapes (5: branch / log / root / plank / twig), ONE
-    // shared bleached-wood material, per-instance size (twig → log) + tint, real *_lod.glb far-LOD.
-    // Static (no wind). Replaces the old primitive logs. Falls back to the primitive on load failure.
-    await this.registerDriftwood(scene);
-
-    // Forest trees — authored beech GLB variants (A/B/C) with two-channel wind (branch sway + leaf
-    // flutter) + crossed-quad impostor far-LOD, in the inland forest-mask zone. Replaces the old
-    // procedural-primitive trees. Falls back to the primitive tree if a GLB fails to load.
-    await this.registerBeeches(scene);
-
-    // Beach palms — authored GLB variants (A/B/C) with wind sway + crossed-quad impostor far-LOD,
-    // replacing the old procedural-primitive palms. Loaded async (streamed + cached) before the
-    // patches build; falls back to the primitive palm if a GLB fails to load.
-    await this.registerPalms(scene);
+    await this.buildLayers(scene);             // grass + the authored-GLB scatter layers (streamed)
 
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
@@ -191,6 +168,58 @@ export class ScatterService {
     });
   }
 
+  /** Build every scatter layer (grass + the authored-GLB groups). Called once by init(), and again by
+   *  reloadAssets() after a /reloadassets version bump so edited GLBs re-stream live. */
+  private async buildLayers(scene: Scene): Promise<void> {
+    // Land grass — green. swayMul 0 → the wind-sway maths is compiled out of the shader. Multi-tier
+    // LoD: full detail+density close, flat thinned blades far. (Names start with `scatter_` so the
+    // ocean refraction RTT's exclusion predicate skips foliage.)
+    this.layers.push(this.makeLayer(scene, 'scatter_grass', new Color3(0.10, 0.26, 0.05), 0, [
+      { stacks: 4, nearerThan: 50,       fraction: 1.0 },
+      { stacks: 1, nearerThan: 150,      fraction: 0.45 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.22 },
+    ], (cx, cz) => this.buildGrass(cx, cz)));
+
+    // Authored-GLB groups (streamed from the server, cached): beach rocks (5 shapes, size pebble→
+    // boulder + tint), driftwood (5 shapes, twig→log + tint), forest beeches (A/B/C, two-channel
+    // wind), beach palms (A/B/C, wind sway). Each falls back to its primitive if a GLB fails.
+    await this.registerRocks(scene);
+    await this.registerDriftwood(scene);
+    await this.registerBeeches(scene);
+    await this.registerPalms(scene);
+  }
+
+  /** Dispose every layer's patches, manager, base meshes and materials (deduped — rocks/driftwood
+   *  share one material across their shape sub-layers). Used by dispose() and the /reloadassets rebuild. */
+  private teardownLayers(): void {
+    const meshes = new Set<Mesh>(), mats = new Set<Material>();
+    for (const l of this.layers) {
+      for (const [, p] of l.patches) { p?.dispose(); }
+      l.patches.clear();
+      l.manager.dispose();
+      for (const m of l.baseMeshes) { meshes.add(m); if (m.material) { mats.add(m.material); } }
+      if (l.mat) { mats.add(l.mat); }
+    }
+    for (const m of meshes) { m.dispose(); }
+    for (const mm of mats) { mm.dispose(); }
+    this.layers = [];
+  }
+
+  /** /reloadassets: bump the cache-bust version, drop the cached containers, tear down the live layers
+   *  and rebuild them — so edited scatter GLBs/textures re-stream from the server live (mirrors the
+   *  vessel cache). The camera observer stays; it reads `this.layers` each frame, so it picks up the
+   *  rebuilt set automatically. */
+  async reloadAssets(version: number): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene) { return; }
+    setScatterVersion(version);
+    clearScatterCache();
+    this.teardownLayers();
+    await this.buildLayers(scene);
+    if (this.enabled) { this.ensurePatches(); }
+    for (const l of this.layers) { l.manager.initInstances(); }
+  }
+
   // ── Beach palms (authored GLB variants) ─────────────────────────────────────
 
   private static readonly PALM_VARIANTS = [
@@ -214,7 +243,7 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
 
-      const tex = new Texture(`/assets/scatter/textures/${cfg.impostor}`, scene);
+      const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
       const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
@@ -246,7 +275,7 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
 
-      const tex = new Texture(`/assets/scatter/textures/${cfg.impostor}`, scene);
+      const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
       const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
@@ -264,7 +293,7 @@ export class ScatterService {
       return d < near ? 1 : 0;   // 1 = full (near), 0 = impostor (far)
     }, [1, 1]);
     manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
-    return { mat: full.material as Material, manager, patches: new Map(), build };
+    return { mat: full.material as Material, manager, patches: new Map(), build, baseMeshes: [imp, full] };
   }
 
   /** Fallback: the old procedural-primitive palm as a single (all-variant) scatter layer. */
@@ -415,7 +444,7 @@ export class ScatterService {
       return (tiers.length - 1) - ni;                       // → farthest-first mesh index
     }, fractions);
     manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
-    return { mat, manager, patches: new Map(), build };
+    return { mat, manager, patches: new Map(), build, baseMeshes: meshes };
   }
 
   /** Build any new cells entering the radius (budgeted across all layers), cull cells that left. */
@@ -765,12 +794,6 @@ export class ScatterService {
 
   dispose(): void {
     if (this.observer) { this.sceneService.scene?.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
-    for (const l of this.layers) {
-      for (const [, p] of l.patches) { p?.dispose(); }
-      l.patches.clear();
-      l.manager.dispose();
-      l.mat.dispose();
-    }
-    this.layers = [];
+    this.teardownLayers();
   }
 }

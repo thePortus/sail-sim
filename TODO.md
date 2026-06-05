@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* dither shoreline more
 * clouds don't move so much as jitter
 * AO problem still affects sails
 * switching from geometry to clip map raised all the shallows to super shallow on many different maps

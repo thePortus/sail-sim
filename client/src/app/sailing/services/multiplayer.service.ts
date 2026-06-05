@@ -8,6 +8,7 @@ import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
+import { ScatterService } from './scatter/scatter.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
 import { TelemetryService } from './telemetry.service';
@@ -71,6 +72,7 @@ export class MultiplayerService {
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
   private vesselService  = inject(VesselService);
+  private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
@@ -379,6 +381,8 @@ export class MultiplayerService {
       // (reloadRemoteVessels already set the cache version, so this fetches the fresh GLB).
       this.reloadRemoteVessels(+msg.version || 0, scene);
       this.vesselService.reloadModel().catch((e) => console.warn('[MP] local model reload failed', e));
+      // Also live-reload the scatter assets (palms/beech/rocks/driftwood) from the server.
+      this.scatterService.reloadAssets(+msg.version || 0).catch((e) => console.warn('[MP] scatter reload failed', e));
 
     } else if (msg.type === 'kicked') {
       // Server closed this session because the same account logged in elsewhere.

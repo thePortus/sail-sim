@@ -3,16 +3,29 @@ import {
   StandardMaterial, Texture,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
+import { Settings } from '../../../app.settings';
 
 /**
- * Streaming loader + cache for the authored scatter GLBs (palms now; beech/rocks/driftwood/grass
- * next). Scatter assets are static client files under `public/assets/scatter/` (NOT the API-server
- * geometry endpoint the vessel cache uses), so this has its own tiny load-once container cache:
- * each variant GLB is fetched ONCE, then thin-instanced for the whole world.
+ * Streaming loader + cache for the authored scatter GLBs (palms / beech / rocks / driftwood). Assets
+ * are served from the API server's `geometry/scatter/` endpoint (same origin + delivery as the
+ * vessels), so the `/reloadassets` owner command can hot-swap edited GLBs live. This keeps a tiny
+ * load-once container cache: each GLB is fetched ONCE, then thin-instanced for the whole world.
  */
 
-/** Base URL for scatter GLBs + impostor textures (served statically from public/assets/scatter/). */
-const SCATTER_BASE = '/assets/scatter/';
+/** Base URL for scatter GLBs + textures (server geometry endpoint — matches the vessel cache). */
+const SCATTER_BASE = Settings.apiUrl + 'geometry/scatter/';
+
+/** Cache-busting token appended as ?v=<version> (set by /reloadassets so the browser refetches edited
+ *  GLBs/textures instead of serving the maxAge-cached copy). 0 = no token (normal caching). */
+let version = 0;
+
+/** Set the cache-bust version (server-supplied timestamp on /reloadassets). */
+export function setScatterVersion(v: number): void { version = v || 0; }
+
+function withV(url: string): string { return version ? `${url}?v=${version}` : url; }
+
+/** Full URL for a scatter texture (impostor / albedo / normal), with the cache-bust token. */
+export function scatterTextureUrl(name: string): string { return withV(`${SCATTER_BASE}textures/${name}`); }
 
 /** filename → in-flight or resolved container load (load-once). */
 const containerCache = new Map<string, Promise<AssetContainer>>();
@@ -20,7 +33,7 @@ const containerCache = new Map<string, Promise<AssetContainer>>();
 function loadContainer(scene: Scene, file: string): Promise<AssetContainer> {
   let p = containerCache.get(file);
   if (!p) {
-    p = SceneLoader.LoadAssetContainerAsync(SCATTER_BASE, file, scene, null, '.glb');
+    p = SceneLoader.LoadAssetContainerAsync(SCATTER_BASE, withV(file), scene, null, '.glb');
     containerCache.set(file, p);
   }
   return p;
@@ -115,8 +128,8 @@ export function createCrossImpostor(scene: Scene, name: string, tex: Texture, wi
  */
 export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, normalFile: string): PBRMaterial {
   const mat = new PBRMaterial(name, scene);
-  mat.albedoTexture = new Texture(`/assets/scatter/textures/${albedoFile}`, scene);
-  mat.bumpTexture = new Texture(`/assets/scatter/textures/${normalFile}`, scene, false, false);  // linear
+  mat.albedoTexture = new Texture(scatterTextureUrl(albedoFile), scene);
+  mat.bumpTexture = new Texture(scatterTextureUrl(normalFile), scene, false, false);  // linear
   mat.metallic = 0.0;
   mat.roughness = 0.9;
   mat.invertNormalMapY = false;   // OpenGL-convention normal map (green = +Y)

@@ -15,7 +15,7 @@ import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
-import { loadScatterMesh, createCrossImpostor } from './asset-loader';
+import { loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR } from './asset-loader';
 
 const EMPTY = new Float32Array(0);
 const EMPTY_PATCH: PatchData = { matrix: EMPTY, color: null };
@@ -142,18 +142,15 @@ export class ScatterService {
       { stacks: 1, nearerThan: Infinity, fraction: 0.22 },
     ], (cx, cz) => this.buildGrass(cx, cz)));
 
-    // Beach rocks — solid faceted stones, per-instance colour (white diffuse × instance colour) and
-    // size (small → boulder). No wind sway (swayMul 0). LoD: detailed near, low-poly far.
-    this.layers.push(this.makeLayer(scene, 'scatter_rocks', new Color3(1, 1, 1), 0, [
-      { stacks: 2, nearerThan: 90,       fraction: 1.0 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
-    ], (cx, cz) => this.buildRocks(cx, cz), createRock, true));
+    // Beach rocks — authored geometry-only GLB shapes (5), ONE shared normal-mapped stone material,
+    // per-instance size (pebble → boulder) + tint, real decimated *_lod.glb as the far-LOD. Replaces
+    // the old procedural-primitive rocks. Falls back to the primitive rock if a GLB fails to load.
+    await this.registerRocks(scene);
 
-    // Driftwood — weathered logs washed up near the tide line; per-instance length + bleached colour.
-    this.layers.push(this.makeLayer(scene, 'scatter_driftwood', new Color3(1, 1, 1), 0, [
-      { stacks: 2, nearerThan: 90,       fraction: 1.0 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
-    ], (cx, cz) => this.buildDriftwood(cx, cz), createDriftwood, true));
+    // Driftwood — authored geometry-only GLB shapes (5: branch / log / root / plank / twig), ONE
+    // shared bleached-wood material, per-instance size (twig → log) + tint, real *_lod.glb far-LOD.
+    // Static (no wind). Replaces the old primitive logs. Falls back to the primitive on load failure.
+    await this.registerDriftwood(scene);
 
     // Forest trees — authored beech GLB variants (A/B/C) with two-channel wind (branch sway + leaf
     // flutter) + crossed-quad impostor far-LOD, in the inland forest-mask zone. Replaces the old
@@ -284,6 +281,98 @@ export class ScatterService {
       { stacks: 2, nearerThan: 110,      fraction: 1.0 },
       { stacks: 1, nearerThan: Infinity, fraction: 0.6 },
     ], (cx, cz) => this.buildTrees(cx, cz, -1), createTree, false));
+  }
+
+  // ── Beach rocks (authored geometry-only GLB shapes) ─────────────────────────
+
+  private static readonly ROCK_SHAPES = [
+    { file: 'rock_a.glb', lod: 'rock_a_lod.glb' },   // rounded boulder
+    { file: 'rock_b.glb', lod: 'rock_b_lod.glb' },   // angular faceted
+    { file: 'rock_c.glb', lod: 'rock_c_lod.glb' },   // flat slab
+    { file: 'rock_d.glb', lod: 'rock_d_lod.glb' },   // chunky
+    { file: 'rock_e.glb', lod: 'rock_e_lod.glb' },   // small pebble
+  ];
+
+  /** Per-instance stone tints (multiply the neutral-gray albedo × baked AO). Bright so they shift hue
+   *  without over-darkening: granite, sandstone, basalt, red, moss, gray. */
+  private static readonly ROCK_TINTS: ReadonlyArray<readonly [number, number, number]> = [
+    [0.92, 0.94, 1.00], [1.00, 0.84, 0.58], [0.50, 0.50, 0.56],
+    [0.96, 0.56, 0.42], [0.62, 0.72, 0.50], [0.85, 0.85, 0.85],
+  ];
+
+  /** Load the 5 authored rock shapes (geometry-only) sharing ONE normal-mapped stone material, with a
+   *  real decimated *_lod.glb far-LOD per shape, and register one scatter sub-layer per shape. Any load
+   *  failure → the procedural-primitive rock. */
+  private async registerRocks(scene: Scene): Promise<void> {
+    const mat = buildScatterPBR(scene, 'scatter_rock_mat', 'rock_albedo.png', 'rock_normal.png');
+    this.sceneService.excludeFromPrePass(mat);
+    for (let v = 0; v < ScatterService.ROCK_SHAPES.length; v++) {
+      const cfg = ScatterService.ROCK_SHAPES[v];
+      const full = await loadScatterGeometry(scene, cfg.file, `scatter_rock_${v}_full`, mat);
+      const lod  = await loadScatterGeometry(scene, cfg.lod,  `scatter_rock_${v}_lod`,  mat);
+      if (!full || !lod) {
+        console.warn(`[scatter] rock shape ${v} (${cfg.file}) failed — using primitive rocks`);
+        this.registerRockFallback(scene);
+        return;
+      }
+      this.sceneService.excludeFromGlow(full);
+      this.sceneService.excludeFromGlow(lod);
+      // Rocks are small — swap to the (real) low-poly LOD mesh at 60 m.
+      this.layers.push(this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildRocks(cx, cz, v)));
+    }
+  }
+
+  /** Fallback: the old procedural-primitive rock as a single (all-shape) scatter layer. */
+  private registerRockFallback(scene: Scene): void {
+    this.layers.push(this.makeLayer(scene, 'scatter_rocks', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 90,       fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
+    ], (cx, cz) => this.buildRocks(cx, cz, -1), createRock, true));
+  }
+
+  // ── Beach driftwood (authored geometry-only GLB shapes) ─────────────────────
+
+  private static readonly DRIFT_SHAPES = [
+    { file: 'drift_a.glb', lod: 'drift_a_lod.glb' },   // gnarled branch (fork)
+    { file: 'drift_b.glb', lod: 'drift_b_lod.glb' },   // worn log
+    { file: 'drift_c.glb', lod: 'drift_c_lod.glb' },   // forked root chunk
+    { file: 'drift_d.glb', lod: 'drift_d_lod.glb' },   // flat weathered plank
+    { file: 'drift_e.glb', lod: 'drift_e_lod.glb' },   // small twig
+  ];
+
+  /** Per-instance driftwood tints (multiply the bleached-gray albedo × baked AO): silver, bleached,
+   *  tan, brown, driftbrown, waterlogged. */
+  private static readonly DRIFT_TINTS: ReadonlyArray<readonly [number, number, number]> = [
+    [1.00, 1.00, 1.02], [1.05, 1.03, 0.98], [1.05, 0.95, 0.76],
+    [0.86, 0.70, 0.50], [0.95, 0.82, 0.63], [0.60, 0.62, 0.64],
+  ];
+
+  /** Load the 5 authored driftwood shapes (geometry-only) sharing ONE bleached-wood material, with a
+   *  real *_lod.glb far-LOD per shape, one scatter sub-layer per shape. Any failure → the primitive. */
+  private async registerDriftwood(scene: Scene): Promise<void> {
+    const mat = buildScatterPBR(scene, 'scatter_drift_mat', 'drift_albedo.png', 'drift_normal.png');
+    this.sceneService.excludeFromPrePass(mat);
+    for (let v = 0; v < ScatterService.DRIFT_SHAPES.length; v++) {
+      const cfg = ScatterService.DRIFT_SHAPES[v];
+      const full = await loadScatterGeometry(scene, cfg.file, `scatter_drift_${v}_full`, mat);
+      const lod  = await loadScatterGeometry(scene, cfg.lod,  `scatter_drift_${v}_lod`,  mat);
+      if (!full || !lod) {
+        console.warn(`[scatter] driftwood shape ${v} (${cfg.file}) failed — using primitive driftwood`);
+        this.registerDriftwoodFallback(scene);
+        return;
+      }
+      this.sceneService.excludeFromGlow(full);
+      this.sceneService.excludeFromGlow(lod);
+      this.layers.push(this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildDriftwood(cx, cz, v)));
+    }
+  }
+
+  /** Fallback: the old procedural-primitive driftwood as a single (all-shape) scatter layer. */
+  private registerDriftwoodFallback(scene: Scene): void {
+    this.layers.push(this.makeLayer(scene, 'scatter_driftwood', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 90,       fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
+    ], (cx, cz) => this.buildDriftwood(cx, cz, -1), createDriftwood, true));
   }
 
   /** Build a scatter layer: material (+ wind/fade plugin), tiered LoD meshes, patch manager.
@@ -481,18 +570,21 @@ export class ScatterService {
 
   /** Build one patch's beach rocks: scattered on the sand/low-dune band, mostly small with some
    *  bigger ones and the rare boulder, each a random size, tumble orientation and stone colour. */
-  private buildRocks(cx: number, cz: number): PatchData {
+  private buildRocks(cx: number, cz: number, variant: number): PatchData {
     const res = 24, size = this.PATCH, cell = size / res, E = 2.0;
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
     const scaleV = this._scaleV, posV = this._posV;
+    const NSHAPES = ScatterService.ROCK_SHAPES.length;
+    const TINTS = ScatterService.ROCK_TINTS;
     let kept = 0;
 
     for (let x = 0; x < res; x++) {
       for (let z = 0; z < res; z++) {
-        const px = cx + (x + Math.random()) * cell - size / 2;
-        const pz = cz + (z + Math.random()) * cell - size / 2;
+        // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
+        const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
+        const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
         if (y < 0.25 || y > 7) { continue; }              // beach + low dune band only
         const slope = this.slopeAt(px, pz, y, E);
@@ -501,25 +593,33 @@ export class ScatterService {
         // Scattered, with subtle clusters (rocks gather a little, slightly sparser between).
         const clump = fbm2(px / 15, pz / 15);
         const dens = (0.022 + 0.24 * smoothstep(0.52, 0.84, clump)) * (1 - slope * 0.4) * this.densityMul;
-        if (Math.random() > dens) { continue; }
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
-        // Size mix: mostly small, some bigger, the occasional boulder.
-        const r = Math.random();
-        const base = r < 0.05 ? 1.8 + Math.random() * 1.7         // ~5% boulders (1.8–3.5 m)
-          : r < 0.30 ? 0.7 + Math.random() * 0.7                  // ~25% bigger (0.7–1.4 m)
-          : 0.25 + Math.random() * 0.4;                           // small (0.25–0.65 m)
-        scaleV.set(base * (0.85 + Math.random() * 0.35), base * (0.6 + Math.random() * 0.4), base * (0.85 + Math.random() * 0.35));
+        // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
+
+        // Size mix: mostly small, some bigger, the occasional boulder (real metres — base mesh ≈ 1 m).
+        const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
+        const base = r < 0.05 ? 1.8 + hash2(px * 2.2, pz * 2.2) * 1.7       // ~5% boulders (1.8–3.5 m)
+          : r < 0.30 ? 0.7 + hash2(px * 1.9 + 3, pz * 1.9 - 3) * 0.7        // ~25% bigger (0.7–1.4 m)
+          : 0.25 + hash2(px * 6.1 + 9, pz * 6.1 - 9) * 0.4;                 // small (0.25–0.65 m)
+        scaleV.set(
+          base * (0.85 + hash2(px * 7.7, pz * 1.3) * 0.35),
+          base * (0.60 + hash2(px * 1.3, pz * 7.7) * 0.40),
+          base * (0.85 + hash2(px * 3.7, pz * 9.1) * 0.35));
         posV.set(px, y - base * 0.1, pz);                  // settle slightly into the sand
         const q = Quaternion.RotationYawPitchRoll(
-          Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5);
+          hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
+          (hash2(px * 2.3, pz * 5.1) - 0.5) * 0.5,
+          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.5);
         Matrix.Compose(scaleV, q, posV).copyToArray(matTmp, kept * 16);
 
-        // Per-instance stone colour: pick a palette entry, jitter each channel.
-        const c = STONE[(Math.random() * STONE.length) | 0];
+        // Per-instance stone tint: pick a palette entry, jitter each channel (multiplies AO × albedo).
+        const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
         const ci = kept * 4;
-        colTmp[ci]     = Math.max(0, c[0] + (Math.random() - 0.5) * 0.10);
-        colTmp[ci + 1] = Math.max(0, c[1] + (Math.random() - 0.5) * 0.10);
-        colTmp[ci + 2] = Math.max(0, c[2] + (Math.random() - 0.5) * 0.10);
+        colTmp[ci]     = Math.max(0, c[0] + (hash2(px * 8.1, pz * 8.3) - 0.5) * 0.10);
+        colTmp[ci + 1] = Math.max(0, c[1] + (hash2(px * 8.3, pz * 8.1) - 0.5) * 0.10);
+        colTmp[ci + 2] = Math.max(0, c[2] + (hash2(px * 8.7, pz * 8.9) - 0.5) * 0.10);
         colTmp[ci + 3] = 1;
         kept++;
       }
@@ -529,18 +629,21 @@ export class ScatterService {
 
   /** Build one patch's driftwood: weathered logs lying flat near the tide line — occasional, varied
    *  length/thickness, random yaw with a slight settle, bleached wood colours. */
-  private buildDriftwood(cx: number, cz: number): PatchData {
+  private buildDriftwood(cx: number, cz: number, variant: number): PatchData {
     const res = 20, size = this.PATCH, cell = size / res, E = 2.0;
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
     const scaleV = this._scaleV, posV = this._posV;
+    const NSHAPES = ScatterService.DRIFT_SHAPES.length;
+    const TINTS = ScatterService.DRIFT_TINTS;
     let kept = 0;
 
     for (let x = 0; x < res; x++) {
       for (let z = 0; z < res; z++) {
-        const px = cx + (x + Math.random()) * cell - size / 2;
-        const pz = cz + (z + Math.random()) * cell - size / 2;
+        // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
+        const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
+        const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
         if (y < 0.25 || y > 6) { continue; }              // sand / low beach band
         const slope = this.slopeAt(px, pz, y, E);
@@ -549,25 +652,30 @@ export class ScatterService {
         // Occasional, with subtle clusters along the drift line.
         const clump = fbm2(px / 14 + 40, pz / 14 - 22);
         const dens = (0.022 + 0.20 * smoothstep(0.52, 0.84, clump)) * (1 - slope * 0.4) * this.densityMul;
-        if (Math.random() > dens) { continue; }
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
-        // Length mix: mostly medium logs, some long, some short chunks. Thickness varies separately.
-        const r = Math.random();
-        const len = r < 0.15 ? 1.2 + Math.random() * 0.7      // ~15% long logs
-          : r < 0.70 ? 0.6 + Math.random() * 0.5              // medium
-          : 0.35 + Math.random() * 0.25;                      // short chunks
-        const thick = 0.5 + Math.random() * 0.7;
-        scaleV.set(len, thick, thick);                        // local X = length, Y/Z = thickness
-        posV.set(px, y - 0.03, pz);                           // settle into the sand
+        // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
+
+        // Size mix: uniform scale (the 5 GLB shapes already carry their own proportions) — mostly
+        // small/medium with some big logs/planks. Base meshes are ~0.8–2.8 m long, so this spans twig→log.
+        const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
+        const s = r < 0.15 ? 1.2 + hash2(px * 2.2, pz * 2.2) * 0.6     // ~15% big (1.2–1.8×)
+          : r < 0.70 ? 0.7 + hash2(px * 1.9 + 3, pz * 1.9 - 3) * 0.5   // medium (0.7–1.2×)
+          : 0.45 + hash2(px * 6.1 + 9, pz * 6.1 - 9) * 0.25;           // small twigs (0.45–0.7×)
+        scaleV.set(s, s, s);
+        posV.set(px, y - 0.03, pz);                          // settle into the sand
         const q = Quaternion.RotationYawPitchRoll(
-          Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.3);
+          hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,
+          (hash2(px * 2.3, pz * 5.1) - 0.5) * 0.3,
+          (hash2(px * 5.1, pz * 2.3) - 0.5) * 0.3);
         Matrix.Compose(scaleV, q, posV).copyToArray(matTmp, kept * 16);
 
-        const c = DRIFTWOOD[(Math.random() * DRIFTWOOD.length) | 0];
+        const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
         const ci = kept * 4;
-        colTmp[ci]     = Math.max(0, c[0] + (Math.random() - 0.5) * 0.08);
-        colTmp[ci + 1] = Math.max(0, c[1] + (Math.random() - 0.5) * 0.08);
-        colTmp[ci + 2] = Math.max(0, c[2] + (Math.random() - 0.5) * 0.08);
+        colTmp[ci]     = Math.max(0, c[0] + (hash2(px * 8.1, pz * 8.3) - 0.5) * 0.08);
+        colTmp[ci + 1] = Math.max(0, c[1] + (hash2(px * 8.3, pz * 8.1) - 0.5) * 0.08);
+        colTmp[ci + 2] = Math.max(0, c[2] + (hash2(px * 8.7, pz * 8.9) - 0.5) * 0.08);
         colTmp[ci + 3] = 1;
         kept++;
       }

@@ -1,5 +1,5 @@
 import {
-  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, Scene, SceneLoader,
+  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, PBRMaterial, Scene, SceneLoader,
   StandardMaterial, Texture,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
@@ -105,6 +105,51 @@ export function createCrossImpostor(scene: Scene, name: string, tex: Texture, wi
   mat.useAlphaFromDiffuseTexture = true;
   merged.material = mat;
   return merged;
+}
+
+/**
+ * Build the shared normal-mapped stone PBR material for the rocks. The rock GLBs are GEOMETRY-ONLY and
+ * all share these two textures (neutral-gray albedo + tileable rocky normal), so we load them ONCE here
+ * and assign this one material to every shape + LOD. Per-instance tint (thin-instance colour buffer)
+ * multiplies on top of the baked-AO vertex colour, turning the neutral stone into granite/sandstone/etc.
+ */
+export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, normalFile: string): PBRMaterial {
+  const mat = new PBRMaterial(name, scene);
+  mat.albedoTexture = new Texture(`/assets/scatter/textures/${albedoFile}`, scene);
+  mat.bumpTexture = new Texture(`/assets/scatter/textures/${normalFile}`, scene, false, false);  // linear
+  mat.metallic = 0.0;
+  mat.roughness = 0.9;
+  mat.invertNormalMapY = false;   // OpenGL-convention normal map (green = +Y)
+  mat.invertNormalMapX = false;
+  return mat;
+}
+
+/**
+ * Load a GEOMETRY-ONLY scatter GLB (rocks now), assign the SHARED material, and keep its baked-AO
+ * vertex colour ON (`useVertexColors = true` — COLOR_0 multiplies albedo, the opposite of the trees,
+ * and it avoids the WebGPU colour-attribute issue entirely). Opaque (no alpha-test). Normals/tangents
+ * left untouched. Returns a hidden, thin-instanceable base mesh, or null on failure.
+ */
+export async function loadScatterGeometry(scene: Scene, file: string, name: string, material: Material): Promise<Mesh | null> {
+  try {
+    const container = await loadContainer(scene, file);
+    const entries = container.instantiateModelsToScene((n) => n, false);
+    const root = entries.rootNodes[0];
+    const mesh = root.getChildMeshes(false).find((m) => m.getTotalVertices() > 0) as Mesh | undefined;
+    if (!mesh) { entries.dispose(); return null; }
+    mesh.setParent(null);
+    mesh.makeGeometryUnique();
+    mesh.bakeCurrentTransformIntoVertices();
+    root.dispose();
+    mesh.name = name;
+    mesh.isVisible = false;
+    mesh.material = material;
+    mesh.useVertexColors = true;     // COLOR_0 = baked AO, multiplies albedo
+    return mesh;
+  } catch (err) {
+    console.warn(`[scatter] loadScatterGeometry failed: ${file}`, err);
+    return null;
+  }
 }
 
 /** Drop all cached scatter containers (e.g. on an asset reload). */

@@ -16,7 +16,7 @@ import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import {
-  loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR,
+  loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR, buildGrassMaterial,
   scatterTextureUrl, setScatterVersion, clearScatterCache,
 } from './asset-loader';
 
@@ -44,6 +44,12 @@ const DRIFTWOOD: ReadonlyArray<readonly [number, number, number]> = [
 function smoothstep(a: number, b: number, x: number): number {
   const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
   return t * t * (3 - 2 * t);
+}
+/** Sharper remap than smoothstep — the same [a,b] clamp but with a steeper mid-ramp, so a gate reads
+ *  closer to hard on/off (used to carve crisp grass-bush edges with a totally-barren outside). */
+function step01(a: number, b: number, x: number): number {
+  const s = smoothstep(a, b, x);
+  return s * s * (3 - 2 * s);
 }
 function hash2(x: number, z: number): number {
   return ((Math.sin(x * 127.1 + z * 311.7) * 43758.5453) % 1 + 1) % 1;
@@ -171,14 +177,12 @@ export class ScatterService {
   /** Build every scatter layer (grass + the authored-GLB groups). Called once by init(), and again by
    *  reloadAssets() after a /reloadassets version bump so edited GLBs re-stream live. */
   private async buildLayers(scene: Scene): Promise<void> {
-    // Land grass — green. swayMul 0 → the wind-sway maths is compiled out of the shader. Multi-tier
-    // LoD: full detail+density close, flat thinned blades far. (Names start with `scatter_` so the
-    // ocean refraction RTT's exclusion predicate skips foliage.)
-    this.layers.push(this.makeLayer(scene, 'scatter_grass', new Color3(0.10, 0.26, 0.05), 0, [
-      { stacks: 4, nearerThan: 50,       fraction: 1.0 },
-      { stacks: 1, nearerThan: 150,      fraction: 0.45 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.22 },
-    ], (cx, cz) => this.buildGrass(cx, cz)));
+    // Land grass — authored CLUMP GLBs (3 tussock variants, scattered at clump density, NOT per-blade).
+    // Retires the old custom grass ShaderMaterial (which failed to compile on WebGPU). (Names start with
+    // `scatter_` so the ocean refraction RTT's exclusion predicate skips foliage.)
+    // DISABLED for now (GRASS_ENABLED=false): the current clump models are too expensive — awaiting
+    // better authored grass. Flip the flag back to true to restore it.
+    if (ScatterService.GRASS_ENABLED) { await this.registerGrass(scene); }
 
     // Authored-GLB groups (streamed from the server, cached): beach rocks (5 shapes, size pebble→
     // boulder + tint), driftwood (5 shapes, twig→log + tint), forest beeches (A/B/C, two-channel
@@ -218,6 +222,45 @@ export class ScatterService {
     await this.buildLayers(scene);
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
+  }
+
+  // ── Land grass (authored clump GLBs) ────────────────────────────────────────
+
+  private static readonly GRASS_CLUMPS = [
+    { file: 'grass_a.glb', lod: 'grass_a_lod.glb' },   // medium tussock
+    { file: 'grass_b.glb', lod: 'grass_b_lod.glb' },   // tall sparse
+    { file: 'grass_c.glb', lod: 'grass_c_lod.glb' },   // short bushy
+  ];
+
+  /** Per-instance grass tints (multiply the base→tip gradient albedo): lush → green → yellow-green →
+   *  dry → straw. Kept near 1 so the gradient still reads. */
+  private static readonly GRASS_TINTS: ReadonlyArray<readonly [number, number, number]> = [
+    [0.82, 1.00, 0.66], [0.78, 0.92, 0.60], [0.96, 0.95, 0.54], [0.88, 0.80, 0.46], [0.93, 0.85, 0.55],
+  ];
+
+  /** Load the 3 authored grass CLUMP GLBs (geometry-only) sharing ONE matte double-sided gradient
+   *  material, with a real *_lod.glb far-LOD per clump, and register one scatter sub-layer per variant.
+   *  Wind: draw-radius dissolve (GrassFadePlugin) + clump-scale sway/flutter (TreeWindPlugin). On any
+   *  load failure → no grass (the old ShaderMaterial blade system is retired). */
+  /** Master on/off for the grass layer. Off while the current clump GLBs are too costly to render —
+   *  set true again once the replacement grass models land. */
+  private static readonly GRASS_ENABLED = false;
+
+  private async registerGrass(scene: Scene): Promise<void> {
+    const mat = buildGrassMaterial(scene, 'scatter_grass_mat', 'grass_albedo.png');
+    new GrassFadePlugin(mat, 0);   // draw-radius dissolve only (no sway here — TreeWind does the wind)
+    new TreeWindPlugin(mat, { flutter: true, swayStart: 0.05, swayFull: 0.85, ampScale: 0.7 });
+    this.sceneService.excludeFromPrePass(mat);
+    for (let v = 0; v < ScatterService.GRASS_CLUMPS.length; v++) {
+      const cfg = ScatterService.GRASS_CLUMPS[v];
+      // useVertexColors=false: grass COLOR_0 is WIND data, not albedo.
+      const full = await loadScatterGeometry(scene, cfg.file, `scatter_grass_${v}_full`, mat, false);
+      const lod  = await loadScatterGeometry(scene, cfg.lod,  `scatter_grass_${v}_lod`,  mat, false);
+      if (!full || !lod) { console.warn(`[scatter] grass clump ${v} (${cfg.file}) failed — skipping grass`); return; }
+      this.sceneService.excludeFromGlow(full);
+      this.sceneService.excludeFromGlow(lod);
+      this.layers.push(this.makeGlbLayer(full, lod, 45, (cx, cz) => this.buildGrass(cx, cz, v)));
+    }
   }
 
   // ── Beach palms (authored GLB variants) ─────────────────────────────────────
@@ -271,7 +314,7 @@ export class ScatterService {
         this.registerTreeFallback(scene);
         return;
       }
-      new TreeWindPlugin(full.material, true);   // flutter = true (leaf shimmer)
+      new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
 
@@ -524,47 +567,87 @@ export class ScatterService {
     return Math.sqrt(dyx * dyx + dyz * dyz) / E;
   }
 
-  /** Build one patch's grass: terrain-snapped, biome-gated (sparse on beaches → lush inland, none on
-   *  cliffs/peaks/underwater), broken into clumps by low-freq noise. */
-  private buildGrass(cx: number, cz: number): PatchData {
-    // Sparser sample grid (~35% fewer candidates → fewer instances + cheaper build); each blade is
-    // widened (W) to fill the larger gaps, so coverage looks the same for noticeably less geometry.
-    const res = 58, size = this.PATCH, cell = size / res, E = 2.0, W = 1.4;
-    const tmp = new Float32Array(res * res * 2 * 16);   // ×2: clump cores can place a second blade
+  /** Build one patch's grass CLUMPS for a single variant. Each authored clump already packs 25–45
+   *  blades, so we scatter at a coarse grid. Clustering is TWO-SCALE: a low-freq `region` field makes
+   *  whole areas sparse vs lush, and a higher-freq `clump` field forms tussock cores. Density ramps
+   *  HARD toward each clump core (gamma curve) and dense cores pack 2–3 clumps per cell, so cores read
+   *  much denser than edges — while sparse regions stay very sparse. Deterministic (hash, not
+   *  Math.random) so the 3 variant calls partition one candidate set. Per-instance tint + size. */
+  private buildGrass(cx: number, cz: number, variant: number): PatchData {
+    const res = 28, size = this.PATCH, cell = size / res, E = 2.0;
+    const BURST = 16;                                   // up to 16 clumps packed into one bush heart
+    const BUSH_R = 0.55;                                // bush radius (m) — a tight tuft, ~a few feet across
+    const cap = 5000;                                   // generous per-patch instance cap (bushes are rare)
+    const matTmp = new Float32Array(cap * 16);
+    const colTmp = new Float32Array(cap * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const scaleV = this._scaleV, posV = this._posV, up = this._up;
+    const NCLUMPS = ScatterService.GRASS_CLUMPS.length;
+    const TINTS = ScatterService.GRASS_TINTS;
     let kept = 0;
+
+    // Place one clump at (px,pz) snapped to terrain, with deterministic size/yaw/tint.
+    const place = (px: number, pz: number, y: number): void => {
+      const s = 0.7 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.9;   // ~0.7–1.6× clump scale
+      scaleV.set(s, s, s);
+      posV.set(px, y - 0.02, pz);
+      Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
+        .copyToArray(matTmp, kept * 16);
+      const c = TINTS[Math.floor(hash2(px * 0.9 - 11, pz * 0.9 + 11) * TINTS.length) % TINTS.length];
+      const ci = kept * 4;
+      colTmp[ci]     = Math.max(0, c[0] + (hash2(px * 8.1, pz * 8.3) - 0.5) * 0.08);
+      colTmp[ci + 1] = Math.max(0, c[1] + (hash2(px * 8.3, pz * 8.1) - 0.5) * 0.08);
+      colTmp[ci + 2] = Math.max(0, c[2] + (hash2(px * 8.7, pz * 8.9) - 0.5) * 0.08);
+      colTmp[ci + 3] = 1;
+      kept++;
+    };
 
     for (let x = 0; x < res; x++) {
       for (let z = 0; z < res; z++) {
-        const px = cx + (x + Math.random()) * cell - size / 2;
-        const pz = cz + (z + Math.random()) * cell - size / 2;
+        const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
+        const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
         if (y < 0.6) { continue; }
-
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.7) { continue; }
 
-        const clump = fbm2(px / 13, pz / 13);
-        const lowland = smoothstep(1.5, 13, y);            // 0 at the shore → 1 on the true lowland
-        const alt = 1 - smoothstep(90, 140, y);            // fade out toward the rocky uplands
-        const slopeFac = 1 - slope * 0.7;
-        const tuft = smoothstep(0.62, 0.88, clump);
-        const coreF = smoothstep(0.80, 0.96, clump);
-        const clumpD = tuft * (0.9 + 0.7 * coreF);
-        const beachD = Math.max(clumpD, 0.008);
-        const lushD = Math.max(0.78, clumpD);
-        const density = (beachD + (lushD - beachD) * lowland) * alt * slopeFac * this.densityMul;
-        if (Math.random() > density) { continue; }
+        // Tight-bush clustering: most of the terrain is TOTALLY barren, with rare small bushes that are
+        // very densely packed at their heart. Two gates, both with HIGH thresholds so they sit above
+        // fbm2's ~0.5 cluster — meaning they read 0 across most of the map and only switch on in the rare
+        // lush spots. No base floor → between bushes (even inside a lush region) there is zero grass.
+        const region = fbm2(px / 45 + 120, pz / 45 - 60);             // where bushes are ALLOWED at all
+        const bush   = fbm2(px / 5 + 31, pz / 5 + 17);                // small scale → small, tight bushes
+        const regionGate = step01(0.54, 0.64, region);                // ~0 almost everywhere → 1 in rare lush spots
+        const core = step01(0.56, 0.80, bush);                        // 0 between bushes → 1 at a bush heart
+        const coreD = core * core * core;                             // cubed: concentrates hard into the heart
+        const lowland = smoothstep(1.5, 13, y);                       // shore → lowland
+        const alt = 1 - smoothstep(90, 140, y);                       // fade out toward the rocky uplands
+        const envFac = lowland * alt * (1 - slope * 0.7) * this.densityMul;
 
-        const s = 0.95 + Math.random() * 0.85;   // ~0.95–1.8 m tall
-        this.compose(tmp, kept++, px, y, pz, s * W, s, s);   // widened across (X); height stays natural
-        if (coreF > 0.35 && Math.random() < coreF * 0.85) {
-          const s2 = 0.85 + Math.random() * 0.75;
-          this.compose(tmp, kept++, px + (Math.random() - 0.5) * cell * 0.8, y, pz + (Math.random() - 0.5) * cell * 0.8, s2 * W, s2, s2);
+        // No meadow base: density is purely region × bush-core, so barren gaps are genuinely empty and the
+        // only grass is the bush hearts (which then get heavily over-packed below).
+        const density = coreD * regionGate * envFac;
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > density) { continue; }
+
+        // Deal each accepted cell to one clump variant.
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NCLUMPS) !== variant) { continue; }
+
+        place(px, pz, y);
+
+        // Burst the bush heart: pack many clumps into a TIGHT tuft (~BUSH_R radius, a few feet across), so
+        // the few bushes that exist read as dense balls of grass. Blade count scales with how deep into
+        // the core we are — fringe cells get a sparse handful, the very heart gets the full BURST.
+        const blades = Math.floor(3 + coreD * (BURST - 3));         // 3 … BURST clumps per bush
+        for (let b = 1; b < blades && kept < cap; b++) {
+          const ang = hash2(px * (3.1 + b * 0.7) + b * 1.7, pz * (2.3 + b * 0.5) - b * 2.9) * Math.PI * 2;
+          const rad = Math.sqrt(hash2(px * (5.7 + b) + 3, pz * (1.9 + b) - 3)) * BUSH_R;  // sqrt → even fill
+          const jx = px + Math.cos(ang) * rad;
+          const jz = pz + Math.sin(ang) * rad;
+          place(jx, jz, getY(jx, jz));
         }
       }
     }
-    return this.finish(tmp, kept);
+    return this.finish(matTmp, kept, colTmp);
   }
 
   // ── Quality control (graphics presets / settings menu) ──────────────────────
@@ -615,13 +698,18 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 0.25 || y > 7) { continue; }              // beach + low dune band only
+        if (y < 0.25 || y > 150) { continue; }            // beach band → all the way up the rocky uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.85) { continue; }
 
-        // Scattered, with subtle clusters (rocks gather a little, slightly sparser between).
+        // Scattered, with subtle clusters (rocks gather a little, slightly sparser between). Two altitude
+        // bands: a denser beach/dune shelf (≤7 m), then a thinner but ever-present upland scatter that
+        // actually picks up again on the rocky higher ground.
         const clump = fbm2(px / 15, pz / 15);
-        const dens = (0.022 + 0.24 * smoothstep(0.52, 0.84, clump)) * (1 - slope * 0.4) * this.densityMul;
+        const beach = 1 - smoothstep(7, 14, y);                       // 1 on the sand shelf → 0 just inland
+        const upland = smoothstep(12, 45, y);                         // fades the upland scatter in past the dunes
+        const bandMul = 0.45 + 0.55 * beach + 0.6 * upland;           // dip in the mid-slope, rocks at both ends
+        const dens = (0.022 + 0.24 * smoothstep(0.52, 0.84, clump)) * bandMul * (1 - slope * 0.4) * this.densityMul;
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
@@ -674,7 +762,7 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 0.25 || y > 6) { continue; }              // sand / low beach band
+        if (y < 0.25 || y > 7) { continue; }              // sand / low beach band (up to the sand line)
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.75) { continue; }
 

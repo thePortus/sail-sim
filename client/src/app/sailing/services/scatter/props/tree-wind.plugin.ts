@@ -24,11 +24,19 @@ export class TreeWindPlugin extends MaterialPluginBase {
    *  base oscillation speed, wind clock (seconds). */
   static readonly WIND = { dirX: 0, dirZ: 1, branchAmp: 0.35, leafAmp: 0.10, speed: 1.1, time: 0 };
 
-  private readonly flutter: boolean;
+  private readonly swayStart: number;   // object-space height where sway begins (root)
+  private readonly swayFull: number;    // …and where it reaches full (canopy / blade tip)
+  private readonly ampScale: number;    // per-material multiplier on the shared branch/leaf amplitudes
 
-  constructor(material: Material, flutter = false) {
+  /** @param opts.flutter add the fast leaf-flutter term. swayStart/swayFull tune the height band the
+   *  sway weight ramps over (beech ≈ 1.5→8 m; grass clumps ≈ 0→0.9 m). ampScale scales the shared
+   *  amplitudes per material (grass sways less in absolute metres than a whole beech). */
+  constructor(material: Material, opts: { flutter?: boolean; swayStart?: number; swayFull?: number; ampScale?: number } = {}) {
+    const flutter = opts.flutter ?? false;
     super(material, 'TreeWind', 216, flutter ? { TREE_WIND: true, TREE_FLUTTER: true } : { TREE_WIND: true });
-    this.flutter = flutter;
+    this.swayStart = opts.swayStart ?? 1.5;
+    this.swayFull = opts.swayFull ?? 8.0;
+    this.ampScale = opts.ampScale ?? 1.0;
     this._enable(true);
   }
 
@@ -39,13 +47,15 @@ export class TreeWindPlugin extends MaterialPluginBase {
     return { ubo: [
       { name: 'treeWind', size: 4, type: 'vec4' },   // dirX, dirZ, branchAmp, time
       { name: 'treeLeaf', size: 2, type: 'vec2' },   // leafAmp, speed
+      { name: 'treeBand', size: 2, type: 'vec2' },   // sway height band: start, full
     ] };
   }
 
   override bindForSubMesh(uniformBuffer: UniformBuffer, _scene: Scene, _engine: AbstractEngine, _subMesh: SubMesh): void {
     const w = TreeWindPlugin.WIND;
-    uniformBuffer.updateFloat4('treeWind', w.dirX, w.dirZ, w.branchAmp, w.time);
-    uniformBuffer.updateFloat2('treeLeaf', w.leafAmp, w.speed);
+    uniformBuffer.updateFloat4('treeWind', w.dirX, w.dirZ, w.branchAmp * this.ampScale, w.time);
+    uniformBuffer.updateFloat2('treeLeaf', w.leafAmp * this.ampScale, w.speed);
+    uniformBuffer.updateFloat2('treeBand', this.swayStart, this.swayFull);
   }
 
   override getCustomCode(shaderType: string, shaderLanguage?: ShaderLanguage): Nullable<{ [point: string]: string }> {
@@ -60,7 +70,7 @@ export class TreeWindPlugin extends MaterialPluginBase {
   private static readonly GLSL = `
     #ifdef INSTANCES
     #ifdef TREE_WIND
-      float tW     = smoothstep(1.5, 8.0, positionUpdated.y);
+      float tW     = smoothstep(treeBand.x, treeBand.y, positionUpdated.y);
       float tPhase = (positionUpdated.x - positionUpdated.z) * 0.5;
       float tTree  = (world3.x + world3.z) * 0.15;
       float tT     = treeWind.w * treeLeaf.y;
@@ -85,7 +95,7 @@ export class TreeWindPlugin extends MaterialPluginBase {
   private static readonly WGSL = `
     #ifdef INSTANCES
     #ifdef TREE_WIND
-      let tW     = smoothstep(1.5, 8.0, positionUpdated.y);
+      let tW     = smoothstep(uniforms.treeBand.x, uniforms.treeBand.y, positionUpdated.y);
       let tPhase = (positionUpdated.x - positionUpdated.z) * 0.5;
       let tTree  = (vertexInputs.world3.x + vertexInputs.world3.z) * 0.15;
       let tT     = uniforms.treeWind.w * uniforms.treeLeaf.y;

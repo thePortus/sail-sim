@@ -8,6 +8,7 @@ import { SceneService } from '../../services/scene.service';
 import { OceanService } from '../../services/ocean.service';
 import { OceanFFTEngine } from '../../services/ocean-fft-engine.service';
 import { ScatterService } from '../../services/scatter/scatter.service';
+import { BirdService } from '../../services/bird.service';
 
 /**
  * Settings panel — opened from the pause menu's "Settings" button. Houses all
@@ -79,6 +80,17 @@ import { ScatterService } from '../../services/scatter/scatter.service';
                  class="q-slider" />
           <div class="q-ticks"><span>Off</span><span>Low</span><span>Med</span><span>High</span><span>Ultra</span></div>
           <div class="q-hint">Coastal grass density + draw distance. Lower is faster — foliage is GPU-heavy.</div>
+
+          <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">Wildlife</span>
+            <span class="q-value">{{ wildlifeLabels[wildlifeQuality] }}</span>
+          </div>
+          <input type="range" min="0" max="4" step="1"
+                 [value]="wildlifeQuality"
+                 (input)="onWildlifeQuality($event)"
+                 class="q-slider" />
+          <div class="q-ticks"><span>Off</span><span>Low</span><span>Med</span><span>High</span><span>Ultra</span></div>
+          <div class="q-hint">Coastal bird flocks near land. Off removes them entirely. Higher = more flocks, spawning faster.</div>
 
           <div class="q-row" style="margin-top:0.7rem">
             <span class="q-label">Anti-aliasing</span>
@@ -217,15 +229,18 @@ export class SettingsMenuComponent {
   private readonly ocean    = inject(OceanService);
   private readonly oceanFft = inject(OceanFFTEngine);
   private readonly scatter  = inject(ScatterService);
+  private readonly birds    = inject(BirdService);
 
   readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
   readonly cloudLabels  = ['Low', 'Medium', 'High', 'Ultra'];
   readonly aaLabels     = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
   readonly grassLabels  = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
+  readonly wildlifeLabels = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
 
   shadowQuality = this.terrain.getShadowQuality();
   cloudQuality  = this.cloudSvc.getCloudQuality();
   grassQuality  = this.scatter.getScatterQuality();
+  wildlifeQuality = this.birds.getWildlifeQuality();
   aaQuality     = this.sceneSvc.getAaQuality();
   renderScale   = this.sceneSvc.getRenderScale();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
@@ -239,14 +254,14 @@ export class SettingsMenuComponent {
   // drops the selection to "Custom" (activePreset = null).
   readonly presetNames = ['Potato', 'Low', 'Medium', 'High', 'Ultra'] as const;
   private readonly PRESETS: Record<string, {
-    render: number; shadows: number; clouds: number; aa: number; grass: number;
+    render: number; shadows: number; clouds: number; aa: number; grass: number; wildlife: number;
     reflections: boolean; transparency: boolean;
   }> = {
-    Potato: { render: 0.50, shadows: 0, clouds: 0, aa: 0, grass: 0, reflections: false, transparency: false },
-    Low:    { render: 0.65, shadows: 1, clouds: 0, aa: 1, grass: 1, reflections: false, transparency: false },
-    Medium: { render: 0.80, shadows: 2, clouds: 1, aa: 1, grass: 2, reflections: false, transparency: true  },
-    High:   { render: 1.00, shadows: 2, clouds: 2, aa: 2, grass: 3, reflections: true,  transparency: true  },
-    Ultra:  { render: 1.00, shadows: 3, clouds: 3, aa: 3, grass: 4, reflections: true,  transparency: true  },
+    Potato: { render: 0.50, shadows: 0, clouds: 0, aa: 0, grass: 0, wildlife: 0, reflections: false, transparency: false },
+    Low:    { render: 0.65, shadows: 1, clouds: 0, aa: 1, grass: 1, wildlife: 1, reflections: false, transparency: false },
+    Medium: { render: 0.80, shadows: 2, clouds: 1, aa: 1, grass: 2, wildlife: 2, reflections: false, transparency: true  },
+    High:   { render: 1.00, shadows: 2, clouds: 2, aa: 2, grass: 3, wildlife: 3, reflections: true,  transparency: true  },
+    Ultra:  { render: 1.00, shadows: 3, clouds: 3, aa: 3, grass: 4, wildlife: 4, reflections: true,  transparency: true  },
   };
   activePreset: string | null = localStorage.getItem('ignis_graphics_preset');
 
@@ -282,6 +297,11 @@ export class SettingsMenuComponent {
     this.scatter.setScatterQuality(this.grassQuality);
     this.markCustom();
   }
+  onWildlifeQuality(e: Event): void {
+    this.wildlifeQuality = +(e.target as HTMLInputElement).value;
+    this.birds.setWildlifeQuality(this.wildlifeQuality);
+    this.markCustom();
+  }
   onAaQuality(e: Event): void {
     this.aaQuality = +(e.target as HTMLInputElement).value;
     this.sceneSvc.setAaQuality(this.aaQuality);
@@ -310,6 +330,7 @@ export class SettingsMenuComponent {
     this.shadowQuality = p.shadows;       this.terrain.setShadowQuality(p.shadows);
     this.cloudQuality = p.clouds;         this.cloudSvc.setCloudQuality(p.clouds);
     this.grassQuality = p.grass;          this.scatter.setScatterQuality(p.grass);
+    this.wildlifeQuality = p.wildlife;    this.birds.setWildlifeQuality(p.wildlife);
     this.aaQuality = p.aa;                this.sceneSvc.setAaQuality(p.aa);
     this.reflectionsOn = p.reflections;   this.ocean.setReflectionsEnabled(p.reflections);
     this.transparencyOn = p.transparency; this.ocean.setWaterTransparencyEnabled(p.transparency);

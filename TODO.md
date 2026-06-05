@@ -2,8 +2,10 @@
 
 # General or Current TODO Items
 
+* make sure asset scattering of non imposters actually follows landscape... noticing I only see rocks and driftwood right near waterline
 * clouds don't move so much as jitter
 * AO problem still affects sails
+* check landscape hit detection... make sure balls don't go through land
 * switching from geometry to clip map raised all the shallows to super shallow on many different maps
 * fix boat back windows bleeding through
 * fix no boat transparency in deep water
@@ -11,6 +13,7 @@
 * add full sinking & capsize animation
 * made cannon elevation aiming smooth and by decimals
 * persistent logoff locations
+* tidal pull?
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
@@ -43,10 +46,3 @@
 * encrypt websocket server? wss instead of ws?
 
 # TODO Items by Module
-
-Amazing... just a few bugs to clean up....
-
-1. I can see the reflection map of the water THROUGH the boat (see screenshot)... so I can see what looks like it would be the ripples of the waves behind the boat.. except I am seeing them through the boat. If I am near the shoreline, I can see the shoreline through the boat
-2. Possibly tied to issues with seeing through the boat mentioned above.. but when I zoom way out, the boat goes very dark, sails and hulls. Unnaturally so.
-3. I still see weird very blue shadows cast by the boat and shoreline when I am in the shallows... which you suspected earlier, was environment mapping
-4. Raindrops look weird now... every rain drop animation is evenly spaced and plays at exactly the same time

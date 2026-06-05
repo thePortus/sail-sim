@@ -138,12 +138,16 @@ export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, 
 }
 
 /**
- * Load a GEOMETRY-ONLY scatter GLB (rocks now), assign the SHARED material, and keep its baked-AO
- * vertex colour ON (`useVertexColors = true` — COLOR_0 multiplies albedo, the opposite of the trees,
- * and it avoids the WebGPU colour-attribute issue entirely). Opaque (no alpha-test). Normals/tangents
- * left untouched. Returns a hidden, thin-instanceable base mesh, or null on failure.
+ * Load a GEOMETRY-ONLY scatter GLB (rocks / driftwood / grass), assign the SHARED material, and return
+ * a hidden, thin-instanceable base mesh. `vertexColors` controls how COLOR_0 is treated:
+ *  - true (rocks/driftwood): baked AO that multiplies albedo (the opposite of the trees, and it avoids
+ *    the WebGPU colour-attribute issue entirely),
+ *  - false (grass): COLOR_0 is WIND data, NOT colour — keep it off so it can't tint the blades.
+ * Opaque (no alpha-test). Normals/tangents left untouched. Returns null on failure.
  */
-export async function loadScatterGeometry(scene: Scene, file: string, name: string, material: Material): Promise<Mesh | null> {
+export async function loadScatterGeometry(
+  scene: Scene, file: string, name: string, material: Material, vertexColors = true,
+): Promise<Mesh | null> {
   try {
     const container = await loadContainer(scene, file);
     const entries = container.instantiateModelsToScene((n) => n, false);
@@ -157,12 +161,27 @@ export async function loadScatterGeometry(scene: Scene, file: string, name: stri
     mesh.name = name;
     mesh.isVisible = false;
     mesh.material = material;
-    mesh.useVertexColors = true;     // COLOR_0 = baked AO, multiplies albedo
+    mesh.useVertexColors = vertexColors;
     return mesh;
   } catch (err) {
     console.warn(`[scatter] loadScatterGeometry failed: ${file}`, err);
     return null;
   }
+}
+
+/**
+ * Shared grass material — matte, DOUBLE-SIDED (blades are thin geometry seen from both sides), lit by
+ * the base→tip gradient albedo (UV V = base→tip). No normal map, no alpha (opaque blades → no sort
+ * cost). COLOR_0 is wind data, so the mesh loads with useVertexColors=false; per-instance tint comes
+ * from the thin-instance colour buffer.
+ */
+export function buildGrassMaterial(scene: Scene, name: string, albedoFile: string): StandardMaterial {
+  const mat = new StandardMaterial(name, scene);
+  mat.diffuseTexture = new Texture(scatterTextureUrl(albedoFile), scene);
+  mat.specularColor = new Color3(0, 0, 0);   // matte foliage
+  mat.backFaceCulling = false;               // double-sided blades
+  mat.twoSidedLighting = true;               // shade blade backs too (no black undersides)
+  return mat;
 }
 
 /** Drop all cached scatter containers (e.g. on an asset reload). */

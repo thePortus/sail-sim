@@ -18,6 +18,7 @@ import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
+import { BirdService }         from '../sailing/services/bird.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -159,6 +160,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
   private scatterService     = inject(ScatterService);
+  private birdService        = inject(BirdService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -298,6 +300,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
       await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
         if (!location.search.includes('noscatter')) { await this.scatterService.init(); }
+        // Coastal birds — flocks of gulls near land (rafts on the water + circling overhead). Own
+        // service (they move, unlike static scatter). PERF DIAGNOSTIC: ?nobirds skips them.
+        if (!location.search.includes('nobirds')) { await this.birdService.init(); }
       });
 
       // 4. Fetch vessel

@@ -18,6 +18,10 @@ export class PatchManager {
   private readonly queue: Array<{ newLOD: number; patch: IPatch }> = [];
   private readonly computeLodLevel: (patch: IPatch) => number;
   private patchUpdateRate = 1;
+  private _lodTick = 0;
+  /** Re-evaluate distance-based LoD only every Nth frame — a few frames of swap lag is invisible, and the
+   *  per-patch distance scan was running every frame for every layer. */
+  private readonly lodEvalEvery = 4;
 
   /** @param lodFractions per-LoD instance fraction (0..1) — thins distant tiers. Defaults to all 1. */
   constructor(meshesFromLod: Mesh[], computeLodLevel: (patch: IPatch) => number = () => 0, lodFractions?: number[]) {
@@ -44,17 +48,16 @@ export class PatchManager {
   }
 
   update(): void {
-    if (this.meshesFromLod.length > 1) { this.updateLOD(); }
-    else { this.updateQueue(this.patchUpdateRate); }
-  }
-
-  private updateLOD(): void {
-    for (let i = 0; i < this.patches.length; i++) {
-      const [patch, patchLod] = this.patches[i];
-      const newLod = this.computeLodLevel(patch);
-      if (newLod === patchLod) { continue; }
-      this.queue.push({ newLOD: newLod, patch });
-      this.patches[i] = [patch, newLod];
+    // Multi-LoD layers: re-scan distances only every Nth frame; single-LoD layers never scan. Either way,
+    // drain the (rate-limited) swap queue every frame so queued LoD changes still stream in smoothly.
+    if (this.meshesFromLod.length > 1 && (this._lodTick++ % this.lodEvalEvery) === 0) {
+      for (let i = 0; i < this.patches.length; i++) {
+        const [patch, patchLod] = this.patches[i];
+        const newLod = this.computeLodLevel(patch);
+        if (newLod === patchLod) { continue; }
+        this.queue.push({ newLOD: newLod, patch });
+        this.patches[i] = [patch, newLod];
+      }
     }
     this.updateQueue(this.patchUpdateRate);
   }

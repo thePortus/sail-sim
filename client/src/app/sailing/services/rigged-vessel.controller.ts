@@ -82,7 +82,7 @@ export class SloopController {
   // against the rendered model; centralized here so tuning is a one-line change.
   private readonly BOOM_SWING_AXIS = Vector3.Up();   // ship-vertical swing axis (parent frame)
   private readonly WHEEL_MAX_RAD   = Math.PI * 2;    // ~one turn lock-to-lock
-  private readonly WHEEL_AXIS      = Vector3.Right(); // wheel spins about its local X
+  private readonly WHEEL_AXIS      = Vector3.Up();   // wheel spins about its OWN axle = local Y (re-aimed in the GLB)
   private readonly RUDDER_MAX_RAD  = 35 * Math.PI / 180; // ±35° hard-over (from manifest)
   private readonly RUDDER_SIGN     = 1;               // deflect direction (matches helm/turn)
   // Constant correction for the flag's rest bearing (the flag's rest streams along the
@@ -214,7 +214,14 @@ export class SloopController {
   setRudder(t: number): void {
     const a = Math.max(-1, Math.min(1, t));
     this.composeSpin('B_Rudder', Vector3.Up(), a * this.RUDDER_MAX_RAD * this.RUDDER_SIGN);
-    this.composeSpin('B_Wheel', this.WHEEL_AXIS, a * this.WHEEL_MAX_RAD);
+    // Wheel: spin about the bone's OWN re-aimed axle (local Y), composing the spin in the bone's LOCAL
+    // frame (rest ⊗ spin) — unlike the parent-frame composeSpin used for the boom/gaff/rudder. The GLB now
+    // weights only the disc (not the stand) to B_Wheel, so just the wheel turns.
+    const w = this.nodes.get('B_Wheel');
+    const wRest = this.restQ.get('B_Wheel');
+    if (w && wRest) {
+      w.rotationQuaternion = wRest.multiply(Quaternion.RotationAxis(this.WHEEL_AXIS, a * this.WHEEL_MAX_RAD));
+    }
   }
 
   /** 0 = square (running) .. 1 = fully braced (close-hauled). Sets the yard-trim TARGET;

@@ -137,6 +137,9 @@ export class ScatterService {
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
   private densityMul = 1;               // grass acceptance multiplier (set from quality)
   private enabled = true;               // false → no grass built at all (Potato)
+  // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
+  // patches built. _patchPending = still filling in this cell (build cap not yet drained).
+  private _lastCx = NaN; private _lastCz = NaN; private _patchPending = true;
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -222,6 +225,7 @@ export class ScatterService {
     clearScatterCache();
     this.teardownLayers();
     await this.buildLayers(scene);
+    this._lastCx = NaN; this._patchPending = true;   // fresh layers → rebuild the grid
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
   }
@@ -504,6 +508,13 @@ export class ScatterService {
     const cz = Math.round(cam.position.z / this.PATCH);
     const R = this.RADIUS;
 
+    // The patch grid only changes when the camera crosses into a new 40 m cell. While it's parked in the
+    // same cell with everything built, there's nothing to add or cull — so skip the whole (2R+1)²×layers
+    // scan + per-patch cull entirely (the common case, since the camera moves far less than a cell/frame).
+    const cellChanged = cx !== this._lastCx || cz !== this._lastCz;
+    if (!cellChanged && !this._patchPending) { return; }
+    this._lastCx = cx; this._lastCz = cz;
+
     let built = 0;
     for (let ix = cx - R; ix <= cx + R && built < this.MAX_BUILDS_PER_FRAME; ix++) {
       for (let iz = cz - R; iz <= cz + R && built < this.MAX_BUILDS_PER_FRAME; iz++) {
@@ -520,14 +531,19 @@ export class ScatterService {
         }
       }
     }
+    // Hit the per-frame build cap → more patches still to fill in; keep scanning next frame.
+    this._patchPending = built >= this.MAX_BUILDS_PER_FRAME;
 
-    const cull = R + 1;
-    for (const l of this.layers) {
-      for (const [key, p] of l.patches) {
-        const c = key.split(',');
-        if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
-          if (p) { l.manager.removePatch(p); p.dispose(); }
-          l.patches.delete(key);
+    // Cull only when the cell moved (the cull boundary is relative to it) — otherwise nothing left the ring.
+    if (cellChanged) {
+      const cull = R + 1;
+      for (const l of this.layers) {
+        for (const [key, p] of l.patches) {
+          const c = key.split(',');
+          if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
+            if (p) { l.manager.removePatch(p); p.dispose(); }
+            l.patches.delete(key);
+          }
         }
       }
     }
@@ -675,6 +691,7 @@ export class ScatterService {
       for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
       l.patches.clear();
     }
+    this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to rebuild the grid
     if (this.enabled) { this.ensurePatches(); }
   }
 

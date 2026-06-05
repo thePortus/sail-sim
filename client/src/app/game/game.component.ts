@@ -21,6 +21,8 @@ import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
 import { DolphinService }      from '../sailing/services/dolphin.service';
+import { SeaweedService }      from '../sailing/services/seaweed.service';
+import { ReedService }         from '../sailing/services/reed.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -165,6 +167,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
   private dolphinService     = inject(DolphinService);
+  private seaweedService     = inject(SeaweedService);
+  private reedService        = inject(ReedService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -311,6 +315,10 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         if (!location.search.includes('nobirds')) { await this.birdService.init(); }
         // A single pod of dolphins that frolics around the boat. PERF DIAGNOSTIC: ?nodolphins skips it.
         if (!location.search.includes('nodolphins')) { await this.dolphinService.init(); }
+        // Underwater seaweed clumps, shallows-only, seen through the shallow refraction. ?noseaweed skips.
+        if (!location.search.includes('noseaweed')) { await this.seaweedService.init(); }
+        // Shoreline reeds — rooted in the water's edge, tops peeking above the surface. ?noreeds skips.
+        if (!location.search.includes('noreeds')) { await this.reedService.init(); }
       });
 
       // 4. Fetch vessel
@@ -427,6 +435,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cloudService.dispose();
     this.oceanAudioService.dispose();
     this.dolphinService.dispose();
+    this.seaweedService.dispose();
+    this.reedService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();

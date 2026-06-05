@@ -17,7 +17,7 @@
 
 import {
   Scene, Camera, PostProcess, Effect, Texture, RawTexture,
-  Vector2, Vector3, Matrix, Constants,
+  Vector2, Vector3, Vector4, Matrix, Constants,
 } from '@babylonjs/core';
 import { ShaderStore } from '@babylonjs/core/Engines/shaderStore';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
@@ -54,6 +54,14 @@ uniform sampler2D weatherSampler;
 // Stores (eyeZ - nearZ) / (farZ - nearZ) in the R channel.
 uniform sampler2D depthSampler;
 
+// Terrain heightfield (R32F metres) for cloud-vs-mountain occlusion — marched directly along the ray
+// (the depth renderer can't see the clipmap's vertex displacement). bounds = (minX, minZ, sizeX, sizeZ).
+uniform sampler2D terrainHeightSampler;
+uniform vec4  terrainBounds;
+uniform vec2  terrainTexSize;
+uniform float terrainMaxAlt;
+uniform float terrainHasField;
+
 // Camera.
 uniform mat4  invViewProjection;
 uniform vec3  cameraPosition;
@@ -75,8 +83,9 @@ uniform float cloudType;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 =
 
 // Wind / time.
 uniform float time;
-uniform vec2  windDir;
-uniform float windSpeed;
+// Accumulated horizontal cloud drift (metres), integrated on the CPU so wind changes never jump the
+// offset. (Replaces wind*time, which scaled every wind tweak by the ever-growing time → jitter.)
+uniform vec2  cloudDrift;
 
 // Clip planes.
 uniform float nearZ;
@@ -186,11 +195,16 @@ float vc_mieFit(float costh) {
     return dot(expValues, expValWeight);
 }
 
-// Ray/sphere intersection (returns nearest positive hit distance, or -1.0).
-float vc_intersectSphere(vec3 origin, vec3 dir, vec3 spherePos, float sphereRad) {
-    vec3  oc = origin - spherePos;
-    float b  = 2.0 * dot(dir, oc);
-    float c  = dot(oc, oc) - sphereRad * sphereRad;
+// Ray vs concentric cloud shell at altitude h, numerically stable at planetary radius. The shell is
+// centred at (camera.x, -EARTH_RADIUS, camera.z), so oc = (0, origin.y + R, 0). The naive
+// c = |oc|^2 - (R+h)^2 squares ~2e6 into ~4e12 and subtracts two such — float32 cancellation that
+// jitters the hit distance as the camera bobs (all clouds vibrate in/out). Factor it as the
+// difference of squares using the SMALL altitude h, so no R^2 intermediate ever forms.
+float vc_intersectShell(vec3 origin, vec3 dir, float h) {
+    float R  = EARTH_RADIUS;
+    float L  = origin.y + R;                              // |oc| (oc points straight up)
+    float b  = 2.0 * (L * dir.y);                         // 2*dot(dir, oc), oc = (0, L, 0)
+    float c  = (origin.y - h) * (origin.y + 2.0 * R + h); // |oc|^2 - (R+h)^2, no R^2 term
     float disc = b * b - 4.0 * c;
     if (disc < 0.0) return -1.0;
     float q  = (-b + ((b < 0.0) ? -sqrt(disc) : sqrt(disc))) / 2.0;
@@ -240,7 +254,7 @@ float vc_getDensity(vec3 p, float lod) {
     // match the game's wind convention (same sign the prior cloud system used). Plus a slow,
     // wind-independent vertical "boil" so clouds evolve in place, not just translate. KNOBS:
     // drift rate 0.08, boil rate 3.0.
-    vec2  wd    = windDir * (time * windSpeed * 0.08);
+    vec2  wd    = cloudDrift;
     vec2  pzx   = p.zx + wd.yx;
     vec3  drift = vec3(wd.x, 0.0, wd.y);
     float evo   = time * 3.0;
@@ -314,9 +328,8 @@ void main(void) {
     // Spherical cloud shell: the camera sails well below the deck, so each upward ray
     // exits the inner shell (cloudBase) at tNear and the outer shell (cloudTop) at tFar.
     // Near-horizon rays graze for huge distances and are fogged out anyway — skip them.
-    vec3  shellCenter = vec3(cameraPosition.x, -EARTH_RADIUS, cameraPosition.z);
-    float tNear = vc_intersectSphere(cameraPosition, rd, shellCenter, EARTH_RADIUS + cloudBase);
-    float tFar  = vc_intersectSphere(cameraPosition, rd, shellCenter, EARTH_RADIUS + cloudTop);
+    float tNear = vc_intersectShell(cameraPosition, rd, cloudBase);
+    float tFar  = vc_intersectShell(cameraPosition, rd, cloudTop);
 
     if (rd.y < 0.02 || tNear < 0.0 || tFar <= tNear) {
         gl_FragColor = scene;
@@ -342,6 +355,38 @@ void main(void) {
             return;
         }
         tFar = min(tFar, geoT);
+    }
+
+    // Terrain occlusion: march the heightfield along the ray and ask "is a mountain in the way?".
+    // If terrain rises above the ray before the cloud, clip the slab to it (or skip the cloud).
+    // Bounded: stop once an ascending ray climbs above the tallest terrain. texelFetch (nearest) —
+    // the R32F heightfield isn't hardware-filterable on WebGPU.
+    if (terrainHasField > 0.5) {
+        float tt = 1.0;
+        for (int it = 0; it < 160; it++) {
+            vec3 pT = cameraPosition + rd * tt;
+            if ((pT.y > terrainMaxAlt + 5.0 && rd.y >= 0.0) || tt > tFar) break;
+            // Bilinear terrain height (smooths the 24 m texels → no blocky silhouette).
+            vec2 uvT = vec2((pT.x - terrainBounds.x) / terrainBounds.z,
+                            (terrainBounds.y + terrainBounds.w - pT.z) / terrainBounds.w);
+            float hT = -1.0e4;
+            if (uvT.x >= 0.0 && uvT.x <= 1.0 && uvT.y >= 0.0 && uvT.y <= 1.0) {
+                vec2 tc = uvT * terrainTexSize - 0.5; vec2 fr = fract(tc);
+                ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(terrainTexSize) - 1;
+                float h00 = texelFetch(terrainHeightSampler, clamp(i0,            ivec2(0), mx), 0).r;
+                float h10 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+                float h01 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+                float h11 = texelFetch(terrainHeightSampler, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+                hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
+            }
+            float gap = pT.y - hT;                                  // clearance above the terrain
+            if (gap < 1.0) {                                        // grazed/hit the surface
+                if (tt <= tNear) { gl_FragColor = scene; return; }
+                tFar = min(tFar, tt);
+                break;
+            }
+            tt += max(25.0, gap * 0.5);                             // sphere-trace: step ∝ clearance
+        }
     }
 
     // Ray march.
@@ -467,8 +512,16 @@ var weatherSampler: texture_2d<f32>;
 var depthSamplerSampler: sampler;
 var depthSampler: texture_2d<f32>;
 
+// Terrain heightfield (R32F metres) for cloud-vs-mountain occlusion (marched along the ray).
+var terrainHeightSamplerSampler: sampler;
+var terrainHeightSampler: texture_2d<f32>;
+
 uniform invViewProjection: mat4x4f;
 uniform cameraPosition: vec3f;
+uniform terrainBounds: vec4f;
+uniform terrainTexSize: vec2f;
+uniform terrainMaxAlt: f32;
+uniform terrainHasField: f32;
 uniform cameraForward: vec3f;
 uniform sunDirection: vec3f;
 uniform sunColor: vec3f;
@@ -481,8 +534,8 @@ uniform cloudDensity: f32;
 uniform absorptionCoeff: f32;
 uniform cloudType: f32;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 = towering cumulonimbus
 uniform time: f32;
-uniform windDir: vec2f;
-uniform windSpeed: f32;
+// Accumulated horizontal cloud drift (metres), integrated on the CPU so wind changes never jump it.
+uniform cloudDrift: vec2f;
 uniform nearZ: f32;
 uniform farZ: f32;
 uniform marchSteps: i32;
@@ -569,10 +622,14 @@ fn vc_mieFit(costh: f32) -> f32 {
     return dot(expValues, expValWeight);
 }
 
-fn vc_intersectSphere(origin: vec3f, dir: vec3f, spherePos: vec3f, sphereRad: f32) -> f32 {
-    let oc = origin - spherePos;
-    let b  = 2.0 * dot(dir, oc);
-    let c  = dot(oc, oc) - sphereRad * sphereRad;
+// Stable ray-vs-concentric-shell at altitude h (see GLSL note): factor c as the difference of
+// squares with the SMALL altitude so no R^2 (~4e12) intermediate forms and float cancellation can't
+// jitter the hit distance as the camera bobs.
+fn vc_intersectShell(origin: vec3f, dir: vec3f, h: f32) -> f32 {
+    let R  = EARTH_RADIUS;
+    let L  = origin.y + R;
+    let b  = 2.0 * (L * dir.y);
+    let c  = (origin.y - h) * (origin.y + 2.0 * R + h);
     let disc = b * b - 4.0 * c;
     if (disc < 0.0) { return -1.0; }
     let q  = (-b + select(sqrt(disc), -sqrt(disc), b < 0.0)) / 2.0;
@@ -611,7 +668,7 @@ fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
     // Storm factor (0.40 calm → 0.95 cumulonimbus). See GLSL twin for the commentary.
     let storm = smoothstep(0.40, 0.95, uniforms.cloudType);
 
-    let wd    = uniforms.windDir * (uniforms.time * uniforms.windSpeed * 0.08);
+    let wd    = uniforms.cloudDrift;
     let pzx   = p.zx + wd.yx;
     let drift = vec3f(wd.x, 0.0, wd.y);
     let evo   = uniforms.time * 3.0;
@@ -671,9 +728,8 @@ fn main(input: FragmentInputs)->FragmentOutputs {
 
     // Spherical cloud shell (see GLSL twin): upward rays exit the inner shell (cloudBase)
     // at tNear and the outer shell (cloudTop) at tFar; near-horizon rays are skipped.
-    let shellCenter = vec3f(uniforms.cameraPosition.x, -EARTH_RADIUS, uniforms.cameraPosition.z);
-    var tNear = vc_intersectSphere(uniforms.cameraPosition, rd, shellCenter, EARTH_RADIUS + uniforms.cloudBase);
-    var tFar  = vc_intersectSphere(uniforms.cameraPosition, rd, shellCenter, EARTH_RADIUS + uniforms.cloudTop);
+    var tNear = vc_intersectShell(uniforms.cameraPosition, rd, uniforms.cloudBase);
+    var tFar  = vc_intersectShell(uniforms.cameraPosition, rd, uniforms.cloudTop);
 
     if (rd.y < 0.02 || tNear < 0.0 || tFar <= tNear) {
         fragmentOutputs.color = scene_color;
@@ -695,6 +751,37 @@ fn main(input: FragmentInputs)->FragmentOutputs {
             return fragmentOutputs;
         }
         tFar = min(tFar, geoT);
+    }
+
+    // Terrain occlusion: march the heightfield along the ray — clip the cloud where a mountain blocks
+    // it (the depth renderer can't see the clipmap's vertex displacement). textureLoad (nearest).
+    if (uniforms.terrainHasField > 0.5) {
+        var tt: f32 = 1.0;
+        for (var it: i32 = 0; it < 160; it = it + 1) {
+            let pT = uniforms.cameraPosition + rd * tt;
+            if ((pT.y > uniforms.terrainMaxAlt + 5.0 && rd.y >= 0.0) || tt > tFar) { break; }
+            let uvT = vec2f((pT.x - uniforms.terrainBounds.x) / uniforms.terrainBounds.z,
+                            (uniforms.terrainBounds.y + uniforms.terrainBounds.w - pT.z) / uniforms.terrainBounds.w);
+            var hT: f32 = -1.0e4;
+            if (uvT.x >= 0.0 && uvT.x <= 1.0 && uvT.y >= 0.0 && uvT.y <= 1.0) {
+                let tc = uvT * uniforms.terrainTexSize - vec2f(0.5);
+                let fr = fract(tc);
+                let i0 = vec2<i32>(floor(tc));
+                let mx = vec2<i32>(uniforms.terrainTexSize) - vec2<i32>(1, 1);
+                let h00 = textureLoad(terrainHeightSampler, clamp(i0,                  vec2<i32>(0), mx), 0).r;
+                let h10 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), mx), 0).r;
+                let h01 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), mx), 0).r;
+                let h11 = textureLoad(terrainHeightSampler, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), mx), 0).r;
+                hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
+            }
+            let gap = pT.y - hT;
+            if (gap < 1.0) {
+                if (tt <= tNear) { fragmentOutputs.color = scene_color; return fragmentOutputs; }
+                tFar = min(tFar, tt);
+                break;
+            }
+            tt = tt + max(25.0, gap * 0.5);
+        }
     }
 
     let dist      = max(tFar - tNear, 0.0);
@@ -855,6 +942,7 @@ export class VolumetricCloudsPlugin {
   private noisePlaceholder:   RawTexture | null = null;
   private weatherPlaceholder: RawTexture | null = null;
   private depthPlaceholder:   RawTexture | null = null;
+  private terrainPlaceholder: RawTexture | null = null;
 
   // Babylon.js DepthRenderer: stores linear (eye-Z) depth for the scene camera.
   private depthRenderer: DepthRenderer | null = null;
@@ -866,6 +954,18 @@ export class VolumetricCloudsPlugin {
   private noiseDepth = 32;  // number of Z slices
 
   private elapsedSecs = 0;
+  /** Accumulated horizontal cloud drift (metres, XZ). Integrated per-frame from wind so that changing
+   *  the wind never retroactively jumps the offset — the old wind*time form scaled every weather-tick
+   *  wind tweak by the ever-growing time, which showed as jitter in the cloud movement. */
+  private cloudDrift = new Vector2(0, 0);
+  /** Low-pass-filtered frame time (seconds) used to advance ALL cloud animation. The raw engine
+   *  delta swings ~15↔45 ms frame-to-frame (and spikes past 1 s on shader-recompile hitches); feeding
+   *  that straight into the time/drift accumulators made the cloud shape morph + translate by a 3×-
+   *  varying amount each frame, which the eye reads as the whole field jittering / "zooming a teeny
+   *  bit." We diagnosed it by instrumenting every candidate input: only dt moved. An EMA of dt keeps
+   *  the long-run speed identical but makes the per-frame step near-constant, so the judder is gone.
+   *  -1 = uninitialised (seed from the first real frame instead of easing up from 0). */
+  private smoothDt = -1;
   private _enabled    = true;
 
   constructor(
@@ -932,6 +1032,14 @@ export class VolumetricCloudsPlugin {
       this.scene, false, false,
       Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE,
     );
+
+    // Terrain height: a deep negative value (R32F) so the placeholder never registers a hit until the
+    // real heightfield is published. Must be FLOAT to match the terrain texture's textureLoad type.
+    this.terrainPlaceholder = new RawTexture(
+      new Float32Array([-1.0e4]), 1, 1, Constants.TEXTUREFORMAT_R,
+      this.scene, false, false,
+      Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,
+    );
   }
 
   /**
@@ -973,11 +1081,12 @@ export class VolumetricCloudsPlugin {
         'invViewProjection', 'cameraPosition', 'cameraForward',
         'sunDirection', 'sunColor', 'skyColor', 'groundColor',
         'cloudBase', 'cloudTop', 'cloudCoverage', 'cloudDensity', 'absorptionCoeff', 'cloudType',
-        'time', 'windDir', 'windSpeed',
+        'time', 'cloudDrift',
         'nearZ', 'farZ', 'marchSteps', 'lightSteps',
         'noiseSliceDim', 'noiseDepth', 'atlasW', 'atlasH', 'atlasCols',
+        'terrainBounds', 'terrainTexSize', 'terrainMaxAlt', 'terrainHasField',
       ],
-      /* samplers */ ['noiseSampler', 'weatherSampler', 'depthSampler'],
+      /* samplers */ ['noiseSampler', 'weatherSampler', 'depthSampler', 'terrainHeightSampler'],
       /* scale    */ renderScale,
       /* camera   */ this.camera,
       /* samplingMode */ undefined,
@@ -1029,14 +1138,31 @@ export class VolumetricCloudsPlugin {
   // ── Per-frame uniform upload ──────────────────────────────────────────────
 
   private applyCloudUniforms(effect: Effect): void {
-    const dt = this.scene.getEngine().getDeltaTime() / 1000;
+    // Smooth + clamp the frame delta before advancing any animation. Raw getDeltaTime() swings
+    // ~15↔45 ms frame-to-frame and spikes past 1 s on shader-recompile hitches; advancing the cloud
+    // time/drift by that raw value made the field morph + translate unevenly each frame — the
+    // "jitter / teeny zoom" the instrumentation pinned to dt (and nothing else). Clamp out spikes,
+    // then EMA toward the running mean so the per-frame step is near-constant. Long-run speed is
+    // unchanged; only the frame-to-frame judder is removed.
+    const rawDt = Math.min(0.05, Math.max(0, this.scene.getEngine().getDeltaTime() / 1000));
+    this.smoothDt = this.smoothDt < 0 ? rawDt : this.smoothDt + (rawDt - this.smoothDt) * 0.06;
+    const dt = this.smoothDt;
     this.elapsedSecs += dt;
+    // Integrate the drift from the CURRENT wind each frame (matches the old wd = wind*time*0.08 rate),
+    // so a wind change only bends future motion instead of jumping the whole accumulated offset.
+    this.cloudDrift.x += this.windDirection.x * this.windSpeed * 0.08 * dt;
+    this.cloudDrift.y += this.windDirection.z * this.windSpeed * 0.08 * dt;
 
     const sunDir = this.getSunDir();
-    const invVP  = Matrix.Invert(this.scene.getTransformMatrix());
+    // Build the inverse view-projection from THIS camera explicitly. scene.getTransformMatrix() returns
+    // whatever transform was set last in the frame — the ocean reflection/refraction RTTs and the depth
+    // renderer each render with their own camera, so reading the shared matrix here can flicker between
+    // camera states frame-to-frame, which the far clouds amplify into a constant jitter. The camera's
+    // own view×projection is stable and correct.
+    const invVP = Matrix.Invert(this.camera.getViewMatrix().multiply(this.camera.getProjectionMatrix()));
 
     effect.setMatrix('invViewProjection', invVP);
-    effect.setVector3('cameraPosition', this.scene.activeCamera!.position);
+    effect.setVector3('cameraPosition', this.camera.globalPosition);
     // World-space unit vector the camera is looking toward; used to convert
     // linear eye-depth back into a ray-parameter t for occlusion comparison.
     effect.setVector3('cameraForward', this.camera.getDirection(Vector3.Forward()));
@@ -1101,12 +1227,8 @@ export class VolumetricCloudsPlugin {
     effect.setFloat('absorptionCoeff', this.absorptionCoeff);
     effect.setFloat('cloudType',       this.cloudType);
 
-    effect.setFloat('time',      this.elapsedSecs);
-    effect.setVector2('windDir', new Vector2(
-      this.windDirection.x,
-      this.windDirection.z,
-    ));
-    effect.setFloat('windSpeed', this.windSpeed);
+    effect.setFloat('time',        this.elapsedSecs);
+    effect.setVector2('cloudDrift', this.cloudDrift);
 
     effect.setFloat('nearZ', this.camera.minZ);
     effect.setFloat('farZ',  this.camera.maxZ);
@@ -1138,6 +1260,23 @@ export class VolumetricCloudsPlugin {
       'depthSampler',
       depthMap?.isReady() ? depthMap : this.depthPlaceholder,
     );
+
+    // Terrain heightfield (published by TerrainService via scene.metadata) for cloud-vs-mountain
+    // occlusion. Fall back to the deep-negative placeholder (= never occludes) until it's ready.
+    const thf = (this.scene.metadata as { terrainHeightField?: {
+      tex: Texture; bounds: Vector4; texSize: Vector2; maxAlt: number } } | null)?.terrainHeightField;
+    const haveTerrain = !!(thf && thf.tex?.isReady());
+    effect.setTexture('terrainHeightSampler', haveTerrain ? thf!.tex : this.terrainPlaceholder);
+    effect.setFloat('terrainHasField', haveTerrain ? 1 : 0);
+    if (haveTerrain) {
+      effect.setVector4('terrainBounds', thf!.bounds);
+      effect.setVector2('terrainTexSize', thf!.texSize);
+      effect.setFloat('terrainMaxAlt', thf!.maxAlt);
+    } else {
+      effect.setVector4('terrainBounds', new Vector4(0, 0, 1, 1));
+      effect.setVector2('terrainTexSize', new Vector2(1, 1));
+      effect.setFloat('terrainMaxAlt', 0);
+    }
   }
 
   // ── Texture loading ───────────────────────────────────────────────────────
@@ -1313,12 +1452,11 @@ export class VolumetricCloudsPlugin {
    */
   getCloudShadowField(): { drift: Vector2; covThresh: number; cloudBase: number } | null {
     if (!this._enabled) { return null; }
-    const k = this.elapsedSecs * this.windSpeed * 0.08;             // matches the shader's wd
     const st = Math.max(0, Math.min(1, (this.cloudType - 0.40) / (0.95 - 0.40)));
     const storm = st * st * (3 - 2 * st);                           // smoothstep(0.40, 0.95)
     const covThresh = 0.28 - (this.cloudCoverage - 0.5) * 0.5 - storm * 0.05;
     return {
-      drift: new Vector2(this.windDirection.x * k, this.windDirection.z * k),
+      drift: this.cloudDrift.clone(),                               // exact accumulated shader drift
       covThresh,
       cloudBase: this.cloudBaseHeight,
     };
@@ -1340,5 +1478,6 @@ export class VolumetricCloudsPlugin {
     this.noisePlaceholder?.dispose();   this.noisePlaceholder   = null;
     this.weatherPlaceholder?.dispose(); this.weatherPlaceholder = null;
     this.depthPlaceholder?.dispose();   this.depthPlaceholder   = null;
+    this.terrainPlaceholder?.dispose(); this.terrainPlaceholder = null;
   }
 }

@@ -564,15 +564,17 @@ export class SceneService {
     this.pipeline.bloomKernel    = 48;
     this.pipeline.bloomScale     = 0.33;
 
-    // SSAO — bakes contact shadows into corners and crevices of nearby geometry
-    // (mast base, under the boom, beneath deck railings, etc.).  maxZ = 100
-    // zeroes the AO term for any fragment beyond 100 world units from the camera,
-    // so distant islands and ocean are unaffected.  The 0.75 ratio renders the
-    // occlusion buffer at 75 % of screen resolution for a good quality/perf trade.
+    // SSAO — bakes contact shadows into corners and crevices of nearby geometry. NOTE: SSAO can't be
+    // removed outright — doing so reorganizes the WebGPU post chain and pushes the godRays pass past the
+    // 16-sampled-texture limit (black screen). It's kept, but dialed WAY down (strength 0.45, base 0.55)
+    // because the rigged vessel is excluded from the prePass (WebGPU varying budget — see
+    // VesselService.registerMeshesForRendering), so at the boat's pixels SSAO reads the OCEAN/shoreline
+    // BEHIND it and paints their AO (wave ripples + coast-shadow) onto the hull/sails. The low strength
+    // + high base make that bleed a faint wash instead of dark ripples. Proper fix: rejoin the prePass.
     const ssao            = new SSAO2RenderingPipeline('ssao2', this.scene, 0.75, [this.camera]);
     ssao.radius           = 2.0;   // world-space sample radius — tuned to ship-deck scale
-    ssao.totalStrength    = 1.8;   // amplification on the AO term (raise for darker corners)
-    ssao.base             = 0.0;   // 0 = fully dark in 100 %-occluded spots
+    ssao.totalStrength    = 0.45;  // dialed down from 1.8 to minimise the boat-pixel bleed (see note)
+    ssao.base             = 0.55;  // raised from 0 so fully-occluded spots only dim to ~55%, not black
     ssao.samples          = 16;    // 16 gives clean results on modern GPUs
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)

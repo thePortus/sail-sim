@@ -17,8 +17,13 @@ import {
   StandardMaterial,
   Matrix,
   VertexData,
+  RawTexture,
+  Vector2,
+  Vector4,
+  Constants,
 } from '@babylonjs/core';
 import { CustomMaterial } from '@babylonjs/materials';
+import { TerrainClipmap } from './terrain/terrain-clipmap';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds } from '../models';
 import { SceneService } from './scene.service';
@@ -67,6 +72,11 @@ export class TerrainService {
   private oceanService = inject(OceanService);
 
   private manifest: TerrainManifest | null = null;
+  /** Quantized value of the waterline (y = 0); 0 for legacy land-only manifests. See init(). */
+  private waterlineQ = 0;
+  /** True while the terrain renders into the ocean's seabed (refraction) RTT — the ragged-waterline
+   *  discard is switched off there so the revealed seabed stays solid (no clear-colour speckles). */
+  private _inRefractionPass = false;
   private heightfield: Uint16Array | null = null;
 
   // Computed once after chunk load; drives beach grading + underwater depth.
@@ -80,7 +90,6 @@ export class TerrainService {
   } | null = null;
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
-  private _inRefractionPass = false;   // true while the terrain renders into the ocean's seabed RTT
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -115,6 +124,11 @@ export class TerrainService {
       );
 
       this.manifest = manifest;
+      // Quantized waterline level (y = 0). For the signed unified field the waterline sits at a
+      // positive quantized value (minElevation < 0); legacy land-only manifests store ocean as 0.
+      this.waterlineQ = (manifest.minElevation != null && manifest.maxElevation != null)
+        ? Math.round(((0 - manifest.minElevation) / (manifest.maxElevation - manifest.minElevation)) * manifest.quantizationLevels)
+        : 0;
       this.heightfield = new Uint16Array(manifest.width * manifest.height);
       await this.loadAllChunks();
       // Grade beaches and compute coastal distance data while heightfield
@@ -124,6 +138,52 @@ export class TerrainService {
     }
 
     this.buildTerrainMesh();
+
+  }
+
+  // ── Terrain clipmap (camera-centric LoD, GPU displacement + Sobel normals) ───
+  private clipmap: TerrainClipmap | null = null;
+  private clipmapObserver: import('@babylonjs/core').Observer<Scene> | null = null;
+
+  /** Build the camera-centric clipmap and render it with the terrain material in clipmap mode
+   *  (vertex height displacement + fragment Sobel normals). This IS the terrain render — no static
+   *  ground mesh. Enrolls each ring in the ocean RTTs so the seabed feeds the water transparency. */
+  private buildClipmap(): void {
+    const scene = this.sceneService.scene;
+    const cam = this.sceneService.camera;
+    const m = this.manifest;
+    if (!scene || !cam || !m || !this.heightfield) { return; }
+
+    // Dispose any prior clipmap (e.g. a quality-driven rebuild).
+    if (this.clipmapObserver) { scene.onBeforeRenderObservable.remove(this.clipmapObserver); this.clipmapObserver = null; }
+    this.clipmap?.dispose();
+    this.clipmap = null;
+
+    const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode: GPU displace + Sobel normals
+    mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
+
+    // Publish the heightfield so the volumetric clouds can march it for terrain occlusion (the clipmap
+    // displaces in the vertex shader, which the depth renderers can't see → clouds need the heights).
+    // Brokered via scene.metadata so neither service has to depend on the other.
+    const meta = (scene.metadata = scene.metadata || {});
+    meta.terrainHeightField = this.clipHeightTex ? {
+      tex: this.clipHeightTex, bounds: this.clipWBounds, texSize: this.clipTexSize,
+      maxAlt: m.maxElevation ?? m.targetPeakElevation,
+    } : null;
+
+    this.clipmap = new TerrainClipmap(cam, scene);
+    this.clipmap.setMaterial(mat);
+    this.clipmap.initializeMeshes();
+    this.clipmap.update();
+    // Enroll every clipmap mesh in the ocean RTTs (the submerged seabed feeds the depth-based water
+    // transparency + refraction + reflection) and exclude from glow. receiveShadows is set in the
+    // clipmap; the terrain intentionally does NOT cast shadows (see the old note — self-shadow moiré).
+    for (const cm of this.clipmap.allMeshes()) {
+      this.oceanService.addToRenderList(cm);
+      this.sceneService.excludeFromGlow(cm);
+    }
+
+    this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
   }
 
   isReady(): boolean {
@@ -144,6 +204,12 @@ export class TerrainService {
     }
     this.shoreMapTexture?.dispose();
     this.shoreMapTexture = null;
+    if (this.clipmapObserver) {
+      this.sceneService.scene.onBeforeRenderObservable.remove(this.clipmapObserver);
+      this.clipmapObserver = null;
+    }
+    this.clipmap?.dispose();
+    this.clipmap = null;
     this.terrainMesh?.dispose();
     this.terrainMesh = null;
     this.terrainMaterial?.dispose();
@@ -191,6 +257,13 @@ export class TerrainService {
     const h1 = h01 + (h11 - h01) * tx;
     const hq = h0 + (h1 - h0) * tz;
 
+    // Signed unified field (real-data regions): decode across [minElevation, maxElevation] so the
+    // seabed (negative) and land (positive) share one continuous field. Legacy PNG manifests have no
+    // minElevation and decode land-only 0..targetPeakElevation.
+    const { minElevation, maxElevation } = this.manifest;
+    if (minElevation != null && maxElevation != null) {
+      return (hq / quantizationLevels) * (maxElevation - minElevation) + minElevation;
+    }
     return (hq / quantizationLevels) * targetPeakElevation;
   }
 
@@ -246,152 +319,15 @@ export class TerrainService {
     const manifest = this.manifest;
     if (!scene || !manifest || !this.heightfield) return;
 
-    if (this.terrainMesh) {
-      this.terrainMesh.dispose();
-      this.terrainMesh = null;
-    }
     this.disposeFoliage();
 
-    const worldWidth = manifest.worldBounds.maxX - manifest.worldBounds.minX;
-    const worldDepth = manifest.worldBounds.maxZ - manifest.worldBounds.minZ;
-    const centerX = (manifest.worldBounds.minX + manifest.worldBounds.maxX) * 0.5;
-    const centerZ = (manifest.worldBounds.minZ + manifest.worldBounds.maxZ) * 0.5;
-    // Cap at 1500 → ~33 m/polygon at 50 km.  The 0.42 multiplier always
-    // exceeds the cap for any source ≥ 3600 px, so the cap is the only knob.
-    // 1500×1500 ≈ 4.5 M triangles — good balance of quality and GPU cost.
-    // Raising to 2000 (8 M triangles) halved framerate on mid-range hardware;
-    // the normal-map micro-detail compensates visually.
-    const subdivisions = Math.max(
-      420,
-      Math.min(1500, Math.floor(Math.max(manifest.width, manifest.height) * 0.42)),
-    );
-
-    const mesh = MeshBuilder.CreateGround('terrain_heightfield', {
-      width: worldWidth,
-      height: worldDepth,
-      subdivisions,
-      updatable: true,
-    }, scene);
-    mesh.position.set(centerX, 0, centerZ);
-    mesh.renderingGroupId = 2;
-
-    const positions = mesh.getVerticesData(VertexBuffer.PositionKind)!;
-    const numVerts   = (subdivisions + 1) * (subdivisions + 1);
-    const gridW      = subdivisions + 1;
-    const colors: number[] = [];
-
-    // ── Pass 1: sample heightfield → raw vertex Y values ─────────────────────
-    // underwaterY[i] stores the seabed depth (≤ 0) for ocean vertices,
-    // pre-computed here so the smoothing write-back can reuse it cheaply.
-    const rawY       = new Float32Array(numVerts);
-    const underwaterY = new Float32Array(numVerts);
-    for (let i = 0; i < numVerts; i++) {
-      const wx = centerX + positions[i * 3];
-      const wz = centerZ + positions[i * 3 + 2];
-      rawY[i] = this.getElevation(wx, wz);
-      if (rawY[i] > 0) {
-        positions[i * 3 + 1] = rawY[i];
-      } else {
-        underwaterY[i]        = this.sampleUnderwaterDepth(wx, wz);
-        positions[i * 3 + 1] = underwaterY[i];
-      }
-    }
-
-    // ── Pass 2: Iterative Gaussian 3×3 smoothing on land heights ─────────────
-    // Three consecutive passes of the 1-2-1 kernel are equivalent to a single
-    // ~7-wide Gaussian — enough to round off coarse polygon steps on hillsides
-    // and cliffs without flattening genuine peaks.
-    // Ocean-floor vertices (y ≤ 0) are held fixed throughout and excluded from
-    // neighbour averages so the waterline is never dragged downward.
-    //
-    // BEACH PROTECTION: any land vertex whose rawY sits in the coastal-grading
-    // zone (0 < rawY ≤ BEACH_H_M) must never be raised by smoothing.  Without
-    // this guard, mountain neighbours at 200–500 m pull the 5 m beach cells up
-    // to 200–400 m after three passes, putting them in the rock biome and
-    // hiding the sandy texture entirely.  The clamp below preserves the beach
-    // profile while still letting the kernel round off genuine cliffs.
-    const SMOOTH_PASSES = 3;
-    const BEACH_H_M = 5.0;   // must match applyCoastalGrading BEACH_H
-    // Work on a copy so rawY stays intact for biome colour sampling below.
-    let currentY = rawY.slice();
-    for (let pass = 0; pass < SMOOTH_PASSES; pass++) {
-      const nextY = new Float32Array(numVerts);
-      for (let gz = 0; gz < gridW; gz++) {
-        for (let gx = 0; gx < gridW; gx++) {
-          const ci = gz * gridW + gx;
-          const cy = currentY[ci];
-          if (cy <= 0) { nextY[ci] = cy; continue; }   // keep ocean fixed
-
-          let sum = 0, wt = 0;
-          for (let dz = -1; dz <= 1; dz++) {
-            const nz = gz + dz;
-            if (nz < 0 || nz >= gridW) continue;
-            for (let dx = -1; dx <= 1; dx++) {
-              const nx = gx + dx;
-              if (nx < 0 || nx >= gridW) continue;
-              const ny = currentY[nz * gridW + nx];
-              if (ny <= 0) continue;                    // don't blend in ocean
-              const w = (2 - Math.abs(dx)) * (2 - Math.abs(dz)); // 1-2-1 kernel
-              sum += ny * w;
-              wt  += w;
-            }
-          }
-          const smoothed = wt > 0 ? sum / wt : cy;
-          // Beach cells: smoothing may only lower (blend out polygon steps toward
-          // water), never raise.  Mountain neighbours must not contaminate them.
-          nextY[ci] = (rawY[ci] > 0 && rawY[ci] <= BEACH_H_M)
-            ? Math.min(rawY[ci], smoothed)
-            : smoothed;
-        }
-      }
-      currentY = nextY;
-    }
-
-    // Write smoothed Y back and build vertex colours (colours use rawY so
-    // biome bands stay aligned with the source heightfield, not the smoothed mesh).
-    // Ocean vertices use the pre-computed exponential depth rather than a flat plane.
-    for (let i = 0; i < numVerts; i++) {
-      positions[i * 3 + 1] = currentY[i] > 0 ? currentY[i] : underwaterY[i];
-    }
-
-    for (let i = 0; i < numVerts; i++) {
-      const elev = rawY[i];
-      if (elev <= 0) {
-        colors.push(0.06, 0.14, 0.28, 1.0);
-      } else {
-        const t = elev / manifest.targetPeakElevation;
-        let r = 0.18, g = 0.35, b = 0.14;
-        if      (t < 0.03) { r = 0.78; g = 0.71; b = 0.54; }
-        else if (t < 0.25) { r = 0.22; g = 0.44; b = 0.16; }
-        else if (t < 0.55) { r = 0.34; g = 0.30; b = 0.22; }
-        else if (t < 0.80) { r = 0.24; g = 0.21; b = 0.19; }
-        else               { r = 0.16; g = 0.14; b = 0.14; }
-        colors.push(r, g, b, 1.0);
-      }
-    }
-
-    mesh.updateVerticesData(VertexBuffer.PositionKind, positions, false);
-    mesh.setVerticesData(VertexBuffer.ColorKind, colors, false);
-    mesh.createNormals(true);
-    mesh.refreshBoundingInfo();
-
-    const material = this.buildTerrainMaterial(scene, manifest);
-    material.zOffset = 4;
-    mesh.material = material;
-    mesh.useVertexColors = false;
-
-    this.oceanService.addToRenderList(mesh);
-    // NOTE: the terrain is intentionally NOT added as a shadow caster. At this
-    // world scale the far shadow cascades have huge texels, so the terrain
-    // shadowing itself produced moving diagonal moiré (self-shadow acne) on
-    // steep slopes, worst at noon. Leaving it out of the shadow map means it can
-    // never self-shadow. It still RECEIVES shadows (trees, boat) via
-    // receiveShadows below, and large-scale terrain shadows are handled by the
-    // dedicated raymarched terrainShadowMask system.
-    this.sceneService.excludeFromGlow(mesh);
-    mesh.receiveShadows = true;
-
-    this.terrainMesh = mesh;
+    // The terrain renders as a camera-centric CLIPMAP — flat LOD-ring grids displaced and
+    // normal-mapped on the GPU from the heightfield texture — replacing the old static 1500²-cap
+    // ground mesh (detail follows the player: crisp near, cheap to the horizon). buildClipmap()
+    // also enrolls the rings in the ocean RTTs and sets receiveShadows / glow exclusion. The terrain
+    // is intentionally NOT a shadow caster (self-shadow moiré at this world scale); large-scale
+    // terrain shadows come from the raymarched terrainShadowMask below.
+    this.buildClipmap();
     // Let the scene occlude the sun against our heightfield (stops the sun disk
     // shining through mountains at dawn/dusk).
     this.sceneService.setTerrainHeightSampler((x, z) => this.getElevation(x, z));
@@ -539,7 +475,9 @@ export class TerrainService {
     const hf = this.heightfield!;
     const px = Math.round(((wx - m.worldBounds.minX) / (m.worldBounds.maxX - m.worldBounds.minX)) * (m.width  - 1));
     const pz = Math.round(((m.worldBounds.maxZ - wz)  / (m.worldBounds.maxZ - m.worldBounds.minZ)) * (m.height - 1));
-    return hf[Math.max(0, Math.min(m.height - 1, pz)) * m.width + Math.max(0, Math.min(m.width - 1, px))] > 0;
+    // Land = quantized height strictly above the waterline (waterlineQ is 0 for legacy manifests, a
+    // positive level for the signed unified field).
+    return hf[Math.max(0, Math.min(m.height - 1, pz)) * m.width + Math.max(0, Math.min(m.width - 1, px))] > this.waterlineQ;
   }
 
   private updateShoreMap(): void {
@@ -1274,7 +1212,7 @@ export class TerrainService {
     this.scatterTypes = [];
   }
 
-  private buildTerrainMaterial(scene: any, manifest: TerrainManifest): CustomMaterial {
+  private buildTerrainMaterial(scene: any, manifest: TerrainManifest, clipmap = false): CustomMaterial {
     this.terrainMaterial?.dispose();
     this.terrainMaterial = null;
     for (const texture of this.terrainTextures) {
@@ -1387,11 +1325,54 @@ export class TerrainService {
     material.AddUniform('uCloudTime',     'float',   null);   // (legacy) cloud-shadow drift clock
     material.AddUniform('uCloudDrift',    'vec2',    null);   // real cloud wind drift (matches ocean)
     material.AddUniform('uCloudBaseH',    'float',   null);   // real cloud base altitude (matches ocean)
-    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = dither shoreline (main view), 0 = off (refraction RTT)
+    material.AddUniform('u_waterlineDither', 'float', null);  // 1 = ragged shoreline (main view), 0 = off (refraction RTT)
 
-    // The waterline dither discards sand pixels — but it must NOT run when the terrain renders into
-    // the ocean's refraction (seabed) RTT, or the holes get filled with that pass's bright clear-
-    // colour and read as a bright band. Flag the refraction pass so the bind below can switch it off.
+    // ── Clipmap mode (P4b): GPU height displacement + Sobel normals ──────────────
+    // The terrain renders as a camera-centric clipmap of FLAT grids; the heightfield is uploaded as a
+    // texture and sampled in the VERTEX shader to displace Y, and in the FRAGMENT shader to recompute
+    // the world normal (Sobel) — replacing the baked mesh heights/normals. Manual bilinear via
+    // texelFetch (R32F isn't HW-filterable on WebGPU).
+    if (clipmap) {
+      this.createClipHeightTexture(scene, manifest);
+      material.AddUniform('heightTex', 'sampler2D', null);
+      material.AddUniform('wbounds',   'vec4', null);   // minX, minZ, sizeX, sizeZ
+      material.AddUniform('texSize',   'vec2', null);   // heightfield texels (w, h)
+      material.Vertex_Definitions(`
+        float _clipH(vec2 uv) {
+          vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+          ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+          float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+          float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+          float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+          float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+          return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+        }
+        float _clipHW(vec2 wxz) {
+          return _clipH(vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w));
+        }
+      `);
+      material.Vertex_Before_PositionUpdated(`
+        vec3 _cw = (world * vec4(positionUpdated, 1.0)).xyz;
+        positionUpdated.y = _clipHW(_cw.xz);
+      `);
+      material.Fragment_Definitions(`
+        float _clipHF(vec2 wxz) {
+          vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
+          ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
+          return texelFetch(heightTex, t, 0).r;
+        }
+        vec3 _clipNormal(vec2 wxz) {
+          float e = wbounds.z / texSize.x;   // 1 texel in world metres
+          float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
+          float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
+          return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
+        }
+      `);
+    }
+
+    // The ragged-waterline discard must NOT run when the terrain renders into the ocean's seabed
+    // (refraction) RTT, or the holes fill with that pass's clear-colour and read as bright specks in
+    // the depth-revealed seabed. Flag the refraction pass so the bind below can switch it off.
     const refr = this.oceanService.getRefractionTexture?.();
     if (refr) {
       refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
@@ -1414,23 +1395,70 @@ export class TerrainService {
 
 
     material.Fragment_Custom_Diffuse(`
-      // ── 0. Noise-dithered waterline ───────────────────────────────────────
-      // Break up the clean sand↔water contour: in a thin band right at the waterline, a world-space
-      // noise discards sand pixels — more the closer to the edge — so the ocean behind shows through
-      // the gaps and the shoreline reads ragged/natural. Opaque-pass discard (no transparency sort).
-      float wlNoise = fract(sin(dot(floor(vPositionW.xz * 80.0), vec2(127.1, 311.7))) * 43758.5453);
-      float wlBand  = (1.0 - smoothstep(0.0, 0.55, vPositionW.y))   // fades out ~0.55 m up the beach
-                    * smoothstep(-0.20, 0.04, vPositionW.y)         // fades in from just below water
-                    * 0.85                                          // max discard fraction at the very edge
+      // ── 0. Ragged, undulating, anti-aliased waterline ─────────────────────
+      // Scallop the sand↔water edge so it isn't a clean contour: in a thin band right at the
+      // waterline, a SMOOTH world-space value-noise (~1.4 m lobes, not fine grain) discards sand
+      // pixels — so the depth-transparent shallows behind show through in uneven bites. The band
+      // EBBS & FLOWS over time (wash running up the beach), and the cutout is anti-aliased via a
+      // derivative-feathered edge + interleaved-gradient dither (FXAA then resolves it). Off in the
+      // refraction RTT (u_waterlineDither = 0) so the revealed seabed stays solid.
+      vec2  wlP = vPositionW.xz * 0.70;                  // ~1.4 m feature size
+      vec2  wlI = floor(wlP), wlF = fract(wlP);
+      vec2  wlU = wlF * wlF * (3.0 - 2.0 * wlF);
+      float wlA = fract(sin(dot(wlI,                  vec2(127.1, 311.7))) * 43758.5453);
+      float wlB = fract(sin(dot(wlI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlC = fract(sin(dot(wlI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlD = fract(sin(dot(wlI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlNoise = mix(mix(wlA, wlB, wlU.x), mix(wlC, wlD, wlU.x), wlU.y);
+      wlNoise = wlNoise * 0.75 + fract(sin(dot(floor(vPositionW.xz * 2.3), vec2(127.1, 311.7))) * 43758.5453) * 0.25;
+      // Ebb & flow: shift the effective waterline up/down ~±0.18 m on a ~8 s wash, varying along shore.
+      float wlEbb = sin(uCloudTime * 0.8 + vPositionW.x * 0.13 + vPositionW.z * 0.09) * 0.12
+                  + sin(uCloudTime * 1.3 - vPositionW.z * 0.18) * 0.06;
+      float wlY = vPositionW.y - wlEbb;
+      float wlBand  = (1.0 - smoothstep(0.0, 0.7, wlY))            // fades out ~0.7 m up the beach
+                    * smoothstep(-0.30, 0.05, wlY)                 // fades in from just below water
+                    * 0.9                                          // max discard fraction at the very edge
                     * u_waterlineDither;                            // 0 in the refraction RTT → seabed stays solid
-      if (wlNoise < wlBand) { discard; }
+      // ── 0b. Fine dither octave on the edge ────────────────────────────────
+      // The ~1.4 m wlNoise gives a clean, well-defined undulating boundary. Add a MUCH finer
+      // value-noise (~0.12 m lobes) that jitters the keep/cut threshold, so the crisp wave edge
+      // breaks up into a grainy, ragged shoreline instead of a sharp contour. Centred on 0 so it
+      // only nudges the edge either way; gated by wlBand (= 0 inland) so it can never punch stray
+      // holes away from the waterline. KNOB 6.0 = fineness (higher → finer grain); grain strength &
+      // band width are tuned where wlFine is applied to the coverage (below).
+      vec2  wlFP = vPositionW.xz * 6.0;                  // ~0.17 m feature size
+      vec2  wlFI = floor(wlFP), wlFF = fract(wlFP);
+      vec2  wlFU = wlFF * wlFF * (3.0 - 2.0 * wlFF);
+      float wlFa = fract(sin(dot(wlFI,                  vec2(127.1, 311.7))) * 43758.5453);
+      float wlFb = fract(sin(dot(wlFI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFc = fract(sin(dot(wlFI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFd = fract(sin(dot(wlFI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFine = mix(mix(wlFa, wlFb, wlFU.x), mix(wlFc, wlFd, wlFU.x), wlFU.y);
+      // (wlFine is applied to the COVERAGE below, not added into wlNoise — see the note there.)
+
+      // Anti-aliased cutout: soft ~1-px coverage from the noise-vs-band gradient, resolved with an
+      // interleaved-gradient screen dither (stable, low sparkle) that the pipeline FXAA smooths.
+      float wlEdge = wlNoise - wlBand;                   // ≥0 keep, <0 cut
+      float wlCov  = clamp(wlEdge / max(fwidth(wlEdge), 1e-4) + 0.5, 0.0, 1.0);
+      // Break up that clean ~1-px edge with the fine octave. Blend the coverage toward the fine-noise
+      // field in a thin band around the boundary (wlNear), so the IGN discard below dissolves the edge
+      // into grain. Done AFTER the fwidth normalisation ON PURPOSE: folding wlFine into wlNoise instead
+      // gets divided straight back out by the fwidth term (high-freq noise raises the gradient as much
+      // as it shifts the edge) -- that is why the first attempt was invisible. KNOBS: 0.18 = width of the
+      // roughened band (noise units), 0.7 = grain strength (0 = clean edge, 1 = fully grainy).
+      float wlNear = (1.0 - smoothstep(0.0, 0.18, abs(wlEdge))) * step(0.0001, wlBand);
+      wlCov = mix(wlCov, wlFine, wlNear * 0.7);
+      float wlIGN  = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      if (wlCov < wlIGN) { discard; }
 
       // ── 1. Macro tonal modifier from procedural albedo ────────────────────
       float macroLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
       float macroMod = 0.75 + macroLum * 0.50;  // [0.75 .. 1.25]
 
       // ── 2. Triplanar blend weights ────────────────────────────────────────
-      vec3 nW   = normalize(vNormalW);
+      // Clipmap mode recomputes the world normal from the heightfield (the flat-grid vNormalW is
+      // meaningless once the vertex shader displaces Y); the static mesh uses its baked normals.
+      vec3 nW   = ${clipmap ? '_clipNormal(vPositionW.xz)' : 'normalize(vNormalW)'};
       vec3 triW = abs(nW);
       triW      = triW * triW * triW * triW * triW * triW;  // pow 6 — no built-in
       triW     /= (triW.x + triW.y + triW.z);               // normalise to sum = 1
@@ -1720,15 +1748,20 @@ export class TerrainService {
       // ground reads as subtly bumpy instead of glassy-smooth. Faded out with
       // distance to avoid shimmer/aliasing and keep the cost near the camera.
       float detFade = 1.0 - smoothstep(70.0, 380.0, length(vPositionW - vEyePosition.xyz));
-      if (detFade > 0.001) {
-        vec3 detN1 = texture2D(uGrassNor, vPositionW.xz * 0.60).rgb * 2.0 - 1.0;
-        vec3 detN2 = texture2D(uRockNor,  vPositionW.xz * 1.30).rgb * 2.0 - 1.0;
-        vec3 detWorld = normalize(
-            vec3(detN1.r, detN1.b, detN1.g) * 0.6 +
-            vec3(detN2.r, detN2.b, detN2.g) * 0.4
-        );
-        normalW = normalize(normalW + detWorld * (0.24 * detFade));
-      }
+      // Sampled UNCONDITIONALLY -- no  if (detFade > 0.001)  guard. WGSL forbids an implicit-LOD
+      // texture sample (texture2D) inside non-uniform control flow (the gradient-based mip selection
+      // requires uniform control flow), so gating these by the per-pixel detFade made the terrain
+      // fragment shader fail to compile on WebGPU -- failing pipeline creation EVERY frame (the cause
+      // of the large frame-time spikes). The detFade multiply below already fades the contribution to
+      // zero past the near field, so dropping the branch is behaviourally identical; the only cost is
+      // two extra texture taps on far pixels, and it keeps mip-correct sampling (no shimmer).
+      vec3 detN1 = texture2D(uGrassNor, vPositionW.xz * 0.60).rgb * 2.0 - 1.0;
+      vec3 detN2 = texture2D(uRockNor,  vPositionW.xz * 1.30).rgb * 2.0 - 1.0;
+      vec3 detWorld = normalize(
+          vec3(detN1.r, detN1.b, detN1.g) * 0.6 +
+          vec3(detN2.r, detN2.b, detN2.g) * 0.4
+      );
+      normalW = normalize(normalW + detWorld * (0.24 * detFade));
     `);
 
     // ── Aerial perspective (distance haze) ────────────────────────────────────
@@ -1798,10 +1831,39 @@ export class TerrainService {
       fx.setTexture('uSandNor',    sandNorTex);
       fx.setTexture('uGrassNor',   grassNorTex);
       fx.setTexture('uRockNor',    rockNorTex);
+      if (clipmap && this.clipHeightTex) {
+        fx.setTexture('heightTex', this.clipHeightTex);
+        fx.setVector4('wbounds', this.clipWBounds);
+        fx.setVector2('texSize', this.clipTexSize);
+      }
     });
 
     this.terrainMaterial = material;
     return material;
+  }
+
+  // ── P4b: clipmap height texture (heightfield → GPU R32F) ─────────────────────
+  private clipHeightTex: RawTexture | null = null;
+  private clipWBounds = new Vector4(0, 0, 1, 1);
+  private clipTexSize = new Vector2(1, 1);
+
+  private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
+    if (this.clipHeightTex || !this.heightfield) { return; }
+    const minE = m.minElevation ?? 0, maxE = m.maxElevation ?? m.targetPeakElevation;
+    const n = m.width * m.height;
+    const data = new Float32Array(n);
+    const span = (maxE - minE) / m.quantizationLevels;
+    for (let i = 0; i < n; i++) { data[i] = this.heightfield[i] * span + minE; }
+    const tex = new RawTexture(
+      data, m.width, m.height, Constants.TEXTUREFORMAT_R, scene,
+      false, false, Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,
+    );
+    tex.wrapU = Texture.CLAMP_ADDRESSMODE;
+    tex.wrapV = Texture.CLAMP_ADDRESSMODE;
+    this.clipHeightTex = tex;
+    this.clipWBounds = new Vector4(m.worldBounds.minX, m.worldBounds.minZ,
+      m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
+    this.clipTexSize = new Vector2(m.width, m.height);
   }
 
   // ── Coastal grading ───────────────────────────────────────────────────────
@@ -1822,10 +1884,17 @@ export class TerrainService {
    * Returns the coast data structure consumed by buildTerrainMesh().
    */
   private applyCoastalGrading(): NonNullable<TerrainService['coastData']> {
-    const { width, height, worldBounds, quantizationLevels, targetPeakElevation } = this.manifest!;
+    const { width, height, worldBounds, quantizationLevels, targetPeakElevation, minElevation, maxElevation } = this.manifest!;
     const hf       = this.heightfield!;
     const n        = width * height;
     const cellSizeM = (worldBounds.maxX - worldBounds.minX) / (width - 1);
+
+    // Ocean test. Legacy PNG fields stored ocean as exactly 0. The signed unified field stores the
+    // waterline (y = 0) at a POSITIVE quantized value (since minElevation < 0), so a cell is ocean
+    // when its quantized height is at/below that waterline level.
+    const signed = minElevation != null && maxElevation != null;
+    const waterQ = signed ? Math.round(((0 - minElevation!) / (maxElevation! - minElevation!)) * quantizationLevels) : 0;
+    const isWater = (q: number) => (signed ? q <= waterQ : q === 0);
 
     // ── 1. Distance transforms ────────────────────────────────────────────────
     const MAX16  = 0xFFFF;
@@ -1833,8 +1902,8 @@ export class TerrainService {
     const distL  = new Uint16Array(n).fill(MAX16);   // water cell → nearest land
 
     for (let i = 0; i < n; i++) {
-      if (hf[i] === 0) distW[i] = 0;
-      else             distL[i] = 0;
+      if (isWater(hf[i])) distW[i] = 0;
+      else                distL[i] = 0;
     }
 
     // Forward pass (top-left → bottom-right)
@@ -1866,19 +1935,24 @@ export class TerrainService {
     //           slope ≈ BEACH_H / BEACH_M = 5/200 = 2.5 % — very walkable.
     // PROFILE:  exponent < 1 → concave curve: flat near water, gently rising
     //           inland.  A natural beach cross-section.
-    const BEACH_M   = 200;
-    const BEACH_H   = 5.0;
-    const PROFILE   = 0.55;
-    const beachCells = Math.ceil(BEACH_M / cellSizeM);
-    const maxBeachQ  = Math.round((BEACH_H / targetPeakElevation) * quantizationLevels);
+    // Signed real-data fields keep their true coastlines (cliffs, headlands) — the artificial sandy
+    // bevel was only needed for the old hand-drawn heightmap, and its land-only quantization math
+    // (0..targetPeakElevation) would corrupt the signed encoding. So skip it entirely when signed.
+    if (!signed) {
+      const BEACH_M   = 200;
+      const BEACH_H   = 5.0;
+      const PROFILE   = 0.55;
+      const beachCells = Math.ceil(BEACH_M / cellSizeM);
+      const maxBeachQ  = Math.round((BEACH_H / targetPeakElevation) * quantizationLevels);
 
-    for (let i = 0; i < n; i++) {
-      if (hf[i] === 0) continue;                     // skip ocean
-      const d = distW[i];
-      if (d >= beachCells) continue;                 // outside beach zone
-      const t   = d / beachCells;                    // 0 = waterline, 1 = inner edge
-      const cap = Math.round(Math.pow(t, PROFILE) * maxBeachQ);
-      if (hf[i] > cap) hf[i] = cap;
+      for (let i = 0; i < n; i++) {
+        if (hf[i] === 0) continue;                     // skip ocean
+        const d = distW[i];
+        if (d >= beachCells) continue;                 // outside beach zone
+        const t   = d / beachCells;                    // 0 = waterline, 1 = inner edge
+        const cap = Math.round(Math.pow(t, PROFILE) * maxBeachQ);
+        if (hf[i] > cap) hf[i] = cap;
+      }
     }
 
     // distW goes out of scope here and will be GC'd.
@@ -2013,6 +2087,11 @@ export class TerrainService {
     const cd = this.coastData;
     const m  = this.manifest;
     if (!cd || !m) return -2.2;
+
+    // Signed unified field: the seabed depth IS the elevation (it's already negative underwater), so
+    // there's no separate depth model — just return the real bathymetry. This collapses the mesh
+    // builder's land/sea split to a single source and retires the fake exponential depth LUT.
+    if (m.minElevation != null) return this.getElevation(worldX, worldZ);
 
     const { width, height, worldBounds } = m;
     const px  = Math.round(((worldX - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX)) * (width  - 1));

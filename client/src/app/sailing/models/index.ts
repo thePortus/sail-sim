@@ -77,12 +77,22 @@ export interface TerrainManifest {
   chunkCountX: number;
   chunkCountZ: number;
   quantizationLevels: number;
-  waterThreshold: number;
-  sourceMin: number;
-  sourceMax: number;
   targetPeakElevation: number;
   worldBounds: TerrainWorldBounds;
   spawns: TerrainSpawnPoint[];
+  // ── Legacy PNG-pipeline fields (optional; absent on real-data region manifests) ──
+  waterThreshold?: number;
+  sourceMin?: number;
+  sourceMax?: number;
+  // ── Signed unified-field encoding (real-data region manifests, version ≥ 2) ──
+  // When present, elevation decodes as (q / quantizationLevels) * (maxElevation - minElevation)
+  // + minElevation, giving one continuous land(+)/seabed(−) field instead of land-only 0..peak.
+  minElevation?: number;
+  maxElevation?: number;
+  seaLevel?: number;
+  verticalScale?: number;
+  sourceName?: string;
+  archetype?: string;
 }
 
 // ── Vessels ───────────────────────────────────────────────────────────────────

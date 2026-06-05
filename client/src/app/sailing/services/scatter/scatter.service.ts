@@ -1,9 +1,10 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  Color3, Matrix, Mesh, Observer, Quaternion, Scene, StandardMaterial, Vector3,
+  Color3, Material, Matrix, Mesh, Observer, Quaternion, Scene, StandardMaterial, Texture, Vector3,
 } from '@babylonjs/core';
 import { SceneService } from '../scene.service';
 import { TerrainService } from '../terrain.service';
+import { WeatherService } from '../weather.service';
 import { ThinInstancePatch } from './instancing/thin-instance-patch';
 import { PatchManager } from './instancing/patch-manager';
 import { createGrassBlade } from './grass/grass-blade';
@@ -12,6 +13,8 @@ import { createDriftwood } from './props/driftwood';
 import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
+import { PalmWindPlugin } from './props/palm-wind.plugin';
+import { loadScatterMesh, createCrossImpostor } from './asset-loader';
 
 const EMPTY = new Float32Array(0);
 const EMPTY_PATCH: PatchData = { matrix: EMPTY, color: null };
@@ -64,7 +67,7 @@ function fbm2(x: number, z: number): number {
 /** One scatter layer (currently just land grass): its own material, LoD patch manager, live patch
  *  grid, and per-cell instance-buffer builder. Kept generic so more layers can be added later. */
 interface Layer {
-  mat: StandardMaterial;
+  mat: Material;
   manager: PatchManager;
   patches: Map<string, ThinInstancePatch | null>;
   build: (cx: number, cz: number) => PatchData;
@@ -88,9 +91,11 @@ interface LodTier { stacks: number; nearerThan: number; fraction: number; }
 export class ScatterService {
   private sceneService   = inject(SceneService);
   private terrainService = inject(TerrainService);
+  private weatherService = inject(WeatherService);
 
   private layers: Layer[] = [];
   private observer: Observer<Scene> | null = null;
+  private _palmTime = 0;   // palm wind clock (advanced each frame from the weather wind)
 
   // Reusable temporaries (avoid per-instance allocation in the build loops).
   private readonly _scaleV = new Vector3();
@@ -159,12 +164,10 @@ export class ScatterService {
       { stacks: 1, nearerThan: Infinity, fraction: 0.6 },
     ], (cx, cz) => this.buildTrees(cx, cz), createTree, false));
 
-    // Beach palms — low-poly vertex-coloured palms (feathered fronds) in coastal stands (groves),
-    // replacing the old terrain beach-palm system. Full detail + coconuts near, simpler far.
-    this.layers.push(this.makeLayer(scene, 'scatter_palms', new Color3(1, 1, 1), 0, [
-      { stacks: 2, nearerThan: 130,      fraction: 1.0 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
-    ], (cx, cz) => this.buildPalms(cx, cz), createPalm, false));
+    // Beach palms — authored GLB variants (A/B/C) with baked-wind COLOR_0 + crossed-quad impostor
+    // far-LOD, replacing the old procedural-primitive palms. Loaded async (streamed + cached) before
+    // the patches build; falls back to the primitive palm if a GLB fails to load.
+    await this.registerPalms(scene);
 
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
@@ -172,9 +175,72 @@ export class ScatterService {
     this.observer = scene.onBeforeRenderObservable.add(() => {
       const c = this.sceneService.camera;
       if (c) { GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z; }
+      // Drive the palm wind from the weather wind (the same source the sails use): unit direction +
+      // a gust amplitude that grows with wind speed, plus a steadily-advancing clock.
+      const wd = this.weatherService.weather()?.wind;
+      if (wd) {
+        const mag = Math.hypot(wd.x, wd.z) || 1;
+        PalmWindPlugin.WIND.dirX = wd.x / mag;
+        PalmWindPlugin.WIND.dirZ = wd.z / mag;
+        PalmWindPlugin.WIND.amplitude = 0.10 + Math.min(0.55, (wd.speed ?? 8) / 24) * 0.30;
+      }
+      this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
+      PalmWindPlugin.WIND.time = this._palmTime;
       this.ensurePatches();
       for (const l of this.layers) { l.manager.update(); }
     });
+  }
+
+  // ── Beach palms (authored GLB variants) ─────────────────────────────────────
+
+  private static readonly PALM_VARIANTS = [
+    { file: 'palm_a.glb', impostor: 'impostor_a.png', height: 8.0 },   // medium, slight lean
+    { file: 'palm_b.glb', impostor: 'impostor_b.png', height: 9.6 },   // tall, slim
+    { file: 'palm_c.glb', impostor: 'impostor_c.png', height: 6.6 },   // short, stout, full crown
+  ];
+
+  /** Load the authored palm GLBs (streamed + cached), attach baked wind + a crossed-quad impostor
+   *  far-LOD, and register one scatter sub-layer per variant. Any load failure → the primitive palm. */
+  private async registerPalms(scene: Scene): Promise<void> {
+    for (let v = 0; v < ScatterService.PALM_VARIANTS.length; v++) {
+      const cfg = ScatterService.PALM_VARIANTS[v];
+      const full = await loadScatterMesh(scene, cfg.file, `scatter_palm_${v}_full`);
+      if (!full || !full.material) {
+        console.warn(`[scatter] palm variant ${v} (${cfg.file}) failed — using primitive palms`);
+        this.registerPalmFallback(scene);
+        return;
+      }
+      new PalmWindPlugin(full.material);
+      this.sceneService.excludeFromGlow(full);
+      this.sceneService.excludeFromPrePass(full.material);
+
+      const tex = new Texture(`/assets/scatter/textures/${cfg.impostor}`, scene);
+      const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height);
+      this.sceneService.excludeFromGlow(imp);
+      if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
+
+      this.layers.push(this.makePalmLayer(full, imp, v));
+    }
+  }
+
+  /** A palm sub-layer: full GLB mesh near, crossed-quad impostor far, swapped per-patch by distance. */
+  private makePalmLayer(full: Mesh, imp: Mesh, variant: number): Layer {
+    const NEAR = 130;   // metres — full mesh inside, impostor beyond
+    const manager = new PatchManager([imp, full], (patch) => {
+      const c = this.sceneService.camera;
+      const d = c ? Vector3.Distance(patch.getPosition(), c.position) : Infinity;
+      return d < NEAR ? 1 : 0;   // 1 = full (near), 0 = impostor (far)
+    }, [1, 1]);
+    manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
+    return { mat: full.material as Material, manager, patches: new Map(), build: (cx, cz) => this.buildPalms(cx, cz, variant) };
+  }
+
+  /** Fallback: the old procedural-primitive palm as a single (all-variant) scatter layer. */
+  private registerPalmFallback(scene: Scene): void {
+    this.layers.push(this.makeLayer(scene, 'scatter_palms', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 130,      fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
+    ], (cx, cz) => this.buildPalms(cx, cz, -1), createPalm, false));
   }
 
   /** Build a scatter layer: material (+ wind/fade plugin), tiered LoD meshes, patch manager.
@@ -503,9 +569,12 @@ export class ScatterService {
     return this.finish(tmp, kept);
   }
 
-  /** Build one patch's beach palms: clustered into coastal STANDS (groves) by low-freq noise, on the
-   *  sand/low-coastal band. Sparse — most beach is open, with the occasional grove. */
-  private buildPalms(cx: number, cz: number): PatchData {
+  /** Build one patch's beach palms for a single VARIANT, clustered into coastal STANDS (groves) by
+   *  low-freq noise on the sand/low-coastal band. Placement is DETERMINISTIC (hash-driven, not
+   *  Math.random) so all three variant calls see the SAME candidates and partition them by a position
+   *  hash — equal total density, mixed varieties per grove. `variant < 0` keeps every candidate (the
+   *  single-mesh primitive fallback). The GLB palms are real metres, so scale is a gentle ±8 % only. */
+  private buildPalms(cx: number, cz: number, variant: number): PatchData {
     const res = 14, size = this.PATCH, cell = size / res, E = 2.5;
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -514,8 +583,8 @@ export class ScatterService {
 
     for (let x = 0; x < res; x++) {
       for (let z = 0; z < res; z++) {
-        const px = cx + (x + Math.random()) * cell - size / 2;
-        const pz = cz + (z + Math.random()) * cell - size / 2;
+        const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
+        const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
         if (y < 0.5 || y > 8) { continue; }                // sand + low coastal band
         const slope = this.slopeAt(px, pz, y, E);
@@ -524,13 +593,15 @@ export class ScatterService {
         // Groves: a high, sharp threshold on a low-freq field → rare clustered stands, open between.
         const stand = fbm2(px / 28 + 60, pz / 28 - 40);
         const dens = smoothstep(0.58, 0.84, stand) * (1 - slope * 0.6) * 0.4 * this.densityMul;
-        if (Math.random() > dens) { continue; }
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
-        const s = 0.6 + Math.random() * 0.45;              // ~5.5–9.5 m palms
-        const w = s * (0.9 + Math.random() * 0.2);
-        scaleV.set(w, s, w);
+        // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+
+        const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
+        scaleV.set(s, s, s);
         posV.set(px, y - 0.1, pz);
-        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, Math.random() * Math.PI * 2), posV)
+        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
           .copyToArray(tmp, kept * 16);
         kept++;
       }

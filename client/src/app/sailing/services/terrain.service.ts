@@ -1419,10 +1419,35 @@ export class TerrainService {
                     * smoothstep(-0.30, 0.05, wlY)                 // fades in from just below water
                     * 0.9                                          // max discard fraction at the very edge
                     * u_waterlineDither;                            // 0 in the refraction RTT → seabed stays solid
+      // ── 0b. Fine dither octave on the edge ────────────────────────────────
+      // The ~1.4 m wlNoise gives a clean, well-defined undulating boundary. Add a MUCH finer
+      // value-noise (~0.12 m lobes) that jitters the keep/cut threshold, so the crisp wave edge
+      // breaks up into a grainy, ragged shoreline instead of a sharp contour. Centred on 0 so it
+      // only nudges the edge either way; gated by wlBand (= 0 inland) so it can never punch stray
+      // holes away from the waterline. KNOB 6.0 = fineness (higher → finer grain); grain strength &
+      // band width are tuned where wlFine is applied to the coverage (below).
+      vec2  wlFP = vPositionW.xz * 6.0;                  // ~0.17 m feature size
+      vec2  wlFI = floor(wlFP), wlFF = fract(wlFP);
+      vec2  wlFU = wlFF * wlFF * (3.0 - 2.0 * wlFF);
+      float wlFa = fract(sin(dot(wlFI,                  vec2(127.1, 311.7))) * 43758.5453);
+      float wlFb = fract(sin(dot(wlFI + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFc = fract(sin(dot(wlFI + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFd = fract(sin(dot(wlFI + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+      float wlFine = mix(mix(wlFa, wlFb, wlFU.x), mix(wlFc, wlFd, wlFU.x), wlFU.y);
+      // (wlFine is applied to the COVERAGE below, not added into wlNoise — see the note there.)
+
       // Anti-aliased cutout: soft ~1-px coverage from the noise-vs-band gradient, resolved with an
       // interleaved-gradient screen dither (stable, low sparkle) that the pipeline FXAA smooths.
       float wlEdge = wlNoise - wlBand;                   // ≥0 keep, <0 cut
       float wlCov  = clamp(wlEdge / max(fwidth(wlEdge), 1e-4) + 0.5, 0.0, 1.0);
+      // Break up that clean ~1-px edge with the fine octave. Blend the coverage toward the fine-noise
+      // field in a thin band around the boundary (wlNear), so the IGN discard below dissolves the edge
+      // into grain. Done AFTER the fwidth normalisation ON PURPOSE: folding wlFine into wlNoise instead
+      // gets divided straight back out by the fwidth term (high-freq noise raises the gradient as much
+      // as it shifts the edge) -- that is why the first attempt was invisible. KNOBS: 0.18 = width of the
+      // roughened band (noise units), 0.7 = grain strength (0 = clean edge, 1 = fully grainy).
+      float wlNear = (1.0 - smoothstep(0.0, 0.18, abs(wlEdge))) * step(0.0001, wlBand);
+      wlCov = mix(wlCov, wlFine, wlNear * 0.7);
       float wlIGN  = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
       if (wlCov < wlIGN) { discard; }
 

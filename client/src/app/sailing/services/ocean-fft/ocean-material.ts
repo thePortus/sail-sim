@@ -120,8 +120,10 @@ export class OceanFFTMaterial {
     // the depth map is no longer needed (it rendered the displaced clipmap flat anyway).
     // Depth-based transparency reach: how far (metres of through-water path) you can see down into the
     // water before it reads fully opaque. Drives the unified seabed/hull reveal (replaces the old
-    // coastal-proximity ramp + boat oval). ~8 m ≈ 26 ft of visibility.
-    mat.AddUniform('_SeeDepth', 'float', 8.0);
+    // coastal-proximity ramp + boat oval). 10 m: bottom visible to ~10 m, broad shallow tint to ~22 m
+    // (10 × 2.2), shoal band to ~35 m (10 × 3.5). Reads true vertical seabed depth from the heightfield;
+    // higher values let you see deeper into the water so gentle shelves read as wider shallows.
+    mat.AddUniform('_SeeDepth', 'float', 10.0);
     // Terrain heightfield (R32F metres, published by TerrainService via scene.metadata) — gives the
     // TRUE seabed depth per water fragment. The clipmap displaces in its vertex shader, which the
     // depth renderer can't see (it renders the seabed flat at y=0), so the depth-map dz reads all

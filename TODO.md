@@ -9,7 +9,9 @@
 * fix boat back windows bleeding through
 * fix no boat transparency in deep water
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
+* add full sinking & capsize animation
 * made cannon elevation aiming smooth and by decimals
+* persistent logoff locations
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location

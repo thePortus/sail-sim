@@ -14,6 +14,7 @@ import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
+import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { loadScatterMesh, createCrossImpostor } from './asset-loader';
 
 const EMPTY = new Float32Array(0);
@@ -154,19 +155,14 @@ export class ScatterService {
       { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
     ], (cx, cz) => this.buildDriftwood(cx, cz), createDriftwood, true));
 
-    // Forest trees — stylised low-poly trees (baked vertex colours: brown trunk + green canopy) in
-    // the inland forest-mask zone. White diffuse so the vertex colours show; no wind sway. LoD: full
-    // detail near, low-poly + thinned far.
-    // solid:false → double-sided + two-sided lighting + matte, so the thin leaves/fronds read from
-    // any angle (not one-sided) and shade like foliage.
-    this.layers.push(this.makeLayer(scene, 'scatter_trees', new Color3(1, 1, 1), 0, [
-      { stacks: 2, nearerThan: 110,      fraction: 1.0 },
-      { stacks: 1, nearerThan: Infinity, fraction: 0.6 },
-    ], (cx, cz) => this.buildTrees(cx, cz), createTree, false));
+    // Forest trees — authored beech GLB variants (A/B/C) with two-channel wind (branch sway + leaf
+    // flutter) + crossed-quad impostor far-LOD, in the inland forest-mask zone. Replaces the old
+    // procedural-primitive trees. Falls back to the primitive tree if a GLB fails to load.
+    await this.registerBeeches(scene);
 
-    // Beach palms — authored GLB variants (A/B/C) with baked-wind COLOR_0 + crossed-quad impostor
-    // far-LOD, replacing the old procedural-primitive palms. Loaded async (streamed + cached) before
-    // the patches build; falls back to the primitive palm if a GLB fails to load.
+    // Beach palms — authored GLB variants (A/B/C) with wind sway + crossed-quad impostor far-LOD,
+    // replacing the old procedural-primitive palms. Loaded async (streamed + cached) before the
+    // patches build; falls back to the primitive palm if a GLB fails to load.
     await this.registerPalms(scene);
 
     if (this.enabled) { this.ensurePatches(); }
@@ -180,12 +176,19 @@ export class ScatterService {
       const wd = this.weatherService.weather()?.wind;
       if (wd) {
         const mag = Math.hypot(wd.x, wd.z) || 1;
-        PalmWindPlugin.WIND.dirX = wd.x / mag;
-        PalmWindPlugin.WIND.dirZ = wd.z / mag;
-        PalmWindPlugin.WIND.amplitude = 0.10 + Math.min(0.55, (wd.speed ?? 8) / 24) * 0.30;
+        const dx = wd.x / mag, dz = wd.z / mag;
+        const gust = Math.min(1, (wd.speed ?? 8) / 24);   // 0 calm → 1 gale
+        PalmWindPlugin.WIND.dirX = dx;
+        PalmWindPlugin.WIND.dirZ = dz;
+        PalmWindPlugin.WIND.amplitude = 0.10 + gust * 0.30;
+        TreeWindPlugin.WIND.dirX = dx;
+        TreeWindPlugin.WIND.dirZ = dz;
+        TreeWindPlugin.WIND.branchAmp = 0.14 + gust * 0.34;   // whole-canopy sway grows with wind
+        TreeWindPlugin.WIND.leafAmp   = 0.05 + gust * 0.10;   // leaf shimmer
       }
       this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
       PalmWindPlugin.WIND.time = this._palmTime;
+      TreeWindPlugin.WIND.time = this._palmTime;
       this.ensurePatches();
       for (const l of this.layers) { l.manager.update(); }
     });
@@ -219,20 +222,52 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
-      this.layers.push(this.makePalmLayer(full, imp, v));
+      this.layers.push(this.makeGlbLayer(full, imp, 130, (cx, cz) => this.buildPalms(cx, cz, v)));
     }
   }
 
-  /** A palm sub-layer: full GLB mesh near, crossed-quad impostor far, swapped per-patch by distance. */
-  private makePalmLayer(full: Mesh, imp: Mesh, variant: number): Layer {
-    const NEAR = 130;   // metres — full mesh inside, impostor beyond
+  // ── Forest beeches (authored GLB variants) ──────────────────────────────────
+
+  private static readonly BEECH_VARIANTS = [
+    { file: 'beech_a.glb', impostor: 'beech_impostor_a.png', w: 17.07, h: 11.27 },   // medium broad
+    { file: 'beech_b.glb', impostor: 'beech_impostor_b.png', w: 19.31, h: 13.30 },   // taller, fuller
+    { file: 'beech_c.glb', impostor: 'beech_impostor_c.png', w: 14.98, h: 10.63 },   // short, very broad
+  ];
+
+  /** Load the authored beech GLBs (streamed + cached), attach two-channel tree wind + a crossed-quad
+   *  impostor far-LOD, and register one scatter sub-layer per variant. Any load failure → primitive. */
+  private async registerBeeches(scene: Scene): Promise<void> {
+    for (let v = 0; v < ScatterService.BEECH_VARIANTS.length; v++) {
+      const cfg = ScatterService.BEECH_VARIANTS[v];
+      const full = await loadScatterMesh(scene, cfg.file, `scatter_beech_${v}_full`);
+      if (!full || !full.material) {
+        console.warn(`[scatter] beech variant ${v} (${cfg.file}) failed — using primitive trees`);
+        this.registerTreeFallback(scene);
+        return;
+      }
+      new TreeWindPlugin(full.material, true);   // flutter = true (leaf shimmer)
+      this.sceneService.excludeFromGlow(full);
+      this.sceneService.excludeFromPrePass(full.material);
+
+      const tex = new Texture(`/assets/scatter/textures/${cfg.impostor}`, scene);
+      const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h);
+      this.sceneService.excludeFromGlow(imp);
+      if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
+
+      // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
+      this.layers.push(this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v)));
+    }
+  }
+
+  /** A GLB tree sub-layer: full mesh near, crossed-quad impostor far, swapped per-patch by distance. */
+  private makeGlbLayer(full: Mesh, imp: Mesh, near: number, build: (cx: number, cz: number) => PatchData): Layer {
     const manager = new PatchManager([imp, full], (patch) => {
       const c = this.sceneService.camera;
       const d = c ? Vector3.Distance(patch.getPosition(), c.position) : Infinity;
-      return d < NEAR ? 1 : 0;   // 1 = full (near), 0 = impostor (far)
+      return d < near ? 1 : 0;   // 1 = full (near), 0 = impostor (far)
     }, [1, 1]);
     manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
-    return { mat: full.material as Material, manager, patches: new Map(), build: (cx, cz) => this.buildPalms(cx, cz, variant) };
+    return { mat: full.material as Material, manager, patches: new Map(), build };
   }
 
   /** Fallback: the old procedural-primitive palm as a single (all-variant) scatter layer. */
@@ -241,6 +276,14 @@ export class ScatterService {
       { stacks: 2, nearerThan: 130,      fraction: 1.0 },
       { stacks: 1, nearerThan: Infinity, fraction: 0.7 },
     ], (cx, cz) => this.buildPalms(cx, cz, -1), createPalm, false));
+  }
+
+  /** Fallback: the old procedural-primitive forest tree as a single (all-variant) scatter layer. */
+  private registerTreeFallback(scene: Scene): void {
+    this.layers.push(this.makeLayer(scene, 'scatter_trees', new Color3(1, 1, 1), 0, [
+      { stacks: 2, nearerThan: 110,      fraction: 1.0 },
+      { stacks: 1, nearerThan: Infinity, fraction: 0.6 },
+    ], (cx, cz) => this.buildTrees(cx, cz, -1), createTree, false));
   }
 
   /** Build a scatter layer: material (+ wind/fade plugin), tiered LoD meshes, patch manager.
@@ -534,7 +577,7 @@ export class ScatterService {
 
   /** Build one patch's forest trees: clustered in the inland forest-mask zone (mid elevation, gentle
    *  slope), broken into stands by low-freq noise with clearings. Sparse — trees are big. */
-  private buildTrees(cx: number, cz: number): PatchData {
+  private buildTrees(cx: number, cz: number, variant: number): PatchData {
     const res = 16, size = this.PATCH, cell = size / res, E = 3.0;
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -543,8 +586,9 @@ export class ScatterService {
 
     for (let x = 0; x < res; x++) {
       for (let z = 0; z < res; z++) {
-        const px = cx + (x + Math.random()) * cell - size / 2;
-        const pz = cz + (z + Math.random()) * cell - size / 2;
+        // Deterministic jitter (hash, not Math.random) so all variant calls partition one candidate set.
+        const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
+        const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
         if (y < 7 || y > 80) { continue; }                 // inland band, below the rocky uplands
         const slope = this.slopeAt(px, pz, y, E);
@@ -555,13 +599,15 @@ export class ScatterService {
         const clearing = fbm2(px / 13 + 9, pz / 13 - 4);
         const dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
           * (1 - slope * 0.8) * 0.6 * this.densityMul;
-        if (Math.random() > dens) { continue; }
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
-        const s = 0.8 + Math.random() * 0.6;               // ~4–7 m trees
-        const w = s * (0.85 + Math.random() * 0.3);
-        scaleV.set(w, s, w);
+        // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+
+        const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
+        scaleV.set(s, s, s);
         posV.set(px, y - 0.1, pz);
-        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, Math.random() * Math.PI * 2), posV)
+        Matrix.Compose(scaleV, Quaternion.RotationAxis(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2), posV)
           .copyToArray(tmp, kept * 16);
         kept++;
       }

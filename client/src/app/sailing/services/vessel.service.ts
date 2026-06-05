@@ -586,7 +586,7 @@ export class VesselService {
       lastTime  = now;
       this.simTime += dt;
       this.physicsStep(dt);
-      this.updateCamera();
+      this.updateCamera(dt);
     });
   }
 
@@ -878,7 +878,7 @@ export class VesselService {
     this.waterShadow.visibility = 0.34 + (1 - Math.max(0, sunDir.y)) * 0.48;
   }
 
-  private updateCamera(): void {
+  private updateCamera(dt: number): void {
     const cam = this.sceneService.camera;
     if (!cam) return;
 
@@ -895,7 +895,13 @@ export class VesselService {
     const desiredZ = targetZ - Math.cos(elevRad) * Math.cos(azRad) * this.camDist;
     const desiredY = targetY + Math.sin(elevRad) * this.camDist;
 
-    const lerp = this.isDragging ? 1.0 : 0.08;  // snap instantly while dragging
+    // Frame-rate-independent follow. A fixed per-frame fraction (the old 0.08) makes the camera's
+    // catch-up speed depend on frame time: with dt swinging 15↔45 ms the look-at orientation steps
+    // by uneven amounts each frame. The near scene barely shifts, but the distant volumetric clouds
+    // reproject almost entirely from camera ROTATION, so that orientation wobble is amplified into
+    // the persistent cloud "jitter". Easing by (1 - e^(-k·dt)) makes the camera cover the same
+    // fraction per unit TIME regardless of frame rate — k=5 reproduces the old 0.08 at 60 fps.
+    const lerp = this.isDragging ? 1.0 : 1 - Math.exp(-5 * dt);
     cam.position.x += (desiredX - cam.position.x) * lerp;
     cam.position.y += (desiredY - cam.position.y) * lerp;
     cam.position.z += (desiredZ - cam.position.z) * lerp;

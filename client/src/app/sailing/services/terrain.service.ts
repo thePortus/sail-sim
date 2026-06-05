@@ -1723,15 +1723,20 @@ export class TerrainService {
       // ground reads as subtly bumpy instead of glassy-smooth. Faded out with
       // distance to avoid shimmer/aliasing and keep the cost near the camera.
       float detFade = 1.0 - smoothstep(70.0, 380.0, length(vPositionW - vEyePosition.xyz));
-      if (detFade > 0.001) {
-        vec3 detN1 = texture2D(uGrassNor, vPositionW.xz * 0.60).rgb * 2.0 - 1.0;
-        vec3 detN2 = texture2D(uRockNor,  vPositionW.xz * 1.30).rgb * 2.0 - 1.0;
-        vec3 detWorld = normalize(
-            vec3(detN1.r, detN1.b, detN1.g) * 0.6 +
-            vec3(detN2.r, detN2.b, detN2.g) * 0.4
-        );
-        normalW = normalize(normalW + detWorld * (0.24 * detFade));
-      }
+      // Sampled UNCONDITIONALLY -- no  if (detFade > 0.001)  guard. WGSL forbids an implicit-LOD
+      // texture sample (texture2D) inside non-uniform control flow (the gradient-based mip selection
+      // requires uniform control flow), so gating these by the per-pixel detFade made the terrain
+      // fragment shader fail to compile on WebGPU -- failing pipeline creation EVERY frame (the cause
+      // of the large frame-time spikes). The detFade multiply below already fades the contribution to
+      // zero past the near field, so dropping the branch is behaviourally identical; the only cost is
+      // two extra texture taps on far pixels, and it keeps mip-correct sampling (no shimmer).
+      vec3 detN1 = texture2D(uGrassNor, vPositionW.xz * 0.60).rgb * 2.0 - 1.0;
+      vec3 detN2 = texture2D(uRockNor,  vPositionW.xz * 1.30).rgb * 2.0 - 1.0;
+      vec3 detWorld = normalize(
+          vec3(detN1.r, detN1.b, detN1.g) * 0.6 +
+          vec3(detN2.r, detN2.b, detN2.g) * 0.4
+      );
+      normalW = normalize(normalW + detWorld * (0.24 * detFade));
     `);
 
     // ── Aerial perspective (distance haze) ────────────────────────────────────

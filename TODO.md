@@ -2,10 +2,14 @@
 
 # General or Current TODO Items
 
-* all rain drops hit at the same time.... even pattern
+* dither shoreline more
 * clouds don't move so much as jitter
+* AO problem still affects sails
 * switching from geometry to clip map raised all the shallows to super shallow on many different maps
+* fix boat back windows bleeding through
+* fix no boat transparency in deep water
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
+* made cannon elevation aiming smooth and by decimals
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?
 * introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location

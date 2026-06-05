@@ -3,8 +3,8 @@
 # General or Current TODO Items
 
 * all rain drops hit at the same time.... even pattern
-* still looks super blue behind the boat int he shallows (probably the environment reflection)
 * I can see through the boat? (I can see the coastline anyway, and water rippling through it)
+* switching from geometry to clip map raised all the shallows to super shallow on many different maps
 * ship seems dark when camera far off
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * Backlighting refreaction color issue in shallows

@@ -309,7 +309,15 @@ export class VesselService {
    *  varyings than the old split parts; combined with the SSAO prePass, shadow receipt, fog,
    *  and the ocean-reflection clip-plane they blow past WebGPU's hard 16 inter-stage limit,
    *  which invalidates EVERY pipeline that includes the vessel (black screen). So: cast
-   *  shadows (depth-only, cheap) but don't receive them, drop fog, exclude from the prePass. */
+   *  shadows (depth-only, cheap) but don't receive them, drop fog.
+   *
+   *  The vessel is now KEPT IN the prePass (the excludeFromPrePass call was removed): with shadow
+   *  receipt + fog already dropped there's room under the 16 limit, and being in the prePass gives
+   *  SSAO/DoF the boat's true depth+normals — without it, SSAO sampled the ocean/shore BEHIND the
+   *  boat and painted their AO onto the hull/sails (the "transparent boat" artifact). If this turns
+   *  out to still overflow 16 (black screen with the vessel pipeline invalid), the next varying to
+   *  shed is the ocean-reflection clip-plane (drop oceanService.addToRenderList → loses boat-in-water
+   *  reflection/refraction), then re-exclude from the prePass as the last resort. */
   private registerMeshesForRendering(meshes: AbstractMesh[]): void {
     const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
@@ -321,7 +329,6 @@ export class VesselService {
       if (mat && !seenMats.has(mat)) {
         seenMats.add(mat);
         mat.fogEnabled = false;
-        this.sceneService.excludeFromPrePass(mat);
       }
     }
   }

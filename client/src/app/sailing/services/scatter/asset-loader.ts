@@ -92,11 +92,47 @@ export async function loadScatterMesh(scene: Scene, file: string, name: string):
  * billboard needed (a 3-way cross reads fine from the near-horizontal angles you sail at). Hidden by
  * default (the PatchManager clones it per far patch).
  */
-export function createCrossImpostor(scene: Scene, name: string, tex: Texture, width: number, height: number): Mesh {
+/**
+ * Measure the fraction of an image that is fully-transparent padding BELOW the content (the lowest
+ * opaque row up to the bottom edge). The authored impostor billboards have empty space under the trunk,
+ * so a quad placed base-at-ground would draw the tree floating; this lets the caller sink the billboard
+ * by exactly that fraction so the trunk meets the ground. Falls back to `fallback` if the image can't be
+ * read (e.g. a cross-origin canvas taint). */
+export async function measureBottomPad(url: string, fallback = 0.08): Promise<number> {
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const i = new Image();
+      i.crossOrigin = 'anonymous';
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = url;
+    });
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const ctx = c.getContext('2d');
+    if (!ctx) { return fallback; }
+    ctx.drawImage(img, 0, 0);
+    const { data } = ctx.getImageData(0, 0, c.width, c.height);
+    let lastOpaqueRow = c.height - 1;
+    for (let y = c.height - 1; y >= 0; y--) {
+      let opaque = false;
+      for (let x = 0; x < c.width; x++) { if (data[(y * c.width + x) * 4 + 3] > 12) { opaque = true; break; } }
+      if (opaque) { lastOpaqueRow = y; break; }
+    }
+    return (c.height - 1 - lastOpaqueRow) / c.height;
+  } catch {
+    return fallback;
+  }
+}
+
+/** @param basePad fraction of `height` of empty padding below the content in the impostor image — the
+ *  quad is sunk by this so the drawn trunk base sits at y=0 (ground) instead of floating. */
+export function createCrossImpostor(scene: Scene, name: string, tex: Texture, width: number, height: number, basePad = 0): Mesh {
   const planes: Mesh[] = [];
   for (let k = 0; k < 3; k++) {
     const q = MeshBuilder.CreatePlane(`${name}_q${k}`, { width, height }, scene);
-    q.bakeTransformIntoVertices(Matrix.Translation(0, height / 2, 0));   // base at y=0
+    // Lower the quad by the image's bottom padding so the trunk (not the image edge) lands at y=0.
+    q.bakeTransformIntoVertices(Matrix.Translation(0, height / 2 - basePad * height, 0));
     q.rotation.y = (k / 3) * Math.PI;                                    // 0°, 60°, 120°
     q.bakeCurrentTransformIntoVertices();
     planes.push(q);

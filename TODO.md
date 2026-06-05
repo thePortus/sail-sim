@@ -2,6 +2,8 @@
 
 # General or Current TODO Items
 
+* birds cast reflections
+* cannonfire lights up landscape
 * add sound of canvas flapping in the wind
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land

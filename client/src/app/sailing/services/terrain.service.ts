@@ -183,7 +183,92 @@ export class TerrainService {
       this.sceneService.excludeFromGlow(cm);
     }
 
-    this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
+    const probe = location.search.includes('treeprobe');
+    this.clipmapObserver = scene.onBeforeRenderObservable.add(() => {
+      this.clipmap?.update();
+      if (probe) { this.runTreeProbe(scene); }
+    });
+  }
+
+  // ── ?treeprobe diagnostic — does getElevation match the rendered terrain surface? ───────────────
+  // Drops a bright marker exactly at getElevation() for a point ~18 m in front of the camera, and logs
+  // getElevation vs the GPU height texture (the value the clipmap vertex shader actually samples) at the
+  // SAME point. If the marker rests on the sand → getElevation is correct (so floating trees would be a
+  // model/placement issue, not terrain). If the marker floats/sinks → getElevation ≠ rendered surface,
+  // and the logged readback diff pinpoints whether the GPU texture diverged from the heightfield.
+  private _probeMarker: import('@babylonjs/core').Mesh | null = null;
+  private _probeAcc = 0;
+  private _probeReadback: Float32Array | null = null;
+  private _probeReadbackPending = false;
+
+  private runTreeProbe(scene: Scene): void {
+    const cam = this.sceneService.camera;
+    if (!cam) { return; }
+    // March along the view direction (horizontal) and stop at the FIRST point up on the beach (elevation
+    // in the band where palms/driftwood live), so the marker lands where the trees actually are.
+    const fwd = cam.getForwardRay().direction;
+    const hl = Math.hypot(fwd.x, fwd.z) || 1;
+    const dx = fwd.x / hl, dz = fwd.z / hl;
+    let wx = cam.position.x + dx * 30, wz = cam.position.z + dz * 30, elev = this.getElevation(wx, wz);
+    for (let t = 6; t <= 220; t += 2) {
+      const x = cam.position.x + dx * t, z = cam.position.z + dz * t;
+      const e = this.getElevation(x, z);
+      if (e > 0.3 && e < 8) { wx = x; wz = z; elev = e; break; }   // first beach-band hit
+    }
+
+    if (!this._probeMarker) {
+      // A tall thin pole whose BASE sits exactly at getElevation — easy to compare to nearby tree trunks.
+      const mk = MeshBuilder.CreateCylinder('treeprobe_marker', { height: 10, diameter: 0.3, tessellation: 6 }, scene);
+      const mat = new StandardMaterial('treeprobe_mat', scene);
+      mat.emissiveColor = new Color3(1, 0, 1); mat.disableLighting = true;
+      mk.material = mat; mk.isPickable = false;
+      this.sceneService.excludeFromGlow(mk);
+      mk.renderingGroupId = 2;   // draw over the terrain so it's always visible
+      this._probeMarker = mk;
+    }
+    this._probeMarker.position.set(wx, elev + 5, wz);   // base at getElevation (cylinder is centre-pivot, h=10)
+
+    this._probeAcc += scene.getEngine().getDeltaTime() / 1000;
+    if (this._probeAcc < 1) { return; }
+    this._probeAcc = 0;
+
+    // Compare getElevation against the GPU height texture read back from the device (the true value the
+    // vertex shader samples). One async readback at a time, cached between logs.
+    const gpuTex = this._probeReadback ? this.sampleReadback(wx, wz) : NaN;
+    // eslint-disable-next-line no-console
+    console.log(`[treeprobe] at (${wx.toFixed(1)}, ${wz.toFixed(1)})  getElevation=${elev.toFixed(3)}  ` +
+      `gpuTex=${Number.isNaN(gpuTex) ? 'pending' : gpuTex.toFixed(3)}  ` +
+      `diff=${Number.isNaN(gpuTex) ? '—' : (elev - gpuTex).toFixed(3)}  ` +
+      `cam.y=${cam.position.y.toFixed(2)}`);
+    if (!this._probeReadback && !this._probeReadbackPending && this.clipHeightTex) {
+      this._probeReadbackPending = true;
+      this.clipHeightTex.readPixels()?.then((buf) => {
+        this._probeReadback = buf instanceof Float32Array ? buf : new Float32Array((buf as ArrayBufferView).buffer);
+        this._probeReadbackPending = false;
+        console.log(`[treeprobe] GPU texture read back: ${this._probeReadback.length} floats ` +
+          `(expected ${this.manifest!.width * this.manifest!.height}); now comparing live.`);
+      }).catch((e) => { this._probeReadbackPending = false; console.warn('[treeprobe] readPixels failed', e); });
+    }
+  }
+
+  /** Bilinear sample of the read-back GPU texture at world (x,z), using the GPU's texel convention.
+   *  readPixels may return R-only or RGBA-packed floats; auto-detect the stride. */
+  private sampleReadback(x: number, z: number): number {
+    const d = this._probeReadback, m = this.manifest;
+    if (!d || !m) { return NaN; }
+    const { width, height, worldBounds } = m;
+    const stride = d.length >= width * height * 4 ? 4 : 1;   // RGBA vs R
+    const ux = (x - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX);
+    const uz = (worldBounds.maxZ - z) / (worldBounds.maxZ - worldBounds.minZ);
+    const px = ux * width - 0.5, pz = uz * height - 0.5;
+    const fx0 = Math.floor(px), fz0 = Math.floor(pz);
+    const x0 = Math.min(width - 1, Math.max(0, fx0)), x1 = Math.min(width - 1, Math.max(0, fx0 + 1));
+    const z0 = Math.min(height - 1, Math.max(0, fz0)), z1 = Math.min(height - 1, Math.max(0, fz0 + 1));
+    const tx = px - fx0, tz = pz - fz0;
+    const at = (xi: number, zi: number) => d[(zi * width + xi) * stride];
+    const h0 = at(x0, z0) + (at(x1, z0) - at(x0, z0)) * tx;
+    const h1 = at(x0, z1) + (at(x1, z1) - at(x0, z1)) * tx;
+    return h0 + (h1 - h0) * tz;
   }
 
   isReady(): boolean {
@@ -237,16 +322,27 @@ export class TerrainService {
     if (!this.manifest || !this.heightfield) return 0;
 
     const { width, height, worldBounds, quantizationLevels, targetPeakElevation } = this.manifest;
-    const px = ((worldX - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX)) * (width - 1);
-    const pz = ((worldBounds.maxZ - worldZ) / (worldBounds.maxZ - worldBounds.minZ)) * (height - 1);
+    // Sample with the EXACT texel convention the GPU clipmap uses (`uv * texSize - 0.5`, then floor +
+    // fract + per-tap edge clamp). The old `uv * (width-1)` mapping differed from the GPU by `(uv-0.5)`
+    // texels — zero at the map centre, ±½ texel toward the edges — so scattered trees/rocks placed via
+    // this height drifted off the rendered surface (floating / sunk) away from centre. Matching the GPU
+    // here keeps every placement flush with the terrain the player actually sees.
+    const ux = (worldX - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX);
+    const uz = (worldBounds.maxZ - worldZ) / (worldBounds.maxZ - worldBounds.minZ);
+    const px = ux * width - 0.5;
+    const pz = uz * height - 0.5;
 
-    const x0 = Math.floor(px);
-    const z0 = Math.floor(pz);
-    const x1 = Math.min(width - 1, x0 + 1);
-    const z1 = Math.min(height - 1, z0 + 1);
+    const fx0 = Math.floor(px);
+    const fz0 = Math.floor(pz);
+    // Per-tap clamp to [0, size-1] (GPU clamps i0 and i0+1 independently); weights use the UNCLAMPED
+    // fract so the interpolation matches texelFetch + fract(tc) exactly.
+    const x0 = Math.min(width - 1,  Math.max(0, fx0));
+    const x1 = Math.min(width - 1,  Math.max(0, fx0 + 1));
+    const z0 = Math.min(height - 1, Math.max(0, fz0));
+    const z1 = Math.min(height - 1, Math.max(0, fz0 + 1));
 
-    const tx = px - x0;
-    const tz = pz - z0;
+    const tx = px - fx0;
+    const tz = pz - fz0;
 
     const h00 = this.sampleQuantized(x0, z0);
     const h10 = this.sampleQuantized(x1, z0);
@@ -1844,6 +1940,7 @@ export class TerrainService {
 
   // ── P4b: clipmap height texture (heightfield → GPU R32F) ─────────────────────
   private clipHeightTex: RawTexture | null = null;
+  private clipHeightData: Float32Array | null = null;   // CPU copy of the texture (decoded metres) — for ?treeprobe
   private clipWBounds = new Vector4(0, 0, 1, 1);
   private clipTexSize = new Vector2(1, 1);
 
@@ -1854,6 +1951,7 @@ export class TerrainService {
     const data = new Float32Array(n);
     const span = (maxE - minE) / m.quantizationLevels;
     for (let i = 0; i < n; i++) { data[i] = this.heightfield[i] * span + minE; }
+    this.clipHeightData = data;
     const tex = new RawTexture(
       data, m.width, m.height, Constants.TEXTUREFORMAT_R, scene,
       false, false, Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_FLOAT,

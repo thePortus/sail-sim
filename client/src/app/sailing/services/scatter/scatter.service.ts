@@ -18,8 +18,8 @@ import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
 import {
-  loadScatterMesh, createCrossImpostor, loadScatterGeometry, buildScatterPBR, buildGrassMaterial,
-  scatterTextureUrl, setScatterVersion, clearScatterCache,
+  loadScatterMesh, createCrossImpostor, measureBottomPad, loadScatterGeometry, buildScatterPBR,
+  buildGrassMaterial, scatterTextureUrl, setScatterVersion, clearScatterCache,
 } from './asset-loader';
 
 const EMPTY = new Float32Array(0);
@@ -332,8 +332,10 @@ export class ScatterService {
       // just stops the per-submesh readiness re-checks across every palm patch clone — free CPU.
       full.material.freeze();
 
-      const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
-      const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height);
+      const impUrl = scatterTextureUrl(cfg.impostor);
+      const tex = new Texture(impUrl, scene);
+      const pad = await measureBottomPad(impUrl, 0.08);   // sink the billboard so the trunk meets the ground
+      const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height, pad);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
@@ -365,8 +367,10 @@ export class ScatterService {
       this.sceneService.excludeFromPrePass(full.material);
       full.material.freeze();   // wind still animates (plugin bind runs when frozen); skips readiness re-checks
 
-      const tex = new Texture(scatterTextureUrl(cfg.impostor), scene);
-      const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h);
+      const impUrl = scatterTextureUrl(cfg.impostor);
+      const tex = new Texture(impUrl, scene);
+      const pad = await measureBottomPad(impUrl, 0.12);   // sink the billboard so the trunk meets the ground
+      const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h, pad);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
@@ -965,7 +969,7 @@ export class ScatterService {
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
-        posV.set(px, y - 0.1, pz);
+        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);
@@ -1007,7 +1011,7 @@ export class ScatterService {
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }
-        posV.set(px, y - 0.1, pz);
+        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);

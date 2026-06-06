@@ -28,6 +28,7 @@ import terrainConfig from '../config/terrain.config.js';
 import { SOURCES, regionById } from '../data/region-catalog.mjs';
 import { deriveAugment } from '../data/augment.mjs';
 import { hydraulicErode, thermalErode, addDetail } from '../data/erode.mjs';
+import { addReefs } from '../data/reefs.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCES_DIR = join(__dirname, '..', 'assets', 'maps', 'sources');
@@ -46,6 +47,15 @@ const SEED = args.some((a) => a.startsWith('--seed=')) ? numArg('seed', 0) : nul
 const ERODE   = args.includes('--no-erode')   ? 0 : numArg('erode', 120000);   // hydraulic droplet count
 const THERMAL = args.includes('--no-thermal') ? 0 : numArg('thermal', 3);      // talus relax iterations
 const DETAIL  = args.includes('--no-detail')  ? 0 : numArg('detail', 2.5);     // fBm micro-relief amp (m)
+// Bathymetry polish (Phase 3): fringing reefs + lagoon shelves + seamounts + seabed micro-relief.
+// Per-archetype defaults; override with --reefs=<0..1> (fringing intensity), --lagoon=<0..1>,
+// --seamounts=<N>, --reef-detail=<m>; disable any with --no-reefs / --no-lagoon / --no-seamounts;
+// --no-bathy skips the whole pass. (null → archetype default, NaN from a bad value → also default.)
+const REEFS     = args.includes('--no-reefs')      ? 0 : (args.some((a) => a.startsWith('--reefs='))     ? numArg('reefs', NaN)       : null);
+const REEFDET   = args.some((a) => a.startsWith('--reef-detail=')) ? numArg('reef-detail', NaN) : null;
+const LAGOON    = args.includes('--no-lagoon')     ? 0 : (args.some((a) => a.startsWith('--lagoon='))    ? numArg('lagoon', NaN)      : null);
+const SEAMOUNTS = args.includes('--no-seamounts')  ? 0 : (args.some((a) => a.startsWith('--seamounts=')) ? numArg('seamounts', NaN)   : null);
+const NOBATHY   = args.includes('--no-bathy');
 
 if (!regionId) { console.error('Usage: build-terrain-region.mjs <regionId> [--res=] [--vscale=] [--sea=]'); process.exit(1); }
 const region = regionById(regionId);
@@ -125,6 +135,18 @@ async function run() {
   if (THERMAL) { thermalErode(field, OUT, { iterations: THERMAL, talus: Math.tan(38 * Math.PI / 180) * cellM, seaLevel: 0 }); console.log(`  thermal erosion: ${THERMAL} iters (talus ${(Math.tan(38 * Math.PI / 180) * cellM).toFixed(1)} m/cell)`); }
   if (DETAIL)  { addDetail(field, OUT, SEED ?? 1, { amp: DETAIL, worldM: worldBounds.maxX - worldBounds.minX, seaLevel: 0 }); console.log(`  detail touch-up: ±${DETAIL} m fBm`); }
 
+  // ── Bathymetry polish (Phase 3) — fringing reefs + lagoon shelves + seamounts + seabed micro-relief ──
+  let reefInfo = null;
+  if (!NOBATHY) {
+    const num = (v) => (v != null && !Number.isNaN(v) ? v : undefined);   // → undefined keeps archetype default
+    const r = addReefs(field, OUT, SEED ?? 1, {
+      cellM, worldM: worldBounds.maxX - worldBounds.minX, archetype: region.archetype, seaLevel: 0,
+      intensity: num(REEFS), detail: num(REEFDET), lagoon: num(LAGOON), seamounts: num(SEAMOUNTS),
+    });
+    reefInfo = r.profile;
+    console.log(`  reefs [${region.archetype}]: ${r.profile.label}  → ${r.placedSeamounts} seamount(s)`);
+  }
+
   let minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < field.length; i++) { const y = field[i]; if (y < minY) minY = y; if (y > maxY) maxY = y; }
   if (maxY <= minY) { console.error('Degenerate elevation range — bad source data?'); process.exit(1); }
@@ -181,6 +203,10 @@ async function run() {
     seed: SEED,
     augment: aug ? { mirror: aug.mirror, rot: +aug.rot.toFixed(4), zoom: +aug.zoom.toFixed(3),
       panU: +aug.panU.toFixed(3), panV: +aug.panV.toFixed(3), seaLevel: +aug.seaLevel.toFixed(2), label: aug.label } : null,
+    reefs: reefInfo ? { intensity: +reefInfo.intensity.toFixed(3), crestDepth: +reefInfo.crestDepth.toFixed(2),
+      crestDistM: +reefInfo.crestDistM.toFixed(0), passDensity: +reefInfo.passDensity.toFixed(3),
+      detailAmp: +reefInfo.detailAmp.toFixed(2), lagoonStrength: +reefInfo.lagoonStrength.toFixed(3),
+      lagoonDepth: +reefInfo.lagoonDepth.toFixed(1), seamountCount: reefInfo.seamountCount, label: reefInfo.label } : null,
     worldBounds,
     spawns,
   };
@@ -215,6 +241,9 @@ function writeFieldPreview(field, OUT, minY, maxY, path) {
       if (h <= 0) {
         const d = cl(h / (minY || -1));                          // 0 surface → 1 deepest
         rgb = [lerp(170, 8, d), lerp(225, 20, d), lerp(240, 70, d)];
+        // Turquoise shoal highlight so reef crests / shelves read clearly (shallowest 4 m).
+        const shoal = 1 - cl(-h / 4);                            // 1 at surface → 0 by −4 m
+        rgb = [lerp(rgb[0], 90, shoal * 0.7), lerp(rgb[1], 230, shoal * 0.7), lerp(rgb[2], 200, shoal * 0.7)];
       } else {
         const t = cl(h / (maxY || 1));
         const ramp = [[0, [216, 200, 150]], [0.12, [70, 120, 55]], [0.45, [110, 95, 70]], [0.78, [90, 80, 72]], [1, [235, 235, 240]]];

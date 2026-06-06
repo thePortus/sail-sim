@@ -97,6 +97,7 @@ export class TerrainService {
   private biomeAlbedoArr: RawTexture2DArray | null = null;
   private biomeOrmArr: RawTexture2DArray | null = null;
   private biomePlaceholderArr: RawTexture2DArray | null = null;
+  private splatTex: Texture | null = null;   // S2 control/splat map (RGBA soft biome weights, world-aligned)
   private static readonly BIOME_TILES = ['sand', 'grass', 'gravel', 'rock', 'snow'];
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
@@ -1982,8 +1983,17 @@ export class TerrainService {
     this.biomePlaceholderArr = this.biomePlaceholderArr ?? this.makePlaceholderArr(scene);
     void this.loadBiomeArrays(scene);
 
+    // S2 control/splat map: world-aligned RGBA soft biome weights. invertY=false so v=0 = north (matches
+    // the heightfield uv). A not-yet-loaded texture still binds; uHasSplat gates its use (→ _biomeW until ready).
+    this.splatTex = new Texture(`${Settings.apiUrl}terrain/splat-map`, scene, false, false,
+      Texture.LINEAR_LINEAR_MIPLINEAR, null, () => console.info('[TerrainPBR] splat map not found — using live biome calc'));
+    this.splatTex.wrapU = Texture.CLAMP_ADDRESSMODE; this.splatTex.wrapV = Texture.CLAMP_ADDRESSMODE;
+    this.terrainTextures.push(this.splatTex);
+
     mat.AddUniform('uAlbedoArr', 'sampler2DArray', null);
     mat.AddUniform('uOrmArr', 'sampler2DArray', null);
+    mat.AddUniform('uSplat', 'sampler2D', null);
+    mat.AddUniform('uHasSplat', 'float', null);
     mat.AddUniform('heightTex', 'sampler2D', null);
     mat.AddUniform('uPeakH', 'float', null);
     mat.AddUniform('wbounds', 'vec4', null);
@@ -2051,6 +2061,23 @@ export class TerrainService {
         float t = max(0.0001, wSand+wGrass+wGravel+wRock+wSnow);
         wSand/=t; wGrass/=t; wGravel/=t; wRock/=t; wSnow/=t;
       }
+      // S2: biome weights from the baked CONTROL/SPLAT map (consistent, flow/moisture-aware,
+      // art-directable), re-sharpened on cliffs by the per-pixel geometry slope (the splat is 24 m/texel
+      // → smooth). Falls back to the live _biomeW until the splat texture is ready (uHasSplat is uniform,
+      // so the branch is uniform control flow → the texture sample is WebGPU-safe).
+      void _biomeSplat(vec3 wp, vec3 nW, out float wSand, out float wGrass, out float wGravel, out float wRock, out float wSnow) {
+        if (uHasSplat < 0.5) { _biomeW(wp, nW, wSand, wGrass, wGravel, wRock, wSnow); return; }
+        vec2 uv = vec2((wp.x - wbounds.x)/wbounds.z, (wbounds.y + wbounds.w - wp.z)/wbounds.w);
+        vec4 s = texture2D(uSplat, uv);
+        wSand = s.r; wGrass = s.g; wGravel = s.b; wRock = s.a; wSnow = max(0.0, 1.0 - (s.r+s.g+s.b+s.a));
+        float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
+        float steep = smoothstep(0.35, 0.72, slope);
+        wRock = max(wRock, steep);
+        wGrass *= (1.0 - steep*0.9);
+        wSand  *= (1.0 - steep*0.7);
+        float t = max(1e-4, wSand+wGrass+wGravel+wRock+wSnow);
+        wSand/=t; wGrass/=t; wGravel/=t; wRock/=t; wSnow/=t;
+      }
     `);
 
     // Roughness (metallic stays 0). Procedural for now — wet, low, flat ground near the waterline reads
@@ -2058,7 +2085,7 @@ export class TerrainService {
     // in S1b. Runs BEFORE the light loop, so it recomputes slope from the Sobel normal.
     mat.Fragment_Custom_MetallicRoughness(`
       vec3 nWr = _clipNormal(vPositionW.xz);
-      float mrS, mrG, mrGr, mrR, mrSn; _biomeW(vPositionW, nWr, mrS, mrG, mrGr, mrR, mrSn);
+      float mrS, mrG, mrGr, mrR, mrSn; _biomeSplat(vPositionW, nWr, mrS, mrG, mrGr, mrR, mrSn);
       float rgh = texture(uOrmArr, vec3(vPositionW.xz*0.05, 0.0)).r*mrS + texture(uOrmArr, vec3(vPositionW.xz*0.05, 1.0)).r*mrG
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 2.0)).r*mrGr + texture(uOrmArr, vec3(vPositionW.xz*0.05, 3.0)).r*mrR
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 4.0)).r*mrSn;
@@ -2088,7 +2115,7 @@ export class TerrainService {
       vec3 nW = _clipNormal(vPositionW.xz);
       vec3 triW = abs(nW); triW = triW*triW*triW*triW*triW*triW; triW /= (triW.x+triW.y+triW.z);
       float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
-      float wSand, wGrass, wGravel, wRock, wSnow; _biomeW(vPositionW, nW, wSand, wGrass, wGravel, wRock, wSnow);
+      float wSand, wGrass, wGravel, wRock, wSnow; _biomeSplat(vPositionW, nW, wSand, wGrass, wGravel, wRock, wSnow);
 
       // Triplanar albedo from the biome ARRAY (layer = biome index): fine + coarse, cross-textured rock/gravel.
       #define TRIA(L, scl) (texture(uAlbedoArr, vec3(vPositionW.yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3(vPositionW.xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3(vPositionW.xy*(scl), float(L))).rgb*triW.z)
@@ -2148,6 +2175,8 @@ export class TerrainService {
       fx.setFloat('uCloudBaseH', csf?.cloudBase ?? 900);
       fx.setTexture('uAlbedoArr', this.biomeAlbedoArr ?? this.biomePlaceholderArr);
       fx.setTexture('uOrmArr', this.biomeOrmArr ?? this.biomePlaceholderArr);
+      if (this.splatTex) { fx.setTexture('uSplat', this.splatTex); }
+      fx.setFloat('uHasSplat', this.splatTex && this.splatTex.isReady() ? 1 : 0);
       if (this.clipHeightTex) {
         fx.setTexture('heightTex', this.clipHeightTex);
         fx.setVector4('wbounds', this.clipWBounds);

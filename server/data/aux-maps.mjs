@@ -119,6 +119,45 @@ export function auxBiome(field, OUT, slope, moisture, peakElev, seaLevel = 0) {
   return out;
 }
 
+/**
+ * S2 control/splat map: SOFT per-biome cover weights packed into RGBA (R=sand, G=grass, B=gravel,
+ * A=rock; snow = 1 − Σ, derived in the shader). Same cover model as the terrain shader's `_biomeW`, but
+ * baked once (consistent, art-directable) and FLOW-AWARE — drainage channels read greener/gravellier
+ * (riparian). Seabed bakes as sand (so submerged terrain reads sandy, not snow-by-remainder). The shader
+ * samples this bilinearly and re-sharpens cliffs with per-pixel slope, so macro classification comes from
+ * here while fine cliff detail stays crisp.
+ */
+export function auxSplat(field, OUT, slope, moisture, flow, peakElev, seaLevel = 0) {
+  const out = new Uint8Array(OUT * OUT * 4);
+  const peak = Math.max(1, peakElev);
+  let maxFlow = 1; for (let i = 0; i < flow.length; i++) if (flow[i] > maxFlow) maxFlow = flow[i];
+  const logMax = Math.log(1 + maxFlow) || 1;
+  const cl = (x) => Math.max(0, Math.min(1, x));
+  for (let i = 0; i < field.length; i++) {
+    const y = field[i], o = i * 4;
+    if (y <= seaLevel) { out[o] = 255; out[o + 1] = 0; out[o + 2] = 0; out[o + 3] = 0; continue; }  // seabed → sand
+    const h = Math.min(1, y / peak);
+    const sl = Math.min(1.5, slope[i]);
+    const wet = cl((moisture[i] - 0.25) / 0.53);
+    const fl = Math.log(1 + flow[i]) / logMax;                  // drainage 0..1
+    const shoreW = cl(1 - y / 10);
+    const hSand = cl(1 - h / 0.085);
+    const sandSlope = (y < 15 ? 1 : Math.max(0, 1 - sl * 1.25));
+    let wSand = Math.max(hSand, shoreW) * sandSlope;
+    let wGrass = cl((h - 0.035) / 0.28) * Math.max(0, 1 - sl * 0.95) * (0.35 + 1.30 * wet);
+    let wGravel = cl((h - 0.20) / 0.52) * Math.max(0, 0.25 + sl * 1.5) * (1.45 - 0.75 * wet);
+    let wRock = cl((h - 0.34) / 0.54) * Math.max(0, 0.22 + sl * 1.7) * (1.25 - 0.40 * wet);
+    const wSnow = cl((h - 0.66) / 0.16) * Math.max(0, 1 - sl * 2.2);
+    wGrass *= 1 + fl * 0.8; wGravel *= 1 + fl * 0.5;            // drainage → riparian green / gravel
+    const t = Math.max(1e-4, wSand + wGrass + wGravel + wRock + wSnow);
+    out[o]     = Math.round((wSand / t) * 255);
+    out[o + 1] = Math.round((wGrass / t) * 255);
+    out[o + 2] = Math.round((wGravel / t) * 255);
+    out[o + 3] = Math.round((wRock / t) * 255);
+  }
+  return out;
+}
+
 /** Compute all aux maps from the final field. Returns the raw typed arrays (full OUT resolution). */
 export function computeAuxMaps(field, OUT, cellM, worldBounds, peakElev, seaLevel = 0) {
   const slope = auxSlope(field, OUT, cellM);
@@ -126,7 +165,8 @@ export function computeAuxMaps(field, OUT, cellM, worldBounds, peakElev, seaLeve
   const moisture = auxMoisture(field, OUT, worldBounds);
   const flow = auxFlow(field, OUT, seaLevel);
   const biome = auxBiome(field, OUT, slope, moisture, peakElev, seaLevel);
-  return { slope, shoreDist, moisture, flow, biome };
+  const splat = auxSplat(field, OUT, slope, moisture, flow, peakElev, seaLevel);
+  return { slope, shoreDist, moisture, flow, biome, splat };
 }
 
 /** Palette (RGB) for the biome ids, for the biome PNG + preview. */

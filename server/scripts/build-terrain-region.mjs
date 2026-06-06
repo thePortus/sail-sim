@@ -305,10 +305,17 @@ function writeAuxMaps(maps, OUT, res, outputDir) {
   writeFileSync(join(outputDir, 'aux_map.png'), PNG.sync.write(packed));
   writeFileSync(join(outputDir, 'biome_map.png'), PNG.sync.write(biomePng));
   writeAuxPreview(maps, OUT, maxFlow, join(outputDir, 'aux_preview.png'));
+
+  // S2 control/splat map — full-res RGBA soft biome weights (sand/grass/gravel/rock; snow = remainder).
+  const splatPng = new PNG({ width: OUT, height: OUT });
+  splatPng.data.set(maps.splat);
+  writeFileSync(join(outputDir, 'splat_map.png'), PNG.sync.write(splatPng));
+
   return {
     resolution: res, packed: 'aux_map.png', channels: { r: 'slope', g: 'shoreDist', b: 'wetness', a: 'flow' },
     slopeMaxMPerM: SLOPE_MAX, shoreDistMaxM: SHORE_MAX, flowLogNorm: true,
     biome: 'biome_map.png', biomeIds: ['seabed', 'sand', 'grass', 'gravel', 'rock', 'snow'],
+    splat: 'splat_map.png', splatResolution: OUT, splatChannels: { r: 'sand', g: 'grass', b: 'gravel', a: 'rock', snow: '1-sum' },
   };
 }
 

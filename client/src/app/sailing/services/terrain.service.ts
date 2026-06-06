@@ -22,7 +22,7 @@ import {
   Vector4,
   Constants,
 } from '@babylonjs/core';
-import { CustomMaterial } from '@babylonjs/materials';
+import { CustomMaterial, PBRCustomMaterial } from '@babylonjs/materials';
 import { TerrainClipmap } from './terrain/terrain-clipmap';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds } from '../models';
@@ -90,6 +90,7 @@ export class TerrainService {
   } | null = null;
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
+  private terrainMaterialPBR: PBRCustomMaterial | null = null;   // S0 spike: ?terrainpbr path
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -159,7 +160,9 @@ export class TerrainService {
     this.clipmap?.dispose();
     this.clipmap = null;
 
-    const mat = this.buildTerrainMaterial(scene, m, true);   // clipmap mode: GPU displace + Sobel normals
+    // S0 spike: `?terrainpbr` swaps the StandardMaterial skin for the PBRCustomMaterial one (default off).
+    const usePBR = typeof location !== 'undefined' && location.search.includes('terrainpbr');
+    const mat = usePBR ? this.buildTerrainMaterialPBR(scene, m) : this.buildTerrainMaterial(scene, m, true);
     mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
 
     // Publish the heightfield so the volumetric clouds can march it for terrain occlusion (the clipmap
@@ -1226,6 +1229,8 @@ export class TerrainService {
   private buildTerrainMaterial(scene: any, manifest: TerrainManifest, clipmap = false): CustomMaterial {
     this.terrainMaterial?.dispose();
     this.terrainMaterial = null;
+    this.terrainMaterialPBR?.dispose();
+    this.terrainMaterialPBR = null;
     for (const texture of this.terrainTextures) {
       texture.dispose();
     }
@@ -1882,6 +1887,199 @@ export class TerrainService {
 
     this.terrainMaterial = material;
     return material;
+  }
+
+  /**
+   * S0 spike (terrain-skinning roadmap) — a PBRCustomMaterial clipmap terrain, behind `?terrainpbr`.
+   * Proves the material-model switch: GPU height-displacement + Sobel normals + procedural detail
+   * normals (P5) + triplanar biome albedo + matte roughness, lit by the Atmosphere addon (physical
+   * sky/sun) instead of StandardMaterial's manual lighting, plus the ragged waterline + cloud shadows +
+   * aerial haze. Intentionally a CLEAN FOUNDATION (per-biome rough/AO + tile normals via texture arrays
+   * = S1; control map = S2; anti-tiling = S3; strata/wet-sand = S4/S5), not a 1:1 port of the Standard
+   * material. Mirrors the FFT ocean's proven PBRCustomMaterial-on-WebGPU pattern (Vertex_After_
+   * WorldPosComputed displaces worldPos; Fragment_Before_Lights sets surfaceAlbedo/normalW;
+   * Fragment_Before_FinalColorComposition post-processes the lit `color`).
+   */
+  private buildTerrainMaterialPBR(scene: Scene, manifest: TerrainManifest): PBRCustomMaterial {
+    this.terrainMaterialPBR?.dispose();
+    this.terrainMaterialPBR = null;
+    for (const t of this.terrainTextures) { t.dispose(); }
+    this.terrainTextures = [];
+    this.createClipHeightTexture(scene, manifest);   // heightTex/wbounds/texSize for the displacement
+    const peakH = manifest.targetPeakElevation ?? 920;
+
+    const mat = new PBRCustomMaterial('terrain_mat_pbr', scene);
+    mat.metallic = 0.0;
+    mat.roughness = 0.92;                       // matte; per-biome roughness maps arrive in S1
+    mat.backFaceCulling = true;
+    mat.maxSimultaneousLights = 6;             // sun + cannon flashes (matches the Standard path)
+
+    const loadTile = (name: string): Texture => {
+      const tex = new Texture(`${Settings.apiUrl}terrain/tile/${name}`, scene, false, false,
+        Texture.LINEAR_LINEAR_MIPLINEAR, null,
+        () => console.warn(`[TerrainPBR] tile '${name}' missing — run: npm run download:terrain-tiles`));
+      tex.wrapU = Texture.WRAP_ADDRESSMODE; tex.wrapV = Texture.WRAP_ADDRESSMODE;
+      this.terrainTextures.push(tex);
+      return tex;
+    };
+    const sandTex = loadTile('sand_diff'), grassTex = loadTile('grass_diff'), gravelTex = loadTile('gravel_diff'),
+      rockTex = loadTile('rock_diff'), snowTex = loadTile('snow_diff');
+
+    for (const u of ['uSandDiff', 'uGrassDiff', 'uGravelDiff', 'uRockDiff', 'uSnowDiff', 'heightTex']) { mat.AddUniform(u, 'sampler2D', null); }
+    mat.AddUniform('uPeakH', 'float', null);
+    mat.AddUniform('wbounds', 'vec4', null);
+    mat.AddUniform('texSize', 'vec2', null);
+    mat.AddUniform('uHazeColor', 'vec3', null);
+    mat.AddUniform('uSunDir', 'vec3', null);
+    mat.AddUniform('uCloudCoverage', 'float', null);
+    mat.AddUniform('uCloudTime', 'float', null);
+    mat.AddUniform('uCloudDrift', 'vec2', null);
+    mat.AddUniform('uCloudBaseH', 'float', null);
+    mat.AddUniform('u_waterlineDither', 'float', null);
+
+    mat.Vertex_Definitions(`
+      float _clipH(vec2 uv) {
+        vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+        ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+        float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+        float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+        float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+        float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+      }
+      float _clipHW(vec2 wxz) { return _clipH(vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w)); }
+    `);
+    // Displace the flat clipmap grid by the heightfield (xz unchanged → vPositionW.xz stays valid).
+    mat.Vertex_After_WorldPosComputed(`
+      worldPos.y = _clipHW(worldPos.xz);
+    `);
+
+    mat.Fragment_Definitions(`
+      float _clipHF(vec2 wxz) {
+        vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
+        ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
+        return texelFetch(heightTex, t, 0).r;
+      }
+      vec3 _clipNormal(vec2 wxz) {
+        float e = wbounds.z / texSize.x;
+        float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
+        float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
+        return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
+      }
+      float _dHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float _dVal(vec2 p) {
+        vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(_dHash(i), _dHash(i + vec2(1.0, 0.0)), u.x), mix(_dHash(i + vec2(0.0, 1.0)), _dHash(i + vec2(1.0, 1.0)), u.x), u.y);
+      }
+      float _detailH(vec2 p) { float s=0.0,a=0.5,n=0.0; vec2 q=p*0.42; for(int o=0;o<3;o++){s+=a*_dVal(q);n+=a;a*=0.5;q=q*2.03+7.3;} return s/n-0.5; }
+    `);
+
+    // Albedo + normal (before the PBR light loop).
+    mat.Fragment_Before_Lights(`
+      // ── Ragged waterline scallop (off in the refraction RTT) ──
+      if (u_waterlineDither > 0.5) {
+        vec2 wlP = vPositionW.xz * 0.70; vec2 wlI = floor(wlP), wlF = fract(wlP); vec2 wlU = wlF*wlF*(3.0-2.0*wlF);
+        float a0=fract(sin(dot(wlI,vec2(127.1,311.7)))*43758.5453);
+        float a1=fract(sin(dot(wlI+vec2(1.,0.),vec2(127.1,311.7)))*43758.5453);
+        float a2=fract(sin(dot(wlI+vec2(0.,1.),vec2(127.1,311.7)))*43758.5453);
+        float a3=fract(sin(dot(wlI+vec2(1.,1.),vec2(127.1,311.7)))*43758.5453);
+        float wlN=mix(mix(a0,a1,wlU.x),mix(a2,a3,wlU.x),wlU.y);
+        float ebb=sin(uCloudTime*0.8+vPositionW.x*0.13+vPositionW.z*0.09)*0.12;
+        float wlY=vPositionW.y-ebb;
+        float band=(1.0-smoothstep(0.0,0.7,wlY))*smoothstep(-0.30,0.05,wlY)*0.9;
+        float edge=wlN-band; float cov=clamp(edge/max(fwidth(edge),1e-4)+0.5,0.0,1.0);
+        float ign=fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+        if (cov < ign) discard;
+      }
+
+      vec3 nW = _clipNormal(vPositionW.xz);
+      vec3 triW = abs(nW); triW = triW*triW*triW*triW*triW*triW; triW /= (triW.x+triW.y+triW.z);
+
+      float h = clamp(vPositionW.y / uPeakH, 0.0, 1.0);
+      float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
+      float shoreW = clamp(1.0 - vPositionW.y / 10.0, 0.0, 1.0);
+      float hSand = clamp(1.0 - h / 0.085, 0.0, 1.0);
+      float sandSlope = mix(1.0, clamp(1.0 - slope*1.25, 0.0, 1.0), smoothstep(0.0, 15.0, vPositionW.y));
+      float wSand = max(hSand, shoreW) * sandSlope;
+      float wGrass = clamp((h-0.035)/0.28,0.0,1.0) * clamp(1.0-slope*0.95,0.0,1.0);
+      float wGravel = clamp((h-0.20)/0.52,0.0,1.0) * clamp(0.25+slope*1.5,0.0,1.0);
+      float wRock = clamp((h-0.34)/0.54,0.0,1.0) * clamp(0.22+slope*1.7,0.0,1.0);
+      float snowJit = sin(vPositionW.x*0.0040+vPositionW.z*0.0031)*0.040 + sin(vPositionW.x*0.0017-vPositionW.z*0.0023)*0.050;
+      float wSnow = clamp((h-(0.66+snowJit))/0.16,0.0,1.0) * clamp(1.0-slope*2.2,0.0,1.0);
+      float moist = 0.5 + 0.34*sin(vPositionW.x*0.00080+1.3) + 0.24*sin(vPositionW.z*0.00095-0.7)
+                  + 0.18*sin((vPositionW.x-vPositionW.z)*0.00060+2.1) + 0.12*sin((vPositionW.x*0.7+vPositionW.z*1.1)*0.0022-1.1);
+      float wetF = smoothstep(0.25, 0.78, clamp(moist,0.0,1.0));
+      wGrass *= 0.35+1.30*wetF; wGravel *= 1.45-0.75*wetF; wRock *= 1.25-0.40*wetF;
+      float wTot = max(0.0001, wSand+wGrass+wGravel+wRock+wSnow);
+      wSand/=wTot; wGrass/=wTot; wGravel/=wTot; wRock/=wTot; wSnow/=wTot;
+
+      // Triplanar fine + coarse per biome (single texture each for the spike; arrays/variants come in S1).
+      vec3 sandC = clamp((
+          (texture2D(uSandDiff, vPositionW.yz*0.067).rgb*triW.x + texture2D(uSandDiff, vPositionW.xz*0.067).rgb*triW.y + texture2D(uSandDiff, vPositionW.xy*0.067).rgb*triW.z)*0.65
+        + texture2D(uSandDiff, vPositionW.xz*0.018).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
+      vec3 grassC = (texture2D(uGrassDiff, vPositionW.yz*0.050).rgb*triW.x + texture2D(uGrassDiff, vPositionW.xz*0.050).rgb*triW.y + texture2D(uGrassDiff, vPositionW.xy*0.050).rgb*triW.z)*0.65
+                  + texture2D(uGrassDiff, vPositionW.xz*0.013).rgb*0.35;
+      vec3 gravC = (texture2D(uGravelDiff, vPositionW.yz*0.040).rgb*triW.x + texture2D(uGravelDiff, vPositionW.xz*0.040).rgb*triW.y + texture2D(uGravelDiff, vPositionW.xy*0.040).rgb*triW.z)*0.6
+                 + (texture2D(uRockDiff, vPositionW.yz*0.020).rgb*triW.x + texture2D(uRockDiff, vPositionW.xz*0.020).rgb*triW.y + texture2D(uRockDiff, vPositionW.xy*0.020).rgb*triW.z)*0.4;
+      vec3 rockC = (texture2D(uRockDiff, vPositionW.yz*0.083).rgb*triW.x + texture2D(uRockDiff, vPositionW.xz*0.083).rgb*triW.y + texture2D(uRockDiff, vPositionW.xy*0.083).rgb*triW.z)*0.6
+                 + (texture2D(uGravelDiff, vPositionW.yz*0.025).rgb*triW.x + texture2D(uGravelDiff, vPositionW.xz*0.025).rgb*triW.y + texture2D(uGravelDiff, vPositionW.xy*0.025).rgb*triW.z)*0.4;
+      vec3 snowC = (texture2D(uSnowDiff, vPositionW.yz*0.033).rgb*triW.x + texture2D(uSnowDiff, vPositionW.xz*0.033).rgb*triW.y + texture2D(uSnowDiff, vPositionW.xy*0.033).rgb*triW.z)*0.7
+                 + texture2D(uSnowDiff, vPositionW.xz*0.010).rgb*0.30;
+      vec3 splatC = sandC*wSand + grassC*wGrass + gravC*wGravel + rockC*wRock + snowC*wSnow;
+      surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2));   // sRGB tiles → linear for the PBR BRDF
+
+      // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.
+      float pdFade = 1.0 - smoothstep(45.0, 210.0, length(vPositionW - vEyePosition.xyz));
+      float pe = 0.7;
+      float pHL=_detailH(vPositionW.xz-vec2(pe,0.0)), pHR=_detailH(vPositionW.xz+vec2(pe,0.0));
+      float pHD=_detailH(vPositionW.xz-vec2(0.0,pe)), pHU=_detailH(vPositionW.xz+vec2(0.0,pe));
+      float pStr=(0.55+slope*2.4)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);
+      float pLand=smoothstep(0.4,4.0,vPositionW.y);
+      normalW = normalize(nW + vec3(-(pHR-pHL), 0.0, -(pHU-pHD)) * (1.5*pdFade*pLand*pStr));
+    `);
+
+    // Cloud shadows + aerial haze on the lit colour (matches the Standard path + the ocean).
+    mat.Fragment_Before_FinalColorComposition(`
+      if (uSunDir.y > 0.03 && uCloudCoverage > 0.02) {
+        vec2 sp = vPositionW.xz + uSunDir.xz / max(uSunDir.y, 0.15) * uCloudBaseH + uCloudDrift;
+        vec2 a0 = sp*0.0013; vec2 i0=floor(a0); vec2 f0=fract(a0); f0=f0*f0*(3.0-2.0*f0);
+        float n0=mix(mix(fract(sin(dot(i0,vec2(127.1,311.7)))*43758.5453),fract(sin(dot(i0+vec2(1.,0.),vec2(127.1,311.7)))*43758.5453),f0.x),
+                     mix(fract(sin(dot(i0+vec2(0.,1.),vec2(127.1,311.7)))*43758.5453),fract(sin(dot(i0+vec2(1.,1.),vec2(127.1,311.7)))*43758.5453),f0.x),f0.y);
+        vec2 a1 = sp*0.0037; vec2 i1=floor(a1); vec2 f1=fract(a1); f1=f1*f1*(3.0-2.0*f1);
+        float n1=mix(mix(fract(sin(dot(i1,vec2(127.1,311.7)))*43758.5453),fract(sin(dot(i1+vec2(1.,0.),vec2(127.1,311.7)))*43758.5453),f1.x),
+                     mix(fract(sin(dot(i1+vec2(0.,1.),vec2(127.1,311.7)))*43758.5453),fract(sin(dot(i1+vec2(1.,1.),vec2(127.1,311.7)))*43758.5453),f1.x),f1.y);
+        float cf = n0*0.65 + n1*0.35;
+        float cShadow = smoothstep(0.58-uCloudCoverage*0.45, 0.70-uCloudCoverage*0.30, cf) * smoothstep(0.05,0.35,uCloudCoverage) * smoothstep(0.03,0.18,uSunDir.y);
+        color.rgb *= 1.0 - cShadow*0.55;
+      }
+      float hazeDist = length(vPositionW - vEyePosition.xyz);
+      float hazeF = clamp(pow(1.0 - exp(-hazeDist*0.00020), 1.4), 0.0, 0.96);
+      color.rgb = mix(color.rgb, uHazeColor, hazeF);
+    `);
+
+    mat.onBindObservable.add(() => {
+      const fx = mat.getEffect();
+      if (!fx) { return; }
+      fx.setFloat('uPeakH', peakH);
+      fx.setFloat('u_waterlineDither', this._inRefractionPass ? 0 : 1);
+      fx.setColor3('uHazeColor', scene.fogColor);
+      fx.setVector3('uSunDir', this.sceneService.getSunDirection());
+      fx.setFloat('uCloudCoverage', this.oceanService.getCloudCoverage());
+      fx.setFloat('uCloudTime', this.oceanService.getOceanTime());
+      const csf = this.oceanService.getCloudShadowField();
+      fx.setFloat2('uCloudDrift', csf?.drift.x ?? 0, csf?.drift.y ?? 0);
+      fx.setFloat('uCloudBaseH', csf?.cloudBase ?? 900);
+      fx.setTexture('uSandDiff', sandTex); fx.setTexture('uGrassDiff', grassTex); fx.setTexture('uGravelDiff', gravelTex);
+      fx.setTexture('uRockDiff', rockTex); fx.setTexture('uSnowDiff', snowTex);
+      if (this.clipHeightTex) {
+        fx.setTexture('heightTex', this.clipHeightTex);
+        fx.setVector4('wbounds', this.clipWBounds);
+        fx.setVector2('texSize', this.clipTexSize);
+      }
+    });
+
+    this.terrainMaterialPBR = mat;
+    return mat;
   }
 
   // ── P4b: clipmap height texture (heightfield → GPU R32F) ─────────────────────

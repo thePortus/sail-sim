@@ -18,6 +18,7 @@ import {
   Matrix,
   VertexData,
   RawTexture,
+  RawTexture2DArray,
   Vector2,
   Vector4,
   Constants,
@@ -91,6 +92,12 @@ export class TerrainService {
   private terrainMesh: Mesh | null = null;
   private terrainMaterial: CustomMaterial | null = null;
   private terrainMaterialPBR: PBRCustomMaterial | null = null;   // S0 spike: ?terrainpbr path
+  // S1b: biome PBR texture arrays (5 layers: 0 sand,1 grass,2 gravel,3 rock,4 snow). One sampler each
+  // (vs 5 per map) → fixes the 16-sampler cap. albedo = RGB diffuse; orm = R roughness, G ambient-occl.
+  private biomeAlbedoArr: RawTexture2DArray | null = null;
+  private biomeOrmArr: RawTexture2DArray | null = null;
+  private biomePlaceholderArr: RawTexture2DArray | null = null;
+  private static readonly BIOME_TILES = ['sand', 'grass', 'gravel', 'rock', 'snow'];
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -1889,6 +1896,62 @@ export class TerrainService {
     return material;
   }
 
+  /** A tiny 1×1×N white array so the sampler2DArray is valid before the real tiles finish loading. */
+  private makePlaceholderArr(scene: Scene): RawTexture2DArray {
+    const N = TerrainService.BIOME_TILES.length;
+    const data = new Uint8Array(N * 4).fill(190);
+    for (let i = 3; i < data.length; i += 4) { data[i] = 255; }
+    return new RawTexture2DArray(data, 1, 1, N, Constants.TEXTUREFORMAT_RGBA, scene,
+      false, false, Texture.NEAREST_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE);
+  }
+
+  /**
+   * S1b: load the 5 biome PBR tiles into texture ARRAYS — albedo (RGB diffuse) + orm (R = roughness,
+   * G = ambient occlusion). One sampler each (vs 5 per map) → fixes the 16-sampler cap and lets the
+   * shader index a biome by layer. Pixels are extracted via a canvas (tiles served from the API server;
+   * crossOrigin set for getImageData). Missing maps fall back to sensible defaults.
+   */
+  private async loadBiomeArrays(scene: Scene): Promise<void> {
+    if (this.biomeAlbedoArr) { return; }
+    const N = TerrainService.BIOME_TILES.length, SIZE = 1024;
+    const loadImg = (name: string) => new Promise<HTMLImageElement | null>((res) => {
+      const im = new Image(); im.crossOrigin = 'anonymous';
+      im.onload = () => res(im); im.onerror = () => res(null);
+      im.src = `${Settings.apiUrl}terrain/tile/${name}`;
+    });
+    const cv = document.createElement('canvas'); cv.width = SIZE; cv.height = SIZE;
+    const ctx = cv.getContext('2d', { willReadFrequently: true } as CanvasRenderingContext2DSettings);
+    if (!ctx) { return; }
+    const pixels = (img: HTMLImageElement | null): Uint8ClampedArray | null => {
+      if (!img) { return null; }
+      ctx.clearRect(0, 0, SIZE, SIZE); ctx.drawImage(img, 0, 0, SIZE, SIZE);
+      try { return ctx.getImageData(0, 0, SIZE, SIZE).data; } catch { return null; }
+    };
+    const albedo = new Uint8Array(N * SIZE * SIZE * 4);
+    const orm = new Uint8Array(N * SIZE * SIZE * 4);
+    for (let L = 0; L < N; L++) {
+      const b = TerrainService.BIOME_TILES[L];
+      const [dImg, rImg, aImg] = await Promise.all([loadImg(`${b}_diff`), loadImg(`${b}_rough`), loadImg(`${b}_ao`)]);
+      const d = pixels(dImg), r = pixels(rImg), a = pixels(aImg);
+      const off = L * SIZE * SIZE * 4;
+      for (let i = 0; i < SIZE * SIZE; i++) {
+        const j = off + i * 4, k = i * 4;
+        albedo[j] = d ? d[k] : 200; albedo[j + 1] = d ? d[k + 1] : 200; albedo[j + 2] = d ? d[k + 2] : 200; albedo[j + 3] = 255;
+        orm[j] = r ? r[k] : 230;            // R = roughness (default fairly matte)
+        orm[j + 1] = a ? a[k] : 255;        // G = ambient occlusion (default none)
+        orm[j + 2] = 0; orm[j + 3] = 255;
+      }
+    }
+    const mk = (data: Uint8Array): RawTexture2DArray => {
+      const t = new RawTexture2DArray(data, SIZE, SIZE, N, Constants.TEXTUREFORMAT_RGBA, scene,
+        true, false, Texture.TRILINEAR_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE);
+      t.wrapU = Texture.WRAP_ADDRESSMODE; t.wrapV = Texture.WRAP_ADDRESSMODE;
+      return t;
+    };
+    this.biomeAlbedoArr = mk(albedo);
+    this.biomeOrmArr = mk(orm);
+  }
+
   /**
    * S0 spike (terrain-skinning roadmap) — a PBRCustomMaterial clipmap terrain, behind `?terrainpbr`.
    * Proves the material-model switch: GPU height-displacement + Sobel normals + procedural detail
@@ -1914,18 +1977,14 @@ export class TerrainService {
     mat.backFaceCulling = true;
     mat.maxSimultaneousLights = 6;             // sun + cannon flashes (matches the Standard path)
 
-    const loadTile = (name: string): Texture => {
-      const tex = new Texture(`${Settings.apiUrl}terrain/tile/${name}`, scene, false, false,
-        Texture.LINEAR_LINEAR_MIPLINEAR, null,
-        () => console.warn(`[TerrainPBR] tile '${name}' missing — run: npm run download:terrain-tiles`));
-      tex.wrapU = Texture.WRAP_ADDRESSMODE; tex.wrapV = Texture.WRAP_ADDRESSMODE;
-      this.terrainTextures.push(tex);
-      return tex;
-    };
-    const sandTex = loadTile('sand_diff'), grassTex = loadTile('grass_diff'), gravelTex = loadTile('gravel_diff'),
-      rockTex = loadTile('rock_diff'), snowTex = loadTile('snow_diff');
+    // Biome PBR via texture arrays (S1b): two sampler2DArray (albedo + orm) instead of 5 diffuse
+    // samplers — big sampler-budget headroom. Async load; a placeholder binds until the real tiles land.
+    this.biomePlaceholderArr = this.biomePlaceholderArr ?? this.makePlaceholderArr(scene);
+    void this.loadBiomeArrays(scene);
 
-    for (const u of ['uSandDiff', 'uGrassDiff', 'uGravelDiff', 'uRockDiff', 'uSnowDiff', 'heightTex']) { mat.AddUniform(u, 'sampler2D', null); }
+    mat.AddUniform('uAlbedoArr', 'sampler2DArray', null);
+    mat.AddUniform('uOrmArr', 'sampler2DArray', null);
+    mat.AddUniform('heightTex', 'sampler2D', null);
     mat.AddUniform('uPeakH', 'float', null);
     mat.AddUniform('wbounds', 'vec4', null);
     mat.AddUniform('texSize', 'vec2', null);
@@ -1972,6 +2031,40 @@ export class TerrainService {
         return mix(mix(_dHash(i), _dHash(i + vec2(1.0, 0.0)), u.x), mix(_dHash(i + vec2(0.0, 1.0)), _dHash(i + vec2(1.0, 1.0)), u.x), u.y);
       }
       float _detailH(vec2 p) { float s=0.0,a=0.5,n=0.0; vec2 q=p*0.42; for(int o=0;o<3;o++){s+=a*_dVal(q);n+=a;a*=0.5;q=q*2.03+7.3;} return s/n-0.5; }
+      // Normalised biome cover weights (sand/grass/gravel/rock/snow) from world pos + normal — shared by
+      // the metallic-roughness and albedo blocks so they agree (those inject at different shader points).
+      void _biomeW(vec3 wp, vec3 nW, out float wSand, out float wGrass, out float wGravel, out float wRock, out float wSnow) {
+        float h = clamp(wp.y / uPeakH, 0.0, 1.0);
+        float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
+        float shoreW = clamp(1.0 - wp.y/10.0, 0.0, 1.0);
+        float hSand = clamp(1.0 - h/0.085, 0.0, 1.0);
+        float sandSlope = mix(1.0, clamp(1.0-slope*1.25,0.0,1.0), smoothstep(0.0,15.0,wp.y));
+        wSand = max(hSand, shoreW)*sandSlope;
+        wGrass = clamp((h-0.035)/0.28,0.0,1.0)*clamp(1.0-slope*0.95,0.0,1.0);
+        wGravel = clamp((h-0.20)/0.52,0.0,1.0)*clamp(0.25+slope*1.5,0.0,1.0);
+        wRock = clamp((h-0.34)/0.54,0.0,1.0)*clamp(0.22+slope*1.7,0.0,1.0);
+        float sj = sin(wp.x*0.0040+wp.z*0.0031)*0.040 + sin(wp.x*0.0017-wp.z*0.0023)*0.050;
+        wSnow = clamp((h-(0.66+sj))/0.16,0.0,1.0)*clamp(1.0-slope*2.2,0.0,1.0);
+        float m = 0.5 + 0.34*sin(wp.x*0.00080+1.3)+0.24*sin(wp.z*0.00095-0.7)+0.18*sin((wp.x-wp.z)*0.00060+2.1)+0.12*sin((wp.x*0.7+wp.z*1.1)*0.0022-1.1);
+        float wet = smoothstep(0.25,0.78,clamp(m,0.0,1.0));
+        wGrass*=0.35+1.30*wet; wGravel*=1.45-0.75*wet; wRock*=1.25-0.40*wet;
+        float t = max(0.0001, wSand+wGrass+wGravel+wRock+wSnow);
+        wSand/=t; wGrass/=t; wGravel/=t; wRock/=t; wSnow/=t;
+      }
+    `);
+
+    // Roughness (metallic stays 0). Procedural for now — wet, low, flat ground near the waterline reads
+    // glossy (wet sand sheen) while slopes/uplands stay matte. Real per-biome roughness maps replace this
+    // in S1b. Runs BEFORE the light loop, so it recomputes slope from the Sobel normal.
+    mat.Fragment_Custom_MetallicRoughness(`
+      vec3 nWr = _clipNormal(vPositionW.xz);
+      float mrS, mrG, mrGr, mrR, mrSn; _biomeW(vPositionW, nWr, mrS, mrG, mrGr, mrR, mrSn);
+      float rgh = texture(uOrmArr, vec3(vPositionW.xz*0.05, 0.0)).r*mrS + texture(uOrmArr, vec3(vPositionW.xz*0.05, 1.0)).r*mrG
+                + texture(uOrmArr, vec3(vPositionW.xz*0.05, 2.0)).r*mrGr + texture(uOrmArr, vec3(vPositionW.xz*0.05, 3.0)).r*mrR
+                + texture(uOrmArr, vec3(vPositionW.xz*0.05, 4.0)).r*mrSn;
+      float wet = (1.0 - smoothstep(0.0, 2.2, vPositionW.y)) * (1.0 - smoothstep(0.35, 0.70, 1.0 - clamp(nWr.y, 0.0, 1.0)));
+      metallicRoughness.r = 0.0;                                    // terrain is never metallic
+      metallicRoughness.g = clamp(mix(rgh, rgh * 0.45, wet), 0.05, 1.0);   // real per-biome rough; wetter near the water
     `);
 
     // Albedo + normal (before the PBR light loop).
@@ -1994,39 +2087,23 @@ export class TerrainService {
 
       vec3 nW = _clipNormal(vPositionW.xz);
       vec3 triW = abs(nW); triW = triW*triW*triW*triW*triW*triW; triW /= (triW.x+triW.y+triW.z);
-
-      float h = clamp(vPositionW.y / uPeakH, 0.0, 1.0);
       float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
-      float shoreW = clamp(1.0 - vPositionW.y / 10.0, 0.0, 1.0);
-      float hSand = clamp(1.0 - h / 0.085, 0.0, 1.0);
-      float sandSlope = mix(1.0, clamp(1.0 - slope*1.25, 0.0, 1.0), smoothstep(0.0, 15.0, vPositionW.y));
-      float wSand = max(hSand, shoreW) * sandSlope;
-      float wGrass = clamp((h-0.035)/0.28,0.0,1.0) * clamp(1.0-slope*0.95,0.0,1.0);
-      float wGravel = clamp((h-0.20)/0.52,0.0,1.0) * clamp(0.25+slope*1.5,0.0,1.0);
-      float wRock = clamp((h-0.34)/0.54,0.0,1.0) * clamp(0.22+slope*1.7,0.0,1.0);
-      float snowJit = sin(vPositionW.x*0.0040+vPositionW.z*0.0031)*0.040 + sin(vPositionW.x*0.0017-vPositionW.z*0.0023)*0.050;
-      float wSnow = clamp((h-(0.66+snowJit))/0.16,0.0,1.0) * clamp(1.0-slope*2.2,0.0,1.0);
-      float moist = 0.5 + 0.34*sin(vPositionW.x*0.00080+1.3) + 0.24*sin(vPositionW.z*0.00095-0.7)
-                  + 0.18*sin((vPositionW.x-vPositionW.z)*0.00060+2.1) + 0.12*sin((vPositionW.x*0.7+vPositionW.z*1.1)*0.0022-1.1);
-      float wetF = smoothstep(0.25, 0.78, clamp(moist,0.0,1.0));
-      wGrass *= 0.35+1.30*wetF; wGravel *= 1.45-0.75*wetF; wRock *= 1.25-0.40*wetF;
-      float wTot = max(0.0001, wSand+wGrass+wGravel+wRock+wSnow);
-      wSand/=wTot; wGrass/=wTot; wGravel/=wTot; wRock/=wTot; wSnow/=wTot;
+      float wSand, wGrass, wGravel, wRock, wSnow; _biomeW(vPositionW, nW, wSand, wGrass, wGravel, wRock, wSnow);
 
-      // Triplanar fine + coarse per biome (single texture each for the spike; arrays/variants come in S1).
-      vec3 sandC = clamp((
-          (texture2D(uSandDiff, vPositionW.yz*0.067).rgb*triW.x + texture2D(uSandDiff, vPositionW.xz*0.067).rgb*triW.y + texture2D(uSandDiff, vPositionW.xy*0.067).rgb*triW.z)*0.65
-        + texture2D(uSandDiff, vPositionW.xz*0.018).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
-      vec3 grassC = (texture2D(uGrassDiff, vPositionW.yz*0.050).rgb*triW.x + texture2D(uGrassDiff, vPositionW.xz*0.050).rgb*triW.y + texture2D(uGrassDiff, vPositionW.xy*0.050).rgb*triW.z)*0.65
-                  + texture2D(uGrassDiff, vPositionW.xz*0.013).rgb*0.35;
-      vec3 gravC = (texture2D(uGravelDiff, vPositionW.yz*0.040).rgb*triW.x + texture2D(uGravelDiff, vPositionW.xz*0.040).rgb*triW.y + texture2D(uGravelDiff, vPositionW.xy*0.040).rgb*triW.z)*0.6
-                 + (texture2D(uRockDiff, vPositionW.yz*0.020).rgb*triW.x + texture2D(uRockDiff, vPositionW.xz*0.020).rgb*triW.y + texture2D(uRockDiff, vPositionW.xy*0.020).rgb*triW.z)*0.4;
-      vec3 rockC = (texture2D(uRockDiff, vPositionW.yz*0.083).rgb*triW.x + texture2D(uRockDiff, vPositionW.xz*0.083).rgb*triW.y + texture2D(uRockDiff, vPositionW.xy*0.083).rgb*triW.z)*0.6
-                 + (texture2D(uGravelDiff, vPositionW.yz*0.025).rgb*triW.x + texture2D(uGravelDiff, vPositionW.xz*0.025).rgb*triW.y + texture2D(uGravelDiff, vPositionW.xy*0.025).rgb*triW.z)*0.4;
-      vec3 snowC = (texture2D(uSnowDiff, vPositionW.yz*0.033).rgb*triW.x + texture2D(uSnowDiff, vPositionW.xz*0.033).rgb*triW.y + texture2D(uSnowDiff, vPositionW.xy*0.033).rgb*triW.z)*0.7
-                 + texture2D(uSnowDiff, vPositionW.xz*0.010).rgb*0.30;
+      // Triplanar albedo from the biome ARRAY (layer = biome index): fine + coarse, cross-textured rock/gravel.
+      #define TRIA(L, scl) (texture(uAlbedoArr, vec3(vPositionW.yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3(vPositionW.xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3(vPositionW.xy*(scl), float(L))).rgb*triW.z)
+      vec3 sandC = clamp((TRIA(0,0.067)*0.65 + texture(uAlbedoArr, vec3(vPositionW.xz*0.018,0.0)).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
+      vec3 grassC = TRIA(1,0.050)*0.65 + texture(uAlbedoArr, vec3(vPositionW.xz*0.013,1.0)).rgb*0.35;
+      vec3 gravC = TRIA(2,0.040)*0.6 + TRIA(3,0.020)*0.4;
+      vec3 rockC = TRIA(3,0.083)*0.6 + TRIA(2,0.025)*0.4;
+      vec3 snowC = TRIA(4,0.033)*0.7 + texture(uAlbedoArr, vec3(vPositionW.xz*0.010,4.0)).rgb*0.30;
+      #undef TRIA
       vec3 splatC = sandC*wSand + grassC*wGrass + gravC*wGravel + rockC*wRock + snowC*wSnow;
-      surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2));   // sRGB tiles → linear for the PBR BRDF
+      // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome).
+      float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
+                + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock
+                + texture(uOrmArr, vec3(vPositionW.xz*0.05,4.0)).g*wSnow;
+      surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB→linear, AO darkens crevices
 
       // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.
       float pdFade = 1.0 - smoothstep(45.0, 210.0, length(vPositionW - vEyePosition.xyz));
@@ -2069,8 +2146,8 @@ export class TerrainService {
       const csf = this.oceanService.getCloudShadowField();
       fx.setFloat2('uCloudDrift', csf?.drift.x ?? 0, csf?.drift.y ?? 0);
       fx.setFloat('uCloudBaseH', csf?.cloudBase ?? 900);
-      fx.setTexture('uSandDiff', sandTex); fx.setTexture('uGrassDiff', grassTex); fx.setTexture('uGravelDiff', gravelTex);
-      fx.setTexture('uRockDiff', rockTex); fx.setTexture('uSnowDiff', snowTex);
+      fx.setTexture('uAlbedoArr', this.biomeAlbedoArr ?? this.biomePlaceholderArr);
+      fx.setTexture('uOrmArr', this.biomeOrmArr ?? this.biomePlaceholderArr);
       if (this.clipHeightTex) {
         fx.setTexture('heightTex', this.clipHeightTex);
         fx.setVector4('wbounds', this.clipWBounds);

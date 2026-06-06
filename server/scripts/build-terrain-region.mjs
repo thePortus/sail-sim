@@ -29,6 +29,7 @@ import { SOURCES, regionById } from '../data/region-catalog.mjs';
 import { deriveAugment } from '../data/augment.mjs';
 import { hydraulicErode, thermalErode, addDetail } from '../data/erode.mjs';
 import { addReefs } from '../data/reefs.mjs';
+import { computeAuxMaps, BIOME_PALETTE } from '../data/aux-maps.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCES_DIR = join(__dirname, '..', 'assets', 'maps', 'sources');
@@ -56,6 +57,9 @@ const REEFDET   = args.some((a) => a.startsWith('--reef-detail=')) ? numArg('ree
 const LAGOON    = args.includes('--no-lagoon')     ? 0 : (args.some((a) => a.startsWith('--lagoon='))    ? numArg('lagoon', NaN)      : null);
 const SEAMOUNTS = args.includes('--no-seamounts')  ? 0 : (args.some((a) => a.startsWith('--seamounts=')) ? numArg('seamounts', NaN)   : null);
 const NOBATHY   = args.includes('--no-bathy');
+// Aux maps (Phase 6): slope / shore-dist / wetness / flow / biome — the substrate for skinning.
+const NOAUX     = args.includes('--no-aux');
+const AUX_RES   = numArg('aux-res', 1024);
 
 if (!regionId) { console.error('Usage: build-terrain-region.mjs <regionId> [--res=] [--vscale=] [--sea=]'); process.exit(1); }
 const region = regionById(regionId);
@@ -183,6 +187,14 @@ async function run() {
   // ── Spawns: navigable open water near a coast ────────────────────────────────
   const spawns = findSpawns(field, OUT, worldBounds);
 
+  // ── Aux maps (Phase 6): slope / shore-dist / wetness / flow / biome → packed PNGs ────────────
+  let auxInfo = null;
+  if (!NOAUX) {
+    const maps = computeAuxMaps(field, OUT, cellM, worldBounds, Math.max(1, maxY), 0);
+    auxInfo = writeAuxMaps(maps, OUT, Math.min(AUX_RES, OUT), outputDir);
+    console.log(`  aux maps: slope/shoreDist/wetness/flow → aux_map.png + biome_map.png (${auxInfo.resolution}²)`);
+  }
+
   const manifest = {
     version: 2,
     source: region.id,
@@ -207,6 +219,7 @@ async function run() {
       crestDistM: +reefInfo.crestDistM.toFixed(0), passDensity: +reefInfo.passDensity.toFixed(3),
       detailAmp: +reefInfo.detailAmp.toFixed(2), lagoonStrength: +reefInfo.lagoonStrength.toFixed(3),
       lagoonDepth: +reefInfo.lagoonDepth.toFixed(1), seamountCount: reefInfo.seamountCount, label: reefInfo.label } : null,
+    auxMaps: auxInfo,
     worldBounds,
     spawns,
   };
@@ -259,6 +272,73 @@ function writeFieldPreview(field, OUT, minY, maxY, path) {
       }
       const idx = (oy * ow + ox) * 4;
       png.data[idx] = rgb[0]; png.data[idx + 1] = rgb[1]; png.data[idx + 2] = rgb[2]; png.data[idx + 3] = 255;
+    }
+  }
+  writeFileSync(path, PNG.sync.write(png));
+}
+
+/** Pack the aux maps into aux_map.png (RGBA = slope, shoreDist, wetness, flow) + biome_map.png
+ *  (palette), downsampled to `res`, and a human-readable aux_preview.png montage. Returns the manifest
+ *  descriptor. */
+function writeAuxMaps(maps, OUT, res, outputDir) {
+  const { PNG } = pngjs;
+  const { slope, shoreDist, moisture, flow, biome } = maps;
+  const SLOPE_MAX = 2.0, SHORE_MAX = 3000;
+  let maxFlow = 1; for (let i = 0; i < flow.length; i++) if (flow[i] > maxFlow) maxFlow = flow[i];
+  const logMax = Math.log(1 + maxFlow) || 1;
+  const scale = OUT / res;
+  const samp = (arr, ox, oy) => arr[Math.min(OUT - 1, (oy * scale) | 0) * OUT + Math.min(OUT - 1, (ox * scale) | 0)];
+
+  const packed = new PNG({ width: res, height: res });
+  const biomePng = new PNG({ width: res, height: res });
+  for (let oy = 0; oy < res; oy++) {
+    for (let ox = 0; ox < res; ox++) {
+      const idx = (oy * res + ox) * 4;
+      packed.data[idx]     = Math.min(255, (samp(slope, ox, oy) / SLOPE_MAX) * 255);
+      packed.data[idx + 1] = Math.min(255, (samp(shoreDist, ox, oy) / SHORE_MAX) * 255);
+      packed.data[idx + 2] = Math.min(255, samp(moisture, ox, oy) * 255);
+      packed.data[idx + 3] = Math.max(8, Math.min(255, (Math.log(1 + samp(flow, ox, oy)) / logMax) * 255));
+      const c = BIOME_PALETTE[samp(biome, ox, oy) | 0] || [0, 0, 0];
+      biomePng.data[idx] = c[0]; biomePng.data[idx + 1] = c[1]; biomePng.data[idx + 2] = c[2]; biomePng.data[idx + 3] = 255;
+    }
+  }
+  writeFileSync(join(outputDir, 'aux_map.png'), PNG.sync.write(packed));
+  writeFileSync(join(outputDir, 'biome_map.png'), PNG.sync.write(biomePng));
+  writeAuxPreview(maps, OUT, maxFlow, join(outputDir, 'aux_preview.png'));
+  return {
+    resolution: res, packed: 'aux_map.png', channels: { r: 'slope', g: 'shoreDist', b: 'wetness', a: 'flow' },
+    slopeMaxMPerM: SLOPE_MAX, shoreDistMaxM: SHORE_MAX, flowLogNorm: true,
+    biome: 'biome_map.png', biomeIds: ['seabed', 'sand', 'grass', 'gravel', 'rock', 'snow'],
+  };
+}
+
+/** A 3×2 montage of the aux maps (slope, shoreDist, wetness, flow, biome) for eyeball verification. */
+function writeAuxPreview(maps, OUT, maxFlow, path) {
+  const { PNG } = pngjs;
+  const { slope, shoreDist, moisture, flow, biome } = maps;
+  const logMax = Math.log(1 + maxFlow) || 1;
+  const T = 256, cols = 3, rows = 2, pad = 4;
+  const W = cols * T + (cols + 1) * pad, H = rows * T + (rows + 1) * pad;
+  const png = new PNG({ width: W, height: H });
+  for (let i = 0; i < png.data.length; i += 4) { png.data[i] = png.data[i + 1] = png.data[i + 2] = 18; png.data[i + 3] = 255; }
+  const g = (v) => [v, v, v];
+  const tiles = [
+    (v) => g(Math.min(1, v / 2.0) * 255),                              // slope
+    (v) => g(Math.min(1, v / 3000) * 255),                            // shoreDist
+    (v) => { const s = v * 255; return [40 + s * 0.2, 80 + s * 0.6, 60 + s * 0.3]; },  // wetness (green)
+    (v) => { const s = (Math.log(1 + v) / logMax) * 255; return [s * 0.4, s * 0.7, s]; },  // flow (blue)
+    (v) => BIOME_PALETTE[v | 0] || [0, 0, 0],                          // biome
+  ];
+  const arrs = [slope, shoreDist, moisture, flow, biome];
+  const scale = OUT / T;
+  for (let ti = 0; ti < tiles.length; ti++) {
+    const cx = ti % cols, cy = (ti / cols) | 0, ox0 = pad + cx * (T + pad), oy0 = pad + cy * (T + pad);
+    for (let y = 0; y < T; y++) {
+      for (let x = 0; x < T; x++) {
+        const v = arrs[ti][Math.min(OUT - 1, (y * scale) | 0) * OUT + Math.min(OUT - 1, (x * scale) | 0)];
+        const c = tiles[ti](v), idx = ((oy0 + y) * W + (ox0 + x)) * 4;
+        png.data[idx] = c[0]; png.data[idx + 1] = c[1]; png.data[idx + 2] = c[2]; png.data[idx + 3] = 255;
+      }
     }
   }
   writeFileSync(path, PNG.sync.write(png));

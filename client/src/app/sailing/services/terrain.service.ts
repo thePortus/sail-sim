@@ -1378,6 +1378,21 @@ export class TerrainService {
           float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
           return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
         }
+        // ── P5: procedural detail field (world-XZ value-noise fBm) ─────────────
+        // Pure ALU (no texture) so it's safe to evaluate in any control flow on WebGPU, non-repeating
+        // (unlike the tiled normal maps), and analytically differentiable for a matching detail normal.
+        float _dHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        float _dVal(vec2 p) {
+          vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+          return mix(mix(_dHash(i), _dHash(i + vec2(1.0, 0.0)), u.x),
+                     mix(_dHash(i + vec2(0.0, 1.0)), _dHash(i + vec2(1.0, 1.0)), u.x), u.y);
+        }
+        // 3-octave detail height in ~[-0.5, 0.5]; p is world metres. Base feature ~2.4 m → finest ~0.6 m.
+        float _detailH(vec2 p) {
+          float s = 0.0, a = 0.5, n = 0.0; vec2 q = p * 0.42;
+          for (int o = 0; o < 3; o++) { s += a * _dVal(q); n += a; a *= 0.5; q = q * 2.03 + 7.3; }
+          return s / n - 0.5;
+        }
       `);
     }
 
@@ -1773,6 +1788,22 @@ export class TerrainService {
           vec3(detN2.r, detN2.b, detN2.g) * 0.4
       );
       normalW = normalize(normalW + detWorld * (0.24 * detFade));
+
+      // ── 9c. Procedural slope-aligned detail normal (P5 — near-field, non-repeating) ──
+      // A world-space value-noise micro-relief: perturb the LIGHTING normal by the analytic gradient
+      // of _detailH so close-up ground reads as real rugged relief (not a repeating tile). Pure ALU
+      // (no texture sample) → safe to evaluate unconditionally on WebGPU. Stronger on rock/slope,
+      // gentle on flat sand, faded in above the waterline and out with distance (keeps cost near the
+      // camera + avoids far-field aliasing). NO geometry displacement → the rendered surface still
+      // matches the CPU getElevation used for collision/scatter (no float/sink regression).
+      float pdFade = 1.0 - smoothstep(45.0, 210.0, length(vPositionW - vEyePosition.xyz));
+      float pe     = 0.7;                                  // gradient sample step (m) — sub-feature
+      float pHL = _detailH(vPositionW.xz - vec2(pe, 0.0)); float pHR = _detailH(vPositionW.xz + vec2(pe, 0.0));
+      float pHD = _detailH(vPositionW.xz - vec2(0.0, pe)); float pHU = _detailH(vPositionW.xz + vec2(0.0, pe));
+      float pStr  = (0.55 + slope * 2.4) * (0.45 + 0.55 * wRock + 0.40 * wGravel + 0.20 * wGrass);
+      float pLand = smoothstep(0.4, 4.0, vPositionW.y);    // fade in just above the waterline
+      float pk    = 1.5 * pdFade * pLand * pStr;
+      normalW = normalize(normalW + vec3(-(pHR - pHL), 0.0, -(pHU - pHD)) * pk);
     `);
 
     // ── Aerial perspective (distance haze) ────────────────────────────────────

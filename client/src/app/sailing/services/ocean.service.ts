@@ -1534,6 +1534,12 @@ export class OceanService {
     this.reflectionRTT.refreshRate = 2;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
+    // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
+    // GPUParticleSystem's CLIPPLANE GLSL variant fails to link on WebGPU ("0:42 'location': SPIR-V
+    // requires location") — a one-time compile error that spammed the console. Particle reflections
+    // at 512px/half-rate are negligible anyway. (objectRenderer renders ALL started particle systems
+    // unless this is off, regardless of renderList.)
+    this.reflectionRTT.renderParticles = false;
 
     // Seed with the sky — always present and covers the whole horizon. Either the Preetham
     // dome ('skybox', WebGL fallback) or the homegrown WGSL sky ('proceduralSky', WebGPU) is
@@ -1567,6 +1573,7 @@ export class OceanService {
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
     this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
+    this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 
     // Island meshes arrive asynchronously (HTTP load).  Auto-enroll them so

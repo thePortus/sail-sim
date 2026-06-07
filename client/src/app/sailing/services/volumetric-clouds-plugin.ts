@@ -380,12 +380,12 @@ void main(void) {
                 hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
             }
             float gap = pT.y - hT;                                  // clearance above the terrain
-            if (gap < 1.0) {                                        // grazed/hit the surface
+            if (gap < 0.0) {                                        // only when the ray is BELOW the surface
                 if (tt <= tNear) { gl_FragColor = scene; return; }
                 tFar = min(tFar, tt);
                 break;
             }
-            tt += max(25.0, gap * 0.5);                             // sphere-trace: step ∝ clearance
+            tt += max(6.0, gap * 0.45);                             // finer near the surface → tight silhouette (no clear-sky halo)
         }
     }
 
@@ -775,12 +775,12 @@ fn main(input: FragmentInputs)->FragmentOutputs {
                 hT = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
             }
             let gap = pT.y - hT;
-            if (gap < 1.0) {
+            if (gap < 0.0) {   // only when the ray is BELOW the surface (was <1.0 → over-occluded, clear-sky halo)
                 if (tt <= tNear) { fragmentOutputs.color = scene_color; return fragmentOutputs; }
                 tFar = min(tFar, tt);
                 break;
             }
-            tt = tt + max(25.0, gap * 0.5);
+            tt = tt + max(6.0, gap * 0.45);   // finer near the surface → silhouette hugs the real terrain edge
         }
     }
 

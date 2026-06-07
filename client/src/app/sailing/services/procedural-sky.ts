@@ -38,7 +38,7 @@ const HM:     f32 = 1000.0;        // Mie scale height
 const R0:     f32 = 6360000.0;     // planet radius
 const RA:     f32 = 6380000.0;     // atmosphere radius
 const HEIGHT: f32 = 500.0;         // viewer height above surface
-const HAZE:   f32 = 0.1;
+const HAZE:   f32 = 0.0;           // aerosol Mie floor. >0 washes the horizon tan/cream; 0 = clean blue sky
 const I_SUN:  f32 = 10.0;          // sun light power
 const G:      f32 = 0.45;          // Mie phase asymmetry
 const ENV:    f32 = 1.0;           // output gain (linear HDR; pipeline ACES-tonemaps). TUNE.
@@ -143,11 +143,22 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     let O = vec3f(0.0, HEIGHT, 0.0);
     var color = sky_scatter(O, D, Ds) * att * ENV;
 
+    // ── Daytime blue ────────────────────────────────────────────────────────────────────────────
+    // This single-scatter model has no multiple-scattering term, so over the long horizon path it
+    // over-extinguishes blue and the horizon turns yellow/olive. When the sun is UP, blend toward a
+    // clean blue gradient (deep zenith -> pale horizon). dayF fades this out by dusk so the warm
+    // sunset scatter below takes over untouched. Tune DAY_ZENITH / DAY_HORIZON for the blue.
+    let dayF = smoothstep(0.0, 0.30, Ds.y);          // 1 when the sun is well up, 0 at/below horizon
+    let DAY_ZENITH  = vec3f(0.07, 0.20, 0.52);       // deep blue overhead
+    let DAY_HORIZON = vec3f(0.42, 0.60, 0.85);       // pale blue at the horizon
+    let dayGrad = mix(DAY_HORIZON, DAY_ZENITH, smoothstep(0.0, 0.6, D.y));
+    color = mix(color, dayGrad, dayF * 0.78);
+
     // ── Sundown shaping ───────────────────────────────────────────────────────────────────────
     // warmF: how "sunset" the sky is. Active across the whole golden-hour window (sun from ~30 deg
     // up down to the horizon), NOT just the last moment. dusk: same but faded out for deep night so
     // the night sky stays dark. Widen the 0.55 to start the shaping while the sun is higher.
-    let warmF = 1.0 - smoothstep(0.0, 0.55, max(Ds.y, 0.0));
+    let warmF = 1.0 - smoothstep(0.0, 0.30, max(Ds.y, 0.0));
     let dusk  = warmF * smoothstep(-0.35, -0.05, Ds.y);
 
     // (1) Warm grade of the horizon band (deep orange, not pale peach). Raise toward 1.0 for paler.

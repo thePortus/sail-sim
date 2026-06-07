@@ -359,6 +359,10 @@ export class CloudService {
         // Quality defaults — can be tweaked at runtime.
         marchSteps:  48,
         lightSteps:  6,
+        // 0.82 = ray-march at 82% res for perf (clouds are low-frequency so it holds up). The terrain
+        // silhouette halo was NOT a resolution issue — it was the terrain heightfield-march occlusion
+        // (tightened in volumetric-clouds-plugin). Bump toward 1.0 only if you want crisper cloud edges
+        // and have FPS headroom.
         renderScale: 0.82,
       },
     );

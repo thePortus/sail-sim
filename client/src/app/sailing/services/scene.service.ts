@@ -14,6 +14,7 @@ import { Atmosphere } from '@babylonjs/addons/atmosphere';
 import { UnregisterMaterialPlugin } from '@babylonjs/core/Materials/materialPluginManager';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
+import { ProceduralSky } from './procedural-sky';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -29,11 +30,16 @@ export class SceneService {
 
   private skyMat!:    SkyMaterial;
   private skyMesh:    any;
-  // Physically-based atmospheric scattering (Babylon 9 addon). When active it renders the sky
-  // and drives the sun light's colour/intensity, superseding the Preetham skybox + manual sun
-  // curves. Flag lets us A/B against the old sky and fall back if unsupported.
-  private readonly useAtmosphere = true;
+  // Physically-based atmospheric scattering (Babylon 9 addon). DISABLED: the addon swaps the
+  // scene environment / sky-IBL on activation and that forces PBR materials to recompile a
+  // REFLECTION variant that fails to LINK on WebGPU ("Missing entry point"). It is replaced by
+  // our homegrown WGSL ProceduralSky (see buildProceduralSky / procedural-sky.ts). The addon
+  // code + activateAtmosphere() are kept intact (flag off) so we can revert if ever needed.
+  private readonly useAtmosphere = false;
   private atmosphere: Atmosphere | null = null;
+  // Homegrown WGSL day/night sky (WebGPU path). Replaces both the atmosphere addon and the
+  // Preetham SkyMaterial dome. Null on the WebGL fallback (keeps the Preetham sky there).
+  private proceduralSky: ProceduralSky | null = null;
   private sun!:       DirectionalLight;
   private moonLight!: DirectionalLight;
   private ambient!:   HemisphericLight;
@@ -206,6 +212,7 @@ export class SceneService {
       this.scene.fogDensity = 0.000035;
 
       this.buildSky();
+      this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
       this.buildLights();
       this.buildCelestialBodies();
       this.buildStars();
@@ -240,6 +247,26 @@ export class SceneService {
     skybox.renderingGroupId = 0;
     skybox.isPickable       = false;
     this.skyMesh = skybox;
+  }
+
+  /**
+   * Build the homegrown WGSL day/night sky (WebGPU only) and retire the Preetham dome.
+   * On the WebGL fallback this is skipped and the Preetham SkyMaterial keeps driving the sky.
+   * Safe to construct during scene setup: unlike the atmosphere addon it registers NO material
+   * plugin and touches no other material's compile — it's a standalone ProceduralTexture + a
+   * StandardMaterial skybox.
+   */
+  private buildProceduralSky(): void {
+    if (!this._isWebGPU || !this.scene) { return; }
+    try {
+      this.proceduralSky = new ProceduralSky(this.scene);
+      this.skyMesh?.setEnabled(false);   // the procedural sky renders the sky now
+      console.info('[Scene] Procedural WGSL sky active — Preetham dome retired.');
+    } catch (e) {
+      console.warn('[Scene] Procedural sky init failed — keeping Preetham sky.', e);
+      this.proceduralSky = null;
+      this.skyMesh?.setEnabled(true);
+    }
   }
 
   // ── Physically-based atmosphere (Babylon addon) ───────────────────────────────
@@ -694,7 +721,15 @@ export class SceneService {
    *  the sun light's diffuse each frame from real scattering (warm at the horizon, white at noon).
    *  Consumers use it as a HUE (magnitude is theirs) so they match the physical sky's temperature. */
   getAtmosphereSunColor(): Vector3 | null {
-    if (!this.atmosphere) { return null; }
+    // Also valid for the procedural sky: the !atmosphere branch in tickTimeOfDay drives
+    // sun.diffuse along the warm-horizon -> white-noon curve, a good sun HUE for clouds/fog.
+    if (!this.atmosphere && !this.proceduralSky) { return null; }
+    // BUT under the procedural sky, sun.diffuse is LOCKED at the horizon orange (1,0.28,0.05)
+    // whenever the sun is down (it's built from above=max(0,h), which is 0 all night). Feeding
+    // that hue to the cloud plugin made the clouds glow orange at midnight. Below the horizon
+    // there is no direct sun, so return null -> the cloud/fog consumers use their own neutral
+    // night colouring. (The atmosphere addon path is unaffected; it sets sun.diffuse physically.)
+    if (!this.atmosphere && this.computeSunDir().y < -0.05) { return null; }
     const d = this.sun.diffuse;
     return new Vector3(d.r, d.g, d.b);
   }
@@ -702,7 +737,7 @@ export class SceneService {
   /** The atmosphere's diffuse sky irradiance (hue) when active, else null. The addon writes it to
    *  scene.ambientColor each frame. */
   getAtmosphereSkyColor(): Vector3 | null {
-    if (!this.atmosphere || !this.scene) { return null; }
+    if ((!this.atmosphere && !this.proceduralSky) || !this.scene) { return null; }
     const a = this.scene.ambientColor;
     return new Vector3(a.r, a.g, a.b);
   }
@@ -723,7 +758,11 @@ export class SceneService {
     const elev  = Math.sin(((this.gameHours - 6) / 12) * Math.PI); // -1..1
     const az    = (this.gameHours / 24) * Math.PI * 2 - Math.PI;   // azimuth
     const horiz = Math.sqrt(Math.max(0, 1 - elev * elev));          // horizontal component
-    return new Vector3(horiz * Math.sin(az), elev, horiz * Math.cos(az));
+    // World cardinal convention (see models/index.ts, vessel.service): +X = East, -X = West.
+    // The X term is NEGATED so the sun RISES in the east (+X) and SETS in the west (-X);
+    // without it the east-west arc ran backwards (sun set in the east). Drives the sun light,
+    // shadows, sun disc/god-rays AND the procedural sky together, so they stay consistent.
+    return new Vector3(-horiz * Math.sin(az), elev, horiz * Math.cos(az));
   }
 
   private tickTimeOfDay(dt: number): void {
@@ -891,6 +930,8 @@ export class SceneService {
     // sun's colour + intensity PHYSICALLY each frame (warm/dim at the horizon, bright at noon),
     // so we skip the hand-tuned curves below.
     this.sun.direction = dir.negate();
+    // Drive the homegrown sky from the same clock; it re-bakes its LUT only when the sun moves.
+    this.proceduralSky?.setSunDir(dir);
     if (!this.atmosphere) {
       this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
       this.sun.diffuse   = new Color3(

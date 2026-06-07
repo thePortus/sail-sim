@@ -1,0 +1,24 @@
+diff --git a/node_modules/@babylonjs/addons/atmosphere/atmosphere.js b/node_modules/@babylonjs/addons/atmosphere/atmosphere.js
+index 56ba622..098df4d 100644
+--- a/node_modules/@babylonjs/addons/atmosphere/atmosphere.js
++++ b/node_modules/@babylonjs/addons/atmosphere/atmosphere.js
+@@ -700,10 +700,15 @@ export class Atmosphere {
+         // sky view LUT for glossy reflections and diffuse sky illiminance LUT for irradiance.
+         // It also handles aerial perspective application when Atmosphere is not provided with a depth texture.
+         UnregisterMaterialPlugin(MaterialPlugin);
+-        RegisterMaterialPlugin(MaterialPlugin, (material) => {
+-            if (material.getClassName() === "PBRMaterial") {
+-                return new AtmospherePBRMaterialPlugin(material, this, this.depthTexture === null);
+-            }
++        // PATCHED (sail-sim, patch-package): never auto-attach the atmo-pbr per-material plugin. Its
++        // REFLECTION-variant GLSL references an undeclared `irradianceSampler`, which fails to link on
++        // WebGPU ("Missing entry point: Each stage requires one entry point"). It attaches to anything whose
++        // getClassName() === "PBRMaterial" -- which includes our PBRCustomMaterial terrain/ocean (they
++        // inherit that class name) and the boat. We only use the Atmosphere addon for the sky render +
++        // physical sun-light driving (both separate from this plugin), NOT per-material aerial perspective
++        // (we apply our own haze). Returning null makes the existing UnregisterMaterialPlugin('atmo-pbr')
++        // call in scene.service reliable regardless of material-creation timing.
++        RegisterMaterialPlugin(MaterialPlugin, (_material) => {
+             return null;
+         });
+         scene.addIsReadyCheck(this);

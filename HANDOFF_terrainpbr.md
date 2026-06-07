@@ -1,6 +1,26 @@
 # Handoff — `?terrainpbr` PBR terrain won't render (WebGPU shader compile failure)
 
-## TL;DR
+> ## ✅ RESOLVED (commit `e9ad9c7` "terrain pbr restored")
+> The terrain now compiles AND renders solid on WebGPU. The fix was **four** changes, not the single
+> `color`→`finalColor` swap this doc originally guessed (that guess was directionally right but incomplete):
+> 1. Moved the cloud-shadow/haze block from `Fragment_Before_FinalColorComposition` to
+>    **`Fragment_Before_Fog`** and used `finalColor.rgb` (on PBR, `finalColor` doesn't exist yet at the
+>    *FinalColorComposition* hook — it's declared inside that block).
+> 2. The real `'wetter' : undeclared identifier` cause was **`//` line comments inside the
+>    `Fragment_Custom_MetallicRoughness` injection**, which `PBRCustomMaterial`'s `ShaderCodeInliner`
+>    mangles (newline-collapse). Converted to `/* */` block comments. (Unicode was a RED HERRING.)
+> 3. Terrain rendered in sparse stripes until we added **`vPositionW = worldPos.xyz;`** in
+>    `Vertex_After_WorldPosComputed` (the displaced height wasn't reaching the fragment → waterline
+>    `discard` culled everything).
+> 4. A glossy "wet water" look was fixed by raising the roughness floor to `0.62`.
+>
+> **Full current state + remaining work (RTT link errors, serving rough/AO + splat) is in
+> `HANDOFF_terrain_overhaul.md`.** The notes below are the ORIGINAL (partly-wrong) diagnosis, kept for the
+> debugging trail.
+
+---
+
+## TL;DR (original — superseded by the banner above)
 We're building an **aux-driven PBR terrain surface** for "Bay of Pirates" (sail-sim), gated behind the
 `?terrainpbr` URL flag. The default StandardMaterial terrain path is untouched and works fine. The PBR
 path currently **fails to compile its fragment shader on WebGPU**, so the terrain mesh never renders.

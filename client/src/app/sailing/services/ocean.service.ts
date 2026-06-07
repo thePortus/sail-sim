@@ -1535,9 +1535,13 @@ export class OceanService {
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
 
-    // Seed with the sky — always present and covers the whole horizon.
+    // Seed with the sky — always present and covers the whole horizon. Either the Preetham
+    // dome ('skybox', WebGL fallback) or the homegrown WGSL sky ('proceduralSky', WebGPU) is
+    // enabled at a time; enrol whichever exists so the ocean reflects the live sky.
     const skybox = scene.getMeshByName('skybox');
     if (skybox) this.reflectionRTT.renderList!.push(skybox);
+    const procSky = scene.getMeshByName('proceduralSky');
+    if (procSky) this.reflectionRTT.renderList!.push(procSky);
 
     // CRITICAL: register as a custom render target so BabylonJS renders it
     // every frame.  Without this entry the ShaderMaterial sampler receives a
@@ -1557,7 +1561,7 @@ export class OceanService {
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
       !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_') &&
-      m.name !== 'skybox';   // exclude the sky: where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+      m.name !== 'skybox' && m.name !== 'proceduralSky';   // exclude the sky (both variants): where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
     // Clear to a sandy tan so where the seabed drops off (no terrain behind the water) the
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.

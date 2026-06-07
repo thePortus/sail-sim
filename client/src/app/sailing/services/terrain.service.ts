@@ -1962,7 +1962,7 @@ export class TerrainService {
    * = S1; control map = S2; anti-tiling = S3; strata/wet-sand = S4/S5), not a 1:1 port of the Standard
    * material. Mirrors the FFT ocean's proven PBRCustomMaterial-on-WebGPU pattern (Vertex_After_
    * WorldPosComputed displaces worldPos; Fragment_Before_Lights sets surfaceAlbedo/normalW;
-   * Fragment_Before_FinalColorComposition post-processes the lit `color`).
+   * Fragment_Before_Fog post-processes the composed `finalColor`).
    */
   private buildTerrainMaterialPBR(scene: Scene, manifest: TerrainManifest): PBRCustomMaterial {
     this.terrainMaterialPBR?.dispose();
@@ -2018,9 +2018,14 @@ export class TerrainService {
       }
       float _clipHW(vec2 wxz) { return _clipH(vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w)); }
     `);
-    // Displace the flat clipmap grid by the heightfield (xz unchanged → vPositionW.xz stays valid).
+    // Displace the flat clipmap grid by the heightfield (xz unchanged -> vPositionW.xz stays valid).
+    // CRITICAL: Babylon assigns vPositionW = worldPos BEFORE this hook (pbr.vertex line ~166), so we must
+    // re-sync vPositionW to the displaced worldPos here. Otherwise the fragment reads a flat (sea-level)
+    // world Y -> the ragged-waterline band thinks the whole terrain is at the shoreline and discards
+    // nearly every fragment (terrain renders only in sparse noise-peak stripes).
     mat.Vertex_After_WorldPosComputed(`
       worldPos.y = _clipHW(worldPos.xz);
+      vPositionW = worldPos.xyz;
     `);
 
     mat.Fragment_Definitions(`
@@ -2041,62 +2046,71 @@ export class TerrainService {
         return mix(mix(_dHash(i), _dHash(i + vec2(1.0, 0.0)), u.x), mix(_dHash(i + vec2(0.0, 1.0)), _dHash(i + vec2(1.0, 1.0)), u.x), u.y);
       }
       float _detailH(vec2 p) { float s=0.0,a=0.5,n=0.0; vec2 q=p*0.42; for(int o=0;o<3;o++){s+=a*_dVal(q);n+=a;a*=0.5;q=q*2.03+7.3;} return s/n-0.5; }
-      // Normalised biome cover weights (sand/grass/gravel/rock/snow) from world pos + normal — shared by
+      // Normalised biome cover weights (sand/grass/gravel/rock/snow) from world pos + normal - shared by
       // the metallic-roughness and albedo blocks so they agree (those inject at different shader points).
-      void _biomeW(vec3 wp, vec3 nW, out float wSand, out float wGrass, out float wGravel, out float wRock, out float wSnow) {
+      // Returns vec4(sand,grass,gravel,rock); snow is reconstructed as 1-(x+y+z+w) at the call site
+      // (post-normalisation the 5 weights sum to 1). No out/inout params -> WebGPU/SPIR-V safe.
+      vec4 _biomeW(vec3 wp, vec3 nW) {
         float h = clamp(wp.y / uPeakH, 0.0, 1.0);
         float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
         float shoreW = clamp(1.0 - wp.y/10.0, 0.0, 1.0);
         float hSand = clamp(1.0 - h/0.085, 0.0, 1.0);
         float sandSlope = mix(1.0, clamp(1.0-slope*1.25,0.0,1.0), smoothstep(0.0,15.0,wp.y));
-        wSand = max(hSand, shoreW)*sandSlope;
-        wGrass = clamp((h-0.035)/0.28,0.0,1.0)*clamp(1.0-slope*0.95,0.0,1.0);
-        wGravel = clamp((h-0.20)/0.52,0.0,1.0)*clamp(0.25+slope*1.5,0.0,1.0);
-        wRock = clamp((h-0.34)/0.54,0.0,1.0)*clamp(0.22+slope*1.7,0.0,1.0);
+        float wSand = max(hSand, shoreW)*sandSlope;
+        float wGrass = clamp((h-0.035)/0.28,0.0,1.0)*clamp(1.0-slope*0.95,0.0,1.0);
+        float wGravel = clamp((h-0.20)/0.52,0.0,1.0)*clamp(0.25+slope*1.5,0.0,1.0);
+        float wRock = clamp((h-0.34)/0.54,0.0,1.0)*clamp(0.22+slope*1.7,0.0,1.0);
         float sj = sin(wp.x*0.0040+wp.z*0.0031)*0.040 + sin(wp.x*0.0017-wp.z*0.0023)*0.050;
-        wSnow = clamp((h-(0.66+sj))/0.16,0.0,1.0)*clamp(1.0-slope*2.2,0.0,1.0);
+        float wSnow = clamp((h-(0.66+sj))/0.16,0.0,1.0)*clamp(1.0-slope*2.2,0.0,1.0);
         float m = 0.5 + 0.34*sin(wp.x*0.00080+1.3)+0.24*sin(wp.z*0.00095-0.7)+0.18*sin((wp.x-wp.z)*0.00060+2.1)+0.12*sin((wp.x*0.7+wp.z*1.1)*0.0022-1.1);
         float wet = smoothstep(0.25,0.78,clamp(m,0.0,1.0));
         wGrass*=0.35+1.30*wet; wGravel*=1.45-0.75*wet; wRock*=1.25-0.40*wet;
         float t = max(0.0001, wSand+wGrass+wGravel+wRock+wSnow);
-        wSand/=t; wGrass/=t; wGravel/=t; wRock/=t; wSnow/=t;
+        return vec4(wSand, wGrass, wGravel, wRock) / t;
       }
       // S2: biome weights from the baked CONTROL/SPLAT map (consistent, flow/moisture-aware,
       // art-directable), re-sharpened on cliffs by the per-pixel geometry slope (the splat is 24 m/texel
-      // → smooth). Falls back to the live _biomeW until the splat texture is ready (uHasSplat is uniform,
-      // so the branch is uniform control flow → the texture sample is WebGPU-safe).
-      void _biomeSplat(vec3 wp, vec3 nW, out float wSand, out float wGrass, out float wGravel, out float wRock, out float wSnow) {
-        if (uHasSplat < 0.5) { _biomeW(wp, nW, wSand, wGrass, wGravel, wRock, wSnow); return; }
+      // -> smooth). Falls back to the live _biomeW until the splat texture is ready (uHasSplat is uniform,
+      // so the branch is uniform control flow -> the texture sample is WebGPU-safe).
+      vec4 _biomeSplat(vec3 wp, vec3 nW) {
+        if (uHasSplat < 0.5) { return _biomeW(wp, nW); }
         vec2 uv = vec2((wp.x - wbounds.x)/wbounds.z, (wbounds.y + wbounds.w - wp.z)/wbounds.w);
         vec4 s = texture2D(uSplat, uv);
-        wSand = s.r; wGrass = s.g; wGravel = s.b; wRock = s.a; wSnow = max(0.0, 1.0 - (s.r+s.g+s.b+s.a));
+        float wSand = s.r; float wGrass = s.g; float wGravel = s.b; float wRock = s.a;
+        float wSnow = max(0.0, 1.0 - (s.r+s.g+s.b+s.a));
         float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
         float steep = smoothstep(0.35, 0.72, slope);
         wRock = max(wRock, steep);
         wGrass *= (1.0 - steep*0.9);
         wSand  *= (1.0 - steep*0.7);
         float t = max(1e-4, wSand+wGrass+wGravel+wRock+wSnow);
-        wSand/=t; wGrass/=t; wGravel/=t; wRock/=t; wSnow/=t;
+        return vec4(wSand, wGrass, wGravel, wRock) / t;
       }
     `);
 
-    // Roughness (metallic stays 0). Procedural for now — wet, low, flat ground near the waterline reads
+    // Roughness (metallic stays 0). Procedural for now - wet, low, flat ground near the waterline reads
     // glossy (wet sand sheen) while slopes/uplands stay matte. Real per-biome roughness maps replace this
     // in S1b. Runs BEFORE the light loop, so it recomputes slope from the Sobel normal.
+    // WARNING: this injection lands INSIDE pbrBlockReflectivity, which PBRCustomMaterial runs through
+    // ShaderCodeInliner (it inlines #define pbr_inline functions, collapsing newlines). A // line comment
+    // here gets its terminating newline eaten on inline -> the next tokens parse as code (we hit
+    // "'wetter' : undeclared identifier"). Use /* */ block comments ONLY inside this block. (The Standard
+    // material path never runs the inliner, which is why // comments are fine everywhere else.)
     mat.Fragment_Custom_MetallicRoughness(`
       vec3 nWr = _clipNormal(vPositionW.xz);
-      float mrS, mrG, mrGr, mrR, mrSn; _biomeSplat(vPositionW, nWr, mrS, mrG, mrGr, mrR, mrSn);
+      vec4 mrW = _biomeSplat(vPositionW, nWr);
+      float mrS = mrW.x, mrG = mrW.y, mrGr = mrW.z, mrR = mrW.w, mrSn = 1.0 - (mrW.x+mrW.y+mrW.z+mrW.w);
       float rgh = texture(uOrmArr, vec3(vPositionW.xz*0.05, 0.0)).r*mrS + texture(uOrmArr, vec3(vPositionW.xz*0.05, 1.0)).r*mrG
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 2.0)).r*mrGr + texture(uOrmArr, vec3(vPositionW.xz*0.05, 3.0)).r*mrR
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 4.0)).r*mrSn;
       float wet = (1.0 - smoothstep(0.0, 2.2, vPositionW.y)) * (1.0 - smoothstep(0.35, 0.70, 1.0 - clamp(nWr.y, 0.0, 1.0)));
-      metallicRoughness.r = 0.0;                                    // terrain is never metallic
-      metallicRoughness.g = clamp(mix(rgh, rgh * 0.45, wet), 0.05, 1.0);   // real per-biome rough; wetter near the water
+      metallicRoughness.r = 0.0;                                    /* terrain is never metallic */
+      metallicRoughness.g = clamp(mix(rgh, rgh * 0.78, wet), 0.62, 1.0);   /* matte floor 0.62: low-roughness sky sheen was reading as wet/transparent water */
     `);
 
     // Albedo + normal (before the PBR light loop).
     mat.Fragment_Before_Lights(`
-      // ── Ragged waterline scallop (off in the refraction RTT) ──
+      // -- Ragged waterline scallop (off in the refraction RTT) --
       if (u_waterlineDither > 0.5) {
         vec2 wlP = vPositionW.xz * 0.70; vec2 wlI = floor(wlP), wlF = fract(wlP); vec2 wlU = wlF*wlF*(3.0-2.0*wlF);
         float a0=fract(sin(dot(wlI,vec2(127.1,311.7)))*43758.5453);
@@ -2115,7 +2129,8 @@ export class TerrainService {
       vec3 nW = _clipNormal(vPositionW.xz);
       vec3 triW = abs(nW); triW = triW*triW*triW*triW*triW*triW; triW /= (triW.x+triW.y+triW.z);
       float slope = 1.0 - clamp(nW.y, 0.0, 1.0);
-      float wSand, wGrass, wGravel, wRock, wSnow; _biomeSplat(vPositionW, nW, wSand, wGrass, wGravel, wRock, wSnow);
+      vec4 bW = _biomeSplat(vPositionW, nW);
+      float wSand = bW.x, wGrass = bW.y, wGravel = bW.z, wRock = bW.w, wSnow = 1.0 - (bW.x+bW.y+bW.z+bW.w);
 
       // Triplanar albedo from the biome ARRAY (layer = biome index): fine + coarse, cross-textured rock/gravel.
       #define TRIA(L, scl) (texture(uAlbedoArr, vec3(vPositionW.yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3(vPositionW.xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3(vPositionW.xy*(scl), float(L))).rgb*triW.z)
@@ -2130,7 +2145,7 @@ export class TerrainService {
       float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05,4.0)).g*wSnow;
-      surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB→linear, AO darkens crevices
+      surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB->linear, AO darkens crevices
 
       // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.
       float pdFade = 1.0 - smoothstep(45.0, 210.0, length(vPositionW - vEyePosition.xyz));
@@ -2143,7 +2158,12 @@ export class TerrainService {
     `);
 
     // Cloud shadows + aerial haze on the lit colour (matches the Standard path + the ocean).
-    mat.Fragment_Before_FinalColorComposition(`
+    // NOTE: must run at Before_Fog, not Before_FinalColorComposition. On PBRCustomMaterial the
+    // composed final-color vec4 is named `finalColor` and is only DECLARED inside the
+    // FinalColorComposition block, so it does not exist yet at the *Before* hook (that hook is where
+    // StandardMaterial exposes `color`, which PBR does not). Before_Fog injects right after finalColor
+    // is composed, still in linear/pre-tonemap space -> correct spot for cloud shadow + aerial haze.
+    mat.Fragment_Before_Fog(`
       if (uSunDir.y > 0.03 && uCloudCoverage > 0.02) {
         vec2 sp = vPositionW.xz + uSunDir.xz / max(uSunDir.y, 0.15) * uCloudBaseH + uCloudDrift;
         vec2 a0 = sp*0.0013; vec2 i0=floor(a0); vec2 f0=fract(a0); f0=f0*f0*(3.0-2.0*f0);
@@ -2154,11 +2174,11 @@ export class TerrainService {
                      mix(fract(sin(dot(i1+vec2(0.,1.),vec2(127.1,311.7)))*43758.5453),fract(sin(dot(i1+vec2(1.,1.),vec2(127.1,311.7)))*43758.5453),f1.x),f1.y);
         float cf = n0*0.65 + n1*0.35;
         float cShadow = smoothstep(0.58-uCloudCoverage*0.45, 0.70-uCloudCoverage*0.30, cf) * smoothstep(0.05,0.35,uCloudCoverage) * smoothstep(0.03,0.18,uSunDir.y);
-        color.rgb *= 1.0 - cShadow*0.55;
+        finalColor.rgb *= 1.0 - cShadow*0.55;
       }
       float hazeDist = length(vPositionW - vEyePosition.xyz);
       float hazeF = clamp(pow(1.0 - exp(-hazeDist*0.00020), 1.4), 0.0, 0.96);
-      color.rgb = mix(color.rgb, uHazeColor, hazeF);
+      finalColor.rgb = mix(finalColor.rgb, uHazeColor, hazeF);
     `);
 
     mat.onBindObservable.add(() => {
@@ -2183,6 +2203,11 @@ export class TerrainService {
         fx.setVector2('texSize', this.clipTexSize);
       }
     });
+
+    // TEMP DIAGNOSTIC (remove once S0-S3 verified): WebGPU SPIR-V compile failures surface as
+    // unhandled promise rejections, NOT via Material.onError. onCompiled DOES fire on success, so this
+    // is our deterministic "the PBR terrain shader actually compiled" signal in the console.
+    mat.onCompiled = () => console.info('[TerrainPBR] shader compiled OK');
 
     this.terrainMaterialPBR = mat;
     return mat;

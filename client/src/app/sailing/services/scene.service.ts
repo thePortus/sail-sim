@@ -248,7 +248,10 @@ export class SceneService {
   private buildProceduralSky(): void {
     if (!this._isWebGPU || !this.scene) { return; }
     try {
-      this.proceduralSky = new ProceduralSky(this.scene);
+      // domeSize must fit INSIDE camera.maxZ (120000) at the box CORNERS, or the far plane clips the upper
+      // corners and the blue-tinted scene clearColor leaks through as a bright blue zenith ring (immune to
+      // the sky shader — it's the engine background). corner = size*sqrt(3)/2; 130000 -> ~112600 < 120000.
+      this.proceduralSky = new ProceduralSky(this.scene, { domeSize: 130000 });
       this.skyMesh?.setEnabled(false);   // the procedural sky renders the sky now
       console.info('[Scene] Procedural WGSL sky active — Preetham dome retired.');
     } catch (e) {

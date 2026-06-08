@@ -165,16 +165,14 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     let SUNSET_GRADE = vec3f(0.98, 0.86, 0.66);
     color = color * mix(vec3f(1.0, 1.0, 1.0), SUNSET_GRADE, warmF);
 
-    // (2) THE KEY ONE: the orange-horizon -> blue-zenith GRADIENT. Mix the UPPER sky FULLY toward a
-    //     bright dusk blue (must be bright enough to beat the HDR orange, or it just darkens). upMix
-    //     rises with view elevation (D.y) and only in the dusk window. Tune:
-    //       DUSK_BLUE : the upper-sky colour (linear HDR). Push B up / R,G down for a bluer zenith;
-    //                   scale all down for a deeper/darker blue.
-    //       smoothstep(0.03, 0.40, D.y): how far DOWN toward the horizon the blue reaches (lower the
-    //                   0.40 to bring blue lower; raise it to keep more orange up high).
-    let DUSK_BLUE = vec3f(0.10, 0.20, 0.52);
-    let upMix = smoothstep(0.03, 0.40, D.y) * dusk;
-    color = mix(color, DUSK_BLUE, upMix);
+    // (2) Dusk gradient: zenith DARKEST, horizon BRIGHTEST (the natural twilight gradient). As the sun sets,
+    //     progressively DARKEN the upper sky (high D.y) while leaving the warm horizon band (low D.y) brightest.
+    //     Replaces an older term that mixed the zenith toward a BRIGHT blue -- that inverted the gradient into a
+    //     bright-blue cap sitting OVER a dark horizon (backwards). dusk (= warmF gated to sundown) ramps this in
+    //     through golden hour and fades by deep night (att has crushed the whole sky by then). KNOBS: 0.88 (max
+    //     zenith darken), smoothstep(0.03, 0.45, D.y) (how far down toward the horizon the darkening reaches).
+    let upDark = smoothstep(0.03, 0.45, D.y) * dusk;
+    color = color * (1.0 - upDark * 0.88);
 
     fragmentOutputs.color = vec4f(color, 1.0);
 }

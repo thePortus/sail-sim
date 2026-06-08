@@ -2,8 +2,6 @@
 
 # General or Current TODO Items
 
-* dusktime shift to night sky showers bright blue on top... upside down
-* clouds a bit dark
 * add camera clipping to prevent going underwater but especially under terrain
 * rain doesn't show over clouds
 * cooler moon disk & replace stars with actual star map?
@@ -15,6 +13,7 @@
 * add full sinking & capsize animation
 * fix speed of asset scattering loading in?
 * birds cast reflections
+* add photo (hide hud mode)
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing

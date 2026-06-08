@@ -100,6 +100,7 @@ export class TerrainService {
   private biomeOrmArr: RawTexture2DArray | null = null;
   private biomePlaceholderArr: RawTexture2DArray | null = null;
   private splatTex: Texture | null = null;   // S2 control/splat map (RGBA soft biome weights, world-aligned)
+  private auxTex: Texture | null = null;     // S4 aux map (R slope, G shoreDist, B wetness, A flow), world-aligned
   private static readonly BIOME_TILES = ['sand', 'grass', 'gravel', 'rock', 'snow'];
   // S3 anti-tiling: the ALBEDO array packs 3 extra variant layers (5/6/7) that the shader cross-fades
   // with the matching core layer over a large-scale noise so no single tile visibly repeats. The ORM
@@ -2028,10 +2029,20 @@ export class TerrainService {
     this.splatTex.wrapU = Texture.CLAMP_ADDRESSMODE; this.splatTex.wrapV = Texture.CLAMP_ADDRESSMODE;
     this.terrainTextures.push(this.splatTex);
 
+    // S4 aux map: world-aligned RGBA data (R slope, G shoreDist, B wetness, A flow). DATA not colour, so
+    // gammaSpace=false (no sRGB decode). invertY=false to match the splat/heightfield uv. uHasAux gates use.
+    this.auxTex = new Texture(`${Settings.apiUrl}terrain/aux-map`, scene, false, false,
+      Texture.LINEAR_LINEAR_MIPLINEAR, null, () => console.info('[TerrainPBR] aux map not found — flow/erosion skinning off'));
+    this.auxTex.gammaSpace = false;
+    this.auxTex.wrapU = Texture.CLAMP_ADDRESSMODE; this.auxTex.wrapV = Texture.CLAMP_ADDRESSMODE;
+    this.terrainTextures.push(this.auxTex);
+
     mat.AddUniform('uAlbedoArr', 'sampler2DArray', null);
     mat.AddUniform('uOrmArr', 'sampler2DArray', null);
     mat.AddUniform('uSplat', 'sampler2D', null);
     mat.AddUniform('uHasSplat', 'float', null);
+    mat.AddUniform('uAux', 'sampler2D', null);
+    mat.AddUniform('uHasAux', 'float', null);
     mat.AddUniform('heightTex', 'sampler2D', null);
     mat.AddUniform('uPeakH', 'float', null);
     mat.AddUniform('wbounds', 'vec4', null);
@@ -2137,6 +2148,14 @@ export class TerrainService {
         float t = max(1e-4, wSand+wGrass+wGravel+wRock+wSnow);
         return vec4(wSand, wGrass, wGravel, wRock) / t;
       }
+      // S4: baked aux map sampled at the same world uv as the splat. Returns (R slope, G shoreDist,
+      // B wetness, A flow); flow is log-normalised. Zero when not loaded (uHasAux is a uniform, so the
+      // branch is uniform control flow -> the texture sample is WebGPU-safe).
+      vec4 _aux(vec3 wp) {
+        if (uHasAux < 0.5) { return vec4(0.0); }
+        vec2 uv = vec2((wp.x - wbounds.x)/wbounds.z, (wbounds.y + wbounds.w - wp.z)/wbounds.w);
+        return texture2D(uAux, uv);
+      }
     `);
 
     // Roughness (metallic stays 0). Procedural for now - wet, low, flat ground near the waterline reads
@@ -2157,6 +2176,9 @@ export class TerrainService {
       float wet = (1.0 - smoothstep(0.0, 2.2, vPositionW.y)) * (1.0 - smoothstep(0.35, 0.70, 1.0 - clamp(nWr.y, 0.0, 1.0)));
       metallicRoughness.r = 0.0;                                    /* terrain is never metallic */
       metallicRoughness.g = clamp(mix(rgh, rgh * 0.78, wet), 0.62, 1.0);   /* matte floor 0.62: low-roughness sky sheen was reading as wet/transparent water */
+      vec4 auxR = _aux(vPositionW);                                 /* S4: water-polished drainage channels */
+      float chanR = smoothstep(0.45, 0.82, auxR.a) * smoothstep(-0.2, 1.5, vPositionW.y);
+      metallicRoughness.g = clamp(mix(metallicRoughness.g, metallicRoughness.g * 0.70, chanR), 0.50, 1.0);
     `);
 
     // Albedo + normal (before the PBR light loop).
@@ -2211,6 +2233,19 @@ export class TerrainService {
       splatC *= (1.0 + macroW * 0.13);
       splatC.r *= (1.0 + macroW * 0.06); splatC.b *= (1.0 - macroW * 0.06);
       splatC = clamp(splatC, 0.0, 1.0);
+      // S4 flow & erosion skinning: the baked flow map carves drainage channels (darker, sediment-toned,
+      // water-polished -- gloss handled in the roughness block); broad wetness dampens/darkens open ground.
+      // Land only (the ocean shades the submerged seabed). Falls back to no-op when the aux map is absent.
+      vec4 aux = _aux(vPositionW);
+      float landMask = smoothstep(-0.2, 1.5, vPositionW.y);
+      float chan = smoothstep(0.45, 0.82, aux.a) * landMask;     // strong flow = drainage channel
+      float damp = smoothstep(0.40, 0.90, aux.b) * landMask;     // broad wetness = damp ground
+      float wetMix = clamp(max(chan, damp * 0.55), 0.0, 1.0);
+      if (wetMix > 0.001) {
+        float sLum = dot(splatC, vec3(0.299, 0.587, 0.114));
+        vec3 sediment = mix(splatC, vec3(sLum) * vec3(0.82, 0.80, 0.74), 0.30);   // cool grey-brown sediment
+        splatC = mix(splatC, sediment * mix(1.0, 0.58, wetMix), wetMix);          // darker + sediment-toned
+      }
       // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome).
       float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock
@@ -2267,6 +2302,8 @@ export class TerrainService {
       fx.setTexture('uOrmArr', this.biomeOrmArr ?? this.biomePlaceholderArr);
       if (this.splatTex) { fx.setTexture('uSplat', this.splatTex); }
       fx.setFloat('uHasSplat', this.splatTex && this.splatTex.isReady() ? 1 : 0);
+      if (this.auxTex) { fx.setTexture('uAux', this.auxTex); }
+      fx.setFloat('uHasAux', this.auxTex && this.auxTex.isReady() ? 1 : 0);
       if (this.clipHeightTex) {
         fx.setTexture('heightTex', this.clipHeightTex);
         fx.setVector4('wbounds', this.clipWBounds);

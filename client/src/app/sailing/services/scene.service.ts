@@ -108,6 +108,11 @@ export class SceneService {
   setTerrainHeightSampler(fn: (x: number, z: number) => number): void {
     this.terrainHeightSampler = fn;
   }
+  /** Terrain surface elevation (metres) at a world XZ, or null if the heightfield isn't ready yet.
+   *  Land is positive, seabed negative. Used for camera terrain-collision (clamp above the ground). */
+  getTerrainHeight(x: number, z: number): number | null {
+    return this.terrainHeightSampler ? this.terrainHeightSampler(x, z) : null;
+  }
 
   // ── Post-processing setter cache ────────────────────────────────────────────
   // BabylonJS ImageProcessingConfiguration setters have NO equality guard:

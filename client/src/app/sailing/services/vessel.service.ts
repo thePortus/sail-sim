@@ -905,6 +905,16 @@ export class VesselService {
     cam.position.x += (desiredX - cam.position.x) * lerp;
     cam.position.y += (desiredY - cam.position.y) * lerp;
     cam.position.z += (desiredZ - cam.position.z) * lerp;
+
+    // Terrain collision: never let the camera dip below the landscape. Clamp its Y to the ground height
+    // at the camera's XZ (+ clearance) so when the orbit would swing it into a hill/cliff it instead rides
+    // UP and ALONG the surface. Over water the seabed is below sea level, so this only engages near land.
+    const groundY = this.sceneService.getTerrainHeight(cam.position.x, cam.position.z);
+    if (groundY !== null) {
+      const minY = groundY + 3.0;   // clearance above the surface (keeps the near plane clear)
+      if (cam.position.y < minY) { cam.position.y = minY; }
+    }
+
     cam.setTarget(new Vector3(targetX, targetY, targetZ));
   }
 

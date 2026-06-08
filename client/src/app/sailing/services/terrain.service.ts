@@ -2145,6 +2145,14 @@ export class TerrainService {
         wRock = max(wRock, steep);
         wGrass *= (1.0 - steep*0.9);
         wSand  *= (1.0 - steep*0.7);
+        // #6 snow line by slope + ASPECT: snow clings to flatter, shaded faces; steep + sun-facing faces go
+        // bare rock. A FIXED sunny azimuth (not the live sun -- snow cover is a seasonal average, so a moving
+        // sun must NOT make snow flicker). Melted snow becomes rock; soft smoothstep bands (no hard cut).
+        vec2 nh = nW.xz; float nhl = length(nh);
+        float aspect = (nhl > 1e-3) ? dot(nh / nhl, vec2(0.5, -0.866)) : 0.0;   // +1 sun-facing, -1 shaded
+        float snowMelt = clamp(max(smoothstep(0.32, 0.62, slope),
+                                   smoothstep(0.0, 0.7, aspect) * smoothstep(0.06, 0.30, slope) * 0.8), 0.0, 1.0);
+        float melted = wSnow * snowMelt; wSnow -= melted; wRock += melted;
         // S5b biome-edge softening: break hard borders with a fine (~1.7 m) noise so materials interlock
         // instead of meeting on a clean contour. Grass and sand trade tufts where they overlap; gravel scree
         // appears along rock/grass borders. Re-normalised below so totals stay valid (AO/roughness match too).

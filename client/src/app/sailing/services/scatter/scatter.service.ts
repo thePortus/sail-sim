@@ -203,8 +203,10 @@ export class ScatterService {
         if (hl > 1e-3) { hx /= hl; hz /= hl; } else { hx = 0; hz = 1; }
         ShadowBlobPlugin.SHADOW.dirX = hx;
         ShadowBlobPlugin.SHADOW.dirZ = hz;
-        ShadowBlobPlugin.SHADOW.stretch = Math.max(1, Math.min(3.5, 1 / Math.max(sun.y, 0.30)));
-        this._shadowMat.alpha = 0.34 * smoothstep(0.0, 0.16, sun.y);
+        const stretch = Math.max(1, Math.min(3.5, 1 / Math.max(sun.y, 0.30)));
+        ShadowBlobPlugin.SHADOW.stretch = stretch;
+        // Fade out at night, and softer/fainter as the shadow stretches long (low-sun shadows are diffuse penumbra).
+        this._shadowMat.alpha = 0.30 * smoothstep(0.0, 0.16, sun.y) * (1.0 - 0.12 * (stretch - 1.0));
       }
       this.ensurePatches();
       for (const l of this.layers) { l.manager.update(); }
@@ -402,24 +404,27 @@ export class ScatterService {
    *  -1 → keep every candidate), so the blobs are a single source of truth with the assets — one disc
    *  per palm/tree/rock/log. The `ShadowBlobPlugin` stretches each round disc away from the sun. */
   private registerShadows(scene: Scene): void {
-    // Soft radial-gradient alpha (opaque centre → transparent rim) → a vague blurry blob.
-    const grad = new DynamicTexture('scatter_shadow_grad', 64, scene, false);
+    // Soft radial-gradient alpha (opaque centre → transparent rim) → a vague blurry blob. Smooth multi-stop
+    // falloff at 128px = a wide diffuse penumbra (no hard ring), which reads far less like a flat decal.
+    const grad = new DynamicTexture('scatter_shadow_grad', 128, scene, false);
     const ctx = grad.getContext() as CanvasRenderingContext2D;
-    const g = ctx.createRadialGradient(32, 32, 2, 32, 32, 31);
-    g.addColorStop(0, 'rgba(255,255,255,1)');
-    g.addColorStop(0.55, 'rgba(255,255,255,0.7)');
-    g.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+    const g = ctx.createRadialGradient(64, 64, 1, 64, 64, 63);
+    g.addColorStop(0.00, 'rgba(255,255,255,1.0)');
+    g.addColorStop(0.30, 'rgba(255,255,255,0.82)');
+    g.addColorStop(0.60, 'rgba(255,255,255,0.45)');
+    g.addColorStop(0.82, 'rgba(255,255,255,0.16)');
+    g.addColorStop(1.00, 'rgba(255,255,255,0.0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
     grad.update();
     grad.hasAlpha = true;
 
     const mat = new StandardMaterial('scatter_shadow_mat', scene);
     mat.diffuseColor = new Color3(0, 0, 0);
     mat.specularColor = new Color3(0, 0, 0);
-    mat.emissiveColor = new Color3(0, 0, 0);
-    mat.disableLighting = true;            // flat black; the disc darkens the ground beneath it
+    mat.emissiveColor = new Color3(0.02, 0.03, 0.05);   // dark COOL shadow (picks up sky ambient) — not dead black
+    mat.disableLighting = true;            // the disc darkens the ground beneath it (cool-tinted)
     mat.opacityTexture = grad;             // radial alpha → soft edge
-    mat.alpha = 0.3;                       // base opacity (modulated each frame by sun elevation)
+    mat.alpha = 0.30;                      // base opacity (modulated each frame by sun elevation + stretch)
     mat.backFaceCulling = false;
     mat.disableDepthWrite = true;          // a decal: blend over the terrain, don't fight other blobs
     new ShadowBlobPlugin(mat);             // stretch away from the sun (GLSL + WGSL)

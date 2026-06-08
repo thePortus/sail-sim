@@ -2255,8 +2255,8 @@ export class TerrainService {
       // S3 macro colour: large-scale (~300-900 m) cool/warm + brightness drift so big areas are not uniform.
       float macroN = _dVal(vPositionW.xz * 0.0022 + 70.0) * 0.6 + _dVal(vPositionW.xz * 0.0009 + 130.0) * 0.4;
       float macroW = macroN - 0.5;
-      splatC *= (1.0 + macroW * 0.13);
-      splatC.r *= (1.0 + macroW * 0.06); splatC.b *= (1.0 - macroW * 0.06);
+      splatC *= (1.0 + macroW * 0.20);
+      splatC.r *= (1.0 + macroW * 0.09); splatC.b *= (1.0 - macroW * 0.09);
       splatC = clamp(splatC, 0.0, 1.0);
       // S4 flow & erosion skinning: the baked flow map carves drainage channels (darker, sediment-toned,
       // water-polished -- gloss handled in the roughness block); broad wetness dampens/darkens open ground.
@@ -2332,6 +2332,11 @@ export class TerrainService {
         float cShadow = smoothstep(0.58-uCloudCoverage*0.45, 0.70-uCloudCoverage*0.30, cf) * smoothstep(0.05,0.35,uCloudCoverage) * smoothstep(0.03,0.18,uSunDir.y);
         finalColor.rgb *= 1.0 - cShadow*0.55;
       }
+      // S6 art: small terrain-only residual lift for off-noon (the scene sun-intensity plateau + ambient now
+      // carry most of the "sunny all day" work). Grows as the sun lowers, ~0 near noon, OFF below the horizon.
+      float aboveH  = smoothstep(-0.02, 0.06, uSunDir.y);
+      float dayLift = 1.0 + 0.30 * aboveH * (1.0 - smoothstep(0.12, 0.92, uSunDir.y));
+      finalColor.rgb *= dayLift;
       float hazeDist = length(vPositionW - vEyePosition.xyz);
       float hazeF = clamp(pow(1.0 - exp(-hazeDist*0.00020), 1.4), 0.0, 0.96);
       finalColor.rgb = mix(finalColor.rgb, uHazeColor, hazeF);

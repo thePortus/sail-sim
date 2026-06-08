@@ -4,20 +4,21 @@
 
 
 * finish landscape
-* rain doesn't show over clouds
+* dusktime shift to night sky showers bright blue on top... upside down
 * clouds a bit dark
+* rain doesn't show over clouds
 * cooler moon disk & replace stars with actual star map?
 * mas dolphins por favor
 * cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind
 * clouds render over reeds
+* add full sinking & capsize animation
 * fix speed of asset scattering loading in?
 * birds cast reflections
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
-* add full sinking & capsize animation
 * made cannon elevation aiming smooth and by decimals
 * fix tree height
 * persistent logoff locations & serverside authoritative location

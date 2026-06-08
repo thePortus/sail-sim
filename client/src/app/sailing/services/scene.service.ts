@@ -871,7 +871,12 @@ export class SceneService {
     this.sun.direction = dir.negate();
     // Drive the homegrown sky from the same clock; it re-bakes its LUT only when the sun moves.
     this.proceduralSky?.setSunDir(dir);
-    this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
+    // Wide bright plateau: ramp up quickly off the horizon, then HOLD ~full across the day. Previously the
+    // intensity scaled with elevation, which compounded with the Lambert N.L falloff (intensity*N.L ~ above^2)
+    // so only a narrow window near noon read bright. Now the sun term stays strong from mid-morning through
+    // mid-afternoon; the horizon ramp (sunUp) keeps it 0 below the horizon (no night floor leak).
+    const sunUp = Math.max(0, Math.min(1, above / 0.18));
+    this.sun.intensity = sunUp * (0.85 + 0.95 * sunUp) * (1 - cloud * 0.55);   // peak ~1.80 (was ~1.25)
     this.sun.diffuse   = new Color3(
       1.0,
       Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
@@ -893,7 +898,7 @@ export class SceneService {
     // moonlight and don't render as featureless black silhouettes.
     this.ambient.intensity = (isNight
       ? 0.28 + cloud * 0.05
-      : 0.10 + above * 0.38 + cloud * 0.06)
+      : 0.24 + above * 0.30 + cloud * 0.06)
       + this._lightningFlash * 2.6;   // lightning flash brightens the whole scene
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight

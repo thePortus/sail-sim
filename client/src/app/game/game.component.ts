@@ -48,7 +48,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
   standalone: true,
   imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent],
   template: `
-    <div class="game-root">
+    <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
       <canvas #gameCanvas class="game-canvas"
               [class.game-canvas--visible]="phase() === 'sailing'"></canvas>
@@ -84,7 +84,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
       <!-- In-game HUD -->
       @if (phase() === 'sailing') {
-        <app-hud (exitGame)="onExitGame()" />
+        <app-hud (exitGame)="onExitGame()" (photoModeChange)="photoMode.set($event)" />
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
@@ -149,6 +149,10 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       display: inline-block; padding: 0 4px; border-radius: 3px;
       border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.35);
     }
+    /* Photo mode (driven by the HUD): hide our own chrome too — minimap + admin hint/panel. */
+    .game-root.photo-mode .minimap-anchor,
+    .game-root.photo-mode .admin-hint,
+    .game-root.photo-mode app-admin-panel { display: none !important; }
   `],
 })
 export class GameComponent implements AfterViewInit, OnDestroy {
@@ -181,6 +185,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   phase      = signal<GamePhase>('selecting');
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
+  photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
   @HostListener('window:keydown.escape')

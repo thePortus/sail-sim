@@ -2006,6 +2006,18 @@ export class TerrainService {
     mat.AddUniform('uCloudBaseH', 'float', null);
     mat.AddUniform('u_waterlineDither', 'float', null);
 
+    // The ragged-waterline discard (below) must NOT run when the terrain renders into the ocean's
+    // seabed (refraction) RTT, or the holes fill with that pass's bright tan clear-colour and read
+    // as a sandy band in the shallows. Flag the refraction pass so onBind switches the discard off.
+    // NOTE: this MUST be registered here too — the Standard path (buildTerrainMaterial) registers
+    // the same observers, but under ?terrainpbr only THIS builder runs, so without this the flag
+    // stays false forever and the discard punches tan holes at the shoreline (PBR-only bug).
+    const refr = this.oceanService.getRefractionTexture?.();
+    if (refr) {
+      refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
+      refr.onAfterRenderObservable.add(() => { this._inRefractionPass = false; });
+    }
+
     mat.Vertex_Definitions(`
       float _clipH(vec2 uv) {
         vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);

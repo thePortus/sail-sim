@@ -2,13 +2,14 @@
 
 # General or Current TODO Items
 
-* fix tree height
+
 * finish landscape
 * mas dolphins por favor
 * cooler moon disk & replace stars with actual star map?
 * made pbr terrain the default
 * note, the weird shoreline bright sand effect that is ONLY on terrainpbr
 * rain doesn't show over clouds
+* clouds a bit dark
 * cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind
@@ -20,7 +21,8 @@
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * add full sinking & capsize animation
 * made cannon elevation aiming smooth and by decimals
-* persistent logoff locations
+* fix tree height
+* persistent logoff locations & serverside authoritative location
 * tidal pull?
 * Backlighting refreaction color issue in shallows
 * bloom lighting and improved sun ring?

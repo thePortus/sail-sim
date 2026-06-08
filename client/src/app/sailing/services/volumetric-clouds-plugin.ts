@@ -437,9 +437,14 @@ void main(void) {
             // base so undersides aren't black + ocean/terrain bounce. Tint/brightness come from
             // our time/weather-aware sky & ground uniforms. KNOBS: 0.34 / 0.10 / 0.45 (raised to
             // lift the shadows and tame the light-vs-dark contrast).
-            vec3 ambient = skyColor    * (0.5 + 0.6 * ch) * 0.34
-                         + skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
-                         + groundColor * (1.0 - ch) * 0.45;
+            // Drive cloud darkness by the CLOUDINESS (coverage) setting: low coverage -> strongly lift the
+            // shadowed-side ambient so partly-cloudy skies read fluffy + white; high coverage keeps a moody
+            // look but with a LIFTED dark floor so storms don't crush huge regions to max black (softer
+            // contrast). ambLift ~3.2 (light) -> 1.5 (heavy).
+            float ambLift = mix(3.2, 1.5, smoothstep(0.10, 0.78, cloudCoverage));
+            vec3 ambient = (skyColor    * (0.5 + 0.6 * ch) * 0.34
+                         +  skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
+                         +  groundColor * (1.0 - ch) * 0.45) * ambLift;
             // Sun term — Mie phase is small so this needs gain; KNOB 15.0 (lowered from 25 to pull
             // the blown highlights down). ≈ the Shadertoy's SUN_POWER rescaled to our exposure.
             vec3 radiance = ambient + sunColor * 15.0 * lt;
@@ -454,6 +459,14 @@ void main(void) {
         t += step;
     }
 
+    // Storm detail-reveal: a gamma (<1) on the cloud's own scatter expands the shadow/midtone separation so
+    // the dense storm masses show structure instead of flattening into one dark blob. Keeps black at black
+    // and barely touches the bright silver linings. Gated to high coverage so fair-weather clouds are unchanged.
+    float stormDetail = smoothstep(0.45, 0.85, cloudCoverage);
+    scatter = mix(scatter, pow(max(scatter, vec3(0.0)), vec3(0.62)), stormDetail);
+    // Fair-weather brightness: lift the WHOLE cloud (lit bodies too, not just shadows) toward bright white at
+    // low coverage, so noon clear-sky cumulus read brilliant white rather than grey. ~1.45x (light) -> 1.0.
+    scatter *= mix(1.45, 1.0, smoothstep(0.12, 0.55, cloudCoverage));
     gl_FragColor = vec4(scene.rgb * transmit + scatter, scene.a);
 }
 `;
@@ -834,9 +847,14 @@ fn main(input: FragmentInputs)->FragmentOutputs {
             let ch = vc_cloudHeight(p);
             // Ambient (sky + base fill + ground bounce); tint/brightness from our uniforms.
             // KNOBS 0.34 / 0.10 / 0.45 — raised to lift shadows and tame the contrast.
-            let ambient = uniforms.skyColor    * (0.5 + 0.6 * ch) * 0.34
-                        + uniforms.skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
-                        + uniforms.groundColor * (1.0 - ch) * 0.45;
+            // Drive cloud darkness by the CLOUDINESS (coverage) setting: low coverage -> strongly lift the
+            // shadowed-side ambient so partly-cloudy skies read fluffy + white; high coverage keeps a moody
+            // look but with a LIFTED dark floor so storms don't crush huge regions to max black (softer
+            // contrast). ambLift ~3.2 (light) -> 1.5 (heavy).
+            let ambLift = mix(3.2, 1.5, smoothstep(0.10, 0.78, uniforms.cloudCoverage));
+            let ambient = (uniforms.skyColor    * (0.5 + 0.6 * ch) * 0.34
+                        +  uniforms.skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
+                        +  uniforms.groundColor * (1.0 - ch) * 0.45) * ambLift;
             // Sun term — gain lowered 25 → 15 to pull down the blown highlights.
             let radiance = ambient + uniforms.sunColor * 15.0 * lt;
 
@@ -849,6 +867,12 @@ fn main(input: FragmentInputs)->FragmentOutputs {
         t += step_size;
     }
 
+    // Storm detail-reveal (see GLSL): gamma (<1) on scatter expands shadow/midtone separation in dense storm
+    // masses; black stays black, silver linings ~unchanged. Gated to high coverage (fair weather untouched).
+    let stormDetail = smoothstep(0.45, 0.85, uniforms.cloudCoverage);
+    scatter = mix(scatter, pow(max(scatter, vec3f(0.0)), vec3f(0.62)), vec3f(stormDetail));
+    // Fair-weather brightness: lift the WHOLE cloud toward bright white at low coverage (noon clear cumulus).
+    scatter *= mix(1.45, 1.0, smoothstep(0.12, 0.55, uniforms.cloudCoverage));
     fragmentOutputs.color = vec4f(scene_color.rgb * transmit + scatter, scene_color.a);
 }
 `;

@@ -2,10 +2,9 @@
 
 # General or Current TODO Items
 
-
-* finish landscape
 * dusktime shift to night sky showers bright blue on top... upside down
 * clouds a bit dark
+* add camera clipping to prevent going underwater but especially under terrain
 * rain doesn't show over clouds
 * cooler moon disk & replace stars with actual star map?
 * mas dolphins por favor
@@ -23,21 +22,14 @@
 * fix tree height
 * persistent logoff locations & serverside authoritative location
 * tidal pull?
-* Backlighting refreaction color issue in shallows
-* bloom lighting and improved sun ring?
 * introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
 * improved landscape generation (and bathymetry... and hydrography).... plan techniques for making
-* dolphins? make shallows fish move more like fish... wish irregular darting motions and then slower periods (use instancing?)
-* add back in butterfly scattering?
 * improve rain from https://playground.babylonjs.com/#XQ8H3C#0
-* improve trees and rocks... textures and alpha for leaves... procudral noise for normals on rocks
-* improve noise where shallows transparency meet deep water
 * add in damage morph targets
 * fix steering wheel bones
 * add player ship collision
 * add improved land collision
 * add damage from collisions and aground
-* add camera clipping to prevent going underwater but especially under terrain
 * First Person View / VR Mode / Which will have an exit Vr mode button on the HUD
 * Make emissive lights cast light on
 * Bring DRACO compression in, remove any CDNs

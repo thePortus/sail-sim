@@ -2246,6 +2246,22 @@ export class TerrainService {
         vec3 sediment = mix(splatC, vec3(sLum) * vec3(0.82, 0.80, 0.74), 0.30);   // cool grey-brown sediment
         splatC = mix(splatC, sediment * mix(1.0, 0.58, wetMix), wetMix);          // darker + sediment-toned
       }
+      // S5 coastal detail: wet-sand tide line + a noise-broken foam/salt stain at the high-water mark.
+      // Elevation is the tide proxy (precise per-pixel via the displaced vPositionW.y); aux shoreDist gates
+      // it to genuine coast (no-op if the aux map is absent -> g=0 -> gate=1). Sand-weighted: beaches only.
+      float shoreGate = 1.0 - smoothstep(0.0, 0.05, aux.g);
+      float tide = (1.0 - smoothstep(0.0, 3.2, vPositionW.y)) * smoothstep(-1.0, 0.25, vPositionW.y) * wSand * shoreGate;
+      if (tide > 0.001) {
+        float tl = dot(splatC, vec3(0.299, 0.587, 0.114));
+        vec3 wetSand = mix(splatC, vec3(tl), 0.20) * 0.66;        // damp sand: darker + desaturated
+        splatC = mix(splatC, wetSand, tide);
+      }
+      float hwm = smoothstep(0.7, 1.5, vPositionW.y) * (1.0 - smoothstep(1.5, 2.8, vPositionW.y)) * wSand * shoreGate;
+      if (hwm > 0.001) {
+        float fN = _dVal(vPositionW.xz * 0.55) * 0.6 + _dVal(vPositionW.xz * 1.7 + 4.0) * 0.4;
+        float stain = smoothstep(0.58, 0.86, fN) * hwm;
+        splatC = mix(splatC, vec3(0.88, 0.87, 0.82), stain * 0.45);   // pale dried salt/foam line
+      }
       // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome).
       float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock

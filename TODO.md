@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* add full sinking & capsize animation
 * fix speed of asset scattering loading in?
 * birds cast reflections, improved bird flight
 * add photo (hide hud mode)

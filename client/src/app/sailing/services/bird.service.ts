@@ -4,6 +4,7 @@ import {
 } from '@babylonjs/core';
 import '@babylonjs/core/Meshes/thinInstanceMesh';
 import { SceneService } from './scene.service';
+import { OceanService } from './ocean.service';
 import { TerrainService } from './terrain.service';
 import { VesselService } from './vessel.service';
 import { MultiplayerService } from './multiplayer.service';
@@ -76,6 +77,7 @@ function lerpAngle(a: number, b: number, t: number): number {
 @Injectable({ providedIn: 'root' })
 export class BirdService {
   private sceneService   = inject(SceneService);
+  private oceanService   = inject(OceanService);
   private terrainService = inject(TerrainService);
   private vesselService  = inject(VesselService);
   private multiplayer    = inject(MultiplayerService);
@@ -226,6 +228,10 @@ export class BirdService {
       mesh.thinInstanceSetBuffer('matrix', this.matBufs[v], 16, false);
       mesh.thinInstanceSetBuffer('color', this.colBufs[v], 4, false);
       mesh.thinInstanceCount = 0;
+      // Reflect the gulls on the water (MirrorTexture renders the base mesh + all its thin instances).
+      // Birds are excluded from the seabed refraction RTT by the scatter_ name prefix, so this only
+      // adds them to the surface reflection.
+      this.oceanService.addToRenderList(mesh);
       this.meshes[v] = mesh;
     }
 

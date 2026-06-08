@@ -276,7 +276,7 @@
 
     <!-- Elevation + target preset -->
     <div class="flex items-center justify-between gap-3 mt-2 font-mono text-xs">
-      <span class="text-slate-400">Elev <span class="text-orange-300">{{ cannonService.gunElevDeg() }}°</span></span>
+      <span class="text-slate-400">Elev <span class="text-orange-300">{{ cannonService.gunElevDeg() | number:'1.1-1' }}°</span></span>
       <div class="flex gap-1">
         <button (click)="cannonService.setTargetMode('hull')"
                 [class]="'tgt-btn ' + (cannonService.targetMode() === 'hull' ? 'tgt-btn--active' : '')">Hull</button>

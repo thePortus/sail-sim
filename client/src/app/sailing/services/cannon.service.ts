@@ -126,6 +126,12 @@ export class CannonService {
   readonly gunElevDeg = signal(this.ELEV_HULL);
   readonly targetMode = signal<'hull' | 'mast'>('hull');
 
+  // Continuous elevation: hold Shift to raise / Control to lower; tick() swings the angle smoothly at
+  // ELEV_RATE_DPS (so the granularity is sub-degree, not whole-degree key-repeat steps).
+  private readonly ELEV_RATE_DPS = 7;
+  private elevRaiseHeld = false;
+  private elevLowerHeld = false;
+
   /** Nudge the elevation (deg); Shift = +, Control = −. */
   elevate(deltaDeg: number): void {
     const v = Math.max(this.ELEV_MIN, Math.min(this.ELEV_MAX, this.gunElevDeg() + deltaDeg));
@@ -163,6 +169,7 @@ export class CannonService {
     stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
   };
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
+  private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
 
   // Cannonball pool
   private balls: Ball[] = [];
@@ -289,6 +296,10 @@ export class CannonService {
     if (this.keyHandler) {
       window.removeEventListener('keydown', this.keyHandler);
       this.keyHandler = null;
+    }
+    if (this.keyUpHandler) {
+      window.removeEventListener('keyup', this.keyUpHandler);
+      this.keyUpHandler = null;
     }
     this.multiplayerService.onRemoteShot = null;
     this.multiplayerService.onCombatHit = null;
@@ -712,14 +723,21 @@ export class CannonService {
     this.keyHandler = (e: KeyboardEvent) => {
       if (document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement) return;
-      // Elevation: Shift raises, Control lowers (allow key-repeat for smooth aim).
-      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevate(+1); return; }
-      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevate(-1); return; }
+      // Elevation: HOLD Shift to raise / Control to lower — tick() swings the angle continuously while
+      // held (ignore the auto-repeat; the held flag drives it). Keyup clears the flag.
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevRaiseHeld = true; return; }
+      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevLowerHeld = true; return; }
       if (e.repeat) return;
       if (e.code === 'KeyZ')      this.armOrFire('port');
       else if (e.code === 'KeyC') this.armOrFire('stbd');
     };
+    // Keyup is unconditional (no input-focus guard) so the elevation can never get stuck "held".
+    this.keyUpHandler = (e: KeyboardEvent) => {
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')       { this.elevRaiseHeld = false; }
+      else if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevLowerHeld = false; }
+    };
     window.addEventListener('keydown', this.keyHandler);
+    window.addEventListener('keyup', this.keyUpHandler);
   }
 
   // ── Gunnery state machine (public; driven by keys + HUD) ───────────────────
@@ -884,6 +902,10 @@ export class CannonService {
 
   private tick(dt: number): void {
     this.elapsed += dt;
+
+    // ── Continuous gun elevation (hold Shift/Control) ────────────────────────
+    const elevDir = (this.elevRaiseHeld ? 1 : 0) - (this.elevLowerHeld ? 1 : 0);
+    if (elevDir !== 0) { this.elevate(elevDir * this.ELEV_RATE_DPS * dt); }
 
     // ── Per-side gunnery state machines ──────────────────────────────────────
     this.tickGun('port', dt);

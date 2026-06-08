@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* made cannon elevation aiming smooth and by decimals
 * add pinnace
 * add player ship collision
 * add damage from collisions and aground

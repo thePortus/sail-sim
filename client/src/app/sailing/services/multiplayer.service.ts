@@ -11,6 +11,7 @@ import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
+import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
@@ -68,6 +69,9 @@ interface OtherPlayerEntry extends OtherPlayer {
   sinking:     boolean;        // server combat_sunk for this id (cleared on repair)
   sinkElapsed: number;         // seconds since the sinking began (feeds sinkProgress)
   sinkEnv:     number;         // applied 0→1 progress (eased out on repair)
+
+  // ── Collision: previous-frame hull distance to the local ship (for on-screen closing rate). ──
+  collPrevDist?: number;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -79,6 +83,7 @@ export class MultiplayerService {
   private vesselService  = inject(VesselService);
   private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
+  private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
 
@@ -262,6 +267,9 @@ export class MultiplayerService {
           this.tickRemoteMotion(entry, renderAt, dt);
           this.tickRecoil(entry, dt);
         }
+        // Ship-to-ship collision: bounce/deflect the LOCAL ship off any remote hull (runs after remote
+        // display positions are updated above).
+        this.tickCollisions(dt);
       };
       scene.registerBeforeRender(this.recoilTickFn);
     }
@@ -823,6 +831,177 @@ export class MultiplayerService {
       entry.root.position.x = entry.dispX + totalSway * Math.cos(h);
       entry.root.position.z = entry.dispZ - totalSway * Math.sin(h);
     }
+  }
+
+  // ── Ship-to-ship collision (local ship only; see plan) ─────────────────────
+  // Each hull is a capsule: a keel segment (centre ± heading·HALF) of radius RADIUS. We resolve only the
+  // LOCAL ship — cancel the component of its velocity pointing INTO the struck hull (+ a little bounce),
+  // keep the tangential part. The other ship's owner resolves its own ship the same way, and we see it via
+  // its position broadcast. No momentum transfer, so no agreement/handshake needed.
+  private readonly COLL_HALF_LEN    = 5.0;   // keel half-length for collision (m)
+  private readonly COLL_RADIUS      = 2.2;   // capsule radius ≈ half-beam + margin (m)
+  private readonly COLL_RESTITUTION = 0.15;  // bounce: 0 = dead stop (T-bone/head-on), 1 = full elastic.
+                                             // Low so head-on/T-bone read as "stop"; a glance keeps its
+                                             // tangential momentum and slides through regardless of this.
+  private readonly COLL_FX_MIN  = 0.6;       // min closing speed (m/s) to fire shake/crunch (ignore taps)
+  private readonly COLL_FX_FULL = 7.0;       // closing speed (m/s) at which shake/crunch are full strength
+  private _collFxCooldown = 0;               // debounce so a scrape doesn't machine-gun the crunch/shake
+
+  private tickCollisions(dt: number): void {
+    if (this._collFxCooldown > 0) { this._collFxCooldown -= dt; }
+    const vs = this.vesselService.state();
+    if (!vs) { return; }
+    const ahr = vs.heading * Math.PI / 180;            // local heading → radians (0=N=+Z, 90=E=+X)
+    const aFx = Math.sin(ahr), aFz = Math.cos(ahr);
+    const rsum = this.COLL_RADIUS * 2;
+
+    // Find the deepest overlap against any remote hull. Also track each hull's ON-SCREEN closing rate
+    // (how fast the gap is shrinking) — symmetric for both ships, and accurate even though remote speed
+    // snapshots lag ~100 ms behind the interpolated display position.
+    const invDt = 1 / Math.max(dt, 1e-3);
+    let best: { nx: number; nz: number; pen: number; closing: number } | null = null;
+    for (const entry of this.players.values()) {
+      if (!entry.root || !entry.root.isEnabled()) { continue; }   // skip culled / far ships
+      const bFx = Math.sin(entry.dispHeading), bFz = Math.cos(entry.dispHeading);
+      const cp = this.closestSegSeg(
+        vs.x, vs.z, aFx, aFz, this.COLL_HALF_LEN,
+        entry.dispX, entry.dispZ, bFx, bFz, this.COLL_HALF_LEN,
+      );
+      const dx = cp.pbx - cp.pax, dz = cp.pbz - cp.paz;
+      const dist = Math.hypot(dx, dz);
+      const prev = entry.collPrevDist;          // last frame's gap (undefined / stale after a cull → ignore)
+      entry.collPrevDist = dist;
+      if (dist >= rsum || dist < 1e-4) { continue; }
+      const pen = rsum - dist;
+      const closing = (prev !== undefined && prev < rsum * 3) ? (prev - dist) * invDt : 0;   // m/s, + = closing
+      if (!best || pen > best.pen) { best = { nx: dx / dist, nz: dz / dist, pen, closing }; }
+    }
+    if (!best) { return; }
+
+    // Separation: each ship backs its own half out, away from the other (n points local→other).
+    const pushX = -best.nx * best.pen * 0.5;
+    const pushZ = -best.nz * best.pen * 0.5;
+
+    // Per-ship resolution: cancel the local velocity component heading INTO the other hull (+ bounce).
+    const vx = vs.speed * aFx, vz = vs.speed * aFz;
+    const into = vx * best.nx + vz * best.nz;
+    if (into <= 0) {                                   // already separating / sideways → just nudge apart
+      this.vesselService.applyCollision(vs.heading, vs.speed, pushX, pushZ, dt);
+    } else {
+      const k = (1 + this.COLL_RESTITUTION) * into;
+      const nvx = vx - k * best.nx, nvz = vz - k * best.nz;
+      const newSpeed   = Math.hypot(nvx, nvz);
+      const newHeading = (Math.atan2(nvx, nvz) * 180 / Math.PI + 360) % 360;   // velocity dir → compass heading
+      this.vesselService.applyCollision(newHeading, newSpeed, pushX, pushZ, dt);
+    }
+
+    // Impact FX (camera shake + crunch). Severity = the on-screen CLOSING rate, so it fires whether WE ram
+    // or WE'RE rammed (the rammer's hull is visibly driving into us even after its broadcast speed reads 0).
+    // Debounced so a sustained scrape fires once per crunch-length rather than every frame.
+    if (this._collFxCooldown <= 0 && best.closing > this.COLL_FX_MIN) {
+      const sev = Math.min(1, best.closing / this.COLL_FX_FULL);
+      this.vesselService.addShakeTrauma(0.3 + sev * 0.6);
+      this.playCollisionCrunch(sev);
+      this._collFxCooldown = 0.9;   // ~matches the crunch length so a scrape doesn't stack crunches
+    }
+  }
+
+  /** Synthesised hull collision: a deep slam thud, a PROLONGED scatter of sharp cracks (timbers
+   *  splintering — dense at impact, thinning out), and a low groan of stressed wood underneath. Scaled by
+   *  severity. Routed through the shared SFX context. */
+  private playCollisionCrunch(sev: number): void {
+    const { ctx, master } = this.sfx.getSharedContext();
+    if (ctx.state === 'suspended') { ctx.resume().catch(() => {}); }
+    const t0 = ctx.currentTime + 0.01;
+    const vol = 0.35 + sev * 0.65;
+
+    // 1) Slam — the deep boom of two hulls colliding.
+    const thud = ctx.createOscillator(); thud.type = 'triangle';
+    thud.frequency.setValueAtTime(150, t0);
+    thud.frequency.exponentialRampToValueAtTime(55, t0 + 0.20);
+    const thudG = ctx.createGain();
+    thudG.gain.setValueAtTime(0.0001, t0);
+    thudG.gain.exponentialRampToValueAtTime(0.95 * vol, t0 + 0.012);
+    thudG.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.34);
+    thud.connect(thudG); thudG.connect(master);
+    thud.start(t0); thud.stop(t0 + 0.38);
+
+    // 2) Splintering timbers — many sharp cracks scattered over ~1 s, clustered at impact and thinning
+    //    out, each a band-passed noise pop at a random "crack" pitch.
+    const windowSec = 0.9 + sev * 0.8;
+    const nCracks = 18 + Math.floor(sev * 26);         // ~18..44 — many, overlapping into a cascade
+    let ct = t0 + 0.02;
+    for (let i = 0; i < nCracks; i++) {
+      const frac = i / nCracks;
+      const fade = 1 - frac * 0.6;                      // later cracks softer (it settles)
+      const dur = 0.05 + Math.random() * 0.18;          // longer than the gaps below → cracks overlap
+      const len = Math.max(1, Math.floor(ctx.sampleRate * (dur + 0.02)));
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let s = 0; s < len; s++) { d[s] = (Math.random() * 2 - 1) * Math.pow(1 - s / len, 1.5); }
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = 240 + Math.random() * 2300;  // wide range → varied crack pitches
+      bp.Q.value = 1.5 + Math.random() * 4;             // higher Q = more tonal, woody snap
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, ct);
+      g.gain.exponentialRampToValueAtTime((0.22 + Math.random() * 0.4) * vol * fade, ct + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, ct + dur);
+      src.connect(bp); bp.connect(g); g.connect(master);
+      src.start(ct); src.stop(ct + dur + 0.03);
+      // TIGHT onsets (much shorter than each crack's duration) → many cracks ring at once; gaps widen
+      // a little over time so the dense cascade at the slam scatters into stray cracks as it settles.
+      ct += (0.006 + Math.random() * 0.022) * (0.5 + frac * 1.8);
+    }
+
+    // 3) Low groan of stressed wood under the cracking.
+    const groan = ctx.createOscillator(); groan.type = 'sawtooth';
+    groan.frequency.setValueAtTime(92, t0);
+    groan.frequency.linearRampToValueAtTime(68, t0 + windowSec);
+    const groanLp = ctx.createBiquadFilter(); groanLp.type = 'lowpass'; groanLp.frequency.value = 250;
+    const groanG = ctx.createGain();
+    groanG.gain.setValueAtTime(0.0001, t0);
+    groanG.gain.exponentialRampToValueAtTime(0.18 * vol, t0 + 0.08);
+    groanG.gain.exponentialRampToValueAtTime(0.0001, t0 + windowSec);
+    groan.connect(groanLp); groanLp.connect(groanG); groanG.connect(master);
+    groan.start(t0); groan.stop(t0 + windowSec + 0.05);
+  }
+
+  /** Closest points between two 2-D segments, each given as (centre, unit dir, half-length). 2-D port of
+   *  Ericson's ClosestPtSegmentSegment. Returns the closest point on each (pa = A, pb = B). */
+  private closestSegSeg(
+    ax: number, az: number, adx: number, adz: number, aHalf: number,
+    bx: number, bz: number, bdx: number, bdz: number, bHalf: number,
+  ): { pax: number; paz: number; pbx: number; pbz: number } {
+    const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+    const p1x = ax - adx * aHalf, p1z = az - adz * aHalf;   // A start
+    const q1x = bx - bdx * bHalf, q1z = bz - bdz * bHalf;   // B start
+    const d1x = adx * 2 * aHalf,  d1z = adz * 2 * aHalf;    // A edge vector
+    const d2x = bdx * 2 * bHalf,  d2z = bdz * 2 * bHalf;    // B edge vector
+    const rx = p1x - q1x, rz = p1z - q1z;
+    const a = d1x * d1x + d1z * d1z;
+    const e = d2x * d2x + d2z * d2z;
+    const f = d2x * rx + d2z * rz;
+    const EPS = 1e-8;
+    let s = 0, t = 0;
+    if (a <= EPS && e <= EPS) { /* both points */ }
+    else if (a <= EPS) { t = clamp01(f / e); }
+    else {
+      const c = d1x * rx + d1z * rz;
+      if (e <= EPS) { s = clamp01(-c / a); }
+      else {
+        const b = d1x * d2x + d1z * d2z;
+        const denom = a * e - b * b;
+        s = denom > EPS ? clamp01((b * f - c * e) / denom) : 0;
+        t = (b * s + f) / e;
+        if (t < 0)      { t = 0; s = clamp01(-c / a); }
+        else if (t > 1) { t = 1; s = clamp01((b - c) / a); }
+      }
+    }
+    return {
+      pax: p1x + d1x * s, paz: p1z + d1z * s,
+      pbx: q1x + d2x * t, pbz: q1z + d2z * t,
+    };
   }
 
   // ── Visibility ────────────────────────────────────────────────────────────

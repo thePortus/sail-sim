@@ -550,6 +550,30 @@ export class VesselService {
     this.buoyancyService.reset();
   }
 
+  // ── Ship-to-ship collision response (resolved by MultiplayerService) ────────
+  private readonly COLL_MIN_SPEED = 0.4;     // below this, don't reaim heading (avoids spin at a near-stop)
+  private readonly COLL_EASE_RATE = 14;      // how fast velocity eases to the post-impact target (1/s)
+
+  /** Apply a collision response to the LOCAL ship: separate out of the hull (push), then EASE the velocity
+   *  vector toward the resolved target (speed + direction) frame-rate-independently — a smooth decel +
+   *  course deflection rather than a choppy per-frame heading snap. The physics loop carries
+   *  x/z/heading/speed into the mesh and the movement broadcast. */
+  applyCollision(targetHeadingDeg: number, targetSpeed: number, pushX: number, pushZ: number, dt: number): void {
+    this.x += pushX;
+    this.z += pushZ;
+    const hr  = this.heading * Math.PI / 180;
+    let vx = this.speed * Math.sin(hr), vz = this.speed * Math.cos(hr);   // current velocity vector
+    const thr = targetHeadingDeg * Math.PI / 180;
+    const tvx = targetSpeed * Math.sin(thr), tvz = targetSpeed * Math.cos(thr);
+    const k = 1 - Math.exp(-this.COLL_EASE_RATE * dt);
+    vx += (tvx - vx) * k;
+    vz += (tvz - vz) * k;
+    this.speed = Math.hypot(vx, vz);
+    if (this.speed > this.COLL_MIN_SPEED) {
+      this.heading = (Math.atan2(vx, vz) * 180 / Math.PI + 360) % 360;
+    }
+  }
+
 
   // ── Sail efficiency curve ─────────────────────────────────────────────────
   // Redesigned to make close-hauled sailing viable (~52 % eff at minTackAngle).

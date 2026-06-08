@@ -78,6 +78,8 @@ export class TerrainService {
   /** True while the terrain renders into the ocean's seabed (refraction) RTT — the ragged-waterline
    *  discard is switched off there so the revealed seabed stays solid (no clear-colour speckles). */
   private _inRefractionPass = false;
+  /** Guards against re-registering the refraction-pass observers on every clipmap rebuild (PBR toggle). */
+  private _refractionObserversWired = false;
   private heightfield: Uint16Array | null = null;
 
   // Computed once after chunk load; drives beach grading + underwater depth.
@@ -99,6 +101,10 @@ export class TerrainService {
   private biomePlaceholderArr: RawTexture2DArray | null = null;
   private splatTex: Texture | null = null;   // S2 control/splat map (RGBA soft biome weights, world-aligned)
   private static readonly BIOME_TILES = ['sand', 'grass', 'gravel', 'rock', 'snow'];
+  // S3 anti-tiling: the ALBEDO array packs 3 extra variant layers (5/6/7) that the shader cross-fades
+  // with the matching core layer over a large-scale noise so no single tile visibly repeats. The ORM
+  // array stays at the 5 core layers (variants reuse the base roughness/AO).
+  private static readonly ALBEDO_LAYERS = ['sand', 'grass', 'gravel', 'rock', 'snow', 'sand2', 'grass2', 'rock2'];
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -168,8 +174,11 @@ export class TerrainService {
     this.clipmap?.dispose();
     this.clipmap = null;
 
-    // S0 spike: `?terrainpbr` swaps the StandardMaterial skin for the PBRCustomMaterial one (default off).
-    const usePBR = typeof location !== 'undefined' && location.search.includes('terrainpbr');
+    // PBRCustomMaterial terrain skin (aux-driven PBR) is now the DEFAULT; the Standard skin remains
+    // as a fallback ("Off" in Settings → Graphics, persisted in localStorage). URL escape hatches for
+    // debugging override the setting: `?noterrainpbr` forces Standard, `?terrainpbr` forces PBR.
+    // (Check `noterrainpbr` first — it contains the substring `terrainpbr`.)
+    const usePBR = this.isTerrainPBREnabled();
     const mat = usePBR ? this.buildTerrainMaterialPBR(scene, m) : this.buildTerrainMaterial(scene, m, true);
     mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
 
@@ -585,6 +594,23 @@ export class TerrainService {
     this.applyQualityLevel(level);
     localStorage.setItem('shadow-quality', String(level));
     if (this.terrainShadowTexture) this.updateTerrainShadowMask();
+  }
+
+  // ── Terrain PBR skin (default ON; Standard material is the fallback) ────────
+
+  /** True when the PBR terrain skin should be used. URL flags override the saved setting. */
+  isTerrainPBREnabled(): boolean {
+    if (typeof location !== 'undefined') {
+      if (location.search.includes('noterrainpbr')) { return false; }   // must test before 'terrainpbr'
+      if (location.search.includes('terrainpbr'))   { return true; }
+    }
+    return (localStorage.getItem('ignis_terrain_pbr') ?? '1') !== '0';   // default ON
+  }
+
+  /** Toggle the PBR terrain skin. Persists, then rebuilds the clipmap live with the new material. */
+  setTerrainPBREnabled(enabled: boolean): void {
+    localStorage.setItem('ignis_terrain_pbr', enabled ? '1' : '0');
+    if (this.isReady()) { this.buildClipmap(); }   // dispose + rebuild with the chosen material
   }
 
   private applyQualityLevel(level: number): void {
@@ -1413,7 +1439,8 @@ export class TerrainService {
     // (refraction) RTT, or the holes fill with that pass's clear-colour and read as bright specks in
     // the depth-revealed seabed. Flag the refraction pass so the bind below can switch it off.
     const refr = this.oceanService.getRefractionTexture?.();
-    if (refr) {
+    if (refr && !this._refractionObserversWired) {
+      this._refractionObserversWired = true;
       refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
       refr.onAfterRenderObservable.add(() => { this._inRefractionPass = false; });
     }
@@ -1899,7 +1926,7 @@ export class TerrainService {
 
   /** A tiny 1×1×N white array so the sampler2DArray is valid before the real tiles finish loading. */
   private makePlaceholderArr(scene: Scene): RawTexture2DArray {
-    const N = TerrainService.BIOME_TILES.length;
+    const N = TerrainService.ALBEDO_LAYERS.length;   // 8: covers the albedo sampler; ORM (5) also binds this
     const data = new Uint8Array(N * 4).fill(190);
     for (let i = 3; i < data.length; i += 4) { data[i] = 255; }
     return new RawTexture2DArray(data, 1, 1, N, Constants.TEXTUREFORMAT_RGBA, scene,
@@ -1914,7 +1941,9 @@ export class TerrainService {
    */
   private async loadBiomeArrays(scene: Scene): Promise<void> {
     if (this.biomeAlbedoArr) { return; }
-    const N = TerrainService.BIOME_TILES.length, SIZE = 1024;
+    const ALB = TerrainService.ALBEDO_LAYERS;          // 8 layers (5 core + sand2/grass2/rock2)
+    const ORMN = TerrainService.BIOME_TILES.length;    // 5 layers (variants reuse base rough/AO)
+    const albN = ALB.length, SIZE = 1024;
     const loadImg = (name: string) => new Promise<HTMLImageElement | null>((res) => {
       const im = new Image(); im.crossOrigin = 'anonymous';
       im.onload = () => res(im); im.onerror = () => res(null);
@@ -1928,29 +1957,38 @@ export class TerrainService {
       ctx.clearRect(0, 0, SIZE, SIZE); ctx.drawImage(img, 0, 0, SIZE, SIZE);
       try { return ctx.getImageData(0, 0, SIZE, SIZE).data; } catch { return null; }
     };
-    const albedo = new Uint8Array(N * SIZE * SIZE * 4);
-    const orm = new Uint8Array(N * SIZE * SIZE * 4);
-    for (let L = 0; L < N; L++) {
-      const b = TerrainService.BIOME_TILES[L];
-      const [dImg, rImg, aImg] = await Promise.all([loadImg(`${b}_diff`), loadImg(`${b}_rough`), loadImg(`${b}_ao`)]);
-      const d = pixels(dImg), r = pixels(rImg), a = pixels(aImg);
+    // Albedo: all 8 layers (core + variants), diffuse only.
+    const albedo = new Uint8Array(albN * SIZE * SIZE * 4);
+    for (let L = 0; L < albN; L++) {
+      const d = pixels(await loadImg(`${ALB[L]}_diff`));
       const off = L * SIZE * SIZE * 4;
       for (let i = 0; i < SIZE * SIZE; i++) {
         const j = off + i * 4, k = i * 4;
         albedo[j] = d ? d[k] : 200; albedo[j + 1] = d ? d[k + 1] : 200; albedo[j + 2] = d ? d[k + 2] : 200; albedo[j + 3] = 255;
+      }
+    }
+    // ORM: 5 core layers only (R = roughness, G = AO).
+    const orm = new Uint8Array(ORMN * SIZE * SIZE * 4);
+    for (let L = 0; L < ORMN; L++) {
+      const b = TerrainService.BIOME_TILES[L];
+      const [rImg, aImg] = await Promise.all([loadImg(`${b}_rough`), loadImg(`${b}_ao`)]);
+      const r = pixels(rImg), a = pixels(aImg);
+      const off = L * SIZE * SIZE * 4;
+      for (let i = 0; i < SIZE * SIZE; i++) {
+        const j = off + i * 4, k = i * 4;
         orm[j] = r ? r[k] : 230;            // R = roughness (default fairly matte)
         orm[j + 1] = a ? a[k] : 255;        // G = ambient occlusion (default none)
         orm[j + 2] = 0; orm[j + 3] = 255;
       }
     }
-    const mk = (data: Uint8Array): RawTexture2DArray => {
-      const t = new RawTexture2DArray(data, SIZE, SIZE, N, Constants.TEXTUREFORMAT_RGBA, scene,
+    const mk = (data: Uint8Array, depth: number): RawTexture2DArray => {
+      const t = new RawTexture2DArray(data, SIZE, SIZE, depth, Constants.TEXTUREFORMAT_RGBA, scene,
         true, false, Texture.TRILINEAR_SAMPLINGMODE, Constants.TEXTURETYPE_UNSIGNED_BYTE);
       t.wrapU = Texture.WRAP_ADDRESSMODE; t.wrapV = Texture.WRAP_ADDRESSMODE;
       return t;
     };
-    this.biomeAlbedoArr = mk(albedo);
-    this.biomeOrmArr = mk(orm);
+    this.biomeAlbedoArr = mk(albedo, albN);
+    this.biomeOrmArr = mk(orm, ORMN);
   }
 
   /**
@@ -2013,7 +2051,8 @@ export class TerrainService {
     // the same observers, but under ?terrainpbr only THIS builder runs, so without this the flag
     // stays false forever and the discard punches tan holes at the shoreline (PBR-only bug).
     const refr = this.oceanService.getRefractionTexture?.();
-    if (refr) {
+    if (refr && !this._refractionObserversWired) {
+      this._refractionObserversWired = true;
       refr.onBeforeRenderObservable.add(() => { this._inRefractionPass = true; });
       refr.onAfterRenderObservable.add(() => { this._inRefractionPass = false; });
     }
@@ -2144,15 +2183,34 @@ export class TerrainService {
       vec4 bW = _biomeSplat(vPositionW, nW);
       float wSand = bW.x, wGrass = bW.y, wGravel = bW.z, wRock = bW.w, wSnow = 1.0 - (bW.x+bW.y+bW.z+bW.w);
 
-      // Triplanar albedo from the biome ARRAY (layer = biome index): fine + coarse, cross-textured rock/gravel.
-      #define TRIA(L, scl) (texture(uAlbedoArr, vec3(vPositionW.yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3(vPositionW.xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3(vPositionW.xy*(scl), float(L))).rgb*triW.z)
-      vec3 sandC = clamp((TRIA(0,0.067)*0.65 + texture(uAlbedoArr, vec3(vPositionW.xz*0.018,0.0)).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
-      vec3 grassC = TRIA(1,0.050)*0.65 + texture(uAlbedoArr, vec3(vPositionW.xz*0.013,1.0)).rgb*0.35;
-      vec3 gravC = TRIA(2,0.040)*0.6 + TRIA(3,0.020)*0.4;
-      vec3 rockC = TRIA(3,0.083)*0.6 + TRIA(2,0.025)*0.4;
-      vec3 snowC = TRIA(4,0.033)*0.7 + texture(uAlbedoArr, vec3(vPositionW.xz*0.010,4.0)).rgb*0.30;
+      // Triplanar albedo from the biome ARRAY, sampling at world position P (so a domain-warped P can be
+      // passed in to break the tile lattice). Layer = biome index.
+      #define TRIA(P, L, scl) (texture(uAlbedoArr, vec3((P).yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3((P).xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3((P).xy*(scl), float(L))).rgb*triW.z)
+      // Anti-tiling, two layers: (1) DOMAIN-WARP the FINE taps with a ~20 m noise (amplitude ~4.5 m, about a
+      // third of the fine tile period) so the periodic grain no longer recurs on an exact grid -- this is the
+      // "repeats every few boat lengths" tell, and the warp is what actually kills it. (2) cross-fade each
+      // fine layer with its VARIANT layer (5 sand2 / 6 grass2 / 7 rock2) over a large noise for material variety.
+      vec2 wq = vPositionW.xz;
+      vec3 wpW = vPositionW + vec3(_dVal(wq*0.035 + 3.7) - 0.5, 0.0, _dVal(wq*0.035 + 19.1) - 0.5) * 14.0;
+      float vSand  = smoothstep(0.35, 0.65, _dVal(wq * 0.0017 + 11.3));
+      float vGrass = smoothstep(0.35, 0.65, _dVal(wq * 0.0019 + 27.7));
+      float vRock  = smoothstep(0.35, 0.65, _dVal(wq * 0.0015 + 51.1));
+      vec3 sandFine  = mix(TRIA(wpW,0,0.067), TRIA(wpW,5,0.061), vSand);
+      vec3 grassFine = mix(TRIA(wpW,1,0.050), TRIA(wpW,6,0.047), vGrass);
+      vec3 rockFine  = mix(TRIA(wpW,3,0.083), TRIA(wpW,7,0.078), vRock);
+      vec3 sandC = clamp((sandFine*0.65 + texture(uAlbedoArr, vec3(wpW.xz*0.018,0.0)).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
+      vec3 grassC = grassFine*0.65 + texture(uAlbedoArr, vec3(wpW.xz*0.013,1.0)).rgb*0.35;
+      vec3 gravC = TRIA(wpW,2,0.040)*0.6 + TRIA(vPositionW,3,0.020)*0.4;
+      vec3 rockC = rockFine*0.6 + TRIA(vPositionW,2,0.025)*0.4;
+      vec3 snowC = TRIA(wpW,4,0.033)*0.7 + texture(uAlbedoArr, vec3(vPositionW.xz*0.010,4.0)).rgb*0.30;
       #undef TRIA
       vec3 splatC = sandC*wSand + grassC*wGrass + gravC*wGravel + rockC*wRock + snowC*wSnow;
+      // S3 macro colour: large-scale (~300-900 m) cool/warm + brightness drift so big areas are not uniform.
+      float macroN = _dVal(vPositionW.xz * 0.0022 + 70.0) * 0.6 + _dVal(vPositionW.xz * 0.0009 + 130.0) * 0.4;
+      float macroW = macroN - 0.5;
+      splatC *= (1.0 + macroW * 0.13);
+      splatC.r *= (1.0 + macroW * 0.06); splatC.b *= (1.0 - macroW * 0.06);
+      splatC = clamp(splatC, 0.0, 1.0);
       // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome).
       float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock

@@ -116,6 +116,13 @@ import { BirdService } from '../../services/bird.service';
           </div>
           <div class="q-hint">See-through shallows over sand. Off is faster — drops a terrain render pass.</div>
 
+          <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">PBR Terrain</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="terrainPbrOn"
+                    (click)="toggleTerrainPbr()">{{ terrainPbrOn ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">Physically-based terrain surfacing (richer rock/sand). Off uses the simpler classic skin.</div>
+
           @if (oceanDetailAvailable) {
             <div class="q-row" style="margin-top:0.7rem">
               <span class="q-label">Ocean Detail</span>
@@ -245,6 +252,7 @@ export class SettingsMenuComponent {
   renderScale   = this.sceneSvc.getRenderScale();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
+  terrainPbrOn   = this.terrain.isTerrainPBREnabled();
   // FFT-ocean grid detail (WebGPU only — the FFT engine is inactive on WebGL).
   oceanDetailAvailable = this.oceanFft.isActive;
   oceanUltra = this.oceanFft.ultra;
@@ -321,6 +329,10 @@ export class SettingsMenuComponent {
   toggleOceanDetail(): void {
     this.oceanUltra = !this.oceanUltra;
     this.oceanFft.setUltra(this.oceanUltra);
+  }
+  toggleTerrainPbr(): void {
+    this.terrainPbrOn = !this.terrainPbrOn;
+    this.terrain.setTerrainPBREnabled(this.terrainPbrOn);
   }
 
   applyPreset(name: string): void {

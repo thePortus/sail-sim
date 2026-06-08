@@ -4,12 +4,10 @@
 
 
 * finish landscape
-* mas dolphins por favor
-* cooler moon disk & replace stars with actual star map?
-* made pbr terrain the default
-* note, the weird shoreline bright sand effect that is ONLY on terrainpbr
 * rain doesn't show over clouds
 * clouds a bit dark
+* cooler moon disk & replace stars with actual star map?
+* mas dolphins por favor
 * cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind

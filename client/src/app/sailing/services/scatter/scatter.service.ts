@@ -984,7 +984,7 @@ export class ScatterService {
         const stand = fbm2(px / 45, pz / 45);
         const clearing = fbm2(px / 13 + 9, pz / 13 - 4);
         const dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
-          * (1 - slope * 0.8) * 0.35 * this.densityMul;   // fewer beeches (palms carry the beach now)
+          * (1 - slope * 0.8) * 0.18 * this.densityMul;   // even fewer beeches (palms dominate now)
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
@@ -1020,13 +1020,13 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 9.0 || y > 18) { continue; }               // well up the beach (lower beach left bare — hides shoreline float)
+        if (y < 27 || y > 42) { continue; }                // FAR up off the shoreline (~3x) — keeps the float well out of view
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }
 
         // Groves: a high, sharp threshold on a low-freq field → clustered stands, open between.
         const stand = fbm2(px / 28 + 60, pz / 28 - 40);
-        const dens = smoothstep(0.52, 0.82, stand) * (1 - slope * 0.6) * 0.75 * this.densityMul;   // more palms — they own the beach
+        const dens = smoothstep(0.48, 0.80, stand) * (1 - slope * 0.6) * 0.95 * this.densityMul;   // even more palms — they own the slope
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).

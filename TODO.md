@@ -2,7 +2,12 @@
 
 # General or Current TODO Items
 
+* Reduce rocks and driftwood
+* fix tree height
+* clouds render over reeds
+* fix speed of asset scattering loading in?
 * birds cast reflections
+* cooler moon disk
 * cannonfire lights up landscape
 * add sound of canvas flapping in the wind
 * clouds don't seem to meet water at horizon.. not for spherical world?

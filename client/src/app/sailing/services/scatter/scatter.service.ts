@@ -182,8 +182,11 @@ export class ScatterService {
         PalmWindPlugin.WIND.amplitude = 0.10 + gust * 0.30;
         TreeWindPlugin.WIND.dirX = dx;
         TreeWindPlugin.WIND.dirZ = dz;
-        TreeWindPlugin.WIND.branchAmp = 0.14 + gust * 0.34;   // whole-canopy sway grows with wind
-        TreeWindPlugin.WIND.leafAmp   = 0.05 + gust * 0.10;   // leaf shimmer
+        // Canopy sway kept SMALL on purpose: a larger silhouette swing exposes a halo against the
+        // volumetric clouds (the cloud depth pass can't replicate the per-vertex sway), so we trade a
+        // little motion for a clean edge. Gentle lean + faint shimmer only.
+        TreeWindPlugin.WIND.branchAmp = 0.05 + gust * 0.10;   // whole-canopy sway grows with wind
+        TreeWindPlugin.WIND.leafAmp   = 0;                    // leaf flutter off — it wiggled the canopy edge and drove the cloud halo
       }
       this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
       PalmWindPlugin.WIND.time = this._palmTime;

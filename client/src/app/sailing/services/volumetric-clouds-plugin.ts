@@ -289,15 +289,16 @@ float vc_hash1(float n) { return fract(sin(n) * 43758.5453); }
 // Returns the sun radiance reaching sample p: multi-term Beer-Lambert (direct + two
 // scattered lobes) × Mie phase × a thin-cloud silver-lining boost. dC = density at p,
 // mu = dot(viewDir, sunDir), phase = vc_mieFit(mu).
-float vc_lightMarch(vec3 p, float phase, float dC, float mu) {
+float vc_lightMarch(vec3 p, float phase, float dC, float mu, float jOff) {
     float ch    = vc_cloudHeight(p);
     float zMaxl = cloudTop - cloudBase;
     float stepL = zMaxl / float(lightSteps);
     float den   = 0.0;
 
-    // Jitter the cone start to break up shadow banding (position-based, NOT time-based, so it
-    // doesn't twinkle frame-to-frame), then accumulate density up-sun.
-    vec3 q = p + sunDirection * stepL * vc_hash1(dot(p, vec3(12.256, 2.646, 6.356)));
+    // Jitter the cone start to break up shadow banding. Use the per-PIXEL Interleaved Gradient Noise
+    // offset (same value for every sample along this ray) rather than a per-sample white-noise hash:
+    // coherent across the ray, so the spatial denoise settles it instead of leaving lit-top grain.
+    vec3 q = p + sunDirection * stepL * jOff;
     for (int j = 0; j < lightSteps; j++) {
         den += vc_getDensity(q + sunDirection * float(j) * stepL, 2.0);
     }
@@ -395,8 +396,11 @@ void main(void) {
 
     // Static per-pixel jitter to break up banding. NOT time-varying: an animated jitter
     // makes the march noise crawl/twinkle every frame, and we have no TAA to average it out —
-    // a fixed screen-space dither lets the spatial denoise settle it instead.
-    float jit = fract(sin(dot(vUV, vec2(127.1, 311.7))) * 43758.5) * step;
+    // a fixed screen-space dither lets the spatial denoise settle it instead. Interleaved Gradient
+    // Noise (low-discrepancy, blue-noise-like) instead of a sin-hash: neighbouring pixels get
+    // well-spread offsets, so the 5x5 denoise resolves it cleanly (white-noise hash left visible grain).
+    float jit01 = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float jit   = jit01 * step;
 
     // Fitted Mie phase — sharp forward-scatter spike (silver lining) + soft glow.
     float cosA  = dot(rd, sunDirection);
@@ -427,7 +431,7 @@ void main(void) {
 
         if (rho > 0.001) {
             // lt already includes the Mie phase + Beer + silver-lining (see vc_lightMarch).
-            float lt = vc_lightMarch(p, phase, rho, cosA);
+            float lt = vc_lightMarch(p, phase, rho, cosA, jit01);
             float ch = vc_cloudHeight(p);
             // Ambient: blue sky irradiance (stronger toward the open top) + a soft fill on the
             // base so undersides aren't black + ocean/terrain bounce. Tint/brightness come from
@@ -462,20 +466,28 @@ uniform sampler2D textureSampler;
 uniform vec2 screenSize;
 
 float vc_luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// Tone-compressed luma (Reinhard): maps HDR [0,inf) into [0,1) so the range weight treats noise in the
+// bright cloud TOPS the same as in the mid/dark clouds (raw HDR luma makes highlight noise look like a
+// hard edge and survive the denoise). Real geometry edges still span a big compressed gap and persist.
+float vc_tone(vec3 c) { float l = vc_luma(c); return l / (1.0 + l); }
 
 void main(void) {
     vec2  px     = 1.0 / screenSize;
     vec4  center = texture2D(textureSampler, vUV);
-    float cl     = vc_luma(center.rgb);
+    float cl     = vc_tone(center.rgb);
 
     vec3  sum = vec3(0.0);
     float wt  = 0.0;
 
-    for (int x = -1; x <= 1; x++) {
-        for (int y = -1; y <= 1; y++) {
+    // 5x5 bilateral blur: a spatial gaussian softens the cloud noise/dither over a wider radius, while
+    // the (tone-compressed) range weight preserves high-contrast geometry edges so the scene stays crisp.
+    for (int x = -2; x <= 2; x++) {
+        for (int y = -2; y <= 2; y++) {
             vec2  uv = vUV + vec2(float(x), float(y)) * px;
             vec4  s  = texture2D(textureSampler, uv);
-            float w  = exp(-abs(vc_luma(s.rgb) - cl) * 12.0);
+            float sw = exp(-float(x * x + y * y) / 4.5);     // spatial gaussian (sigma ~1.5)
+            float rw = exp(-abs(vc_tone(s.rgb) - cl) * 10.0); // range — edge-preserving in tone space
+            float w  = sw * rw;
             sum += s.rgb * w;
             wt  += w;
         }
@@ -693,15 +705,14 @@ fn vc_getDensity(p: vec3f, lod: f32) -> f32 {
 
 fn vc_hash1(n: f32) -> f32 { return fract(sin(n) * 43758.5453); }
 
-// Faithful Shadertoy lightRay — see GLSL twin for commentary.
-fn vc_lightMarch(p: vec3f, phase: f32, dC: f32, mu: f32) -> f32 {
+// Faithful Shadertoy lightRay — see GLSL twin for commentary. jOff = per-pixel IGN cone-start offset.
+fn vc_lightMarch(p: vec3f, phase: f32, dC: f32, mu: f32, jOff: f32) -> f32 {
     let ch    = vc_cloudHeight(p);
     let zMaxl = uniforms.cloudTop - uniforms.cloudBase;
     let stepL = zMaxl / f32(uniforms.lightSteps);
     var den: f32 = 0.0;
 
-    let q = p + uniforms.sunDirection * stepL
-              * vc_hash1(dot(p, vec3f(12.256, 2.646, 6.356)));
+    let q = p + uniforms.sunDirection * stepL * jOff;
     for (var j: i32 = 0; j < uniforms.lightSteps; j++) {
         den += vc_getDensity(q + uniforms.sunDirection * f32(j) * stepL, 2.0);
     }
@@ -787,9 +798,10 @@ fn main(input: FragmentInputs)->FragmentOutputs {
     let dist      = max(tFar - tNear, 0.0);
     let step_size = dist / f32(uniforms.marchSteps);
 
-    // Static per-pixel jitter (see GLSL note): not time-varying, so the march noise doesn't
-    // crawl/twinkle without TAA — the spatial denoise settles the fixed dither instead.
-    let jit = fract(sin(dot(input.vUV, vec2f(127.1, 311.7))) * 43758.5) * step_size;
+    // Static per-pixel jitter (see GLSL note): Interleaved Gradient Noise (low-discrepancy) rather
+    // than a sin-hash, so neighbouring pixels get well-spread offsets the 5x5 denoise resolves cleanly.
+    let jit01 = fract(52.9829189 * fract(dot(input.position.xy, vec2f(0.06711056, 0.00583715))));
+    let jit   = jit01 * step_size;
 
     // Dual-lobe phase: broad forward scatter + a tight forward spike (silver lining).
     let cosA  = dot(rd, uniforms.sunDirection);
@@ -818,7 +830,7 @@ fn main(input: FragmentInputs)->FragmentOutputs {
 
         if (rho > 0.001) {
             // lt already includes the Mie phase + Beer + silver-lining (see vc_lightMarch).
-            let lt = vc_lightMarch(p, phase, rho, cosA);
+            let lt = vc_lightMarch(p, phase, rho, cosA, jit01);
             let ch = vc_cloudHeight(p);
             // Ambient (sky + base fill + ground bounce); tint/brightness from our uniforms.
             // KNOBS 0.34 / 0.10 / 0.45 — raised to lift shadows and tame the contrast.
@@ -850,21 +862,29 @@ var textureSampler: texture_2d<f32>;
 uniform screenSize: vec2f;
 
 fn vc_luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+// Tone-compressed luma (Reinhard): maps HDR [0,inf) into [0,1) so the range weight treats noise in the
+// bright cloud TOPS the same as in the mid/dark clouds (raw HDR luma makes highlight noise look like a
+// hard edge and survive the denoise). Real geometry edges still span a big compressed gap and persist.
+fn vc_tone(c: vec3f) -> f32 { let l = vc_luma(c); return l / (1.0 + l); }
 
 @fragment
 fn main(input: FragmentInputs)->FragmentOutputs {
     let px     = 1.0 / uniforms.screenSize;
     let center = textureSample(textureSampler, textureSamplerSampler, input.vUV);
-    let cl     = vc_luma(center.rgb);
+    let cl     = vc_tone(center.rgb);
 
     var sum: vec3f = vec3f(0.0);
     var wt:  f32   = 0.0;
 
-    for (var x: i32 = -1; x <= 1; x++) {
-        for (var y: i32 = -1; y <= 1; y++) {
+    // 5x5 bilateral blur: a spatial gaussian softens the cloud noise/dither over a wider radius, while
+    // the (tone-compressed) range weight preserves high-contrast geometry edges so the scene stays crisp.
+    for (var x: i32 = -2; x <= 2; x++) {
+        for (var y: i32 = -2; y <= 2; y++) {
             let uv = input.vUV + vec2f(f32(x), f32(y)) * px;
             let s  = textureSampleLevel(textureSampler, textureSamplerSampler, uv, 0.0);
-            let w  = exp(-abs(vc_luma(s.rgb) - cl) * 12.0);
+            let sw = exp(-f32(x * x + y * y) / 4.5);            // spatial gaussian (sigma ~1.5)
+            let rw = exp(-abs(vc_tone(s.rgb) - cl) * 10.0);     // range — edge-preserving in tone space
+            let w  = sw * rw;
             sum   += s.rgb * w;
             wt    += w;
         }

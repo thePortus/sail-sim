@@ -2,14 +2,19 @@
 
 # General or Current TODO Items
 
-* Reduce rocks and driftwood
 * fix tree height
+* finish landscape
+* mas dolphins por favor
+* cooler moon disk & replace stars with actual star map?
+* made pbr terrain the default
+* note, the weird shoreline bright sand effect that is ONLY on terrainpbr
+* rain doesn't show over clouds
+* cannonfire lights up landscape
+* ships bells at dawn, noon, and dusk
+* add sound of canvas flapping in the wind
 * clouds render over reeds
 * fix speed of asset scattering loading in?
 * birds cast reflections
-* cooler moon disk
-* cannonfire lights up landscape
-* add sound of canvas flapping in the wind
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing

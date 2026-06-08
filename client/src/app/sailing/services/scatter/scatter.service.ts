@@ -328,6 +328,7 @@ export class ScatterService {
         this.registerPalmFallback(scene);
         return;
       }
+      this.groundToBase(full);
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -365,6 +366,7 @@ export class ScatterService {
         this.registerTreeFallback(scene);
         return;
       }
+      this.groundToBase(full);
       new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -700,6 +702,21 @@ export class ScatterService {
     return Math.sqrt(dyx * dyx + dyz * dyz) / E;
   }
 
+  /**
+   * Ground a tree mesh so its trunk base sits at object-space y=0. Authored GLBs often have their ORIGIN
+   * below (or above) the trunk base; since instances are scaled per-tree, that gap renders as a float of
+   * baseOffset×scale — i.e. a DIFFERENT amount on every tree (which is exactly the symptom: only trees,
+   * by random amounts). Baking the base to y=0 makes the existing `posV.y = groundY - 0.35` placement
+   * plant the trunk correctly regardless of per-instance scale.
+   */
+  private groundToBase(mesh: Mesh): void {
+    const minY = mesh.getBoundingInfo().boundingBox.minimum.y;
+    if (Math.abs(minY) > 0.02) {
+      mesh.position.y = -minY;                  // lift the base to y=0
+      mesh.bakeCurrentTransformIntoVertices();  // fold the shift into the geometry; origin now == base
+    }
+  }
+
   /** Build one patch's grass CLUMPS for a single variant. Each authored clump already packs 25–45
    *  blades, so we scatter at a coarse grid. Clustering is TWO-SCALE: a low-freq `region` field makes
    *  whole areas sparse vs lush, and a higher-freq `clump` field forms tussock cores. Density ramps
@@ -959,7 +976,7 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 7 || y > 80) { continue; }                 // inland band, below the rocky uplands
+        if (y < 20 || y > 80) { continue; }                // high inland only (shoreline float hidden), below uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }                     // trees on gentle ground only
 
@@ -967,7 +984,7 @@ export class ScatterService {
         const stand = fbm2(px / 45, pz / 45);
         const clearing = fbm2(px / 13 + 9, pz / 13 - 4);
         const dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
-          * (1 - slope * 0.8) * 0.6 * this.densityMul;
+          * (1 - slope * 0.8) * 0.35 * this.densityMul;   // fewer beeches (palms carry the beach now)
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
@@ -1003,13 +1020,13 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 0.5 || y > 8) { continue; }                // sand + low coastal band
+        if (y < 9.0 || y > 18) { continue; }               // well up the beach (lower beach left bare — hides shoreline float)
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }
 
-        // Groves: a high, sharp threshold on a low-freq field → rare clustered stands, open between.
+        // Groves: a high, sharp threshold on a low-freq field → clustered stands, open between.
         const stand = fbm2(px / 28 + 60, pz / 28 - 40);
-        const dens = smoothstep(0.58, 0.84, stand) * (1 - slope * 0.6) * 0.4 * this.densityMul;
+        const dens = smoothstep(0.52, 0.82, stand) * (1 - slope * 0.6) * 0.75 * this.densityMul;   // more palms — they own the beach
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).

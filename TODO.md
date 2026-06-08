@@ -2,14 +2,13 @@
 
 # General or Current TODO Items
 
-* cooler moon disk & replace stars with actual star map?
 * mas dolphins por favor
 * cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind
 * add full sinking & capsize animation
 * fix speed of asset scattering loading in?
-* birds cast reflections
+* birds cast reflections, improved bird flight
 * add photo (hide hud mode)
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land

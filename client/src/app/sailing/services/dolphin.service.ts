@@ -30,6 +30,7 @@ interface Dolphin {
   depthPhase: number; depthRate: number; depthAmp: number;
   retarget: number;                    // countdown to the next wander/dart decision
   scale: number;
+  homeX: number; homeZ: number;        // this pod's home, as an offset from the boat (groups the dolphins)
   tint: Color3;
 }
 
@@ -66,6 +67,7 @@ export class DolphinService {
   private static readonly DEPTH_MIN = 2.0;
   private static readonly DEPTH_MAX = 22;
   private static readonly LEASH = 42;
+  private static readonly PODS = 2;        // number of separate dolphin pods spawned near the boat
   private static readonly SURFACE_CLEAR = 1.0;
   private static readonly SEABED_CLEAR = 0.7;
 
@@ -146,8 +148,9 @@ export class DolphinService {
         d.baseY = -(1.5 + Math.random() * 5);                        // pick a new cruising depth
       }
 
-      // Leash: if it strays too far from the boat, steer home.
-      const dxB = bx - d.x, dzB = bz - d.z;
+      // Leash: if it strays too far from its POD HOME (boat + the pod's offset), steer back. Leashing to
+      // the per-pod home (rather than the boat) keeps the two pods as distinct clusters that travel along.
+      const dxB = (bx + d.homeX) - d.x, dzB = (bz + d.homeZ) - d.z;
       const distB = Math.hypot(dxB, dzB);
       if (distB > leash) { d.targetTheta = Math.atan2(dzB, dxB); }
 
@@ -212,25 +215,35 @@ export class DolphinService {
     return d;
   }
 
-  /** Spawn a handful of independent dolphins scattered around the boat in the shallows. */
+  /** Spawn TWO pods of independent dolphins in the shallows — each pod clusters around its own home
+   *  point (offset from the boat, kept apart) so the sea reads as livelier than one dense group. */
   private spawn(bx: number, bz: number): void {
-    const n = 5 + Math.floor(Math.random() * 5);          // 5–9
     this.pod = [];
-    for (let i = 0; i < n; i++) {
-      const ang = Math.random() * Math.PI * 2, r = 6 + Math.random() * 24;
-      this.pod.push({
-        x: bx + Math.cos(ang) * r, z: bz + Math.sin(ang) * r, y: -(2 + Math.random() * 4),
-        theta: Math.random() * Math.PI * 2, targetTheta: Math.random() * Math.PI * 2,
-        speed: 2 + Math.random() * 2, targetSpeed: 2 + Math.random() * 2,
-        baseY: -(1.5 + Math.random() * 5),
-        depthPhase: Math.random() * Math.PI * 2,
-        depthRate: 0.1 + Math.random() * 0.25,
-        depthAmp: 0.8 + Math.random() * 2.0,
-        retarget: Math.random() * 2,
-        scale: 0.9 + Math.random() * 0.4,
-        tint: DolphinService.TINTS[Math.floor(Math.random() * DolphinService.TINTS.length)],
-      });
+    const baseAng = Math.random() * Math.PI * 2;
+    for (let g = 0; g < DolphinService.PODS; g++) {
+      // Pod home: a point 16–38 m from the boat, with the pods fanned to opposite-ish sides.
+      const gAng  = baseAng + (g * Math.PI * 2) / DolphinService.PODS + (Math.random() - 0.5) * 0.8;
+      const gDist = 16 + Math.random() * 22;
+      const homeX = Math.cos(gAng) * gDist, homeZ = Math.sin(gAng) * gDist;
+      const members = 5 + Math.floor(Math.random() * 4);          // 5–8 per pod (≈10–16 total)
+      for (let i = 0; i < members; i++) {
+        const ang = Math.random() * Math.PI * 2, r = 4 + Math.random() * 16;
+        this.pod.push({
+          x: bx + homeX + Math.cos(ang) * r, z: bz + homeZ + Math.sin(ang) * r, y: -(2 + Math.random() * 4),
+          theta: Math.random() * Math.PI * 2, targetTheta: Math.random() * Math.PI * 2,
+          speed: 2 + Math.random() * 2, targetSpeed: 2 + Math.random() * 2,
+          baseY: -(1.5 + Math.random() * 5),
+          depthPhase: Math.random() * Math.PI * 2,
+          depthRate: 0.1 + Math.random() * 0.25,
+          depthAmp: 0.8 + Math.random() * 2.0,
+          retarget: Math.random() * 2,
+          scale: 0.9 + Math.random() * 0.4,
+          homeX, homeZ,
+          tint: DolphinService.TINTS[Math.floor(Math.random() * DolphinService.TINTS.length)],
+        });
+      }
     }
+    const n = this.pod.length;
     this.matBuf = new Float32Array(n * 16);
     this.colBuf = new Float32Array(n * 4);
     for (let i = 0; i < n; i++) {

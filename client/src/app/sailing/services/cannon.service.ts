@@ -253,7 +253,7 @@ export class CannonService {
   init(): void {
     this.scene  = this.sceneService.scene;
     this.canvas = this.scene.getEngine().getRenderingCanvas() as HTMLCanvasElement;
-    this.sfxCtx = new AudioContext();
+    this.sfxCtx = this.sfx.getSharedAudioContext();   // shared SFX context (own master + reverb bus below)
     this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
     this.buildCannonAudio();
 
@@ -320,10 +320,13 @@ export class CannonService {
       this.dirtPS, this.landSmokePS, this.shipDebrisPS, this.shipFirePS, this.shipSmokePS,
     ]) { ps?.stop(); ps?.dispose(); }
     this.smokeNoise?.dispose();
-    this.cannonBus = null;   // torn down with the context below
+    // Shared context: disconnect our master (severs the reverb bus / limiter / one-shots) and release it,
+    // but do NOT close the context — other SFX producers share it. One-shots auto-stop; the idle reverb
+    // bus is orphaned by the disconnect and GC'd.
+    this.cannonBus = null;
+    this.sfxMaster?.disconnect();
     this.sfx.releaseMaster(this.sfxMaster);
     this.sfxMaster = null;
-    this.sfxCtx?.close().catch(() => {});
     this.sfxCtx = null;
   }
 

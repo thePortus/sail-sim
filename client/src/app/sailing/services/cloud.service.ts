@@ -219,6 +219,7 @@ export class CloudService {
 
   // Continuous rain ambience (light patter bed), gain driven by precip intensity.
   private rainGain: GainNode | null = null;
+  private rainSource: AudioBufferSourceNode | null = null;   // looping noise bed (stopped on dispose)
   private rainNoiseStarted = false;
   private sfxMaster: GainNode | null = null;
 
@@ -340,9 +341,13 @@ export class CloudService {
     this.sceneService.setLightningFlash(0);
     this.flashActive = false;
     this.pendingThunder = null;
+    // Shared context: STOP the looping rain bed (else it runs silently forever), disconnect + release our
+    // master, but do NOT close the context — other SFX producers share it. Reset so a re-init rebuilds.
+    try { this.rainSource?.stop(); } catch { /* already stopped */ }
+    this.rainSource = null;
+    this.sfxMaster?.disconnect();
     this.sfx.releaseMaster(this.sfxMaster);
     this.sfxMaster = null;
-    this.sfxCtx?.close().catch(() => {});
     this.sfxCtx = null;
     this.rainGain = null;
     this.rainNoiseStarted = false;
@@ -1089,7 +1094,7 @@ export class CloudService {
 
   private ensureSfxCtx(): AudioContext {
     if (!this.sfxCtx) {
-      this.sfxCtx = new AudioContext();
+      this.sfxCtx = this.sfx.getSharedAudioContext();   // shared SFX context (own master below)
       this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
     }
     return this.sfxCtx;
@@ -1117,6 +1122,7 @@ export class CloudService {
       src.connect(hpf); hpf.connect(lpf); lpf.connect(g); g.connect(this.sfxMaster ?? ctx.destination);
       src.start();
       this.rainGain = g;
+      this.rainSource = src;
       this.rainNoiseStarted = true;
     }
 

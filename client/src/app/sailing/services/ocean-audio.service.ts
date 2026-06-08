@@ -30,12 +30,15 @@ export class OceanAudioService {
   private hissGain: GainNode | null = null;
   private swellDepth: GainNode | null = null;
   private swellLfo: OscillatorNode | null = null;
+  // Looping sources — kept so dispose() can stop them (the context is now shared and never closed).
+  private brownSrc: AudioBufferSourceNode | null = null;
+  private whiteSrc: AudioBufferSourceNode | null = null;
 
   init(): void {
     const scene = this.sceneService.scene;
     if (!scene || this.ctx) { return; }
     try {
-      this.ctx = new AudioContext();
+      this.ctx = this.sfx.getSharedAudioContext();   // shared SFX context (own master below)
       this.master = this.sfx.createMaster(this.ctx);
     } catch { this.ctx = null; return; }
     if (this.ctx.state === 'suspended') { void this.ctx.resume(); }
@@ -87,6 +90,7 @@ export class OceanAudioService {
 
     brown.start(); white.start(); lfo.start();
     this.bedGain = bed; this.washLpf = lpf; this.hissGain = hiss; this.swellDepth = depth; this.swellLfo = lfo;
+    this.brownSrc = brown; this.whiteSrc = white;
   }
 
   /** Map the current wind speed to the sea-bed parameters (smoothed, so weather shifts ease in). */
@@ -107,8 +111,12 @@ export class OceanAudioService {
     const scene = this.sceneService.scene;
     if (this.observer && scene) { scene.onBeforeRenderObservable.remove(this.observer); }
     this.observer = null;
-    if (this.master) { this.sfx.releaseMaster(this.master); this.master = null; }
-    if (this.ctx) { void this.ctx.close(); this.ctx = null; }
+    // Shared context: STOP our looping sources (else they run silently forever), disconnect + release our
+    // master, but do NOT close the context — other SFX producers share it.
+    try { this.brownSrc?.stop(); this.whiteSrc?.stop(); this.swellLfo?.stop(); } catch { /* already stopped */ }
+    this.brownSrc = this.whiteSrc = null;
+    if (this.master) { this.master.disconnect(); this.sfx.releaseMaster(this.master); this.master = null; }
+    this.ctx = null;
     this.bedGain = this.washLpf = this.hissGain = this.swellDepth = this.swellLfo = null as never;
   }
 }

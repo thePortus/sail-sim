@@ -31,3 +31,5 @@
 * encrypt websocket server? wss instead of ws?
 
 # TODO Items by Module
+
+Now, I'd love to add a capsize animation when someone is sunk, either the player or another player... if it is yourself that is sunk, I want to delay the message about being sunk until after they see the animation...basically... I want to sink the ship.. already it will be riding low in the water where it was damanged... on that portion of the boat... basically, I just want to decrease buoyancey overall, so that the whole boat goes into the water, but especially so on the size with the most damage... would be great if the boat rolled or just had a dramatic pitch as it went down. It doesn't have to go fully underwater... but look like it is wrecked for sure.... Then, when the player clicks the clear message... as before, they will be repaired and have full buoyance again and be able to sail off...

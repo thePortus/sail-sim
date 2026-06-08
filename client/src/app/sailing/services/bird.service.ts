@@ -424,7 +424,7 @@ export class BirdService {
   private ensureAudio(): boolean {
     if (this.audioCtx) { return true; }
     try {
-      this.audioCtx = new AudioContext();
+      this.audioCtx = this.sfx.getSharedAudioContext();   // shared SFX context (own master below)
       this.audioMaster = this.sfx.createMaster(this.audioCtx);
       if (this.audioCtx.state === 'suspended') { void this.audioCtx.resume(); }
       return true;
@@ -653,7 +653,9 @@ export class BirdService {
     this.meshes = []; this.materials = []; this.matBufs = []; this.colBufs = [];
     this.flocks = [];
     this.enabled = false;
-    if (this.audioMaster) { this.sfx.releaseMaster(this.audioMaster); this.audioMaster = null; }
-    if (this.audioCtx) { void this.audioCtx.close(); this.audioCtx = null; }
+    // Shared context: disconnect + release our own master (severs any in-flight cries) but do NOT close
+    // the context — other SFX producers share it.
+    if (this.audioMaster) { this.audioMaster.disconnect(); this.sfx.releaseMaster(this.audioMaster); this.audioMaster = null; }
+    this.audioCtx = null;
   }
 }

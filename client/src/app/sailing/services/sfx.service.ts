@@ -64,15 +64,24 @@ export class SfxService {
   }
 
   /**
-   * Lazily create (once) a SHARED AudioContext + master for small procedural SFX, and return them.
-   * Callers connect their nodes to `master` and must NOT close the context or release the master — it
-   * is owned here and lives for the app's lifetime, shared across every lightweight-SFX producer.
+   * The shared AudioContext (lazily created once). All SFX producers route through this single context
+   * so the page never approaches the browser's ~6-context cap. Callers must NOT close it — it is owned
+   * here and lives for the app's lifetime. Each producer makes its OWN master via createMaster(ctx) (so
+   * it can tear down independently), and stops its own looping sources on dispose.
+   */
+  getSharedAudioContext(): AudioContext {
+    if (!this.sharedCtx) { this.sharedCtx = new AudioContext(); }
+    return this.sharedCtx;
+  }
+
+  /**
+   * The shared context plus a SHARED master gain (also lazily created once), for tiny one-shot producers
+   * (ship's bell, sail flaps) that don't need their own sub-mix. Don't close the context or release this
+   * master — both are owned here.
    */
   getSharedContext(): { ctx: AudioContext; master: GainNode } {
-    if (!this.sharedCtx) {
-      this.sharedCtx = new AudioContext();
-      this.sharedMaster = this.createMaster(this.sharedCtx);
-    }
-    return { ctx: this.sharedCtx, master: this.sharedMaster! };
+    const ctx = this.getSharedAudioContext();
+    if (!this.sharedMaster) { this.sharedMaster = this.createMaster(ctx); }
+    return { ctx, master: this.sharedMaster };
   }
 }

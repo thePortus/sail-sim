@@ -841,11 +841,14 @@ export class ScatterService {
         // Scattered, with subtle clusters (rocks gather a little, slightly sparser between). Two altitude
         // bands: a denser beach/dune shelf (≤7 m), then a thinner but ever-present upland scatter that
         // actually picks up again on the rocky higher ground.
-        const clump = fbm2(px / 15, pz / 15);
+        const clump = fbm2(px / 18, pz / 18);
         const beach = 1 - smoothstep(7, 14, y);                       // 1 on the sand shelf → 0 just inland
         const upland = smoothstep(12, 45, y);                         // fades the upland scatter in past the dunes
         const bandMul = 0.45 + 0.55 * beach + 0.6 * upland;           // dip in the mid-slope, rocks at both ends
-        const dens = (0.022 + 0.24 * smoothstep(0.52, 0.84, clump)) * bandMul * (1 - slope * 0.4) * this.densityMul;
+        // Clump-DOMINATED so rocks gather into fields with clean sand between, rather than a uniform
+        // sprinkle (the old flat base looked "dirty"). Tiny loner base + a clustered term gated to the
+        // noise peaks. Overall ~1/3 the previous count.
+        const dens = (0.004 + 0.085 * smoothstep(0.60, 0.82, clump)) * bandMul * (1 - slope * 0.4) * this.densityMul;
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
@@ -904,9 +907,10 @@ export class ScatterService {
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.75) { continue; }
 
-        // Occasional, with subtle clusters along the drift line.
-        const clump = fbm2(px / 14 + 40, pz / 14 - 22);
-        const dens = (0.022 + 0.20 * smoothstep(0.52, 0.84, clump)) * (1 - slope * 0.4) * this.densityMul;
+        // Gathered into drifts along the tide line (clump-dominated, tiny loner base) rather than a
+        // uniform sprinkle. Overall ~1/3 the previous count.
+        const clump = fbm2(px / 16 + 40, pz / 16 - 22);
+        const dens = (0.004 + 0.07 * smoothstep(0.60, 0.82, clump)) * (1 - slope * 0.4) * this.densityMul;
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).

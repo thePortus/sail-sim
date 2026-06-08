@@ -2219,18 +2219,32 @@ export class TerrainService {
       // Triplanar albedo from the biome ARRAY, sampling at world position P (so a domain-warped P can be
       // passed in to break the tile lattice). Layer = biome index.
       #define TRIA(P, L, scl) (texture(uAlbedoArr, vec3((P).yz*(scl), float(L))).rgb*triW.x + texture(uAlbedoArr, vec3((P).xz*(scl), float(L))).rgb*triW.y + texture(uAlbedoArr, vec3((P).xy*(scl), float(L))).rgb*triW.z)
+      // Variant triplanar via textureLod (explicit LOD) so it is legal inside the per-pixel distance branch below.
+      #define TRIAL(L, scl, lod) (textureLod(uAlbedoArr, vec3(wpW.yz*(scl), float(L)), lod).rgb*triW.x + textureLod(uAlbedoArr, vec3(wpW.xz*(scl), float(L)), lod).rgb*triW.y + textureLod(uAlbedoArr, vec3(wpW.xy*(scl), float(L)), lod).rgb*triW.z)
       // Anti-tiling, two layers: (1) DOMAIN-WARP the FINE taps with a ~20 m noise (amplitude ~4.5 m, about a
       // third of the fine tile period) so the periodic grain no longer recurs on an exact grid -- this is the
       // "repeats every few boat lengths" tell, and the warp is what actually kills it. (2) cross-fade each
       // fine layer with its VARIANT layer (5 sand2 / 6 grass2 / 7 rock2) over a large noise for material variety.
+      float dCam = length(vPositionW - vEyePosition.xyz);
       vec2 wq = vPositionW.xz;
       vec3 wpW = vPositionW + vec3(_dVal(wq*0.035 + 3.7) - 0.5, 0.0, _dVal(wq*0.035 + 19.1) - 0.5) * 14.0;
-      float vSand  = smoothstep(0.35, 0.65, _dVal(wq * 0.0017 + 11.3));
-      float vGrass = smoothstep(0.35, 0.65, _dVal(wq * 0.0019 + 27.7));
-      float vRock  = smoothstep(0.35, 0.65, _dVal(wq * 0.0015 + 51.1));
-      vec3 sandFine  = mix(TRIA(wpW,0,0.067), TRIA(wpW,5,0.061), vSand);
-      vec3 grassFine = mix(TRIA(wpW,1,0.050), TRIA(wpW,6,0.047), vGrass);
-      vec3 rockFine  = mix(TRIA(wpW,3,0.083), TRIA(wpW,7,0.078), vRock);
+      vec3 sandFine  = TRIA(wpW,0,0.067);
+      vec3 grassFine = TRIA(wpW,1,0.050);
+      vec3 rockFine  = TRIA(wpW,3,0.083);
+      // S6 perf: the variant cross-fade (9 extra taps) is only visible up close; past ~170 m skip it entirely.
+      // texture() can't go in a per-pixel branch (mip derivatives need uniform flow), so the variants use
+      // textureLod inside the branch; the base fine taps above keep auto-mip. Most of the screen saves 9 taps.
+      float varFade = 1.0 - smoothstep(70.0, 170.0, dCam);
+      if (varFade > 0.003) {
+        float vlod = clamp(log2(max(dCam, 1.0) / 35.0), 0.0, 4.0);
+        float vSand  = smoothstep(0.35, 0.65, _dVal(wq * 0.0017 + 11.3)) * varFade;
+        float vGrass = smoothstep(0.35, 0.65, _dVal(wq * 0.0019 + 27.7)) * varFade;
+        float vRock  = smoothstep(0.35, 0.65, _dVal(wq * 0.0015 + 51.1)) * varFade;
+        sandFine  = mix(sandFine,  TRIAL(5,0.061,vlod), vSand);
+        grassFine = mix(grassFine, TRIAL(6,0.047,vlod), vGrass);
+        rockFine  = mix(rockFine,  TRIAL(7,0.078,vlod), vRock);
+      }
+      #undef TRIAL
       vec3 sandC = clamp((sandFine*0.65 + texture(uAlbedoArr, vec3(wpW.xz*0.018,0.0)).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);
       vec3 grassC = grassFine*0.65 + texture(uAlbedoArr, vec3(wpW.xz*0.013,1.0)).rgb*0.35;
       vec3 gravC = TRIA(wpW,2,0.040)*0.6 + TRIA(vPositionW,3,0.020)*0.4;
@@ -2273,10 +2287,20 @@ export class TerrainService {
         float stain = smoothstep(0.58, 0.86, fN) * hwm;
         splatC = mix(splatC, vec3(0.88, 0.87, 0.82), stain * 0.45);   // pale dried salt/foam line
       }
-      // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome).
-      float aoT = texture(uOrmArr, vec3(vPositionW.xz*0.05,0.0)).g*wSand + texture(uOrmArr, vec3(vPositionW.xz*0.05,1.0)).g*wGrass
-                + texture(uOrmArr, vec3(vPositionW.xz*0.05,2.0)).g*wGravel + texture(uOrmArr, vec3(vPositionW.xz*0.05,3.0)).g*wRock
-                + texture(uOrmArr, vec3(vPositionW.xz*0.05,4.0)).g*wSnow;
+      // Ambient occlusion (orm.g), biome-weighted (single planar tap per biome). S6 perf: crevice AO is
+      // invisible at distance, so past ~200 m drop to aoT=1 (no darkening) and skip these 5 taps. Same rule
+      // as the variants -- textureLod inside the per-pixel branch (auto-mip texture() is illegal there).
+      float aoT = 1.0;
+      float aoFade = 1.0 - smoothstep(90.0, 200.0, dCam);
+      if (aoFade > 0.003) {
+        float alod = clamp(log2(max(dCam, 1.0) / 35.0), 0.0, 5.0);
+        float ao5 = textureLod(uOrmArr, vec3(vPositionW.xz*0.05,0.0), alod).g*wSand
+                  + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,1.0), alod).g*wGrass
+                  + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,2.0), alod).g*wGravel
+                  + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,3.0), alod).g*wRock
+                  + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,4.0), alod).g*wSnow;
+        aoT = mix(1.0, ao5, aoFade);
+      }
       surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB->linear, AO darkens crevices
 
       // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.

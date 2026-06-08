@@ -2145,6 +2145,17 @@ export class TerrainService {
         wRock = max(wRock, steep);
         wGrass *= (1.0 - steep*0.9);
         wSand  *= (1.0 - steep*0.7);
+        // S5b biome-edge softening: break hard borders with a fine (~1.7 m) noise so materials interlock
+        // instead of meeting on a clean contour. Grass and sand trade tufts where they overlap; gravel scree
+        // appears along rock/grass borders. Re-normalised below so totals stay valid (AO/roughness match too).
+        float en = _dVal(wp.xz * 1.10) * 0.6 + _dVal(wp.xz * 3.40 + 13.0) * 0.4;
+        float eb = (en - 0.5) * 2.0;
+        float sg = clamp(min(wSand, wGrass) * 4.0, 0.0, 1.0);     // sand/grass overlap
+        wGrass += eb * sg * 0.5; wSand -= eb * sg * 0.5;
+        float rg = clamp(min(wRock, wGrass) * 4.0, 0.0, 1.0);     // rock/grass overlap
+        float scree = smoothstep(0.55, 0.85, en) * rg;
+        wGravel += scree * 0.6; wRock -= scree * 0.3; wGrass -= scree * 0.3;
+        wSand = max(wSand, 0.0); wGrass = max(wGrass, 0.0); wGravel = max(wGravel, 0.0); wRock = max(wRock, 0.0);
         float t = max(1e-4, wSand+wGrass+wGravel+wRock+wSnow);
         return vec4(wSand, wGrass, wGravel, wRock) / t;
       }

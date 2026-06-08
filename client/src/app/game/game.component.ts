@@ -23,6 +23,8 @@ import { BirdService }         from '../sailing/services/bird.service';
 import { DolphinService }      from '../sailing/services/dolphin.service';
 import { SeaweedService }      from '../sailing/services/seaweed.service';
 import { ReedService }         from '../sailing/services/reed.service';
+import { ShipBellService }     from '../sailing/services/ship-bell.service';
+import { SailAudioService }    from '../sailing/services/sail-audio.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -169,6 +171,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private dolphinService     = inject(DolphinService);
   private seaweedService     = inject(SeaweedService);
   private reedService        = inject(ReedService);
+  private shipBellService    = inject(ShipBellService);
+  private sailAudioService   = inject(SailAudioService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -319,6 +323,10 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         if (!location.search.includes('noseaweed')) { await this.seaweedService.init(); }
         // Shoreline reeds — rooted in the water's edge, tops peeking above the surface. ?noreeds skips.
         if (!location.search.includes('noreeds')) { await this.reedService.init(); }
+        // Ship's bell: a brief "clang clang" at midnight / dawn / noon / dusk. ?nobells skips it.
+        if (!location.search.includes('nobells')) { this.shipBellService.init(); }
+        // Sail canvas rustle/flap when sails are set (more under full sail + wind). ?nosailsfx skips it.
+        if (!location.search.includes('nosailsfx')) { this.sailAudioService.init(); }
       });
 
       // 4. Fetch vessel
@@ -431,6 +439,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.dolphinService.dispose();
     this.seaweedService.dispose();
     this.reedService.dispose();
+    this.shipBellService.dispose();
+    this.sailAudioService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();

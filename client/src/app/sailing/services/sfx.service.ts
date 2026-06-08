@@ -21,6 +21,13 @@ export class SfxService {
   // One master gain per registered AudioContext.
   private readonly masters = new Set<GainNode>();
 
+  // A single shared AudioContext + master for LIGHTWEIGHT procedural SFX (ship's bell, sail flaps, …).
+  // Browsers cap a page at ~6 AudioContexts; the heavier beds (rain, ocean, cannon, gulls, music/Tone)
+  // already own most of those slots, so small one-shot effects share this one instead of each grabbing
+  // a slot (a 7th `new AudioContext()` throws). Created lazily on first use.
+  private sharedCtx: AudioContext | null = null;
+  private sharedMaster: GainNode | null = null;
+
   private loadVolume(): number {
     const raw = parseFloat(localStorage.getItem(SfxService.STORAGE_KEY) ?? '0.8');
     return isNaN(raw) ? 0.8 : Math.max(0, Math.min(1, raw));
@@ -54,5 +61,18 @@ export class SfxService {
   /** Stop tracking a master gain (call when its context is closed). */
   releaseMaster(node: GainNode | null): void {
     if (node) this.masters.delete(node);
+  }
+
+  /**
+   * Lazily create (once) a SHARED AudioContext + master for small procedural SFX, and return them.
+   * Callers connect their nodes to `master` and must NOT close the context or release the master — it
+   * is owned here and lives for the app's lifetime, shared across every lightweight-SFX producer.
+   */
+  getSharedContext(): { ctx: AudioContext; master: GainNode } {
+    if (!this.sharedCtx) {
+      this.sharedCtx = new AudioContext();
+      this.sharedMaster = this.createMaster(this.sharedCtx);
+    }
+    return { ctx: this.sharedCtx, master: this.sharedMaster! };
   }
 }

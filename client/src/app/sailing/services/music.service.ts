@@ -155,11 +155,17 @@ export class MusicService {
   }
 
   private readStoredVolume(): number {
+    // Default to 30% on a NEW device (no stored value) so music never blasts on first load. A previously
+    // set volume — including 0 (muted) — is stored as a string, so `?? '0.3'` only applies when the key is
+    // genuinely absent, leaving any prior preference untouched.
+    const DEFAULT_VOL = 0.3;
     try {
-      const v = parseFloat(localStorage.getItem(LS_VOL_KEY) ?? '1');
-      return isNaN(v) ? 1 : Math.max(0, Math.min(1, v));
+      const raw = localStorage.getItem(LS_VOL_KEY);
+      if (raw === null) { return DEFAULT_VOL; }
+      const v = parseFloat(raw);
+      return isNaN(v) ? DEFAULT_VOL : Math.max(0, Math.min(1, v));
     } catch {
-      return 1;
+      return DEFAULT_VOL;
     }
   }
 

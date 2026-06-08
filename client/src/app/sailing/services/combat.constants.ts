@@ -76,6 +76,38 @@ export function listingFor(z: ZoneState | null | undefined): { roll: number; pit
   };
 }
 
+// ── Sink / capsize animation (dramatic wreck when a ship is sunk) ─────────────
+// When a hull is sunk we drive a shared 0→1 progress that (a) drops the whole hull DRAFT and (b)
+// amplifies the damage listing into a real capsize — far past the gentle in-combat LIST_* tilt. The
+// pose is held (boat awash, listing hard) until the player repairs, then eased back out.
+export const SINK_DUR        = 3.2;          // seconds to reach the fully-wrecked pose
+export const SINK_DEPTH      = 3.2;          // metres the hull settles into the water at full sink
+export const CAPSIZE_ROLL_MAX  = 0.96;       // rad (~55°) heel toward the holed beam at full sink
+export const CAPSIZE_PITCH_MAX = 0.49;       // rad (~28°) plunge by the damaged end at full sink
+export const SINK_REVEAL_MS  = SINK_DUR * 1000 + 700;   // delay before the local "you were sunk" card
+
+/** Eased sink progress in [0,1] from seconds elapsed since the sinking began (smoothstep → settles). */
+export function sinkProgress(elapsedSec: number): number {
+  const t = Math.max(0, Math.min(1, elapsedSec / SINK_DUR));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Dramatic capsize tilt (radians) for a sunk hull — same direction conventions as listingFor (roll + =
+ * stbd-down toward the holed beam; pitch + = bow-up), scaled to the capsize maxima. If the damage is too
+ * symmetric to pick a side, force a default heel so she always rolls over rather than settling flat.
+ */
+export function capsizeFor(z: ZoneState | null | undefined): { roll: number; pitch: number } {
+  const dmg = (zone: Zone) =>
+    1 - Math.max(0, Math.min(1, (z?.[zone] ?? ZONE_HP[zone]) / ZONE_HP[zone]));   // 0..1, raw (no curve)
+  let rollN  = z ? dmg('port') - dmg('starboard') : 0;   // matches listingFor's sign
+  const pitchN = z ? dmg('bow') - dmg('stern')      : 0;
+  // Always tip: if neither beam nor end dominates, lean to one side (sign-preserving) so she capsizes.
+  if (Math.abs(rollN) < 0.15 && Math.abs(pitchN) < 0.35) { rollN = (rollN >= 0 ? 1 : -1) * 0.6; }
+  const clampU = (v: number) => Math.max(-1, Math.min(1, v));
+  return { roll: CAPSIZE_ROLL_MAX * clampU(rollN), pitch: CAPSIZE_PITCH_MAX * clampU(pitchN) };
+}
+
 export type Severity = 'none' | 'green' | 'yellow' | 'red' | 'destroyed';
 
 /** Map a zone's current HP to a severity band for the HUD. */

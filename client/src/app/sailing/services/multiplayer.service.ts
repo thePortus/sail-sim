@@ -12,7 +12,7 @@ import { ScatterService } from './scatter/scatter.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor } from './combat.constants';
+import { CombatHitMsg, ZoneState, listingFor, capsizeFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -63,6 +63,11 @@ interface OtherPlayerEntry extends OtherPlayer {
   // ── Damage listing (eased toward the target tilt from this ship's hull state) ──
   listRoll:  number;           // smoothed extra roll from beam damage
   listPitch: number;           // smoothed extra pitch from bow/stern damage
+
+  // ── Sink/capsize (this ship was sunk) ──
+  sinking:     boolean;        // server combat_sunk for this id (cleared on repair)
+  sinkElapsed: number;         // seconds since the sinking began (feeds sinkProgress)
+  sinkEnv:     number;         // applied 0→1 progress (eased out on repair)
 }
 
 @Injectable({ providedIn: 'root' })
@@ -175,6 +180,7 @@ export class MultiplayerService {
   requestCombatReset(): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'combat_reset' }));
     this.combatService.clearSunk();
+    this.vesselService.stopSinking();                  // refloat the hull (eases buoyancy back to normal)
     if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
   }
 
@@ -360,10 +366,21 @@ export class MultiplayerService {
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
     } else if (msg.type === 'combat_sunk') {
-      if (msg.victimId === this.myId) this.combatService.markSunk(String(msg.shooterName ?? ''));
+      if (msg.victimId === this.myId) {
+        // Start the capsize NOW, but delay the "you were sunk" card until the wreck animation has played.
+        this.vesselService.startSinking();
+        const by = String(msg.shooterName ?? '');
+        setTimeout(() => this.combatService.markSunk(by), SINK_REVEAL_MS);
+      } else {
+        // A remote ship was sunk → capsize it (its per-zone damage drives which way it rolls/settles).
+        const e = this.players.get(String(msg.victimId));
+        if (e && !e.sinking) { e.sinking = true; e.sinkElapsed = 0; }
+      }
 
     } else if (msg.type === 'combat_repair') {
-      // A remote ship was restored to full → clear its persistent battle damage.
+      // A remote ship was restored to full → clear its persistent battle damage AND refloat it.
+      const e = this.players.get(String(msg.playerId));
+      if (e) { e.sinking = false; }
       this.onCombatRepair?.(String(msg.playerId));
 
     } else if (msg.type === 'gun_state') {
@@ -444,6 +461,9 @@ export class MultiplayerService {
         rollWaveRad: 0,
         listRoll:    0,
         listPitch:   0,
+        sinking:     false,
+        sinkElapsed: 0,
+        sinkEnv:     0,
       };
       this.players.set(data.id, entry);
       // Seed any hull state we already heard about before this ship's mesh existed.
@@ -706,9 +726,15 @@ export class MultiplayerService {
     entry.pitchRad    += (pitchTarget - entry.pitchRad) * bk;
     entry.rollWaveRad += (rollTarget  - entry.rollWaveRad) * bk;
 
+    // Sink progress: eased 0→1 while sinking, eased back out on repair. Updated HERE (runs before
+    // tickRecoil) so the draft drop and the capsize rotation use the same value this frame.
+    if (entry.sinking) { entry.sinkElapsed += dt; entry.sinkEnv = sinkProgress(entry.sinkElapsed); }
+    else if (entry.sinkEnv > 0.0001) { entry.sinkEnv += (0 - entry.sinkEnv) * Math.min(1, dt * 1.8); }
+    else { entry.sinkEnv = 0; }
+
     entry.root.position.x = entry.dispX;
     entry.root.position.z = entry.dispZ;
-    entry.root.position.y = entry.heaveY;
+    entry.root.position.y = entry.heaveY - SINK_DEPTH * entry.sinkEnv;
     entry.root.rotation.y = entry.dispHeading;
     entry.root.rotation.x = entry.pitchRad;
     // rotation.z gets wave roll here; tickRecoil adds cannon recoil on top.
@@ -762,10 +788,14 @@ export class MultiplayerService {
     entry.listRoll  += (list.roll  - entry.listRoll)  * this.LIST_EASE;
     entry.listPitch += (list.pitch - entry.listPitch) * this.LIST_EASE;
 
+    // Capsize: dramatic heel/plunge toward the damaged side, scaled by sink progress (env set in
+    // tickRemoteMotion this frame). Layered on top of everything else, free to exceed the list cap.
+    const cap = entry.sinkEnv > 0.0001 ? capsizeFor(this.remoteZones.get(entry.id)) : { roll: 0, pitch: 0 };
+
     // Combine cannon recoil + hit shudder + damage list with the wave-induced roll/pitch
     // set by tickRemoteMotion (runs first) so neither channel overwrites the other.
-    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll + entry.listRoll;
-    entry.root.rotation.x = entry.pitchRad + entry.listPitch;
+    entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll + entry.hitRoll + entry.listRoll + cap.roll * entry.sinkEnv;
+    entry.root.rotation.x = entry.pitchRad + entry.listPitch + cap.pitch * entry.sinkEnv;
 
     // Lateral shudder: damped sideways lurch away from the firing side, layered on
     // top of the interpolated display position (dispX/dispZ set by tickRemoteMotion).

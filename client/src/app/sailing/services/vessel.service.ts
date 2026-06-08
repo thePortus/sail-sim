@@ -12,7 +12,7 @@ import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { SloopController } from './rigged-vessel.controller';
 import { CombatService } from './combat.service';
-import { listingFor } from './combat.constants';
+import { listingFor, capsizeFor, sinkProgress, SINK_DEPTH } from './combat.constants';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 // Single rigged vessel asset (replaces the old 7-part split sloop). The companion
@@ -88,6 +88,11 @@ export class VesselService {
   // Damage listing — eased toward the tilt from our own hull state (combatService.zones).
   private listRoll  = 0;
   private listPitch = 0;
+  // Sink/capsize: while `sinking`, a 0→1 progress (from `sinkStartT`) settles the hull deep and rolls it
+  // over toward the damaged side; held at the wreck pose until repair, then eased back out.
+  private sinking    = false;
+  private sinkStartT = 0;     // sim time `t` at which the sinking began
+  private sinkEnv    = 0;     // applied progress (eased out on repair)
   private readonly RECOIL_SPRING = 7.2;
   private readonly RECOIL_DAMPING = 5.8;
   private readonly RECOIL_IMPULSE = 0.40;   // rad/s heel kick PER shot
@@ -495,6 +500,22 @@ export class VesselService {
     this.groundedTime = 0;
     this.grounded.set(false);
     this.resetWake();
+    this.stopSinking();
+  }
+
+  /** Begin the capsize/sink animation (the ship settles deep + rolls toward the damaged side). Control is
+   *  frozen while sinking. Called when the local ship is sunk (before the delayed "you were sunk" card). */
+  startSinking(): void {
+    if (this.sinking) { return; }
+    this.sinking    = true;
+    this.sinkStartT = this.simTime;
+    this.speed      = 0;
+  }
+
+  /** End the sink (on repair / refloat): the hull eases back up to normal buoyancy. */
+  stopSinking(): void {
+    this.sinking = false;
+    this.buoyancyService.reset();
   }
 
 
@@ -614,12 +635,15 @@ export class VesselService {
 
     const eff    = this.sailEfficiency(angleFromWind);
     const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor));
-    // speedModifier applied below after buoyancy is computed
-    this.speed  += (baseTarget - this.speed) * this.physics.accelerationRate * dt;
+    // speedModifier applied below after buoyancy is computed.
+    // While sinking, control is frozen: glide to a dead stop (no sail drive) and ignore the helm.
+    const spdTarget = this.sinking ? 0 : baseTarget;
+    const spdRate   = this.sinking ? 1.2 : this.physics.accelerationRate;
+    this.speed  += (spdTarget - this.speed) * spdRate * dt;
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
 
     // Steering
-    if (this.keys.left || this.keys.right) {
+    if ((this.keys.left || this.keys.right) && !this.sinking) {
       const dir = this.keys.left ? -1 : 1;
       this.heading = ((this.heading + dir * this.turnRate(this.speed) * dt) + 360) % 360;
     }
@@ -785,7 +809,19 @@ export class VesselService {
     // hull from going dramatically underwater without launching it into the air.
     const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
     const heaveApplied = buoy.heave + floorLift * 0.15;
-    this.root.position.y = FLOAT_DRAFT + heaveApplied;
+
+    // Sink progress: eased 0→1 over SINK_DUR while sinking (curve handles the accelerating plunge), then
+    // eased back to 0 on repair. Drives a deep draft drop + a dramatic capsize layered on below.
+    if (this.sinking) {
+      this.sinkEnv = sinkProgress(this.simTime - this.sinkStartT);
+    } else if (this.sinkEnv > 0.0001) {
+      this.sinkEnv += (0 - this.sinkEnv) * Math.min(1, dt * 1.8);
+    } else {
+      this.sinkEnv = 0;
+    }
+
+    // Settle the whole hull into the water as she sinks (overrides the anti-sink floor).
+    this.root.position.y = FLOAT_DRAFT + heaveApplied - SINK_DEPTH * this.sinkEnv;
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     // Damage listing: ease toward the tilt implied by our hull state, then layer it on
@@ -794,8 +830,12 @@ export class VesselService {
     this.listRoll  += (list.roll  - this.listRoll)  * 0.04;
     this.listPitch += (list.pitch - this.listPitch) * 0.04;
 
-    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll;
-    this.root.rotation.x = buoy.pitchRad + this.listPitch;
+    // Capsize: a dramatic heel/plunge toward the damaged side, scaled by sink progress, ADDED here so it
+    // is free to exceed the buoyancy MAX_TILT clamp. Continues smoothly from the in-combat list.
+    const cap = capsizeFor(this.combatService.zones());
+
+    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
+    this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv;
 
     // ── Rigged vessel drive (single GLB: skeleton clips + free bones) ─────────
     if (this.controller) {

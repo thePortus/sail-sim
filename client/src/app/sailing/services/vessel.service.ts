@@ -120,11 +120,28 @@ export class VesselService {
   private readonly HIT_MAX_ROLL     = 0.34;  // ~19° cap
   private readonly HIT_MAX_SWAY     = 1.8;   // m cap
 
+  // Camera shake (trauma model): firing and taking a hit add trauma; updateCamera applies a decaying,
+  // high-frequency positional jitter scaled by trauma² (punchy falloff). The offset is removed before the
+  // follow-ease each frame so it never feeds back into the camera's base position.
+  private camTrauma = 0;
+  private shakeTime = 0;   // oscillation clock — reset when a fresh shake starts so it swings from zero
+  private readonly camShakeOffset = new Vector3();
+  private readonly CAM_TRAUMA_DECAY = 0.6;    // SLOW decay → the shake rings for ~1 s (not a single flick)
+  private readonly CAM_SHAKE_MAX    = 1.2;    // max camera position offset (m) at trauma = 1
+  private readonly CAM_SHAKE_FREQ   = 12.6;   // rad/s ≈ 2 Hz → a visible back-and-forth, not a fast jitter
+
+  /** Add camera-shake trauma (0..1, clamped). Trauma decays in updateCamera. */
+  addShakeTrauma(amount: number): void {
+    if (this.camTrauma < 0.01) { this.shakeTime = 0; }   // fresh shake → start the swing from zero
+    this.camTrauma = Math.min(1, this.camTrauma + amount);
+  }
+
   /** Heavy shudder from taking a cannonball on the given struck side. */
   addHitShudder(side: 'port' | 'stbd'): void {
     const dir = side === 'port' ? 1 : -1;
     this.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
     this.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
+    this.addShakeTrauma(0.85);   // taking a hit: a big, ringing shake (~2-3 swings)
   }
 
   addCannonRecoil(side: 'port' | 'stbd'): void {
@@ -133,6 +150,7 @@ export class VesselService {
     const dir = side === 'port' ? 1 : -1;
     this.recoilRollVel += dir * this.RECOIL_IMPULSE;
     this.recoilSwayVel += dir * this.RECOIL_SWAY_IMPULSE;
+    this.addShakeTrauma(0.32);   // per shot — a broadside (3 shots) stacks toward a big jolt
   }
 
   // ── Gunnery animation delegators (CannonService → SloopController) ──────────
@@ -941,6 +959,10 @@ export class VesselService {
     // reproject almost entirely from camera ROTATION, so that orientation wobble is amplified into
     // the persistent cloud "jitter". Easing by (1 - e^(-k·dt)) makes the camera cover the same
     // fraction per unit TIME regardless of frame rate — k=5 reproduces the old 0.08 at 60 fps.
+    // Strip last frame's camera-shake offset before the follow-ease so the ease operates on the true
+    // base position (otherwise the transient jitter would feed back into a slow random walk).
+    cam.position.subtractInPlace(this.camShakeOffset);
+
     const lerp = this.isDragging ? 1.0 : 1 - Math.exp(-5 * dt);
     cam.position.x += (desiredX - cam.position.x) * lerp;
     cam.position.y += (desiredY - cam.position.y) * lerp;
@@ -953,6 +975,25 @@ export class VesselService {
     if (groundY !== null) {
       const minY = groundY + 3.0;   // clearance above the surface (keeps the near plane clear)
       if (cam.position.y < minY) { cam.position.y = minY; }
+    }
+
+    // ── Camera shake ──────────────────────────────────────────────────────────
+    // A damped oscillation: a ~2 Hz sine (slow enough to read as a clear back-and-forth) with a LINEAR
+    // amplitude envelope from the decaying trauma, so the camera swings a few times with each swing a
+    // little smaller, then settles. Phase resets on a fresh shake (addShakeTrauma) so it swings from
+    // zero. Re-stripped next frame so it never feeds back into the follow-ease.
+    this.camTrauma = Math.max(0, this.camTrauma - dt * this.CAM_TRAUMA_DECAY);
+    if (this.camTrauma > 1e-3) {
+      this.shakeTime += dt;
+      const st = this.shakeTime, amp = this.CAM_SHAKE_MAX * this.camTrauma;
+      this.camShakeOffset.set(
+        Math.sin(st * this.CAM_SHAKE_FREQ)              * amp,          // primary lateral swing (~2 Hz)
+        Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55,   // vertical, smaller, slightly detuned
+        Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50,   // fore-aft
+      );
+      cam.position.addInPlace(this.camShakeOffset);
+    } else {
+      this.camShakeOffset.setAll(0);
     }
 
     cam.setTarget(new Vector3(targetX, targetY, targetZ));

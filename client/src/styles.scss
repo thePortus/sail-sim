@@ -224,7 +224,8 @@ p {
 // ── Fullscreen + photo-mode buttons (top-right) ───────────────────────────────
 
 .fullscreen-btn,
-.photo-btn {
+.photo-btn,
+.fp-btn {
   position: absolute;
   top: 1.25rem;
   right: 1.25rem;
@@ -258,6 +259,18 @@ p {
   &.active {
     opacity: 0.28;
     &:hover { opacity: 1; }
+  }
+}
+
+// First-person button sits left of the photo button (two slots over).
+.fp-btn {
+  right: calc(1.25rem + 2 * (34px + 8px));
+
+  // Lit blue while first-person is active, so the toggle state is obvious.
+  &.active {
+    color: #93c5fd;
+    border-color: rgba(96, 165, 250, 0.55);
+    background: rgba(59, 130, 246, 0.22);
   }
 }
 

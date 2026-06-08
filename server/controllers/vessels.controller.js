@@ -37,6 +37,10 @@ const VESSELS = [
       sailAreaFactor:   0.40,
       weight:           2800,
     },
+    // First-person ("on deck") camera eye, in vessel-local space (+Z bow, +X stbd, +Y up; deck ≈ y 1.22).
+    // Placed at the helm — just aft of the wheel, on the centreline, at standing eye height — looking
+    // forward over the deck. Tune per vessel here.
+    firstPersonCam: { x: 0.6, y: 2.6, z: -2.8 },
     parts: [],
   },
 ];

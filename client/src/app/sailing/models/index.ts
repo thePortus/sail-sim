@@ -173,6 +173,8 @@ export interface Vessel {
   description: string;
   physics:     VesselPhysics;
   parts:       VesselPart[];
+  /** First-person camera eye position in vessel-local space (+Z bow, +X stbd, +Y up). Optional. */
+  firstPersonCam?: { x: number; y: number; z: number };
 }
 
 export interface VesselSummary {

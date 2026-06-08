@@ -26,6 +26,15 @@
     </svg>
   </button>
 
+  <!-- ── First-person toggle (left of photo mode): camera to a spot on the deck, free-look by drag. ── -->
+  <button class="fp-btn pointer-events-auto" [class.active]="vesselService.firstPerson()" (click)="vesselService.toggleFirstPerson()"
+          [title]="vesselService.firstPerson() ? 'Exit first-person view' : 'First-person view (on deck)'">
+    <!-- Eye icon -->
+    <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18">
+      <path d="M10 4C5.5 4 1.9 7.2 1 10c.9 2.8 4.5 6 9 6s8.1-3.2 9-6c-.9-2.8-4.5-6-9-6zm0 9.6A3.6 3.6 0 1 1 10 6.4a3.6 3.6 0 0 1 0 7.2zm0-1.8a1.8 1.8 0 1 0 0-3.6 1.8 1.8 0 0 0 0 3.6z"/>
+    </svg>
+  </button>
+
   <!-- ── Wind & speed panel (top-left) ──────────────────────────────────── -->
   <div class="hud-panel top-left">
 

@@ -221,6 +221,15 @@ export class VesselService {
   private camElevation = 22;   // degrees above horizon
   private camDist      = 24;   // follow distance (units)
   private isDragging   = false;
+
+  // ── First-person ("on deck") camera ────────────────────────────────────────
+  /** On = camera sits at the deck eye point (fpEye) looking forward; drag = free-look. */
+  readonly firstPerson = signal(false);
+  private fpEye: Vector3 | null = null;   // vessel-local eye position (from the server vessel def)
+  private fpYaw   = 0;   // free-look yaw offset from the bow (deg)
+  private fpPitch = 0;   // free-look pitch (deg, + = up)
+
+  toggleFirstPerson(): void { this.firstPerson.update(v => !v); }
   private lastMouseX   = 0;
   private lastMouseY   = 0;
 
@@ -291,6 +300,11 @@ export class VesselService {
     this.z       = spawnZ;
     this.heading = spawnHeading;
     if (vessel.physics) Object.assign(this.physics, vessel.physics);
+
+    // First-person ("on deck") eye position (vessel-local), from the server vessel def. Falls back to a
+    // sensible helm position if a vessel doesn't define one, so the toggle always does something.
+    const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
+    this.fpEye = new Vector3(fp.x, fp.y, fp.z);
 
     const { scene } = this.sceneService;
     // Group 2 renders after ocean (groups 0+1) but keeps the ocean's depth values
@@ -940,48 +954,15 @@ export class VesselService {
     const cam = this.sceneService.camera;
     if (!cam) return;
 
-    // Orbit angles — azimuth is relative to vessel heading so the camera
-    // stays behind the boat as it turns, but the user can swing it around.
-    const azRad   = (this.heading + this.camAzimuth) * Math.PI / 180;
-    const elevRad = this.camElevation * Math.PI / 180;
-
-    const targetX = this.x;
-    const targetY = 2.5;   // aim at lower-mast level
-    const targetZ = this.z;
-
-    const desiredX = targetX - Math.cos(elevRad) * Math.sin(azRad) * this.camDist;
-    const desiredZ = targetZ - Math.cos(elevRad) * Math.cos(azRad) * this.camDist;
-    const desiredY = targetY + Math.sin(elevRad) * this.camDist;
-
-    // Frame-rate-independent follow. A fixed per-frame fraction (the old 0.08) makes the camera's
-    // catch-up speed depend on frame time: with dt swinging 15↔45 ms the look-at orientation steps
-    // by uneven amounts each frame. The near scene barely shifts, but the distant volumetric clouds
-    // reproject almost entirely from camera ROTATION, so that orientation wobble is amplified into
-    // the persistent cloud "jitter". Easing by (1 - e^(-k·dt)) makes the camera cover the same
-    // fraction per unit TIME regardless of frame rate — k=5 reproduces the old 0.08 at 60 fps.
-    // Strip last frame's camera-shake offset before the follow-ease so the ease operates on the true
-    // base position (otherwise the transient jitter would feed back into a slow random walk).
+    // Strip last frame's camera-shake offset first so neither path (orbit follow-ease OR FP placement)
+    // feeds the transient jitter back into the base position.
     cam.position.subtractInPlace(this.camShakeOffset);
-
-    const lerp = this.isDragging ? 1.0 : 1 - Math.exp(-5 * dt);
-    cam.position.x += (desiredX - cam.position.x) * lerp;
-    cam.position.y += (desiredY - cam.position.y) * lerp;
-    cam.position.z += (desiredZ - cam.position.z) * lerp;
-
-    // Terrain collision: never let the camera dip below the landscape. Clamp its Y to the ground height
-    // at the camera's XZ (+ clearance) so when the orbit would swing it into a hill/cliff it instead rides
-    // UP and ALONG the surface. Over water the seabed is below sea level, so this only engages near land.
-    const groundY = this.sceneService.getTerrainHeight(cam.position.x, cam.position.z);
-    if (groundY !== null) {
-      const minY = groundY + 3.0;   // clearance above the surface (keeps the near plane clear)
-      if (cam.position.y < minY) { cam.position.y = minY; }
-    }
 
     // ── Camera shake ──────────────────────────────────────────────────────────
     // A damped oscillation: a ~2 Hz sine (slow enough to read as a clear back-and-forth) with a LINEAR
-    // amplitude envelope from the decaying trauma, so the camera swings a few times with each swing a
-    // little smaller, then settles. Phase resets on a fresh shake (addShakeTrauma) so it swings from
-    // zero. Re-stripped next frame so it never feeds back into the follow-ease.
+    // amplitude envelope from the decaying trauma, so the camera swings a few times, each a little
+    // smaller, then settles. Phase resets on a fresh shake (addShakeTrauma). Computed here; ADDED to the
+    // final camera position at the end of whichever branch runs below.
     this.camTrauma = Math.max(0, this.camTrauma - dt * this.CAM_TRAUMA_DECAY);
     if (this.camTrauma > 1e-3) {
       this.shakeTime += dt;
@@ -991,11 +972,55 @@ export class VesselService {
         Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55,   // vertical, smaller, slightly detuned
         Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50,   // fore-aft
       );
-      cam.position.addInPlace(this.camShakeOffset);
     } else {
       this.camShakeOffset.setAll(0);
     }
 
+    // ── First-person ("on deck"): sit at the deck eye point looking forward; drag = free-look. ──
+    if (this.firstPerson() && this.fpEye && this.root) {
+      // Eye = the vessel-local point through the hull's CURRENT world matrix, so it rides with
+      // heave/heel/pitch like a real helmsman. (physicsStep set the pose earlier this frame.)
+      this.root.computeWorldMatrix(true);
+      const eye = Vector3.TransformCoordinates(this.fpEye, this.root.getWorldMatrix());
+      eye.addInPlace(this.camShakeOffset);
+      cam.position.copyFrom(eye);
+      const yaw   = (this.heading + this.fpYaw) * Math.PI / 180;
+      const pitch = this.fpPitch * Math.PI / 180;
+      const cp    = Math.cos(pitch);
+      cam.setTarget(new Vector3(
+        eye.x + Math.sin(yaw) * cp * 20,
+        eye.y + Math.sin(pitch)    * 20,
+        eye.z + Math.cos(yaw) * cp * 20,
+      ));
+      return;
+    }
+
+    // ── Orbit follow (default 3rd-person) ───────────────────────────────────────────────────────
+    // Azimuth is relative to vessel heading so the camera stays behind the boat as it turns, but the
+    // user can swing it around. Frame-rate-independent follow ease (1 - e^(-k·dt)); k=5 ≈ the old 0.08
+    // at 60 fps — keeps the distant cloud reprojection from jittering as dt varies.
+    const azRad   = (this.heading + this.camAzimuth) * Math.PI / 180;
+    const elevRad = this.camElevation * Math.PI / 180;
+    const targetX = this.x;
+    const targetY = 2.5;   // aim at lower-mast level
+    const targetZ = this.z;
+    const desiredX = targetX - Math.cos(elevRad) * Math.sin(azRad) * this.camDist;
+    const desiredZ = targetZ - Math.cos(elevRad) * Math.cos(azRad) * this.camDist;
+    const desiredY = targetY + Math.sin(elevRad) * this.camDist;
+
+    const lerp = this.isDragging ? 1.0 : 1 - Math.exp(-5 * dt);
+    cam.position.x += (desiredX - cam.position.x) * lerp;
+    cam.position.y += (desiredY - cam.position.y) * lerp;
+    cam.position.z += (desiredZ - cam.position.z) * lerp;
+
+    // Terrain collision: never let the camera dip below the landscape (rides up & along a hill/cliff).
+    const groundY = this.sceneService.getTerrainHeight(cam.position.x, cam.position.z);
+    if (groundY !== null) {
+      const minY = groundY + 3.0;
+      if (cam.position.y < minY) { cam.position.y = minY; }
+    }
+
+    cam.position.addInPlace(this.camShakeOffset);
     cam.setTarget(new Vector3(targetX, targetY, targetZ));
   }
 
@@ -1022,8 +1047,14 @@ export class VesselService {
             const dy = ev.clientY - this.lastMouseY;
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
-            this.camAzimuth   += dx * 0.45;
-            this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3));
+            if (this.firstPerson()) {
+              // Free-look from the deck: drag yaws/pitches the view (yaw is free 360°; pitch clamped).
+              this.fpYaw   += dx * 0.30;
+              this.fpPitch  = Math.max(-70, Math.min(70, this.fpPitch - dy * 0.25));
+            } else {
+              this.camAzimuth   += dx * 0.45;
+              this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3));
+            }
           }
           break;
         case PointerEventTypes.POINTERUP:
@@ -1072,6 +1103,7 @@ export class VesselService {
         case 'Digit2': this.setSailState('topsails'); break;
         case 'Digit3': this.setSailState('full');     break;
         case 'KeyP':   this.toggleAnchor();           break;
+        case 'KeyV':   this.toggleFirstPerson();      break;   // switch first-person / orbit view
       }
     };
     this.keyUpHandler = (e: KeyboardEvent) => {

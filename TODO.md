@@ -2,20 +2,19 @@
 
 # General or Current TODO Items
 
-* add camera shake on damage taken or cannons firing
-* First Person View
 * made cannon elevation aiming smooth and by decimals
+* add pinnace
 * add player ship collision
 * add damage from collisions and aground
 * fix speed of asset scattering loading in?
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
+* add keymap help screen
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
 * add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
 * fix tree height
 * persistent logoff locations & serverside authoritative location
 * tidal pull?
-* Refactor a systemwide shared audio context so you don't hit browser cap
 * introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
 * add in damage morph targets
 * Bring DRACO compression in, remove any CDNs
@@ -28,5 +27,7 @@
 * Add lost server connection detection
 * encrypt websocket server? wss instead of ws?
 * Add swear list filter, see if we can source from not us and build into the pipeline
+* Optimization pass
+* Security pass
 
 # TODO Items by Module

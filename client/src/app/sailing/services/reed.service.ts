@@ -72,10 +72,21 @@ export class ReedService {
     // Matte, double-sided, opaque, FROZEN (static) — NOT named scatter_ so it enters the refraction RTT.
     // useVertexColors=false: the atlas COLOR_0 carries baked wind data, not albedo.
     const mat = new StandardMaterial('reedBed_mat', scene);
-    mat.diffuseTexture = new Texture(scatterTextureUrl('reeds_atlas.png'), scene);
+    const reedTex = new Texture(scatterTextureUrl('reeds_atlas.png'), scene);
+    mat.diffuseTexture = reedTex;
     mat.specularColor = new Color3(0, 0, 0);
     mat.backFaceCulling = false;
     mat.twoSidedLighting = true;
+    // ALPHA-TEST (cutout), NOT alpha-blend. This is the same treatment every other scatter type gets
+    // (asset-loader: "EEVEE exports alphaMode BLEND, which sorts wrong when instanced"). It matters
+    // beyond sorting: Babylon's DepthRenderer (which the volumetric clouds clip against) SKIPS
+    // alpha-BLENDED submeshes entirely (forceDepthWriteTransparentMeshes is false), so blended reeds
+    // never reach the cloud depth map -> clouds draw over them. Alpha-TEST submeshes DO write depth, so
+    // the reeds correctly occlude the clouds. (Earlier render-group tweaks were a red herring.)
+    reedTex.hasAlpha = true;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.transparencyMode = Material.MATERIAL_ALPHATEST;
+    mat.alphaCutOff = 0.4;
     this.sceneService.excludeFromPrePass(mat);
     this.material = mat;
 
@@ -85,6 +96,10 @@ export class ReedService {
       this.sceneService.excludeFromGlow(mesh);
       mesh.isVisible = true;
       mesh.alwaysSelectAsActiveMesh = true;
+      // Group 2 = the world group (terrain / ocean near-LODs / vessel / palm) for consistent transparency
+      // sorting against the ocean. Cloud occlusion itself comes from the alpha-TEST material above (which
+      // lets the reeds write into the DepthRenderer), not from the rendering group.
+      mesh.renderingGroupId = 2;
       this.matBufs[v] = new Float32Array(ReedService.CAP * 16);
       this.colBufs[v] = new Float32Array(ReedService.CAP * 4);
       mesh.thinInstanceSetBuffer('matrix', this.matBufs[v], 16, false);

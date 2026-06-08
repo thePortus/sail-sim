@@ -512,8 +512,11 @@ export class SceneService {
     );
     const depthMap = depthRenderer.getDepthMap();
     // Exclude the four ocean LOD meshes (all named 'ocean_*') so open water reads
-    // the 1e8 clear (= "far") rather than its own surface depth.
-    depthMap.renderListPredicate = (m) => !m.name.startsWith('ocean_');
+    // the 1e8 clear (= "far") rather than its own surface depth. Also exclude meshes
+    // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
+    // water with soft-waterline foam.
+    depthMap.renderListPredicate = (m) =>
+      !m.name.startsWith('ocean_') && !m.metadata?.excludeFromOceanDepth;
     // Every frame: at low FPS an every-other-frame depth pass makes the soft-waterline
     // foam around the bobbing hull strobe. (Was 2 for perf; the strobe wasn't worth it.)
     depthMap.refreshRate = 1;

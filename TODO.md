@@ -2,14 +2,11 @@
 
 # General or Current TODO Items
 
-* add camera clipping to prevent going underwater but especially under terrain
-* rain doesn't show over clouds
 * cooler moon disk & replace stars with actual star map?
 * mas dolphins por favor
 * cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind
-* clouds render over reeds
 * add full sinking & capsize animation
 * fix speed of asset scattering loading in?
 * birds cast reflections

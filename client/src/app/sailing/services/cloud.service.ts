@@ -2,10 +2,17 @@ import { Injectable, inject } from '@angular/core';
 import {
   Scene,
   Vector3,
+  Color3,
   Color4,
   DynamicTexture,
   ParticleSystem,
   GPUParticleSystem,
+  SolidParticleSystem,
+  SolidParticle,
+  Mesh,
+  MeshBuilder,
+  StandardMaterial,
+  Material,
   SpriteManager,
   Sprite,
   Observer,
@@ -166,11 +173,21 @@ export class CloudService {
   private stormParticles: ParticleSystem | GPUParticleSystem | null = null;
   private stormUsesGpu = false;
 
-  // Layer E: rain streaks (separate from mist; elongated additive particles)
+  // Layer E: rain streaks. A SolidParticleSystem (ONE real mesh) rather than a ParticleSystem, so an
+  // alpha-TEST material lets it write into the DepthRenderer the volumetric clouds clip against — the
+  // clouds then correctly occlude BEHIND the streaks (a ParticleSystem is skipped by the depth pass).
+  // CPU-updated per frame via setParticles(), so the cap is lower than the old 12k particle system.
   private rainTexture: DynamicTexture | null = null;
-  private rainEmitter = new Vector3(0, 0, 0);
-  private rainParticles: ParticleSystem | GPUParticleSystem | null = null;
-  private rainUsesGpu = false;
+  private rainSPS: SolidParticleSystem | null = null;
+  private rainMesh: Mesh | null = null;
+  private static readonly RAIN_CAP = 7000;
+  private _rainVisible = 0;          // how many particles are active this frame (scaled by intensity)
+  private _rainDt = 0.016;           // dt handed to updateRainParticle
+  private _rainTilt = 0;             // horizontal drift per unit fall (3-D wind lean)
+  private _rainTiltAngle = 0;        // screen-space roll so streaks lean with the wind
+  private _rainCamX = 0;
+  private _rainCamY = 0;
+  private _rainCamZ = 0;
 
   // Layer F: lens-rain post-process (drops on the camera lens)
   private lensRain: PostProcess | null = null;
@@ -310,8 +327,10 @@ export class CloudService {
     this.stormTexture?.dispose();
     this.stormTexture = null;
 
-    this.rainParticles?.dispose();
-    this.rainParticles = null;
+    this.rainSPS?.dispose();
+    this.rainSPS = null;
+    this.rainMesh?.dispose();
+    this.rainMesh = null;
     this.rainTexture?.dispose();
     this.rainTexture = null;
 
@@ -776,70 +795,96 @@ export class CloudService {
 
   private initRainLayer(scene: Scene): void {
     this.rainTexture = this.buildRainTexture(scene);
+    this.rainTexture.hasAlpha = true;
 
-    // Always use the CPU particle system for rain: GPUParticleSystem does not
-    // support non-uniform minScaleX/minScaleY, which are essential for the
-    // elongated streak appearance. 12 000 capacity lets a full storm fill the
-    // screen with dense, driving rain.
-    this.rainParticles = new ParticleSystem('rain', 12_000, scene);
-    this.rainUsesGpu = false;
+    // Unlit, alpha-TEST streak material. disableLighting + emissiveTexture shows the texture's
+    // bright blue-white directly (no sun shading), reading clearly against both a dark storm sky and
+    // a pale sea. Alpha-TEST (not blend) is the whole point: it makes the streaks write depth, so the
+    // volumetric-cloud post-process occludes BEHIND them. (Same trick the tree impostors use.)
+    const mat = new StandardMaterial('rainSPS_mat', scene);
+    mat.diffuseTexture = this.rainTexture;
+    mat.emissiveTexture = this.rainTexture;
+    mat.diffuseColor = new Color3(0, 0, 0);
+    mat.disableLighting = true;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.transparencyMode = Material.MATERIAL_ALPHATEST;
+    mat.alphaCutOff = 0.2;            // low cutoff keeps a little of the soft streak edge
+    mat.backFaceCulling = false;
+    this.sceneService.excludeFromPrePass(mat);
 
-    const ps = this.rainParticles;
-    ps.particleTexture = this.rainTexture;
-    ps.emitter = this.rainEmitter;
+    // One quad per streak, merged into a single SPS mesh. billboard = streaks face the camera; the
+    // per-particle rotation.z leans them with the wind on screen.
+    const sps = new SolidParticleSystem('rainSPS', scene, { useModelMaterial: false });
+    const quad = MeshBuilder.CreatePlane('rainQuad', { width: 1, height: 1 }, scene);
+    sps.addShape(quad, CloudService.RAIN_CAP);
+    quad.dispose();
+    const mesh = sps.buildMesh();
+    mesh.material = mat;
+    mesh.isPickable = false;
+    mesh.alwaysSelectAsActiveMesh = true;   // moves with the camera; skip frustum culling
+    mesh.renderingGroupId = 3;              // over the ocean LODs (groups 0-2)
+    // Keep rain OUT of the ocean's soft-waterline depth renderer (it would speckle the water surface
+    // with foam). That renderer skips meshes flagged here; the cloud depth renderer has no predicate,
+    // so the rain still writes there and occludes the clouds.
+    mesh.metadata = { ...(mesh.metadata ?? {}), excludeFromOceanDepth: true };
 
-    // Spread emitters in a 400 m × 400 m square at a fixed height above the
-    // emitter point.  The emitter itself tracks the camera (see tickRainLayer).
-    ps.minEmitBox = new Vector3(-200, 0, -200);
-    ps.maxEmitBox = new Vector3( 200, 0,  200);
+    sps.billboard = true;
+    sps.computeParticleColor = false;
+    sps.computeParticleTexture = false;
+    sps.computeBoundingBox = false;
+    sps.computeParticleRotation = true;
 
-    // Direction is predominantly downward; wind component is set each tick.
-    // Fast fall (~55 m/s) with a short lifetime so streaks rip past the camera
-    // and recycle quickly — real rain reads as fast, not drifting. From the
-    // emitter at +130 m: 55 m/s × ~3 s ≈ 165 m, reaching the water before expiry.
-    ps.direction1 = new Vector3(-0.03, -1, -0.03);
-    ps.direction2 = new Vector3( 0.03, -1,  0.03);
-    // Driving rain: very fast fall (~70–100 m/s) and short life so streaks tear
-    // down the screen. From +130 m they cross the visible band in well under a
-    // second, reading as hard, beating rain rather than a drift.
-    ps.minEmitPower = 70;
-    ps.maxEmitPower = 100;
-    ps.minLifeTime  = 1.8;
-    ps.maxLifeTime  = 2.6;
+    sps.initParticles = () => {
+      for (let i = 0; i < sps.nbParticles; i++) {
+        const p = sps.particles[i];
+        p.scaling.set(0, 0, 0);
+        p.props = { len: 0, wid: 0, fall: 0, spawned: false };
+      }
+    };
+    sps.updateParticle = (p) => this.updateRainParticle(p);
+    sps.initParticles();
+    sps.setParticles();
+    mesh.setEnabled(false);   // tick enables it when it actually rains
 
-    // Bright translucent white. STANDARD (alpha) blending — see blendMode below —
-    // composites the streaks OVER the water, so they stay visible even against a
-    // pale, near-white storm sea (additive white was invisible there).
-    ps.color1    = new Color4(0.88, 0.92, 0.98, 0.55);
-    ps.color2    = new Color4(0.80, 0.86, 0.95, 0.40);
-    ps.colorDead = new Color4(0.80, 0.86, 0.95, 0.0);
-
-    // Thin, long streaks: tiny scaleX = a fine vertical line; large scaleY
-    // stretches it into a fast motion-blurred streak. Wide size/scale ranges so
-    // drops vary from small fine threads to longer, fatter streaks (per-particle
-    // random) — avoids the uniform "every drop identical" look.
-    ps.minSize   = 2.5;
-    ps.maxSize   = 9.0;
-    ps.minScaleX = 0.04;
-    ps.maxScaleX = 0.14;
-    ps.minScaleY = 2.4;
-    ps.maxScaleY = 6.2;
-
-    // STANDARD alpha blending: streaks composite OVER the water with their own
-    // opacity, so they read clearly against both the dark sky and a pale sea.
-    // (Additive washed out completely over bright, near-white storm water.)
-    ps.blendMode   = ParticleSystem.BLENDMODE_STANDARD;
-    ps.gravity     = Vector3.Zero();  // velocity comes from direction × emitPower
-    ps.updateSpeed = 0.016;
-    ps.emitRate    = 0;
-
-    // Group 3 renders after ocean + terrain (groups 0–2) so additive blending
-    // composites correctly over water.  Without this call, Babylon.js would
-    // clear the depth buffer before group 3, making rain appear in front of the
-    // ship.  Keeping the depth buffer lets rain depth-test against the hull.
+    // Keep the depth buffer between groups so rain depth-tests against the hull (group 3 is the last
+    // world group; without this Babylon would clear depth and draw rain in front of everything).
     scene.setRenderingAutoClearDepthStencil(3, false);
-    ps.renderingGroupId = 3;
-    ps.start();
+
+    this.rainSPS = sps;
+    this.rainMesh = mesh;
+  }
+
+  /** Per-particle rain update (called by the SPS each frame for every streak). */
+  private updateRainParticle(p: SolidParticle): SolidParticle {
+    const props = p.props as { len: number; wid: number; fall: number; spawned: boolean };
+
+    // Inactive streaks (beyond the intensity-scaled count) collapse to a degenerate, unrasterised quad.
+    if (p.idx >= this._rainVisible) { p.scaling.set(0, 0, 0); return p; }
+
+    // Spawn / recycle: respawn high above the camera once a streak falls past it or drifts out of range.
+    if (!props.spawned ||
+        p.position.y < this._rainCamY - 55 ||
+        Math.abs(p.position.x - this._rainCamX) > 210 ||
+        Math.abs(p.position.z - this._rainCamZ) > 210) {
+      p.position.x = this._rainCamX + (Math.random() * 2 - 1) * 200;
+      p.position.z = this._rainCamZ + (Math.random() * 2 - 1) * 200;
+      p.position.y = this._rainCamY + 110 + Math.random() * 45;
+      props.len  = 3 + Math.random() * 6;       // streak length (world m) — opaque, so kept short
+      props.wid  = 0.05 + Math.random() * 0.11; // streak width (world m)
+      props.fall = 70 + Math.random() * 30;     // fall speed (m/s)
+      props.spawned = true;
+    }
+
+    // Fall + lean with the wind.
+    const drop = props.fall * this._rainDt;
+    p.position.y -= drop;
+    p.position.x += this.windX * this._rainTilt * drop;
+    p.position.z += this.windZ * this._rainTilt * drop;
+
+    p.scaling.x = props.wid;
+    p.scaling.y = props.len;
+    p.rotation.z = this._rainTiltAngle;
+    return p;
   }
 
   /**
@@ -872,9 +917,12 @@ export class CloudService {
         // against dark backgrounds (the "outline" over the islands).
         const a = Math.min(1, Math.pow(horiz * vert, 1.8));
         const i = (y * w + x) * 4;
-        img.data[i]     = 225;   // bright neutral blue-white
-        img.data[i + 1] = 236;
-        img.data[i + 2] = 255;
+        // Dim blue-grey (NOT bright white): the streaks are unlit opaque cutouts, so the
+        // texture colour IS their on-screen brightness. A muted tone keeps them subtle rather
+        // than stark white bars — paired with the higher density it reads as a soft rain veil.
+        img.data[i]     = 150;
+        img.data[i + 1] = 166;
+        img.data[i + 2] = 198;
         img.data[i + 3] = Math.round(a * 255);
       }
     }
@@ -884,7 +932,7 @@ export class CloudService {
   }
 
   private tickRainLayer(dt: number, camX: number, camZ: number): void {
-    if (!this.rainParticles) return;
+    if (!this.rainSPS || !this.rainMesh) return;
 
     // Smoothly blend toward target intensity (faster ramp-up than ramp-down).
     const lerpRate = this.precipIntensity < this.targetPrecipIntensity ? 0.9 : 0.55;
@@ -898,66 +946,44 @@ export class CloudService {
 
     const camera = this.sceneService.camera;
     const camY = camera?.position.y ?? 0;
-
-    // Keep emitter directly above the camera so rain falls around the player.
-    // 130 m height + ~55 m/s × ~3 s ≈ 165 m fall — reaches the water surface
-    // before the particle expires.
-    this.rainEmitter.x = camX;
-    this.rainEmitter.y = camY + 130;
-    this.rainEmitter.z = camZ;
-
     const intens = this.precipIntensity;
+
+    // No rain → disable the mesh entirely (skips setParticles AND its depth write).
     if (intens < 0.005) {
-      this.rainParticles.emitRate = 0;
+      if (this.rainMesh.isEnabled()) { this.rainMesh.setEnabled(false); }
       return;
     }
+    if (!this.rainMesh.isEnabled()) { this.rainMesh.setEnabled(true); }
 
-    // Emit rate: drizzle ≈ 120/s, rain ≈ 600/s, extreme storm ≈ 2 000/s.
-    // 2 000 × lifetime 5 s = 10 000 simultaneous particles — at 5 000 capacity
-    // the oldest recycle quickly, keeping the screen dense with streaks.
+    // Active streak count: drizzle ≈ 12%, storm = full cap, with a slow gust pulse in heavy rain.
     const gustFactor = intens > 0.75
       ? (0.85 + 0.15 * Math.sin(this.elapsed * 0.7 + 1.3))
       : 1.0;
-    // Drizzle ≈ 250/s, rain ≈ 2 100/s, full storm ≈ 5 000/s. At 12 000 capacity
-    // and ~2.2 s life the screen saturates with streaks during a storm.
-    this.rainParticles.emitRate = (200 + intens * 4800) * gustFactor;
-
-    // Wind direction tilts the rain.  At windSpeed = 20 m/s with factor 0.022
-    // the lateral velocity is ≈ 0.44 m/s per m/s of downward velocity,
-    // producing a noticeable ~24° tilt during a gale.
-    const tilt = this.windSpeed * 0.022;
-    const jitter = 0.06;
-    this.rainParticles.direction1 = new Vector3(
-      this.windX * tilt - jitter, -1, this.windZ * tilt - jitter,
-    );
-    this.rainParticles.direction2 = new Vector3(
-      this.windX * tilt + jitter, -1, this.windZ * tilt + jitter,
+    this._rainVisible = Math.min(
+      CloudService.RAIN_CAP,
+      Math.floor(CloudService.RAIN_CAP * Math.min(1, intens) * gustFactor),
     );
 
-    // Rotate each newly-emitted particle so its long axis aligns with the
-    // screen-space fall direction.  Without this the drop sprite is always
-    // drawn upright even when the wind tilts the trajectory sideways.
-    //
-    // Project the 3-D velocity (windX*tilt, -1, windZ*tilt) onto the camera's
-    // right and up axes to get the 2-D screen-space direction, then compute
-    // the angle from "pointing downward on screen" (angle = 0 = no rotation).
+    // Wind: 3-D lean (drift per unit fall) + screen-space roll so streaks tilt toward the wind.
+    this._rainTilt = this.windSpeed * 0.012;
+    let dropAngle = 0;
     if (camera) {
+      const tilt = this.windSpeed * 0.022;
       const wm = camera.getWorldMatrix();
       const camRight = Vector3.TransformNormal(new Vector3(1, 0, 0), wm);
       const camUp    = Vector3.TransformNormal(new Vector3(0, 1, 0), wm);
       const screenX  = this.windX * tilt * camRight.x - camRight.y + this.windZ * tilt * camRight.z;
       const screenY  = this.windX * tilt * camUp.x    - camUp.y    + this.windZ * tilt * camUp.z;
-      const dropAngle = Math.atan2(screenX, -screenY);
-      this.rainParticles.minInitialRotation = dropAngle - 0.05;
-      this.rainParticles.maxInitialRotation = dropAngle + 0.05;
+      dropAngle = Math.atan2(screenX, -screenY);
     }
+    this._rainTiltAngle = dropAngle;
 
-    // Alpha scales with intensity: light drizzle → heavy, near-opaque storm
-    // streaks (standard blending, so higher alpha = more visible, not glowing).
-    const alphaA = 0.34 + intens * 0.50;
-    const alphaB = 0.26 + intens * 0.42;
-    this.rainParticles.color1 = new Color4(0.88, 0.92, 0.98, alphaA);
-    this.rainParticles.color2 = new Color4(0.80, 0.86, 0.95, alphaB);
+    this._rainDt   = dt;
+    this._rainCamX = camX;
+    this._rainCamY = camY;
+    this._rainCamZ = camZ;
+
+    this.rainSPS.setParticles();
   }
 
   // --------------------------------------------------------------------------

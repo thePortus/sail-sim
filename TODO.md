@@ -2,8 +2,6 @@
 
 # General or Current TODO Items
 
-* mas dolphins por favor
-* cannonfire lights up landscape
 * ships bells at dawn, noon, and dusk
 * add sound of canvas flapping in the wind
 * add full sinking & capsize animation

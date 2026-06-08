@@ -2054,6 +2054,7 @@ export class TerrainService {
     mat.AddUniform('uCloudDrift', 'vec2', null);
     mat.AddUniform('uCloudBaseH', 'float', null);
     mat.AddUniform('u_waterlineDither', 'float', null);
+    mat.AddUniform('uCannonFlash', 'vec4', null);   // xz = world pos, z = strength (0 = none), w = radius (m)
 
     // The ragged-waterline discard (below) must NOT run when the terrain renders into the ocean's
     // seabed (refraction) RTT, or the holes fill with that pass's bright tan clear-colour and read
@@ -2345,6 +2346,17 @@ export class TerrainService {
       float aboveH  = smoothstep(-0.02, 0.06, uSunDir.y);
       float dayLift = 1.0 + 0.30 * aboveH * (1.0 - smoothstep(0.12, 0.92, uSunDir.y));
       finalColor.rgb *= dayLift;
+      /* Cannon muzzle-flash glow on the land. A dynamic point light does not reach this custom PBR
+         material (it stopped dead at the water's edge), so we fake it exactly like the ocean's flash:
+         the SAME warm colour + gaussian falloff SHAPE, so the pool reads continuously across the
+         waterline. The spread (uCannonFlash.w) is wider than the sea's tight ~16 m pool only because the
+         muzzle is over water, so the shore is across a gap. uCannonFlash = (worldX, worldZ, strength, spread). */
+      if (uCannonFlash.z > 0.001) {
+        float fr   = length(vPositionW.xz - uCannonFlash.xy);
+        float fall = exp(-(fr * fr) / max(uCannonFlash.w, 1.0));
+        float landF = smoothstep(-0.4, 0.8, vPositionW.y);     /* start at the waterline, fade inland-up */
+        finalColor.rgb += vec3(1.0, 0.52, 0.18) * (uCannonFlash.z * fall * landF);
+      }
       float hazeDist = length(vPositionW - vEyePosition.xyz);
       float hazeF = clamp(pow(1.0 - exp(-hazeDist*0.00020), 1.4), 0.0, 0.96);
       finalColor.rgb = mix(finalColor.rgb, uHazeColor, hazeF);
@@ -2362,6 +2374,18 @@ export class TerrainService {
       const csf = this.oceanService.getCloudShadowField();
       fx.setFloat2('uCloudDrift', csf?.drift.x ?? 0, csf?.drift.y ?? 0);
       fx.setFloat('uCloudBaseH', csf?.cloudBase ?? 900);
+      // Cannon muzzle flash: reuse the ocean's flash registry (every shot, local + remote, is recorded
+      // there) and feed the STRONGEST active flash to the terrain glow. The point light can't light this
+      // material, so this is what actually lights the shore — see the Fragment_Before_Fog block.
+      const cf2 = this.oceanService.getCannonFlash();
+      let flX = 0, flZ = 0, flEnv = 0;
+      for (let i = 0; i < cf2.count; i++) {
+        const env = Math.max(0, 1 - cf2.data[i * 4 + 2] / cf2.life);
+        if (env > flEnv) { flEnv = env; flX = cf2.data[i * 4]; flZ = cf2.data[i * 4 + 1]; }
+      }
+      // strength = (1−t)^2 (sharp onset, quick fade — matches the ocean's env), lightly boosted so the
+      // darker land albedo still reads. .w = gaussian spread (≈65–80 m pool; was 240 m — too wide vs the sea).
+      fx.setFloat4('uCannonFlash', flX, flZ, flEnv * flEnv * 1.4, 1600.0);
       fx.setTexture('uAlbedoArr', this.biomeAlbedoArr ?? this.biomePlaceholderArr);
       fx.setTexture('uOrmArr', this.biomeOrmArr ?? this.biomePlaceholderArr);
       if (this.splatTex) { fx.setTexture('uSplat', this.splatTex); }

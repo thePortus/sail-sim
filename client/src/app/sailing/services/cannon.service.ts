@@ -372,7 +372,9 @@ export class CannonService {
       l.intensity = 0;
       // Reach far enough to wash distant cliffs and enemy ships (~1 km), but with a STANDARD
       // (quadratic-to-zero) falloff so it's bright at the firing ship and fades to a faint hint
-      // at the edge — rather than the default inverse-square, which dies within ~50 m.
+      // at the edge — rather than the default inverse-square, which dies within ~50 m. (NEARBY LAND
+      // is lit separately via a faked glow in the terrain shader — see uCannonFlash there — because a
+      // dynamic point light doesn't reach that custom PBR material, same as the emissive sea.)
       l.range        = 1150;
       l.falloffType  = Light.FALLOFF_STANDARD;
       // Sort BELOW the scene's base lights (sun/moon/ambient, priority 0): the forward renderer

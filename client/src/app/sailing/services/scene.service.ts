@@ -10,6 +10,7 @@ import {
   VolumetricLightScatteringPostProcess,
 } from '@babylonjs/core';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
+import { Settings } from '../../app.settings';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
 import { ProceduralSky } from './procedural-sky';
@@ -328,13 +329,25 @@ export class SceneService {
     this.sunMesh.renderingGroupId = 2;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
 
-    // Moon — a rocky, self-glowing sphere built from a procedural crater texture.
-    // disableLighting + emissiveTexture means it shows its surface fully lit (a
-    // glowing full moon) regardless of scene lighting; the glow layer adds a halo.
+    // Moon — a self-glowing sphere wrapped in NASA's real lunar colour map (CGI Moon Kit LROC colour,
+    // public domain; served from /sky/moon, fetched by `npm run download:sky-textures`). disableLighting
+    // + emissiveTexture shows the surface fully lit (a glowing full moon) regardless of scene lighting;
+    // the glow layer adds a halo. The real map is darker than the old procedural grey, so emissiveColor
+    // is boosted (>1, HDR) to keep the disc bright after tone-mapping — tune here if it reads dim/bright.
     const moonMat = new StandardMaterial('moonMat', this.scene);
     moonMat.disableLighting = true;
-    moonMat.emissiveTexture = this.buildMoonTexture();
-    moonMat.emissiveColor   = new Color3(0.82, 0.88, 1.0);   // cool moonlight tint
+    const moonTex = new Texture(
+      `${Settings.apiUrl}sky/moon`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
+      null,
+      () => {   // server texture missing (sky textures not downloaded) → procedural fallback
+        console.warn('[Scene] moon texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
+        moonMat.emissiveTexture = this.buildMoonTexture();
+      },
+    );
+    moonMat.emissiveTexture = moonTex;
+    // Bright cool disc. HDR (>1) + ACES tone-mapping compress it toward white while keeping crater
+    // detail; the disc brightness lives here (NOT the moonLight intensity, which lights the scene).
+    moonMat.emissiveColor   = new Color3(2.6, 2.72, 3.0);
     moonMat.diffuseColor    = Color3.Black();
     moonMat.specularColor   = Color3.Black();
 
@@ -343,6 +356,9 @@ export class SceneService {
     this.moonMesh.isPickable = false;
     this.moonMesh.renderingGroupId = 2;
     this.moonMesh.visibility = 0;
+    // CRITICAL for disc brightness: the moon sits ~62 km out where EXP2 fog saturates, washing the
+    // disc toward the (dark, at night) fog colour. Exempt it from fog like the star dome.
+    this.moonMesh.applyFog = false;
     this.glowLayer.addIncludedOnlyMesh(this.moonMesh);
   }
 
@@ -352,9 +368,24 @@ export class SceneService {
   // slightly in colour (cool blue-white ↔ faint warm amber), with a faint Milky Way
   // band — baked into a texture so there's no fragile custom shader. Drifts slowly.
   private buildStars(): void {
-    const tex = this.buildStarTexture();
-
     const mat = new CustomMaterial('starMat', this.scene);
+
+    // Real all-sky star map: NASA Tycho Skymap II (4096x2048, public domain; served from /sky/stars,
+    // fetched by `npm run download:sky-textures`). JPG has no alpha, so getAlphaFromRGB derives opacity
+    // from luminance → the black sky stays transparent (the procedural night-sky shows through) and only
+    // stars/Milky Way draw. Falls back to the procedural starfield if the server texture is missing.
+    const tex = new Texture(
+      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
+      null,
+      () => {
+        console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
+        const fb = this.buildStarTexture();
+        mat.emissiveTexture = fb;
+        mat.opacityTexture  = fb;
+      },
+    );
+    tex.getAlphaFromRGB = true;
+
     mat.disableLighting = true;
     mat.emissiveTexture = tex;
     mat.opacityTexture  = tex;            // alpha from the texture → black sky stays clear

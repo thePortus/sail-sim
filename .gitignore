@@ -18,6 +18,9 @@ server/assets/terrain/
 # downloaded terrain source rasters (re-fetchable via npm run fetch:terrain-sources)
 server/assets/maps/sources/
 
+# downloaded sky textures (re-fetchable via npm run download:sky-textures)
+server/assets/sky/
+
 # user info
 server/seeders/import/**/*
 

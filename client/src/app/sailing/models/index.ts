@@ -166,6 +166,9 @@ export interface VesselPart {
   material:     { color: string; specular?: string; alpha?: number; emissive?: string };
 }
 
+/** One cannon muzzle in vessel-local space (+Z bow, +Y up). */
+export interface VesselCannon { x: number; y: number; z: number; }
+
 export interface Vessel {
   id:          number;
   name:        string;
@@ -175,6 +178,17 @@ export interface Vessel {
   parts:       VesselPart[];
   /** First-person camera eye position in vessel-local space (+Z bow, +X stbd, +Y up). Optional. */
   firstPersonCam?: { x: number; y: number; z: number };
+  /** Rigged GLB + animation manifest filenames under /geometry/ (defaults to the sloop if absent). */
+  glb?:      string;
+  manifest?: string;
+  /** Rotate the model 180° about Y on import so its bow faces game-forward (+Z). */
+  importFlipY?: boolean;
+  /** World starboard direction in vessel-local X: +1 = starboard is +X, −1 = −X (opposite handedness). */
+  rightSign?: 1 | -1;
+  /** Muzzle positions per side (length = guns per side). */
+  cannons?: { port: VesselCannon[]; stbd: VesselCannon[] };
+  /** Per-zone hit points (overrides the default ZONE_HP; lets a vessel be weaker/sturdier). */
+  zoneHp?: Partial<Record<'bow' | 'stern' | 'port' | 'starboard' | 'masts', number>>;
 }
 
 export interface VesselSummary {

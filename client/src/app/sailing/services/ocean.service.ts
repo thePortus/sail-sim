@@ -2,6 +2,7 @@ import { Injectable, inject } from '@angular/core';
 import {
   MeshBuilder, Vector2, Vector3, Vector4, AbstractMesh, Mesh, ShaderMaterial, Scene,
   MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture, Color4,
+  StandardMaterial,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -487,6 +488,9 @@ void main() {
     discard;
   }
 
+  // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
+  // hull reads dry inside while the sea still laps the outer planking. World-space (not a
+  // screen-space mask), so it never removes the water in front of or around the hull.
   float depth = u_WaveDepth;
   vec2 worldXZ = v_worldPos.xz;
 
@@ -1168,6 +1172,9 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     discard;
   }
 
+  // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
+  // hull reads dry inside while the sea still laps the outer planking. World-space (not a
+  // screen-space mask), so it never removes the water in front of or around the hull.
   let depth = uniforms.u_WaveDepth;
   let worldXZ = input.v_worldPos.xz;
 
@@ -1756,6 +1763,57 @@ export class OceanService {
 
     return mat;
   }
+
+  // ── Hull interior water-clip (baked hull-silhouette mask, height-aware) ─────
+
+  // Baked hull beam-profile cut (texture-free → no sampler; Mac/Metal caps samplers at 16). The
+  // profile is half-beam vs along-position; the ocean shader cuts sea inside it AND above waterY.
+  static readonly HULL_CUT_N = 96;      // along-bins (must match the shader's array size × 4)
+  private hullCutOn       = 0;
+  private hullCutProfile  = new Array<number>(OceanService.HULL_CUT_N).fill(0);
+  private hullCutAlongMin = 0;
+  private hullCutAlongLen = 1;
+  private hullCutAcrossCenter = 0;
+  private hullCutAlongSign = 1;         // +1 if the boat's forward (BoatDir) is +root-Z, else -1
+  private hullCutWaterY   = -1.0e9;     // world Y of the boat's floor; sea ABOVE this (in hull) is cut
+
+  /** Install the baked hull beam profile for the local boat's interior cut (once, on load).
+   *  alongSign maps the boat's forward heading to +root-Z (flip if bow/stern read swapped). */
+  setHullCutProfile(profile: Float32Array, alongMin: number, alongLen: number, acrossCenter: number,
+                    alongSign: 1 | -1): void {
+    const N = OceanService.HULL_CUT_N;
+    for (let i = 0; i < N; i++) { this.hullCutProfile[i] = profile[i] ?? 0; }
+    this.hullCutAlongMin = alongMin;
+    this.hullCutAlongLen = alongLen;
+    this.hullCutAcrossCenter = acrossCenter;
+    this.hullCutAlongSign = alongSign;
+  }
+
+  /** Enable/disable the interior cut (off for vessels that don't need it, e.g. the sloop). */
+  setHullCutEnabled(enabled: boolean): void { this.hullCutOn = enabled ? 1 : 0; }
+
+  /** Per-frame: the world Y of the boat's floor. Sea inside the hull ABOVE this is cut (dry interior);
+   *  sea below it is kept, so when the boat lifts on a trough you never see through the ocean. */
+  setHullCutWaterY(y: number): void { this.hullCutWaterY = y; }
+
+  /** Local boat interior-cut state, consumed by the FFT ocean material (ocean-material.ts). */
+  getHullCut(): { on: number; profile: number[]; alongMin: number; alongLen: number;
+                  acrossCenter: number; alongSign: number; waterY: number } {
+    return { on: this.hullCutOn, profile: this.hullCutProfile, alongMin: this.hullCutAlongMin,
+             alongLen: this.hullCutAlongLen, acrossCenter: this.hullCutAcrossCenter,
+             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY };
+  }
+
+  /**
+   * (legacy, unused) Carve a vessel's INTERIOR footprint out of every ocean LOD so an open, low-sitting
+   * hull reads dry inside while the sea still laps the outer planking. The cut is a boat-oriented
+   * ellipse in WORLD space (centred on u_BoatPos, oriented by u_BoatDir — both already pushed
+   * to the ocean materials each frame for the local boat), so unlike a screen-space mask it
+   * only ever removes the actual interior column, never the water in front of or around the
+   * hull. Inset just inside the planking so the exterior waterline is preserved.
+   *
+   * Superseded by the baked-mask, height-aware cut above (setHullCutMask / setHullCutWaterY).
+   */
 
   // ── Per-frame render loop ──────────────────────────────────────────────────
 

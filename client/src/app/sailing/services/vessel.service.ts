@@ -8,17 +8,15 @@ import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoade
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
+import { bakeHullCutProfile } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { SloopController } from './rigged-vessel.controller';
+import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
 import { CombatService } from './combat.service';
 import { listingFor, capsizeFor, sinkProgress, SINK_DEPTH } from './combat.constants';
 import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
-// Single rigged vessel asset (replaces the old 7-part split sloop). The companion
-// manifest names every clip / morph / bone the SloopController drives.
-const SLOOP_GLB      = 'bermuda_sloop_rigged.glb';
-const SLOOP_MANIFEST = 'bermuda_sloop_rigged.manifest.json';
+// The rigged GLB + manifest are now resolved per-vessel (see this.rig in init / vessel-controller.ts).
 
 @Injectable({ providedIn: 'root' })
 export class VesselService {
@@ -69,7 +67,11 @@ export class VesselService {
 
 
   // ── Rigged vessel animation driver (single GLB: skeleton clips + morphs) ────
-  private controller: SloopController | null = null;
+  private controller: VesselController | null = null;
+  private vesselSlug = 'sloop';
+  private rig: VesselRig = rigForSlug('sloop');
+  /** World starboard in vessel-local X (+1 = +X, −1 = −X). Used by sign-sensitive visuals (Phase E). */
+  rightSign: 1 | -1 = 1;
 
   // Water-contact shadow projected beneath the hull.
   private waterShadow: Mesh | null = null;
@@ -301,6 +303,22 @@ export class VesselService {
     this.heading = spawnHeading;
     if (vessel.physics) Object.assign(this.physics, vessel.physics);
 
+    // Resolve the rig (GLB + manifest + orientation + handedness). The server vessel def is authoritative;
+    // fall back to the slug→rig map.
+    this.vesselSlug = vessel.slug;
+    const base = rigForSlug(vessel.slug);
+    this.rig = {
+      glb:        vessel.glb        ?? base.glb,
+      manifest:   vessel.manifest   ?? base.manifest,
+      importFlipY: vessel.importFlipY ?? base.importFlipY,
+      rightSign:  vessel.rightSign  ?? base.rightSign,
+      controller: base.controller,
+      floatDraft: base.floatDraft,
+      hullCut:    base.hullCut,
+      buoyancy:   base.buoyancy,
+    };
+    this.rightSign = this.rig.rightSign;
+
     // First-person ("on deck") eye position (vessel-local), from the server vessel def. Falls back to a
     // sensible helm position if a vessel doesn't define one, so the toggle always does something.
     const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
@@ -339,6 +357,25 @@ export class VesselService {
     // Register every hull / rig / sail mesh for ocean reflection + shadows + the WebGPU
     // varying-budget trims (see helper).
     this.registerMeshesForRendering(this.root.getChildMeshes());
+
+    // Clip the sea out of the hull interior (open, low boats) so wave crests never show
+    // inside the floor while the sea still laps the outer planking.
+    this.applyHullCut();
+  }
+
+  /** Bake this vessel's hull silhouette into the ocean's interior cut (rig.hullCut vessels only;
+   *  off otherwise). Local boat only — the ocean shader tracks a single boat transform. The per-frame
+   *  floor height (waterY) is pushed from the physics loop so the cut rides the bob. */
+  private applyHullCut(): void {
+    const hc = this.rig.hullCut;
+    if (!hc || !this.root) { this.oceanService.setHullCutEnabled(false); return; }
+    const hull = this.root.getChildMeshes()
+      .find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
+    const baked = hull ? bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N) : null;
+    if (!baked) { this.oceanService.setHullCutEnabled(false); return; }
+    this.oceanService.setHullCutProfile(
+      baked.profile, baked.alongMin, baked.alongLen, baked.acrossCenter, hc.alongSign);
+    this.oceanService.setHullCutEnabled(true);
   }
 
   /** Register a set of vessel meshes for ocean reflection/refraction, shadow casting, and
@@ -387,6 +424,7 @@ export class VesselService {
     await this.buildGLBMeshes(scene);   // re-instantiate fresh + build a new controller
     if (this.controller) {
       this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
+      this.applyHullCut();
     }
   }
 
@@ -400,12 +438,12 @@ export class VesselService {
   // Parenting + renderingGroupId 2 still happen inside instantiateRigged().
   private async buildGLBMeshes(scene: Scene): Promise<void> {
     const [rigged, manifest] = await Promise.all([
-      this.assetCache.instantiateRigged(SLOOP_GLB, scene, this.root, true),
-      this.assetCache.loadManifest(SLOOP_MANIFEST),
+      this.assetCache.instantiateRigged(this.rig.glb, scene, this.root, this.rig.importFlipY),
+      this.assetCache.loadManifest(this.rig.manifest),
     ]);
-    if (!rigged) { console.warn('[Vessel] rigged sloop failed to load'); return; }
+    if (!rigged) { console.warn(`[Vessel] rigged ${this.vesselSlug} failed to load`); return; }
 
-    this.controller = new SloopController(rigged.entries, rigged.root, manifest, scene);
+    this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
     this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
   }
 
@@ -781,7 +819,7 @@ export class VesselService {
     // port of the GPU vertex shader's waveHeight() — so the physics height
     // matches the rendered surface exactly.
     const t    = this.simTime;
-    const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt);
+    const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt, this.rig.buoyancy);
 
     // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
     // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.
@@ -803,10 +841,10 @@ export class VesselService {
       this.heading = ((this.heading + (buoy.steeringBias + waveYaw) * dt) + 360) % 360;
     }
 
-    // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water. The rigged
-    // model's origin is authored AT the waterline (midships), so 0 sits it right; the old
-    // -0.75 was tuned for the previous model and swamped this one. Negative = lower/more draft.
-    const FLOAT_DRAFT = 0.0;
+    // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water. The rigged sloop's origin is
+    // authored AT the waterline so 0 sits it right; per-vessel `floatDraft` raises a shallow open boat
+    // (the pinnace) so the sea surface doesn't wash through its low hull.
+    const FLOAT_DRAFT = this.rig.floatDraft;
 
     // Cannon recoil: damped lateral roll response driven only by fire impulses.
     const recoilAcc = -this.RECOIL_SPRING * this.recoilRoll - this.RECOIL_DAMPING * this.recoilRollVel;
@@ -879,6 +917,12 @@ export class VesselService {
     // Settle the whole hull into the water as she sinks (overrides the anti-sink floor).
     this.root.position.y = FLOAT_DRAFT + heaveApplied - SINK_DEPTH * this.sinkEnv;
 
+    // Feed the ocean's height-aware interior cut the current floor level so the cut rides the bob:
+    // sea inside the hull above this is removed (dry), below it is kept (no see-through on a trough).
+    if (this.rig.hullCut) {
+      this.oceanService.setHullCutWaterY(this.root.position.y + this.rig.hullCut.floorY);
+    }
+
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     // Damage listing: ease toward the tilt implied by our hull state, then layer it on
     // top of wave roll + heel + recoil/hit. roll +stbd-down, pitch +bow-up (buoy convention).
@@ -893,18 +937,11 @@ export class VesselService {
     this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
     this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv;
 
-    // ── Rigged vessel drive (single GLB: skeleton clips + free bones) ─────────
+    // ── Rigged vessel drive (per-vessel controller via the VesselController interface) ─────────
     if (this.controller) {
-      // Yards: brace from square (eased / running, sheet 88°) to fully braced
-      // (close-hauled, sheet 5°). Maps the player sheet angle onto the Trim clip.
-      const braced = Math.max(0, Math.min(1, (88 - this.sheetAngleDeg) / 83));
-      this.controller.setTrim(braced);
-
-      // Boom + gaff: tack-correct leeward swing (same math as the old boom pivot:
-      // boom forward at 0° running downwind, swinging athwartship upwind).
-      const swingSide = isPortTack ? -1 : 1;
-      const swingRad  = swingSide * (this.sheetAngleDeg - 90) * Math.PI / 180;
-      this.controller.setBoomSwing(swingRad);
+      // Trim: the controller maps the eased sheet angle + tack onto its own rig (sloop braces yards +
+      // swings the boom/gaff; pinnace scrubs its symmetric lug-trim clip).
+      this.controller.setSailTrim(this.sheetAngleDeg, isPortTack);
 
       // Rudder/wheel: from the helm keys; when not steering, mirror the actual yaw
       // (wave wander + momentum) so the rudder isn't frozen amidships.

@@ -2,8 +2,10 @@
 
 # General or Current TODO Items
 
-* add pinnace
+* add spawns close to coast
+* switching boats needs hard reload... fix
 * add server-side authoritative movement... and force player to re-login if 401 on player-location at start... and have server check collisions for future damage bounces
+* add dedication
 * add damage from collisions and aground
 * fix speed of asset scattering loading in?
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...

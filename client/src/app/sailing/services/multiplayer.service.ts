@@ -9,7 +9,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { SloopController } from './rigged-vessel.controller';
+import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
 import { CombatService } from './combat.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
@@ -17,13 +17,7 @@ import { CombatHitMsg, ZoneState, listingFor, capsizeFor, sinkProgress, SINK_DEP
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
-// Single rigged vessel asset, shared with VesselService. Future ships map their slug
-// to a different GLB/manifest here.
-const SLOOP_GLB      = 'bermuda_sloop_rigged.glb';
-const SLOOP_MANIFEST = 'bermuda_sloop_rigged.manifest.json';
-function glbForSlug(_slug: string): { glb: string; manifest: string } {
-  return { glb: SLOOP_GLB, manifest: SLOOP_MANIFEST };
-}
+// Remote vessel rig assets are resolved per slug via rigForSlug() (vessel-controller.ts).
 
 // One buffered server snapshot of a remote vessel's pose, stamped with the local
 // arrival time so we can render on a consistent local clock.
@@ -36,7 +30,7 @@ interface PoseSnapshot {
 // ── OtherPlayerEntry holds everything for one remote vessel ───────────────────
 interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
-  controller:      SloopController | null;  // drives this remote's trim/sail/rudder/flag
+  controller:      VesselController | null;  // drives this remote's trim/sail/rudder/flag
   recoilRoll:      number;
   recoilRollVel:   number;
   recoilSway:      number;
@@ -725,7 +719,7 @@ export class MultiplayerService {
     // REMOTE_DRAFT matches the local vessel's FLOAT_DRAFT so remotes sit at the SAME
     // waterline as your own ship (they were floating ~2.4 m too high at the old fixed
     // REMOTE_FLOAT_Y=1.65 baseline).
-    const heaveTarget = hC + this.REMOTE_DRAFT;
+    const heaveTarget = hC + this.REMOTE_DRAFT + rigForSlug(entry.vesselSlug).floatDraft;
     const pitchTarget = Math.atan2(hStern - hBow, HALF_LEN * 2);   // +bow up
     const rollTarget  = Math.atan2(hStbd - hPort, HALF_BEAM * 2);  // +stbd down
 
@@ -1011,11 +1005,7 @@ export class MultiplayerService {
    *  to the leeward side per tack). */
   private applyRemoteTrim(entry: OtherPlayerEntry): void {
     if (!entry.controller) return;
-    const sheet = entry.sheetAngle ?? 30;
-    const braced = Math.max(0, Math.min(1, (88 - sheet) / 83));
-    entry.controller.setTrim(braced);
-    const swingSide = entry.isPortTack ? -1 : 1;
-    entry.controller.setBoomSwing(swingSide * (sheet - 90) * Math.PI / 180);
+    entry.controller.setSailTrim(entry.sheetAngle ?? 30, !!entry.isPortTack);
   }
 
   private applyVisibility(entry: OtherPlayerEntry): void {
@@ -1043,15 +1033,15 @@ export class MultiplayerService {
     // per session, then cheaply cloned per vessel with its own skeleton/clips/morphs).
     // 180° Y flip so the bow faces +Z = forward (matches VesselService); parenting +
     // renderingGroupId 2 happen in the cache.
-    const { glb, manifest: manifestFile } = glbForSlug(slug);
+    const rig = rigForSlug(slug);
     const [rigged, manifest] = await Promise.all([
-      this.assetCache.instantiateRigged(glb, scene, entry.root, true),
-      this.assetCache.loadManifest(manifestFile),
+      this.assetCache.instantiateRigged(rig.glb, scene, entry.root, rig.importFlipY),
+      this.assetCache.loadManifest(rig.manifest),
     ]);
     if (!rigged) { console.warn('[Multiplayer] rigged vessel failed to load for', playerId); return; }
 
     for (const m of rigged.root.getChildMeshes(false)) m.isPickable = false;
-    entry.controller = new SloopController(rigged.entries, rigged.root, manifest, scene);
+    entry.controller = createVesselController(slug, rigged.entries, rigged.root, manifest, scene);
 
     // Apply the sail state + trim we already know (updates may have arrived pre-build).
     entry.controller.applySailState(entry.sailState, true);   // snap initial pose

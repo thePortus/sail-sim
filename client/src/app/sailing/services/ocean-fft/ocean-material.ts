@@ -39,6 +39,12 @@ export interface OceanMaterialDeps {
   refractionTexture: BaseTexture | null;
   /** Live boat pose for the wake (dir = heading unit vector, speed scaled). Null = no wake. */
   getBoatWake: (() => { x: number; z: number; dirX: number; dirZ: number; speed: number }) | null;
+  /** Local boat interior cut for an open hull: on (>0.5), baked half-beam profile (96 stations packed
+   *  as 24 vec4 = number[96]), its root-frame along range + centreline + bow sign, and floor world-Y. */
+  getHullCut?: (() => {
+    on: number; profile: number[]; alongMin: number; alongLen: number;
+    acrossCenter: number; alongSign: number; waterY: number;
+  }) | null;
   /** Per-vessel wake paths (local + remotes): flat `paths` (vec4 ×WAKE_MAX_BOATS·WAKE_POINTS),
    *  `meta` (vec4 ×WAKE_MAX_BOATS: x,z,count,speed), and active boat count. Curved wakes for all. */
   getWakePaths: (() => { paths: Float32Array; meta: Float32Array; count: number }) | null;
@@ -157,6 +163,10 @@ export class OceanFFTMaterial {
     if (hasWake) {
       mat.AddUniform('_BoatPos', 'vec2', new Vector2(0, 0));   // local boat (calm + deep-water transparency halo)
       mat.AddUniform('_BoatDir', 'vec2', new Vector2(0, 1));   // local boat heading (for the hull-shaped hull-reveal ellipse)
+      mat.AddUniform('_HullCutOn',      'float', 0);                       // >0.5 = local boat interior cut on
+      mat.AddUniform('_HullCutProfile[24]', 'vec4', '');                   // 96 half-beam stations along the hull (NO sampler)
+      mat.AddUniform('_HullCutMeta',    'vec4', new Vector4(0, 1, 0, 1));  // alongMin, alongLen, acrossCentre, alongSign
+      mat.AddUniform('_HullCutWaterY',  'float', -1.0e9);                  // floor world-Y; sea above this (in hull) is cut
       mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
       mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
       mat.AddUniform('_WakeBoatCount', 'float', '');
@@ -524,6 +534,34 @@ export class OceanFFTMaterial {
         // rise up through the deck. Matched on the CPU (height provider) so buoyancy agrees.
         displacement *= (0.45 + 0.55 * smoothstep(6.0, 16.0, length(vWorldUV - _BoatPos)));
 
+        // Hull water displacement: instead of cutting a hole in the sea, DEPRESS the surface under
+        // the hull to just below the floor and flatten its chop, so the boat sits in its own hollow.
+        // The sea still renders everywhere (no see-through), can never rise into the cockpit (it's
+        // forced below the floor regardless of wave height), and laps the hull normally outside — the
+        // hull's planking hides the lip of the depression. The footprint is the baked beam profile
+        // (inset toward the waterline) oriented to the boat; sinkY rides the bob via _HullCutWaterY.
+        if (_HullCutOn > 0.5) {
+          vec2  hf = normalize(_BoatDir + vec2(1e-5, 0.0));
+          vec2  hr = vec2(hf.y, -hf.x);
+          vec2  rel = vWorldUV - _BoatPos;
+          float along  = dot(rel, hf) * _HullCutMeta.w;     // root-local +Z
+          float across = dot(rel, hr) - _HullCutMeta.z;     // root-local +X off the centreline
+          float t = (along - _HullCutMeta.x) / _HullCutMeta.y;
+          float fp = 0.0;
+          if (t > 0.0 && t < 1.0) {
+            int bi = int(clamp(floor(t * 96.0), 0.0, 95.0));
+            vec4 pv = _HullCutProfile[bi / 4];
+            int pc = bi - (bi / 4) * 4;
+            float halfBeam = (pc == 0 ? pv.x : (pc == 1 ? pv.y : (pc == 2 ? pv.z : pv.w))) * 1.0;
+            fp = (1.0 - smoothstep(halfBeam + 0.10, halfBeam + 0.42, abs(across)))
+               * smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.96, 1.0, t));
+          }
+          float sinkY = _HullCutWaterY - 0.38;              // target surface under the hull (below the floor)
+          displacement.y = mix(displacement.y, sinkY - worldPos.y, fp);
+          displacement.x *= (1.0 - fp);
+          displacement.z *= (1.0 - fp);
+        }
+
         // Wake riding on the swell: flatten the FFT chop in the churned core (the boat
         // smooths the water), carve a trough there, and raise the diverging bow-wave crests.
         vec2 wcv = _wakeCV(vWorldUV);
@@ -798,6 +836,13 @@ export class OceanFFTMaterial {
       }
       const wake = this._deps.getBoatWake?.();
       if (wake) { eff.setFloat2('_BoatPos', wake.x, wake.z); eff.setFloat2('_BoatDir', wake.dirX, wake.dirZ); }
+      const hc = this._deps.getHullCut?.();
+      if (hc) {
+        eff.setFloat('_HullCutOn', hc.on);
+        eff.setFloat('_HullCutWaterY', hc.waterY);
+        eff.setArray4('_HullCutProfile', hc.profile);
+        eff.setFloat4('_HullCutMeta', hc.alongMin, hc.alongLen, hc.acrossCenter, hc.alongSign);
+      }
       const wp = this._deps.getWakePaths?.();
       if (wp) {
         eff.setArray4('_WakePaths', wp.paths as unknown as number[]);

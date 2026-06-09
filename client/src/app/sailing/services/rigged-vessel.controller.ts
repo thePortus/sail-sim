@@ -3,6 +3,7 @@ import {
   InstantiatedEntries, Skeleton, PBRMaterial,
 } from '@babylonjs/core';
 import { RiggedManifest, SailState } from '../models';
+import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
 
@@ -25,7 +26,7 @@ import { BakedAOPlugin } from './baked-ao.plugin';
  * B_Gaff are overwritten each frame (after the clip scrub) so they swing to the correct
  * leeward side per tack — which a single one-sided clip can't represent.
  */
-export class SloopController {
+export class SloopController implements VesselController {
   readonly root: TransformNode;
   private readonly scene: Scene;
   private readonly manifest: RiggedManifest;
@@ -233,6 +234,14 @@ export class SloopController {
 
   private applyTrim(): void {
     this.pose('Trim', (this.trimCur ?? 0) * this.frameEnd);
+  }
+
+  /** Unified trim entry point (VesselController). Square-rigged sloop: brace the yards from the eased
+   *  sheet angle and swing the boom/gaff to the leeward side for the current tack. */
+  setSailTrim(sheetAngleDeg: number, isPortTack: boolean): void {
+    this.setTrim(Math.max(0, Math.min(1, (88 - sheetAngleDeg) / 83)));   // 0 square (eased) .. 1 braced
+    const swingSide = isPortTack ? -1 : 1;
+    this.setBoomSwing(swingSide * (sheetAngleDeg - 90) * Math.PI / 180);
   }
 
   /** Gunport lids per side: 0 = closed (default), 1 = open. */

@@ -71,6 +71,7 @@ export class OceanFFTRenderer {
       },
       getShore: () => this.oceanService.getShoreInfo(),
       getBoatWake: () => this.oceanService.getBoatWake(),
+      getHullCut: () => this.oceanService.getHullCut(),
       getWakePaths: () => ({
         paths: this._wakeTracker.paths,
         meta: this._wakeTracker.meta,

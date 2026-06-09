@@ -127,11 +127,17 @@ export class HarborService {
     // measured while the parent is still at identity (so child world AABB == model space).
     let off = this.seawardOffset.get(h.variant);
     if (off === undefined) { off = this.computeSeawardOffset(pier); this.seawardOffset.set(h.variant, off); }
-    pier.rotation.y = off;
 
     // Place at the shore point, waterline at y=0, body extending along the seaward heading.
+    // IMPORTANT: the seaward yaw (off) is applied to the PARENT, not the pier. The instantiated root
+    // carries the glTF loader's RH->LH coordinate-conversion rotationQuaternion, and Babylon ignores a
+    // node's Euler `.rotation` whenever a rotationQuaternion is set — so the old `pier.rotation.y = off`
+    // was silently a no-op, leaving every pier facing 180 deg landward (invisible on the symmetric
+    // straight, but it threw the asymmetric L/T crossbar onto the shore). The parent has no quaternion,
+    // so off composes cleanly onto its world Y: rotation.y = heading + off rotates the model's measured
+    // seaward axis onto the world seaward direction.
     parent.position.set(h.x, 0, h.z);
-    parent.rotation.y = (h.heading * Math.PI) / 180;
+    parent.rotation.y = (h.heading * Math.PI) / 180 + off;
 
     // Static registration. The pier's full PBR (albedo+MR+normal, + emissive lantern) is heavy on
     // WebGPU's hard 16 inter-stage-variable cap. Like the vessel (VesselService.registerMeshesForRendering),

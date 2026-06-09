@@ -2,6 +2,9 @@
 
 # General or Current TODO Items
 
+* zoomable map
+* fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
+* make sure towns DON'T spawn in tiny spot barely sticking out of the water
 * clouds occlude birds
 * shallow water gets into boat, not displaced
 * keypress makes songs lock up

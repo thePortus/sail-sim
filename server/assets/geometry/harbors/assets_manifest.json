@@ -1,0 +1,315 @@
+{
+  "schema": "harbor-town-assets/1.0",
+  "convention": {
+    "units": "meters (1u=1m)",
+    "up": "Y (glTF)",
+    "origin": "ground/waterline centered",
+    "textures": "embedded WebP",
+    "requires": [
+      "EXT_texture_webp",
+      "KHR_materials_emissive_strength"
+    ]
+  },
+  "count": 13,
+  "assets": [
+    {
+      "id": "cabin_dwelling",
+      "file": "cabin_dwelling.glb",
+      "category": "cabin",
+      "name": "Log dwelling",
+      "placement": "ground",
+      "size_m": {
+        "width_x": 6.26,
+        "height_y": 5.62,
+        "depth_z": 5.49
+      },
+      "footprint_m": [
+        6.26,
+        5.49
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3211,
+      "notes": "Stone foundation; shingle roof; stone chimney. Emissive windows."
+    },
+    {
+      "id": "cabin_shack",
+      "file": "cabin_shack.glb",
+      "category": "cabin",
+      "name": "Fisherman's shack on stilts",
+      "placement": "shoreline_waterline",
+      "size_m": {
+        "width_x": 4.61,
+        "height_y": 6.75,
+        "depth_z": 4.15
+      },
+      "footprint_m": [
+        4.61,
+        4.15
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 2708,
+      "notes": "Raised on pilings; place at water's edge. Thatch roof. Emissive window."
+    },
+    {
+      "id": "cabin_tavern",
+      "file": "cabin_tavern.glb",
+      "category": "cabin",
+      "name": "Dockside tavern",
+      "placement": "ground",
+      "size_m": {
+        "width_x": 8.41,
+        "height_y": 6.7,
+        "depth_z": 7.31
+      },
+      "footprint_m": [
+        8.41,
+        7.31
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 4196,
+      "notes": "Covered porch + hanging sign; emissive windows; barrels on porch."
+    },
+    {
+      "id": "fountain_simple",
+      "file": "fountain_simple.glb",
+      "category": "fountain",
+      "name": "Simple stone basin",
+      "placement": "plaza_ground",
+      "size_m": {
+        "width_x": 2.83,
+        "height_y": 1.15,
+        "depth_z": 2.83
+      },
+      "footprint_m": [
+        2.83,
+        2.83
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 877,
+      "notes": "Low octagonal basin + bubbler."
+    },
+    {
+      "id": "fountain_spout",
+      "file": "fountain_spout.glb",
+      "category": "fountain",
+      "name": "Dolphin spout fountain",
+      "placement": "plaza_ground",
+      "size_m": {
+        "width_x": 3.64,
+        "height_y": 1.94,
+        "depth_z": 3.64
+      },
+      "footprint_m": [
+        3.64,
+        3.64
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 1351,
+      "notes": "Bronze leaping dolphins. Reflective water surface."
+    },
+    {
+      "id": "fountain_statue",
+      "file": "fountain_statue.glb",
+      "category": "fountain",
+      "name": "Statue fountain",
+      "placement": "plaza_ground",
+      "size_m": {
+        "width_x": 3.64,
+        "height_y": 3.69,
+        "depth_z": 3.64
+      },
+      "footprint_m": [
+        3.64,
+        3.64
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 1268,
+      "notes": "Central trident figure. Reflective water surface."
+    },
+    {
+      "id": "fountain_tiered",
+      "file": "fountain_tiered.glb",
+      "category": "fountain",
+      "name": "Tiered classical fountain",
+      "placement": "plaza_ground",
+      "size_m": {
+        "width_x": 3.79,
+        "height_y": 3.1,
+        "depth_z": 3.79
+      },
+      "footprint_m": [
+        3.79,
+        3.79
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 1092,
+      "notes": "Stacked bowls + jets. Water material is reflective (no animation; add in-engine)."
+    },
+    {
+      "id": "pier_l",
+      "file": "pier_l.glb",
+      "category": "pier",
+      "name": "L-shaped pier",
+      "placement": "shoreline_waterline",
+      "size_m": {
+        "width_x": 11.25,
+        "height_y": 4.9,
+        "depth_z": 13.3
+      },
+      "footprint_m": [
+        11.25,
+        13.3
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3043,
+      "notes": "Perpendicular arm at the sea end; more dock edge."
+    },
+    {
+      "id": "pier_straight",
+      "file": "pier_straight.glb",
+      "category": "pier",
+      "name": "Straight finger pier",
+      "placement": "shoreline_waterline",
+      "size_m": {
+        "width_x": 3.23,
+        "height_y": 4.9,
+        "depth_z": 14.3
+      },
+      "footprint_m": [
+        3.23,
+        14.3
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 2356,
+      "notes": "Dock edge on one long side; bollards/ladder at the seaward half."
+    },
+    {
+      "id": "pier_t",
+      "file": "pier_t.glb",
+      "category": "pier",
+      "name": "T-shaped pier",
+      "placement": "shoreline_waterline",
+      "size_m": {
+        "width_x": 11.3,
+        "height_y": 4.9,
+        "depth_z": 13.3
+      },
+      "footprint_m": [
+        11.3,
+        13.3
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3180,
+      "notes": "Crossbar head; docks multiple ships."
+    },
+    {
+      "id": "shipwright_shack",
+      "file": "shipwright_shack.glb",
+      "category": "cabin",
+      "name": "Shipwright's workshop",
+      "placement": "ground",
+      "size_m": {
+        "width_x": 6.91,
+        "height_y": 5.43,
+        "depth_z": 7.58
+      },
+      "footprint_m": [
+        6.91,
+        7.58
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3925,
+      "notes": "Workshop + work-yard: anchor, ship's wheel, plank stacks, sawhorse, barrels."
+    },
+    {
+      "id": "townhall_governor",
+      "file": "townhall_governor.glb",
+      "category": "townhall",
+      "name": "Governor's Hall (pastel + tower)",
+      "placement": "ground",
+      "size_m": {
+        "width_x": 12.46,
+        "height_y": 11.65,
+        "depth_z": 9.7
+      },
+      "footprint_m": [
+        12.46,
+        9.7
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3947,
+      "notes": "Pastel plaster; bell/clock tower; arcade + balcony."
+    },
+    {
+      "id": "townhall_magistrate",
+      "file": "townhall_magistrate.glb",
+      "category": "townhall",
+      "name": "Magistrate's Hall (white)",
+      "placement": "ground",
+      "size_m": {
+        "width_x": 11.46,
+        "height_y": 8.67,
+        "depth_z": 9.2
+      },
+      "footprint_m": [
+        11.46,
+        9.2
+      ],
+      "origin": "centered at ground/waterline; drop at placement point (y=0)",
+      "up_axis": "Y (glTF)",
+      "scale": "1 unit = 1 m (do not rescale)",
+      "textures": "embedded WebP (EXT_texture_webp)",
+      "emissive": true,
+      "file_kb": 3622,
+      "notes": "Whitewashed plaster; arched arcade + balcony; hipped tile roof."
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const jwt    = require('jsonwebtoken');
+const config = require('./config/db.config');
 const db   = require('./models');
 const User = db.User;
 const { fn, col, where } = db.Sequelize;
@@ -315,6 +317,27 @@ async function loadAndBroadcastFriends(id, callsign, playersMap) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Authenticate a websocket upgrade with the same JWT the REST API uses. Browsers can't set custom
+ * headers on a WebSocket, so the client passes the token as a query param: wss://host/?token=<jwt>.
+ * Returns the verified identity { userId, callsign, role } or null if the token is missing/invalid/
+ * expired (the caller closes the socket with a 4401 the client maps to "re-login"). The callsign +
+ * role come straight from the signed token payload, so they cannot be spoofed by the client.
+ */
+function verifyWsToken(req) {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+    if (!token) return null;
+    const decoded = jwt.verify(token, config.JWT_SECRET);
+    const d = decoded && decoded.data;
+    if (!d || d.id == null) return null;
+    return { userId: d.id, callsign: String(d.callsign ?? '').slice(0, 32), role: d.role };
+  } catch {
+    return null;   // bad signature / expired / malformed
+  }
+}
+
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
@@ -398,9 +421,19 @@ function attachMultiplayer(server) {
     }
   }, 33);
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    // ── Authenticate the connection (JWT) ──────────────────────────────────────
+    // No valid token → refuse with a 4401 close code. The client treats 4401 as "your session is
+    // invalid" and routes to the login screen. This binds every connection to a real user, so the
+    // callsign/identity used everywhere below can't be spoofed.
+    const auth = verifyWsToken(req);
+    if (!auth) {
+      try { ws.close(4401, 'unauthorized'); } catch { /* already closing */ }
+      return;
+    }
+
     const id = String(nextId++);
-    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState() });
+    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState(), auth });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
     ws.send(JSON.stringify(currentWaveState()));
@@ -436,7 +469,9 @@ function attachMultiplayer(server) {
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
-          callsign:   String(msg.callsign   ?? '').slice(0, 32),
+          // Authoritative identity from the verified JWT — a forged `msg.callsign` is ignored, so a
+          // client can't impersonate another player or hijack their single-session slot.
+          callsign:   players.get(id).auth.callsign,
         };
         players.get(id).state = state;
         players.get(id).lastUpdateMs = Date.now();   // for combat victim-pose lag compensation

@@ -16,6 +16,7 @@ import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
+import { AuthService } from '../../services/auth.service';
 
 // Remote vessel rig assets are resolved per slug via rigForSlug() (vessel-controller.ts).
 
@@ -80,6 +81,7 @@ export class MultiplayerService {
   private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
+  private authService    = inject(AuthService);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
   chatMessages  = signal<ChatMessage[]>([]);
@@ -88,6 +90,9 @@ export class MultiplayerService {
   // Set when the server kicks this session (same account opened in another window).
   // The game component watches this to show a notice and bail out of the session.
   kickedReason  = signal<string | null>(null);
+  // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
+  // watches this to force a fresh login — the session token can no longer be trusted.
+  authFailed    = signal<boolean>(false);
 
   // Callsigns this user has muted/blocked — their chat is dropped on receipt.
   // Persisted in localStorage so the block list survives reloads.
@@ -250,6 +255,7 @@ export class MultiplayerService {
   connect(callsign: string): void {
     this.localState.callsign = callsign;
     this.kickedReason.set(null);   // clear any stale kick from a previous session
+    this.authFailed.set(false);
 
     // Recoil animation tick — runs every render frame while connected
     const scene = this.sceneService.scene;
@@ -268,7 +274,10 @@ export class MultiplayerService {
       scene.registerBeforeRender(this.recoilTickFn);
     }
 
-    const url = Settings.wsUrl;
+    // Authenticate the socket: browsers can't set WS headers, so pass the JWT as a query param. The
+    // server verifies it and refuses (close 4401) if it's missing/invalid.
+    const token = this.authService.getToken();
+    const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
     this.ws = new WebSocket(url);
 
     this.ws.addEventListener('open', () => {
@@ -287,10 +296,12 @@ export class MultiplayerService {
       this.zone.run(() => this.handleMessage(msg));
     });
 
-    this.ws.addEventListener('close', () => {
+    this.ws.addEventListener('close', (evt) => {
       if (this.updateTimer) clearInterval(this.updateTimer);
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.telemetry.ping.set(-1);
+      // 4401 = server rejected the JWT. The token can't be trusted → force a fresh login.
+      if (evt.code === 4401) this.zone.run(() => this.authFailed.set(true));
     });
   }
 

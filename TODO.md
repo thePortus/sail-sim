@@ -37,10 +37,16 @@
 
 # TODO Items by Module
 
-Great. I committed, and we are onto a major module upgrade on multiplayer movement, where we are going to make all player movement server-side authoritative... which will require thinking about the player's vessel, remote vessels... server side and client side.... thinking on systems like player collision, which had been handled locally. Basically, I want to prevent player tampering by being able to broadcast crap locations... I want server to enforce fair movement rules... Also.... I realize this means changing the player model, as we will have to store the player's location to make that authoritative between sessions. I'd also like to store the last map/seed they were on, so that we can check it against the current, and if they don't match.... start at a new spawn location.
+Great, it's time for another module.... I want to start to add (harbor) towns. Eventually, these towns will have a bunch of assets... different buildings, etc... but for now, they are going to be represented by the most central asset in the town for any sailing vessel.... the pier. I have pier assets (three variations) attached here with handoff documentation.
 
-But before we get started there are two related minor changes I want to make...
+Physical Placement - We need to automatically identify, during terrain generation, about 30-50 sites for harbors. A suitable site is any area of beach that is relatively flat that could have a pier running out into the water where a player's ship can pull up to reach it. So, we need to find the spot... and figure out the orientation that would put the pier so one end is on the beach, and one hangs out over the water. Terrain maps can change over time, so we will want to identify sites each time we make a new map
 
-1.) Sometimes a player gets into the game without being properly authenticated, and as they log in get a 401 from the servers `/player-locations` route.... when this happens, the current result is that they just start over at the new player spawn (0,0)... rather than where they should be. What I want to have happen is that they are taken back to the log in screen and forced to reauthenticate, and thus have their real location
+Naming, Describing - We will want to give names and a short description to each of these towns.... now, we can have a bank of canned names/descriptions, and they just get semi-randomly assigned to each location when we generate good harbor sites.... but I want these places to have "identities"... not every town in the canned list has to appear on every map, if there are not enough suitable locations
 
-2.) I'd like to have new player spawns happen automatically near a coast.... can we have a way to identify good spawn points, choose one, and then spawn new players there
+Map - I want these towns to appear on the player's map, and their names to display when the player hovers
+
+Geometry - Eventually, each town will have its own geometry... for now that will just be one of the three pier variants... but have space to accomodate other geometry, which will be placed nearby
+
+So, every time we generate a new map, it identifies good locations, then maps existing town name/description/geometries onto those location candidates
+
+No doubt this involves new server routes and client services

@@ -267,6 +267,16 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.kickedNotice.set(reason);
       });
     });
+
+    // Websocket rejected our JWT (close 4401) — the session token is invalid/expired. Force a fresh
+    // login (full teardown + clear creds + route to /login), reusing the startup re-auth path.
+    effect(() => {
+      if (!this.multiplayerService.authFailed()) return;
+      untracked(() => {
+        this.multiplayerService.authFailed.set(false);
+        this.forceReauth();
+      });
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).

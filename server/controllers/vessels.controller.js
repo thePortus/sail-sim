@@ -85,6 +85,10 @@ const VESSELS = [
   },
 ];
 
+/** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
+ *  read per-vessel physics (maxSpeed, etc.) when checking the plausibility of a position update. */
+exports.getVesselDef = (slug) => VESSELS.find(v => v.slug === slug) || VESSELS.find(v => v.slug === 'sloop') || VESSELS[0];
+
 exports.getVessels = (req, res) => {
   const summaries = VESSELS.map(v => ({
     id: v.id, name: v.name, slug: v.slug, description: v.description,

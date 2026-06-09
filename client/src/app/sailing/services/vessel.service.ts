@@ -598,30 +598,39 @@ export class VesselService {
     this.buoyancyService.reset();
   }
 
-  // ── Ship-to-ship collision response (resolved by MultiplayerService) ────────
-  private readonly COLL_MIN_SPEED = 0.4;     // below this, don't reaim heading (avoids spin at a near-stop)
-  private readonly COLL_EASE_RATE = 14;      // how fast velocity eases to the post-impact target (1/s)
+  // Ship-to-ship collision is resolved SERVER-side now (movement.resolvePair) and arrives as a
+  // `correction` handled by applyServerCorrection(); the old local applyCollision() resolver was retired.
 
-  /** Apply a collision response to the LOCAL ship: separate out of the hull (push), then EASE the velocity
-   *  vector toward the resolved target (speed + direction) frame-rate-independently — a smooth decel +
-   *  course deflection rather than a choppy per-frame heading snap. The physics loop carries
-   *  x/z/heading/speed into the mesh and the movement broadcast. */
-  applyCollision(targetHeadingDeg: number, targetSpeed: number, pushX: number, pushZ: number, dt: number): void {
-    this.x += pushX;
-    this.z += pushZ;
-    const hr  = this.heading * Math.PI / 180;
-    let vx = this.speed * Math.sin(hr), vz = this.speed * Math.cos(hr);   // current velocity vector
-    const thr = targetHeadingDeg * Math.PI / 180;
-    const tvx = targetSpeed * Math.sin(thr), tvz = targetSpeed * Math.cos(thr);
-    const k = 1 - Math.exp(-this.COLL_EASE_RATE * dt);
-    vx += (tvx - vx) * k;
-    vz += (tvz - vz) * k;
-    this.speed = Math.hypot(vx, vz);
-    if (this.speed > this.COLL_MIN_SPEED) {
-      this.heading = (Math.atan2(vx, vz) * 180 / Math.PI + 360) % 360;
+
+  // Visual reconciliation of server corrections. The SIM (this.x/z) snaps to the authoritative pose
+  // immediately (so physics + the broadcast stay correct), but we carry the snap as a decaying RENDER
+  // offset so the mesh glides to the new spot instead of popping — smooth for collision bumps. Big
+  // corrections (teleport rejection) are snapped outright (no glide). Purely local; never networked.
+  private corrErrX = 0;
+  private corrErrZ = 0;
+  private readonly CORR_DECAY     = 9;    // 1/s — render-error decay rate (~0.3 s glide)
+  private readonly CORR_SNAP_DIST = 25;   // m — above this, snap (don't glide a teleport)
+
+  /** Reconcile the local boat to a server-authoritative pose (a `correction` message). Sent only when
+   *  the server CLAMPED our claim (teleport/speed-hack/land) or resolved a collision — rare in honest
+   *  play. The sim snaps; the visual eases (see corrErr decay in physicsStep). */
+  applyServerCorrection(x: number, z: number, heading: number, speed: number): void {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return;
+    const prevVisX = this.x + this.corrErrX, prevVisZ = this.z + this.corrErrZ;
+    this.x = x;
+    this.z = z;
+    if (Number.isFinite(heading)) this.heading = ((heading % 360) + 360) % 360;
+    if (Number.isFinite(speed)) this.speed = speed;
+    // Carry the visual continuity: offset = where the mesh was − where the sim now is. Snap big jumps.
+    const ex = prevVisX - this.x, ez = prevVisZ - this.z;
+    if (Math.hypot(ex, ez) > this.CORR_SNAP_DIST) { this.corrErrX = 0; this.corrErrZ = 0; }
+    else { this.corrErrX = ex; this.corrErrZ = ez; }
+    if (this.root) {
+      this.root.position.x = this.x + this.corrErrX;
+      this.root.position.z = this.z + this.corrErrZ;
+      this.root.rotation.y = this.heading * Math.PI / 180;
     }
   }
-
 
   // ── Sail efficiency curve ─────────────────────────────────────────────────
   // Redesigned to make close-hauled sailing viable (~52 % eff at minTackAngle).
@@ -905,6 +914,17 @@ export class VesselService {
       const swayHRad = this.heading * Math.PI / 180;
       this.root.position.x = this.x + totalSway * Math.cos(swayHRad);
       this.root.position.z = this.z - totalSway * Math.sin(swayHRad);
+    }
+
+    // Server-correction reconciliation: glide out any residual render offset so a clamp/collision snap
+    // reads as a quick slide rather than a pop. Decays frame-rate-independently; added on top of
+    // whatever position was set above (sim or sway). Zero in the common (no-correction) case.
+    if (this.corrErrX !== 0 || this.corrErrZ !== 0) {
+      const decay = Math.exp(-this.CORR_DECAY * dt);
+      this.corrErrX = Math.abs(this.corrErrX) < 0.01 ? 0 : this.corrErrX * decay;
+      this.corrErrZ = Math.abs(this.corrErrZ) < 0.01 ? 0 : this.corrErrZ * decay;
+      this.root.position.x += this.corrErrX;
+      this.root.position.z += this.corrErrZ;
     }
 
     // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess

@@ -214,7 +214,6 @@ export class GameComponent implements AfterViewInit, OnDestroy {
 
   private selectedSlug = '';
   private callsign     = '';
-  private saveInterval: ReturnType<typeof setInterval> | null = null;
 
   // Wire weather → ocean + vessel
   constructor() {
@@ -417,7 +416,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.multiplayerService.connect(this.callsign);
       });
 
-      this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
+      // Location persistence is now SERVER-authoritative: the websocket server saves the validated
+      // pose every 30 s + on disconnect. No client-side save (it would be a tamper vector).
       this.phase.set('sailing');
     } catch (error) {
       // A 401/403 anywhere in startup (verify-auth or the player-location fetch) means the stored
@@ -460,24 +460,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  /** PUT the current position to the server so it survives a reload. */
-  private saveLocation(): void {
-    if (!this.callsign) return;
-    const vs = this.vesselService.state();
-    this.http.put(
-      `${Settings.apiUrl}player-location/${encodeURIComponent(this.callsign)}`,
-      { x: vs.x, z: vs.z, heading: vs.heading, vesselSlug: this.selectedSlug },
-    ).subscribe();
-  }
-
   /** Full teardown of the running game — safe to call from both exit and destroy.
    *  keepEngine=true (Return to Harbour) rebuilds only the Scene next session, reusing the WebGPU
    *  engine; false (component destroy) disposes the engine too. */
   private teardown(keepEngine = false): void {
     if (!this.sceneStarted) return;   // scene never booted → nothing to tear down
     this.sceneStarted = false;
-    this.saveLocation();
-    if (this.saveInterval) { clearInterval(this.saveInterval); this.saveInterval = null; }
+    // Location is saved server-side (on the ws disconnect below + a 30 s autosave) — no client PUT.
     this.weatherService.stop();
     this.multiplayerService.disconnect();
     this.cannonService.dispose();

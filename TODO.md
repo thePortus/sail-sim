@@ -2,12 +2,10 @@
 
 # General or Current TODO Items
 
-* add spawns close to coast
 * clouds occlude birds
 * shallow water gets into boat, not displaced
 * keypress makes songs lock up
 * cannonfire smoke is occluded by clouds
-* add server-side authoritative movement... and force player to re-login if 401 on player-location at start... and have server check collisions for future damage bounces
 * adjust water displacement to better fit hull of pinnace
 * add dedication
 * add damage from collisions and aground
@@ -45,8 +43,8 @@ Naming, Describing - We will want to give names and a short description to each 
 
 Map - I want these towns to appear on the player's map, and their names to display when the player hovers
 
-Geometry - Eventually, each town will have its own geometry... for now that will just be one of the three pier variants... but have space to accomodate other geometry, which will be placed nearby
+Geometry - Eventually, each town will have its own geometry... for now that will just be one of the three pier variants... but have space to accomodate other geometry, which will be placed nearby. We can use asset scattering for this or not, whatever you think is most efficient
 
-So, every time we generate a new map, it identifies good locations, then maps existing town name/description/geometries onto those location candidates
+So, every time we generate a new map, it identifies good locations, then maps existing town name/description/geometries onto those location candidates... also, if we have generated a new map and seed, the player will need a new starting location
 
 No doubt this involves new server routes and client services

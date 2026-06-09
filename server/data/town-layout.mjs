@@ -140,31 +140,44 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
     place(wish.townhall, resF1 + 6 + fp[wish.townhall].d / 2, (rng() - 0.5) * 18 + town.heading);
   }
 
-  // Wandering streets: each runs roughly inland but drifts + sine-waves laterally, spread across the width.
+  // ── Streets: several wandering, roughly-parallel lanes (dense → lots of house frontage), then CONNECTORS
+  //    that tie them into one network (no orphan roads): a cross-street across the front + back of the lanes,
+  //    and a spine joining the lanes to the pier-front and the square. ──
   const streets = [];
-  const nStreets = Math.max(1, Math.min(SPEC.maxStreets, Math.floor(usableWidth / 19)));
-  const lines = [];
-  for (let k = 0; k < nStreets; k++) {
-    const baseS = nStreets === 1 ? (rng() - 0.5) * 6 : (k / (nStreets - 1) - 0.5) * (usableWidth - 18);
+  const seg = (P, Q) => { const A = L(P.f, P.s), B = L(Q.f, Q.s); streets.push({ x1: A.x, z1: A.z, x2: B.x, z2: B.z, width: STREET_W }); };
+  const nLanes = Math.max(1, Math.min(SPEC.maxStreets, Math.floor(usableWidth / 19)));
+  const lines = [];                                  // sAt functions (house frontage runs along these)
+  const fronts = [], backs = [];                     // lane endpoints, for the cross-connectors
+  for (let k = 0; k < nLanes; k++) {
+    const baseS = nLanes === 1 ? (rng() - 0.5) * 6 : (k / (nLanes - 1) - 0.5) * (usableWidth - 18);
     const amp = 5 + rng() * 9, ph = rng() * Math.PI * 2, fr = 0.6 + rng() * 1.5, tilt = (rng() - 0.5) * 0.45;
     const sAt = (f) => baseS + tilt * (f - resF0) + amp * Math.sin(ph + fr * Math.PI * (f - resF0) / Math.max(1, resF1 - resF0));
     lines.push(sAt);
-    let pp = L(resF0 - 4, sAt(resF0 - 4));
-    for (let f = resF0 + 6; f <= resF1 + 4; f += 7) { const np = L(f, sAt(f)); streets.push({ x1: pp.x, z1: pp.z, x2: np.x, z2: np.z, width: STREET_W }); pp = np; }
+    const front = { f: resF0, s: sAt(resF0) }; fronts.push(front);
+    let pcur = front;
+    for (let f = resF0 + 7; f <= resF1; f += 7) { const np = { f, s: sAt(f) }; seg(pcur, np); pcur = np; }
+    backs.push(pcur);
   }
+  // Connectors: chain the lane fronts together + the lane backs together, then a spine from the front-centre
+  // out to the pier (f≈3) and from the back-centre to the square centre — so the whole town is one network.
+  for (let k = 0; k < nLanes - 1; k++) { seg(fronts[k], fronts[k + 1]); seg(backs[k], backs[k + 1]); }
+  const mid = Math.floor(nLanes / 2);
+  seg({ f: 3, s: 0 }, fronts[mid]);
+  if (square) seg(backs[mid], { f: resF1 + 6 + SPEC.squareD / 2, s: 0 });
 
-  // Candidate house lots along both sides of every street, jittered + rotated to face the street.
+  // House candidate lots along both sides of each lane (jittered position/setback, rotated to face the road).
   const cands = [];
   for (const sAt of lines) {
     for (let f = resF0 + rng() * 3; f <= resF1; f += 7.5 + rng() * 2.5) {
       const sc = sAt(f), ds = (sAt(f + 1) - sAt(f - 1)) / 2, tl = Math.hypot(1, ds);
-      const nF = -ds / tl, nS = 1 / tl;              // unit normal (across the street) in local (f,s)
+      const nF = -ds / tl, nS = 1 / tl;
       for (const side of [-1, 1]) {
         const setback = STREET_W / 2 + 4.1 + rng() * 1.8;
-        const cf = f + nF * side * setback + (rng() - 0.5) * 1.6;
-        const cs = sc + nS * side * setback + (rng() - 0.5) * 1.6;
-        const rot = localHeading(-nF * side, -nS * side) + (rng() - 0.5) * 28;   // face the street ± ~14°
-        cands.push({ f: cf, s: cs, rot });
+        cands.push({
+          f: f + nF * side * setback + (rng() - 0.5) * 1.6,
+          s: sc + nS * side * setback + (rng() - 0.5) * 1.6,
+          rot: localHeading(-nF * side, -nS * side) + (rng() - 0.5) * 28,
+        });
       }
     }
   }

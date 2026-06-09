@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* bring trees back
 * zoomable map
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
 * shallow water gets into boat, not displaced

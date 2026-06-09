@@ -1,5 +1,6 @@
 import { Injectable, inject, signal } from '@angular/core';
-import { TransformNode, Vector3, Mesh, Material, Scene, PBRMaterial, Color3, PointLight, Observer } from '@babylonjs/core';
+import { TransformNode, Vector3, Mesh, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
+  StandardMaterial, DynamicTexture, VertexData, Texture } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
@@ -45,13 +46,16 @@ export class HarborService {
   // async builds against the per-frame scan re-triggering.
   private readonly townNodes = new Map<string, TransformNode>();
   private readonly townLoading = new Set<string>();
+  // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
+  private squareMat: StandardMaterial | null = null;
+  private roadMat: StandardMaterial | null = null;
   private readonly BUILD_RANGE = 1500;
   private readonly DROP_RANGE = 1900;
   private readonly STREAM_BUILDINGS = true;
-  // Dock when the hull is within ~10 ft (≈3 m) of the pier DECK EDGE (not the shore point — the pier
+  // Dock when the hull is within ~20 ft (≈6 m) of the pier DECK EDGE (not the shore point — the pier
   // blocks the centre from ever reaching the shore). Per-variant deck size (m): len = along-seaward
   // from the shore point, halfWidth = half the across-extent (matches the server pier-obstacles dims).
-  private readonly DOCK_EDGE_M = 3;
+  private readonly DOCK_EDGE_M = 6;
   private readonly PIER_DIMS: Record<string, { len: number; halfWidth: number }> = {
     straight: { len: 14.3, halfWidth: 1.6 },
     l:        { len: 11.0, halfWidth: 6.5 },
@@ -177,7 +181,149 @@ export class HarborService {
       parent.rotation.y = (b.rotY * Math.PI) / 180;
       this.applyBuildingRecipe(node);
     }
+    this.buildGround(h, root, padElev);
     return root;
+  }
+
+  /** Lazily build the two shared procedural ground materials: cobblestone (the civic square) + dirt (roads).
+   *  Self-contained — the textures are drawn to a canvas, so no asset files/server routes are needed. */
+  private ensureGroundMaterials(scene: Scene): void {
+    if (this.squareMat) return;
+    const cob = new StandardMaterial('townCobbleMat', scene);
+    cob.diffuseTexture = this.makeCobbleTexture(scene);
+    const dirt = new StandardMaterial('townDirtMat', scene);
+    dirt.diffuseTexture = this.makeDirtTexture(scene);
+    for (const mat of [cob, dirt]) {
+      mat.specularColor = new Color3(0, 0, 0);        // matte ground — no plastic highlight
+      mat.maxSimultaneousLights = 2;
+      mat.fogEnabled = false;
+      mat.backFaceCulling = false;                    // flat ground quads — visible regardless of winding
+      this.sceneService.excludeFromPrePass(mat);
+    }
+    // The dirt path uses its texture's alpha for soft, worn edges that blend into the ground (an "airbrushed"
+    // trodden look, not a hard-edged laid road). disableDepthWrite avoids z-fighting where roads overlap.
+    dirt.useAlphaFromDiffuseTexture = true;
+    dirt.transparencyMode = Material.MATERIAL_ALPHABLEND;
+    dirt.disableDepthWrite = true;
+    this.squareMat = cob;
+    this.roadMat = dirt;
+  }
+
+  /** Procedural cobblestone: warm-grey rounded stones with mortar gaps, brick-offset rows. */
+  private makeCobbleTexture(scene: Scene): DynamicTexture {
+    const S = 256, dt = new DynamicTexture('townCobbleTex', S, scene, true);
+    const ctx = dt.getContext() as unknown as CanvasRenderingContext2D;
+    let seed = 0x9e37; const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    ctx.fillStyle = '#4a453f'; ctx.fillRect(0, 0, S, S);
+    const cw = 22, ch = 18;
+    for (let y = -ch; y < S + ch; y += ch) {
+      const off = (Math.round(y / ch) % 2) * (cw / 2);
+      for (let x = -cw; x < S + cw; x += cw) {
+        const px = x + off + 1.5, py = y + 1.5, w = cw - 3 - rnd() * 2, h = ch - 3 - rnd() * 2;
+        const g = 118 + Math.floor(rnd() * 64);
+        ctx.fillStyle = `rgb(${g},${Math.max(0, g - 8)},${Math.max(0, g - 18)})`;
+        ctx.beginPath();
+        const rr = ctx as unknown as { roundRect?: (x: number, y: number, w: number, h: number, r: number) => void };
+        if (rr.roundRect) rr.roundRect(px, py, w, h, 4); else ctx.rect(px, py, w, h);
+        ctx.fill();
+      }
+    }
+    dt.update();
+    dt.wrapU = dt.wrapV = Texture.WRAP_ADDRESSMODE;
+    return dt;
+  }
+
+  /** Procedural WORN PATH: U across the path (0..1, clamped) = a soft alpha cross-section that wavers + thins
+   *  patchily (grass showing through); V along the path (tiling) = trodden-dirt colour noise. Alpha-blended by
+   *  the material, so the path airbrushes into the ground rather than reading as a hard-edged laid road. */
+  private makeDirtTexture(scene: Scene): DynamicTexture {
+    const W = 96, H = 128, P = 8;                      // P = noise tiling period (in V) for a seamless wrap
+    const dt = new DynamicTexture('townDirtTex', { width: W, height: H }, scene, true);
+    const ctx = dt.getContext() as unknown as CanvasRenderingContext2D;
+    const img = ctx.createImageData(W, H), d = img.data;
+    const hash = (x: number, y: number) => { let h = (x * 374761393 + y * 668265263) | 0; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+    const vn = (x: number, y: number) => {            // tileable bilinear value-noise (period P in y)
+      const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+      const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      const hh = (a: number, b: number) => hash(a, ((b % P) + P) % P);
+      const n00 = hh(xi, yi), n10 = hh(xi + 1, yi), n01 = hh(xi, yi + 1), n11 = hh(xi + 1, yi + 1);
+      return (n00 * (1 - sx) + n10 * sx) * (1 - sy) + (n01 * (1 - sx) + n11 * sx) * sy;
+    };
+    const smooth = (a: number, b: number, x: number) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    for (let y = 0; y < H; y++) {
+      const vv = y / H;
+      for (let x = 0; x < W; x++) {
+        const uu = x / (W - 1), distC = Math.abs(uu - 0.5) * 2;       // 0 centre … 1 edge
+        const halfW = 0.62 + (vn(uu * 3, vv * P) - 0.5) * 0.30;       // wavering path width
+        let alpha = 1 - smooth(halfW - 0.28, halfW + 0.04, distC);    // soft fade past the edge
+        alpha *= 0.66 + 0.34 * vn(uu * 5 + 11, vv * P + 3);          // patchy wear (grass peeks through)
+        const worn = 1 - (1 - distC) * 0.22;                         // centre darker (trodden)
+        const base = (96 + vn(uu * 7 + 3, vv * P * 2) * 30) * worn;  // darker trodden earth (reads in daylight)
+        const i = (y * W + x) * 4;
+        d[i] = base; d[i + 1] = base * 0.80; d[i + 2] = base * 0.58;
+        d[i + 3] = Math.max(0, Math.min(255, alpha * 255));
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    dt.update();
+    dt.hasAlpha = true;
+    dt.wrapU = Texture.CLAMP_ADDRESSMODE;              // U = cross-section, don't repeat the falloff
+    dt.wrapV = Texture.WRAP_ADDRESSMODE;               // V = along the path, tiles
+    return dt;
+  }
+
+  /** Build a town's ground: a dirt ribbon mesh along the (curving) street segments + a cobblestone square,
+   *  laid flat on the pad just above the terrain. One mesh each → cheap; parented to the town so they stream
+   *  + dispose with it (materials are shared and survive — see dispose()). */
+  private buildGround(h: TerrainHarbor, root: TransformNode, padElev: number): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    this.ensureGroundMaterials(scene);
+    // Drape on the ACTUAL ground (so roads follow the slope down to the pier, not float flat) + 8 cm.
+    const yAt = (x: number, z: number) => (this.sceneService.getTerrainHeight(x, z) ?? padElev) + 0.08;
+
+    // ── Dirt roads: each street segment → a SUBDIVIDED ribbon that conforms to the terrain; all one mesh ──
+    if (h.streets?.length) {
+      const pos: number[] = [], idx: number[] = [], uv: number[] = [], nrm: number[] = [];
+      for (const s of h.streets) {
+        const dx = s.x2 - s.x1, dz = s.z2 - s.z1, len = Math.hypot(dx, dz) || 1;
+        const px = (-dz / len) * (s.width / 2), pz = (dx / len) * (s.width / 2);
+        const n = Math.max(1, Math.ceil(len / 4));     // ~4 m steps so it tracks the slope
+        for (let i = 0; i <= n; i++) {
+          const t = i / n, cx = s.x1 + dx * t, cz = s.z1 + dz * t;
+          const lx = cx + px, lz = cz + pz, rx = cx - px, rz = cz - pz;
+          const b = pos.length / 3;
+          pos.push(lx, yAt(lx, lz), lz, rx, yAt(rx, rz), rz);
+          nrm.push(0, 1, 0, 0, 1, 0);
+          const v = (len * t) / 6;
+          uv.push(0, v, 1, v);                         // U=0/1 across the path, V tiles along it
+          if (i > 0) idx.push(b - 2, b, b - 1, b - 1, b, b + 1);
+        }
+      }
+      const vd = new VertexData(); vd.positions = pos; vd.indices = idx; vd.uvs = uv; vd.normals = nrm;
+      const mesh = new Mesh(`roads_${h.id}`, scene);
+      vd.applyToMesh(mesh);
+      mesh.material = this.roadMat; mesh.parent = root; mesh.renderingGroupId = 2;
+      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+    }
+
+    // ── Cobblestone square (on the flat pad; sampled corners + 3 cm above the roads where they meet) ──
+    if (h.square) {
+      const sq = h.square, hr = (sq.rotY * Math.PI) / 180;
+      const ax = Math.sin(hr), az = Math.cos(hr);     // along heading (halfZ axis)
+      const bx = Math.cos(hr), bz = -Math.sin(hr);    // across (halfX axis)
+      const corner = (a: number, c: number) => [sq.cx + ax * a * sq.halfZ + bx * c * sq.halfX, sq.cz + az * a * sq.halfZ + bz * c * sq.halfX];
+      const cs = [corner(-1, -1), corner(1, -1), corner(-1, 1), corner(1, 1)];
+      const vd = new VertexData();
+      vd.positions = cs.flatMap((c) => [c[0], yAt(c[0], c[1]) + 0.03, c[1]]);
+      vd.normals = [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0];
+      vd.uvs = [0, 0, sq.halfZ / 2.5, 0, 0, sq.halfX / 2.5, sq.halfZ / 2.5, sq.halfX / 2.5];
+      vd.indices = [0, 2, 1, 1, 2, 3];
+      const mesh = new Mesh(`square_${h.id}`, scene);
+      vd.applyToMesh(mesh);
+      mesh.material = this.squareMat; mesh.parent = root; mesh.renderingGroupId = 2;
+      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+    }
   }
 
   /** WebGPU-minimal recipe for a building's meshes. These imported PBR materials otherwise blow the per-
@@ -307,6 +453,8 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    this.squareMat?.dispose(false, true); this.squareMat = null;   // shared ground mats + their procedural textures
+    this.roadMat?.dispose(false, true);   this.roadMat = null;
     this.root?.dispose(false, false);
     this.root = null;
     this.harbors = [];

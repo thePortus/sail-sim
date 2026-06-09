@@ -221,9 +221,11 @@ p {
   }
 }
 
-// ── Fullscreen toggle button ──────────────────────────────────────────────────
+// ── Fullscreen + photo-mode buttons (top-right) ───────────────────────────────
 
-.fullscreen-btn {
+.fullscreen-btn,
+.photo-btn,
+.fp-btn {
   position: absolute;
   top: 1.25rem;
   right: 1.25rem;
@@ -238,7 +240,7 @@ p {
   backdrop-filter: blur(12px);
   color: rgba(255, 255, 255, 0.55);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, opacity 0.15s;
   z-index: 41;   // sits above hud-panel (z-index: 40)
 
   &:hover {
@@ -246,6 +248,35 @@ p {
     color: rgba(255, 255, 255, 0.90);
     border-color: rgba(255, 255, 255, 0.25);
   }
+}
+
+// Photo button sits just left of the fullscreen button (34px + a small gap).
+.photo-btn {
+  right: calc(1.25rem + 34px + 8px);
+
+  // In photo mode it's the lone control left on screen — dim it so it doesn't intrude on the shot
+  // (still clickable; brightens on hover).
+  &.active {
+    opacity: 0.28;
+    &:hover { opacity: 1; }
+  }
+}
+
+// First-person button sits left of the photo button (two slots over).
+.fp-btn {
+  right: calc(1.25rem + 2 * (34px + 8px));
+
+  // Lit blue while first-person is active, so the toggle state is obvious.
+  &.active {
+    color: #93c5fd;
+    border-color: rgba(96, 165, 250, 0.55);
+    background: rgba(59, 130, 246, 0.22);
+  }
+}
+
+// Photo mode: hide every HUD element EXCEPT the photo button (the way back; Esc also exits).
+.hud-overlay.photo-mode > *:not(.photo-btn) {
+  display: none !important;
 }
 
 kbd {

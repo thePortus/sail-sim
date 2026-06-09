@@ -24,7 +24,10 @@ const fs    = require('fs');
 const path  = require('path');
 
 const OUTPUT_DIR = path.join(__dirname, '..', 'assets', 'terrain', 'tiles');
-const CDN_BASE   = 'https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k';
+// Resolution knob: default 1k; pass --2k for crisper close-up tiles (≈4× the bytes — heavier VRAM once
+// packed into the S1 texture arrays). Higher res is the "higher-quality sets" lever requested for S1.
+const RES        = process.argv.includes('--2k') ? '2k' : '1k';
+const CDN_BASE   = `https://dl.polyhaven.org/file/ph-assets/Textures/jpg/${RES}`;
 
 // ── Texture manifest ──────────────────────────────────────────────────────
 // Each entry:
@@ -45,10 +48,14 @@ const TILES = [
   { biome: 'snow',   polyId: 'snow_02',           note: '~15 m tile' },
 ];
 
-// Both diff (colour) and nor_gl (OpenGL normal map) are fetched.
+// Full PBR channel set. diff + nor are required; rough + ao are OPTIONAL (a few Polyhaven assets lack
+// them — those are skipped with a warning, the build still works). rough drives the wet/dry response;
+// ao deepens crevices. (S1 packs these into texture arrays; metalness is 0 for all terrain.)
 const MAPS = [
-  { suffix: 'diff',   outSuffix: 'diff' },
-  { suffix: 'nor_gl', outSuffix: 'nor'  },
+  { suffix: 'diff',   outSuffix: 'diff',  optional: false },
+  { suffix: 'nor_gl', outSuffix: 'nor',   optional: false },
+  { suffix: 'rough',  outSuffix: 'rough', optional: true  },
+  { suffix: 'ao',     outSuffix: 'ao',    optional: true  },
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -107,20 +114,26 @@ async function main() {
   let downloaded = 0;
   let skipped    = 0;
 
+  let missing = 0;
   for (const tile of TILES) {
     for (const map of MAPS) {
       const filename = `${tile.biome}_${map.outSuffix}.jpg`;
       const dest     = path.join(OUTPUT_DIR, filename);
-      const url      = `${CDN_BASE}/${tile.polyId}/${tile.polyId}_${map.suffix}_1k.jpg`;
+      const url      = `${CDN_BASE}/${tile.polyId}/${tile.polyId}_${map.suffix}_${RES}.jpg`;
 
       process.stdout.write(`  ${filename.padEnd(22)} ← ${tile.polyId}  `);
       const existed = fs.existsSync(dest);
-      await download(url, dest);
-      if (existed) { skipped++; } else { downloaded++; }
+      try {
+        await download(url, dest);
+        if (existed) { skipped++; } else { downloaded++; }
+      } catch (err) {
+        if (map.optional) { process.stdout.write(`[skip — not available]\n`); missing++; }
+        else { throw err; }
+      }
     }
   }
 
-  console.log(`\n✓ Done.  ${downloaded} downloaded, ${skipped} skipped.`);
+  console.log(`\n✓ Done.  ${downloaded} downloaded, ${skipped} skipped, ${missing} optional missing.  (res ${RES})`);
   console.log(`  Output: ${OUTPUT_DIR}\n`);
   console.log('  Textures are CC0 — free for any use including commercial.');
   console.log('  Attribution appreciated but not required (polyhaven.com).\n');

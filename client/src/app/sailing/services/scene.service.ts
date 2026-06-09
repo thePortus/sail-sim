@@ -10,10 +10,10 @@ import {
   VolumetricLightScatteringPostProcess,
 } from '@babylonjs/core';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
-import { Atmosphere } from '@babylonjs/addons/atmosphere';
-import { UnregisterMaterialPlugin } from '@babylonjs/core/Materials/materialPluginManager';
+import { Settings } from '../../app.settings';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
+import { ProceduralSky } from './procedural-sky';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -29,11 +29,10 @@ export class SceneService {
 
   private skyMat!:    SkyMaterial;
   private skyMesh:    any;
-  // Physically-based atmospheric scattering (Babylon 9 addon). When active it renders the sky
-  // and drives the sun light's colour/intensity, superseding the Preetham skybox + manual sun
-  // curves. Flag lets us A/B against the old sky and fall back if unsupported.
-  private readonly useAtmosphere = true;
-  private atmosphere: Atmosphere | null = null;
+  // Homegrown WGSL day/night sky (WebGPU path). Replaces the old Babylon Atmosphere addon (removed:
+  // it forced a PBR REFLECTION recompile that failed to link on WebGPU) AND the Preetham SkyMaterial
+  // dome. Null on the WebGL fallback, where the Preetham SkyMaterial sky is kept instead.
+  private proceduralSky: ProceduralSky | null = null;
   private sun!:       DirectionalLight;
   private moonLight!: DirectionalLight;
   private ambient!:   HemisphericLight;
@@ -109,6 +108,11 @@ export class SceneService {
   /** Called by TerrainService so the sun can be occluded by the heightfield. */
   setTerrainHeightSampler(fn: (x: number, z: number) => number): void {
     this.terrainHeightSampler = fn;
+  }
+  /** Terrain surface elevation (metres) at a world XZ, or null if the heightfield isn't ready yet.
+   *  Land is positive, seabed negative. Used for camera terrain-collision (clamp above the ground). */
+  getTerrainHeight(x: number, z: number): number | null {
+    return this.terrainHeightSampler ? this.terrainHeightSampler(x, z) : null;
   }
 
   // ── Post-processing setter cache ────────────────────────────────────────────
@@ -205,14 +209,12 @@ export class SceneService {
       this.scene.fogMode    = Scene.FOGMODE_EXP2;
       this.scene.fogDensity = 0.000035;
 
-      this.buildSky();
+      this.buildSky();             // Preetham SkyMaterial dome (kept as the WebGL fallback sky)
+      this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
       this.buildLights();
       this.buildCelestialBodies();
       this.buildStars();
       this.buildCamera(canvas);
-      // NOTE: the atmosphere is built LATER via activateAtmosphere() — after the rest of the
-      // scene's materials have compiled — because constructing it corrupts the WebGPU GLSL→SPIR-V
-      // compile of any custom material built around/after it (varying-location failures).
       this.buildPostProcessing();
       this.buildOceanDepthRenderer();
       this.startRenderLoop();
@@ -242,45 +244,26 @@ export class SceneService {
     this.skyMesh = skybox;
   }
 
-  // ── Physically-based atmosphere (Babylon addon) ───────────────────────────────
-
   /**
-   * Build the physical atmosphere. Call this AFTER the full scene has loaded and its materials
-   * have compiled — constructing the atmosphere earlier corrupts the WebGPU GLSL→SPIR-V compile
-   * of custom materials built around it. Waits for the scene to be ready first.
+   * Build the homegrown WGSL day/night sky (WebGPU only) and retire the Preetham dome.
+   * On the WebGL fallback this is skipped and the Preetham SkyMaterial keeps driving the sky.
+   * Safe to construct during scene setup: unlike the atmosphere addon it registers NO material
+   * plugin and touches no other material's compile — it's a standalone ProceduralTexture + a
+   * StandardMaterial skybox.
    */
-  async activateAtmosphere(): Promise<void> {
-    if (!this.useAtmosphere || !this.scene || this.atmosphere) { return; }
-    await this.scene.whenReadyAsync();
+  private buildProceduralSky(): void {
+    if (!this._isWebGPU || !this.scene) { return; }
     try {
-      if (!Atmosphere.IsSupported(this.engine)) {
-        console.info('[Scene] Atmosphere addon unsupported on this engine — keeping Preetham sky.');
-        return;
-      }
-      // The atmosphere illuminates from the sun DirectionalLight; we keep driving its DIRECTION
-      // from the day/night clock and let the atmosphere set its colour + intensity physically.
-      const atm = new Atmosphere('atmosphere', this.scene, [this.sun]);
-      atm.isLinearSpaceComposition = true;  // we composite in HDR linear → pipeline ACES tonemaps
-      atm.isLinearSpaceLight       = true;  // PBR materials expect linear light
-      atm.skyRenderingGroup        = 0;     // sky behind everything (where the skybox drew)
-      this.atmosphere = atm;
-
-      // The atmosphere auto-registers a PBR material plugin ("atmo-pbr") that injects
-      // aerial-perspective/sky-IBL code into EVERY PBRMaterial-classed material — including our
-      // boat (PBRMaterial) and FFT ocean (PBRCustomMaterial, which inherits that class name).
-      // Its injected GLSL uses `#include` directives that the WebGPU GLSL→SPIR-V path can't
-      // resolve, so those materials fail to compile (boat invisible, ocean off). We don't need
-      // atmospheric scattering on these near-camera surfaces (our own fog/haze covers distance),
-      // so unregister the auto-attach. The sky render + physical sun-light driving are separate
-      // and unaffected.
-      UnregisterMaterialPlugin('atmo-pbr');
-
-      // Retire the Preetham skybox — the atmosphere renders the sky now.
-      this.skyMesh?.setEnabled(false);
-      console.info('[Scene] Atmosphere addon active — physical sky + sun lighting.');
+      // domeSize must fit INSIDE camera.maxZ (120000) at the box CORNERS, or the far plane clips the upper
+      // corners and the blue-tinted scene clearColor leaks through as a bright blue zenith ring (immune to
+      // the sky shader — it's the engine background). corner = size*sqrt(3)/2; 130000 -> ~112600 < 120000.
+      this.proceduralSky = new ProceduralSky(this.scene, { domeSize: 130000 });
+      this.skyMesh?.setEnabled(false);   // the procedural sky renders the sky now
+      console.info('[Scene] Procedural WGSL sky active — Preetham dome retired.');
     } catch (e) {
-      console.warn('[Scene] Atmosphere init failed — keeping Preetham sky.', e);
-      this.atmosphere = null;
+      console.warn('[Scene] Procedural sky init failed — keeping Preetham sky.', e);
+      this.proceduralSky = null;
+      this.skyMesh?.setEnabled(true);
     }
   }
 
@@ -346,13 +329,25 @@ export class SceneService {
     this.sunMesh.renderingGroupId = 2;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
 
-    // Moon — a rocky, self-glowing sphere built from a procedural crater texture.
-    // disableLighting + emissiveTexture means it shows its surface fully lit (a
-    // glowing full moon) regardless of scene lighting; the glow layer adds a halo.
+    // Moon — a self-glowing sphere wrapped in NASA's real lunar colour map (CGI Moon Kit LROC colour,
+    // public domain; served from /sky/moon, fetched by `npm run download:sky-textures`). disableLighting
+    // + emissiveTexture shows the surface fully lit (a glowing full moon) regardless of scene lighting;
+    // the glow layer adds a halo. The real map is darker than the old procedural grey, so emissiveColor
+    // is boosted (>1, HDR) to keep the disc bright after tone-mapping — tune here if it reads dim/bright.
     const moonMat = new StandardMaterial('moonMat', this.scene);
     moonMat.disableLighting = true;
-    moonMat.emissiveTexture = this.buildMoonTexture();
-    moonMat.emissiveColor   = new Color3(0.82, 0.88, 1.0);   // cool moonlight tint
+    const moonTex = new Texture(
+      `${Settings.apiUrl}sky/moon`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
+      null,
+      () => {   // server texture missing (sky textures not downloaded) → procedural fallback
+        console.warn('[Scene] moon texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
+        moonMat.emissiveTexture = this.buildMoonTexture();
+      },
+    );
+    moonMat.emissiveTexture = moonTex;
+    // Bright cool disc. HDR (>1) + ACES tone-mapping compress it toward white while keeping crater
+    // detail; the disc brightness lives here (NOT the moonLight intensity, which lights the scene).
+    moonMat.emissiveColor   = new Color3(2.6, 2.72, 3.0);
     moonMat.diffuseColor    = Color3.Black();
     moonMat.specularColor   = Color3.Black();
 
@@ -361,6 +356,9 @@ export class SceneService {
     this.moonMesh.isPickable = false;
     this.moonMesh.renderingGroupId = 2;
     this.moonMesh.visibility = 0;
+    // CRITICAL for disc brightness: the moon sits ~62 km out where EXP2 fog saturates, washing the
+    // disc toward the (dark, at night) fog colour. Exempt it from fog like the star dome.
+    this.moonMesh.applyFog = false;
     this.glowLayer.addIncludedOnlyMesh(this.moonMesh);
   }
 
@@ -370,9 +368,24 @@ export class SceneService {
   // slightly in colour (cool blue-white ↔ faint warm amber), with a faint Milky Way
   // band — baked into a texture so there's no fragile custom shader. Drifts slowly.
   private buildStars(): void {
-    const tex = this.buildStarTexture();
-
     const mat = new CustomMaterial('starMat', this.scene);
+
+    // Real all-sky star map: NASA Tycho Skymap II (4096x2048, public domain; served from /sky/stars,
+    // fetched by `npm run download:sky-textures`). JPG has no alpha, so getAlphaFromRGB derives opacity
+    // from luminance → the black sky stays transparent (the procedural night-sky shows through) and only
+    // stars/Milky Way draw. Falls back to the procedural starfield if the server texture is missing.
+    const tex = new Texture(
+      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
+      null,
+      () => {
+        console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
+        const fb = this.buildStarTexture();
+        mat.emissiveTexture = fb;
+        mat.opacityTexture  = fb;
+      },
+    );
+    tex.getAlphaFromRGB = true;
+
     mat.disableLighting = true;
     mat.emissiveTexture = tex;
     mat.opacityTexture  = tex;            // alpha from the texture → black sky stays clear
@@ -530,8 +543,11 @@ export class SceneService {
     );
     const depthMap = depthRenderer.getDepthMap();
     // Exclude the four ocean LOD meshes (all named 'ocean_*') so open water reads
-    // the 1e8 clear (= "far") rather than its own surface depth.
-    depthMap.renderListPredicate = (m) => !m.name.startsWith('ocean_');
+    // the 1e8 clear (= "far") rather than its own surface depth. Also exclude meshes
+    // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
+    // water with soft-waterline foam.
+    depthMap.renderListPredicate = (m) =>
+      !m.name.startsWith('ocean_') && !m.metadata?.excludeFromOceanDepth;
     // Every frame: at low FPS an every-other-frame depth pass makes the soft-waterline
     // foam around the bobbing hull strobe. (Was 2 for perf; the strobe wasn't worth it.)
     depthMap.refreshRate = 1;
@@ -558,15 +574,17 @@ export class SceneService {
     this.pipeline.bloomKernel    = 48;
     this.pipeline.bloomScale     = 0.33;
 
-    // SSAO — bakes contact shadows into corners and crevices of nearby geometry
-    // (mast base, under the boom, beneath deck railings, etc.).  maxZ = 100
-    // zeroes the AO term for any fragment beyond 100 world units from the camera,
-    // so distant islands and ocean are unaffected.  The 0.75 ratio renders the
-    // occlusion buffer at 75 % of screen resolution for a good quality/perf trade.
+    // SSAO — bakes contact shadows into corners and crevices of nearby geometry. NOTE: SSAO can't be
+    // removed outright — doing so reorganizes the WebGPU post chain and pushes the godRays pass past the
+    // 16-sampled-texture limit (black screen). It's kept, but dialed WAY down (strength 0.45, base 0.55)
+    // because the rigged vessel is excluded from the prePass (WebGPU varying budget — see
+    // VesselService.registerMeshesForRendering), so at the boat's pixels SSAO reads the OCEAN/shoreline
+    // BEHIND it and paints their AO (wave ripples + coast-shadow) onto the hull/sails. The low strength
+    // + high base make that bleed a faint wash instead of dark ripples. Proper fix: rejoin the prePass.
     const ssao            = new SSAO2RenderingPipeline('ssao2', this.scene, 0.75, [this.camera]);
     ssao.radius           = 2.0;   // world-space sample radius — tuned to ship-deck scale
-    ssao.totalStrength    = 1.8;   // amplification on the AO term (raise for darker corners)
-    ssao.base             = 0.0;   // 0 = fully dark in 100 %-occluded spots
+    ssao.totalStrength    = 0.45;  // dialed down from 1.8 to minimise the boat-pixel bleed (see note)
+    ssao.base             = 0.55;  // raised from 0 so fully-occluded spots only dim to ~55%, not black
     ssao.samples          = 16;    // 16 gives clean results on modern GPUs
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
@@ -604,7 +622,7 @@ export class SceneService {
     this.pipeline.imageProcessing.toneMappingEnabled       = true;
     this.pipeline.imageProcessing.toneMappingType          = 2;     // ACES filmic
     this.pipeline.imageProcessing.vignetteEnabled          = true;
-    this.pipeline.imageProcessing.vignetteWeight           = 0.60;
+    this.pipeline.imageProcessing.vignetteWeight           = 0.40;   // was 0.60 — lighter; corners read too dark
     this.pipeline.imageProcessing.contrast                 = 1.10;
     this.pipeline.imageProcessing.exposure                 = 1.0;
 
@@ -682,19 +700,25 @@ export class SceneService {
   /** Returns a unit vector pointing FROM the scene origin TOWARD the sun. */
   getSunDirection(): Vector3 { return this.computeSunDir(); }
 
-  /** The atmosphere-driven physical sun colour (hue) when active, else null. The atmosphere sets
-   *  the sun light's diffuse each frame from real scattering (warm at the horizon, white at noon).
-   *  Consumers use it as a HUE (magnitude is theirs) so they match the physical sky's temperature. */
+  /** The sky's sun colour (hue) for clouds/fog to match, or null. Driven by the day/night curve
+   *  (sun.diffuse: warm at the horizon, white at noon). Consumers use it as a HUE (magnitude is
+   *  theirs) so they match the sky's temperature. Named "...Atmosphere..." for the cloud/fog
+   *  consumers that predate the procedural sky. */
   getAtmosphereSunColor(): Vector3 | null {
-    if (!this.atmosphere) { return null; }
+    if (!this.proceduralSky) { return null; }
+    // sun.diffuse is LOCKED at the horizon orange (1,0.28,0.05) whenever the sun is down (it's
+    // built from above=max(0,h), which is 0 all night). Feeding that hue to the cloud plugin made
+    // the clouds glow orange at midnight. Below the horizon there is no direct sun, so return null
+    // -> the cloud/fog consumers fall back to their own neutral night colouring.
+    if (this.computeSunDir().y < -0.05) { return null; }
     const d = this.sun.diffuse;
     return new Vector3(d.r, d.g, d.b);
   }
 
-  /** The atmosphere's diffuse sky irradiance (hue) when active, else null. The addon writes it to
-   *  scene.ambientColor each frame. */
+  /** The sky's diffuse ambient (hue) for clouds/fog to match, or null. Sourced from
+   *  scene.ambientColor (driven per-frame by the day/night ambient curve). */
   getAtmosphereSkyColor(): Vector3 | null {
-    if (!this.atmosphere || !this.scene) { return null; }
+    if (!this.proceduralSky || !this.scene) { return null; }
     const a = this.scene.ambientColor;
     return new Vector3(a.r, a.g, a.b);
   }
@@ -715,7 +739,11 @@ export class SceneService {
     const elev  = Math.sin(((this.gameHours - 6) / 12) * Math.PI); // -1..1
     const az    = (this.gameHours / 24) * Math.PI * 2 - Math.PI;   // azimuth
     const horiz = Math.sqrt(Math.max(0, 1 - elev * elev));          // horizontal component
-    return new Vector3(horiz * Math.sin(az), elev, horiz * Math.cos(az));
+    // World cardinal convention (see models/index.ts, vessel.service): +X = East, -X = West.
+    // The X term is NEGATED so the sun RISES in the east (+X) and SETS in the west (-X);
+    // without it the east-west arc ran backwards (sun set in the east). Drives the sun light,
+    // shadows, sun disc/god-rays AND the procedural sky together, so they stay consistent.
+    return new Vector3(-horiz * Math.sin(az), elev, horiz * Math.cos(az));
   }
 
   private tickTimeOfDay(dt: number): void {
@@ -737,8 +765,9 @@ export class SceneService {
     this.skyCloudiness += (this.targetSkyCloudiness - this.skyCloudiness) * Math.min(1, dt * 0.35);
     const cloud = this.skyCloudiness;
 
-    // The Preetham sky is only driven when the physical atmosphere is NOT active.
-    if (!this.atmosphere) {
+    // The Preetham SkyMaterial is only driven when the procedural sky is NOT active (i.e. the
+    // WebGL fallback). On WebGPU the procedural sky renders and the Preetham dome is disabled.
+    if (!this.proceduralSky) {
       // inclination: 0 = at horizon, 0.45 ≈ high noon, negative = below horizon.
       this.skyMat.inclination = h * 0.45;
       this.skyMat.azimuth = (this.gameHours / 24 * 0.5 + 0.1) % 1;
@@ -861,7 +890,10 @@ export class SceneService {
       // real-time during the transition window, invisible at the rate the sky moves).
       const newExposure = isNight
         ? 0.72    // was 0.58 — too dark to see terrain at all at night
-        : Math.max(0.52, 1.0 + horizon * 0.40 - cloud * 0.16 - nightBlend * 0.38);
+        // Daytime base raised 1.0 → 1.35 to match the reference atmosphere look (its 1.5, minus a
+        // little since the sun=π change already brightens). horizon term softened so golden hour
+        // doesn't blow out on top of the brighter base.
+        : Math.max(0.6, 1.35 + horizon * 0.22 - cloud * 0.18 - nightBlend * 0.70);
       const newContrast = isNight
         ? 1.06
         : Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
@@ -876,19 +908,23 @@ export class SceneService {
     }
 
     // ── Directional (sun) light ────────────────────────────────────────────────
-    // Direction is always driven from the day clock. When the atmosphere is active it sets the
-    // sun's colour + intensity PHYSICALLY each frame (warm/dim at the horizon, bright at noon),
-    // so we skip the hand-tuned curves below.
+    // Direction is always driven from the day clock. Colour + intensity follow hand-tuned curves
+    // (warm/dim at the horizon, bright/white at noon).
     this.sun.direction = dir.negate();
-    if (!this.atmosphere) {
-      this.sun.intensity = above * (1.35 * (1 - cloud * 0.55));
-      this.sun.diffuse   = new Color3(
-        1.0,
-        Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
-        Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
-      );
-      this.sun.specular = this.sun.diffuse;
-    }
+    // Drive the homegrown sky from the same clock; it re-bakes its LUT only when the sun moves.
+    this.proceduralSky?.setSunDir(dir);
+    // Wide bright plateau: ramp up quickly off the horizon, then HOLD ~full across the day. Previously the
+    // intensity scaled with elevation, which compounded with the Lambert N.L falloff (intensity*N.L ~ above^2)
+    // so only a narrow window near noon read bright. Now the sun term stays strong from mid-morning through
+    // mid-afternoon; the horizon ramp (sunUp) keeps it 0 below the horizon (no night floor leak).
+    const sunUp = Math.max(0, Math.min(1, above / 0.18));
+    this.sun.intensity = sunUp * (0.85 + 0.95 * sunUp) * (1 - cloud * 0.55);   // peak ~1.80 (was ~1.25)
+    this.sun.diffuse   = new Color3(
+      1.0,
+      Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
+      Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
+    );
+    this.sun.specular = this.sun.diffuse;
 
     // ── Moonlight (directional, opposite the sun, only at night) ─────────────
     // Peaks at midnight (h = -1) → intensity 0.35, zero by sunrise.
@@ -904,7 +940,7 @@ export class SceneService {
     // moonlight and don't render as featureless black silhouettes.
     this.ambient.intensity = (isNight
       ? 0.28 + cloud * 0.05
-      : 0.10 + above * 0.38 + cloud * 0.06)
+      : 0.24 + above * 0.30 + cloud * 0.06)
       + this._lightningFlash * 2.6;   // lightning flash brightens the whole scene
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight
@@ -958,10 +994,10 @@ export class SceneService {
     // islands don't read brighter than the dark storm sky behind them.
     fog = Color3.Lerp(fog, overcast, Math.min(0.92, cloud * (0.45 + stormDark * 0.45)));
 
-    // Match the fog to the physical sky's horizon when the atmosphere is active: keep the tuned
-    // brightness (the day/dusk/night + overcast curve above) but swap the HUE to the atmosphere's
-    // sky colour, warmed toward the sun colour as the sun nears the horizon (golden-hour haze).
-    // Storm overcast keeps its own grey (cloud high → atmosphere tint backed off).
+    // Match the fog to the sky's horizon when the procedural sky is active: keep the tuned
+    // brightness (the day/dusk/night + overcast curve above) but swap the HUE to the sky's
+    // ambient colour, warmed toward the sun colour as the sun nears the horizon (golden-hour haze).
+    // Storm overcast keeps its own grey (cloud high → sky tint backed off).
     const atmoSky = this.getAtmosphereSkyColor();
     const atmoSun = this.getAtmosphereSunColor();
     if (atmoSky && atmoSun) {

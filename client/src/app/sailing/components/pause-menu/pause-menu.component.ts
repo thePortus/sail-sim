@@ -1,6 +1,7 @@
 import { Component, Output, EventEmitter, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MusicService } from '../../services/music.service';
+import { SfxService } from '../../services/sfx.service';
 
 @Component({
   selector: 'app-pause-menu',
@@ -23,6 +24,29 @@ import { MusicService } from '../../services/music.service';
       <div class="now-playing">
         <span class="now-playing-icon">{{ music.isPlaying() ? '♫' : '♩' }}</span>
         <span class="now-playing-name">{{ music.currentTrackName() }}</span>
+      </div>
+
+      <!-- Audio controls -->
+      <div class="pause-audio">
+        <div class="audio-buttons">
+          <button class="audio-btn" [class.audio-btn--on]="music.isEnabled()" (click)="toggleMusic()">
+            {{ music.isEnabled() ? '🔊 Music On' : '🔇 Music Off' }}
+          </button>
+          <button class="audio-btn" (click)="nextTrack()"
+                  [disabled]="music.trackList().length <= 1">⏭ Next Track</button>
+        </div>
+        <div class="audio-slider-row">
+          <span class="audio-label">Music</span>
+          <input type="range" min="0" max="1" step="0.01"
+                 [value]="music.volume()" (input)="onVolume($event)" class="audio-slider" />
+          <span class="audio-pct">{{ volumePct() }}%</span>
+        </div>
+        <div class="audio-slider-row">
+          <span class="audio-label">Sound</span>
+          <input type="range" min="0" max="1" step="0.01"
+                 [value]="sfx.volume()" (input)="onSfxVolume($event)" class="audio-slider" />
+          <span class="audio-pct">{{ sfxVolumePct() }}%</span>
+        </div>
       </div>
 
       <!-- Navigation buttons -->
@@ -79,6 +103,35 @@ import { MusicService } from '../../services/music.service';
     .now-playing-icon { color: #c8a44a; font-size: 1rem; }
     .now-playing-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+    /* Audio controls */
+    .pause-audio {
+      display: flex; flex-direction: column; gap: 0.5rem;
+      padding: 0.85rem; border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .audio-buttons { display: flex; gap: 0.5rem; }
+    .audio-btn {
+      flex: 1; padding: 0.45rem; border-radius: 6px;
+      font-family: monospace; font-size: 0.8rem; font-weight: bold; cursor: pointer;
+      background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.72);
+      border: 1px solid rgba(255,255,255,0.12);
+      transition: filter 0.15s, color 0.15s, background 0.15s;
+    }
+    .audio-btn:hover:not(:disabled) { filter: brightness(1.15); color: #fff; }
+    .audio-btn:disabled { opacity: 0.4; cursor: default; }
+    .audio-btn--on { color: #c8a44a; border-color: rgba(200,170,100,0.35); }
+    .audio-slider-row { display: flex; align-items: center; gap: 0.6rem; }
+    .audio-label {
+      font-family: monospace; font-size: 0.75rem; color: rgba(255,255,255,0.55);
+      width: 3.2rem; flex-shrink: 0;
+    }
+    .audio-slider { flex: 1; accent-color: #c8a44a; cursor: pointer; }
+    .audio-pct {
+      font-family: monospace; font-size: 0.72rem; color: rgba(255,255,255,0.45);
+      width: 2.6rem; text-align: right; flex-shrink: 0;
+    }
+
     .pause-actions { display: flex; flex-direction: column; gap: 0.6rem; }
     .pause-btn {
       width: 100%; padding: 0.75rem;
@@ -123,8 +176,17 @@ export class PauseMenuComponent {
   @Output() openSettings = new EventEmitter<void>();
 
   readonly music = inject(MusicService);
+  readonly sfx   = inject(SfxService);
 
   onResume():   void { this.resume.emit(); }
   onQuit():     void { this.quit.emit(); }
   onSettings(): void { this.openSettings.emit(); }
+
+  // Audio controls (mirror the settings menu; both bind the same MusicService/SfxService signals).
+  volumePct(): number { return Math.round(this.music.volume() * 100); }
+  onVolume(e: Event): void { this.music.setVolume(+(e.target as HTMLInputElement).value); }
+  sfxVolumePct(): number { return Math.round(this.sfx.volume() * 100); }
+  onSfxVolume(e: Event): void { this.sfx.setVolume(+(e.target as HTMLInputElement).value); }
+  async toggleMusic(): Promise<void> { await this.music.toggle(); }
+  async nextTrack(): Promise<void> { await this.music.next(); }
 }

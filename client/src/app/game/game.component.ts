@@ -17,6 +17,14 @@ import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
+import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
+import { ScatterService }     from '../sailing/services/scatter/scatter.service';
+import { BirdService }         from '../sailing/services/bird.service';
+import { DolphinService }      from '../sailing/services/dolphin.service';
+import { SeaweedService }      from '../sailing/services/seaweed.service';
+import { ReedService }         from '../sailing/services/reed.service';
+import { ShipBellService }     from '../sailing/services/ship-bell.service';
+import { SailAudioService }    from '../sailing/services/sail-audio.service';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
@@ -40,7 +48,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
   standalone: true,
   imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent],
   template: `
-    <div class="game-root">
+    <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
       <canvas #gameCanvas class="game-canvas"
               [class.game-canvas--visible]="phase() === 'sailing'"></canvas>
@@ -76,7 +84,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
       <!-- In-game HUD -->
       @if (phase() === 'sailing') {
-        <app-hud (exitGame)="onExitGame()" />
+        <app-hud (exitGame)="onExitGame()" (photoModeChange)="photoMode.set($event)" />
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
@@ -141,6 +149,10 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       display: inline-block; padding: 0 4px; border-radius: 3px;
       border: 1px solid rgba(255,255,255,0.18); color: rgba(255,255,255,0.35);
     }
+    /* Photo mode (driven by the HUD): hide our own chrome too — minimap + admin hint/panel. */
+    .game-root.photo-mode .minimap-anchor,
+    .game-root.photo-mode .admin-hint,
+    .game-root.photo-mode app-admin-panel { display: none !important; }
   `],
 })
 export class GameComponent implements AfterViewInit, OnDestroy {
@@ -157,6 +169,14 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
+  private oceanAudioService  = inject(OceanAudioService);
+  private scatterService     = inject(ScatterService);
+  private birdService        = inject(BirdService);
+  private dolphinService     = inject(DolphinService);
+  private seaweedService     = inject(SeaweedService);
+  private reedService        = inject(ReedService);
+  private shipBellService    = inject(ShipBellService);
+  private sailAudioService   = inject(SailAudioService);
   private multiplayerService = inject(MultiplayerService);
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
@@ -165,6 +185,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   phase      = signal<GamePhase>('selecting');
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
+  photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
   @HostListener('window:keydown.escape')
@@ -283,12 +304,34 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         // Build the FFT ocean surface (clipmap + PBR material), disabled. Ctrl+Shift+O
         // A/Bs it against the procedural ocean while the rewrite is in progress.
         this.oceanFftRenderer.init();
-        this.cloudService.init();
+        // PERF DIAGNOSTIC: ?noclouds skips the volumetric clouds (raymarch) to isolate their cost.
+        if (!location.search.includes('noclouds')) { this.cloudService.init(); }
+        // Weather-driven ambient sea bed (filtered-noise wash + whitecap hiss).
+        this.oceanAudioService.init();
       });
 
       // 3. Load terrain
       await this.runInitStep('init-terrain', 'Surveying the coastline…', async () => {
         await this.terrainService.init();
+      });
+
+      // 3b. Asset scattering (grass/rocks/driftwood/trees/palms) — needs the terrain ready.
+      // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
+      await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
+        if (!location.search.includes('noscatter')) { await this.scatterService.init(); }
+        // Coastal birds — flocks of gulls near land (rafts on the water + circling overhead). Own
+        // service (they move, unlike static scatter). PERF DIAGNOSTIC: ?nobirds skips them.
+        if (!location.search.includes('nobirds')) { await this.birdService.init(); }
+        // A single pod of dolphins that frolics around the boat. PERF DIAGNOSTIC: ?nodolphins skips it.
+        if (!location.search.includes('nodolphins')) { await this.dolphinService.init(); }
+        // Underwater seaweed clumps, shallows-only, seen through the shallow refraction. ?noseaweed skips.
+        if (!location.search.includes('noseaweed')) { await this.seaweedService.init(); }
+        // Shoreline reeds — rooted in the water's edge, tops peeking above the surface. ?noreeds skips.
+        if (!location.search.includes('noreeds')) { await this.reedService.init(); }
+        // Ship's bell: a brief "clang clang" at midnight / dawn / noon / dusk. ?nobells skips it.
+        if (!location.search.includes('nobells')) { this.shipBellService.init(); }
+        // Sail canvas rustle/flap when sails are set (more under full sail + wind). ?nosailsfx skips it.
+        if (!location.search.includes('nosailsfx')) { this.sailAudioService.init(); }
       });
 
       // 4. Fetch vessel
@@ -357,11 +400,6 @@ export class GameComponent implements AfterViewInit, OnDestroy {
 
       this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
       this.phase.set('sailing');
-
-      // Build the physical atmosphere LAST — after every scene material has compiled — so its
-      // construction can't corrupt their WebGPU GLSL→SPIR-V compile (varying-location failures).
-      // Fire-and-forget: it waits for scene-ready internally and falls back to the Preetham sky.
-      void this.sceneService.activateAtmosphere();
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);
@@ -402,6 +440,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cannonService.dispose();
     this.musicService.dispose();
     this.cloudService.dispose();
+    this.oceanAudioService.dispose();
+    this.dolphinService.dispose();
+    this.seaweedService.dispose();
+    this.reedService.dispose();
+    this.shipBellService.dispose();
+    this.sailAudioService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
     this.sceneService.dispose();

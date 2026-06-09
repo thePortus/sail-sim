@@ -1,7 +1,8 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  MeshBuilder, Vector2, Vector3, AbstractMesh, Mesh, ShaderMaterial, Scene,
+  MeshBuilder, Vector2, Vector3, Vector4, AbstractMesh, Mesh, ShaderMaterial, Scene,
   MirrorTexture, Plane, Texture, DynamicTexture, RenderTargetTexture, Color4,
+  StandardMaterial,
 } from '@babylonjs/core';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
 import { SceneService } from './scene.service';
@@ -201,6 +202,7 @@ uniform float u_reflectionStrength;  // 1 = RTT reflections on, 0 = analytic-sky
 uniform float u_seabedStrength;      // 1 = shallow-water transparency on, 0 = off (Water-transparency setting)
 uniform int u_normalIter;            // per-LOD fragment normal detail (near hi, far lo)
 uniform vec3  u_sunDir;          // unit vector toward the sun (boat shadow on water)
+uniform vec4  u_fishStartle;     // xy = recent cannon-shot pos, w = flee strength (fish scatter)
 uniform mat4  view;              // auto-bound by Babylon — world→view (camera) space
 uniform sampler2D u_sceneDepth;  // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
 uniform sampler2D u_refraction;  // seabed (terrain) colour for true shallow-water transparency
@@ -413,6 +415,11 @@ float fishField(vec2 p, float t) {
   float sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
   vec2  cellC = (id + 0.5) / scale;
   vec2  fishC = cellC + vec2(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;  // wander within the cell
+  // Cannon startle: shove this fish away from a recent nearby shot (u_fishStartle.xy = pos, .w = strength).
+  vec2  sOff  = fishC - u_fishStartle.xy;
+  float sLen  = length(sOff) + 1e-4;
+  float sFall = u_fishStartle.w * (1.0 - smoothstep(0.0, 24.0, sLen));            // only fish within ~24 m flee
+  fishC += (sOff / sLen) * sFall * 8.0;                                           // dart up to ~8 m outward
   vec2  vel   = vec2(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));     // heading + speed
   vec2  fwd   = normalize(vel + vec2(1e-4, 0.0));
   vec2  rel   = p - fishC;
@@ -481,6 +488,9 @@ void main() {
     discard;
   }
 
+  // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
+  // hull reads dry inside while the sea still laps the outer planking. World-space (not a
+  // screen-space mask), so it never removes the water in front of or around the hull.
   float depth = u_WaveDepth;
   vec2 worldXZ = v_worldPos.xz;
 
@@ -618,7 +628,7 @@ void main() {
   // terrain through it (true refraction): sample the seabed colour from the
   // refraction RTT at this pixel, with a slight wave-driven wobble, and blend
   // toward it by shallowness. dz ≈ 1e8 in open ocean → reveal 0.
-  float seabedReveal = 1.0 - smoothstep(0.0, 22.0, dz);
+  float seabedReveal = 1.0 - smoothstep(0.0, 44.0, dz);
   // Gate by distance to land (shore-map R = land proximity, 1 at shore → 0 far):
   // only reveal the seabed near islands, never over shallow open water.
   vec2 revShoreUV = (worldXZ - u_shoreMapCenter) / u_shoreMapSize + 0.5;
@@ -638,7 +648,7 @@ void main() {
     seabed *= (1.0 - fish * 0.50);   // a touch fainter
     // Tint toward water teal with depth so the deeper shallows read as water,
     // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
-    float depthTint = smoothstep(0.0, 22.0, dz);
+    float depthTint = smoothstep(0.0, 44.0, dz);
     vec3 shallowWater = mix(seabed, vec3(0.07, 0.30, 0.38), depthTint * 0.65);
     color = mix(color, shallowWater, seabedReveal * 0.90);
   }
@@ -887,6 +897,7 @@ uniform u_reflectionStrength: f32; // 1 = RTT reflections on, 0 = analytic-sky o
 uniform u_seabedStrength: f32;     // 1 = shallow-water transparency on, 0 = off
 uniform u_normalIter: i32;         // per-LOD fragment normal detail (near hi, far lo)
 uniform u_sunDir: vec3f;           // unit vector toward the sun (boat shadow on water)
+uniform u_fishStartle: vec4f;      // xy = recent cannon-shot pos, w = flee strength (fish scatter)
 uniform view: mat4x4f;             // auto-bound by Babylon — world→view (camera) space
 var u_sceneDepthSampler: sampler;
 var u_sceneDepth: texture_2d<f32>; // camera-space Z of opaque geom (ocean excluded), 1e8 = empty
@@ -1094,7 +1105,12 @@ fn fishField(p: vec2f, t: f32) -> f32 {
   let sp1 = 0.30 + rnd * 0.55;
   let sp2 = 0.40 + fract(rnd * 7.3) * 0.60;
   let cellC = (id + vec2f(0.5)) / scale;
-  let fishC = cellC + vec2f(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+  var fishC = cellC + vec2f(sin(t * sp1 + ph), sin(t * sp2 + ph * 1.7)) * 4.5;
+  // Cannon startle: shove this fish away from a recent nearby shot (u_fishStartle.xy = pos, .w = strength).
+  let sOff  = fishC - uniforms.u_fishStartle.xy;
+  let sLen  = length(sOff) + 1e-4;
+  let sFall = uniforms.u_fishStartle.w * (1.0 - smoothstep(0.0, 24.0, sLen));
+  fishC += (sOff / sLen) * sFall * 8.0;
   let vel   = vec2f(sp1 * cos(t * sp1 + ph), sp2 * cos(t * sp2 + ph * 1.7));
   let fwd   = normalize(vel + vec2f(1e-4, 0.0));
   let rel   = p - fishC;
@@ -1156,6 +1172,9 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     discard;
   }
 
+  // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
+  // hull reads dry inside while the sea still laps the outer planking. World-space (not a
+  // screen-space mask), so it never removes the water in front of or around the hull.
   let depth = uniforms.u_WaveDepth;
   let worldXZ = input.v_worldPos.xz;
 
@@ -1274,7 +1293,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
 
   // Depth-based shallow water (same as GLSL path): show the REAL terrain through
   // thin water by sampling the seabed refraction RTT, blended by shallowness.
-  var seabedReveal = 1.0 - smoothstep(0.0, 22.0, dz);
+  var seabedReveal = 1.0 - smoothstep(0.0, 44.0, dz);
   // Gate by distance to land (shore-map proximity) — only reveal near islands.
   let revShoreUV = (worldXZ - uniforms.u_shoreMapCenter) / uniforms.u_shoreMapSize + vec2f(0.5);
   let revInB = revShoreUV.x >= 0.0 && revShoreUV.x <= 1.0 && revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0;
@@ -1289,7 +1308,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     var fish = 0.0;
     if (uniforms.u_cameraPosition.y > 0.05) { fish = fishField(worldXZ, uniforms.u_Time); }
     seabed = seabed * (1.0 - fish * 0.50);   // a touch fainter
-    let depthTint = smoothstep(0.0, 22.0, dz);
+    let depthTint = smoothstep(0.0, 44.0, dz);
     let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));
     color = mix(color, shallowWater, vec3f(seabedReveal * 0.90));
   }
@@ -1418,6 +1437,12 @@ export class OceanService {
   private shoreMapSize = 3000;  // correct world width; placeholder is always black
 
   private elapsed    = 0;
+
+  // Fish startle: a recent cannon shot the drifting-fish silhouettes scatter away from. xy = world pos,
+  // w = flee strength (a quick-rise / smooth-decay envelope on the CPU, so the two oceans needn't share
+  // a clock). _fishStartleAge < 0 means idle.
+  private readonly _fishStartle = new Vector4(0, 0, 0, 0);
+  private _fishStartleAge = -1;
   private boatX      = 0;
   private boatZ      = 0;
   private boatHdgR   = 0;
@@ -1516,10 +1541,20 @@ export class OceanService {
     this.reflectionRTT.refreshRate = 2;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
+    // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
+    // GPUParticleSystem's CLIPPLANE GLSL variant fails to link on WebGPU ("0:42 'location': SPIR-V
+    // requires location") — a one-time compile error that spammed the console. Particle reflections
+    // at 512px/half-rate are negligible anyway. (objectRenderer renders ALL started particle systems
+    // unless this is off, regardless of renderList.)
+    this.reflectionRTT.renderParticles = false;
 
-    // Seed with the sky — always present and covers the whole horizon.
+    // Seed with the sky — always present and covers the whole horizon. Either the Preetham
+    // dome ('skybox', WebGL fallback) or the homegrown WGSL sky ('proceduralSky', WebGPU) is
+    // enabled at a time; enrol whichever exists so the ocean reflects the live sky.
     const skybox = scene.getMeshByName('skybox');
     if (skybox) this.reflectionRTT.renderList!.push(skybox);
+    const procSky = scene.getMeshByName('proceduralSky');
+    if (procSky) this.reflectionRTT.renderList!.push(procSky);
 
     // CRITICAL: register as a custom render target so BabylonJS renders it
     // every frame.  Without this entry the ShaderMaterial sampler receives a
@@ -1539,12 +1574,13 @@ export class OceanService {
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
       !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_') &&
-      m.name !== 'skybox';   // exclude the sky: where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+      m.name !== 'skybox' && m.name !== 'proceduralSky';   // exclude the sky (both variants): where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
     // Clear to a sandy tan so where the seabed drops off (no terrain behind the water) the
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
     this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
+    this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 
     // Island meshes arrive asynchronously (HTTP load).  Auto-enroll them so
@@ -1663,7 +1699,7 @@ export class OceanService {
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
-          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir',
+          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir', 'u_fishStartle',
           'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter',
           'u_wakePath', 'u_wakeCount', 'u_splashData', 'u_splashCount',
         ],
@@ -1706,6 +1742,7 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setVector4('u_fishStartle', this._fishStartle);
     mat.setFloat('u_reflectionStrength', this._reflectionsEnabled ? 1 : 0);
     mat.setFloat('u_seabedStrength',     this._transparencyEnabled ? 1 : 0);
     // Per-LOD fragment-normal detail: near/LOD0 stay smooth (reflections read clearly),
@@ -1726,6 +1763,57 @@ export class OceanService {
 
     return mat;
   }
+
+  // ── Hull interior water-clip (baked hull-silhouette mask, height-aware) ─────
+
+  // Baked hull beam-profile cut (texture-free → no sampler; Mac/Metal caps samplers at 16). The
+  // profile is half-beam vs along-position; the ocean shader cuts sea inside it AND above waterY.
+  static readonly HULL_CUT_N = 96;      // along-bins (must match the shader's array size × 4)
+  private hullCutOn       = 0;
+  private hullCutProfile  = new Array<number>(OceanService.HULL_CUT_N).fill(0);
+  private hullCutAlongMin = 0;
+  private hullCutAlongLen = 1;
+  private hullCutAcrossCenter = 0;
+  private hullCutAlongSign = 1;         // +1 if the boat's forward (BoatDir) is +root-Z, else -1
+  private hullCutWaterY   = -1.0e9;     // world Y of the boat's floor; sea ABOVE this (in hull) is cut
+
+  /** Install the baked hull beam profile for the local boat's interior cut (once, on load).
+   *  alongSign maps the boat's forward heading to +root-Z (flip if bow/stern read swapped). */
+  setHullCutProfile(profile: Float32Array, alongMin: number, alongLen: number, acrossCenter: number,
+                    alongSign: 1 | -1): void {
+    const N = OceanService.HULL_CUT_N;
+    for (let i = 0; i < N; i++) { this.hullCutProfile[i] = profile[i] ?? 0; }
+    this.hullCutAlongMin = alongMin;
+    this.hullCutAlongLen = alongLen;
+    this.hullCutAcrossCenter = acrossCenter;
+    this.hullCutAlongSign = alongSign;
+  }
+
+  /** Enable/disable the interior cut (off for vessels that don't need it, e.g. the sloop). */
+  setHullCutEnabled(enabled: boolean): void { this.hullCutOn = enabled ? 1 : 0; }
+
+  /** Per-frame: the world Y of the boat's floor. Sea inside the hull ABOVE this is cut (dry interior);
+   *  sea below it is kept, so when the boat lifts on a trough you never see through the ocean. */
+  setHullCutWaterY(y: number): void { this.hullCutWaterY = y; }
+
+  /** Local boat interior-cut state, consumed by the FFT ocean material (ocean-material.ts). */
+  getHullCut(): { on: number; profile: number[]; alongMin: number; alongLen: number;
+                  acrossCenter: number; alongSign: number; waterY: number } {
+    return { on: this.hullCutOn, profile: this.hullCutProfile, alongMin: this.hullCutAlongMin,
+             alongLen: this.hullCutAlongLen, acrossCenter: this.hullCutAcrossCenter,
+             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY };
+  }
+
+  /**
+   * (legacy, unused) Carve a vessel's INTERIOR footprint out of every ocean LOD so an open, low-sitting
+   * hull reads dry inside while the sea still laps the outer planking. The cut is a boat-oriented
+   * ellipse in WORLD space (centred on u_BoatPos, oriented by u_BoatDir — both already pushed
+   * to the ocean materials each frame for the local boat), so unlike a screen-space mask it
+   * only ever removes the actual interior column, never the water in front of or around the
+   * hull. Inset just inside the planking so the exterior waterline is preserved.
+   *
+   * Superseded by the baked-mask, height-aware cut above (setHullCutMask / setHullCutWaterY).
+   */
 
   // ── Per-frame render loop ──────────────────────────────────────────────────
 
@@ -1767,6 +1855,7 @@ export class OceanService {
       this.updateWakePath(dt);
       this.updateSplashes(dt);
       this.updateCannonFlashes(dt);
+      this.updateFishStartle(dt);
 
       const allMats   = [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar];
       const boatDir = new Vector2(Math.sin(this.boatHdgR), Math.cos(this.boatHdgR));
@@ -1785,6 +1874,7 @@ export class OceanService {
         mat.setFloat('u_sunElevation',  this._sunElevation);
         mat.setFloat('u_rainIntensity', this._rainIntensity);
         mat.setVector3('u_sunDir', this.sceneService.getSunDirection());
+        mat.setVector4('u_fishStartle', this._fishStartle);
         mat.setArray4('u_wakePath', wakePathArr);
         mat.setFloat('u_wakeCount', this.wakePathCount);
         mat.setArray4('u_splashData', splashArr);
@@ -1930,6 +2020,26 @@ export class OceanService {
   getRainIntensity(): number { return this._rainIntensity; }
   /** Current shader time (same clock that drifts the ocean's cloud shadows). */
   getOceanTime(): number { return this.elapsed; }
+
+  /** A cannon shot near (x,z): the drifting fish silhouettes scatter away from it for a few seconds.
+   *  Tracks only the latest shot (one uniform). Mirror of BirdService.startleAt / DolphinService.scatterFrom. */
+  startleFish(x: number, z: number): void {
+    this._fishStartle.x = x; this._fishStartle.y = z;
+    this._fishStartleAge = 0;
+  }
+
+  /** The live fish-startle vector (xy = pos, w = strength) — also read by the FFT ocean material. */
+  getFishStartle(): Vector4 { return this._fishStartle; }
+
+  /** Advance the startle envelope: a quick rise (~0.18 s) then a smooth decay (~1.6 s), zeroed when spent. */
+  private updateFishStartle(dt: number): void {
+    if (this._fishStartleAge < 0) { return; }
+    this._fishStartleAge += dt;
+    const a = this._fishStartleAge;
+    const strength = Math.min(1, a / 0.18) * Math.exp(-a / 1.6);
+    if (a > 6 || strength < 0.002) { this._fishStartleAge = -1; this._fishStartle.w = 0; return; }
+    this._fishStartle.w = strength;
+  }
 
   /** Call each frame from CloudService — drives the surface rain-ripple normals. */
   setRainIntensity(intensity: number): void {

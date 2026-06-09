@@ -1,0 +1,75 @@
+import { AbstractMesh, InstantiatedEntries, Scene, TransformNode } from '@babylonjs/core';
+import { RiggedManifest, SailState } from '../models';
+import { SloopController } from './rigged-vessel.controller';
+import { PinnaceController } from './pinnace-vessel.controller';
+
+export type GunSide = 'S' | 'P';
+
+/**
+ * The game-facing contract every vessel's animation driver implements. VesselService (local ship) and
+ * MultiplayerService (remotes) drive vessels ONLY through this interface, so rigs can differ wildly under
+ * the hood (the sloop scrubs a brace clip + spins a wheel + 6 sails; the pinnace scrubs symmetric
+ * rudder/trim clips + 2 morph-furled sails + a Flag bone chain) without the callers caring.
+ */
+export interface VesselController {
+  readonly root: TransformNode;
+  /** -1 hard port .. 0 center .. +1 hard starboard. */
+  setRudder(t: number): void;
+  /** Trim the sails for the current sheet-eased amount + tack. Each rig maps it to its own yards/booms. */
+  setSailTrim(sheetAngleDeg: number, isPortTack: boolean): void;
+  /** Map the game's 3-state sail model onto this rig. immediate=true snaps (initial spawn pose). */
+  applySailState(state: SailState, immediate?: boolean): void;
+  setGunDeployTarget(side: GunSide, t: number): void;
+  addGunRecoil(side: GunSide, kick?: number): void;
+  isGunReady(side: GunSide): boolean;
+  gunSettled(side: GunSide): boolean;
+  setGunports(side: GunSide, open: number): void;   // no-op on rigs without gunport lids
+  dropAnchor(side: GunSide, t: number): void;
+  idleWind(windDirLocalRad: number, strength: number, t: number): void;
+  tickRig(dt: number): void;
+  getMeshes(): AbstractMesh[];
+  dispose(): void;
+}
+
+/** Rig asset descriptor by vessel slug. Used by BOTH the local VesselService (which also has the full
+ *  server vessel def) and MultiplayerService (which only knows a remote ship's slug). */
+export interface VesselRig {
+  glb: string;
+  manifest: string;
+  importFlipY: boolean;
+  rightSign: 1 | -1;
+  controller: 'sloop' | 'pinnace';
+  /** Extra metres to raise the hull out of the water (a shallow open boat shows the surface otherwise). */
+  floatDraft: number;
+  /** Clip the sea out of the hull's INTERIOR (open, low-sitting boats only) so wave crests never show
+   *  inside the floor while the sea still laps the outer planking. Uses a baked hull-silhouette mask +
+   *  a height-aware cut (see OceanService.setHullCutProfile / bakeHullCutProfile). Omit → no cut.
+   *   - floorY:    metres above the vessel root origin of the cockpit floor; sea inside the hull ABOVE
+   *                this world height is cut (dry interior), below it is kept (no see-through on troughs).
+   *   - alongSign: +1 if the boat's forward heading is +Z in the root frame; flip to -1 if bow/stern read swapped. */
+  hullCut?: { floorY: number; alongSign: 1 | -1 };
+  /** Per-vessel buoyancy feel (omit → generic sloop response). pitchScale lower = gentler bow
+   *  pitch; heaveTau higher = slower, less "bouncy" vertical follow. See VesselBuoyancyService. */
+  buoyancy?: { pitchScale?: number; heaveTau?: number };
+  /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
+  hullHalfLen: number;
+  hullHalfBeam: number;
+}
+
+export const VESSEL_RIGS: Record<string, VesselRig> = {
+  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2 },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.1, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, buoyancy: { pitchScale: 0.08, heaveTau: 2.1 } },
+};
+
+export function rigForSlug(slug: string | undefined): VesselRig {
+  return VESSEL_RIGS[slug ?? ''] ?? VESSEL_RIGS['sloop'];
+}
+
+/** Build the right controller for a vessel slug from an instantiated rigged GLB + its manifest. */
+export function createVesselController(
+  slug: string | undefined, entries: InstantiatedEntries, root: TransformNode, manifest: RiggedManifest, scene: Scene,
+): VesselController {
+  return rigForSlug(slug).controller === 'pinnace'
+    ? new PinnaceController(entries, root, manifest, scene)
+    : new SloopController(entries, root, manifest, scene);
+}

@@ -43,6 +43,8 @@ function serveTerrainPng(filename, label) {
 exports.getNormalMap   = serveTerrainPng('normal_map.png',   'Normal map');
 exports.getSpecularMap = serveTerrainPng('specular_map.png', 'Specular map');
 exports.getAOMap       = serveTerrainPng('ao_map.png',       'AO map');
+exports.getSplatMap    = serveTerrainPng('splat_map.png',    'Splat/control map');   // S2 terrain skinning
+exports.getAuxMap      = serveTerrainPng('aux_map.png',      'Aux map');   // S4: R slope, G shoreDist, B wetness, A flow
 
 /**
  * Serve a tiling terrain tile texture (JPG).

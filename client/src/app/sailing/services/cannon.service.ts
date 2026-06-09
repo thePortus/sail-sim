@@ -11,6 +11,8 @@ import { VesselService }      from './vessel.service';
 import { TerrainService }     from './terrain.service';
 import { MultiplayerService } from './multiplayer.service';
 import { SfxService }         from './sfx.service';
+import { BirdService }        from './bird.service';
+import { DolphinService }     from './dolphin.service';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -37,13 +39,12 @@ const AIM_RADIUS  = 0.30;                // tube thickness (m)
 // They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
 const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this many accrue
 
-// Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
-// x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
-// (Model gunports are mirrored+flipped by the 180° instantiate flip — tune at runtime.)
-// y lowered from the gunport-rim values so balls/blast emit from the barrel mouth,
-// not above it.
+// Default battery — the sloop's three muzzle tips per side in vessel root-local space, derived from
+// the 3 gunports. x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
+// Used when the vessel def carries no `cannons` layout. Per-vessel batteries (e.g. the pinnace's
+// single gun a side, opposite handedness) override this via syncGuns() reading VesselService.
 type Muz = { x: number; y: number; z: number };
-const MUZZLES: Record<'port' | 'stbd', Muz[]> = {
+const DEFAULT_MUZZLES: Record<'port' | 'stbd', Muz[]> = {
   port: [
     { x: -1.98, y: 1.50, z: 1.36 },
     { x: -1.87, y: 1.65, z: 2.40 },
@@ -102,6 +103,8 @@ export class CannonService {
   private terrainService     = inject(TerrainService);
   private multiplayerService = inject(MultiplayerService);
   private sfx                = inject(SfxService);
+  private birds              = inject(BirdService);
+  private dolphins           = inject(DolphinService);
   private zone               = inject(NgZone);
 
   // ── Public signals (consumed by HUD) — per-side gun state + reload progress ──
@@ -121,6 +124,12 @@ export class CannonService {
   private readonly ELEV_MAST = 12;
   readonly gunElevDeg = signal(this.ELEV_HULL);
   readonly targetMode = signal<'hull' | 'mast'>('hull');
+
+  // Continuous elevation: hold Shift to raise / Control to lower; tick() swings the angle smoothly at
+  // ELEV_RATE_DPS (so the granularity is sub-degree, not whole-degree key-repeat steps).
+  private readonly ELEV_RATE_DPS = 7;
+  private elevRaiseHeld = false;
+  private elevLowerHeld = false;
 
   /** Nudge the elevation (deg); Shift = +, Control = −. */
   elevate(deltaDeg: number): void {
@@ -159,6 +168,11 @@ export class CannonService {
     stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
   };
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
+  private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
+
+  // Active gun layout for the LOCAL ship — refreshed from the vessel def at each broadside (syncGuns).
+  private muzzles: Record<'port' | 'stbd', Muz[]> = DEFAULT_MUZZLES;
+  private gunsPerSide = DEFAULT_MUZZLES.port.length;
 
   // Cannonball pool
   private balls: Ball[] = [];
@@ -249,7 +263,7 @@ export class CannonService {
   init(): void {
     this.scene  = this.sceneService.scene;
     this.canvas = this.scene.getEngine().getRenderingCanvas() as HTMLCanvasElement;
-    this.sfxCtx = new AudioContext();
+    this.sfxCtx = this.sfx.getSharedAudioContext();   // shared SFX context (own master + reverb bus below)
     this.sfxMaster = this.sfx.createMaster(this.sfxCtx);
     this.buildCannonAudio();
 
@@ -267,6 +281,9 @@ export class CannonService {
     this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq) => {
       this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
       this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
+      this.birds.startleAt(ox, oz);   // a remote ship's broadside startles gulls near its muzzle too
+      this.dolphins.scatterFrom(ox, oz);   // …and scatters any nearby dolphins
+      this.oceanService.startleFish(ox, oz);   // …and the shallow-water fish
     };
     this.multiplayerService.onCombatHit = (msg) => this.onCombatHit(msg);
     // A repaired ship (server `combat_reset`) clears its accumulated scorch decals.
@@ -282,6 +299,10 @@ export class CannonService {
     if (this.keyHandler) {
       window.removeEventListener('keydown', this.keyHandler);
       this.keyHandler = null;
+    }
+    if (this.keyUpHandler) {
+      window.removeEventListener('keyup', this.keyUpHandler);
+      this.keyUpHandler = null;
     }
     this.multiplayerService.onRemoteShot = null;
     this.multiplayerService.onCombatHit = null;
@@ -313,10 +334,13 @@ export class CannonService {
       this.dirtPS, this.landSmokePS, this.shipDebrisPS, this.shipFirePS, this.shipSmokePS,
     ]) { ps?.stop(); ps?.dispose(); }
     this.smokeNoise?.dispose();
-    this.cannonBus = null;   // torn down with the context below
+    // Shared context: disconnect our master (severs the reverb bus / limiter / one-shots) and release it,
+    // but do NOT close the context — other SFX producers share it. One-shots auto-stop; the idle reverb
+    // bus is orphaned by the disconnect and GC'd.
+    this.cannonBus = null;
+    this.sfxMaster?.disconnect();
     this.sfx.releaseMaster(this.sfxMaster);
     this.sfxMaster = null;
-    this.sfxCtx?.close().catch(() => {});
     this.sfxCtx = null;
   }
 
@@ -365,7 +389,9 @@ export class CannonService {
       l.intensity = 0;
       // Reach far enough to wash distant cliffs and enemy ships (~1 km), but with a STANDARD
       // (quadratic-to-zero) falloff so it's bright at the firing ship and fades to a faint hint
-      // at the edge — rather than the default inverse-square, which dies within ~50 m.
+      // at the edge — rather than the default inverse-square, which dies within ~50 m. (NEARBY LAND
+      // is lit separately via a faked glow in the terrain shader — see uCannonFlash there — because a
+      // dynamic point light doesn't reach that custom PBR material, same as the emissive sea.)
       l.range        = 1150;
       l.falloffType  = Light.FALLOFF_STANDARD;
       // Sort BELOW the scene's base lights (sun/moon/ambient, priority 0): the forward renderer
@@ -700,14 +726,21 @@ export class CannonService {
     this.keyHandler = (e: KeyboardEvent) => {
       if (document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement) return;
-      // Elevation: Shift raises, Control lowers (allow key-repeat for smooth aim).
-      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevate(+1); return; }
-      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevate(-1); return; }
+      // Elevation: HOLD Shift to raise / Control to lower — tick() swings the angle continuously while
+      // held (ignore the auto-repeat; the held flag drives it). Keyup clears the flag.
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')     { this.elevRaiseHeld = true; return; }
+      if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevLowerHeld = true; return; }
       if (e.repeat) return;
       if (e.code === 'KeyZ')      this.armOrFire('port');
       else if (e.code === 'KeyC') this.armOrFire('stbd');
     };
+    // Keyup is unconditional (no input-focus guard) so the elevation can never get stuck "held".
+    this.keyUpHandler = (e: KeyboardEvent) => {
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight')       { this.elevRaiseHeld = false; }
+      else if (e.code === 'ControlLeft' || e.code === 'ControlRight') { this.elevLowerHeld = false; }
+    };
     window.addEventListener('keydown', this.keyHandler);
+    window.addEventListener('keyup', this.keyUpHandler);
   }
 
   // ── Gunnery state machine (public; driven by keys + HUD) ───────────────────
@@ -715,10 +748,19 @@ export class CannonService {
   // Per side: STOWED → (arm) → ARMING → READY → (fire) → FIRING → RELOADING → STOWED.
   // Animations (ports/run-out/recoil) are eased in SloopController via VesselService.
 
+  /** Pull the LOCAL ship's gun layout from its vessel def (per-vessel battery + handedness), or fall
+   *  back to the default sloop battery. Cheap; called whenever a side begins a broadside. */
+  private syncGuns(): void {
+    const c = this.vesselService.getCannons();
+    this.muzzles = (c && c.port.length && c.stbd.length) ? c : DEFAULT_MUZZLES;
+    this.gunsPerSide = Math.max(1, this.muzzles.port.length);
+  }
+
   /** Z / port button, C / stbd button. ARM if stowed; FIRE if ready; else ignore. */
   armOrFire(side: 'port' | 'stbd'): void {
     const g = this.gun[side];
     if (g.state === 'stowed') {
+      this.syncGuns();
       g.state = 'arming';
       this.vesselService.setGunDeploy(side, 1);
       this.multiplayerService.broadcastGunState(side, 1);
@@ -763,16 +805,16 @@ export class CannonService {
 
     } else if (g.state === 'firing') {
       g.shotTimer += dt;
-      // Fire the 3 cannons in sequence with a randomized human gap; one full
-      // hull-roll impulse on the first.
-      while (g.shotsFired < 3 && g.shotTimer >= g.nextShotAt) {
-        this.vesselService.addCannonRecoil(side);   // hull shudder per shot (3 lurches)
+      // Fire this side's cannons in sequence with a randomized human gap; one full
+      // hull-roll impulse per shot.
+      while (g.shotsFired < this.gunsPerSide && g.shotTimer >= g.nextShotAt) {
+        this.vesselService.addCannonRecoil(side);   // hull shudder per shot
         this.fireOneCannon(side, g.shotsFired);
         this.vesselService.addGunRecoilKick(side);
         g.shotsFired++;
         g.nextShotAt += STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN);
       }
-      if (g.shotsFired >= 3) {
+      if (g.shotsFired >= this.gunsPerSide) {
         g.timer += dt;
         if (g.timer >= FIRE_HOLD) {
           g.state = 'reloading'; g.timer = 0;
@@ -835,7 +877,8 @@ export class CannonService {
     const vy0     = MUZZLE_V * Math.sin(elevRad);
     const bvx     = dirX * vh, bvz = dirZ * vh;
 
-    const muz = MUZZLES[side][1] ?? MUZZLES[side][0];   // centre gun, representative
+    const m = this.muzzles[side];
+    const muz = m[Math.floor(m.length / 2)] ?? m[0];   // centre gun, representative
     const ox  = vs.x + muz.x * cosH + muz.z * sinH;
     const oy  = muz.y;
     const oz  = vs.z - muz.x * sinH + muz.z * cosH;
@@ -872,6 +915,10 @@ export class CannonService {
 
   private tick(dt: number): void {
     this.elapsed += dt;
+
+    // ── Continuous gun elevation (hold Shift/Control) ────────────────────────
+    const elevDir = (this.elevRaiseHeld ? 1 : 0) - (this.elevLowerHeld ? 1 : 0);
+    if (elevDir !== 0) { this.elevate(elevDir * this.ELEV_RATE_DPS * dt); }
 
     // ── Per-side gunnery state machines ──────────────────────────────────────
     this.tickGun('port', dt);
@@ -998,7 +1045,8 @@ export class CannonService {
     const sinH = Math.sin(hRad);
     const cosH = Math.cos(hRad);
 
-    // Beam direction (perpendicular to the hull): port = (-cosH, sinH), stbd = (cosH, -sinH).
+    // Beam direction (perpendicular to the hull): port out −X, starboard out +X. Each vessel's def
+    // places its muzzles on the matching side, so the ball always leaves out its own rail.
     const dirX = side === 'port' ? -cosH :  cosH;
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
@@ -1008,7 +1056,7 @@ export class CannonService {
     const bvz  = dirZ * vh;
 
     // Muzzle world position from this cannon's local offset, rotated by heading.
-    const muz = MUZZLES[side][idx] ?? MUZZLES[side][0];
+    const muz = this.muzzles[side][idx] ?? this.muzzles[side][0];
     const mwx = vs.x + muz.x * cosH + muz.z * sinH;
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;
@@ -1017,6 +1065,9 @@ export class CannonService {
     const myId = this.multiplayerService.getMyId() ?? 'local';
     this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq);
     this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq);
+    this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
+    this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting
+    this.oceanService.startleFish(mwx, mwz);   // …and scatters the drifting shallow-water fish
     this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
     this.playCannonSound();
   }

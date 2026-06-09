@@ -21,6 +21,13 @@ export class SfxService {
   // One master gain per registered AudioContext.
   private readonly masters = new Set<GainNode>();
 
+  // A single shared AudioContext + master for LIGHTWEIGHT procedural SFX (ship's bell, sail flaps, …).
+  // Browsers cap a page at ~6 AudioContexts; the heavier beds (rain, ocean, cannon, gulls, music/Tone)
+  // already own most of those slots, so small one-shot effects share this one instead of each grabbing
+  // a slot (a 7th `new AudioContext()` throws). Created lazily on first use.
+  private sharedCtx: AudioContext | null = null;
+  private sharedMaster: GainNode | null = null;
+
   private loadVolume(): number {
     const raw = parseFloat(localStorage.getItem(SfxService.STORAGE_KEY) ?? '0.8');
     return isNaN(raw) ? 0.8 : Math.max(0, Math.min(1, raw));
@@ -54,5 +61,27 @@ export class SfxService {
   /** Stop tracking a master gain (call when its context is closed). */
   releaseMaster(node: GainNode | null): void {
     if (node) this.masters.delete(node);
+  }
+
+  /**
+   * The shared AudioContext (lazily created once). All SFX producers route through this single context
+   * so the page never approaches the browser's ~6-context cap. Callers must NOT close it — it is owned
+   * here and lives for the app's lifetime. Each producer makes its OWN master via createMaster(ctx) (so
+   * it can tear down independently), and stops its own looping sources on dispose.
+   */
+  getSharedAudioContext(): AudioContext {
+    if (!this.sharedCtx) { this.sharedCtx = new AudioContext(); }
+    return this.sharedCtx;
+  }
+
+  /**
+   * The shared context plus a SHARED master gain (also lazily created once), for tiny one-shot producers
+   * (ship's bell, sail flaps) that don't need their own sub-mix. Don't close the context or release this
+   * master — both are owned here.
+   */
+  getSharedContext(): { ctx: AudioContext; master: GainNode } {
+    const ctx = this.getSharedAudioContext();
+    if (!this.sharedMaster) { this.sharedMaster = this.createMaster(ctx); }
+    return { ctx, master: this.sharedMaster };
   }
 }

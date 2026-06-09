@@ -140,23 +140,64 @@ export class HudComponent implements OnInit, OnDestroy {
   grounded  = this.vesselService.grounded;
   anchored  = this.vesselService.anchored;
   exitGame  = output<void>();
+  /** Emitted whenever photo mode toggles, so the parent can hide its own chrome (minimap, admin hint). */
+  photoModeChange = output<boolean>();
 
   // ── Fullscreen ────────────────────────────────────────────────────────────
   isFullscreen = signal(!!document.fullscreenElement);
-  private onFullscreenChange = () => this.isFullscreen.set(!!document.fullscreenElement);
+  // Photo mode: fullscreen + every HUD element hidden for a clean screenshot. The photo button itself
+  // stays visible (it's the only way back).
+  photoMode = signal(false);
+  private onFullscreenChange = () => {
+    const fs = !!document.fullscreenElement;
+    this.isFullscreen.set(fs);
+    // Leaving fullscreen (e.g. via Esc) also leaves photo mode, so the HUD reappears.
+    if (!fs && this.photoMode()) { this.setPhotoMode(false); }
+  };
+
+  /** Set photo mode and notify the parent (so it hides its own chrome too). */
+  private setPhotoMode(v: boolean): void {
+    if (this.photoMode() === v) { return; }
+    this.photoMode.set(v);
+    this.photoModeChange.emit(v);
+  }
+
+  // Esc leaves photo mode. Registered in the CAPTURE phase so it runs before the bubble-phase
+  // window:keydown HostListeners (incl. game.component's Esc→pause), and stopImmediatePropagation blocks
+  // them — so Esc exits photo mode WITHOUT also opening the pause menu. Covers the no-fullscreen case too
+  // (if the fullscreen request was denied, the fullscreenchange path wouldn't fire).
+  private onEscCapture = (e: KeyboardEvent): void => {
+    if (e.key !== 'Escape' || !this.photoMode()) { return; }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    void this.togglePhotoMode();   // clears photo mode + exits fullscreen if still in it
+  };
 
   ngOnInit(): void {
     document.addEventListener('fullscreenchange', this.onFullscreenChange);
+    window.addEventListener('keydown', this.onEscCapture, true);   // capture phase
   }
 
   ngOnDestroy(): void {
     document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+    window.removeEventListener('keydown', this.onEscCapture, true);
   }
 
   async toggleFullscreen(): Promise<void> {
     if (!document.fullscreenElement) {
       await document.documentElement.requestFullscreen().catch(() => {});
     } else {
+      await document.exitFullscreen().catch(() => {});
+    }
+  }
+
+  /** Photo mode: enter fullscreen + hide the whole HUD (toggle off to restore both). */
+  async togglePhotoMode(): Promise<void> {
+    const entering = !this.photoMode();
+    this.setPhotoMode(entering);
+    if (entering) {
+      if (!document.fullscreenElement) { await document.documentElement.requestFullscreen().catch(() => {}); }
+    } else if (document.fullscreenElement) {
       await document.exitFullscreen().catch(() => {});
     }
   }

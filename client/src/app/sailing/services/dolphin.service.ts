@@ -1,0 +1,275 @@
+import { Injectable, inject } from '@angular/core';
+import { Color3, Matrix, Mesh, Observer, Quaternion, Scene, StandardMaterial, Texture, Vector3 } from '@babylonjs/core';
+import '@babylonjs/core/Meshes/thinInstanceMesh';
+import { SceneService } from './scene.service';
+import { VesselService } from './vessel.service';
+import { TerrainService } from './terrain.service';
+import { DolphinSwimPlugin } from './scatter/props/dolphin-swim.plugin';
+import { loadScatterGeometry, scatterTextureUrl } from './scatter/asset-loader';
+
+/**
+ * Bottlenose dolphins seen as murky shapes swimming UNDERWATER, only in the shallows. They aren't drawn
+ * directly on top of the ocean — instead the mesh is named off the `scatter_` prefix so it renders into
+ * the ocean's seabed REFRACTION RTT, which the water shader only reveals where the water is shallow. So
+ * the dolphins show through clear shallow water and vanish as the bottom drops away (and the pod despawns
+ * the moment the boat leaves the shallows).
+ *
+ * Each dolphin is an INDEPENDENT wanderer (no pod cohesion): it darts around near the boat, eases its
+ * depth up and down, and is clamped to stay between the surface and the seabed (never under the bottom).
+ * The authored body-wave (swim shader) animates the swimming; this service drives where each one goes.
+ * `?nodolphins` disables it.
+ */
+
+/** One independent dolphin's swim state (all world-space). */
+interface Dolphin {
+  x: number; z: number; y: number;     // world position (y < 0 underwater)
+  theta: number;                       // travel heading (world, math convention)
+  targetTheta: number;                 // wander target heading
+  speed: number; targetSpeed: number;  // m/s
+  baseY: number;                       // preferred cruising depth
+  depthPhase: number; depthRate: number; depthAmp: number;
+  retarget: number;                    // countdown to the next wander/dart decision
+  scale: number;
+  homeX: number; homeZ: number;        // this pod's home, as an offset from the boat (groups the dolphins)
+  tint: Color3;
+}
+
+@Injectable({ providedIn: 'root' })
+export class DolphinService {
+  private sceneService  = inject(SceneService);
+  private vesselService = inject(VesselService);
+  private terrain       = inject(TerrainService);
+
+  private mesh: Mesh | null = null;
+  private material: StandardMaterial | null = null;
+  private observer: Observer<Scene> | null = null;
+  private matBuf = new Float32Array(0);
+  private colBuf = new Float32Array(0);
+
+  private pod: Dolphin[] = [];
+  private active = false;
+  private _swimTime = 0;
+
+  // Cannon-fire panic: while this counts down the pod bolts away from the shot, fast, on a relaxed leash —
+  // then settles back. They never despawn (presence preserved); they just scatter for a few seconds.
+  private _panic = 0;
+  private _panicX = 0;
+  private _panicZ = 0;
+  private static readonly PANIC_TIME = 5.5;
+
+  // Orientation conventions (flip if needed): a roll about the forward axis rights the side-lying model;
+  // FACE_OFFSET aims the nose. (Match the surfaced version we were tuning.)
+  private static readonly UPRIGHT = Math.PI / 2;
+  private static readonly FACE_OFFSET = Math.PI;
+
+  // Shallows window (water depth, m) the pod lives in; leash keeps them near the boat; clearances keep
+  // them off the surface and off the bottom.
+  private static readonly DEPTH_MIN = 2.0;
+  private static readonly DEPTH_MAX = 22;
+  private static readonly LEASH = 42;
+  private static readonly PODS = 2;        // number of separate dolphin pods spawned near the boat
+  private static readonly SURFACE_CLEAR = 1.0;
+  private static readonly SEABED_CLEAR = 0.7;
+
+  private static readonly TINTS: readonly Color3[] = [
+    new Color3(1.00, 1.00, 1.00),
+    new Color3(0.82, 0.86, 0.94),
+    new Color3(0.70, 0.76, 0.86),
+    new Color3(0.92, 0.95, 1.00),
+  ];
+
+  private readonly _scl = new Vector3();
+  private readonly _pos = new Vector3();
+  private readonly _quat = new Quaternion();   // scratch — avoids a per-dolphin per-frame allocation
+  private readonly _mat = new Matrix();
+
+  async init(): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || this.mesh) { return; }
+
+    const mat = new StandardMaterial('dolphin_mat', scene);
+    mat.diffuseTexture = new Texture(scatterTextureUrl('dolphin_atlas.png'), scene);
+    mat.specularColor = new Color3(0.1, 0.11, 0.13);
+    mat.emissiveColor = new Color3(0.12, 0.13, 0.15);
+    mat.backFaceCulling = false;
+    mat.twoSidedLighting = true;
+    new DolphinSwimPlugin(mat);
+    this.sceneService.excludeFromPrePass(mat);
+    this.material = mat;
+
+    // NOTE: name is NOT `scatter_…` on purpose — that lets the mesh into the ocean's seabed refraction
+    // RTT (which excludes scatter/foliage), so the dolphins are revealed through shallow water.
+    const mesh = await loadScatterGeometry(scene, 'dolphin_a.glb', 'dolphinPod', mat, false);
+    if (!mesh) { console.warn('[dolphins] dolphin_a.glb failed — no dolphins'); return; }
+    this.sceneService.excludeFromGlow(mesh);
+    mesh.isVisible = true;
+    mesh.alwaysSelectAsActiveMesh = true;
+    this.mesh = mesh;
+
+    this.observer = scene.onBeforeRenderObservable.add(() => {
+      const dt = Math.min(0.05, scene.getEngine().getDeltaTime() / 1000);
+      this._swimTime += dt;
+      DolphinSwimPlugin.SWIM.time = this._swimTime;
+      this.update(dt);
+    });
+  }
+
+  private update(dt: number): void {
+    const mesh = this.mesh;
+    if (!mesh) { return; }
+    const vs = this.vesselService.state();
+    if (!vs) { return; }
+    const bx = vs.x, bz = vs.z;
+
+    // Are we over the shallows? (seabed elevation is negative underwater; depth = −elev.)
+    const seabed = this.terrain.getElevation(bx, bz);
+    const depth = -seabed;
+    const inShallows = depth >= DolphinService.DEPTH_MIN && depth <= DolphinService.DEPTH_MAX;
+
+    if (inShallows && !this.active) { this.spawn(bx, bz); }
+    else if (!inShallows && this.active) { this.despawn(); }
+    if (!this.active) { return; }
+
+    if (this._panic > 0) { this._panic = Math.max(0, this._panic - dt); }
+    const panicking = this._panic > 0;
+    const leash = panicking ? DolphinService.LEASH * 1.7 : DolphinService.LEASH;   // let them scatter wide
+
+    const t = this._swimTime;
+    for (let i = 0; i < this.pod.length; i++) {
+      const d = this.pod[i];
+
+      // Wander / dart decisions.
+      d.retarget -= dt;
+      if (d.retarget <= 0) {
+        d.retarget = 1.2 + Math.random() * 3.0;
+        d.targetTheta = d.theta + (Math.random() - 0.5) * 2.4;       // turn somewhere new
+        d.targetSpeed = 2.0 + Math.random() * 2.8;                   // cruise…
+        if (Math.random() < 0.25) { d.targetSpeed = 5.5 + Math.random() * 2.5; }  // …or a dart
+        d.baseY = -(1.5 + Math.random() * 5);                        // pick a new cruising depth
+      }
+
+      // Leash: if it strays too far from its POD HOME (boat + the pod's offset), steer back. Leashing to
+      // the per-pod home (rather than the boat) keeps the two pods as distinct clusters that travel along.
+      const dxB = (bx + d.homeX) - d.x, dzB = (bz + d.homeZ) - d.z;
+      const distB = Math.hypot(dxB, dzB);
+      if (distB > leash) { d.targetTheta = Math.atan2(dzB, dxB); }
+
+      // Don't shoal into land: if the water AHEAD gets too shallow, veer hard back toward deeper water
+      // (toward the boat, which is in the navigable shallows).
+      const la = 7;
+      const aheadDepth = -this.terrain.getElevation(d.x + Math.cos(d.theta) * la, d.z + Math.sin(d.theta) * la);
+      const avoiding = aheadDepth < DolphinService.DEPTH_MIN;
+      if (avoiding) {
+        d.targetTheta = Math.atan2(dzB, dxB);
+        d.targetSpeed = Math.min(d.targetSpeed, 2.5);
+      } else if (panicking && distB <= leash) {
+        // Bolt away from the shot (a stable per-dolphin angular offset fans the pod out), fast.
+        d.targetTheta = Math.atan2(d.z - this._panicZ, d.x - this._panicX) + (d.depthPhase - Math.PI) * 0.15;
+        d.targetSpeed = 6.5 + Math.random() * 2.0;
+      }
+
+      // Ease heading + speed (turn sharply when avoiding the shallows or fleeing), then swim forward.
+      d.theta += this.angDiff(d.targetTheta, d.theta) * Math.min(1, dt * (avoiding ? 3.5 : panicking ? 3.0 : 1.4));
+      d.speed += (d.targetSpeed - d.speed) * Math.min(1, dt * 1.5);
+      d.x += Math.cos(d.theta) * d.speed * dt;
+      d.z += Math.sin(d.theta) * d.speed * dt;
+
+      // Depth: ease toward the cruising depth + a gentle wander, clamped between surface and seabed.
+      const sb = this.terrain.getElevation(d.x, d.z);
+      let yTarget = d.baseY + Math.sin(t * d.depthRate + d.depthPhase) * d.depthAmp;
+      const lo = sb + DolphinService.SEABED_CLEAR;                   // never under the bottom
+      const hi = -DolphinService.SURFACE_CLEAR;                      // stay below the surface
+      yTarget = hi < lo ? (lo + hi) * 0.5 : Math.max(lo, Math.min(hi, yTarget));
+      d.y += (yTarget - d.y) * Math.min(1, dt * 1.5);
+
+      // Face travel direction (Babylon handedness → negate), upright via the roll slot.
+      const yaw = -d.theta + DolphinService.FACE_OFFSET;
+      this._scl.set(d.scale, d.scale, d.scale);
+      this._pos.set(d.x, d.y, d.z);
+      Quaternion.RotationYawPitchRollToRef(yaw, DolphinService.UPRIGHT, 0, this._quat);
+      Matrix.ComposeToRef(this._scl, this._quat, this._pos, this._mat);
+      this._mat.copyToArray(this.matBuf, i * 16);
+    }
+    mesh.thinInstanceBufferUpdated('matrix');
+  }
+
+  /**
+   * Spook the pod with a cannon shot near (x,z): they bolt away from it, fast, for a few seconds, then
+   * settle back. Does NOT despawn them — their presence is preserved. No-op if no pod is currently out.
+   */
+  scatterFrom(x: number, z: number): void {
+    if (!this.active) { return; }
+    this._panic = DolphinService.PANIC_TIME;
+    this._panicX = x; this._panicZ = z;
+    for (const d of this.pod) {
+      d.targetTheta = Math.atan2(d.z - z, d.x - x) + (d.depthPhase - Math.PI) * 0.15;
+      d.targetSpeed = 6.5 + Math.random() * 2.0;
+      d.retarget = Math.max(d.retarget, 1.5);   // don't let a wander decision immediately override the bolt
+    }
+  }
+
+  /** Shortest-arc difference b−a. */
+  private angDiff(b: number, a: number): number {
+    let d = (b - a) % (Math.PI * 2);
+    if (d > Math.PI) { d -= Math.PI * 2; } else if (d < -Math.PI) { d += Math.PI * 2; }
+    return d;
+  }
+
+  /** Spawn TWO pods of independent dolphins in the shallows — each pod clusters around its own home
+   *  point (offset from the boat, kept apart) so the sea reads as livelier than one dense group. */
+  private spawn(bx: number, bz: number): void {
+    this.pod = [];
+    const baseAng = Math.random() * Math.PI * 2;
+    for (let g = 0; g < DolphinService.PODS; g++) {
+      // Pod home: a point 16–38 m from the boat, with the pods fanned to opposite-ish sides.
+      const gAng  = baseAng + (g * Math.PI * 2) / DolphinService.PODS + (Math.random() - 0.5) * 0.8;
+      const gDist = 16 + Math.random() * 22;
+      const homeX = Math.cos(gAng) * gDist, homeZ = Math.sin(gAng) * gDist;
+      const members = 5 + Math.floor(Math.random() * 4);          // 5–8 per pod (≈10–16 total)
+      for (let i = 0; i < members; i++) {
+        const ang = Math.random() * Math.PI * 2, r = 4 + Math.random() * 16;
+        this.pod.push({
+          x: bx + homeX + Math.cos(ang) * r, z: bz + homeZ + Math.sin(ang) * r, y: -(2 + Math.random() * 4),
+          theta: Math.random() * Math.PI * 2, targetTheta: Math.random() * Math.PI * 2,
+          speed: 2 + Math.random() * 2, targetSpeed: 2 + Math.random() * 2,
+          baseY: -(1.5 + Math.random() * 5),
+          depthPhase: Math.random() * Math.PI * 2,
+          depthRate: 0.1 + Math.random() * 0.25,
+          depthAmp: 0.8 + Math.random() * 2.0,
+          retarget: Math.random() * 2,
+          scale: 0.9 + Math.random() * 0.4,
+          homeX, homeZ,
+          tint: DolphinService.TINTS[Math.floor(Math.random() * DolphinService.TINTS.length)],
+        });
+      }
+    }
+    const n = this.pod.length;
+    this.matBuf = new Float32Array(n * 16);
+    this.colBuf = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const c = this.pod[i].tint, ci = i * 4;
+      this.colBuf[ci] = c.r; this.colBuf[ci + 1] = c.g; this.colBuf[ci + 2] = c.b; this.colBuf[ci + 3] = 1;
+    }
+    this.mesh!.thinInstanceSetBuffer('matrix', this.matBuf, 16, false);
+    this.mesh!.thinInstanceSetBuffer('color', this.colBuf, 4, false);
+    this.mesh!.thinInstanceCount = n;
+    this.active = true;
+  }
+
+  /** Leave the shallows → the dolphins are gone. */
+  private despawn(): void {
+    this.pod = [];
+    if (this.mesh) { this.mesh.thinInstanceCount = 0; }
+    this.active = false;
+  }
+
+  dispose(): void {
+    const scene = this.sceneService.scene;
+    if (this.observer && scene) { scene.onBeforeRenderObservable.remove(this.observer); }
+    this.observer = null;
+    this.mesh?.dispose();
+    this.material?.dispose();
+    this.mesh = null; this.material = null;
+    this.pod = []; this.active = false;
+  }
+}

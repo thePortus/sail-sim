@@ -87,7 +87,16 @@ export class VesselBuoyancyService {
    * @param t          Elapsed simulation time (seconds)
    * @param dt         Physics frame delta-time (seconds)
    */
-  update(wx: number, wz: number, headingRad: number, t: number, dt: number): BuoyancyState {
+  update(
+    wx: number, wz: number, headingRad: number, t: number, dt: number,
+    opts?: { pitchScale?: number; heaveTau?: number },
+  ): BuoyancyState {
+    // Per-vessel buoyancy feel (defaults = the generic sloop). A smaller, calmer boat
+    // (the pinnace) passes a lower pitchScale + longer heaveTau so its short hull doesn't
+    // pitch like a 10 m sloop or snap up onto every crest.
+    const pitchScale = opts?.pitchScale ?? PITCH_SCALE;
+    const heaveTau   = opts?.heaveTau   ?? HEAVE_TAU;
+
     const sinH = Math.sin(headingRad);
     const cosH = Math.cos(headingRad);
 
@@ -118,12 +127,12 @@ export class VesselBuoyancyService {
 
     const N = HULL_POINTS.length;
     const meanH     = sumH / N;
-    // PITCH_SCALE damps the raw torque-normalised angle for Voronoi crests.
-    const pitchRaw  = pitchTorq / (armFwd2 / N) * PITCH_SCALE;
-    const rollRaw   = rollTorq  / (armRgt2 / N) * PITCH_SCALE;
+    // pitchScale damps the raw torque-normalised angle for Voronoi crests.
+    const pitchRaw  = pitchTorq / (armFwd2 / N) * pitchScale;
+    const rollRaw   = rollTorq  / (armRgt2 / N) * pitchScale;
 
     // ── Smooth heave with exponential filter ──────────────────────────────
-    const alpha = 1 - Math.exp(-dt / HEAVE_TAU);
+    const alpha = 1 - Math.exp(-dt / heaveTau);
     this.heaveFiltered += (meanH - this.heaveFiltered) * alpha;
 
     // ── Smooth pitch and roll ──────────────────────────────────────────────

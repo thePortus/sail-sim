@@ -2,17 +2,22 @@
 
 const path = require('path');
 
-module.exports = {
-  // Source grayscale elevation map image.
-  // This must be a HEIGHT MAP (bright = high, dark = low / ocean).
-  // Do NOT point this at a normal map — that will produce meaningless terrain.
-  // If you want a normal map output, set generateNormalMap below.
-  sourceImage: path.join(__dirname, '..', 'assets', 'maps', 'elevation.png'),
+// Load the repo-root .env so host-run build scripts (e.g. the terrain source fetcher) pick up
+// OPENTOPO_API_KEY regardless of the directory they're launched from. Vars already present in the
+// environment (e.g. set by docker-compose) take precedence — dotenv never overrides them.
+require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
-  // Generated terrain artifacts.
+module.exports = {
+  // ── External data sources ──────────────────────────────────────────────────
+  // OpenTopography API key for fetching Copernicus GLO-30 elevation tiles.
+  // Set it in the repo-root .env (copy from .env.example) — NOT here. Blank if unset.
+  openTopoApiKey: process.env.OPENTOPO_API_KEY || '',
+
+  // ── Terrain output ───────────────────────────────────────────────────────────
+  // Where the baked terrain (manifest.json + chunk_*.bin) is written and served from.
   outputDir: path.join(__dirname, '..', 'assets', 'terrain'),
 
-  // Fit full image into current playable world envelope.
+  // Playable world envelope. The fetched region is mapped onto this square.
   worldBounds: {
     minX: -25000,
     maxX: 25000,
@@ -20,65 +25,8 @@ module.exports = {
     maxZ: 25000,
   },
 
-  // Pixel values <= threshold are ocean only.
-  // Range: 0..1 where 0 = black and 1 = white.
-  waterThreshold: 0.33,
-
-  // Chunking / quantization.
-  // Larger chunk size reduces HTTP request fan-out on large source maps.
+  // Chunking / quantization. Heights are stored as Uint16 chunks of chunkSize²; the world build maps
+  // the signed elevation range [minElevation, maxElevation] (in the manifest) across quantizationLevels.
   chunkSize: 256,
   quantizationLevels: 65535,
-
-  // Heightfield smoothing (applied before quantization).
-  // Helps convert noisy/stair-stepped source maps into gently rolling terrain
-  // while preserving the original large-scale shapes.
-  smoothingIterations: 2,
-  smoothingStrength: 0.55,
-
-  // Elevation remapping controls for better level differentiation.
-  // gamma < 1 boosts lower/mid elevations; gamma > 1 compresses them.
-  elevationGamma: 0.86,
-  // Local relief boost sharpens subtle differences without changing macro shape.
-  localReliefBoost: 0.20,
-  // How strongly boosted local detail is blended back into the terrain.
-  localReliefBlend: 0.40,
-
-  // Match current gameplay mountain scale (roughly current max island peak).
-  targetPeakElevation: 920,
-
-  // Spawn search tuning.
-  spawnPointsCount: 8,
-
-  // ── Texture map generation ────────────────────────────────────────────────
-  // When true, the build script writes normal_map.png to outputDir alongside
-  // the terrain chunks.  The output is an OpenGL tangent-space normal map:
-  //   flat surface → (127, 127, 255)  ← the standard blue
-  //   R encodes tangent-X, G encodes tangent-Y, B encodes the surface normal.
-  //
-  // Using the result in Babylon.js StandardMaterial:
-  //   material.bumpTexture = new Texture('.../normal_map.png', scene);
-  //   // For OpenGL-convention tools: no extra flip needed.
-  //   // For DirectX-convention (Substance Painter, some Photoshop plugins):
-  //   //   material.invertNormalMapY = true;
-  //
-  // normalMapStrength: scales the slope gradient before normalisation.
-  // Higher → bumpier-looking normals.  Typical range 2–15; start with 5.
-  generateNormalMap: true,
-  // Typical range 1–8.  Lower = subtle bump, higher = very pronounced slopes.
-  // 2.0 is a good starting point; increase if the terrain looks too flat.
-  normalMapStrength: 2.0,
-
-  // ── Specular map ──────────────────────────────────────────────────────────
-  // Encodes per-texel shininess: rock/steep slopes shine, grass/sand are matte.
-  generateSpecularMap: true,
-
-  // ── Ambient Occlusion map ─────────────────────────────────────────────────
-  // Darkens valleys and depressions using a depression-detection blur.
-  // aoRadius: blur window in heightfield pixels (larger = softer, wider AO).
-  // aoStrength: how aggressively depressions are darkened (2–6 typical range).
-  generateAOMap: true,
-  aoRadius:   80,   // ~1 km at 4096×4096 covering 50 km
-  // Keep strength low — coast edges are extremal and will darken hard.
-  // 1.5 gives visible valley depth while the 0.30 floor prevents black areas.
-  aoStrength:  1.5,
 };

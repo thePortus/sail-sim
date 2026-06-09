@@ -6,7 +6,7 @@
  * between it and the classic procedural ocean.
  */
 import { Injectable, inject } from '@angular/core';
-import { Observer, Scene, Material, Mesh } from '@babylonjs/core';
+import { Observer, Scene, Material, Mesh, Vector3 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { OceanFFTEngine } from './ocean-fft-engine.service';
@@ -55,14 +55,23 @@ export class OceanFFTRenderer {
       scene,
       camera,
       fft: this.fft,
-      // Depth-based contact foam disabled for now: the scene depth RTT is currently invalid
-      // in this build (pre-existing pipeline error), and binding it can poison the draw.
-      // Re-enabled in Phase 5 once that RTT is sorted.
-      depthTexture: null,
+      // Scene depth (camera-space Z of opaque geom, ocean excluded) — the same live DepthRenderer
+      // the procedural ocean uses. Used here to depth-cut the near-boat hull reveal so it shows the
+      // submerged hull but not the deeper seabed behind it. (Contact foam stays off — _ContactFoam=0.)
+      depthTexture: this.sceneService.oceanDepthMap,
       reflectionTexture: this.oceanService.getReflectionTexture(),
       refractionTexture: this.oceanService.getRefractionTexture(),
+      // When reflections are off the mirror RTT stops rendering, so feed the shader the sky/fog hue
+      // to reflect analytically (strength 0 → planar reflection off, sky fallback full) instead of a
+      // dead-black RTT — keeps the shallows see-through and the water from reading flat-dark.
+      getSkyReflect: () => {
+        const fog = this.sceneService.scene?.fogColor;
+        const color = fog ? new Vector3(fog.r, fog.g, fog.b).scaleInPlace(1.25) : new Vector3(0.45, 0.62, 0.82);
+        return { color, strength: this.oceanService.isReflectionsEnabled() ? 0.9 : 0 };
+      },
       getShore: () => this.oceanService.getShoreInfo(),
       getBoatWake: () => this.oceanService.getBoatWake(),
+      getHullCut: () => this.oceanService.getHullCut(),
       getWakePaths: () => ({
         paths: this._wakeTracker.paths,
         meta: this._wakeTracker.meta,
@@ -82,6 +91,7 @@ export class OceanFFTRenderer {
       },
       getSunDir: () => this.sceneService.getSunDirection(),
       getTime: () => performance.now() / 1000 - this._startTime,
+      getFishStartle: () => this.oceanService.getFishStartle(),
     });
 
     this._realMaterials = [

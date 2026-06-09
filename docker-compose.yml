@@ -34,6 +34,9 @@ services:
       - OWNER_USERNAME=admin
       - OWNER_PASSWORD=123456
       - OWNER_CALLSIGN=Teach
+      # OpenTopography API key for the terrain source-fetch tooling (Copernicus GLO-30 DEM).
+      # Set OPENTOPO_API_KEY in a repo-root ".env" file (copy from .env.example); blank if unset.
+      - OPENTOPO_API_KEY=${OPENTOPO_API_KEY:-}
     stdin_open: true
     tty: true
     networks:

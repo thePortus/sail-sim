@@ -1,0 +1,279 @@
+{
+  "model": "pinnace.glb",
+  "schema_version": 2,
+  "units": "meters",
+  "up_axis": "Y",
+  "forward_axis": "+Z (bow)",
+  "right_axis": "-X (starboard)",
+  "frame_range": [
+    0,
+    30
+  ],
+  "fps_authored": 30,
+  "constants": {
+    "rudder_max_deg": 30.0,
+    "trim_max_deg": 48.0,
+    "anchor_drop_m": 1.4,
+    "gun_run_m": 0.28,
+    "gun_recoil_m": 0.28,
+    "furl_max": 1.0,
+    "clip_frame_end": 30
+  },
+  "skeleton": {
+    "armature_node": "PinnaceRig",
+    "joints": [
+      "Root",
+      "MainTrim",
+      "JibTrim",
+      "Flag1",
+      "Flag2",
+      "Flag3"
+    ]
+  },
+  "notes": [
+    "Bow is +Z, up is +Y (matches the sloop's forward). HANDEDNESS: this hull's starboard is -X (port +X) — the OPPOSITE of the sloop (starboard +X). Use right_axis for the world side; port/starboard parts are also identified by node-name suffix (_P=port, _S=starboard) regardless of axis.",
+    "All clips are normalized poses over frame_range; scrub by normalized time for state, play for recoil.",
+    "Clips are sparse/composable: each touches only its listed targets; apply several at once.",
+    "Rudder is SYMMETRIC: 0=hard port, 0.5=center (frame 15), 1=hard starboard. Tiller is a child of Rudder and follows automatically.",
+    "Trim is SYMMETRIC for this fore-and-aft lug rig: 0=port tack, 0.5=amidships (frame 15), 1=starboard tack. Drives the MainTrim + JibTrim bones; all running rigging is skinned to them and follows.",
+    "Guns are PER SIDE (Gun_P, Gun_S): 0=STOWED (run in), 1=READY (run out over the rail). Recoil reuses this same travel — kick from ready toward stowed (~gun_recoil_m) and ease back to 1.",
+    "AnchorDrop: 0=stowed (canted in the cathead), 1=lowered. The anchor swings upright over the first ~quarter of the clip then lowers; the cable (AnchorCable morph 'Drop') pays out with it. One anchor, starboard bow.",
+    "Furl: 0=full sail, 1=furled. Furl_Main and Furl_Jib each drive the sail AND its running-rigging/clew-block morphs together so the sheets, tack and clew block rise with the sail. Morph weights can be driven directly (0..1) instead of via the Furl_* clips — see morph_targets / sail_sheet_pairs.",
+    "Flag (Flag1>Flag2>Flag3 bone chain, red ensign) has NO clip — oscillate in code (see free_rotation_bones).",
+    "Rudder, GunMount_P/S and Anchor are TRANSFORM (object) nodes, not skeleton joints; scrub their clips by name like any other.",
+    "Lantern glass is emissive (KHR_materials_emissive_strength); 3 warm point lights ship with them: Lantern_Bow_L, Lantern_Mast_L, Lantern_Stern_L. Add a glow/bloom layer. The model also animates, so prefer runtime SSAO over the lightly-baked AO."
+  ],
+  "clips": {
+    "Rudder": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Rudder",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=hard_port 0.5=center 1=hard_starboard",
+      "center_frame": 15,
+      "max": 30.0
+    },
+    "Trim": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "MainTrim",
+          "path": "rotation"
+        },
+        {
+          "node": "JibTrim",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=port_tack 0.5=amidships 1=starboard_tack",
+      "center_frame": 15,
+      "max": 48.0
+    },
+    "Gun_P": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "GunMount_P",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed 1=ready(run out)",
+      "run_m": 0.28,
+      "recoil_m": 0.28
+    },
+    "Gun_S": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "GunMount_S",
+          "path": "translation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed 1=ready(run out)",
+      "run_m": 0.28,
+      "recoil_m": 0.28
+    },
+    "AnchorDrop": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Anchor",
+          "path": "translation"
+        },
+        {
+          "node": "Anchor",
+          "path": "rotation"
+        },
+        {
+          "node": "AnchorCable",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=stowed 1=lowered",
+      "max": 1.4
+    },
+    "Furl_Main": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "MainSail",
+          "path": "weights"
+        },
+        {
+          "node": "MainSheet",
+          "path": "weights"
+        },
+        {
+          "node": "MainTack",
+          "path": "weights"
+        },
+        {
+          "node": "Block_MainClew",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    },
+    "Furl_Jib": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "Jib",
+          "path": "weights"
+        },
+        {
+          "node": "JibSheet_P",
+          "path": "weights"
+        },
+        {
+          "node": "JibSheet_S",
+          "path": "weights"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=full_sail 1=furled"
+    }
+  },
+  "morph_targets": {
+    "MainSail": {
+      "Furl": 0
+    },
+    "Jib": {
+      "Furl": 0
+    },
+    "MainSheet": {
+      "Furl": 0
+    },
+    "MainTack": {
+      "Furl": 0
+    },
+    "JibSheet_P": {
+      "Furl": 0
+    },
+    "JibSheet_S": {
+      "Furl": 0
+    },
+    "Block_MainClew": {
+      "Furl": 0
+    },
+    "AnchorCable": {
+      "Drop": 0
+    }
+  },
+  "sail_sheet_pairs": [
+    {
+      "sail": "Mainsail",
+      "furl_clip": "Furl_Main",
+      "sail_morph": {
+        "node": "MainSail",
+        "target": "Furl",
+        "index": 0
+      },
+      "rigging_morphs": [
+        {
+          "node": "MainSheet",
+          "target": "Furl",
+          "index": 0
+        },
+        {
+          "node": "MainTack",
+          "target": "Furl",
+          "index": 0
+        },
+        {
+          "node": "Block_MainClew",
+          "target": "Furl",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "sail": "Jib",
+      "furl_clip": "Furl_Jib",
+      "sail_morph": {
+        "node": "Jib",
+        "target": "Furl",
+        "index": 0
+      },
+      "rigging_morphs": [
+        {
+          "node": "JibSheet_P",
+          "target": "Furl",
+          "index": 0
+        },
+        {
+          "node": "JibSheet_S",
+          "target": "Furl",
+          "index": 0
+        }
+      ]
+    }
+  ],
+  "free_rotation_bones": {
+    "Flag1": {
+      "role": "ensign (chain root)",
+      "drive": "code",
+      "suggestion": "oscillate yaw a few degrees for wind"
+    },
+    "Flag2": {
+      "role": "ensign (chain mid)",
+      "drive": "code",
+      "suggestion": "larger/phase-delayed oscillation vs Flag1"
+    },
+    "Flag3": {
+      "role": "ensign (chain tip)",
+      "drive": "code",
+      "suggestion": "largest/most-delayed oscillation for a travelling-wave ripple"
+    }
+  }
+}

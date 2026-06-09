@@ -3,6 +3,7 @@ import {
   InstantiatedEntries, Skeleton, PBRMaterial,
 } from '@babylonjs/core';
 import { RiggedManifest, SailState } from '../models';
+import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
 
@@ -25,7 +26,7 @@ import { BakedAOPlugin } from './baked-ao.plugin';
  * B_Gaff are overwritten each frame (after the clip scrub) so they swing to the correct
  * leeward side per tack — which a single one-sided clip can't represent.
  */
-export class SloopController {
+export class SloopController implements VesselController {
   readonly root: TransformNode;
   private readonly scene: Scene;
   private readonly manifest: RiggedManifest;
@@ -82,7 +83,7 @@ export class SloopController {
   // against the rendered model; centralized here so tuning is a one-line change.
   private readonly BOOM_SWING_AXIS = Vector3.Up();   // ship-vertical swing axis (parent frame)
   private readonly WHEEL_MAX_RAD   = Math.PI * 2;    // ~one turn lock-to-lock
-  private readonly WHEEL_AXIS      = Vector3.Right(); // wheel spins about its local X
+  private readonly WHEEL_AXIS      = Vector3.Up();   // wheel spins about its OWN axle = local Y (re-aimed in the GLB)
   private readonly RUDDER_MAX_RAD  = 35 * Math.PI / 180; // ±35° hard-over (from manifest)
   private readonly RUDDER_SIGN     = 1;               // deflect direction (matches helm/turn)
   // Constant correction for the flag's rest bearing (the flag's rest streams along the
@@ -128,6 +129,9 @@ export class SloopController {
       // to (absent) IBL, so without this the bake is invisible. Shared material → attach once.
       if (mesh.material instanceof PBRMaterial &&
           !mesh.material.pluginManager?.getPlugin('BakedAO')) {
+        // Full-strength baked AO up close; the plugin itself fades it out with camera distance so the
+        // occlusion map's coarse (darker) mips can't drive the ship toward black at range — see
+        // BakedAOPlugin.bindForSubMesh.
         new BakedAOPlugin(mesh.material);
         // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby
         // broadside lights this hull without displacing the sun (which would darken the ship).
@@ -211,7 +215,14 @@ export class SloopController {
   setRudder(t: number): void {
     const a = Math.max(-1, Math.min(1, t));
     this.composeSpin('B_Rudder', Vector3.Up(), a * this.RUDDER_MAX_RAD * this.RUDDER_SIGN);
-    this.composeSpin('B_Wheel', this.WHEEL_AXIS, a * this.WHEEL_MAX_RAD);
+    // Wheel: spin about the bone's OWN re-aimed axle (local Y), composing the spin in the bone's LOCAL
+    // frame (rest ⊗ spin) — unlike the parent-frame composeSpin used for the boom/gaff/rudder. The GLB now
+    // weights only the disc (not the stand) to B_Wheel, so just the wheel turns.
+    const w = this.nodes.get('B_Wheel');
+    const wRest = this.restQ.get('B_Wheel');
+    if (w && wRest) {
+      w.rotationQuaternion = wRest.multiply(Quaternion.RotationAxis(this.WHEEL_AXIS, a * this.WHEEL_MAX_RAD));
+    }
   }
 
   /** 0 = square (running) .. 1 = fully braced (close-hauled). Sets the yard-trim TARGET;
@@ -223,6 +234,14 @@ export class SloopController {
 
   private applyTrim(): void {
     this.pose('Trim', (this.trimCur ?? 0) * this.frameEnd);
+  }
+
+  /** Unified trim entry point (VesselController). Square-rigged sloop: brace the yards from the eased
+   *  sheet angle and swing the boom/gaff to the leeward side for the current tack. */
+  setSailTrim(sheetAngleDeg: number, isPortTack: boolean): void {
+    this.setTrim(Math.max(0, Math.min(1, (88 - sheetAngleDeg) / 83)));   // 0 square (eased) .. 1 braced
+    const swingSide = isPortTack ? -1 : 1;
+    this.setBoomSwing(swingSide * (sheetAngleDeg - 90) * Math.PI / 180);
   }
 
   /** Gunport lids per side: 0 = closed (default), 1 = open. */

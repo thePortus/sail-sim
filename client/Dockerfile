@@ -29,9 +29,6 @@ COPY --from=build /client/dist/sail-sim/browser /usr/share/nginx/html
 # Copy custom Nginx configuration file
 COPY --from=build /client/nginx.conf /etc/nginx/conf.d/default.conf
 
-# Set the correct permissions for the fonts directory
-RUN chmod -R 755 /usr/share/nginx/html/fonts
-
 # Expose port 80
 EXPOSE 80
 

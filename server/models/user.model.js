@@ -20,6 +20,10 @@ module.exports = (sequelize, DataTypes) => {
     lastVesselSlug:  { type: DataTypes.STRING(64), allowNull: true, defaultValue: null },
     lastCallsign:    { type: DataTypes.STRING(16), allowNull: true, defaultValue: null },
     locationSavedAt: { type: DataTypes.DATE,       allowNull: true, defaultValue: null },
+    // Map version the saved position belongs to. On spawn, a saved location is restored only when this
+    // matches the server's current MAP_VERSION (movement-constants.js); otherwise the player coastal-
+    // spawns on the new map. NULL = a legacy save from before this column existed (treated as current).
+    lastMapVersion:  { type: DataTypes.INTEGER,    allowNull: true, defaultValue: null },
 
     // ── Friend list ──────────────────────────────────────────────────────────
     // JSON array of callsigns this user has explicitly friended.

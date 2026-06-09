@@ -4,7 +4,7 @@ import {
   HostListener, untracked,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { catchError, of } from 'rxjs';
@@ -15,6 +15,8 @@ import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.servic
 import { OceanFFTRenderer }    from '../sailing/services/ocean-fft-renderer.service';
 import { TerrainService }     from '../sailing/services/terrain.service';
 import { VesselService }      from '../sailing/services/vessel.service';
+import { VesselAssetCacheService } from '../sailing/services/vessel-asset-cache.service';
+import { clearScatterCache } from '../sailing/services/scatter/asset-loader';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
 import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
@@ -167,6 +169,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private oceanFftRenderer     = inject(OceanFFTRenderer);
   private terrainService     = inject(TerrainService);
   private vesselService      = inject(VesselService);
+  private vesselAssetCache   = inject(VesselAssetCacheService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
   private oceanAudioService  = inject(OceanAudioService);
@@ -183,6 +186,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
+  /** True once the BabylonJS scene/engine has been booted this session. Gates teardown so it runs for
+   *  a partially-initialised game (e.g. aborting mid-init on an auth failure), not just while sailing. */
+  private sceneStarted = false;
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
@@ -208,7 +214,6 @@ export class GameComponent implements AfterViewInit, OnDestroy {
 
   private selectedSlug = '';
   private callsign     = '';
-  private saveInterval: ReturnType<typeof setInterval> | null = null;
 
   // Wire weather → ocean + vessel
   constructor() {
@@ -261,6 +266,16 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.kickedNotice.set(reason);
       });
     });
+
+    // Websocket rejected our JWT (close 4401) — the session token is invalid/expired. Force a fresh
+    // login (full teardown + clear creds + route to /login), reusing the startup re-auth path.
+    effect(() => {
+      if (!this.multiplayerService.authFailed()) return;
+      untracked(() => {
+        this.multiplayerService.authFailed.set(false);
+        this.forceReauth();
+      });
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
@@ -293,6 +308,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       // 1. Boot BabylonJS scene (WebGPU/WebGL)
       await this.runInitStep('init-scene', 'Preparing the ocean…', async () => {
         await this.sceneService.initAsync(this.canvasRef.nativeElement);
+        this.sceneStarted = true;
       });
 
       // 2. Build ocean + atmosphere
@@ -342,24 +358,26 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
 
       // 5. Determine spawn.
-      // First-time players start at the world origin (0, 0) — the map centre.
-      // If (0, 0) happens to be on land, find the nearest navigable water.
-      let spawnX: number;
-      let spawnZ: number;
-      let spawnHeading: number;
-
-      if (!this.terrainService.isOnLand(0, 0)) {
-        spawnX = 0; spawnZ = 0; spawnHeading = 270;
-      } else {
-        const s = this.terrainService.nearestSpawn(0, 0);
-        spawnX = s.spawnX; spawnZ = s.spawnZ; spawnHeading = s.heading;
-      }
+      // First-time players (no saved location) spawn a short way off a coastline so they begin
+      // "arriving at a shore" rather than marooned in open ocean at the map centre. coastalSpawn()
+      // falls back to nearestSpawn(0,0) if the coast data isn't ready / nothing qualifies.
+      const s = this.terrainService.coastalSpawn();
+      let spawnX = s.spawnX;
+      let spawnZ = s.spawnZ;
+      let spawnHeading = s.heading;
 
       const saved = await this.runInitStep('load-player-location', 'Checking your last anchorage…', async () => {
         return await firstValueFrom(
           this.http.get<{ x: number; z: number; heading: number } | null>(
             `${Settings.apiUrl}player-location/${encodeURIComponent(this.callsign)}`,
-          ).pipe(catchError(() => of(null))),
+          ).pipe(catchError((err: HttpErrorResponse) => {
+            // An auth failure here means the session token is invalid — we must NOT silently fall back
+            // to the (0,0) new-player spawn, or the player loses their real position. Re-throw so the
+            // outer catch routes them to the login screen. Any OTHER error (network/5xx) is transient →
+            // swallow and use the default spawn.
+            if (err.status === 401 || err.status === 403) throw err;
+            return of(null);
+          })),
         );
       });
 
@@ -398,15 +416,37 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.multiplayerService.connect(this.callsign);
       });
 
-      this.saveInterval = setInterval(() => this.saveLocation(), 30_000);
+      // Location persistence is now SERVER-authoritative: the websocket server saves the validated
+      // pose every 30 s + on disconnect. No client-side save (it would be a tamper vector).
       this.phase.set('sailing');
     } catch (error) {
+      // A 401/403 anywhere in startup (verify-auth or the player-location fetch) means the stored
+      // session is no longer valid. Force a fresh login rather than dropping the player into the game
+      // at the wrong spot — they come back authenticated, with their real saved location.
+      const status = (error instanceof HttpErrorResponse) ? error.status : 0;
+      if (status === 401 || status === 403) {
+        console.warn('[GameInit] auth failure during startup — sending to login to re-authenticate');
+        this.forceReauth();
+        return;
+      }
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);
       this.loadingMsg.set('Startup failed. Check browser console for [GameInit] logs.');
       this.phase.set('selecting');
       return;
     }
+  }
+
+  /** Abort a half-built startup on an auth failure: tear down (full engine dispose — navigating away
+   *  destroys this component + its canvas, so the next /game entry must boot a fresh engine), clear the
+   *  stale credentials, and route to the login screen. */
+  private forceReauth(): void {
+    this.callsign = '';        // suppress teardown's location-save — the token is invalid anyway
+    this.teardown(false);      // full teardown (engine included) of whatever booted so far
+    this.selectedSlug = '';
+    this.phase.set('selecting');
+    this.authService.clearStorage();
+    this.router.navigate(['/login']);
   }
 
   private async runInitStep<T>(tag: string, message: string, fn: () => Promise<T>): Promise<T> {
@@ -416,25 +456,17 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error(`[GameInit:${tag}]`, err);
-      throw err;
+      throw error;   // rethrow the ORIGINAL (preserves HttpErrorResponse + its status for re-auth)
     }
   }
 
-  /** PUT the current position to the server so it survives a reload. */
-  private saveLocation(): void {
-    if (!this.callsign) return;
-    const vs = this.vesselService.state();
-    this.http.put(
-      `${Settings.apiUrl}player-location/${encodeURIComponent(this.callsign)}`,
-      { x: vs.x, z: vs.z, heading: vs.heading, vesselSlug: this.selectedSlug },
-    ).subscribe();
-  }
-
-  /** Full teardown of the running game — safe to call from both exit and destroy. */
-  private teardown(): void {
-    if (this.phase() !== 'sailing') return;   // nothing to tear down if we never sailed
-    this.saveLocation();
-    if (this.saveInterval) { clearInterval(this.saveInterval); this.saveInterval = null; }
+  /** Full teardown of the running game — safe to call from both exit and destroy.
+   *  keepEngine=true (Return to Harbour) rebuilds only the Scene next session, reusing the WebGPU
+   *  engine; false (component destroy) disposes the engine too. */
+  private teardown(keepEngine = false): void {
+    if (!this.sceneStarted) return;   // scene never booted → nothing to tear down
+    this.sceneStarted = false;
+    // Location is saved server-side (on the ws disconnect below + a 30 s autosave) — no client PUT.
     this.weatherService.stop();
     this.multiplayerService.disconnect();
     this.cannonService.dispose();
@@ -448,7 +480,24 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.sailAudioService.dispose();
     this.terrainService.dispose();
     this.vesselService.dispose();
-    this.sceneService.dispose();
+    // The FFT ocean engine + renderer are root singletons whose init() early-returns on persisted
+    // fields (_active / _geometry). Without disposing them here they'd keep dead-engine compute
+    // generators + clipmap geometry across a return-to-harbour and skip rebuilding on the new engine.
+    this.oceanFftRenderer.dispose();
+    this.oceanFftEngine.dispose();
+    // Drop the cached vessel AssetContainers BEFORE the engine dies. They hold GPU
+    // buffers/materials bound to THIS engine; if they survive into the next session
+    // (the cache is a root singleton), instantiateRigged() would clone stale, dead-engine
+    // resources into the fresh scene → "Invalid BindGroup" in the ocean-reflection /
+    // prePass passes (a broken pipeline that only a hard reload cleared). Clearing here
+    // makes the next vessel load fetch + parse fresh against the new engine.
+    this.vesselAssetCache.clearCache();
+    // Same hazard for the scatter (rocks/trees/palms/birds/dolphins/seaweed/reeds) GLB containers:
+    // a module-level cache that would hand the next session dead-engine containers (→ "Cannot read
+    // getChildMeshes of undefined" on instantiate). Drop it so each session re-fetches fresh.
+    clearScatterCache();
+    if (keepEngine) { this.sceneService.disposeScene(); }
+    else { this.sceneService.dispose(); }
   }
 
   /** Called by the pause menu Resume button or Esc toggle. */
@@ -466,7 +515,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onExitGame(): void {
     this.paused.set(false);
     this.showSettings.set(false);
-    this.teardown();
+    this.teardown(true);   // keep the WebGPU engine alive; only the Scene is rebuilt on re-entry
     this.selectedSlug = '';
     this.callsign     = '';
     this.loadingMsg.set('Charting the archipelago…');

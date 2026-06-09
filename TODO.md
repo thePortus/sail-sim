@@ -2,10 +2,10 @@
 
 # General or Current TODO Items
 
-* add spawns close to coast
-* switching boats needs hard reload... fix
+* clouds occlude birds
+* shallow water gets into boat, not displaced
+* keypress makes songs lock up
 * cannonfire smoke is occluded by clouds
-* add server-side authoritative movement... and force player to re-login if 401 on player-location at start... and have server check collisions for future damage bounces
 * adjust water displacement to better fit hull of pinnace
 * add dedication
 * add damage from collisions and aground
@@ -34,3 +34,17 @@
 * Security pass
 
 # TODO Items by Module
+
+Great, it's time for another module.... I want to start to add (harbor) towns. Eventually, these towns will have a bunch of assets... different buildings, etc... but for now, they are going to be represented by the most central asset in the town for any sailing vessel.... the pier. I have pier assets (three variations) attached here with handoff documentation.
+
+Physical Placement - We need to automatically identify, during terrain generation, about 30-50 sites for harbors. A suitable site is any area of beach that is relatively flat that could have a pier running out into the water where a player's ship can pull up to reach it. So, we need to find the spot... and figure out the orientation that would put the pier so one end is on the beach, and one hangs out over the water. Terrain maps can change over time, so we will want to identify sites each time we make a new map
+
+Naming, Describing - We will want to give names and a short description to each of these towns.... now, we can have a bank of canned names/descriptions, and they just get semi-randomly assigned to each location when we generate good harbor sites.... but I want these places to have "identities"... not every town in the canned list has to appear on every map, if there are not enough suitable locations
+
+Map - I want these towns to appear on the player's map, and their names to display when the player hovers
+
+Geometry - Eventually, each town will have its own geometry... for now that will just be one of the three pier variants... but have space to accomodate other geometry, which will be placed nearby. We can use asset scattering for this or not, whatever you think is most efficient
+
+So, every time we generate a new map, it identifies good locations, then maps existing town name/description/geometries onto those location candidates... also, if we have generated a new map and seed, the player will need a new starting location
+
+No doubt this involves new server routes and client services

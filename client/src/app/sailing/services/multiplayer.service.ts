@@ -16,6 +16,7 @@ import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
+import { AuthService } from '../../services/auth.service';
 
 // Remote vessel rig assets are resolved per slug via rigForSlug() (vessel-controller.ts).
 
@@ -80,6 +81,7 @@ export class MultiplayerService {
   private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
+  private authService    = inject(AuthService);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
   chatMessages  = signal<ChatMessage[]>([]);
@@ -88,6 +90,9 @@ export class MultiplayerService {
   // Set when the server kicks this session (same account opened in another window).
   // The game component watches this to show a notice and bail out of the session.
   kickedReason  = signal<string | null>(null);
+  // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
+  // watches this to force a fresh login — the session token can no longer be trusted.
+  authFailed    = signal<boolean>(false);
 
   // Callsigns this user has muted/blocked — their chat is dropped on receipt.
   // Persisted in localStorage so the block list survives reloads.
@@ -250,6 +255,7 @@ export class MultiplayerService {
   connect(callsign: string): void {
     this.localState.callsign = callsign;
     this.kickedReason.set(null);   // clear any stale kick from a previous session
+    this.authFailed.set(false);
 
     // Recoil animation tick — runs every render frame while connected
     const scene = this.sceneService.scene;
@@ -268,7 +274,10 @@ export class MultiplayerService {
       scene.registerBeforeRender(this.recoilTickFn);
     }
 
-    const url = Settings.wsUrl;
+    // Authenticate the socket: browsers can't set WS headers, so pass the JWT as a query param. The
+    // server verifies it and refuses (close 4401) if it's missing/invalid.
+    const token = this.authService.getToken();
+    const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
     this.ws = new WebSocket(url);
 
     this.ws.addEventListener('open', () => {
@@ -287,10 +296,12 @@ export class MultiplayerService {
       this.zone.run(() => this.handleMessage(msg));
     });
 
-    this.ws.addEventListener('close', () => {
+    this.ws.addEventListener('close', (evt) => {
       if (this.updateTimer) clearInterval(this.updateTimer);
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.telemetry.ping.set(-1);
+      // 4401 = server rejected the JWT. The token can't be trusted → force a fresh login.
+      if (evt.code === 4401) this.zone.run(() => this.authFailed.set(true));
     });
   }
 
@@ -341,6 +352,11 @@ export class MultiplayerService {
     } else if (msg.type === 'update') {
       if (msg.id === this.myId) return;
       this.addOrUpdatePlayer(msg, scene);
+
+    } else if (msg.type === 'correction') {
+      // Server clamped our claimed pose (teleport/speed-hack, or — later — collision/land). Snap the
+      // local boat to the authoritative pose. Honest play never triggers this.
+      this.vesselService.applyServerCorrection(+msg.x, +msg.z, +msg.heading, +msg.speed);
 
     } else if (msg.type === 'leave') {
       this.removePlayer(msg.id);
@@ -842,9 +858,8 @@ export class MultiplayerService {
   private collDims(slug: string | undefined): { halfLen: number; radius: number } {
     return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
   }
-  private readonly COLL_RESTITUTION = 0.15;  // bounce: 0 = dead stop (T-bone/head-on), 1 = full elastic.
-                                             // Low so head-on/T-bone read as "stop"; a glance keeps its
-                                             // tangential momentum and slides through regardless of this.
+  // (Separation/bounce is resolved server-side now — movement.resolvePair. The client only detects
+  // contact here to fire impact FX, so the restitution constant moved to the server.)
   private readonly COLL_FX_MIN  = 0.6;       // min closing speed (m/s) to fire shake/crunch (ignore taps)
   private readonly COLL_FX_FULL = 7.0;       // closing speed (m/s) at which shake/crunch are full strength
   private _collFxCooldown = 0;               // debounce so a scrape doesn't machine-gun the crunch/shake
@@ -861,7 +876,7 @@ export class MultiplayerService {
     // (how fast the gap is shrinking) — symmetric for both ships, and accurate even though remote speed
     // snapshots lag ~100 ms behind the interpolated display position.
     const invDt = 1 / Math.max(dt, 1e-3);
-    let best: { nx: number; nz: number; pen: number; closing: number } | null = null;
+    let best: { pen: number; closing: number } | null = null;
     for (const entry of this.players.values()) {
       if (!entry.root || !entry.root.isEnabled()) { continue; }   // skip culled / far ships
       const bDim = this.collDims(entry.vesselSlug);   // remote ship's capsule size
@@ -878,26 +893,13 @@ export class MultiplayerService {
       if (dist >= rsum || dist < 1e-4) { continue; }
       const pen = rsum - dist;
       const closing = (prev !== undefined && prev < rsum * 3) ? (prev - dist) * invDt : 0;   // m/s, + = closing
-      if (!best || pen > best.pen) { best = { nx: dx / dist, nz: dz / dist, pen, closing }; }
+      if (!best || pen > best.pen) { best = { pen, closing }; }
     }
     if (!best) { return; }
 
-    // Separation: each ship backs its own half out, away from the other (n points local→other).
-    const pushX = -best.nx * best.pen * 0.5;
-    const pushZ = -best.nz * best.pen * 0.5;
-
-    // Per-ship resolution: cancel the local velocity component heading INTO the other hull (+ bounce).
-    const vx = vs.speed * aFx, vz = vs.speed * aFz;
-    const into = vx * best.nx + vz * best.nz;
-    if (into <= 0) {                                   // already separating / sideways → just nudge apart
-      this.vesselService.applyCollision(vs.heading, vs.speed, pushX, pushZ, dt);
-    } else {
-      const k = (1 + this.COLL_RESTITUTION) * into;
-      const nvx = vx - k * best.nx, nvz = vz - k * best.nz;
-      const newSpeed   = Math.hypot(nvx, nvz);
-      const newHeading = (Math.atan2(nvx, nvz) * 180 / Math.PI + 360) % 360;   // velocity dir → compass heading
-      this.vesselService.applyCollision(newHeading, newSpeed, pushX, pushZ, dt);
-    }
+    // NOTE: the actual separation + bounce is resolved SERVER-side now (movement.resolvePair) and
+    // arrives as a `correction` that snaps the local ship apart. Here we only detect the contact to
+    // fire the local impact FX (camera shake + crunch) so the feel stays immediate.
 
     // Impact FX (camera shake + crunch). Severity = the on-screen CLOSING rate, so it fires whether WE ram
     // or WE'RE rammed (the rammer's hull is visibly driving into us even after its broadcast speed reads 0).

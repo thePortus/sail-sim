@@ -177,6 +177,13 @@ export class OceanFFTRenderer {
     this._realMaterials.forEach((m) => m.dispose());
     this._material?.dispose();
     this._geometry = null;
+    this._material = null;
+    this._realMaterials = [];
+    // Reset the A/B state so the next session starts fresh. init() default-enables FFT via
+    // toggleFFT(), which TOGGLES on _mode — if we leave _mode='fft' here, the next init would
+    // toggle it OFF and drop back to the procedural Gerstner ocean ("looks like WebGL").
+    this._mode = 'off';
+    this._enabled = false;
   }
 
   private _installToggleKey(): void {

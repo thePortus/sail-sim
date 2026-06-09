@@ -29,6 +29,9 @@ Go into container, build terrain files and run server migrations
 
 ``` sh
 docker exec -it sail-sim-nodejs sh
+# get source maps
+npm run fetch:terrain-sources
+# get basic ground and night sky textures
 npm run download:terrain-tiles
 # OR download in 2k
 npm run download:terrain-tiles -- --2k

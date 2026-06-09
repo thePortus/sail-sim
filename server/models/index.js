@@ -15,4 +15,24 @@ db.sequelize = sequelize;
 
 db.User = require('./user.model')(sequelize, Sequelize.DataTypes);
 
+/**
+ * Self-applying, NON-destructive schema top-up. This project has no sequelize.sync(), so new columns
+ * must be added explicitly. addColumn is idempotent here (we swallow the "already exists" error), so
+ * it's safe to run on every boot and needs no separate migration step. Add future columns to `adds`.
+ */
+db.ensureColumns = async () => {
+  const qi = sequelize.getQueryInterface();
+  const adds = [
+    ['lastMapVersion', { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
+  ];
+  for (const [name, spec] of adds) {
+    try {
+      await qi.addColumn('users', name, spec);
+      console.log(`[db] added column users.${name}`);
+    } catch {
+      /* already exists (or DB unreachable) — a genuinely missing column surfaces at query time */
+    }
+  }
+};
+
 module.exports = db;

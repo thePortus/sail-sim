@@ -1,6 +1,8 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const jwt    = require('jsonwebtoken');
+const config = require('./config/db.config');
 const db   = require('./models');
 const User = db.User;
 const { fn, col, where } = db.Sequelize;
@@ -46,6 +48,9 @@ const weatherState = require('./weather-state');
 
 // ── Server-authoritative ship-to-ship combat ─────────────────────────────────
 const combat = require('./combat');
+const movement = require('./movement');
+const moveConst = require('./movement-constants');
+const terrainMask = require('./terrain-mask');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -315,10 +320,92 @@ async function loadAndBroadcastFriends(id, callsign, playersMap) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Authenticate a websocket upgrade with the same JWT the REST API uses. Browsers can't set custom
+ * headers on a WebSocket, so the client passes the token as a query param: wss://host/?token=<jwt>.
+ * Returns the verified identity { userId, callsign, role } or null if the token is missing/invalid/
+ * expired (the caller closes the socket with a 4401 the client maps to "re-login"). The callsign +
+ * role come straight from the signed token payload, so they cannot be spoofed by the client.
+ */
+function verifyWsToken(req) {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+    if (!token) return null;
+    const decoded = jwt.verify(token, config.JWT_SECRET);
+    const d = decoded && decoded.data;
+    if (!d || d.id == null) return null;
+    return { userId: d.id, callsign: String(d.callsign ?? '').slice(0, 32), role: d.role };
+  } catch {
+    return null;   // bad signature / expired / malformed
+  }
+}
+
+/**
+ * Persist a player's AUTHORITATIVE pose to their user row. The position comes from the validated
+ * movement stream (p.authPose), keyed by the verified userId — NOT from anything the client can write
+ * — so a tampered client can't fake its saved location. Stamps the current MAP_VERSION so a later
+ * map re-bake makes the save stale (see player-location.controller getLocation). Fire-and-forget.
+ */
+async function savePlayerLocation(p) {
+  if (!p || !p.auth || p.auth.userId == null || !p.authPose) return;
+  try {
+    await User.update(
+      {
+        lastX: p.authPose.x, lastZ: p.authPose.z, lastHeading: p.authPose.heading,
+        lastVesselSlug: (p.state && p.state.vesselSlug) || 'sloop',
+        lastCallsign: String(p.auth.callsign || '').slice(0, 16) || null,
+        lastMapVersion: moveConst.MAP_VERSION,
+        locationSavedAt: new Date(),
+      },
+      { where: { id: p.auth.userId } },
+    );
+  } catch (err) {
+    console.warn('[WS] savePlayerLocation failed:', err.message);
+  }
+}
+
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
   let nextId = 1;
+
+  // ── Movement helpers (authoritative pose application + correction/broadcast) ───────────────────
+  /** Write an authoritative pose onto a player (both the stored authPose and the broadcast state). */
+  const applyPose = (p, pose) => {
+    p.authPose = pose;
+    if (p.state) { p.state.x = pose.x; p.state.z = pose.z; p.state.heading = pose.heading; p.state.speed = pose.speed; }
+  };
+  /** Apply a collision-resolved pose, but never SHOVE a hull onto land — keep the velocity response
+   *  while holding the old position if the pushed spot is on land. */
+  const applyResolved = (p, pose) => {
+    const onLand = terrainMask.isOnLand(pose.x, pose.z);
+    applyPose(p, {
+      x: onLand ? p.authPose.x : pose.x,
+      z: onLand ? p.authPose.z : pose.z,
+      heading: pose.heading,
+      speed: pose.speed,
+    });
+  };
+  /** Send a player the authoritative pose to snap to. */
+  const sendCorrection = (p) => {
+    if (p.ws.readyState === 1 && p.authPose) {
+      p.ws.send(JSON.stringify({
+        type: 'correction',
+        x: p.authPose.x, z: p.authPose.z, heading: p.authPose.heading, speed: p.authPose.speed,
+        seq: p.lastSeq || 0,
+      }));
+    }
+  };
+  /** Broadcast a player's current authoritative pose to everyone else (used when a ship's pose
+   *  changes from a collision it didn't itself report). */
+  const broadcastPose = (pid, p) => {
+    if (!p.state) return;
+    const m = JSON.stringify({ type: 'update', id: pid, ...p.state, ts: Date.now(), seq: p.lastSeq || 0 });
+    for (const [qid, q] of players) {
+      if (qid !== pid && q.ws.readyState === 1) q.ws.send(m);
+    }
+  };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
   const broadcastWeather = () => {
@@ -335,6 +422,13 @@ function attachMultiplayer(server) {
       broadcastWeather();
     }
   }, 1000);
+
+  // ── Authoritative location autosave (every 30 s) ──────────────────────────────
+  // Persist each connected player's validated pose so they resume where they actually were. Replaces
+  // the old client-initiated PUT /player-location (removed) — the server is the sole writer now.
+  setInterval(() => {
+    for (const [, p] of players) savePlayerLocation(p);
+  }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change
   // happens, so the whole server updates at once instead of waiting for the next tick.
@@ -398,9 +492,19 @@ function attachMultiplayer(server) {
     }
   }, 33);
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    // ── Authenticate the connection (JWT) ──────────────────────────────────────
+    // No valid token → refuse with a 4401 close code. The client treats 4401 as "your session is
+    // invalid" and routes to the login screen. This binds every connection to a real user, so the
+    // callsign/identity used everywhere below can't be spoofed.
+    const auth = verifyWsToken(req);
+    if (!auth) {
+      try { ws.close(4401, 'unauthorized'); } catch { /* already closing */ }
+      return;
+    }
+
     const id = String(nextId++);
-    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState() });
+    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState(), auth });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
     ws.send(JSON.stringify(currentWaveState()));
@@ -436,10 +540,56 @@ function attachMultiplayer(server) {
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
           vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
-          callsign:   String(msg.callsign   ?? '').slice(0, 32),
+          // Authoritative identity from the verified JWT — a forged `msg.callsign` is ignored, so a
+          // client can't impersonate another player or hijack their single-session slot.
+          callsign:   players.get(id).auth.callsign,
         };
-        players.get(id).state = state;
-        players.get(id).lastUpdateMs = Date.now();   // for combat victim-pose lag compensation
+        // ── Authoritative movement validation ──────────────────────────────────
+        // Validate the claimed pose against the vessel's physics relative to the LAST accepted pose.
+        // Implausible claims (teleport / speed-hack) are clamped; the sender is corrected and
+        // everyone else only ever sees the clamped pose. The first update has no baseline → trusted.
+        {
+          const p = players.get(id);
+          const now = Date.now();
+          const dt = p.lastUpdateMs ? (now - p.lastUpdateMs) / 1000 : 0;
+          // Owner/Admin bypass movement validation — they have a teleport ability. Role is from the
+          // verified JWT (p.auth), so a regular client can't claim it.
+          const trusted = p.auth.role === 'Owner' || p.auth.role === 'Admin';
+          const { pose, corrected } = movement.validateMove(
+            p.authPose || null,
+            { x: state.x, z: state.z, heading: state.heading, speed: state.speed, vesselSlug: state.vesselSlug },
+            dt,
+            trusted,
+          );
+          p.state = state;
+          p.lastUpdateMs = now;   // also drives combat victim-pose lag compensation
+          p.lastSeq = Number.isFinite(+msg.seq) ? +msg.seq : 0;
+          applyPose(p, pose);     // overwrite the cosmetic state with the authoritative pose
+          let needCorrection = corrected;
+
+          // ── Ship-to-ship collision (authoritative) ──────────────────────────
+          // Resolve this mover against every other live hull. resolvePair is symmetric, so on contact
+          // BOTH ships get pushed apart + a velocity response. The other ship changed without sending
+          // an update of its own, so re-broadcast + correct it here; the mover is corrected below and
+          // re-broadcast by the normal path at the end of the handler. Trusted (admin) ships skip this.
+          if (!trusted) {
+            const dimA = moveConst.collDims(state.vesselSlug);
+            for (const [pid, q] of players) {
+              if (pid === id || !q.state || !q.authPose) continue;
+              if (q.combat && q.combat.sunk) continue;        // a sinking hull doesn't collide
+              const res = movement.resolvePair(p.authPose, q.authPose, dimA, moveConst.collDims(q.state.vesselSlug));
+              if (!res.hit) continue;
+              applyResolved(p, res.a);
+              applyResolved(q, res.b);
+              needCorrection = true;
+              broadcastPose(pid, q);
+              sendCorrection(q);
+            }
+          }
+
+          // Tell the sender to snap if we clamped/collided (no message in the common honest case).
+          if (needCorrection) sendCorrection(p);
+        }
 
         // Seed the combat hull to the player's actual vessel the first time we learn its slug (and
         // re-seed if they respawn in a different ship). The slug is constant per session, so this
@@ -672,7 +822,9 @@ function attachMultiplayer(server) {
     });
 
     ws.on('close', () => {
-      const closingCallsign = players.get(id)?.state?.callsign;
+      const closing = players.get(id);
+      const closingCallsign = closing?.state?.callsign;
+      savePlayerLocation(closing);   // persist final authoritative pose before dropping the player
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a

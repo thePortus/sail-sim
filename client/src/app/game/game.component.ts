@@ -14,6 +14,7 @@ import { OceanService }       from '../sailing/services/ocean.service';
 import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.service';
 import { OceanFFTRenderer }    from '../sailing/services/ocean-fft-renderer.service';
 import { TerrainService }     from '../sailing/services/terrain.service';
+import { HarborService }      from '../sailing/services/harbor.service';
 import { VesselService }      from '../sailing/services/vessel.service';
 import { VesselAssetCacheService } from '../sailing/services/vessel-asset-cache.service';
 import { clearScatterCache } from '../sailing/services/scatter/asset-loader';
@@ -106,14 +107,28 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <div class="admin-hint">Press <kbd>&#96;</kbd> for admin controls</div>
         }
 
-        <!-- Sunk overlay — acknowledge to restore the hull to full -->
+        <!-- Dock prompt + town menu (when near a harbor and not sunk) -->
+        @if (!combatService.sunk() && harborService.dockable(); as town) {
+          @if (!dockMenuOpen()) {
+            <button class="dock-prompt" (click)="dockMenuOpen.set(true)">⚓ Dock at {{ town.name }}</button>
+          } @else {
+            <div class="dock-menu">
+              <div class="dock-name">{{ town.name }}</div>
+              <div class="dock-desc">{{ town.description }}</div>
+              <button class="dock-opt" (click)="onRepairVessel()">Repair Vessel</button>
+              <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
+            </div>
+          }
+        }
+
+        <!-- Sunk overlay — acknowledge to respawn at the nearest port -->
         @if (combatService.sunk()) {
           <div class="sunk-backdrop">
             <div class="sunk-card">
               <div class="sunk-icon">🌊</div>
               <div class="sunk-title">Your ship was sunk</div>
               <div class="sunk-text">Sent to the depths by {{ combatService.sunkBy() }}.</div>
-              <button class="sunk-btn" (click)="onConfirmSunk()">Repair &amp; Sail On</button>
+              <button class="sunk-btn" (click)="onConfirmSunk()">Respawn at Nearest Port</button>
             </div>
           </div>
         }
@@ -134,6 +149,28 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                   background: rgba(59,130,246,0.22); color: #dbeafe; font-weight: 600; cursor: pointer;
                   transition: all 0.15s; }
     .sunk-btn:hover { background: rgba(59,130,246,0.38); }
+    /* Dock prompt + town menu (screen centre) */
+    .dock-prompt { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                   z-index: 60; padding: 12px 24px; border-radius: 10px; cursor: pointer;
+                   border: 1px solid rgba(232,211,160,0.55); background: rgba(20,28,40,0.86);
+                   color: #ffe9b0; font-weight: 600; font-family: ui-monospace, monospace;
+                   box-shadow: 0 6px 20px rgba(0,0,0,0.5); transition: all 0.15s; }
+    .dock-prompt:hover { background: rgba(40,52,68,0.92); }
+    .dock-menu { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                 z-index: 60; min-width: 280px; padding: 22px 26px; text-align: center;
+                 border-radius: 14px; border: 1px solid rgba(232,211,160,0.4);
+                 background: rgba(12,20,32,0.95); box-shadow: 0 14px 44px rgba(0,0,0,0.6); }
+    .dock-name { color: #ffe9b0; font-size: 1.2rem; font-weight: 700; }
+    .dock-desc { color: #cfe3f5; opacity: 0.75; font-size: 0.85rem; margin: 6px 0 16px;
+                 font-family: ui-monospace, monospace; }
+    .dock-opt  { display: block; width: 100%; padding: 10px; margin-bottom: 8px; cursor: pointer;
+                 border-radius: 9px; border: 1px solid rgba(96,165,250,0.5);
+                 background: rgba(59,130,246,0.22); color: #dbeafe; font-weight: 600; transition: all 0.15s; }
+    .dock-opt:hover { background: rgba(59,130,246,0.4); }
+    .dock-cast { display: block; width: 100%; padding: 7px; cursor: pointer; border-radius: 9px;
+                 border: 1px solid rgba(255,255,255,0.15); background: transparent;
+                 color: rgba(255,255,255,0.6); font-family: ui-monospace, monospace; }
+    .dock-cast:hover { color: #fff; }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                    opacity: 0; transition: opacity 0.8s ease; }
@@ -168,6 +205,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private oceanFftEngine      = inject(OceanFFTEngine);
   private oceanFftRenderer     = inject(OceanFFTRenderer);
   private terrainService     = inject(TerrainService);
+  protected harborService    = inject(HarborService);   // template reads dockable()
   private vesselService      = inject(VesselService);
   private vesselAssetCache   = inject(VesselAssetCacheService);
   private weatherService     = inject(WeatherService);
@@ -191,6 +229,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private sceneStarted = false;
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
+  dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
@@ -276,6 +315,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.forceReauth();
       });
     });
+
+    // Sailed away from the pier → close the town menu if it was open.
+    effect(() => {
+      if (!this.harborService.dockable() && untracked(() => this.dockMenuOpen())) {
+        this.dockMenuOpen.set(false);
+      }
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
@@ -331,6 +377,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         await this.terrainService.init();
       });
 
+      // 3a. Harbor towns — piers at the detected sites (needs the terrain manifest).
+      await this.runInitStep('init-harbors', 'Raising the harbours…', async () => {
+        await this.harborService.init();
+      });
+
       // 3b. Asset scattering (grass/rocks/driftwood/trees/palms) — needs the terrain ready.
       // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
       await this.runInitStep('init-scatter', 'Planting the wilds…', async () => {
@@ -358,10 +409,10 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
 
       // 5. Determine spawn.
-      // First-time players (no saved location) spawn a short way off a coastline so they begin
-      // "arriving at a shore" rather than marooned in open ocean at the map centre. coastalSpawn()
-      // falls back to nearestSpawn(0,0) if the coast data isn't ready / nothing qualifies.
-      const s = this.terrainService.coastalSpawn();
+      // First-time players (no saved location) spawn just off a random town's pier, facing it — so the
+      // game opens "arriving at a harbour". harborSpawn() falls back to coastalSpawn() (then to
+      // nearestSpawn(0,0)) if there are no towns / the spot isn't navigable.
+      const s = this.terrainService.harborSpawn();
       let spawnX = s.spawnX;
       let spawnZ = s.spawnZ;
       let spawnHeading = s.heading;
@@ -479,6 +530,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.shipBellService.dispose();
     this.sailAudioService.dispose();
     this.terrainService.dispose();
+    this.harborService.dispose();
     this.vesselService.dispose();
     // The FFT ocean engine + renderer are root singletons whose init() early-returns on persisted
     // fields (_active / _geometry). Without disposing them here they'd keep dead-engine compute
@@ -506,9 +558,19 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.showSettings.set(false);
   }
 
-  /** Acknowledge a sinking → ask the server to restore the hull to full. */
+  /** Acknowledge a sinking → respawn at the nearest harbor town (teleport + full repair). The server
+   *  respawn clears our authoritative pose so the teleport isn't clamped by movement validation. */
   onConfirmSunk(): void {
+    const pos = this.vesselService.getPosition();
+    const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
+    this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
+    this.multiplayerService.requestRespawn();
+  }
+
+  /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */
+  onRepairVessel(): void {
     this.multiplayerService.requestCombatReset();
+    // Keep the town menu open (return to the main town screen) — "Cast Off" leaves.
   }
 
   /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */

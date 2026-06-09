@@ -754,6 +754,25 @@ function attachMultiplayer(server) {
           }
         }
 
+      } else if (msg.type === 'respawn') {
+        // A SUNK player respawns at a harbor: the client picks the nearest town and teleports there.
+        // Reset the hull AND clear the authoritative pose so the next position update (the teleport) is
+        // accepted as a fresh bootstrap instead of being clamped as an impossible jump. Gated on
+        // actually being sunk so it can't be used as a free teleport mid-sail.
+        const me = players.get(id);
+        if (me && me.combat && me.combat.sunk) {
+          me.combat = combat.newCombatState(me.state?.vesselSlug);
+          me.authPose = null;   // trust the next update — the respawn teleport
+          const stateMsg = JSON.stringify({
+            type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
+          });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+          const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
+          for (const [pid, p] of players) {
+            if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
+        }
+
       } else if (msg.type === 'gun_state') {
         // Relay a ship's gun run-out/stow so others see its ports + barrels animate.
         const side = msg.side === 'port' ? 'port' : 'stbd';

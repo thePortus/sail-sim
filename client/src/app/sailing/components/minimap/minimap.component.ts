@@ -27,6 +27,20 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private terrainLayerSmall: HTMLCanvasElement | null = null;
   private terrainLayerLarge: HTMLCanvasElement | null = null;
   private keyHandler = (e: KeyboardEvent) => { if (e.code === 'KeyM') this.toggleExpand(); };
+  /** Cursor position in canvas-pixel space (null when off the map) — drives the town hover tooltip. */
+  private hoverPx: { x: number; y: number } | null = null;
+
+  /** Track the cursor over the map (canvas-pixel space, accounting for any CSS scaling). */
+  onPointerMove(e: MouseEvent): void {
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) { this.hoverPx = null; return; }
+    const r = canvas.getBoundingClientRect();
+    this.hoverPx = {
+      x: (e.clientX - r.left) * (canvas.width / r.width),
+      y: (e.clientY - r.top) * (canvas.height / r.height),
+    };
+  }
+  onPointerLeave(): void { this.hoverPx = null; }
 
   ngOnInit(): void {
     window.addEventListener('keydown', this.keyHandler);
@@ -87,6 +101,59 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     const gridStep = W / 8;
     for (let gx = 0; gx <= W; gx += gridStep) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke(); }
     for (let gy = 0; gy <= H; gy += gridStep) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
+
+    // Harbor towns (expanded map only) — markers + a name/description tooltip on hover.
+    if (this.expanded()) {
+      const harbors = this.terrainService.getHarbors();
+      const hp = this.hoverPx;
+      let hovered: { name: string; description: string; x: number; y: number } | null = null;
+      let bestD = 8;   // px hover radius
+      for (const h of harbors) {
+        const hxp = wx(h.x), hyp = wz(h.z);
+        ctx.fillStyle   = '#e8d3a0';            // tan — distinct from player gold/orange
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+        ctx.lineWidth   = 0.8;
+        ctx.beginPath();
+        ctx.arc(hxp, hyp, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        if (hp) {
+          const d = Math.hypot(hp.x - hxp, hp.y - hyp);
+          if (d < bestD) { bestD = d; hovered = { name: h.name, description: h.description, x: hxp, y: hyp }; }
+        }
+      }
+      if (hovered) {
+        // Highlight the hovered marker, then draw a name (+ description) pill above it.
+        ctx.fillStyle = '#fff4d0';
+        ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 4, 0, Math.PI * 2); ctx.fill();
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        ctx.font = 'bold 11px monospace';
+        const nameW = ctx.measureText(hovered.name).width;
+        ctx.font = '9px monospace';
+        const descW = ctx.measureText(hovered.description).width;
+        const padX = 6, boxW = Math.max(nameW, descW) + padX * 2, boxH = 30;
+        let bx = hovered.x - boxW / 2;
+        let by = hovered.y - 8 - boxH;
+        bx = Math.max(2, Math.min(W - boxW - 2, bx));   // keep the pill on-map
+        by = Math.max(2, by);
+
+        ctx.fillStyle = 'rgba(10,16,26,0.86)';
+        ctx.strokeStyle = 'rgba(232,211,160,0.5)';
+        ctx.lineWidth = 1;
+        ctx.fillRect(bx, by, boxW, boxH);
+        ctx.strokeRect(bx, by, boxW, boxH);
+
+        const cx = bx + boxW / 2;
+        ctx.fillStyle = '#ffe9b0';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText(hovered.name, cx, by + 13);
+        ctx.fillStyle = 'rgba(220,220,210,0.85)';
+        ctx.font = '9px monospace';
+        ctx.fillText(hovered.description, cx, by + 25);
+      }
+    }
 
     // Other players — split into friends (gold) and strangers (orange)
     const mutuals = this.multiplayerService.mutualFriends();

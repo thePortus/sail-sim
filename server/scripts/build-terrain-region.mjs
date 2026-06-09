@@ -26,10 +26,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import terrainConfig from '../config/terrain.config.js';
 import { SOURCES, regionById } from '../data/region-catalog.mjs';
-import { deriveAugment } from '../data/augment.mjs';
+import { deriveAugment, mulberry32 } from '../data/augment.mjs';
 import { hydraulicErode, thermalErode, addDetail } from '../data/erode.mjs';
-import { addReefs } from '../data/reefs.mjs';
-import { computeAuxMaps, BIOME_PALETTE } from '../data/aux-maps.mjs';
+import { addReefs, shoreDistanceField } from '../data/reefs.mjs';
+import { computeAuxMaps, auxSlope, BIOME_PALETTE } from '../data/aux-maps.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCES_DIR = join(__dirname, '..', 'assets', 'maps', 'sources');
@@ -187,6 +187,14 @@ async function run() {
   // ── Spawns: navigable open water near a coast ────────────────────────────────
   const spawns = findSpawns(field, OUT, worldBounds);
 
+  // ── Harbor towns: flat-beach pier sites + canned identities (deterministic per seed) ──────────
+  // slope + shore-distance drive the site detection; compute them here so harbors work even with
+  // --no-aux (cheap O(N) passes — the aux-PNG block below recomputes its own if enabled).
+  const harborSlope = auxSlope(field, OUT, cellM);
+  const harborShore = shoreDistanceField(field, OUT, cellM, 0);
+  const harborSites = findHarbors(field, OUT, worldBounds, harborSlope, harborShore, 50);
+  const harbors = assignTowns(harborSites, SEED);
+
   // ── Aux maps (Phase 6): slope / shore-dist / wetness / flow / biome → packed PNGs ────────────
   let auxInfo = null;
   if (!NOAUX) {
@@ -222,6 +230,7 @@ async function run() {
     auxMaps: auxInfo,
     worldBounds,
     spawns,
+    harbors,
   };
   writeFileSync(join(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
@@ -234,7 +243,7 @@ async function run() {
   writeFileSync(join(outputDir, 'ao_map.png'), PNG.sync.write(ao));
 
   console.log(`  ${chunkCountX}×${chunkCountZ} chunks + manifest + neutral ao_map written → ${outputDir}`);
-  console.log(`  ${spawns.length} spawn point(s).\nDone.`);
+  console.log(`  ${spawns.length} spawn point(s); ${harbors.length} harbor town(s).\nDone.`);
 }
 
 /** Colorized, hill-shaded preview of the final signed field (land ramp + bathy ramp), ~600 px. */
@@ -384,6 +393,129 @@ function findSpawns(field, OUT, worldBounds) {
     }
   }
   return spawns;
+}
+
+/**
+ * Detect harbor-town pier sites: flat-beach shore points with open navigable water ahead, where a pier
+ * can run from the sand out over the sea. Returns up to `maxSites` spread-out sites as
+ * { x, z, heading } — x,z is the shore point at the waterline (pier origin), heading points SEAWARD
+ * (the pier's body extends that way, and the docking water lies ahead). Deterministic given the field.
+ *
+ * Criteria (per candidate coastal water cell):
+ *   • shallow coastal water (depth band) within ~1.5 cells of land → it's right at a shore;
+ *   • the landward side is a FLAT, LOW beach (low slope a few cells inland, gentle elevation) — not a
+ *     cliff or a mountain plunging into the sea;
+ *   • the seaward side stays navigable water for ~PIER_REACH and ends deep enough to float a ship.
+ * Scored by flatness + seaward depth, then non-max-suppressed by a minimum separation so the sites
+ * spread around all the coastlines instead of clustering on the best beach.
+ */
+function findHarbors(field, OUT, worldBounds, slope, shoreDist, maxSites) {
+  const cellM = (worldBounds.maxX - worldBounds.minX) / (OUT - 1);
+  const toWorld = (ox, oz) => ({
+    x: worldBounds.minX + (ox / (OUT - 1)) * (worldBounds.maxX - worldBounds.minX),
+    z: worldBounds.maxZ - (oz / (OUT - 1)) * (worldBounds.maxZ - worldBounds.minZ),
+  });
+  const at = (ox, oz) => (ox < 0 || oz < 0 || ox >= OUT || oz >= OUT) ? NaN : field[oz * OUT + ox];
+
+  const MIN_SEP_M       = 1700;                       // spread sites apart (≈ unique towns per coast)
+  const minSepCells     = MIN_SEP_M / cellM;
+  const FLAT_SLOPE      = 0.22;                        // m/m — landward beach must be at/under this
+  const REACH_CELLS     = Math.max(3, Math.round(90 / cellM));  // ~90 m seaward must stay navigable
+  const SEAWARD_MIN_DEP = -1.5;                        // m — water at the pier end must float a ship
+  const COAST_NEAR_M    = 1.6 * cellM;                 // candidate water must hug the shore
+
+  const cands = [];
+  const scan = 3;   // texel step (fine enough to hit most coastline, NMS thins it out)
+  for (let oz = 2; oz < OUT - 2; oz += scan) {
+    for (let ox = 2; ox < OUT - 2; ox += scan) {
+      const i = oz * OUT + ox;
+      const y = field[i];
+      if (y < -8 || y >= -0.3) continue;                // shallow coastal water just below the surface
+      if (shoreDist[i] > COAST_NEAR_M) continue;        // must be right at a shore
+
+      // Shore normal from the elevation gradient: uphill (toward land) vs downhill (seaward), texel space.
+      const gx = (at(ox + 1, oz) - at(ox - 1, oz)) / (2 * cellM);
+      const gy = (at(ox, oz + 1) - at(ox, oz - 1)) / (2 * cellM);
+      const glen = Math.hypot(gx, gy);
+      if (!(glen > 1e-4)) continue;                     // flat/ambiguous → no defined shore facing
+      const landTx = gx / glen, landTz = gy / glen;     // unit, toward land (uphill), texel space
+      const seaTx = -landTx, seaTz = -landTz;
+
+      // Landward beach must be flat + low (a beach, not a cliff/headland).
+      const lcx = Math.round(ox + landTx * 3), lcz = Math.round(oz + landTz * 3);
+      if (lcx < 0 || lcz < 0 || lcx >= OUT || lcz >= OUT) continue;
+      const li = lcz * OUT + lcx;
+      const landElev = field[li];
+      if (landElev <= 0 || landElev > 10) continue;     // gentle low beach above the waterline
+      if (slope[li] > FLAT_SLOPE) continue;             // flat, walkable sand — not a steep shore
+
+      // Seaward water must stay open + navigable for the pier + ship approach.
+      let ok = true, endDepth = y;
+      for (let s = 1; s <= REACH_CELLS; s++) {
+        const d = at(Math.round(ox + seaTx * s), Math.round(oz + seaTz * s));
+        if (!(d < 0)) { ok = false; break; }            // land/reef breaks the surface ahead
+        endDepth = d;
+      }
+      if (!ok || endDepth > SEAWARD_MIN_DEP) continue;
+
+      // Shore point (pier origin) = step landward to the waterline crossing.
+      let sx = ox, sz = oz;
+      for (let s = 1; s <= 4; s++) {
+        const nx = Math.round(ox + landTx * s), nz = Math.round(oz + landTz * s);
+        if (!(at(nx, nz) < 0)) break;                   // next step is land → stop at last water cell
+        sx = nx; sz = nz;
+      }
+      const wp = toWorld(sx, sz);
+      const heading = (Math.atan2(-gx, gy) * 180 / Math.PI + 360) % 360;   // world seaward dir → heading
+      const score = (1 - slope[li] / FLAT_SLOPE) + Math.min(1, -endDepth / 4);
+      cands.push({ ox: sx, oz: sz, x: +wp.x.toFixed(1), z: +wp.z.toFixed(1), heading: Math.round(heading), score });
+    }
+  }
+
+  // Best-first, spread apart by min separation.
+  cands.sort((a, b) => b.score - a.score);
+  const kept = [];
+  for (const c of cands) {
+    if (kept.some((k) => Math.hypot(k.ox - c.ox, k.oz - c.oz) < minSepCells)) continue;
+    kept.push(c);
+    if (kept.length >= maxSites) break;
+  }
+  return kept;
+}
+
+/** Fisher–Yates shuffle driven by a seeded RNG (deterministic per map seed). */
+function seededShuffle(arr, rng) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/**
+ * Turn raw pier sites into named towns. Deterministically (by seed) shuffles the canned name bank and
+ * assigns one unique identity per site, capped at the number of names (extra sites are dropped so no
+ * two towns share a name). Each town also gets a pier variant from the same seeded RNG.
+ */
+function assignTowns(sites, seed) {
+  const bank = JSON.parse(readFileSync(join(__dirname, '..', 'data', 'town-names.json'), 'utf8')).towns;
+  const rng = mulberry32((seed ?? 1) ^ 0x70c4b0a7);            // distinct stream from terrain/reefs
+  const names = seededShuffle(bank, rng);
+  const variants = ['straight', 'l', 't'];
+  const n = Math.min(sites.length, names.length);
+  const towns = [];
+  for (let k = 0; k < n; k++) {
+    const s = sites[k], id = names[k];
+    towns.push({
+      id: `town_${k}`,
+      name: id.name,
+      description: id.description,
+      variant: variants[Math.floor(rng() * variants.length)],
+      x: s.x, z: s.z, heading: s.heading,
+    });
+  }
+  return towns;
 }
 
 run().catch((err) => { console.error('\nFatal:', err); process.exit(1); });

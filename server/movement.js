@@ -14,6 +14,7 @@
 
 const M = require('./movement-constants');
 const mask = require('./terrain-mask');
+const piers = require('./pier-obstacles');
 const { getVesselDef } = require('./controllers/vessels.controller');
 
 function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -81,6 +82,15 @@ function validateMove(prev, claim, dtSec, trusted = false) {
   // The boat may still turn in place. Honest clients never hit this — they stop at the shore
   // themselves, and their broadcast centre stays in water.
   if (mask.isOnLand(x, z)) {
+    x = prev.x;
+    z = prev.z;
+    speed = 0;
+    corrected = true;
+  }
+
+  // Pier guard: ships can't sail through a harbor pier (a static no-clip box around the deck).
+  // Same response as the land guard — hold the prior pose + stop. (Admins already bypass above.)
+  if (piers.blockedAt(x, z)) {
     x = prev.x;
     z = prev.z;
     speed = 0;

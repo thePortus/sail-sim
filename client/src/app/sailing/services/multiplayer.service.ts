@@ -180,12 +180,21 @@ export class MultiplayerService {
     this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
   }
 
-  /** Ask the server to restore our hull to full (after acknowledging a sinking). */
+  /** Ask the server to restore our hull to full IN PLACE (dock "Repair Vessel"; no teleport). */
   requestCombatReset(): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'combat_reset' }));
     this.combatService.clearSunk();
     this.vesselService.stopSinking();                  // refloat the hull (eases buoyancy back to normal)
     if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
+  }
+
+  /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
+   *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
+  requestRespawn(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'respawn' }));
+    this.combatService.clearSunk();
+    this.vesselService.stopSinking();
+    if (this.myId) this.onCombatRepair?.(this.myId);
   }
 
   /** Our own server-assigned id (for combat targeting). */

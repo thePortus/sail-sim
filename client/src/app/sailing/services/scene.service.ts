@@ -186,14 +186,30 @@ export class SceneService {
 
         if (gpuSupported) {
           try {
+            // Read the adapter's real per-stage limits so we can REQUEST more than WebGPU's tiny spec
+            // minimums (which are what you get by default). The default maxUniformBuffersPerShaderStage is
+            // only 12 — town/terrain PBR variants in the prePass blow past it. Raise toward the adapter max
+            // (Apple/Metal reports far more); clamp so the request can never exceed what the adapter offers
+            // (an over-request would reject the device and drop us to WebGL).
+            let maxUBO = 12, maxStorageTex = 8;
+            try {
+              type AdapterLike = { limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number } };
+              const gpu = (navigator as { gpu?: { requestAdapter?: () => Promise<AdapterLike | null> } }).gpu;
+              const adapter = gpu?.requestAdapter ? await gpu.requestAdapter() : null;
+              if (adapter?.limits?.maxUniformBuffersPerShaderStage) maxUBO = adapter.limits.maxUniformBuffersPerShaderStage;
+              if (adapter?.limits?.maxStorageTexturesPerShaderStage) maxStorageTex = Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
+            } catch { /* fall back to defaults below */ }
+            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}`);
             this.engine = await WebGPUEngine.CreateAsync(canvas, {
               antialias: true,
-              // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
-              // textures per stage.  The WebGPU default minimum is 4; the adapter
-              // supports 8.  We must declare this in requiredLimits at device creation
-              // time — it cannot be patched later without recreating the device.
+              // The FFT postprocess and time-evolve compute shaders bind 5–6 storage textures per stage
+              // (default min is 4). Uniform-buffer headroom (see above) lets the harbor-town + terrain PBR
+              // prepass variants fit. Both must be declared at device-creation time.
               deviceDescriptor: {
-                requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
+                requiredLimits: {
+                  maxStorageTexturesPerShaderStage: maxStorageTex,
+                  maxUniformBuffersPerShaderStage: Math.min(maxUBO, 24),
+                },
               },
             });
             this._isWebGPU = true;

@@ -135,6 +135,8 @@ export class SloopController implements VesselController {
         new BakedAOPlugin(mesh.material);
         // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby
         // broadside lights this hull without displacing the sun (which would darken the ship).
+        // (The WebGPU 12-UBO/stage limit is governed by the scene's TOTAL light count, not this cap —
+        // see cannon.service REMOTE_RIG_COUNT — so 6 here is fine in the forward pass.)
         mesh.material.maxSimultaneousLights = 6;
       }
     }

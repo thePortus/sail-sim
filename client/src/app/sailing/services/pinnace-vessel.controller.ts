@@ -95,7 +95,7 @@ export class PinnaceController implements VesselController {
       if (mesh.material instanceof PBRMaterial) {
         const mat = mesh.material;
         if (mat.ambientTexture && !mat.pluginManager?.getPlugin('BakedAO')) { new BakedAOPlugin(mat); }
-        mat.maxSimultaneousLights = 6;   // let the sun + cannon-flash point lights co-exist
+        mat.maxSimultaneousLights = 6;   // sun + cannon flashes (forward pass); UBO budget is set by scene light count
       }
     }
 

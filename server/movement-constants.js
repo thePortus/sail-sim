@@ -41,7 +41,7 @@ const COLL_RESTITUTION = 0.15;
 const COLL_MIN_SPEED   = 0.4;
 
 // Bump whenever the terrain is re-baked so stale saved positions are discarded on spawn. Phase 5.
-const MAP_VERSION = 1;
+const MAP_VERSION = 2;
 
 module.exports = {
   worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX,

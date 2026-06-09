@@ -37,6 +37,17 @@ export class HarborService {
   private pierLight: PointLight | null = null;
   private harbors: TerrainHarbor[] = [];
   private tickObs: Observer<Scene> | null = null;
+  private frame = 0;
+
+  // Town-building STREAMING: a town's buildings are instantiated only while the player is within
+  // BUILD_RANGE and disposed once past DROP_RANGE (towns are ≥1.7 km apart, so ~0–1 are active → ~10
+  // resident meshes instead of 360). townNodes = built town id → its root; townLoading guards in-flight
+  // async builds against the per-frame scan re-triggering.
+  private readonly townNodes = new Map<string, TransformNode>();
+  private readonly townLoading = new Set<string>();
+  private readonly BUILD_RANGE = 1500;
+  private readonly DROP_RANGE = 1900;
+  private readonly STREAM_BUILDINGS = true;
   // Dock when the hull is within ~10 ft (≈3 m) of the pier DECK EDGE (not the shore point — the pier
   // blocks the centre from ever reaching the shore). Per-variant deck size (m): len = along-seaward
   // from the shore point, halfWidth = half the across-extent (matches the server pier-obstacles dims).
@@ -65,7 +76,7 @@ export class HarborService {
     this.pierLight.falloffType = PointLight.FALLOFF_STANDARD;
     this.pierLight.range = 60;
     this.pierLight.intensity = 0;
-    this.tickObs = scene.onBeforeRenderObservable.add(() => this.updateNearestPier());
+    this.tickObs = scene.onBeforeRenderObservable.add(() => this.tick());
     console.log(`[Harbor] ${this.harbors.length} piers; pool light created`);
 
     // Build sequentially: the 3 variant GLBs each parse once (cache), then instantiate cheaply.
@@ -113,6 +124,90 @@ export class HarborService {
     const len2 = dx * dx + dz * dz || 1;
     const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / len2));
     return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+  }
+
+  /** Per-frame: keep the pool light on the nearest pier + dockable town (every frame), and stream town
+   *  buildings in/out of range (a few times a second — instantiation is far too heavy to scan per frame). */
+  private tick(): void {
+    this.updateNearestPier();
+    if ((this.frame++ % 20) === 0) this.streamTowns();
+  }
+
+  /** Instantiate the buildings of any town the player has come within BUILD_RANGE of; dispose those past
+   *  DROP_RANGE. The hysteresis gap stops a town on the range boundary from thrashing in and out. */
+  private streamTowns(): void {
+    if (!this.STREAM_BUILDINGS) return;
+    const p = this.vesselService.getPosition();
+    const build2 = this.BUILD_RANGE * this.BUILD_RANGE, drop2 = this.DROP_RANGE * this.DROP_RANGE;
+    for (const h of this.harbors) {
+      if (!h.buildings || !h.buildings.length) continue;
+      const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
+      if (d2 < build2 && !this.townNodes.has(h.id) && !this.townLoading.has(h.id)) {
+        this.townLoading.add(h.id);
+        this.buildTown(h).then((node) => {
+          if (node) this.townNodes.set(h.id, node);
+          this.townLoading.delete(h.id);
+        });
+      } else if (d2 > drop2 && this.townNodes.has(h.id)) {
+        // dispose meshes only, NOT materials/textures: they're shared (cloneMaterials=false) via the
+        // asset-cache container and reused by every other town that streams the same GLB. Disposing them
+        // here would leave later towns with null materials (white). The container owns them (clearCache).
+        this.townNodes.get(h.id)!.dispose(false, false);
+        this.townNodes.delete(h.id);
+      }
+    }
+  }
+
+  /** Instantiate one town's buildings onto its (already-flattened) pad. Each building's GLB is loaded once
+   *  via the shared cache; instances are parented per-building so the seaward yaw can be applied on a
+   *  quaternion-free parent (the instantiate root carries the loader's RH→LH quaternion — see buildPier). */
+  private async buildTown(h: TerrainHarbor): Promise<TransformNode | null> {
+    const scene = this.sceneService.scene;
+    if (!scene || !h.buildings) return null;
+    const root = new TransformNode(`town_${h.id}`, scene);
+    root.parent = this.root;
+    const padElev = h.pad?.elev ?? 0;
+    for (const b of h.buildings) {
+      const parent = new TransformNode(`b_${h.id}_${b.asset}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate(`harbors/${b.asset}.glb`, scene, parent, false);
+      if (!node) { parent.dispose(); continue; }
+      // Stilt-shacks straddle the waterline (origin at y=0); every other asset rests on the flat pad.
+      parent.position.set(b.x, b.asset === 'cabin_shack' ? 0 : padElev, b.z);
+      parent.rotation.y = (b.rotY * Math.PI) / 180;
+      this.applyBuildingRecipe(node);
+    }
+    return root;
+  }
+
+  /** WebGPU-minimal recipe for a building's meshes. These imported PBR materials otherwise blow the per-
+   *  stage uniform-buffer limit (12 vertex UBOs on Metal): every extra pipeline variant (prePass, glow,
+   *  shadow-receive) + light slot adds bindings. So we keep buildings DELIBERATELY cheap: no fog, out of
+   *  the prePass, NOT shadow casters or glow-included (yet), light slots capped, and every optional PBR
+   *  feature block disabled. Buildings are inland → also kept out of the ocean-reflection list.
+   *  (Shadows + window glow come back in a later polish phase once the budget is profiled.) */
+  private applyBuildingRecipe(node: TransformNode): void {
+    for (const m of node.getChildMeshes(false)) {
+      m.receiveShadows = false;
+      m.computeWorldMatrix(true);
+      m.freezeWorldMatrix();
+      const mat = m.material;
+      if (mat && !this.frozenMats.has(mat)) {
+        this.frozenMats.add(mat);
+        mat.fogEnabled = false;
+        this.sceneService.excludeFromPrePass(mat);
+        // Cap light slots regardless of the concrete material class (duck-typed — the glTF loader's
+        // material may not be `instanceof PBRMaterial` across module boundaries): fewer light UBOs.
+        const lit = mat as unknown as { maxSimultaneousLights?: number };
+        if (typeof lit.maxSimultaneousLights === 'number') lit.maxSimultaneousLights = 2;
+        if (mat instanceof PBRMaterial) {
+          mat.clearCoat.isEnabled = false;
+          mat.sheen.isEnabled = false;
+          mat.anisotropy.isEnabled = false;
+          mat.detailMap.isEnabled = false;
+        }
+      }
+    }
   }
 
   private async buildPier(scene: Scene, h: TerrainHarbor): Promise<void> {
@@ -209,6 +304,9 @@ export class HarborService {
     if (this.tickObs) { this.sceneService.scene?.onBeforeRenderObservable.remove(this.tickObs); this.tickObs = null; }
     this.pierLight?.dispose();
     this.pierLight = null;
+    for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
+    this.townNodes.clear();
+    this.townLoading.clear();
     this.root?.dispose(false, false);
     this.root = null;
     this.harbors = [];

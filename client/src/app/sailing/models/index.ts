@@ -71,6 +71,26 @@ export interface TerrainSpawnPoint {
 /** A harbor town: identity + a pier site. x,z = the shore point (pier origin at the waterline);
  *  heading points SEAWARD (the pier body + docking water extend that way). Detected during terrain
  *  generation (server build findHarbors → manifest.harbors). */
+/** One placed building/prop in a town (world coords; rotY in degrees). asset = GLB basename in harbors/. */
+export interface TownBuilding {
+  asset: string;
+  x: number;
+  z: number;
+  rotY: number;
+}
+
+/** Oriented rectangle (world coords; halfZ along heading/inland, halfX across; rotY degrees). */
+export interface TownRect {
+  cx: number;
+  cz: number;
+  halfX: number;
+  halfZ: number;
+  rotY: number;
+  elev?: number;   // flattened pad elevation (pads only)
+}
+
+export interface TownStreet { x1: number; z1: number; x2: number; z2: number; width: number; }
+
 export interface TerrainHarbor {
   id: string;
   name: string;
@@ -79,6 +99,12 @@ export interface TerrainHarbor {
   x: number;
   z: number;
   heading: number;
+  // Harbor Towns v2 (optional — present on manifests baked with the town-layout generator).
+  tier?: 'capital' | 'medium' | 'small';
+  pad?: TownRect;
+  buildings?: TownBuilding[];
+  square?: TownRect | null;
+  streets?: TownStreet[];
 }
 
 export interface TerrainManifest {

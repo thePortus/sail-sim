@@ -1421,9 +1421,7 @@ export class TerrainService {
     material.disableLighting = false;
     material.specularColor   = Color3.Black();  // fully matte
     material.specularPower   = 256;
-    // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby flash
-    // can light the beach/cliffs without displacing the sun (which would darken the terrain).
-    material.maxSimultaneousLights = 6;
+    material.maxSimultaneousLights = 6;        // forward pass; the prePass UBO budget is governed by scene light count
 
     // ── Helper: load a server-generated terrain map (png) ────────────────────
     const loadTerrainTex = (path: string, label: string): Texture => {
@@ -2150,7 +2148,7 @@ export class TerrainService {
     mat.metallic = 0.0;
     mat.roughness = 0.92;                       // matte; per-biome roughness maps arrive in S1
     mat.backFaceCulling = true;
-    mat.maxSimultaneousLights = 6;             // sun + cannon flashes (matches the Standard path)
+    mat.maxSimultaneousLights = 6;             // forward pass; the prePass UBO budget is governed by scene light count
 
     // Biome PBR via texture arrays (S1b): two sampler2DArray (albedo + orm) instead of 5 diffuse
     // samplers — big sampler-budget headroom. Async load; a placeholder binds until the real tiles land.

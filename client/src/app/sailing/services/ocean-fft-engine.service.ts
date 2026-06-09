@@ -16,6 +16,7 @@ import { SceneService } from './scene.service';
 import { Wind, SeaConditions } from '../models';
 import { WavesGenerator } from './ocean-fft/waves-generator';
 import { WavesSettings } from './ocean-fft/waves-settings';
+import { ComputeHelper } from './ocean-fft/compute-helper';
 
 /** Grid size presets. N must be a power of two. */
 export const FFT_SIZE_DEFAULT = 128;   // standard quality
@@ -194,6 +195,8 @@ export class OceanFFTEngine {
     this._generator?.dispose();
     this._generator = null;
     this._active = false;
+    // Drop the engine-bound static copy shaders so the next session rebuilds them on the new engine.
+    ComputeHelper.reset();
   }
 
   private _tick(): void {

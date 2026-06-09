@@ -3,7 +3,9 @@
 # General or Current TODO Items
 
 * add spawns close to coast
-* switching boats needs hard reload... fix
+* clouds occlude birds
+* shallow water gets into boat, not displaced
+* keypress makes songs lock up
 * cannonfire smoke is occluded by clouds
 * add server-side authoritative movement... and force player to re-login if 401 on player-location at start... and have server check collisions for future damage bounces
 * adjust water displacement to better fit hull of pinnace
@@ -34,3 +36,11 @@
 * Security pass
 
 # TODO Items by Module
+
+Great. I committed, and we are onto a major module upgrade on multiplayer movement, where we are going to make all player movement server-side authoritative... which will require thinking about the player's vessel, remote vessels... server side and client side.... thinking on systems like player collision, which had been handled locally. Basically, I want to prevent player tampering by being able to broadcast crap locations... I want server to enforce fair movement rules... Also.... I realize this means changing the player model, as we will have to store the player's location to make that authoritative between sessions. I'd also like to store the last map/seed they were on, so that we can check it against the current, and if they don't match.... start at a new spawn location.
+
+But before we get started there are two related minor changes I want to make...
+
+1.) Sometimes a player gets into the game without being properly authenticated, and as they log in get a 401 from the servers `/player-locations` route.... when this happens, the current result is that they just start over at the new player spawn (0,0)... rather than where they should be. What I want to have happen is that they are taken back to the log in screen and forced to reauthenticate, and thus have their real location
+
+2.) I'd like to have new player spawns happen automatically near a coast.... can we have a way to identify good spawn points, choose one, and then spawn new players there

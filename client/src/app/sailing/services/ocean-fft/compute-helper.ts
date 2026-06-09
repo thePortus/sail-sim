@@ -20,6 +20,18 @@ export class ComputeHelper {
   private static _copy4Params: UniformBuffer | null = null;
   private static _copy2Params: UniformBuffer | null = null;
 
+  /** Drop the cached copy shaders/buffers. They are bound to a specific WebGPUEngine; if the engine is
+   *  disposed (e.g. returning to harbour) and a new one created, these statics would otherwise hand back
+   *  dead-engine GPU handles to the next session. Called from OceanFFTEngine.dispose(). */
+  static reset(): void {
+    ComputeHelper._copy4Params?.dispose();
+    ComputeHelper._copy2Params?.dispose();
+    ComputeHelper._copy4 = null;
+    ComputeHelper._copy2 = null;
+    ComputeHelper._copy4Params = null;
+    ComputeHelper._copy2Params = null;
+  }
+
   /** Create a compute shader and remember its workgroup size for Dispatch(). */
   static createShader(
     engine: WebGPUEngine, name: string, source: string, entryPoint: string, bindings: Bindings,

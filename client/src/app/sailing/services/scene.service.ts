@@ -68,6 +68,9 @@ export class SceneService {
   shadowGenerator!: ShadowGenerator;
   private pipeline!: DefaultRenderingPipeline;
   private _aaQuality = 1; // 0=Off 1=FXAA 2=MSAA2x 3=MSAA4x
+  // FPS overlay element — created once and reused across sessions (the engine is reused, so the
+  // overlay + its global hotkey/resize listeners must NOT be re-installed each scene rebuild).
+  private _fpsEl: HTMLDivElement | null = null;
 
   // Lightning flash: additive boost to ambient light, driven by CloudService.
   // 0 = no flash; ~1 = full strike. Applied on top of the time-of-day ambient.
@@ -165,33 +168,40 @@ export class SceneService {
     await this.zone.runOutsideAngular(async () => {
 
       // ── Engine selection: prefer WebGPU, fall back to WebGL ─────────────────
-      const FORCE_WEBGL = false;
-      const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined'
-        && !!(navigator as { gpu?: unknown }).gpu;
+      // Create the engine ONCE per page and reuse it across sessions (Return to Harbour rebuilds the
+      // Scene, not the engine). Disposing a WebGPUEngine and creating a new one on the SAME canvas
+      // leaves the old GPUCanvasContext/device configured — the next engine then renders degraded /
+      // falls back to a software path ("forced to WebGL" until a hard reload). Keeping one engine for
+      // the canvas's lifetime sidesteps that; disposeScene() tears down only the per-session Scene.
+      if (!this.engine || this.engine.isDisposed) {
+        const FORCE_WEBGL = false;
+        const gpuSupported = !FORCE_WEBGL && typeof navigator !== 'undefined'
+          && !!(navigator as { gpu?: unknown }).gpu;
 
-      if (gpuSupported) {
-        try {
-          this.engine = await WebGPUEngine.CreateAsync(canvas, {
-            antialias: true,
-            // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
-            // textures per stage.  The WebGPU default minimum is 4; the adapter
-            // supports 8.  We must declare this in requiredLimits at device creation
-            // time — it cannot be patched later without recreating the device.
-            deviceDescriptor: {
-              requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
-            },
-          });
-          this._isWebGPU = true;
-          console.log('[Scene] WebGPU engine active');
-        } catch (err) {
-          console.warn('[Scene] WebGPU init failed — falling back to WebGL:', err);
+        if (gpuSupported) {
+          try {
+            this.engine = await WebGPUEngine.CreateAsync(canvas, {
+              antialias: true,
+              // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
+              // textures per stage.  The WebGPU default minimum is 4; the adapter
+              // supports 8.  We must declare this in requiredLimits at device creation
+              // time — it cannot be patched later without recreating the device.
+              deviceDescriptor: {
+                requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
+              },
+            });
+            this._isWebGPU = true;
+            console.log('[Scene] WebGPU engine active');
+          } catch (err) {
+            console.warn('[Scene] WebGPU init failed — falling back to WebGL:', err);
+            this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+            this._isWebGPU = false;
+          }
+        } else {
+          console.log('[Scene] WebGPU not available — using WebGL');
           this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
           this._isWebGPU = false;
         }
-      } else {
-        console.log('[Scene] WebGPU not available — using WebGL');
-        this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
-        this._isWebGPU = false;
       }
 
       // Render at the display's native pixel density. Without this the backing
@@ -1062,19 +1072,33 @@ export class SceneService {
   // ── Render loop ───────────────────────────────────────────────────────────────
 
   private startRenderLoop(): void {
+    // The engine is reused across sessions, so a previous session's render loop may still be
+    // registered — clear it before adding this scene's loop (otherwise the dead scene renders too).
+    this.engine.stopRenderLoop();
+
     // FPS overlay — hidden by default, toggled with the backtick (`) key.
     // (F12 can't be used: browsers reserve it for DevTools and block preventDefault.)
-    const fpsEl = document.createElement('div');
-    fpsEl.style.cssText =
-      'position:fixed;top:6px;left:6px;z-index:99999;text-align:left;line-height:1.45;' +
-      'font:600 12px ui-monospace,monospace;color:#9effa0;background:rgba(0,0,0,0.62);' +
-      'padding:6px 9px;border-radius:6px;pointer-events:none;display:none;white-space:pre;';
-    document.body.appendChild(fpsEl);
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'Backquote') {
-        fpsEl.style.display = fpsEl.style.display === 'none' ? 'block' : 'none';
-      }
-    });
+    // Install the overlay + its global hotkey/resize listeners ONCE per page; re-adding them on every
+    // scene rebuild (Return to Harbour) would leak duplicate DOM nodes + listeners.
+    if (!this._fpsEl) {
+      const el = document.createElement('div');
+      el.style.cssText =
+        'position:fixed;top:6px;left:6px;z-index:99999;text-align:left;line-height:1.45;' +
+        'font:600 12px ui-monospace,monospace;color:#9effa0;background:rgba(0,0,0,0.62);' +
+        'padding:6px 9px;border-radius:6px;pointer-events:none;display:none;white-space:pre;';
+      document.body.appendChild(el);
+      this._fpsEl = el;
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Backquote' && this._fpsEl) {
+          this._fpsEl.style.display = this._fpsEl.style.display === 'none' ? 'block' : 'none';
+        }
+      });
+      window.addEventListener('resize', () => {
+        this.applyResolutionScale();
+        this.engine.resize();
+      });
+    }
+    const fpsEl = this._fpsEl;
 
     // Perf instrumentation — only read when the overlay is visible. Breaks the
     // frame into CPU (active-mesh eval, render-targets, inter-frame JS) and GPU
@@ -1110,10 +1134,6 @@ export class SceneService {
           `interFrame ${ms(sInstr.interFrameTimeCounter)} ms (cpu/js)\n` +
           `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}`;
       }
-    });
-    window.addEventListener('resize', () => {
-      this.applyResolutionScale();
-      this.engine.resize();
     });
   }
 
@@ -1167,10 +1187,21 @@ export class SceneService {
     if (sm) sm.refreshRate = level <= 0 ? 2 : 1;
   }
 
-  dispose(): void {
+  /** Tear down the per-session Scene but KEEP the engine alive for the next session (Return to
+   *  Harbour). scene.dispose() releases every mesh/material/texture/light/camera/RTT/post-process the
+   *  scene owns; the engine + its WebGPU device/canvas context persist so the next initAsync rebuilds
+   *  a fresh Scene on them without the WebGPU-recreation degradation. */
+  disposeScene(): void {
+    this.engine?.stopRenderLoop();
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;
+    this.scene?.dispose();
+  }
+
+  /** Full teardown including the engine (page unload / component destroy). */
+  dispose(): void {
+    this.disposeScene();
     this.engine?.dispose();
   }
 }

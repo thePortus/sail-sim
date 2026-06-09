@@ -239,6 +239,18 @@ export class TerrainService {
       texture.dispose();
     }
     this.terrainTextures = [];
+
+    // S1b PBR terrain: these are GPU resources bound to the CURRENT engine, and loadBiomeArrays()
+    // early-returns when biomeAlbedoArr is already set. If we don't dispose AND null them here, a
+    // return-to-harbour (which disposes the engine) leaves the next session reusing dead-engine
+    // texture arrays → "TextureViewDimension::e2D doesn't match expected e2DArray" + a cascade of
+    // Invalid BindGroup errors in the prePass / ocean-reflection passes. Null so init() rebuilds.
+    this.biomeAlbedoArr?.dispose();      this.biomeAlbedoArr = null;
+    this.biomeOrmArr?.dispose();         this.biomeOrmArr = null;
+    this.biomePlaceholderArr?.dispose(); this.biomePlaceholderArr = null;
+    this.terrainMaterialPBR?.dispose();  this.terrainMaterialPBR = null;
+    this.splatTex = null;   // disposed above via terrainTextures; null so it isn't reused stale
+    this.auxTex = null;
   }
 
   getManifest(): TerrainManifest | null {
@@ -344,6 +356,88 @@ export class TerrainService {
     }
 
     return { spawnX: best.x, spawnZ: best.z, heading: best.heading };
+  }
+
+  /**
+   * Pick a navigable spawn point a short way off a coastline — for brand-new players (no saved
+   * location) so they begin "arriving at a shore" instead of marooned in open ocean at (0, 0).
+   *
+   * Reuses the precomputed water→land distance field (the same one `applyCoastalGrading` builds with a
+   * signed-aware waterline test — unlike the broken cove detector that read `hf>0` as land). A good
+   * coastal spawn is a WATER cell whose distance to the nearest land sits in a target offshore band
+   * (close enough to see/reach the coast, far enough not to run aground) and whose seabed is deep
+   * enough to float. One cell is chosen at random from all qualifiers so successive new players are
+   * spread around the map's coastlines, and the heading is aimed at the nearest land.
+   *
+   * Falls back to nearestSpawn(0, 0) if the coast data isn't ready or nothing qualifies.
+   */
+  coastalSpawn(): { spawnX: number; spawnZ: number; heading: number } {
+    const m = this.manifest, hf = this.heightfield, cd = this.coastData;
+    if (!m || !hf || !cd) return this.nearestSpawn(0, 0);
+
+    const { width, height, worldBounds, quantizationLevels, minElevation, maxElevation } = m;
+    const distL = cd.distToLand;
+    const cellSizeM = cd.cellSizeM;
+
+    const signed = minElevation != null && maxElevation != null;
+    const waterQ = signed
+      ? Math.round(((0 - minElevation!) / (maxElevation! - minElevation!)) * quantizationLevels)
+      : 0;
+    const isWater = (q: number) => (signed ? q <= waterQ : q === 0);
+    // Decode a quantized cell to elevation (m). Only meaningful for the signed field (legacy water = 0).
+    const elevOf = (q: number) => signed
+      ? (q / quantizationLevels) * (maxElevation! - minElevation!) + minElevation!
+      : 0;
+
+    // Offshore band + minimum navigable depth.
+    const MIN_OFF_M = 60, MAX_OFF_M = 180, MIN_DEPTH_M = 1.5;
+    const minCells = Math.max(1, Math.round(MIN_OFF_M / cellSizeM));
+    const maxCells = Math.max(minCells + 1, Math.round(MAX_OFF_M / cellSizeM));
+
+    // Collect qualifying water cells (coarse stride bounds cost + reduces clustering).
+    const STRIDE = 2;
+    const cands: number[] = [];
+    for (let z = 1; z < height - 1; z += STRIDE) {
+      for (let x = 1; x < width - 1; x += STRIDE) {
+        const i = z * width + x;
+        const d = distL[i];
+        if (d < minCells || d > maxCells) continue;     // outside the offshore band
+        const q = hf[i];
+        if (!isWater(q)) continue;                       // not navigable water
+        if (signed && elevOf(q) > -MIN_DEPTH_M) continue; // too shallow (bar/reef) to float
+        cands.push(i);
+      }
+    }
+    if (!cands.length) return this.nearestSpawn(0, 0);
+
+    const cell = cands[Math.floor(Math.random() * cands.length)];
+    const cx = cell % width;
+    const cz = Math.floor(cell / width);
+    const cellToWorld = (ix: number, iz: number) => ({
+      x: worldBounds.minX + (ix / (width  - 1)) * (worldBounds.maxX - worldBounds.minX),
+      z: worldBounds.maxZ - (iz / (height - 1)) * (worldBounds.maxZ - worldBounds.minZ),
+    });
+    const { x: spawnX, z: spawnZ } = cellToWorld(cx, cz);
+
+    // Heading: face the nearest land. Cast rays in cell space; the direction whose first land hit is
+    // closest wins. Cell +x → world +X; cell +z → world -Z (worldZ = maxZ - iz·range), so a cell-space
+    // ray dir (dxc, dzc) toward land maps to world heading atan2(dxc, -dzc).
+    let heading = 270, bestLand = Infinity;
+    const RAYS = 16, reach = maxCells + minCells;
+    for (let r = 0; r < RAYS; r++) {
+      const a = (r / RAYS) * Math.PI * 2;
+      const dxc = Math.cos(a), dzc = Math.sin(a);
+      for (let s = 1; s <= reach; s++) {
+        const nx = Math.round(cx + dxc * s), nz = Math.round(cz + dzc * s);
+        if (nx < 0 || nx >= width || nz < 0 || nz >= height) break;
+        if (!isWater(hf[nz * width + nx])) {             // first land along this ray
+          if (s < bestLand) { bestLand = s; heading = (Math.atan2(dxc, -dzc) * 180 / Math.PI + 360) % 360; }
+          break;
+        }
+      }
+    }
+
+    return { spawnX, spawnZ, heading };
   }
 
   private buildTerrainMesh(): void {

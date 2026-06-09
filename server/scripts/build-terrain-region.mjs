@@ -171,9 +171,9 @@ async function run() {
   const harbors = assignTowns(harborSites, SEED, elevAt, footprints);
   // Bake each town's flat pad into the field (level the ground under the buildings/streets/square).
   const flattened = flattenTownPads(field, OUT, worldBounds, harbors);
-  // Dredge a deep basin under each pier so it stands in water, not a shallow sand shelf.
-  const dredged = dredgeHarborBasins(field, OUT, worldBounds, harbors);
-  console.log(`  flattened ${harbors.length} town pads (${flattened} cells levelled); dredged piers (${dredged} cells)`);
+  // Quay + basin under each pier so it crosses the waterline (landward end on land, body over water).
+  const shaped = shapeHarborBasins(field, OUT, worldBounds, harbors);
+  console.log(`  flattened ${harbors.length} town pads (${flattened} cells levelled); shaped pier quays/basins (${shaped} cells)`);
 
   let minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < field.length; i++) { const y = field[i]; if (y < minY) minY = y; if (y > maxY) maxY = y; }
@@ -492,15 +492,19 @@ function flattenTownPads(field, OUT, worldBounds, harbors) {
 }
 
 /**
- * Dredge a deep basin under each pier so it stands in clearly-deep WATER, not a shallow shelf that reads as
- * wet sand. For each harbor, the water rect from the shore point seaward (length REACH, width ±HALFW) is
- * deepened to DEPTH, ramped at the edges. ONLY deepens (never raises) and only touches water/shallow cells
- * (field < 0.5) — so it carves shallow shelves down to navigable depth but never gouges a channel into land.
+ * Shape a quay + basin around each pier so it crosses the waterline: ONE END ON LAND, the rest over water.
+ * The pier origin is the shore (waterline) cell, and the pier (~14 m) is shorter than one 24 m terrain cell,
+ * so we can't carve the transition within that cell — instead we set the SHORE cell to a low quay (+QUAY,
+ * ~deck height → land) and the seaward cells to a deep basin (-DEPTH → water). The renderer's bilinear
+ * interpolation between them ramps the ground under the pier from land down through the waterline to water,
+ * so the landward end sits firmly on the quay and the body stands over the basin. Quay only raises; basin
+ * only deepens water/shallows (never gouges land).
  */
-function dredgeHarborBasins(field, OUT, worldBounds, harbors) {
+function shapeHarborBasins(field, OUT, worldBounds, harbors) {
   const { minX, maxX, minZ, maxZ } = worldBounds;
   const cellM = (maxX - minX) / (OUT - 1);
-  const DEPTH = -3.5, REACH = 30, HALFW = 14, ramp = cellM;
+  const QUAY = 1.2, DEPTH = -3.5, REACH = 36, HW_QUAY = 9, HW_BASIN = 14, ramp = cellM;
+  const cut = cellM * 0.55;                            // boundary: quay = the shore cell, basin = seaward cells
   let touched = 0;
   for (const t of harbors) {
     const hr = t.heading * Math.PI / 180;
@@ -509,20 +513,27 @@ function dredgeHarborBasins(field, OUT, worldBounds, harbors) {
     const ccx = t.x + seaX * REACH / 2, ccz = t.z + seaZ * REACH / 2;
     const cox = (ccx - minX) / (maxX - minX) * (OUT - 1);
     const coz = (maxZ - ccz) / (maxZ - minZ) * (OUT - 1);
-    const rCells = Math.ceil((Math.hypot(REACH / 2, HALFW) + ramp + cellM) / cellM) + 1;
+    const rCells = Math.ceil((Math.hypot(REACH / 2, HW_BASIN) + ramp + cellM) / cellM) + 1;
     for (let oz = Math.max(0, Math.floor(coz - rCells)); oz <= Math.min(OUT - 1, Math.ceil(coz + rCells)); oz++) {
       for (let ox = Math.max(0, Math.floor(cox - rCells)); ox <= Math.min(OUT - 1, Math.ceil(cox + rCells)); ox++) {
-        const i = oz * OUT + ox;
-        if (field[i] > 0.5) continue;                  // never carve into land — only deepen water/shallows
         const wx = minX + ox / (OUT - 1) * (maxX - minX);
         const wz = maxZ - oz / (OUT - 1) * (maxZ - minZ);
-        const a = (wx - t.x) * seaX + (wz - t.z) * seaZ;   // along-seaward from the shore point (0..REACH)
+        const a = (wx - t.x) * seaX + (wz - t.z) * seaZ;   // along-seaward from the shore point
         const s = (wx - t.x) * rgtX + (wz - t.z) * rgtZ;   // across
-        const outside = Math.hypot(a < 0 ? -a : (a > REACH ? a - REACH : 0), Math.max(0, Math.abs(s) - HALFW));
-        if (outside > ramp) continue;
-        const w = outside <= 0 ? 1 : 1 - outside / ramp;
-        const blended = field[i] * (1 - w) + DEPTH * w;
-        if (blended < field[i]) { field[i] = blended; touched++; }   // only lower
+        const i = oz * OUT + ox;
+        if (a >= -cut && a < cut) {                    // QUAY: raise the shore cell → landward pier end on land
+          if (Math.max(0, Math.abs(s) - HW_QUAY) > ramp) continue;
+          const w = 1 - Math.max(0, Math.abs(s) - HW_QUAY) / ramp;
+          const nv = field[i] * (1 - w) + QUAY * w;
+          if (nv > field[i]) { field[i] = nv; touched++; }
+        } else if (a >= cut && a <= REACH) {           // BASIN: deepen seaward water → pier body over water
+          if (field[i] > 0.5) continue;                // never gouge land
+          const outside = Math.hypot(a > REACH ? a - REACH : 0, Math.max(0, Math.abs(s) - HW_BASIN));
+          if (outside > ramp) continue;
+          const w = 1 - outside / ramp;
+          const nv = field[i] * (1 - w) + DEPTH * w;
+          if (nv < field[i]) { field[i] = nv; touched++; }
+        }
       }
     }
   }

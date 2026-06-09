@@ -4,9 +4,10 @@
 
 * zoomable map
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
-* make sure towns DON'T spawn in tiny spot barely sticking out of the water
-* clouds occlude birds
 * shallow water gets into boat, not displaced
+* some buildings on uneven land
+* clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon
+* make stuff look cool pass)
 * keypress makes songs lock up
 * cannonfire smoke is occluded by clouds
 * adjust water displacement to better fit hull of pinnace

@@ -39,19 +39,20 @@ export function composeTown(tier, rng) {
   if (tier === 'capital') {
     townhall  = rng() < 0.6 ? 'townhall_governor' : 'townhall_magistrate';
     fountain  = pick(fountains);
-    taverns   = 1 + Math.floor(rng() * 2);            // 1–2
-    dwellings = 8 + Math.floor(rng() * 9);            // 8–16
+    taverns   = 2 + Math.floor(rng() * 2);            // 2–3
+    dwellings = 22 + Math.floor(rng() * 12);          // 22–33
     shacks    = 1 + Math.floor(rng() * 3);            // 1–3
   } else if (tier === 'medium') {
     townhall  = rng() < 0.8 ? (rng() < 0.5 ? 'townhall_magistrate' : 'townhall_governor') : null;
     fountain  = (townhall && rng() < 0.5) ? pick(fountains) : null;
-    taverns   = 1;
-    dwellings = 3 + Math.floor(rng() * 4);            // 3–6
-    shacks    = rng() < 0.5 ? 1 : 0;
+    taverns   = 1 + Math.floor(rng() * 2);            // 1–2
+    dwellings = 12 + Math.floor(rng() * 9);           // 12–20
+    shacks    = 1 + (rng() < 0.4 ? 1 : 0);            // 1–2
   } else {                                            // small
-    townhall  = rng() < 0.3 ? 'townhall_magistrate' : null;
+    townhall  = rng() < 0.4 ? 'townhall_magistrate' : null;
     taverns   = 1;
-    dwellings = Math.floor(rng() * 3);                // 0–2
+    dwellings = 11 + Math.floor(rng() * 5);           // 11–15
+    shacks    = rng() < 0.6 ? 1 : 0;                  // ~60% get one
   }
   const houses = [];
   for (let i = 0; i < taverns; i++) houses.push('cabin_tavern');
@@ -71,84 +72,115 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const L = (f, s) => ({ x: +(town.x + fwd[0] * f + rgt[0] * s).toFixed(1),
                          z: +(town.z + fwd[1] * f + rgt[1] * s).toFixed(1) });
 
-  const STREET_W = 5, GAP = 3.5;
-  const HW = 8.6, HD = 7.5;                            // house lot cell (max of tavern/dwelling footprints)
-  const laneHalf = STREET_W / 2 + HD / 2 + GAP;       // side offset of a house column from its avenue
-  const rowPitch = HW + GAP;                          // fwd spacing between house rows
-  const aveSpacing = 2 * laneHalf + STREET_W + HW;    // gap between the two avenues (capital)
-
+  const STREET_W = 5;
   const SPEC = {
-    capital: { avenues: 2, depthM: 80, squareD: 20, squareW: 24 },
-    medium:  { avenues: 1, depthM: 50, squareD: 14, squareW: 16 },
-    small:   { avenues: 1, depthM: 30, squareD: 0,  squareW: 0  },
+    capital: { depthM: 150, squareD: 20, squareW: 24, maxStreets: 4, targetWidthM: 90 },
+    medium:  { depthM: 95,  squareD: 14, squareW: 16, maxStreets: 3, targetWidthM: 58 },
+    small:   { depthM: 80,  squareD: 0,  squareW: 0,  maxStreets: 2, targetWidthM: 42 },
   }[tier];
 
-  const WATERFRONT = 20;                              // band reserved near the pier (kept clear of the shore/water cell)
-  const usableDepth = Math.max(rowPitch, Math.min(SPEC.depthM, site.inlandFlatM) - WATERFRONT - SPEC.squareD - GAP * 2);
-  const usableWidth = Math.min(120, site.flatWidthM);
-  const rows = Math.max(1, Math.floor(usableDepth / rowPitch));
-  let avenues = SPEC.avenues;
-  const widthFor = (n) => n === 2 ? aveSpacing + 2 * laneHalf + HW : 2 * laneHalf + HW;
-  while (avenues > 1 && widthFor(avenues) > usableWidth) avenues--;
-
-  const aveOffs = avenues === 2 ? [-aveSpacing / 2, aveSpacing / 2] : [0];
-  const cols = [];
-  for (const a of aveOffs) { cols.push({ s: a - laneHalf, ave: a }); cols.push({ s: a + laneHalf, ave: a }); }
-  const maxHouses = rows * cols.length;
+  // Town extends up to ~46 m past the naturally-flat land (the pad flattens the rest), so even tight sites
+  // host a proper number of houses. Layout is ORGANIC: a few WANDERING streets, with houses placed along
+  // both sides at jittered spacing/setback and rotated to face the local street direction (+ a little skew).
+  const WATERFRONT = 20;                              // band reserved near the pier (clear of the shore/water cell)
+  const usableDepth = Math.max(20, Math.min(SPEC.depthM, site.inlandFlatM + 46) - WATERFRONT - SPEC.squareD - 8);
+  const usableWidth = Math.min(SPEC.targetWidthM, site.flatWidthM + 30);
 
   const buildings = [];
+  const placed = [];                                 // {x,z,r} for greedy overlap rejection
   let minF = Infinity, maxF = -Infinity, minS = Infinity, maxS = -Infinity;
+  // Town-local direction (df=inland, ds=across) → world heading degrees.
+  const localHeading = (df, ds) => dirHeading(fwd[0] * df + rgt[0] * ds, fwd[1] * df + rgt[1] * ds);
   const place = (asset, f, s, rotDeg, inPad = true) => {
     const p = L(f, s);
     buildings.push({ asset, x: p.x, z: p.z, rotY: Math.round(rotDeg) });
-    if (!inPad) return;                               // stilt-shacks live at the waterline, outside the flat apron
-    const r = Math.max(fp[asset].w, fp[asset].d) / 2 + 1;
-    minF = Math.min(minF, f - r); maxF = Math.max(maxF, f + r);
-    minS = Math.min(minS, s - r); maxS = Math.max(maxS, s + r);
+    placed.push({ x: p.x, z: p.z, r: Math.hypot(fp[asset].w, fp[asset].d) / 2 + 0.6 });
+    if (!inPad) return;                              // stilt-shacks live at the waterline, outside the flat apron
+    const rr = Math.max(fp[asset].w, fp[asset].d) / 2 + 1;
+    minF = Math.min(minF, f - rr); maxF = Math.max(maxF, f + rr);
+    minS = Math.min(minS, s - rr); maxS = Math.max(maxS, s + rr);
   };
+  const overlaps = (x, z, r) => placed.some((p) => Math.hypot(p.x - x, p.z - z) < p.r + r);
 
-  // Waterfront: shipwright off to one side of the pier; stilt-shacks at the water's edge. The shacks sit
-  // ON stilts over the water (origin at the waterline), so they're excluded from the flattened pad.
+  // Waterfront: shipwright near the pier (on the quay/land).
   const swSide = rng() < 0.5 ? -1 : 1;
-  place('shipwright_shack', 16, swSide * 12, town.heading);   // ~16 m inland → lands on a LAND cell, not the water shore cell
-  for (let i = 0; i < (wish.shacks || 0); i++) {
-    place('cabin_shack', 2, (i % 2 ? 1 : -1) * (8 + Math.floor(i / 2) * 5), town.heading, false);
-  }
+  place('shipwright_shack', 16, swSide * 14, town.heading + (rng() - 0.5) * 30);
 
-  // Residential: fill the lot grid row by row, each house facing its avenue.
-  const houses = wish.houses.slice(0, maxHouses);
-  const resFStart = WATERFRONT + HD / 2 + 2;
-  let hi = 0;
-  for (let r = 0; r < rows && hi < houses.length; r++) {
-    for (const c of cols) {
-      if (hi >= houses.length) break;
-      const faceSign = Math.sign(c.ave - c.s) || 1;   // face toward the avenue
-      place(houses[hi++], resFStart + r * rowPitch, c.s, dirHeading(rgt[0] * faceSign, rgt[1] * faceSign));
+  // Stilt-shacks: out over the harbour water, off to the side of the pier. Placed SEAWARD of the shore (ff<0,
+  // beyond the raised quay's a-range) so the quay never lifts them onto land, and where the natural seabed is
+  // already water (findHarbors guarantees navigable water seaward). The shack sits at the waterline (client
+  // y=0) — the seabed depth below is hidden underwater. Excluded from the pad.
+  let shacksLeft = wish.shacks || 0;
+  if (shacksLeft > 0) {
+    for (const ff of [-15, -18, -21, -13, -24]) {
+      for (const mag of [11, 14, 17]) for (const sgn of [swSide, -swSide]) {
+        if (shacksLeft <= 0) break;
+        const s = sgn * mag, p = L(ff, s), e = elevAt(p.x, p.z);
+        if (e < -0.4 && !overlaps(p.x, p.z, 4)) {
+          place('cabin_shack', ff, s, town.heading + (rng() - 0.5) * 45, false);
+          shacksLeft--;
+        }
+      }
+      if (shacksLeft <= 0) break;
     }
   }
-  const resFEnd = resFStart + (rows - 1) * rowPitch;
 
-  // Civic square (town hall on its inland edge facing seaward, fountain centred) — skipped for tiers/sites
-  // without a town hall or square depth.
+  // Civic square (inland end): town hall + fountain. Placed BEFORE the houses so the greedy fill flows around it.
+  const resF0 = WATERFRONT + 6, resF1 = resF0 + usableDepth;
   let square = null;
   if (wish.townhall && SPEC.squareD > 0) {
-    const sqF = resFEnd + GAP + SPEC.squareD / 2;
+    const sqF = resF1 + 6 + SPEC.squareD / 2;
     const c = L(sqF, 0);
     square = { cx: c.x, cz: c.z, halfX: +(SPEC.squareW / 2).toFixed(1), halfZ: +(SPEC.squareD / 2).toFixed(1), rotY: Math.round(town.heading) };
-    minF = Math.min(minF, sqF - SPEC.squareD / 2); maxF = Math.max(maxF, sqF + SPEC.squareD / 2);
-    minS = Math.min(minS, -SPEC.squareW / 2);       maxS = Math.max(maxS, SPEC.squareW / 2);
+    minF = Math.min(minF, sqF - SPEC.squareD / 2 - 2); maxF = Math.max(maxF, sqF + SPEC.squareD / 2 + 2);
+    minS = Math.min(minS, -SPEC.squareW / 2 - 2);      maxS = Math.max(maxS, SPEC.squareW / 2 + 2);
     if (wish.fountain) place(wish.fountain, sqF, 0, town.heading);
     place(wish.townhall, sqF + SPEC.squareD / 2 + fp[wish.townhall].d / 2 + 1, 0, town.heading);
   } else if (wish.townhall) {
-    place(wish.townhall, resFEnd + GAP + fp[wish.townhall].d / 2 + 2, 0, town.heading);
+    place(wish.townhall, resF1 + 6 + fp[wish.townhall].d / 2, (rng() - 0.5) * 18 + town.heading);
   }
 
-  // Streets: a spine along the centreline; for two-avenue towns, each avenue + a waterfront connector.
+  // Wandering streets: each runs roughly inland but drifts + sine-waves laterally, spread across the width.
   const streets = [];
-  const ribbon = (f1, s1, f2, s2) => { const a = L(f1, s1), b = L(f2, s2); streets.push({ x1: a.x, z1: a.z, x2: b.x, z2: b.z, width: STREET_W }); };
-  ribbon(4, 0, square ? resFEnd + GAP : resFEnd, 0);
-  for (const a of aveOffs) { if (Math.abs(a) > 0.1) ribbon(resFStart - GAP, a, resFEnd + GAP, a); }
-  if (avenues === 2) ribbon(resFStart - GAP, aveOffs[0], resFStart - GAP, aveOffs[1]);
+  const nStreets = Math.max(1, Math.min(SPEC.maxStreets, Math.floor(usableWidth / 19)));
+  const lines = [];
+  for (let k = 0; k < nStreets; k++) {
+    const baseS = nStreets === 1 ? (rng() - 0.5) * 6 : (k / (nStreets - 1) - 0.5) * (usableWidth - 18);
+    const amp = 5 + rng() * 9, ph = rng() * Math.PI * 2, fr = 0.6 + rng() * 1.5, tilt = (rng() - 0.5) * 0.45;
+    const sAt = (f) => baseS + tilt * (f - resF0) + amp * Math.sin(ph + fr * Math.PI * (f - resF0) / Math.max(1, resF1 - resF0));
+    lines.push(sAt);
+    let pp = L(resF0 - 4, sAt(resF0 - 4));
+    for (let f = resF0 + 6; f <= resF1 + 4; f += 7) { const np = L(f, sAt(f)); streets.push({ x1: pp.x, z1: pp.z, x2: np.x, z2: np.z, width: STREET_W }); pp = np; }
+  }
+
+  // Candidate house lots along both sides of every street, jittered + rotated to face the street.
+  const cands = [];
+  for (const sAt of lines) {
+    for (let f = resF0 + rng() * 3; f <= resF1; f += 7.5 + rng() * 2.5) {
+      const sc = sAt(f), ds = (sAt(f + 1) - sAt(f - 1)) / 2, tl = Math.hypot(1, ds);
+      const nF = -ds / tl, nS = 1 / tl;              // unit normal (across the street) in local (f,s)
+      for (const side of [-1, 1]) {
+        const setback = STREET_W / 2 + 4.1 + rng() * 1.8;
+        const cf = f + nF * side * setback + (rng() - 0.5) * 1.6;
+        const cs = sc + nS * side * setback + (rng() - 0.5) * 1.6;
+        const rot = localHeading(-nF * side, -nS * side) + (rng() - 0.5) * 28;   // face the street ± ~14°
+        cands.push({ f: cf, s: cs, rot });
+      }
+    }
+  }
+
+  // Greedy: drop each wishlist house into the next candidate lot that doesn't overlap anything placed.
+  const houses = wish.houses.slice();
+  let hi = 0;
+  for (const c of cands) {
+    if (hi >= houses.length) break;
+    const asset = houses[hi];
+    const r = Math.hypot(fp[asset].w, fp[asset].d) / 2 + 0.6;
+    const p = L(c.f, c.s);
+    if (overlaps(p.x, p.z, r)) continue;
+    place(asset, c.f, c.s, c.rot);
+    hi++;
+  }
 
   // Pad: the flat rectangle to bake under the whole town (halfZ along heading/inland, halfX across).
   const M = 4;

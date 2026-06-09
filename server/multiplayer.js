@@ -364,6 +364,7 @@ function attachMultiplayer(server) {
     // Victim's authoritative hull state → drives their HUD diagram + everyone's listing tilt.
     const stateMsg = JSON.stringify({
       type: 'combat_state', playerId: hit.victimId, zones: victim.combat.zones,
+      maxHp: victim.combat.maxHp,
     });
     for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
@@ -439,6 +440,16 @@ function attachMultiplayer(server) {
         };
         players.get(id).state = state;
         players.get(id).lastUpdateMs = Date.now();   // for combat victim-pose lag compensation
+
+        // Seed the combat hull to the player's actual vessel the first time we learn its slug (and
+        // re-seed if they respawn in a different ship). The slug is constant per session, so this
+        // fires once — a pinnace starts with its lighter HP, a sloop keeps the default.
+        {
+          const p = players.get(id);
+          if (p.combat && p.combat.slug !== state.vesselSlug) {
+            p.combat = combat.newCombatState(state.vesselSlug);
+          }
+        }
 
         // On first callsign assignment: load friends from DB
         if (state.callsign && state.callsign !== prevCallsign) {
@@ -579,10 +590,11 @@ function attachMultiplayer(server) {
         // Player acknowledged a sinking → restore their hull to full.
         const me = players.get(id);
         if (me && me.combat) {
-          me.combat = combat.newCombatState();
+          me.combat = combat.newCombatState(me.state?.vesselSlug);
           // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones,
+            maxHp: me.combat.maxHp,
           });
           for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
           // Tell everyone else this ship is repaired so they clear its scorch decals.

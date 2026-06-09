@@ -13,8 +13,8 @@ import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
 import { CombatService } from './combat.service';
-import { listingFor, capsizeFor, sinkProgress, SINK_DEPTH } from './combat.constants';
-import { Vessel, VesselPart, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
+import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH } from './combat.constants';
+import { Vessel, VesselPart, VesselCannon, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 // The rigged GLB + manifest are now resolved per-vessel (see this.rig in init / vessel-controller.ts).
 
@@ -72,6 +72,8 @@ export class VesselService {
   private rig: VesselRig = rigForSlug('sloop');
   /** World starboard in vessel-local X (+1 = +X, −1 = −X). Used by sign-sensitive visuals (Phase E). */
   rightSign: 1 | -1 = 1;
+  /** Per-vessel gun layout from the server vessel def (null → CannonService default sloop battery). */
+  private vesselCannons: { port: VesselCannon[]; stbd: VesselCannon[] } | null = null;
 
   // Water-contact shadow projected beneath the hull.
   private waterShadow: Mesh | null = null;
@@ -183,6 +185,9 @@ export class VesselService {
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
   getRoot(): TransformNode { return this.root; }
 
+  /** Per-vessel muzzle layout (vessel-local offsets per side), or null to use CannonService's default. */
+  getCannons(): { port: VesselCannon[]; stbd: VesselCannon[] } | null { return this.vesselCannons; }
+
   // ── Sheet (sail trim) ─────────────────────────────────────────────────────
   // sheetAngleDeg: degrees from the boat's centreline the boom swings out.
   //   5 = close-hauled (sail sheeted hard in)
@@ -252,8 +257,7 @@ export class VesselService {
   // could plunge ~half a hull-length into an island before the centre reached land
   // (the "sailing inside the island" bug). We instead sample several points along
   // the hull's length so the bow/stern stops at the shoreline like a solid body.
-  private readonly HULL_HALF_LEN = 7.0;   // world units from centre to bow/stern tip
-  private readonly HULL_SAMPLES  = 4;     // points sampled fore-of-centre to the bow
+  private readonly HULL_SAMPLES  = 4;     // points sampled fore-of-centre to the bow (HULL half-len from rig)
 
   /**
    * True if any point along the hull centreline (from centre toward the moving end)
@@ -264,7 +268,7 @@ export class VesselService {
     const fx = Math.sin(hr) * dirSign;   // unit heading vector (forward / reverse)
     const fz = Math.cos(hr) * dirSign;
     for (let i = 1; i <= this.HULL_SAMPLES; i++) {
-      const d = (this.HULL_HALF_LEN * i) / this.HULL_SAMPLES;
+      const d = (this.rig.hullHalfLen * i) / this.HULL_SAMPLES;
       if (this.terrainService.isOnLand(cx + fx * d, cz + fz * d)) return true;
     }
     return false;
@@ -316,8 +320,14 @@ export class VesselService {
       floatDraft: base.floatDraft,
       hullCut:    base.hullCut,
       buoyancy:   base.buoyancy,
+      hullHalfLen:  base.hullHalfLen,
+      hullHalfBeam: base.hullHalfBeam,
     };
     this.rightSign = this.rig.rightSign;
+
+    // Per-vessel gun layout (muzzle offsets per side, vessel-local). Null → CannonService falls back to
+    // its built-in sloop battery (3/side). The pinnace ships 1/side with its own handedness baked in.
+    this.vesselCannons = vessel.cannons ?? null;
 
     // First-person ("on deck") eye position (vessel-local), from the server vessel def. Falls back to a
     // sensible helm position if a vessel doesn't define one, so the toggle always does something.
@@ -926,13 +936,14 @@ export class VesselService {
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
     // Damage listing: ease toward the tilt implied by our hull state, then layer it on
     // top of wave roll + heel + recoil/hit. roll +stbd-down, pitch +bow-up (buoy convention).
-    const list = listingFor(this.combatService.zones());
+    const hullMax = zoneHpFor(this.vesselSlug);
+    const list = listingFor(this.combatService.zones(), hullMax);
     this.listRoll  += (list.roll  - this.listRoll)  * 0.04;
     this.listPitch += (list.pitch - this.listPitch) * 0.04;
 
     // Capsize: a dramatic heel/plunge toward the damaged side, scaled by sink progress, ADDED here so it
     // is free to exceed the buoyancy MAX_TILT clamp. Continues smoothly from the in-combat list.
-    const cap = capsizeFor(this.combatService.zones());
+    const cap = capsizeFor(this.combatService.zones(), hullMax);
 
     this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
     this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv;
@@ -1299,9 +1310,9 @@ export class VesselService {
     const rgtX =  Math.cos(hdgR);
     const rgtZ = -Math.sin(hdgR);
 
-    // Approximate hull geometry (world units)
-    const halfLen = 7.0;   // bow/stern offset from vessel centre
-    const halfBm  = 2.2;   // half-beam (port/stbd offset)
+    // Approximate hull geometry (world units) — per-vessel so the foam spawns at the real bow/stern/rails.
+    const halfLen = this.rig.hullHalfLen;   // bow/stern offset from vessel centre
+    const halfBm  = this.rig.hullHalfBeam;  // half-beam (port/stbd offset)
     const Y       = this.WAKE_Y;
 
     // ── Reposition emitters ──────────────────────────────────────────────

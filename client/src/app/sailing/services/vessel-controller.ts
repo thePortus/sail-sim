@@ -51,11 +51,14 @@ export interface VesselRig {
   /** Per-vessel buoyancy feel (omit → generic sloop response). pitchScale lower = gentler bow
    *  pitch; heaveTau higher = slower, less "bouncy" vertical follow. See VesselBuoyancyService. */
   buoyancy?: { pitchScale?: number; heaveTau?: number };
+  /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
+  hullHalfLen: number;
+  hullHalfBeam: number;
 }
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
-  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0 },
-  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.1, hullCut: { floorY: 0.15, alongSign: 1 }, buoyancy: { pitchScale: 0.08, heaveTau: 2.1 } },
+  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2 },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.1, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, buoyancy: { pitchScale: 0.08, heaveTau: 2.1 } },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {

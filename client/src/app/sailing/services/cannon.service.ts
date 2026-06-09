@@ -39,13 +39,12 @@ const AIM_RADIUS  = 0.30;                // tube thickness (m)
 // They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
 const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this many accrue
 
-// Three muzzle tips per side in vessel root-local space, derived from the 3 gunports.
-// x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
-// (Model gunports are mirrored+flipped by the 180° instantiate flip — tune at runtime.)
-// y lowered from the gunport-rim values so balls/blast emit from the barrel mouth,
-// not above it.
+// Default battery — the sloop's three muzzle tips per side in vessel root-local space, derived from
+// the 3 gunports. x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
+// Used when the vessel def carries no `cannons` layout. Per-vessel batteries (e.g. the pinnace's
+// single gun a side, opposite handedness) override this via syncGuns() reading VesselService.
 type Muz = { x: number; y: number; z: number };
-const MUZZLES: Record<'port' | 'stbd', Muz[]> = {
+const DEFAULT_MUZZLES: Record<'port' | 'stbd', Muz[]> = {
   port: [
     { x: -1.98, y: 1.50, z: 1.36 },
     { x: -1.87, y: 1.65, z: 2.40 },
@@ -170,6 +169,10 @@ export class CannonService {
   };
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
   private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
+
+  // Active gun layout for the LOCAL ship — refreshed from the vessel def at each broadside (syncGuns).
+  private muzzles: Record<'port' | 'stbd', Muz[]> = DEFAULT_MUZZLES;
+  private gunsPerSide = DEFAULT_MUZZLES.port.length;
 
   // Cannonball pool
   private balls: Ball[] = [];
@@ -745,10 +748,19 @@ export class CannonService {
   // Per side: STOWED → (arm) → ARMING → READY → (fire) → FIRING → RELOADING → STOWED.
   // Animations (ports/run-out/recoil) are eased in SloopController via VesselService.
 
+  /** Pull the LOCAL ship's gun layout from its vessel def (per-vessel battery + handedness), or fall
+   *  back to the default sloop battery. Cheap; called whenever a side begins a broadside. */
+  private syncGuns(): void {
+    const c = this.vesselService.getCannons();
+    this.muzzles = (c && c.port.length && c.stbd.length) ? c : DEFAULT_MUZZLES;
+    this.gunsPerSide = Math.max(1, this.muzzles.port.length);
+  }
+
   /** Z / port button, C / stbd button. ARM if stowed; FIRE if ready; else ignore. */
   armOrFire(side: 'port' | 'stbd'): void {
     const g = this.gun[side];
     if (g.state === 'stowed') {
+      this.syncGuns();
       g.state = 'arming';
       this.vesselService.setGunDeploy(side, 1);
       this.multiplayerService.broadcastGunState(side, 1);
@@ -793,16 +805,16 @@ export class CannonService {
 
     } else if (g.state === 'firing') {
       g.shotTimer += dt;
-      // Fire the 3 cannons in sequence with a randomized human gap; one full
-      // hull-roll impulse on the first.
-      while (g.shotsFired < 3 && g.shotTimer >= g.nextShotAt) {
-        this.vesselService.addCannonRecoil(side);   // hull shudder per shot (3 lurches)
+      // Fire this side's cannons in sequence with a randomized human gap; one full
+      // hull-roll impulse per shot.
+      while (g.shotsFired < this.gunsPerSide && g.shotTimer >= g.nextShotAt) {
+        this.vesselService.addCannonRecoil(side);   // hull shudder per shot
         this.fireOneCannon(side, g.shotsFired);
         this.vesselService.addGunRecoilKick(side);
         g.shotsFired++;
         g.nextShotAt += STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN);
       }
-      if (g.shotsFired >= 3) {
+      if (g.shotsFired >= this.gunsPerSide) {
         g.timer += dt;
         if (g.timer >= FIRE_HOLD) {
           g.state = 'reloading'; g.timer = 0;
@@ -865,7 +877,8 @@ export class CannonService {
     const vy0     = MUZZLE_V * Math.sin(elevRad);
     const bvx     = dirX * vh, bvz = dirZ * vh;
 
-    const muz = MUZZLES[side][1] ?? MUZZLES[side][0];   // centre gun, representative
+    const m = this.muzzles[side];
+    const muz = m[Math.floor(m.length / 2)] ?? m[0];   // centre gun, representative
     const ox  = vs.x + muz.x * cosH + muz.z * sinH;
     const oy  = muz.y;
     const oz  = vs.z - muz.x * sinH + muz.z * cosH;
@@ -1032,7 +1045,8 @@ export class CannonService {
     const sinH = Math.sin(hRad);
     const cosH = Math.cos(hRad);
 
-    // Beam direction (perpendicular to the hull): port = (-cosH, sinH), stbd = (cosH, -sinH).
+    // Beam direction (perpendicular to the hull): port out −X, starboard out +X. Each vessel's def
+    // places its muzzles on the matching side, so the ball always leaves out its own rail.
     const dirX = side === 'port' ? -cosH :  cosH;
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
@@ -1042,7 +1056,7 @@ export class CannonService {
     const bvz  = dirZ * vh;
 
     // Muzzle world position from this cannon's local offset, rotated by heading.
-    const muz = MUZZLES[side][idx] ?? MUZZLES[side][0];
+    const muz = this.muzzles[side][idx] ?? this.muzzles[side][0];
     const mwx = vs.x + muz.x * cosH + muz.z * sinH;
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;

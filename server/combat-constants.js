@@ -27,8 +27,16 @@ const MAST_Y_TOP = 22.0;  // top of the mast column
 // Zone names. 'masts' is tracked but exempt from the sink rule and has no effect yet.
 const ZONES = ['bow', 'stern', 'port', 'starboard', 'masts'];
 
-// Starting hit points per zone (sloop). Sides are the big broadside targets.
-const ZONE_HP = { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 };
+// Starting hit points per zone, per vessel. Sides are the big broadside targets. The pinnace is
+// lightly built — far fewer HP, so it sinks much faster than the sloop. Keep these in sync with the
+// vessel defs (server/controllers/vessels.controller.js) and the client mirror (combat.constants.ts).
+const ZONE_HP_BY_SLUG = {
+  sloop:   { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
+  pinnace: { bow: 55, stern: 55, port: 80,  starboard: 80,  masts: 60  },
+};
+function zoneHpFor(slug) { return ZONE_HP_BY_SLUG[slug] || ZONE_HP_BY_SLUG.sloop; }
+// Back-compat default (sloop) for any caller without a slug.
+const ZONE_HP = ZONE_HP_BY_SLUG.sloop;
 
 // Outward face normal of each hull zone in vessel-local (lat = +X/starboard, lon = +Z/bow).
 const ZONE_NORMAL = {
@@ -80,7 +88,7 @@ const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
 module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
-  ZONES, ZONE_HP, ZONE_NORMAL,
+  ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,

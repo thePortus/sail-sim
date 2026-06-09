@@ -53,10 +53,11 @@ const VESSELS = [
     },
     // Helm: near the front of the tiller, just to starboard (starboard = −X here), seated eye height.
     firstPersonCam: { x: -0.45, y: 1.45, z: -2.4 },
-    // One carriage gun per side, amidships. Port is +X on this hull, starboard −X (run out to the rail).
+    // One carriage gun per side, amidships. Standard sides: port = −X (left), starboard = +X (right),
+    // so each gun fires out its own rail (matches the run-out animation and the cannon-fire direction).
     cannons: {
-      port: [{ x:  0.95, y: 0.85, z: -0.15 }],
-      stbd: [{ x: -0.95, y: 0.85, z:  0.15 }],
+      port: [{ x: -0.95, y: 0.85, z:  0.15 }],
+      stbd: [{ x:  0.95, y: 0.85, z: -0.15 }],
     },
     zoneHp: { bow: 55, stern: 55, port: 80, starboard: 80, masts: 60 },
     parts: [],

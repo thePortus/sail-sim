@@ -13,11 +13,14 @@
 
 const C = require('./combat-constants');
 
-/** Fresh full-HP hull for a newly connected player. */
-function newCombatState() {
+/** Fresh full-HP hull for a player, seeded from their vessel's per-zone HP (slug → vessel). */
+function newCombatState(slug) {
+  const hp = C.zoneHpFor(slug);
   const zones = {};
-  for (const z of C.ZONES) zones[z] = C.ZONE_HP[z];
-  return { zones, sunk: false, shotTimes: [] };
+  for (const z of C.ZONES) zones[z] = hp[z];
+  // maxHp travels in the combat_state broadcast so clients can size the HUD severity bands
+  // per vessel without a separate slug lookup.
+  return { zones, maxHp: { ...hp }, slug: slug || 'sloop', sunk: false, shotTimes: [] };
 }
 
 /** Which hull zone (if any) contains a point in vessel-local space. null = no hit. */

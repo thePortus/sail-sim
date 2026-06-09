@@ -10,10 +10,20 @@ export type Zone = 'bow' | 'stern' | 'port' | 'starboard' | 'masts';
 /** Diagram-friendly order. */
 export const ZONES: Zone[] = ['bow', 'port', 'starboard', 'stern', 'masts'];
 
-/** Starting / max hit points per zone (must match server ZONE_HP). */
-export const ZONE_HP: Record<Zone, number> = {
-  bow: 90, stern: 90, port: 130, starboard: 130, masts: 100,
+/** Starting / max hit points per zone, per vessel (must match server ZONE_HP_BY_SLUG). The pinnace
+ *  is lightly built — far fewer HP, so it sinks faster. */
+export const ZONE_HP_BY_SLUG: Record<string, Record<Zone, number>> = {
+  sloop:   { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
+  pinnace: { bow: 55, stern: 55, port: 80,  starboard: 80,  masts: 60  },
 };
+
+/** Per-zone max HP for a vessel slug (defaults to the sloop). */
+export function zoneHpFor(slug: string | undefined): Record<Zone, number> {
+  return ZONE_HP_BY_SLUG[slug ?? ''] ?? ZONE_HP_BY_SLUG['sloop'];
+}
+
+/** Default (sloop) per-zone max HP — used when a caller has no per-vessel table. */
+export const ZONE_HP: Record<Zone, number> = ZONE_HP_BY_SLUG['sloop'];
 
 export const SEV_GREEN_MIN  = 0.60;
 export const SEV_YELLOW_MIN = 0.30;
@@ -39,6 +49,7 @@ export interface CombatStateMsg {
   type:     'combat_state';
   playerId: string;          // whose hull this is (own id → also feeds the HUD)
   zones:    ZoneState;
+  maxHp?:   ZoneState;       // per-vessel full-HP (sizes the HUD severity bands); omitted = sloop default
 }
 
 /** Server → victim + shooter: a sinking (messages only, for now). */
@@ -64,10 +75,12 @@ export const LIST_CURVE     = 0.55;
  * roll `+` = starboard-down, pitch `+` = bow-up.
  * Returns {0,0} for a pristine / unknown hull.
  */
-export function listingFor(z: ZoneState | null | undefined): { roll: number; pitch: number } {
+export function listingFor(
+  z: ZoneState | null | undefined, maxHp: Record<Zone, number> = ZONE_HP,
+): { roll: number; pitch: number } {
   if (!z) return { roll: 0, pitch: 0 };
   const dmg = (zone: Zone) => {
-    const frac = 1 - Math.max(0, Math.min(1, (z[zone] ?? ZONE_HP[zone]) / ZONE_HP[zone]));
+    const frac = 1 - Math.max(0, Math.min(1, (z[zone] ?? maxHp[zone]) / maxHp[zone]));
     return Math.pow(frac, LIST_CURVE);   // partial damage lists sooner
   };
   return {
@@ -97,9 +110,11 @@ export function sinkProgress(elapsedSec: number): number {
  * stbd-down toward the holed beam; pitch + = bow-up), scaled to the capsize maxima. If the damage is too
  * symmetric to pick a side, force a default heel so she always rolls over rather than settling flat.
  */
-export function capsizeFor(z: ZoneState | null | undefined): { roll: number; pitch: number } {
+export function capsizeFor(
+  z: ZoneState | null | undefined, maxHp: Record<Zone, number> = ZONE_HP,
+): { roll: number; pitch: number } {
   const dmg = (zone: Zone) =>
-    1 - Math.max(0, Math.min(1, (z?.[zone] ?? ZONE_HP[zone]) / ZONE_HP[zone]));   // 0..1, raw (no curve)
+    1 - Math.max(0, Math.min(1, (z?.[zone] ?? maxHp[zone]) / maxHp[zone]));   // 0..1, raw (no curve)
   let rollN  = z ? dmg('port') - dmg('starboard') : 0;   // matches listingFor's sign
   const pitchN = z ? dmg('bow') - dmg('stern')      : 0;
   // Always tip: if neither beam nor end dominates, lean to one side (sign-preserving) so she capsizes.
@@ -110,9 +125,9 @@ export function capsizeFor(z: ZoneState | null | undefined): { roll: number; pit
 
 export type Severity = 'none' | 'green' | 'yellow' | 'red' | 'destroyed';
 
-/** Map a zone's current HP to a severity band for the HUD. */
-export function severityFor(zone: Zone, hp: number): Severity {
-  const frac = Math.max(0, Math.min(1, hp / ZONE_HP[zone]));
+/** Map a zone's current HP to a severity band for the HUD (against the vessel's per-zone max). */
+export function severityFor(zone: Zone, hp: number, maxHp: Record<Zone, number> = ZONE_HP): Severity {
+  const frac = Math.max(0, Math.min(1, hp / maxHp[zone]));
   if (frac >= 1)              return 'none';
   if (frac <= 0)              return 'destroyed';
   if (frac >= SEV_GREEN_MIN)  return 'green';

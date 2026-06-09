@@ -4,7 +4,9 @@
 
 * add spawns close to coast
 * switching boats needs hard reload... fix
+* cannonfire smoke is occluded by clouds
 * add server-side authoritative movement... and force player to re-login if 401 on player-location at start... and have server check collisions for future damage bounces
+* adjust water displacement to better fit hull of pinnace
 * add dedication
 * add damage from collisions and aground
 * fix speed of asset scattering loading in?

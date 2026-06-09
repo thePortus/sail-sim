@@ -13,7 +13,7 @@ import { VesselController, createVesselController, rigForSlug } from './vessel-c
 import { CombatService } from './combat.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor, capsizeFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
+import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage } from '../models';
 import { Settings } from '../../app.settings';
 
@@ -364,7 +364,8 @@ export class MultiplayerService {
 
     } else if (msg.type === 'combat_state') {
       const pid = String(msg.playerId ?? '');
-      if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState);
+      const maxHp = (msg as { maxHp?: ZoneState }).maxHp;
+      if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState, maxHp);
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
     } else if (msg.type === 'combat_sunk') {
@@ -470,7 +471,7 @@ export class MultiplayerService {
       this.players.set(data.id, entry);
       // Seed any hull state we already heard about before this ship's mesh existed.
       const known = this.remoteZones.get(data.id);
-      if (known) { const l = listingFor(known); entry.listRoll = l.roll; entry.listPitch = l.pitch; }
+      if (known) { const l = listingFor(known, zoneHpFor(entry.vesselSlug)); entry.listRoll = l.roll; entry.listPitch = l.pitch; }
 
       const callsign = String(data.callsign ?? '').slice(0, 32);
       const slug     = String(data.vesselSlug ?? 'sloop').slice(0, 64);
@@ -785,14 +786,14 @@ export class MultiplayerService {
       entry.hitRoll = 0; entry.hitRollVel = 0;
     }
 
-    // Damage listing: ease toward the tilt implied by this ship's hull state.
-    const list = listingFor(this.remoteZones.get(entry.id));
+    // Damage listing: ease toward the tilt implied by this ship's hull state (per-vessel HP).
+    const list = listingFor(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug));
     entry.listRoll  += (list.roll  - entry.listRoll)  * this.LIST_EASE;
     entry.listPitch += (list.pitch - entry.listPitch) * this.LIST_EASE;
 
     // Capsize: dramatic heel/plunge toward the damaged side, scaled by sink progress (env set in
     // tickRemoteMotion this frame). Layered on top of everything else, free to exceed the list cap.
-    const cap = entry.sinkEnv > 0.0001 ? capsizeFor(this.remoteZones.get(entry.id)) : { roll: 0, pitch: 0 };
+    const cap = entry.sinkEnv > 0.0001 ? capsizeFor(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug)) : { roll: 0, pitch: 0 };
 
     // Combine cannon recoil + hit shudder + damage list with the wave-induced roll/pitch
     // set by tickRemoteMotion (runs first) so neither channel overwrites the other.
@@ -832,8 +833,15 @@ export class MultiplayerService {
   // LOCAL ship — cancel the component of its velocity pointing INTO the struck hull (+ a little bounce),
   // keep the tangential part. The other ship's owner resolves its own ship the same way, and we see it via
   // its position broadcast. No momentum transfer, so no agreement/handshake needed.
-  private readonly COLL_HALF_LEN    = 5.0;   // keel half-length for collision (m)
-  private readonly COLL_RADIUS      = 2.2;   // capsule radius ≈ half-beam + margin (m)
+  // Per-vessel collision capsule (keel half-length + radius ≈ half-beam + margin). Each ship uses its
+  // OWN size, so a small pinnace collides at its true hull, not the sloop's bulk. Default = sloop.
+  private readonly COLL_DIMS_BY_SLUG: Record<string, { halfLen: number; radius: number }> = {
+    sloop:   { halfLen: 5.0, radius: 2.2 },
+    pinnace: { halfLen: 3.8, radius: 1.4 },
+  };
+  private collDims(slug: string | undefined): { halfLen: number; radius: number } {
+    return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
+  }
   private readonly COLL_RESTITUTION = 0.15;  // bounce: 0 = dead stop (T-bone/head-on), 1 = full elastic.
                                              // Low so head-on/T-bone read as "stop"; a glance keeps its
                                              // tangential momentum and slides through regardless of this.
@@ -847,7 +855,7 @@ export class MultiplayerService {
     if (!vs) { return; }
     const ahr = vs.heading * Math.PI / 180;            // local heading → radians (0=N=+Z, 90=E=+X)
     const aFx = Math.sin(ahr), aFz = Math.cos(ahr);
-    const rsum = this.COLL_RADIUS * 2;
+    const aDim = this.collDims(this.localState.vesselSlug);   // local ship's capsule size
 
     // Find the deepest overlap against any remote hull. Also track each hull's ON-SCREEN closing rate
     // (how fast the gap is shrinking) — symmetric for both ships, and accurate even though remote speed
@@ -856,10 +864,12 @@ export class MultiplayerService {
     let best: { nx: number; nz: number; pen: number; closing: number } | null = null;
     for (const entry of this.players.values()) {
       if (!entry.root || !entry.root.isEnabled()) { continue; }   // skip culled / far ships
+      const bDim = this.collDims(entry.vesselSlug);   // remote ship's capsule size
+      const rsum = aDim.radius + bDim.radius;
       const bFx = Math.sin(entry.dispHeading), bFz = Math.cos(entry.dispHeading);
       const cp = this.closestSegSeg(
-        vs.x, vs.z, aFx, aFz, this.COLL_HALF_LEN,
-        entry.dispX, entry.dispZ, bFx, bFz, this.COLL_HALF_LEN,
+        vs.x, vs.z, aFx, aFz, aDim.halfLen,
+        entry.dispX, entry.dispZ, bFx, bFz, bDim.halfLen,
       );
       const dx = cp.pbx - cp.pax, dz = cp.pbz - cp.paz;
       const dist = Math.hypot(dx, dz);

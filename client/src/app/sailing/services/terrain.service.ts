@@ -26,7 +26,7 @@ import {
 import { CustomMaterial, PBRCustomMaterial } from '@babylonjs/materials';
 import { TerrainClipmap } from './terrain/terrain-clipmap';
 import { Settings } from '../../app.settings';
-import { TerrainManifest, TerrainWorldBounds } from '../models';
+import { TerrainManifest, TerrainWorldBounds, TerrainHarbor } from '../models';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { createSpsTreeArchetype } from '../utils/sps-tree-generator';
@@ -266,6 +266,11 @@ export class TerrainService {
     };
   }
 
+  /** Harbor towns detected during terrain generation (manifest.harbors). Empty array if none. */
+  getHarbors(): TerrainHarbor[] {
+    return this.manifest?.harbors ?? [];
+  }
+
   getElevation(worldX: number, worldZ: number): number {
     if (!this.manifest || !this.heightfield) return 0;
 
@@ -356,6 +361,42 @@ export class TerrainService {
     }
 
     return { spawnX: best.x, spawnZ: best.z, heading: best.heading };
+  }
+
+  /**
+   * Spawn a brand-new player just off a random town's pier, facing the town — so the game opens with
+   * "arriving at a harbour" rather than empty ocean. The shore point + seaward heading come straight
+   * from the detected harbor; we step seaward past the pier (length + approach) into open water and
+   * face back toward the pier. Falls back to coastalSpawn() if there are no towns / the spot isn't
+   * navigable water.
+   */
+  harborSpawn(): { spawnX: number; spawnZ: number; heading: number } {
+    const harbors = this.getHarbors();
+    if (!harbors.length) return this.coastalSpawn();
+    return this.spawnOffPier(harbors[Math.floor(Math.random() * harbors.length)]);
+  }
+
+  /** Spawn just off the NEAREST town's pier to (worldX, worldZ) — used to respawn a sunk player at the
+   *  closest harbor. Falls back to coastalSpawn() if there are no towns. */
+  nearestHarborSpawn(worldX: number, worldZ: number): { spawnX: number; spawnZ: number; heading: number } {
+    const harbors = this.getHarbors();
+    if (!harbors.length) return this.coastalSpawn();
+    let best = harbors[0], bestD = Infinity;
+    for (const h of harbors) {
+      const d = (h.x - worldX) ** 2 + (h.z - worldZ) ** 2;
+      if (d < bestD) { bestD = d; best = h; }
+    }
+    return this.spawnOffPier(best);
+  }
+
+  /** A navigable point ~55 m off the seaward end of a town's pier, facing back toward it. */
+  private spawnOffPier(h: TerrainHarbor): { spawnX: number; spawnZ: number; heading: number } {
+    const hr = (h.heading * Math.PI) / 180;     // seaward direction
+    const OFF = 55;                              // m off the shore point — clears the pier + pilings
+    const spawnX = h.x + Math.sin(hr) * OFF;
+    const spawnZ = h.z + Math.cos(hr) * OFF;
+    if (this.isOnLand(spawnX, spawnZ)) return this.coastalSpawn();   // safety
+    return { spawnX, spawnZ, heading: (h.heading + 180) % 360 };     // face back toward the pier
   }
 
   /**

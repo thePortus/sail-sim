@@ -556,6 +556,16 @@ export class VesselService {
     this.resetWake();
   }
 
+  /** Respawn the vessel at a given pose (used after sinking → a harbor). Teleports, faces the given
+   *  heading, furls sails, stops/clears sinking + grounded. The server-side respawn clears our
+   *  authoritative pose so this jump isn't clamped by movement validation. */
+  respawnAt(worldX: number, worldZ: number, heading: number): void {
+    this.teleportTo(worldX, worldZ);
+    this.heading = ((heading % 360) + 360) % 360;
+    if (this.root) this.root.rotation.y = this.heading * Math.PI / 180;
+    this.stopSinking();
+  }
+
   // Teleports the vessel to the nearest terrain spawn point, furls sails,
   // resets speed, and clears the grounded flag.
 

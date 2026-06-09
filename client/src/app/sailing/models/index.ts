@@ -68,6 +68,19 @@ export interface TerrainSpawnPoint {
   heading: number;
 }
 
+/** A harbor town: identity + a pier site. x,z = the shore point (pier origin at the waterline);
+ *  heading points SEAWARD (the pier body + docking water extend that way). Detected during terrain
+ *  generation (server build findHarbors → manifest.harbors). */
+export interface TerrainHarbor {
+  id: string;
+  name: string;
+  description: string;
+  variant: 'straight' | 'l' | 't';
+  x: number;
+  z: number;
+  heading: number;
+}
+
 export interface TerrainManifest {
   version: number;
   source: string;
@@ -80,6 +93,7 @@ export interface TerrainManifest {
   targetPeakElevation: number;
   worldBounds: TerrainWorldBounds;
   spawns: TerrainSpawnPoint[];
+  harbors?: TerrainHarbor[];   // harbor towns (version ≥ 2 real-data manifests)
   // ── Legacy PNG-pipeline fields (optional; absent on real-data region manifests) ──
   waterThreshold?: number;
   sourceMin?: number;

@@ -37,7 +37,7 @@ npm run download:terrain-tiles
 npm run download:terrain-tiles -- --2k
 # now to build...
 # random region + random seed
-npm run terrain -- cyclades_naxos	that region, random seed
+npm run terrain -- cyclades_naxos
 # OR specific seed
 npm run terrain -- 42
 # OR a specific region with a specific seed

@@ -49,6 +49,12 @@ export class SceneService {
     this.glowLayer?.addExcludedMesh(mesh);
   }
 
+  /** Add an emissive mesh to the glow layer's include list (the layer is include-only — sun/moon by
+   *  default), so its emissive blooms. Used for the pier lanterns. */
+  includeInGlow(mesh: Mesh): void {
+    this.glowLayer?.addIncludedOnlyMesh(mesh);
+  }
+
   /**
    * Exclude a material from the prePass G-buffer render (normals/depth).
    * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't

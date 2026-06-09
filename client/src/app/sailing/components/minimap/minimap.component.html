@@ -5,6 +5,8 @@
   <canvas #canvas
           [width]="expanded() ? 600 : 200"
           [height]="expanded() ? 600 : 200"
+          (mousemove)="onPointerMove($event)"
+          (mouseleave)="onPointerLeave()"
     class="minimap-canvas">
   </canvas>
 

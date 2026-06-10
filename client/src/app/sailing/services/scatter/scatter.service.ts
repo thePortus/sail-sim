@@ -157,6 +157,17 @@ export class ScatterService {
   // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
   // patches built. _patchPending = still filling in this cell (build cap not yet drained).
   private _lastCx = NaN; private _lastCz = NaN; private _patchPending = true;
+  // Adaptive streaming. _hasFilledOnce = have we completed the FIRST fill-from-empty yet? Until then we run
+  // "aggressive" (bigger time/commit budget) so the initial load snaps in — a brief stutter is invisible
+  // while the screen is still appearing. Once filled, every later top-up (sailing across a cell boundary)
+  // is GENTLE so it never hiccups, even though a leading edge legitimately takes a few frames to fill. NOT
+  // streak-based on purpose: a cell-cross adds a multi-frame backlog too, so "sustained backlog" can't tell
+  // sailing apart from the initial load — "have we ever finished filling" can. _ringOffsets = cell deltas
+  // sorted NEAREST-FIRST so the budget always lands on the most-visible patches; cached per RADIUS.
+  private _hasFilledOnce = false;
+  private _aggressive = false;
+  private _ringOffsets: { dx: number; dz: number }[] | null = null;
+  private _ringR = -1;
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -212,7 +223,20 @@ export class ScatterService {
         this._shadowMat.alpha = 0.30 * smoothstep(0.0, 0.16, sun.y) * (1.0 - 0.12 * (stretch - 1.0));
       }
       this.ensurePatches();
-      for (const l of this.layers) { l.manager.update(); }
+      // LoD re-eval is cheap (rate-limited internally); the queue DRAIN is the GPU-heavy bit (geometry
+      // clone + thin-instance buffer upload). Drain it on ONE budget shared across all layers, round-robin,
+      // so a leading ring of several layers can't spike into 3×N clones in a single frame (the sailing
+      // hiccup). Generous during an aggressive fill, tight while cruising.
+      for (const l of this.layers) { l.manager.reevaluateLod(); }
+      let commitBudget = this._aggressive ? 24 : 6;
+      let drainedAny = true;
+      while (commitBudget > 0 && drainedAny) {
+        drainedAny = false;
+        for (const l of this.layers) {
+          if (commitBudget <= 0) { break; }
+          if (l.manager.drainQueue(1) > 0) { commitBudget--; drainedAny = true; }
+        }
+      }
     });
   }
 
@@ -271,7 +295,7 @@ export class ScatterService {
     clearScatterCache();
     this.teardownLayers();
     await this.buildLayers(scene);
-    this._lastCx = NaN; this._patchPending = true;   // fresh layers → rebuild the grid
+    this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // fresh layers → aggressive refill
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
   }
@@ -619,7 +643,22 @@ export class ScatterService {
     return { mat, manager, patches: new Map(), build, baseMeshes: meshes };
   }
 
-  /** Build any new cells entering the radius (budgeted across all layers), cull cells that left. */
+  /** Cell deltas within radius R, sorted NEAREST-FIRST (Euclidean) so patch building always favours the
+   *  patches closest to the camera — fastest to appear on initial load, and the leading edge first while
+   *  sailing. Cached per R (cheap to rebuild when quality changes the radius). */
+  private buildRingOffsets(R: number): { dx: number; dz: number }[] {
+    const out: { dx: number; dz: number }[] = [];
+    for (let dx = -R; dx <= R; dx++) {
+      for (let dz = -R; dz <= R; dz++) { out.push({ dx, dz }); }
+    }
+    out.sort((a, b) => (a.dx * a.dx + a.dz * a.dz) - (b.dx * b.dx + b.dz * b.dz));
+    return out;
+  }
+
+  /** Build any new cells entering the radius (NEAREST-FIRST, on an adaptive TIME budget), cull cells that
+   *  left. Steady cruising only adds a thin leading edge → clears in ~1 frame, gently. A sustained backlog
+   *  (initial fill / fast travel) flips "aggressive" → a bigger time/count budget fills fast. Either way the
+   *  per-frame build time is capped, so a single frame never spikes regardless of how heavy the patches are. */
   private ensurePatches(): void {
     const cam = this.sceneService.camera;
     if (!cam || !this.layers.length || !this.enabled) { return; }
@@ -628,32 +667,46 @@ export class ScatterService {
     const R = this.RADIUS;
 
     // The patch grid only changes when the camera crosses into a new 40 m cell. While it's parked in the
-    // same cell with everything built, there's nothing to add or cull — so skip the whole (2R+1)²×layers
-    // scan + per-patch cull entirely (the common case, since the camera moves far less than a cell/frame).
+    // same cell with everything built, there's nothing to add or cull — so skip the whole scan + cull
+    // entirely (the common case, since the camera moves far less than a cell/frame).
     const cellChanged = cx !== this._lastCx || cz !== this._lastCz;
-    if (!cellChanged && !this._patchPending) { return; }
+    if (!cellChanged && !this._patchPending) { this._hasFilledOnce = true; this._aggressive = false; return; }
     this._lastCx = cx; this._lastCz = cz;
 
+    if (!this._ringOffsets || this._ringR !== R) { this._ringOffsets = this.buildRingOffsets(R); this._ringR = R; }
+
+    // Adaptive budget: the first fill-from-empty builds punchy (a stutter is invisible while the screen is
+    // still appearing); every later top-up while cruising builds gently so it never hiccups. The time cap
+    // bounds the per-frame spike either way.
+    const aggressive = !this._hasFilledOnce;
+    this._aggressive = aggressive;
+    const budgetMs = aggressive ? 6 : 2;
+    const maxBuilds = aggressive ? 64 : 8;
+
+    const t0 = performance.now();
     let built = 0;
-    for (let ix = cx - R; ix <= cx + R && built < this.MAX_BUILDS_PER_FRAME; ix++) {
-      for (let iz = cz - R; iz <= cz + R && built < this.MAX_BUILDS_PER_FRAME; iz++) {
-        const key = ix + ',' + iz;
-        for (const l of this.layers) {
-          if (built >= this.MAX_BUILDS_PER_FRAME) { break; }
-          if (l.patches.has(key)) { continue; }
-          // Shadow (and any capped) layers only build within their near ring around the camera cell.
-          if (l.maxRing !== undefined && (Math.abs(ix - cx) > l.maxRing || Math.abs(iz - cz) > l.maxRing)) { continue; }
-          const data = l.build(ix * this.PATCH, iz * this.PATCH);
-          built++;
-          if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
-          const p = new ThinInstancePatch(new Vector3(ix * this.PATCH, 0, iz * this.PATCH), data.matrix, data.color);
-          l.manager.addPatch(p);
-          l.patches.set(key, p);
-        }
+    let incomplete = false;
+    for (const off of this._ringOffsets) {
+      // Always build at least the nearest cell; thereafter stop on the time OR count cap.
+      if (built >= maxBuilds || (built > 0 && performance.now() - t0 > budgetMs)) { incomplete = true; break; }
+      const ix = cx + off.dx, iz = cz + off.dz;
+      const key = ix + ',' + iz;
+      for (const l of this.layers) {
+        if (l.patches.has(key)) { continue; }
+        // Shadow (and any capped) layers only build within their near ring around the camera cell.
+        if (l.maxRing !== undefined && (Math.abs(off.dx) > l.maxRing || Math.abs(off.dz) > l.maxRing)) { continue; }
+        const data = l.build(ix * this.PATCH, iz * this.PATCH);
+        built++;
+        if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
+        const p = new ThinInstancePatch(new Vector3(ix * this.PATCH, 0, iz * this.PATCH), data.matrix, data.color);
+        l.manager.addPatch(p);
+        l.patches.set(key, p);
       }
     }
-    // Hit the per-frame build cap → more patches still to fill in; keep scanning next frame.
-    this._patchPending = built >= this.MAX_BUILDS_PER_FRAME;
+    // Broke out on a budget cap → more patches still to fill; keep going next frame. The first time we
+    // fully drain (incomplete=false) the initial load is done → drop to gentle streaming forever after.
+    this._patchPending = incomplete;
+    if (!incomplete) { this._hasFilledOnce = true; }
 
     // Cull only when the cell moved (the cull boundary is relative to it) — otherwise nothing left the ring.
     if (cellChanged) {
@@ -829,7 +882,7 @@ export class ScatterService {
       for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
       l.patches.clear();
     }
-    this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to rebuild the grid
+    this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // force ensurePatches to rebuild the grid
     if (this.enabled) { this.ensurePatches(); }
   }
 

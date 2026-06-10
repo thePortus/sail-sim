@@ -3,7 +3,7 @@
 # General or Current TODO Items
 
 * optimize asset scattering loading
-* bring trees back
+* any cheap and easy FPS wins?
 * zoomable map
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
 * shallow water gets into boat, not displaced
@@ -11,6 +11,7 @@
 * clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon
 * make stuff look cool pass)
 * keypress makes songs lock up
+* Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * cannonfire smoke is occluded by clouds
 * adjust water displacement to better fit hull of pinnace
 * add dedication
@@ -35,7 +36,6 @@
 * Add /teleport playername x y and /teleportTo playername to admins
 * Add lost server connection detection
 * encrypt websocket server? wss instead of ws?
-* Add swear list filter, see if we can source from not us and build into the pipeline
 * Optimization pass
 * Security pass
 

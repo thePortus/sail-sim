@@ -48,8 +48,14 @@ export class PatchManager {
   }
 
   update(): void {
-    // Multi-LoD layers: re-scan distances only every Nth frame; single-LoD layers never scan. Either way,
-    // drain the (rate-limited) swap queue every frame so queued LoD changes still stream in smoothly.
+    this.reevaluateLod();
+    this.drainQueue(this.patchUpdateRate);
+  }
+
+  /** Re-scan patch distances and queue any LoD changes (multi-LoD layers only, every Nth frame).
+   *  Split out from the queue drain so the (GPU-heavy) drain can run on a budget shared across ALL
+   *  layers — otherwise N layers each draining independently spikes into N× geometry clones per frame. */
+  reevaluateLod(): void {
     if (this.meshesFromLod.length > 1 && (this._lodTick++ % this.lodEvalEvery) === 0) {
       for (let i = 0; i < this.patches.length; i++) {
         const [patch, patchLod] = this.patches[i];
@@ -59,19 +65,26 @@ export class PatchManager {
         this.patches[i] = [patch, newLod];
       }
     }
-    this.updateQueue(this.patchUpdateRate);
   }
 
-  private updateQueue(n: number): void {
+  /** Commit up to `n` queued patches (the expensive clone + thin-instance-buffer upload). Returns how
+   *  many it actually committed, so a caller can spread a global budget across layers round-robin. */
+  drainQueue(n: number): number {
+    let done = 0;
     for (let i = 0; i < n; i++) {
       const head = this.queue.shift();
       if (head === undefined) { break; }
       head.patch.createInstances(this.meshesFromLod[head.newLOD], this.lodFractions[head.newLOD]);
+      done++;
     }
+    return done;
   }
 
+  /** Number of patches awaiting a (GPU) commit. */
+  get pendingCommits(): number { return this.queue.length; }
+
   /** Build all queued instances immediately (e.g. after the initial patch set is added). */
-  initInstances(): void { this.updateQueue(this.queue.length); }
+  initInstances(): void { this.drainQueue(this.queue.length); }
 
   setLodUpdateCadence(cadence: number): void { this.patchUpdateRate = cadence; }
 

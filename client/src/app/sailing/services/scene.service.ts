@@ -755,6 +755,15 @@ export class SceneService {
     return new Vector3(a.r, a.g, a.b);
   }
 
+  /** The baked equirect sky LUT, reusable as a SCOPED IBL/reflection source for select PBR materials
+   *  (harbor metals + fountain water) that otherwise read black — we run NO scene-wide environmentTexture,
+   *  so assigning this per-material is the only way those surfaces pick up sky radiance. It's HDR, in
+   *  FIXED_EQUIRECTANGULAR mode (shared with the skybox), and re-bakes with the sun, so the reflections
+   *  it drives track time of day for free. Returns null on the WebGL fallback (no procedural sky). */
+  getSkyEnvTexture(): Texture | null {
+    return this.proceduralSky?.lutTexture ?? null;
+  }
+
   updateFogDensity(density: number): void {
     if (this.scene) this.scene.fogDensity = density;
   }

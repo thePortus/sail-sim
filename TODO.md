@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* optimize asset scattering loading
 * bring trees back
 * zoomable map
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
@@ -15,7 +16,6 @@
 * add dedication
 * draw distance (for other players, etc)
 * add damage from collisions and aground
-* fix speed of asset scattering loading in?
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * add keymap help screen
 * clouds don't seem to meet water at horizon.. not for spherical world?

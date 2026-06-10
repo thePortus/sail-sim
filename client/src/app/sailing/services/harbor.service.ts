@@ -32,16 +32,13 @@ export class HarborService {
   private readonly seawardOffset = new Map<string, number>();
   private readonly frozenMats = new Set<Material>();
 
-  // One warm "pool" light that follows the nearest pier — it actually illuminates the deck + the
-  // player's hull when docking at night (the 50 lanterns are emissive-only). A single always-on,
-  // range-limited light keeps us under the per-mesh light cap (sun+moon+ambient+this = 4).
-  private pierLight: PointLight | null = null;
   // ONE shared warm light parked at the nearest town's civic square at night. Only ~1 town is streamed
-  // at a time, so a single pooled light suffices. Enabled scene lights: 7 existing (ambient+sun+moon+
-  // pierLight+3 cannon-flash; the remote-rig lights are null) + this = 8 → prePass vertex UBO = 3 base +
-  // 8 = 11, one under Metal's 12 maxUniformBuffersPerShaderStage cap. Keep ≤9 total (see
+  // at a time, so a single pooled light suffices, and it also reaches the waterfront/pier (the town
+  // square sits just inland), so no separate dock light is needed. Enabled scene lights: 6 existing
+  // (ambient+sun+moon+3 cannon-flash; the remote-rig lights are null) + this = 7 → prePass vertex UBO =
+  // 3 base + 7 = 10, well under Metal's 12 maxUniformBuffersPerShaderStage cap. Keep ≤9 total (see
   // harbor_towns_v2_roadmap — the prePass G-buffer bakes LIGHTCOUNT = total enabled lights, ignoring
-  // maxSimultaneousLights). One slot of margin remains; don't spend it casually.
+  // maxSimultaneousLights).
   private squareLight: PointLight | null = null;
   // The scoped sky-IBL reflection texture (procedural-sky LUT), fetched lazily on first building build.
   private skyEnv: Texture | null = null;
@@ -80,27 +77,18 @@ export class HarborService {
     if (!scene || !this.harbors.length) return;
     this.root = new TransformNode('harbors_root', scene);
 
-    this.pierLight = new PointLight('pierLight', new Vector3(0, 6, 0), scene);
-    this.pierLight.diffuse = new Color3(1.0, 0.72, 0.42);   // warm lantern light
-    this.pierLight.specular = new Color3(0.6, 0.45, 0.25);
-    // STANDARD falloff = intensity as a plain multiplier with a range cutoff (PBR's default physical
-    // inverse-square makes a small intensity vanish at pier scale). Intensity is driven per-frame by
-    // the night factor below — bright after dark, off in daylight (where the sun would wash it out).
-    this.pierLight.falloffType = PointLight.FALLOFF_STANDARD;
-    this.pierLight.range = 60;
-    this.pierLight.intensity = 0;
-
-    // Civic-square night light (warm, like the pier's). Parked per-frame at the nearest town's square,
-    // intensity driven by the same night curve. Range-limited so it only touches that town's centre.
+    // Civic-square night light (warm). Parked per-frame at the nearest town's square, intensity driven
+    // by the night curve. STANDARD falloff = a plain range-cutoff multiplier (PBR's default inverse-
+    // square would vanish at this scale). Range reaches the waterfront so the pier reads at night too.
     this.squareLight = new PointLight('townSquareLight', new Vector3(0, 8, 0), scene);
     this.squareLight.diffuse = new Color3(1.0, 0.80, 0.52);
     this.squareLight.specular = new Color3(0.35, 0.26, 0.16);
     this.squareLight.falloffType = PointLight.FALLOFF_STANDARD;
-    this.squareLight.range = 55;
+    this.squareLight.range = 85;   // square sits ~28 m inland; reach the pier/waterfront too
     this.squareLight.intensity = 0;
 
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.tick());
-    console.log(`[Harbor] ${this.harbors.length} piers; pool light created`);
+    console.log(`[Harbor] ${this.harbors.length} piers; town-square light created`);
 
     // Build sequentially: the 3 variant GLBs each parse once (cache), then instantiate cheaply.
     for (const h of this.harbors) {
@@ -119,11 +107,7 @@ export class HarborService {
     if (!best) return;
     const hr = (best.heading * Math.PI) / 180;
     const fx = Math.sin(hr), fz = Math.cos(hr);
-    const nf = this.nightFactor();   // 0 in daylight → 1 after dark (drives both pool lights)
-    if (this.pierLight) {
-      this.pierLight.position.set(best.x + fx * 5, 6, best.z + fz * 5);
-      this.pierLight.intensity = 7 * nf;
-    }
+    const nf = this.nightFactor();   // 0 in daylight → 1 after dark
     if (this.squareLight) {
       // Park at the nearest town's civic square (world coords) — its pad is flat, so a fixed height
       // lights the cobblestones + the buildings ringing it. Fall back to just inland of the shore point.
@@ -508,8 +492,6 @@ export class HarborService {
     // The scene teardown disposes these meshes; null our refs + clear caches so a fresh session
     // rebuilds piers (and re-measures the per-variant offsets) cleanly.
     if (this.tickObs) { this.sceneService.scene?.onBeforeRenderObservable.remove(this.tickObs); this.tickObs = null; }
-    this.pierLight?.dispose();
-    this.pierLight = null;
     this.squareLight?.dispose();
     this.squareLight = null;
     this.skyEnv = null;   // owned by the procedural sky; just drop our reference

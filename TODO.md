@@ -13,6 +13,7 @@
 * cannonfire smoke is occluded by clouds
 * adjust water displacement to better fit hull of pinnace
 * add dedication
+* draw distance (for other players, etc)
 * add damage from collisions and aground
 * fix speed of asset scattering loading in?
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...

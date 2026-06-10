@@ -131,6 +131,9 @@ export class ScatterService {
   private readonly _mat = new Matrix();
   private readonly _stride = new Float32Array(16);   // scratch for the instance shuffle
 
+  // Harbor-town pad rectangles (cached) — NO scatter is placed inside them (no trees in the fountain).
+  private townPads: { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number; r: number }[] | null = null;
+
   // ── Tuning ──────────────────────────────────────────────────────────────────
   private readonly PATCH = 40;          // metres per patch
   private readonly MAX_BUILDS_PER_FRAME = 3;  // builds (across all layers) per frame — stream in gently
@@ -254,6 +257,7 @@ export class ScatterService {
     for (const mm of mats) { mm.dispose(); }
     this.layers = [];
     this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
+    this.townPads = null;                              // re-fetch town pads after a region/manifest change
   }
 
   /** /reloadassets: bump the cache-bust version, drop the cached containers, tear down the live layers
@@ -730,6 +734,7 @@ export class ScatterService {
    *  Math.random) so the 3 variant calls partition one candidate set. Per-instance tint + size. */
   private buildGrass(cx: number, cz: number, variant: number): PatchData {
     const res = 28, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const BURST = 16;                                   // up to 16 clumps packed into one bush heart
     const BUSH_R = 0.55;                                // bush radius (m) — a tight tuft, ~a few feet across
     const cap = 5000;                                   // generous per-patch instance cap (bushes are rare)
@@ -763,6 +768,7 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.6) { continue; }
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.7) { continue; }
@@ -842,6 +848,7 @@ export class ScatterService {
    *  bigger ones and the rare boulder, each a random size, tumble orientation and stone colour. */
   private buildRocks(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 24, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -856,6 +863,7 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 150) { continue; }            // beach band → all the way up the rocky uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.85) { continue; }
@@ -911,6 +919,7 @@ export class ScatterService {
    *  length/thickness, random yaw with a slight settle, bleached wood colours. */
   private buildDriftwood(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 20, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
@@ -925,6 +934,7 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 7) { continue; }              // sand / low beach band (up to the sand line)
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.75) { continue; }
@@ -966,10 +976,65 @@ export class ScatterService {
     return this.finish(matTmp, kept, shadow ? null : colTmp);
   }
 
+  /** Harbor-town pad rectangles (oriented), each padded by a small margin. Lazily cached once the terrain
+   *  manifest is loaded; re-fetched until the harbors are present. Used to keep ALL scatter out of towns. */
+  private getTownPads(): { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number; r: number }[] {
+    if (this.townPads && this.townPads.length) { return this.townPads; }
+    const harbors = this.terrainService.getHarbors();
+    if (!harbors || !harbors.length) { return []; }   // manifest not loaded yet — don't cache empty
+    const M = 6;                                       // keep scatter this far back from the town edge too
+    const pads = [];
+    for (const h of harbors) {
+      if (!h.pad) { continue; }
+      const p = h.pad, hr = (p.rotY * Math.PI) / 180, hx = p.halfX + M, hz = p.halfZ + M;
+      pads.push({ cx: p.cx, cz: p.cz, hx, hz, sin: Math.sin(hr), cos: Math.cos(hr), r: Math.hypot(hx, hz) });
+    }
+    this.townPads = pads;
+    return pads;
+  }
+
+  /** The town pads whose footprint can reach into the patch centred at (cx,cz) — usually none, so the
+   *  per-candidate test below is skipped entirely away from towns. */
+  private townPadsNear(cx: number, cz: number) {
+    const reach = this.PATCH; // patch half-extent (20) + headroom
+    return this.getTownPads().filter((p) => Math.hypot(p.cx - cx, p.cz - cz) < p.r + reach);
+  }
+
+  /** True if (px,pz) is inside any of the given (oriented) town pads → no scatter there. */
+  private inTown(px: number, pz: number, pads: { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number }[]): boolean {
+    for (const p of pads) {
+      const dx = px - p.cx, dz = pz - p.cz;
+      const along = dx * p.sin + dz * p.cos;     // along the town's heading axis (halfZ)
+      const across = dx * p.cos - dz * p.sin;    // across (halfX)
+      if (Math.abs(along) <= p.hz && Math.abs(across) <= p.hx) { return true; }
+    }
+    return false;
+  }
+
+  /** True if the shore/shallows lie within `minDist` m of (px,pz) — used to keep beach trees a few metres
+   *  back from the water so no trunks stand in the surf or float over the transparent coastal shallows.
+   *  Scans a FILLED DISK (3 rings × 8 spokes), not a single ring: a lone ring at exactly `minDist` misses
+   *  water that sits closer than that (e.g. a sandbar tip with water 2 m off but land again at the 5 m
+   *  sample), which let trees float over the shallows. The reject threshold is +0.4 m (not ≈0), so trees
+   *  also stay off the low transition band where the seabed is just under water and rendered transparent. */
+  private nearShoreline(px: number, pz: number, minDist: number): boolean {
+    const g = this.terrainService;
+    const RINGS = 3, SPOKES = 8, MARGIN = 0.4;
+    for (let r = 1; r <= RINGS; r++) {
+      const d = (r / RINGS) * minDist;
+      for (let i = 0; i < SPOKES; i++) {
+        const a = (i / SPOKES) * Math.PI * 2 + r * 0.4;   // stagger rings so spokes don't all align
+        if (g.getElevation(px + Math.cos(a) * d, pz + Math.sin(a) * d) <= MARGIN) { return true; }
+      }
+    }
+    return false;
+  }
+
   /** Build one patch's forest trees: clustered in the inland forest-mask zone (mid elevation, gentle
    *  slope), broken into stands by low-freq noise with clearings. Sparse — trees are big. */
   private buildTrees(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 16, size = this.PATCH, cell = size / res, E = 3.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
@@ -981,7 +1046,8 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 20 || y > 80) { continue; }                // high inland only (shoreline float hidden), below uplands
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
+        if (y < 0.6 || y > 80) { continue; }               // on solid land (beaches included), below the uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }                     // trees on gentle ground only
 
@@ -994,6 +1060,7 @@ export class ScatterService {
 
         // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
@@ -1015,6 +1082,7 @@ export class ScatterService {
    *  single-mesh primitive fallback). The GLB palms are real metres, so scale is a gentle ±8 % only. */
   private buildPalms(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 14, size = this.PATCH, cell = size / res, E = 2.5;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
@@ -1025,7 +1093,8 @@ export class ScatterService {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
         const y = getY(px, pz);
-        if (y < 27 || y > 42) { continue; }                // FAR up off the shoreline (~3x) — keeps the float well out of view
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
+        if (y < 0.6 || y > 45) { continue; }               // beach + low coast (was 27–42, off the shore); off the uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }
 
@@ -1036,6 +1105,7 @@ export class ScatterService {
 
         // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);

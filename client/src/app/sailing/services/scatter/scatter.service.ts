@@ -168,6 +168,7 @@ export class ScatterService {
   private _aggressive = false;
   private _ringOffsets: { dx: number; dz: number }[] | null = null;
   private _ringR = -1;
+  private _cellM = 0;   // world m per heightfield texel (~24) — slope-sampling baseline (lazy from terrain)
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -755,13 +756,17 @@ export class ScatterService {
     return { matrix, color };
   }
 
-  /** Slope magnitude (rise/run) from a FORWARD difference reusing the already-sampled height — 2
-   *  terrain lookups instead of 4, which roughly halves the dominant cost of a patch build. */
-  private slopeAt(px: number, pz: number, baseY: number, E: number): number {
+  /** Slope magnitude (rise/run) from a FORWARD difference reusing the already-sampled (fast) height. Uses
+   *  the NEAREST sampler over a ONE-TEXEL baseline (~24 m): two nearest samples closer than a texel land in
+   *  the same cell → a constant 0 slope, so the baseline must span a full texel. Within a cell the bilinear
+   *  gradient equals the cell gradient, so the values (and the tuned thresholds) match the old E≈2 m bilinear
+   *  difference — at ~⅓ the cost (2 nearest reads, no interpolation). `baseY` must be the FAST centre height. */
+  private slopeAt(px: number, pz: number, baseY: number, _E: number): number {
     const g = this.terrainService;
-    const dyx = g.getElevation(px + E, pz) - baseY;
-    const dyz = g.getElevation(px, pz + E) - baseY;
-    return Math.sqrt(dyx * dyx + dyz * dyz) / E;
+    const D = this._cellM || (this._cellM = g.getCellSizeM());
+    const dyx = g.getElevationFast(px + D, pz) - baseY;
+    const dyz = g.getElevationFast(px, pz + D) - baseY;
+    return Math.sqrt(dyx * dyx + dyz * dyz) / D;
   }
 
   /**
@@ -794,6 +799,7 @@ export class ScatterService {
     const matTmp = new Float32Array(cap * 16);
     const colTmp = new Float32Array(cap * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     const NCLUMPS = ScatterService.GRASS_CLUMPS.length;
     const TINTS = ScatterService.GRASS_TINTS;
@@ -820,7 +826,7 @@ export class ScatterService {
       for (let z = 0; z < res; z++) {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
         if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.6) { continue; }
         const slope = this.slopeAt(px, pz, y, E);
@@ -847,6 +853,8 @@ export class ScatterService {
         // Deal each accepted cell to one clump variant.
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NCLUMPS) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (gating used the fast sampler)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline — no clumps in the surf
         place(px, pz, y);
 
         // Burst the bush heart: pack many clumps into a TIGHT tuft (~BUSH_R radius, a few feet across), so
@@ -905,6 +913,7 @@ export class ScatterService {
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV;
     const NSHAPES = ScatterService.ROCK_SHAPES.length;
     const TINTS = ScatterService.ROCK_TINTS;
@@ -915,7 +924,7 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
         if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 150) { continue; }            // beach band → all the way up the rocky uplands
         const slope = this.slopeAt(px, pz, y, E);
@@ -937,6 +946,8 @@ export class ScatterService {
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + mesh settle)
+        if (y < 0.25) { continue; }        // confirm against the precise waterline
         // Size mix: mostly small, some bigger, the occasional boulder (real metres — base mesh ≈ 1 m).
         const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
         const base = r < 0.05 ? 1.8 + hash2(px * 2.2, pz * 2.2) * 1.7       // ~5% boulders (1.8–3.5 m)
@@ -976,6 +987,7 @@ export class ScatterService {
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV;
     const NSHAPES = ScatterService.DRIFT_SHAPES.length;
     const TINTS = ScatterService.DRIFT_TINTS;
@@ -986,7 +998,7 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
         if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 7) { continue; }              // sand / low beach band (up to the sand line)
         const slope = this.slopeAt(px, pz, y, E);
@@ -1001,6 +1013,8 @@ export class ScatterService {
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + settle)
+        if (y < 0.25) { continue; }        // confirm against the precise waterline
         // Size mix: uniform scale (the 5 GLB shapes already carry their own proportions) — mostly
         // small/medium with some big logs/planks. Base meshes are ~0.8–2.8 m long, so this spans twig→log.
         const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
@@ -1090,6 +1104,7 @@ export class ScatterService {
     const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     let kept = 0;
 
@@ -1098,7 +1113,7 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all variant calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
         if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.6 || y > 80) { continue; }               // on solid land (beaches included), below the uplands
         const slope = this.slopeAt(px, pz, y, E);
@@ -1115,6 +1130,8 @@ export class ScatterService {
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
         if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
@@ -1138,6 +1155,7 @@ export class ScatterService {
     const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     let kept = 0;
 
@@ -1145,7 +1163,7 @@ export class ScatterService {
       for (let z = 0; z < res; z++) {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
         if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.6 || y > 45) { continue; }               // beach + low coast (was 27–42, off the shore); off the uplands
         const slope = this.slopeAt(px, pz, y, E);
@@ -1160,6 +1178,8 @@ export class ScatterService {
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
         if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }

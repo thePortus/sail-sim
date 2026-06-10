@@ -316,6 +316,31 @@ export class TerrainService {
     return (hq / quantizationLevels) * targetPeakElevation;
   }
 
+  /** NEAREST-texel elevation — one heightfield read + decode, NO bilinear interpolation (~3–4× cheaper
+   *  than getElevation). For SCATTER GATING (elevation-band + slope rejection) where sub-cell precision
+   *  doesn't matter; an accepted instance's FINAL placement Y still uses getElevation so it sits flush on
+   *  slopes. Same texel convention as getElevation (uv·size − 0.5, rounded) so the two agree at texel centres. */
+  getElevationFast(worldX: number, worldZ: number): number {
+    const m = this.manifest;
+    if (!m || !this.heightfield) return 0;
+    const ux = (worldX - m.worldBounds.minX) / (m.worldBounds.maxX - m.worldBounds.minX);
+    const uz = (m.worldBounds.maxZ - worldZ) / (m.worldBounds.maxZ - m.worldBounds.minZ);
+    const x = Math.round(ux * m.width  - 0.5);
+    const z = Math.round(uz * m.height - 0.5);
+    const hq = this.sampleQuantized(x, z);   // clamps to edge internally
+    return m.minElevation != null && m.maxElevation != null
+      ? (hq / m.quantizationLevels) * (m.maxElevation - m.minElevation) + m.minElevation
+      : (hq / m.quantizationLevels) * m.targetPeakElevation;
+  }
+
+  /** World metres per heightfield texel (~24 m). Scatter uses this as the slope-sampling baseline so a
+   *  NEAREST forward difference spans a full texel (otherwise two nearest samples land in the same cell →
+   *  a constant 0 slope). One cell over ≈ the same gradient bilinear gives within a cell, so thresholds carry. */
+  getCellSizeM(): number {
+    const m = this.manifest;
+    return m ? (m.worldBounds.maxX - m.worldBounds.minX) / Math.max(1, m.width - 1) : 24;
+  }
+
   isOnLand(worldX: number, worldZ: number): boolean {
     return this.getElevation(worldX, worldZ) > 0.02;
   }

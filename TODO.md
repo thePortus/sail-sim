@@ -2,17 +2,15 @@
 
 # General or Current TODO Items
 
-* optimize asset scattering loading
-* any cheap and easy FPS wins?
+* cheaper terrain sampling in the scatter builders
 * zoomable map
+* cannonfire smoke is occluded by clouds, clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
 * shallow water gets into boat, not displaced
 * some buildings on uneven land
-* clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon
 * make stuff look cool pass)
 * keypress makes songs lock up
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
-* cannonfire smoke is occluded by clouds
 * adjust water displacement to better fit hull of pinnace
 * add dedication
 * draw distance (for other players, etc)

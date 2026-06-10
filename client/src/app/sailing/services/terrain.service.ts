@@ -759,6 +759,8 @@ export class TerrainService {
     }
     // Also drive the cascaded shadow MAP (was previously never wired to this slider).
     this.sceneService.setShadowMapQuality(level);
+    // …and the full-screen ocean depth pass: every-frame on High, every-other-frame on low/mid tiers.
+    this.sceneService.setOceanDepthQuality(level);
   }
 
   private buildTreeFoliage(scene: Scene, manifest: TerrainManifest): void {

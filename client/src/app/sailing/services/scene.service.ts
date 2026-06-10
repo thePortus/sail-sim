@@ -77,6 +77,11 @@ export class SceneService {
   // FPS overlay element — created once and reused across sessions (the engine is reused, so the
   // overlay + its global hotkey/resize listeners must NOT be re-installed each scene rebuild).
   private _fpsEl: HTMLDivElement | null = null;
+  // Perf instrumentation — capture is toggled ON only while the overlay is visible (see setPerfCapture):
+  // each captured metric adds per-frame timing hooks, and GPU frame timing forces a sync, so leaving them
+  // on when nobody's reading them is wasted work every frame.
+  private _sInstr: SceneInstrumentation | null = null;
+  private _eInstr: EngineInstrumentation | null = null;
 
   // Lightning flash: additive boost to ambient light, driven by CloudService.
   // 0 = no flash; ~1 = full strike. Applied on top of the time-of-day ambient.
@@ -240,6 +245,11 @@ export class SceneService {
       this.scene = new Scene(this.engine);
       this.scene.fogMode    = Scene.FOGMODE_EXP2;
       this.scene.fogDensity = 0.000035;
+      // By default Babylon runs a full scene pick on EVERY pointer-move to fire hover/over events. We
+      // have no hover triggers (the only pointer-move handler reads raw DOM coords for camera drag, not
+      // pickInfo), so that pick is pure waste — and during a camera drag over hundreds of meshes it's a
+      // real CPU hit. Skip it. (Click/down still picks; cannon aim uses an explicit pickWithRay.)
+      this.scene.skipPointerMovePicking = true;
 
       this.buildSky();             // Preetham SkyMaterial dome (kept as the WebGL fallback sky)
       this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
@@ -579,9 +589,14 @@ export class SceneService {
     // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
     // water with soft-waterline foam.
     depthMap.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.metadata?.excludeFromOceanDepth;
-    // Every frame: at low FPS an every-other-frame depth pass makes the soft-waterline
-    // foam around the bobbing hull strobe. (Was 2 for perf; the strobe wasn't worth it.)
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.metadata?.excludeFromOceanDepth;
+    // ^ scatter_* = inland foliage (grass/trees/palms/rocks — hundreds of patch meshes). They're above
+    // water and never want shoreline foam, so drawing them into this FULL-SCREEN, EVERY-FRAME depth pass
+    // was pure cost (the refraction RTT already excludes them for the same reason).
+    // refreshRate is driven by the shadows/heavy-render quality dial (setOceanDepthQuality, called from
+    // terrain.applyQualityLevel): top tier = every frame (smoothest foam); lower tiers = every other
+    // frame (halves this full-screen pass — the big GPU win — at the cost of a slight foam shimmer
+    // around the bobbing hull, which is the documented tradeoff). Default until the dial applies: 1.
     depthMap.refreshRate = 1;
     this.scene.customRenderTargets.push(depthMap);
 
@@ -1121,7 +1136,9 @@ export class SceneService {
       this._fpsEl = el;
       window.addEventListener('keydown', (e) => {
         if (e.code === 'Backquote' && this._fpsEl) {
-          this._fpsEl.style.display = this._fpsEl.style.display === 'none' ? 'block' : 'none';
+          const show = this._fpsEl.style.display === 'none';
+          this._fpsEl.style.display = show ? 'block' : 'none';
+          this.setPerfCapture(show);   // only measure while the overlay is up
         }
       });
       window.addEventListener('resize', () => {
@@ -1131,17 +1148,12 @@ export class SceneService {
     }
     const fpsEl = this._fpsEl;
 
-    // Perf instrumentation — only read when the overlay is visible. Breaks the
-    // frame into CPU (active-mesh eval, render-targets, inter-frame JS) and GPU
-    // time so we can see exactly what's pinning the frame rate.
-    const sInstr = new SceneInstrumentation(this.scene);
-    sInstr.captureActiveMeshesEvaluationTime = true;
-    sInstr.captureRenderTargetsRenderTime = true;
-    sInstr.captureRenderTime = true;
-    sInstr.captureFrameTime = true;
-    sInstr.captureInterFrameTime = true;
-    const eInstr = new EngineInstrumentation(this.engine);
-    eInstr.captureGPUFrameTime = true;
+    // Perf instrumentation — breaks the frame into CPU (active-mesh eval, render-targets, inter-frame JS)
+    // and GPU time. Capture is OFF until the overlay is shown (setPerfCapture), so it costs nothing in
+    // normal play; enabled here only if the overlay is already visible across a scene rebuild.
+    this._sInstr = new SceneInstrumentation(this.scene);
+    this._eInstr = new EngineInstrumentation(this.engine);
+    this.setPerfCapture(fpsEl.style.display !== 'none');
     let perfFrame = 0;
 
     let lastTime = performance.now();
@@ -1151,7 +1163,8 @@ export class SceneService {
       lastTime  = now;
       this.tickTimeOfDay(dt);
       this.scene.render();
-      if (fpsEl.style.display !== 'none' && (perfFrame++ % 15) === 0) {
+      if (fpsEl.style.display !== 'none' && this._sInstr && this._eInstr && (perfFrame++ % 15) === 0) {
+        const sInstr = this._sInstr, eInstr = this._eInstr;
         const ms = (c: { lastSecAverage: number }) => c.lastSecAverage.toFixed(1);
         const gpuMs = (eInstr.gpuFrameTimeCounter.lastSecAverage / 1e6) || 0;
         const ping = this.telemetry.ping();
@@ -1166,6 +1179,20 @@ export class SceneService {
           `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}`;
       }
     });
+  }
+
+  /** Toggle perf-counter capture. Each metric adds per-frame timing hooks and the GPU timer forces a
+   *  sync, so we only measure while the backtick overlay is actually on screen. */
+  private setPerfCapture(on: boolean): void {
+    const s = this._sInstr, e = this._eInstr;
+    if (s) {
+      s.captureActiveMeshesEvaluationTime = on;
+      s.captureRenderTargetsRenderTime = on;
+      s.captureRenderTime = on;
+      s.captureFrameTime = on;
+      s.captureInterFrameTime = on;
+    }
+    if (e) { e.captureGPUFrameTime = on; }
   }
 
   // Render resolution is now its own user setting (the single biggest perf/quality
@@ -1218,6 +1245,14 @@ export class SceneService {
     if (sm) sm.refreshRate = level <= 0 ? 2 : 1;
   }
 
+  /** Scale the ocean depth pass with the same heavy-render quality dial. The depth map is a full-screen,
+   *  EVERY-FRAME pass feeding the shoreline/hull foam; on low + mid tiers we drop it to every-other-frame
+   *  (halves the pass — a large GPU win) at the cost of slight foam shimmer around the bobbing hull. Only
+   *  the top tier (High, level 3) keeps the smooth every-frame pass. Threshold is one line to tune. */
+  setOceanDepthQuality(level: number): void {
+    if (this._oceanDepthMap) { this._oceanDepthMap.refreshRate = level >= 3 ? 1 : 2; }
+  }
+
   /** Tear down the per-session Scene but KEEP the engine alive for the next session (Return to
    *  Harbour). scene.dispose() releases every mesh/material/texture/light/camera/RTT/post-process the
    *  scene owns; the engine + its WebGPU device/canvas context persist so the next initAsync rebuilds
@@ -1227,6 +1262,8 @@ export class SceneService {
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;
+    this._sInstr?.dispose(); this._sInstr = null;
+    this._eInstr?.dispose(); this._eInstr = null;
     this.scene?.dispose();
   }
 

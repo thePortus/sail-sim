@@ -368,7 +368,11 @@ export class SceneService {
     this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
     this.sunMesh.isPickable = false;
-    this.sunMesh.renderingGroupId = 2;
+    // Group 0 = the sky layer. The volumetric cloud DOME (group 0, alphaIndex 5000, centred on the
+    // camera so the transparent sort draws it LAST) composites over the disc → clouds can pass in front
+    // of the sun. Everything in groups 1+ still paints over both. (Was group 2, which drew the disc on
+    // top of the in-scene clouds.)
+    this.sunMesh.renderingGroupId = 0;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
 
     // Moon — a self-glowing sphere wrapped in NASA's real lunar colour map (CGI Moon Kit LROC colour,
@@ -396,7 +400,7 @@ export class SceneService {
     this.moonMesh = MeshBuilder.CreateSphere('moonDisk', { diameter: 1900, segments: 32 }, this.scene);
     this.moonMesh.material = moonMat;
     this.moonMesh.isPickable = false;
-    this.moonMesh.renderingGroupId = 2;
+    this.moonMesh.renderingGroupId = 0;   // sky layer — clouds (group 0 dome) pass in front (see sunDisk)
     this.moonMesh.visibility = 0;
     // CRITICAL for disc brightness: the moon sits ~62 km out where EXP2 fog saturates, washing the
     // disc toward the (dark, at night) fog colour. Exempt it from fog like the star dome.

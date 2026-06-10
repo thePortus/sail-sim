@@ -2,12 +2,16 @@
 
 # General or Current TODO Items
 
-* zoomable map
-* cannonfire smoke is occluded by clouds, clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon).. that way we don't even have to worry about depth
+* Alternate clouds? https://playground.babylonjs.com/#BHNVUE#2 or https://www.shadertoy.com/view/4tdSWr 
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
 * shallow water gets into boat, not displaced
 * some buildings on uneven land
 * make stuff look cool pass)
+* RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
+* consider cheap ocean replacement https://www.shadertoy.com/view/MdXyzX
+* shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
+* shader for water on camera https://www.shadertoy.com/view/ltffzl
+* add in pirates
 * keypress makes songs lock up
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * adjust water displacement to better fit hull of pinnace

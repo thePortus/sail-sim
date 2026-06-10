@@ -709,6 +709,12 @@ export class TerrainService {
     const imageData = ctx.getImageData(0, 0, res, res);
     const data = imageData.data;
 
+    // CPU twin of the texture: the ocean's buoyancy sampler needs the SAME shore proximity the vertex
+    // shader reads, so the hull bobs with the shore-attenuated (shoaling-flattened) waves.
+    if (!this._shoreProx || this._shoreProx.length !== res * res) { this._shoreProx = new Float32Array(res * res); }
+    const prox = this._shoreProx;
+    this._shoreProxCX = cx; this._shoreProxCZ = cz; this._shoreProxSize = size; this._shoreProxRes = res;
+
     let ptr = 0;
     for (let py = 0; py < res; py++) {
       for (let px = 0; px < res; px++) {
@@ -732,6 +738,7 @@ export class TerrainService {
           encoded = Math.max(0, 1.0 - (minDist - 1) / (MAX_STEPS - 1));
         }
 
+        prox[py * res + px] = encoded;   // CPU copy → ocean buoyancy shore attenuation (see below)
         const v = Math.round(encoded * 255);
         data[ptr++] = v;    // R channel
         data[ptr++] = 0;    // G
@@ -742,7 +749,24 @@ export class TerrainService {
 
     ctx.putImageData(imageData, 0, 0);
     texture.update();
-    this.oceanService.setShoreMap(texture, cx, cz, size);
+    this.oceanService.setShoreMap(texture, cx, cz, size, (x, z) => this.shoreProximityAt(x, z));
+  }
+
+  // Backing store for the CPU shore-proximity twin (mirrors the painted shore-map window).
+  private _shoreProx: Float32Array | null = null;
+  private _shoreProxCX = 0; private _shoreProxCZ = 0; private _shoreProxSize = 1; private _shoreProxRes = 0;
+
+  /** Land proximity at a world point (1 at the waterline → 0 in open water), from the same data the
+   *  shore-map texture was painted with. Nearest texel; 0 outside the camera window / before first paint. */
+  private shoreProximityAt(x: number, z: number): number {
+    const prox = this._shoreProx;
+    if (!prox || this._shoreProxRes < 2) { return 0; }
+    const res = this._shoreProxRes, half = this._shoreProxSize * 0.5;
+    const wpt = this._shoreProxSize / (res - 1);
+    const px = Math.round((x - this._shoreProxCX + half) / wpt);
+    const py = Math.round((this._shoreProxCZ + half - z) / wpt);
+    if (px < 0 || px >= res || py < 0 || py >= res) { return 0; }
+    return prox[py * res + px];
   }
 
   // ── Shadow quality ────────────────────────────────────────────────────────

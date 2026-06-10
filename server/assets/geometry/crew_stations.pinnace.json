@@ -1,0 +1,250 @@
+{
+  "ship": "pinnace",
+  "glb": "pinnace.glb",
+  "schema_version": 1,
+  "space": "ship-local GLB coordinates; parent crew to the ship root node",
+  "axes": {
+    "up": "+Y",
+    "bow": "+Z",
+    "port": "+X"
+  },
+  "heading_convention": "yaw degrees about +Y; 0 = facing +Z (bow), 90 = facing +X (port)",
+  "deck_levels": {
+    "sole": 0.14,
+    "stern_deck": 0.8,
+    "fore_grating": 0.89,
+    "thwart_top": 0.436
+  },
+  "waypoints": {
+    "wp_sterndeck": [
+      0.0,
+      0.8,
+      -3.2
+    ],
+    "wp_deck_edge": [
+      0.0,
+      0.8,
+      -2.45
+    ],
+    "wp_zoneB": [
+      0.0,
+      0.14,
+      -2.0
+    ],
+    "wp_zoneC_aft": [
+      0.0,
+      0.14,
+      -0.9
+    ],
+    "wp_gun_squeeze": [
+      0.0,
+      0.14,
+      0.0
+    ],
+    "wp_zoneC_fore": [
+      0.0,
+      0.14,
+      0.9
+    ],
+    "wp_zoneD": [
+      0.0,
+      0.14,
+      2.0
+    ],
+    "wp_foredeck": [
+      0.0,
+      0.89,
+      3.0
+    ]
+  },
+  "edges": [
+    [
+      "wp_sterndeck",
+      "wp_deck_edge",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_deck_edge",
+      "wp_zoneB",
+      {
+        "kind": "step",
+        "note": "0.66m step down off stern deck"
+      }
+    ],
+    [
+      "wp_zoneB",
+      "wp_zoneC_aft",
+      {
+        "kind": "step_over",
+        "note": "thwart at z-1.5, top y0.436 - arc Y over it or slow-walk"
+      }
+    ],
+    [
+      "wp_zoneC_aft",
+      "wp_gun_squeeze",
+      {
+        "kind": "squeeze",
+        "note": "20cm strip between gun carriages - slow walk, single file"
+      }
+    ],
+    [
+      "wp_gun_squeeze",
+      "wp_zoneC_fore",
+      {
+        "kind": "squeeze"
+      }
+    ],
+    [
+      "wp_zoneC_fore",
+      "wp_zoneD",
+      {
+        "kind": "step_over",
+        "note": "thwart at z+1.5 beside mast; cross at x~0.40"
+      }
+    ],
+    [
+      "wp_zoneD",
+      "wp_foredeck",
+      {
+        "kind": "step",
+        "note": "0.75m step up onto fore grating"
+      }
+    ]
+  ],
+  "stations": [
+    {
+      "id": "helm",
+      "kind": "helm",
+      "pos": [
+        0.3,
+        0.8,
+        -3.4
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_sterndeck",
+      "note": "helmsman beside tiller sweep, facing bow"
+    },
+    {
+      "id": "gun_P",
+      "kind": "cannon",
+      "pos": [
+        -0.3,
+        0.14,
+        -0.15
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Cannon",
+      "wp": "wp_zoneC_aft",
+      "note": "behind port gun breech, facing outboard +X"
+    },
+    {
+      "id": "gun_S",
+      "kind": "cannon",
+      "pos": [
+        0.3,
+        0.14,
+        0.15
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Cannon",
+      "wp": "wp_zoneC_fore"
+    },
+    {
+      "id": "ropes_P",
+      "kind": "ropes",
+      "pos": [
+        0.48,
+        0.14,
+        1.0
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Ropes",
+      "wp": "wp_zoneC_fore",
+      "note": "port shroud deadeyes / cleats"
+    },
+    {
+      "id": "ropes_S",
+      "kind": "ropes",
+      "pos": [
+        -0.48,
+        0.14,
+        1.0
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Ropes",
+      "wp": "wp_zoneC_fore"
+    },
+    {
+      "id": "lookout",
+      "kind": "lookout",
+      "pos": [
+        0.0,
+        0.89,
+        3.0
+      ],
+      "heading_deg": 0,
+      "clip": "Lookout",
+      "wp": "wp_foredeck"
+    },
+    {
+      "id": "seat_P_aft",
+      "kind": "seat",
+      "pos": [
+        0.45,
+        0.14,
+        -1.5
+      ],
+      "heading_deg": 180,
+      "clip": "Sit",
+      "wp": "wp_zoneB",
+      "note": "sit on z-1.5 thwart facing stern; bench top 0.436 vs clip seat 0.46"
+    },
+    {
+      "id": "seat_S_aft",
+      "kind": "seat",
+      "pos": [
+        -0.45,
+        0.14,
+        -1.5
+      ],
+      "heading_deg": 180,
+      "clip": "Sit",
+      "wp": "wp_zoneB"
+    },
+    {
+      "id": "seat_P_strn",
+      "kind": "seat",
+      "pos": [
+        0.45,
+        0.14,
+        -2.5
+      ],
+      "heading_deg": 0,
+      "clip": "Sit",
+      "wp": "wp_zoneB",
+      "note": "face bow"
+    },
+    {
+      "id": "seat_S_strn",
+      "kind": "seat",
+      "pos": [
+        -0.45,
+        0.14,
+        -2.5
+      ],
+      "heading_deg": 0,
+      "clip": "Sit",
+      "wp": "wp_zoneB"
+    }
+  ],
+  "climb_paths": [],
+  "notes": [
+    "No climb paths: the pinnace mast has bare shrouds (no ratlines) and is short - crew work the rig from deck.",
+    "Thwart crossings are step_over edges: arc instance Y by +0.45 mid-edge or accept shin clipping at distance.",
+    "Death footprint fits the sole between thwarts (1.8m) only along the centerline fore-aft; wounded near guns are fine.",
+    "max_crew_suggested: 6 (helm, 2 guns, 1 ropes, lookout, 1 seated)."
+  ]
+}

@@ -55,7 +55,7 @@ void main() {
     gl_Position = projection * view * worldPosition;
 
     vPosition = position;
-    // Transform the normal to world space HERE (not via a mat4 varying). A `varying mat4` can't be
+    // Transform the normal to world space HERE (not via a mat4 varying). A "varying mat4" can't be
     // assigned a layout location on WebGPU's GLSL->SPIR-V path (a matrix needs 4 locations), which
     // made the shader fail to compile. Grass blades are uniformly scaled, so the world matrix's
     // upper-3x3 transforms normals correctly — no transpose(inverse) needed.

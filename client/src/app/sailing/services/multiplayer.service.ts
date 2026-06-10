@@ -10,6 +10,7 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
+import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
@@ -32,6 +33,7 @@ interface PoseSnapshot {
 interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
   controller:      VesselController | null;  // drives this remote's trim/sail/rudder/flag
+  crew:            CrewHandle | null;        // animated deck crew (seeded from playerId)
   recoilRoll:      number;
   recoilRollVel:   number;
   recoilSway:      number;
@@ -75,6 +77,7 @@ export class MultiplayerService {
   private oceanService   = inject(OceanService);
   private weatherService = inject(WeatherService);
   private assetCache     = inject(VesselAssetCacheService);
+  private crewService    = inject(CrewService);
   private vesselService  = inject(VesselService);
   private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
@@ -466,6 +469,7 @@ export class MultiplayerService {
       entry = {
         root,
         controller:      null,
+        crew:            null,
         recoilRoll:      0,
         recoilRollVel:   0,
         recoilSway:      0,
@@ -575,6 +579,8 @@ export class MultiplayerService {
   }
 
   private disposeEntry(entry: OtherPlayerEntry): void {
+    entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
+    entry.crew = null;
     entry.controller?.dispose();
     entry.controller = null;
     // Unregister from the ocean reflection list before disposing so stale meshes don't
@@ -594,7 +600,7 @@ export class MultiplayerService {
   private publishSignal(): void {
     this.otherPlayers.set(
       Array.from(this.players.values()).map(
-        ({ root: _r, controller: _c, recoilRoll: _rr, recoilRollVel: _rv,
+        ({ root: _r, controller: _c, crew: _cw, recoilRoll: _rr, recoilRollVel: _rv,
            recoilSway: _rs, recoilSwayVel: _rsv,
            hitRoll: _hr, hitRollVel: _hrv, hitSway: _hs, hitSwayVel: _hsv,
            anchorDeploy: _ad, ...p }) => p as OtherPlayer,
@@ -1067,6 +1073,16 @@ export class MultiplayerService {
     // Apply the sail state + trim we already know (updates may have arrived pre-build).
     entry.controller.applySailState(entry.sailState, true);   // snap initial pose
     this.applyRemoteTrim(entry);
+
+    // Animated deck crew, seeded from the player id — every client derives the same
+    // seed from the same id, so this remote's pirates look identical everywhere.
+    void this.crewService
+      .attach(slug, rigged.root, scene, crewSeedFrom(playerId))
+      .then((h) => {
+        if (!h) return;
+        if (this.players.get(playerId) === entry) entry.crew = h;
+        else h.dispose();   // player left while the crew GLB was loading
+      });
 
     // Snapshot of vessel meshes before the label is added (for shadow casting +
     // ocean registration — we don't want the billboard label in either).

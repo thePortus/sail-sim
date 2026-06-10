@@ -12,6 +12,7 @@ import { bakeHullCutProfile } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
+import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH } from './combat.constants';
 import { Vessel, VesselPart, VesselCannon, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
@@ -25,8 +26,12 @@ export class VesselService {
   private oceanService     = inject(OceanService);
   private buoyancyService  = inject(VesselBuoyancyService);
   private assetCache       = inject(VesselAssetCacheService);
+  private crewService      = inject(CrewService);
   private combatService    = inject(CombatService);
   private zone             = inject(NgZone);
+
+  /** Animated deck crew on the local vessel (null until the GLB + crew assets load). */
+  private crewHandle: CrewHandle | null = null;
 
   // ── Public reactive state ─────────────────────────────────────────────────
   grounded = signal<boolean>(false);
@@ -456,7 +461,21 @@ export class VesselService {
 
     this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
     this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
+
+    // Animated deck crew — seeded look, station/waypoint behaviour from the
+    // companion crew_stations JSON. Fire-and-forget: the vessel is sailable
+    // before the (larger) pirate GLB finishes loading. A stale handle from a
+    // previous rebuild self-disposes when its ship root is disposed; we still
+    // drop ours explicitly so cloned materials are freed promptly.
+    this.crewHandle?.dispose();
+    this.crewHandle = null;
+    void this.crewService
+      .attach(this.vesselSlug, rigged.root, scene, crewSeedFrom('local_' + this.vesselSlug))
+      .then((h) => { this.crewHandle = h; });
   }
+
+  /** Animated deck crew handle (casualties via killOne()/reviveAll()); null until loaded. */
+  get crew(): CrewHandle | null { return this.crewHandle; }
 
   private buildWaterShadow(scene: Scene): void {
     const tex = new DynamicTexture('hullShadowTex', { width: 128, height: 128 }, scene, false);

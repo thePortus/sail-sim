@@ -606,10 +606,10 @@ export class SceneService {
     // ^ scatter_* = inland foliage (grass/trees/palms/rocks — hundreds of patch meshes). They're above
     // water and never want shoreline foam, so drawing them into this FULL-SCREEN, EVERY-FRAME depth pass
     // was pure cost (the refraction RTT already excludes them for the same reason).
-    // refreshRate is driven by the shadows/heavy-render quality dial (setOceanDepthQuality, called from
-    // terrain.applyQualityLevel): top tier = every frame (smoothest foam); lower tiers = every other
-    // frame (halves this full-screen pass — the big GPU win — at the cost of a slight foam shimmer
-    // around the bobbing hull, which is the documented tradeoff). Default until the dial applies: 1.
+    // EVERY frame, ALWAYS. A quality-driven every-other-frame throttle was tried TWICE and reverted
+    // TWICE: a one-frame-stale depth map misaligns with the camera during rotation, and the waterline
+    // foam reads the misaligned depths as "geometry just behind the surface" → bright foam STROBES
+    // across the water with every camera move. Not a subtle shimmer — a flashing artifact. Don't.
     depthMap.refreshRate = 1;
     this.scene.customRenderTargets.push(depthMap);
 
@@ -1266,13 +1266,12 @@ export class SceneService {
     if (sm) sm.refreshRate = level <= 0 ? 2 : 1;
   }
 
-  /** Scale the ocean depth pass with the same heavy-render quality dial. The depth map is a full-screen,
-   *  EVERY-FRAME pass feeding the shoreline/hull foam; on low + mid tiers we drop it to every-other-frame
-   *  (halves the pass — a large GPU win) at the cost of slight foam shimmer around the bobbing hull. Only
-   *  the top tier (High, level 3) keeps the smooth every-frame pass. Threshold is one line to tune. */
-  setOceanDepthQuality(level: number): void {
-    if (this._oceanDepthMap) { this._oceanDepthMap.refreshRate = level >= 3 ? 1 : 2; }
-  }
+  /** The ocean depth pass runs EVERY frame, at every quality level. An every-other-frame throttle here
+   *  has now been tried twice (once pre-history per the original comment, once via this dial) and makes
+   *  the waterline foam STROBE during camera rotation — a stale depth map misaligns with the view and
+   *  the foam term reads garbage dz. Kept as a no-op so the quality plumbing stays in place if a safer
+   *  lever (e.g. half-RESOLUTION depth) is ever wanted here. */
+  setOceanDepthQuality(_level: number): void { /* intentionally a no-op — see above */ }
 
   /** Tear down the per-session Scene but KEEP the engine alive for the next session (Return to
    *  Harbour). scene.dispose() releases every mesh/material/texture/light/camera/RTT/post-process the

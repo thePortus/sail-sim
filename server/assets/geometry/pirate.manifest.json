@@ -1,0 +1,99 @@
+{
+  "model": "pirate.glb",
+  "schema_version": 2,
+  "units": "meters",
+  "up_axis": "Y",
+  "forward_axis": "+Z (facing)",
+  "fps_authored": 30,
+  "height_m": 1.69,
+  "constants": {
+    "walk_speed_mps": 1.2,
+    "climb_speed_mps": 0.45,
+    "sit_seat_height_m": 0.46,
+    "eye_height_m": 1.55
+  },
+  "skeleton": {
+    "armature_node": "PirateRig",
+    "joints": ["Root","Hips","Spine","Chest","Neck","Head",
+               "Clavicle.L","UpperArm.L","Forearm.L","Hand.L","Thumb.L",
+               "Clavicle.R","UpperArm.R","Forearm.R","Hand.R","Thumb.R",
+               "Thigh.L","Shin.L","Foot.L","Toe.L","Thigh.R","Shin.R","Foot.R","Toe.R"]
+  },
+  "clips": {
+    "Idle":        {"frames":[0,60],  "kind":"loop",    "use":"standing rest, breathing"},
+    "Walk":        {"frames":[0,32],  "kind":"loop",    "use":"in-place walk; translate root at walk_speed_mps along facing"},
+    "Work_Cannon": {"frames":[0,60],  "kind":"loop",    "use":"crouched gun adjust/push; place facing the carriage, hands ~0.6-0.9m work height"},
+    "Work_Ropes":  {"frames":[0,40],  "kind":"loop",    "use":"hand-over-hand line hauling, gaze up; place facing pin rail / shroud base"},
+    "Climb":       {"frames":[0,24],  "kind":"loop",    "use":"in-place ratline climb; translate along climb path at climb_speed_mps (one cycle = ~0.30m, scale playback to match)"},
+    "Sit":         {"frames":[0,90],  "kind":"loop",    "use":"bench sit; hips at sit_seat_height_m above the node origin - align origin to deck in front of bench"},
+    "Lookout":     {"frames":[0,120], "kind":"loop",    "use":"hand shading eyes, slow horizon scan; bow/masthead stations"},
+    "Death":       {"frames":[0,45],  "kind":"oneshot", "use":"stagger+collapse onto back; play once then hold last frame or switch to Dead"},
+    "Dead":        {"frames":[0,2],   "kind":"hold",    "use":"lying corpse pose; also for spawning already-dead"}
+  },
+  "death_footprint": {
+    "note": "Death/Dead: pelvis stays near node origin; head extends ~0.75m toward -Z (behind), feet ~0.85m toward +Z. Ensure ~1.8m x 0.8m clear deck or accept overlap.",
+    "lying_axis": "Z"
+  },
+  "variants": {
+    "how": "One material per slot is embedded (the defaults below). Per crew member: clone the slot material(s) and override albedo (garments) or albedoTexture (skin). All values are linear RGB.",
+    "skin": {
+      "slot_material": "EXP_Skin_Tan",
+      "meshes": ["Human"],
+      "options": {
+        "Tan":   {"texture": "textures/pirate_skin_tan.png",   "embedded": true},
+        "Fair":  {"texture": "textures/pirate_skin_fair.png"},
+        "Deep":  {"texture": "textures/pirate_skin_deep.png"},
+        "Olive": {"texture": "textures/pirate_skin_olive.png"}
+      }
+    },
+    "shirt": {
+      "slot_material": "EXP_Shirt",
+      "meshes": ["Shirt"],
+      "options": {
+        "Ecru":   [0.55, 0.47, 0.34],
+        "Red":    [0.21, 0.038, 0.028],
+        "Indigo": [0.025, 0.045, 0.10],
+        "Olive":  [0.075, 0.085, 0.035]
+      }
+    },
+    "breeches": {
+      "slot_material": "EXP_Breeches",
+      "meshes": ["Breeches"],
+      "linked_slot": {"material": "EXP_BreechesFall", "meshes": ["Breeches_fall"], "factor": 0.75,
+                      "note": "fall flap = breeches color x 0.75 per channel"},
+      "options": {
+        "Tan":      [0.26, 0.18, 0.095],
+        "Brown":    [0.10, 0.058, 0.034],
+        "Charcoal": [0.030, 0.030, 0.032],
+        "Navy":     [0.022, 0.035, 0.075]
+      }
+    },
+    "boots": {
+      "slot_material": "EXP_Boots",
+      "meshes": ["Boots"],
+      "options": {
+        "DarkBrown": [0.045, 0.030, 0.022],
+        "Black":     [0.015, 0.014, 0.013],
+        "Chestnut":  [0.13, 0.06, 0.03]
+      }
+    },
+    "headwear": {
+      "nodes": ["Hat_Tricorn", "Hat_WideBrim", "Hat_Bicorne", "Skullcap"],
+      "rule": "enable at most ONE (or none for bareheaded); all are exported visible - hide the rest on spawn",
+      "options": ["Tricorn", "WideBrim", "Bicorne", "Skullcap", "None"]
+    }
+  },
+  "crew_randomization": {
+    "recipe": "per crew member: rng = mulberry32(shipSeed * 31 + crewIndex); pick skin=rng()%4, shirt=rng()%4, breeches=rng()%4, boots=rng()%3, headwear=rng()%5. Deterministic across clients from one synced shipSeed.",
+    "combinations": "4 skins x 4 shirts x 4 breeches x 3 boots x 5 headwear = 960 distinct crew"
+  },
+  "notes": [
+    "All clips key every joint - no residual-pose leakage; safe to switch/blend arbitrarily.",
+    "All clips are in-place (no root motion). Walk/Climb: move the instance's parent transform.",
+    "Parent each crew instance to the SHIP node so deck pitch/roll is inherited for free.",
+    "Headwear + Eyes are rigid children of the Head joint, not skinned.",
+    "Skin texture has lips/stubble/brows baked in; all 4 skin PNGs ship in textures/.",
+    "Spawn pattern: loader.instantiateModelsToScene or AssetContainer per crew member; clone slot materials before tinting so instances don't share.",
+    "Joint influences were capped at 4 per vertex on export (normalized) - cosmetic-only difference."
+  ]
+}

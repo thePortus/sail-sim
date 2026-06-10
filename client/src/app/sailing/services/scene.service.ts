@@ -55,6 +55,12 @@ export class SceneService {
     this.glowLayer?.addIncludedOnlyMesh(mesh);
   }
 
+  /** Remove a mesh from the glow include list — REQUIRED before disposing a glow-included mesh
+   *  (streamed piers), so the layer's include list doesn't accumulate dead references. */
+  removeFromGlow(mesh: Mesh): void {
+    this.glowLayer?.removeIncludedOnlyMesh(mesh);
+  }
+
   /**
    * Exclude a material from the prePass G-buffer render (normals/depth).
    * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't

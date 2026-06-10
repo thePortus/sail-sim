@@ -52,11 +52,27 @@ export class HarborService {
   // async builds against the per-frame scan re-triggering.
   private readonly townNodes = new Map<string, TransformNode>();
   private readonly townLoading = new Set<string>();
+  // PIER streaming (50-town map): piers used to be built once for ALL towns and stay resident —
+  // every pier mesh then lives in the main pass, the ocean mirror RTT (addToRenderList), the
+  // shadow cascades (addShadowCaster) AND the glow include list (lantern), all frame, every frame.
+  // A 14 m pier is sub-pixel beyond ~2 km, so stream them like buildings; disposal must unwind
+  // those four registrations (see disposePier).
+  private readonly pierNodes = new Map<string, TransformNode>();
+  private readonly pierLoading = new Set<string>();
+  private readonly PIER_BUILD_RANGE = 2400;
+  private readonly PIER_DROP_RANGE = 2800;
   // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
   private squareMat: StandardMaterial | null = null;
   private roadMat: StandardMaterial | null = null;
-  private readonly BUILD_RANGE = 1500;
-  private readonly DROP_RANGE = 1900;
+  // Building stream ranges: tuned for the 50-town map — a 6 m cabin at 1 km is a couple of pixels,
+  // and several towns can now be in range at once, so keep the detail bubble tight (was 1500/1900).
+  private readonly BUILD_RANGE = 950;
+  private readonly DROP_RANGE = 1150;
+  // Cap on simultaneous full-detail towns: only the nearest MAX_ACTIVE_TOWNS inside BUILD_RANGE may
+  // START building. Eviction stays purely range-based (DROP_RANGE) — rank churn between two towns at
+  // similar distances never disposes one, so there's no swap-thrash; the cap just stops a dense bay
+  // from instantiating 3+ full towns at once.
+  private readonly MAX_ACTIVE_TOWNS = 2;
   private readonly STREAM_BUILDINGS = true;
   // Dock when the hull is within ~20 ft (≈6 m) of the pier DECK EDGE (not the shore point — the pier
   // blocks the centre from ever reaching the shore). Per-variant deck size (m): len = along-seaward
@@ -88,12 +104,9 @@ export class HarborService {
     this.squareLight.intensity = 0;
 
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.tick());
-    console.log(`[Harbor] ${this.harbors.length} piers; town-square light created`);
-
-    // Build sequentially: the 3 variant GLBs each parse once (cache), then instantiate cheaply.
-    for (const h of this.harbors) {
-      await this.buildPier(scene, h);
-    }
+    console.log(`[Harbor] ${this.harbors.length} harbors; piers + buildings stream by range`);
+    // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to
+    // build up front. The 3 variant GLBs parse once into the shared cache on first use.
   }
 
   /** Each frame: park the pool light at the nearest pier and update the dockable town. */
@@ -147,11 +160,46 @@ export class HarborService {
     return Math.max(0, Math.min(1, nf));
   }
 
-  /** Per-frame: keep the pool light on the nearest pier + dockable town (every frame), and stream town
-   *  buildings in/out of range (a few times a second — instantiation is far too heavy to scan per frame). */
+  /** Per-frame: keep the pool light on the nearest pier + dockable town (every frame), and stream
+   *  piers + town buildings in/out of range (a few times a second — instantiation is far too heavy
+   *  to scan per frame). */
   private tick(): void {
     this.updateNearestPier();
-    if ((this.frame++ % 20) === 0) this.streamTowns();
+    if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); }
+  }
+
+  /** Instantiate piers within PIER_BUILD_RANGE; tear down those past PIER_DROP_RANGE (hysteresis
+   *  stops boundary thrash). Keeps ~1–3 piers resident instead of all 50. */
+  private streamPiers(): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    const p = this.vesselService.getPosition();
+    const build2 = this.PIER_BUILD_RANGE ** 2, drop2 = this.PIER_DROP_RANGE ** 2;
+    for (const h of this.harbors) {
+      const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
+      if (d2 < build2 && !this.pierNodes.has(h.id) && !this.pierLoading.has(h.id)) {
+        this.pierLoading.add(h.id);
+        this.buildPier(scene, h).then((node) => {
+          if (node) this.pierNodes.set(h.id, node);
+          this.pierLoading.delete(h.id);
+        });
+      } else if (d2 > drop2 && this.pierNodes.has(h.id)) {
+        this.disposePier(this.pierNodes.get(h.id)!);
+        this.pierNodes.delete(h.id);
+      }
+    }
+  }
+
+  /** Unwind everything buildPier registered: ocean mirror render list, shadow casters, lantern glow.
+   *  Then dispose meshes only — materials/textures are shared via the asset-cache container. */
+  private disposePier(node: TransformNode): void {
+    const sg = this.sceneService.shadowGenerator;
+    for (const m of node.getChildMeshes(false)) {
+      this.oceanService.removeFromRenderList(m);
+      sg?.removeShadowCaster(m as Mesh);
+      if (/glass/i.test(m.name)) this.sceneService.removeFromGlow(m as Mesh);
+    }
+    node.dispose(false, false);
   }
 
   /** Instantiate the buildings of any town the player has come within BUILD_RANGE of; dispose those past
@@ -160,15 +208,12 @@ export class HarborService {
     if (!this.STREAM_BUILDINGS) return;
     const p = this.vesselService.getPosition();
     const build2 = this.BUILD_RANGE * this.BUILD_RANGE, drop2 = this.DROP_RANGE * this.DROP_RANGE;
+    const inRange: { h: TerrainHarbor; d2: number }[] = [];
     for (const h of this.harbors) {
       if (!h.buildings || !h.buildings.length) continue;
       const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
-      if (d2 < build2 && !this.townNodes.has(h.id) && !this.townLoading.has(h.id)) {
-        this.townLoading.add(h.id);
-        this.buildTown(h).then((node) => {
-          if (node) this.townNodes.set(h.id, node);
-          this.townLoading.delete(h.id);
-        });
+      if (d2 < build2) {
+        inRange.push({ h, d2 });
       } else if (d2 > drop2 && this.townNodes.has(h.id)) {
         // dispose meshes only, NOT materials/textures: they're shared (cloneMaterials=false) via the
         // asset-cache container and reused by every other town that streams the same GLB. Disposing them
@@ -176,6 +221,17 @@ export class HarborService {
         this.townNodes.get(h.id)!.dispose(false, false);
         this.townNodes.delete(h.id);
       }
+    }
+    // Build only the nearest MAX_ACTIVE_TOWNS candidates (closest first).
+    inRange.sort((a, b) => a.d2 - b.d2);
+    for (let i = 0; i < inRange.length && i < this.MAX_ACTIVE_TOWNS; i++) {
+      const h = inRange[i].h;
+      if (this.townNodes.has(h.id) || this.townLoading.has(h.id)) continue;
+      this.townLoading.add(h.id);
+      this.buildTown(h).then((node) => {
+        if (node) this.townNodes.set(h.id, node);
+        this.townLoading.delete(h.id);
+      });
     }
   }
 
@@ -397,13 +453,13 @@ export class HarborService {
     }
   }
 
-  private async buildPier(scene: Scene, h: TerrainHarbor): Promise<void> {
+  private async buildPier(scene: Scene, h: TerrainHarbor): Promise<TransformNode | null> {
     const parent = new TransformNode(`harbor_${h.id}`, scene);
     parent.parent = this.root;
 
     // flipY=false: piers are authored +up, no 180° hull flip. The cache shares geometry+materials.
     const pier = await this.assetCache.instantiate(`harbors/pier_${h.variant}.glb`, scene, parent, false);
-    if (!pier) { console.warn(`[Harbor] pier GLB failed to load: pier_${h.variant}.glb`); parent.dispose(); return; }
+    if (!pier) { console.warn(`[Harbor] pier GLB failed to load: pier_${h.variant}.glb`); parent.dispose(); return null; }
 
     // Determine (once per variant) the base yaw that aligns the model's seaward axis to +Z. Must be
     // measured while the parent is still at identity (so child world AABB == model space).
@@ -460,6 +516,7 @@ export class HarborService {
         // is freezeWorldMatrix() above; the per-material freeze is negligible and would break lighting.
       }
     }
+    return parent;
   }
 
   /**
@@ -498,6 +555,10 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    // Pier nodes die with root below (the scene teardown also disposes the shadow/reflection/glow
+    // lists they were registered in) — just drop the refs.
+    this.pierNodes.clear();
+    this.pierLoading.clear();
     this.squareMat?.dispose(false, true); this.squareMat = null;   // shared ground mats + their procedural textures
     this.roadMat?.dispose(false, true);   this.roadMat = null;
     this.root?.dispose(false, false);

@@ -76,7 +76,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       }
     }
   }
-  textureStore(dest, vec2i(id.xy), vec4f(mask, mask, mask, 1.0));
+  // Store Y-FLIPPED: the CPU path painted a canvas (row 0 = north) that DynamicTexture uploads
+  // Y-inverted (default invertY), so the ocean shader's UV math expects v=1 = north. textureStore
+  // has no such inversion — flip the row here to match the convention the consumers were built on.
+  textureStore(dest, vec2i(i32(id.x), i32(res.y) - 1 - i32(id.y)), vec4f(mask, mask, mask, 1.0));
 }
 `;
 

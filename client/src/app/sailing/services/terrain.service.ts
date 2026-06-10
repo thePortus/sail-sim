@@ -28,6 +28,7 @@ import type { WebGPUEngine } from '@babylonjs/core';
 import { CustomMaterial, PBRCustomMaterial } from '@babylonjs/materials';
 import { TerrainClipmap } from './terrain/terrain-clipmap';
 import { TerrainShadowCompute } from './terrain/terrain-shadow-compute';
+import { ShoreMapCompute } from './terrain/shore-map-compute';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds, TerrainHarbor } from '../models';
 import { SceneService } from './scene.service';
@@ -231,6 +232,10 @@ export class TerrainService {
     }
     this.shoreMapTexture?.dispose();
     this.shoreMapTexture = null;
+    this.shoreMapCompute?.dispose();
+    this.shoreMapCompute = null;
+    this.shoreLastCx = Infinity;
+    this.shoreLastCz = Infinity;
     if (this.clipmapObserver) {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.clipmapObserver);
       this.clipmapObserver = null;
@@ -558,6 +563,14 @@ export class TerrainService {
       this.terrainShadowCompute = new TerrainShadowCompute(
         scene.getEngine() as WebGPUEngine, this.TERRAIN_SHADOW_RES,
       );
+      // Publish synchronously before the first dispatch — same reason as the shore map: the FFT
+      // ocean material bakes its shadow define at build time from whether a mask exists. Strength 0
+      // keeps the (zero-initialized) contents inert until the first real dispatch lands.
+      const cam0 = this.sceneService.camera;
+      this.oceanService.setTerrainShadowMask(
+        this.terrainShadowCompute.texture, cam0?.position.x ?? 0, cam0?.position.z ?? 0,
+        this.TERRAIN_SHADOW_WORLD_SIZE, 0,
+      );
       this.updateTerrainShadowMaskGPU();
       this.terrainShadowObserver = scene.onBeforeRenderObservable.add(() => {
         this.terrainShadowFrame++;
@@ -723,7 +736,36 @@ export class TerrainService {
   // ── Shore elevation map ───────────────────────────────────────────────────
 
   private setupShoreMap(scene: Scene): void {
-    if (this.shoreMapTexture) return;
+    if (this.shoreMapTexture || this.shoreMapCompute) return;
+
+    // WebGPU: land scan + proximity search in a compute shader over the GPU-resident heightfield
+    // (roadmap P2) — the CPU version below costs ~1M array ops + canvas churn per update. The CPU
+    // buoyancy twin (_shoreProx) is refreshed by a small async readback of the same texture, so
+    // hull shoaling keeps reading the exact data the vertex shader samples.
+    // A/B escape hatch: localStorage.setItem('ignis_shore_gpu','0') + reload forces the CPU path.
+    if (this.sceneService.isWebGPU && localStorage.getItem('ignis_shore_gpu') !== '0') {
+      this.shoreMapCompute = new ShoreMapCompute(
+        scene.getEngine() as WebGPUEngine, this.SHORE_MAP_RES,
+      );
+      // Publish the texture to the ocean SYNCHRONOUSLY, before the first dispatch. The FFT ocean
+      // material bakes '#define HAS_SHORE' (shoaling + refraction) at build time from whether a
+      // shore map EXISTS — the CPU path always registered one here, synchronously. Waiting for the
+      // async compute-shader compile would let the FFT material build WITHOUT shoaling (waves wash
+      // over towns). Content is deterministically black until the first dispatch (WebGPU zero-
+      // initializes textures), which just means "open water" for the first few frames.
+      const cam0 = this.sceneService.camera;
+      this.oceanService.setShoreMap(
+        this.shoreMapCompute.texture, cam0?.position.x ?? 0, cam0?.position.z ?? 0,
+        this.SHORE_MAP_WORLD_SIZE, (x, z) => this.shoreProximityAt(x, z),
+      );
+      this.updateShoreMapGPU();
+      this.shoreMapObserver = scene.onBeforeRenderObservable.add(() => {
+        this.shoreMapFrame++;
+        if (this.shoreMapFrame % 10 !== 0) return;
+        this.updateShoreMapGPU();
+      });
+      return;
+    }
 
     this.shoreMapTexture = new DynamicTexture(
       'shoreElevationMap',
@@ -743,6 +785,61 @@ export class TerrainService {
       this.updateShoreMap();
     });
   }
+
+  /** GPU twin of updateShoreMap: one compute dispatch + an async readback for the CPU shoaling
+   *  sampler. Skips entirely while the camera sits still (the map depends only on camera x/z). */
+  private updateShoreMapGPU(): void {
+    const gpu = this.shoreMapCompute;
+    const camera = this.sceneService.camera;
+    const m = this.manifest;
+    if (!gpu || !camera || !m || !this.clipHeightTex) return;
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+    const size = this.SHORE_MAP_WORLD_SIZE;
+    const res = this.SHORE_MAP_RES;
+
+    // Static skip: half a texel (~8 m) of drift can't change any texel's land/water rounding.
+    if (this._shoreProx && Math.abs(cx - this.shoreLastCx) < 8 && Math.abs(cz - this.shoreLastCz) < 8) return;
+
+    // The quantized land test (hf > waterlineQ) as an exact metre threshold against the
+    // dequantized height texture: anything at or below the waterline quantum is water.
+    const minE = m.minElevation ?? 0;
+    const maxE = m.maxElevation ?? m.targetPeakElevation;
+    const qSpan = (maxE - minE) / (m.quantizationLevels || 65535);
+    const landThreshold = (this.waterlineQ + 0.5) * qSpan + minE;
+
+    const ok = gpu.update(this.clipHeightTex, this.clipWBounds, this.clipTexSize, cx, cz, size, landThreshold);
+    if (!ok) return;   // compute shader still compiling — retry next tick
+    this.shoreLastCx = cx;
+    this.shoreLastCz = cz;
+
+    this.oceanService.setShoreMap(gpu.texture, cx, cz, size, (x, z) => this.shoreProximityAt(x, z));
+
+    // Refresh the CPU twin from the texture we just wrote (one in-flight readback at a time; it
+    // lands 1–2 frames later, harmless for shoaling). Window params are committed WITH the data
+    // so shoreProximityAt never mixes a new centre with old contents.
+    if (this.shoreReadbackPending) return;
+    this.shoreReadbackPending = true;
+    gpu.texture.readPixels(undefined, undefined, undefined, undefined, true)?.then((buf) => {
+      const px = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      if (!this._shoreProx || this._shoreProx.length !== res * res) this._shoreProx = new Float32Array(res * res);
+      // The kernel stores rows Y-flipped (texture v=1 = north, matching the DynamicTexture
+      // convention); shoreProximityAt indexes rows north-first — un-flip while copying.
+      for (let py = 0; py < res; py++) {
+        const src = (res - 1 - py) * res;
+        const dst = py * res;
+        for (let x = 0; x < res; x++) this._shoreProx[dst + x] = px[(src + x) * 4] / 255;
+      }
+      this._shoreProxCX = cx; this._shoreProxCZ = cz; this._shoreProxSize = size; this._shoreProxRes = res;
+      this.shoreReadbackPending = false;
+    }).catch(() => { this.shoreReadbackPending = false; });
+  }
+
+  private shoreMapCompute: ShoreMapCompute | null = null;   // WebGPU path (roadmap P2)
+  private shoreLastCx = Infinity;
+  private shoreLastCz = Infinity;
+  private shoreReadbackPending = false;
 
   // Returns true if the raw heightfield cell nearest to (wx, wz) is land.
   // Uses nearest-neighbour sampling (one Uint16Array read, zero interpolation)

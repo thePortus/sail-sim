@@ -395,6 +395,9 @@ export class CloudService {
     // atmosphere's sun & sky colour temperature so they match the sky at sunrise/sunset/night.
     this.volClouds.getAtmoSun = () => this.sceneService.getAtmosphereSunColor();
     this.volClouds.getAtmoSky = () => this.sceneService.getAtmosphereSkyColor();
+    // And the reverse hook: the scene dims the sun/moon discs, god-rays and glow by the cloud cover
+    // along the given direction, so the glare post-processes stop punching straight through the deck.
+    this.sceneService.cloudTransmittance = (dir) => this.volClouds?.getSunTransmittance(dir) ?? 1;
   }
 
   // --------------------------------------------------------------------------

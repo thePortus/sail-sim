@@ -49,6 +49,9 @@ const SEED = args.some((a) => a.startsWith('--seed=')) ? numArg('seed', 0) : nul
 const ERODE   = args.includes('--no-erode')   ? 0 : numArg('erode', 120000);   // hydraulic droplet count
 const THERMAL = args.includes('--no-thermal') ? 0 : numArg('thermal', 3);      // talus relax iterations
 const DETAIL  = args.includes('--no-detail')  ? 0 : numArg('detail', 2.5);     // fBm micro-relief amp (m)
+// Navigable-depth floor: minimum water depth that GROWS with distance from shore (see the pass below).
+// --depth-floor=<scale> scales the whole curve (1 = default); --no-depth-floor disables it.
+const DEPTHFLOOR = args.includes('--no-depth-floor') ? 0 : numArg('depth-floor', 1.0);
 // Bathymetry polish (Phase 3): fringing reefs + lagoon shelves + seamounts + seabed micro-relief.
 // Per-archetype defaults; override with --reefs=<0..1> (fringing intensity), --lagoon=<0..1>,
 // --seamounts=<N>, --reef-detail=<m>; disable any with --no-reefs / --no-lagoon / --no-seamounts;
@@ -139,6 +142,38 @@ async function run() {
   if (ERODE)   { hydraulicErode(field, OUT, SEED ?? 1, { droplets: ERODE, seaLevel: 0 }); console.log(`  hydraulic erosion: ${ERODE} droplets`); }
   if (THERMAL) { thermalErode(field, OUT, { iterations: THERMAL, talus: Math.tan(38 * Math.PI / 180) * cellM, seaLevel: 0 }); console.log(`  thermal erosion: ${THERMAL} iters (talus ${(Math.tan(38 * Math.PI / 180) * cellM).toFixed(1)} m/cell)`); }
   if (DETAIL)  { addDetail(field, OUT, SEED ?? 1, { amp: DETAIL, worldM: worldBounds.maxX - worldBounds.minX, seaLevel: 0 }); console.log(`  detail touch-up: ±${DETAIL} m fBm`); }
+
+  // ── Navigable-depth floor ────────────────────────────────────────────────────────────────────
+  // GEBCO's ~460 m texels smear island flanks into broad FALSE shallow shelves (measured: at 100–300 m
+  // offshore ~23% of water was <4 m deep; banks persisted past 800 m), so "open" water often barely
+  // cleared the hull and wave troughs exposed the seabed. Enforce a minimum depth that grows with
+  // distance from shore: the beach entry + shallows-transparency band (<~80 m) is untouched, then the
+  // seabed is guaranteed to drop away. Water cells are only ever DEEPENED (land never touched), and the
+  // pass runs BEFORE addReefs(), which re-raises all the INTENTIONAL shallow features (fringing crests,
+  // reef flats, lagoon shelves, seamounts) on top — so designed shallows survive, accidental banks don't.
+  if (DEPTHFLOOR > 0) {
+    const shoreD = shoreDistanceField(field, OUT, cellM, 0);
+    // Gentle by design: the ocean's see-through reveal reads the seabed down to ~22 m, so this curve keeps
+    // a WIDE visible shallows apron (nothing forced until 150 m out; only ~2.5 m by 350 m) and just
+    // guarantees wave troughs can't expose sand in honestly-open water. (The first curve — 3 m @ 200 m,
+    // 7 m @ 450 m — read as a cliff right off the beach; user feedback.)
+    const CURVE = [[150, 0], [350, 2.5], [750, 5.5], [1500, 9], [2800, 14]];   // [shoreDist m, min depth m]
+    const minDepthAt = (d) => {
+      if (d <= CURVE[0][0]) return 0;
+      for (let k = 1; k < CURVE.length; k++) {
+        const [d1, m1] = CURVE[k - 1], [d2, m2] = CURVE[k];
+        if (d <= d2) return (m1 + (m2 - m1) * (d - d1) / (d2 - d1)) * DEPTHFLOOR;
+      }
+      return CURVE[CURVE.length - 1][1] * DEPTHFLOOR;
+    };
+    let deepened = 0;
+    for (let i = 0; i < OUT * OUT; i++) {
+      if (field[i] > 0) continue;
+      const floorY = -minDepthAt(shoreD[i]);
+      if (field[i] > floorY) { field[i] = floorY; deepened++; }
+    }
+    console.log(`  navigable-depth floor (×${DEPTHFLOOR}): ${deepened} water cells deepened`);
+  }
 
   // ── Bathymetry polish (Phase 3) — fringing reefs + lagoon shelves + seamounts + seabed micro-relief ──
   let reefInfo = null;

@@ -2,9 +2,6 @@
 
 # General or Current TODO Items
 
-* Alternate clouds? https://playground.babylonjs.com/#BHNVUE#2 or https://www.shadertoy.com/view/4tdSWr 
-* fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
-* shallow water gets into boat, not displaced
 * some buildings on uneven land
 * make stuff look cool pass)
 * RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG

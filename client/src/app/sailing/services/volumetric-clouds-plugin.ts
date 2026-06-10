@@ -1269,21 +1269,25 @@ export class VolumetricCloudsPlugin {
       needAlphaBlending: true,
       shaderLanguage: ShaderLanguage.WGSL,
     });
-    mat.backFaceCulling   = false;            // viewed from inside the box
+    mat.backFaceCulling   = false;            // viewed from inside
     mat.disableDepthWrite = true;             // backdrop never occludes anything
     mat.fogEnabled        = false;            // infiniteDistance + EXP2 fog would wash it to fog colour
     mat.alphaMode         = Constants.ALPHA_PREMULTIPLIED;   // ONE / ONE_MINUS_SRC_ALPHA
+    // NOTE: the regular depth test stays ON — it is what lets terrain/mountains (which write depth in
+    // this same group) occlude the clouds. (A depthFunction=ALWAYS experiment painted clouds over the
+    // whole landscape.) The mesh must therefore be UNIFORMLY nearer than the sky objects — see below.
     mat.onBindObservable.add(() => {
       const eff = mat.getEffect();
       if (eff && this._enabled) { this.applyCloudUniforms(eff); }
     });
     this.domeMat = mat;
 
-    // Slightly inside the sky domes (proceduralSky 130000 / Preetham 150000) so depth-testing against
-    // the opaque sky always passes; sun (65000) and moon are farther from the camera than this mesh's
-    // centre (the camera itself), so the back-to-front transparent sort draws them FIRST → clouds pass
-    // in front of the sun/moon. alphaIndex above the star dome's default breaks the distance tie.
-    const dome = MeshBuilder.CreateBox('volCloudDome', { size: 120000 }, this.scene);
+    // A SPHERE, not a box, at a UNIFORM ~55 km radius: nearer than the sun disc (65 km), moon (62 km)
+    // and skybox (65+ km) in EVERY direction — so the depth test always passes against the sky objects
+    // and the clouds composite over them — while still farther than any terrain, so mountains' depth
+    // occludes the clouds correctly. (A box failed both ways: its surface ranges 60–104 km by direction,
+    // so toward the corners the discs sat NEARER than the dome and punched through the clouds.)
+    const dome = MeshBuilder.CreateSphere('volCloudDome', { diameter: 110000, segments: 16 }, this.scene);
     dome.material         = mat;
     dome.infiniteDistance = true;
     dome.renderingGroupId = 0;
@@ -1589,6 +1593,10 @@ export class VolumetricCloudsPlugin {
       }
     }
 
+    // Keep a CPU copy: getSunTransmittance() samples the same field to dim the sun glare behind clouds.
+    this.weatherData = data;
+    this.weatherSize = size;
+
     const tex = new RawTexture(
       data, size, size, Constants.TEXTUREFORMAT_R, this.scene,
       /*generateMipMaps=*/false, /*invertY=*/false,
@@ -1597,6 +1605,57 @@ export class VolumetricCloudsPlugin {
     tex.wrapU = Texture.MIRROR_ADDRESSMODE;
     tex.wrapV = Texture.MIRROR_ADDRESSMODE;
     return tex;
+  }
+
+  // CPU copy of the procedural weather field (grey-noise path only) for sun-glare occlusion.
+  private weatherData: Uint8Array | null = null;
+  private weatherSize = 0;
+
+  /**
+   * Cloud transmittance toward `dir` (unit, typically the sun): 1 = clear sky, →0 = thick cloud in the
+   * way. CPU twin of vc_getDensity's WEATHER/coverage term, sampled where the ray crosses the middle of
+   * the cloud shell. The cloud DOME composites over the sun DISC already — but the god-rays + glow are
+   * post-processes drawn over the final image, so they need this factor to stop shining through clouds.
+   */
+  getSunTransmittance(dir: Vector3): number {
+    if (!this._enabled || !this.weatherData || dir.y <= 0.02) { return 1; }
+    const cam = this.camera.globalPosition;
+    const midH = this.cloudBaseHeight + this.cloudThickness * 0.5;
+    // Same shell intersection as vc_intersectShell (EARTH_RADIUS = 2e6), origin at the camera.
+    const R = 2000000;
+    const b = 2 * (cam.y + R) * dir.y;
+    const c = (cam.y - midH) * (cam.y + 2 * R + midH);
+    const disc = b * b - 4 * c;
+    if (disc < 0) { return 1; }
+    const q = (-b + (b < 0 ? -Math.sqrt(disc) : Math.sqrt(disc))) / 2;
+    let t0 = q, t1 = c / q;
+    if (t0 > t1) { const tmp = t0; t0 = t1; t1 = tmp; }
+    const t = t0 >= 0 ? t0 : t1;
+    if (t <= 0) { return 1; }
+
+    // Shader convention: pzx = p.zx + drift.yx; uv = scale * pzx (MIRROR addressing).
+    const sx = (cam.z + dir.z * t) + this.cloudDrift.y;
+    const sy = (cam.x + dir.x * t) + this.cloudDrift.x;
+    const mirror = (u: number) => { const f = Math.abs((u / 2 - Math.floor(u / 2)) * 2 - 1); return f; };
+    const sampleW = (u: number, v: number): number => {
+      const size = this.weatherSize;
+      const fx = mirror(u) * (size - 1), fy = mirror(v) * (size - 1);
+      const x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const x1 = Math.min(size - 1, x0 + 1), y1 = Math.min(size - 1, y0 + 1);
+      const tx = fx - x0, ty = fy - y0;
+      const d = this.weatherData!;
+      const a = d[y0 * size + x0], bb = d[y0 * size + x1], cc = d[y1 * size + x0], dd = d[y1 * size + x1];
+      return ((a * (1 - tx) + bb * tx) * (1 - ty) + (cc * (1 - tx) + dd * tx) * ty) / 255;
+    };
+
+    const large = Math.max(0, Math.min(2, (sampleW(-0.00005 * sx, -0.00005 * sy) - 0.18) * 5));
+    const st = Math.max(0, Math.min(1, (this.cloudType - 0.40) / (0.95 - 0.40)));
+    const storm = st * st * (3 - 2 * st);
+    const covThresh = 0.28 - (this.cloudCoverage - 0.5) * 0.5 - storm * 0.05;
+    const weather = large * Math.max(0, sampleW(0.0002 * sx, 0.0002 * sy) - covThresh) / 0.72;
+    const shape = Math.pow(Math.max(0, weather), 1.8);   // mid-shell height envelope ≈ 1 → exponent 1.8
+    // Beer-ish falloff; floor keeps a faint glow even under a solid deck (real skies do).
+    return Math.max(0.05, Math.exp(-2.4 * Math.min(2, shape)));
   }
 
   /**

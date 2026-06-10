@@ -107,6 +107,12 @@ export class SceneService {
 
   // Sun glare occlusion: 0 = fully blocked by terrain, 1 = fully visible.
   private sunOcclusionT = 1.0;
+  // Cloud transmittance toward a sky direction (1 = clear). Set by CloudService (same hook pattern as
+  // the volumetric plugin's atmo-colour callbacks); smoothed here and folded into the sun AND moon
+  // disc / god-rays / glow so the glare post-processes stop shining straight through the cloud deck.
+  cloudTransmittance: ((dir: Vector3) => number) | null = null;
+  private sunCloudT = 1.0;
+  private moonCloudT = 1.0;
   private sunOcclusionFrame = 0;
   private lastSunOccluded = false;
 
@@ -368,11 +374,12 @@ export class SceneService {
     this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
     this.sunMesh.isPickable = false;
-    // Group 0 = the sky layer. The volumetric cloud DOME (group 0, alphaIndex 5000, centred on the
-    // camera so the transparent sort draws it LAST) composites over the disc → clouds can pass in front
-    // of the sun. Everything in groups 1+ still paints over both. (Was group 2, which drew the disc on
-    // top of the in-scene clouds.)
+    // Group 0 = the sky layer. The volumetric cloud DOME (group 0, alphaIndex 5000) composites over the
+    // disc → clouds pass in front of the sun. alphaIndex MUST be set low: Babylon's default is
+    // Number.MAX_VALUE, so a fading disc (visibility < 1 → transparent bucket) would sort AFTER the dome
+    // and punch through the clouds. Everything in groups 1+ still paints over both.
     this.sunMesh.renderingGroupId = 0;
+    this.sunMesh.alphaIndex = 10;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
 
     // Moon — a self-glowing sphere wrapped in NASA's real lunar colour map (CGI Moon Kit LROC colour,
@@ -401,6 +408,7 @@ export class SceneService {
     this.moonMesh.material = moonMat;
     this.moonMesh.isPickable = false;
     this.moonMesh.renderingGroupId = 0;   // sky layer — clouds (group 0 dome) pass in front (see sunDisk)
+    this.moonMesh.alphaIndex = 10;        // below the dome's 5000 (default is MAX_VALUE → would draw over clouds)
     this.moonMesh.visibility = 0;
     // CRITICAL for disc brightness: the moon sits ~62 km out where EXP2 fog saturates, washing the
     // disc toward the (dark, at night) fog colour. Exempt it from fog like the star dome.
@@ -460,6 +468,7 @@ export class SceneService {
     dome.renderingGroupId = 0;            // with the skybox; transparent → draws over it
     dome.applyFog         = false;        // stars must not be tinted by scene fog
     dome.isPickable       = false;
+    dome.alphaIndex       = 5;            // before the cloud dome (5000) → clouds cover the stars
     dome.setEnabled(false);               // off during the day
     this.starDome = dome;
   }
@@ -847,11 +856,15 @@ export class SceneService {
       // God rays: anchor the shaft source at the sun, and fade them out at night and at
       // high noon (shafts read as long, dramatic streaks when the sun is low — golden
       // hour — and vanish overhead). above = max(0, sun elevation).
+      // Cloud cover between camera and sun (smoothed — the sample moves with the cloud drift).
+      const cloudTarget = this.cloudTransmittance?.(dir) ?? 1.0;
+      this.sunCloudT += (cloudTarget - this.sunCloudT) * Math.min(1, dt * 2.5);
+
       if (this.godRays) {
         this.godRays.customMeshPosition = sunPos;
         const lowSun = 1.0 - Math.min(1, Math.max(0, h) / 0.55);   // 1 near horizon → 0 high
         const dayUp  = Math.max(0, Math.min(1, (h + 0.02) / 0.10)); // fade in just above horizon
-        this.godRays.exposure = 0.55 * dayUp * (0.35 + 0.65 * lowSun);
+        this.godRays.exposure = 0.55 * dayUp * (0.35 + 0.65 * lowSun) * this.sunCloudT;
       }
 
       const sunShouldBeOn = h > -0.06;
@@ -863,7 +876,7 @@ export class SceneService {
       } else {
         this.sunOcclusionT = 1.0;
       }
-      occT = this.sunOcclusionT;
+      occT = this.sunOcclusionT * this.sunCloudT;
 
       this.sunMesh.scaling.setAll((1.0 + Math.max(0, 0.88 - above) * 3.0) * occT);
       this.sunMesh.visibility = Math.max(0.0, above) * occT;
@@ -880,8 +893,12 @@ export class SceneService {
       const moonDir = dir.scale(-1);
       const moonBlocked = this.isMoonOccluded(moonDir);
       this.moonOcclusionT += ((moonBlocked ? 0.0 : 1.0) - this.moonOcclusionT) * 0.50;
+      // Cloud cover between camera and moon — same treatment as the sun, along the anti-solar direction.
+      // moonVis feeds both the disc visibility and the lunar glow, so one factor dims them together.
+      const moonCloudTarget = this.cloudTransmittance?.(moonDir) ?? 1.0;
+      this.moonCloudT += (moonCloudTarget - this.moonCloudT) * Math.min(1, dt * 2.5);
 
-      const moonVis = Math.max(0, Math.min(1, (0.04 - h) / 0.16)) * this.moonOcclusionT;
+      const moonVis = Math.max(0, Math.min(1, (0.04 - h) / 0.16)) * this.moonOcclusionT * this.moonCloudT;
       this.moonMesh.position.copyFrom(this.camera.position.add(moonDir.scale(62000)));
       this.moonMesh.visibility = moonVis;
       this.moonMesh.rotation.y += dt * 0.012;

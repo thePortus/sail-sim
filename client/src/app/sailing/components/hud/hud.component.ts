@@ -1,4 +1,4 @@
-import { Component, computed, inject, output, signal, OnInit, OnDestroy, ViewChild, HostListener } from '@angular/core';
+import { Component, computed, inject, output, signal, OnInit, OnDestroy, ViewChild, HostListener, NgZone } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
@@ -19,6 +19,7 @@ export class HudComponent implements OnInit, OnDestroy {
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
   cannonService  = inject(CannonService);
+  private zone   = inject(NgZone);
 
   @ViewChild(ChatComponent) private chat?: ChatComponent;
 
@@ -167,15 +168,21 @@ export class HudComponent implements OnInit, OnDestroy {
   // them — so Esc exits photo mode WITHOUT also opening the pause menu. Covers the no-fullscreen case too
   // (if the fullscreen request was denied, the fullscreenchange path wouldn't fire).
   private onEscCapture = (e: KeyboardEvent): void => {
-    if (e.key !== 'Escape' || !this.photoMode()) { return; }
+    if (e.repeat || e.key !== 'Escape' || !this.photoMode()) { return; }
     e.preventDefault();
     e.stopImmediatePropagation();
-    void this.togglePhotoMode();   // clears photo mode + exits fullscreen if still in it
+    // Registered outside the Angular zone (see ngOnInit) so it doesn't run change detection on every
+    // keydown; re-enter the zone for the actual action so the HUD reflects leaving photo mode.
+    this.zone.run(() => void this.togglePhotoMode());
   };
 
   ngOnInit(): void {
     document.addEventListener('fullscreenchange', this.onFullscreenChange);
-    window.addEventListener('keydown', this.onEscCapture, true);   // capture phase
+    // Outside the zone: this is a global keydown listener, so leaving it in-zone would fire a change-
+    // detection pass on EVERY keypress (incl. held-key repeats) — a main-thread hog that starves the
+    // MIDI music scheduler. (vessel.service swallows repeats in the capture phase, but this listener is
+    // ALSO capture-phase, so that swallow can't block it — it must opt out of the zone itself.)
+    this.zone.runOutsideAngular(() => window.addEventListener('keydown', this.onEscCapture, true));
   }
 
   ngOnDestroy(): void {

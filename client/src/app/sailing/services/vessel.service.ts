@@ -220,6 +220,7 @@ export class VesselService {
   private keys = { left: false, right: false, sheetIn: false, sheetOut: false };
   private keyHandler!:    (e: KeyboardEvent) => void;
   private keyUpHandler!:  (e: KeyboardEvent) => void;
+  private repeatSwallow!: (e: KeyboardEvent) => void;
   private wheelHandler!:  (e: WheelEvent) => void;
   private pointerObserver: any = null;
 
@@ -1185,41 +1186,58 @@ export class VesselService {
   }
 
   private setupInput(): void {
+    const typing = () => document.activeElement instanceof HTMLInputElement ||
+                         document.activeElement instanceof HTMLTextAreaElement;
     this.keyHandler = (e: KeyboardEvent) => {
-      if (document.activeElement instanceof HTMLInputElement ||
-          document.activeElement instanceof HTMLTextAreaElement) return;
-      switch (e.code) {
-        case 'ArrowLeft':  case 'KeyA': this.keys.left     = true; break;
-        case 'ArrowRight': case 'KeyD': this.keys.right    = true; break;
-        case 'KeyQ': this.keys.sheetOut = true;  break;   // ease sheet (sail swings out)
-        case 'KeyE': this.keys.sheetIn  = true;  break;   // haul in sheet (sail comes in)
-        case 'KeyW': this.stepSail(1);  break;   // step sail up
-        case 'KeyS': this.stepSail(-1); break;   // step sail down
-        case 'KeyT': {                            // auto-trim: jump to optimal sheet angle
-          const curState = this.state();
-          const optimal  = this.optimalSheetAngle(Math.abs(curState.windAngle));
-          this.sheetAngleDeg = optimal;
-          break;
+      if (e.repeat || typing()) return;   // ignore OS key-repeat: held keys are tracked via keyup below
+      // Re-enter the Angular zone so a discrete press refreshes the HUD (sail/anchor/view indicators).
+      // The listener itself is registered OUTSIDE the zone (below), so held keys add no per-event CD.
+      this.zone.run(() => {
+        switch (e.code) {
+          case 'ArrowLeft':  case 'KeyA': this.keys.left     = true; break;
+          case 'ArrowRight': case 'KeyD': this.keys.right    = true; break;
+          case 'KeyQ': this.keys.sheetOut = true;  break;   // ease sheet (sail swings out)
+          case 'KeyE': this.keys.sheetIn  = true;  break;   // haul in sheet (sail comes in)
+          case 'KeyW': this.stepSail(1);  break;   // step sail up
+          case 'KeyS': this.stepSail(-1); break;   // step sail down
+          case 'KeyT': {                            // auto-trim: jump to optimal sheet angle
+            const curState = this.state();
+            const optimal  = this.optimalSheetAngle(Math.abs(curState.windAngle));
+            this.sheetAngleDeg = optimal;
+            break;
+          }
+          case 'Digit1': this.setSailState('reefed');   break;
+          case 'Digit2': this.setSailState('topsails'); break;
+          case 'Digit3': this.setSailState('full');     break;
+          case 'KeyP':   this.toggleAnchor();           break;
+          case 'KeyV':   this.toggleFirstPerson();      break;   // switch first-person / orbit view
         }
-        case 'Digit1': this.setSailState('reefed');   break;
-        case 'Digit2': this.setSailState('topsails'); break;
-        case 'Digit3': this.setSailState('full');     break;
-        case 'KeyP':   this.toggleAnchor();           break;
-        case 'KeyV':   this.toggleFirstPerson();      break;   // switch first-person / orbit view
-      }
+      });
     };
     this.keyUpHandler = (e: KeyboardEvent) => {
-      if (document.activeElement instanceof HTMLInputElement ||
-          document.activeElement instanceof HTMLTextAreaElement) return;
-      switch (e.code) {
+      if (typing()) return;
+      switch (e.code) {   // steering booleans only — read by the render loop, no HUD change → no CD needed
         case 'ArrowLeft':  case 'KeyA': this.keys.left     = false; break;
         case 'ArrowRight': case 'KeyD': this.keys.right    = false; break;
         case 'KeyQ': this.keys.sheetOut = false; break;
         case 'KeyE': this.keys.sheetIn  = false; break;
       }
     };
-    window.addEventListener('keydown', this.keyHandler);
-    window.addEventListener('keyup',   this.keyUpHandler);
+    // Holding a key fires keydown ~60×/s (OS repeat). Each one reaching an in-zone @HostListener (HUD,
+    // game-component, minimap…) triggers a full Angular change-detection pass; 60 CD/s of the HUD signal
+    // tree saturates the main thread and starves the Tone.js MIDI scheduler's note callbacks (they run on
+    // the main thread) → the music stutters/locks while a key is held. Swallow REPEAT events in the
+    // CAPTURE phase, before they reach those bubble-phase listeners. Gameplay is unaffected (held keys are
+    // tracked by the first non-repeat press + keyup). Skip while typing so text-field repeat still works.
+    this.repeatSwallow = (e: KeyboardEvent) => {
+      if (e.repeat && !typing()) { e.stopPropagation(); }
+    };
+    // Register OUTSIDE the Angular zone so these high-frequency events add no change detection of their own.
+    this.zone.runOutsideAngular(() => {
+      window.addEventListener('keydown', this.repeatSwallow, true);   // capture: runs before bubble HostListeners
+      window.addEventListener('keydown', this.keyHandler);
+      window.addEventListener('keyup',   this.keyUpHandler);
+    });
   }
 
   // ── Wake / hull-wash particle systems ────────────────────────────────────
@@ -1680,6 +1698,7 @@ export class VesselService {
   dispose(): void {
     window.removeEventListener('keydown', this.keyHandler);
     window.removeEventListener('keyup',   this.keyUpHandler);
+    if (this.repeatSwallow) { window.removeEventListener('keydown', this.repeatSwallow, true); }
     if (this.pointerObserver) {
       this.sceneService.scene?.onPointerObservable.remove(this.pointerObserver);
     }

@@ -1,6 +1,6 @@
 import {
   Component, ElementRef, ViewChild, AfterViewInit, OnInit,
-  OnDestroy, inject, signal,
+  OnDestroy, inject, signal, NgZone,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { TerrainService } from '../../services/terrain.service';
@@ -20,8 +20,27 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private terrainService     = inject(TerrainService);
   private vesselService      = inject(VesselService);
   private multiplayerService = inject(MultiplayerService);
+  private zone               = inject(NgZone);
 
   expanded = signal(false);
+
+  // Zoom + pan for the EXPANDED map. zoom 1 = whole world (the original view); higher = zoomed in on a
+  // sub-region centred on (viewCX, viewCZ) in world coords. Wheel zooms toward the cursor. Plain fields
+  // (not signals): the rAF draw loop reads them every frame, so they need no change detection.
+  private readonly MAX_ZOOM = 6;
+  private zoom = 1;
+  private viewCX = 0;
+  private viewCZ = 0;
+  private viewInit = false;
+
+  // Click-drag pan (expanded map). dragMoved distinguishes a pan from a click so a drag doesn't also
+  // toggle the map closed; suppressClick eats the click event that fires at the end of a drag.
+  private dragging = false;
+  private dragMoved = false;
+  private dragLastX = 0;
+  private dragLastY = 0;
+  private dragStartX = 0;
+  private dragStartY = 0;
 
   private animFrameId: number | null = null;
   private terrainLayerSmall: HTMLCanvasElement | null = null;
@@ -33,7 +52,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   /** Track the cursor over the map (canvas-pixel space, accounting for any CSS scaling). */
   onPointerMove(e: MouseEvent): void {
     const canvas = this.canvasRef?.nativeElement;
-    if (!canvas) { this.hoverPx = null; return; }
+    if (!canvas || this.dragging) { this.hoverPx = null; return; }   // no town tooltip mid-pan
     const r = canvas.getBoundingClientRect();
     this.hoverPx = {
       x: (e.clientX - r.left) * (canvas.width / r.width),
@@ -42,22 +61,127 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   }
   onPointerLeave(): void { this.hoverPx = null; }
 
+  // ── Click-drag pan (expanded map) ───────────────────────────────────────────
+
+  /** Begin a drag-pan. Only on the expanded map + left button; the drag itself is tracked via window
+   *  listeners (outside the zone) so it keeps working if the cursor leaves the canvas and adds no CD. */
+  onMouseDown(e: MouseEvent): void {
+    if (!this.expanded() || e.button !== 0) { return; }
+    e.preventDefault();
+    this.dragging = true;
+    this.dragMoved = false;
+    this.dragStartX = this.dragLastX = e.clientX;
+    this.dragStartY = this.dragLastY = e.clientY;
+    this.hoverPx = null;
+    const canvas = this.canvasRef?.nativeElement;
+    if (canvas) { canvas.style.cursor = 'grabbing'; }
+    this.zone.runOutsideAngular(() => {
+      window.addEventListener('mousemove', this.onDragMove);
+      window.addEventListener('mouseup', this.onDragUp);
+    });
+  }
+
+  private onDragMove = (e: MouseEvent): void => {
+    if (!this.dragging) { return; }
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) { return; }
+    const r = canvas.getBoundingClientRect();
+    const dxPx = (e.clientX - this.dragLastX) * (canvas.width / r.width);
+    const dyPx = (e.clientY - this.dragLastY) * (canvas.height / r.height);
+    this.dragLastX = e.clientX; this.dragLastY = e.clientY;
+    if (Math.hypot(e.clientX - this.dragStartX, e.clientY - this.dragStartY) > 4) { this.dragMoved = true; }
+    const b = this.terrainService.getWorldBounds();
+    const visW = (b.maxX - b.minX) / this.zoom, visH = (b.maxZ - b.minZ) / this.zoom;
+    this.viewCX -= dxPx * (visW / canvas.width);    // grab-and-pull: the world follows the cursor
+    this.viewCZ += dyPx * (visH / canvas.height);   // Z flipped (north = up)
+    this.clampView();
+  };
+
+  private onDragUp = (): void => {
+    if (!this.dragging) { return; }
+    this.dragging = false;
+    const canvas = this.canvasRef?.nativeElement;
+    if (canvas) { canvas.style.cursor = ''; }
+    window.removeEventListener('mousemove', this.onDragMove);
+    window.removeEventListener('mouseup', this.onDragUp);
+  };
+
+  /** Wrapper click → toggle expand, UNLESS it was the tail of a drag-pan. dragMoved is reset by the next
+   *  mousedown, so checking it directly (vs a persisted flag) can't get stuck if a drag ends off-canvas. */
+  onMapClick(): void {
+    if (this.dragMoved) { return; }
+    this.toggleExpand();
+  }
+
+  /** Mouse-wheel zoom — only on the EXPANDED map. Zooms toward the cursor (the world point under the
+   *  pointer stays put), clamped to [1, MAX_ZOOM] and to the world bounds. Registered outside the Angular
+   *  zone (see ngAfterViewInit) so scrolling adds no change detection; the rAF loop redraws from the fields. */
+  private wheelHandler = (e: WheelEvent): void => {
+    if (!this.expanded()) { return; }   // small map stays whole-world; let the page scroll otherwise
+    e.preventDefault();
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) { return; }
+    const r = canvas.getBoundingClientRect();
+    const cxp = (e.clientX - r.left) * (canvas.width / r.width);
+    const cyp = (e.clientY - r.top) * (canvas.height / r.height);
+    const before = this.canvasToWorld(cxp, cyp);
+    // Scale the step by the wheel delta but cap it at one notch, so a mouse wheel (deltaY≈±100/notch) and a
+    // trackpad two-finger scroll (many small deltas) both zoom at a comfortable rate. Up/out → zoom in.
+    const step = Math.sign(e.deltaY) * Math.min(1, Math.abs(e.deltaY) / 100);
+    this.zoom = Math.max(1, Math.min(this.MAX_ZOOM, this.zoom * Math.pow(1.2, -step)));
+    this.clampView();
+    const after = this.canvasToWorld(cxp, cyp);
+    this.viewCX += before.x - after.x;                     // keep the cursor's world point fixed
+    this.viewCZ += before.z - after.z;
+    this.clampView();
+  };
+
+  /** Canvas-pixel → world coords under the current zoom/pan view. */
+  private canvasToWorld(cxp: number, cyp: number): { x: number; z: number } {
+    const canvas = this.canvasRef.nativeElement;
+    const b = this.terrainService.getWorldBounds();
+    const visW = (b.maxX - b.minX) / this.zoom, visH = (b.maxZ - b.minZ) / this.zoom;
+    return {
+      x: (this.viewCX - visW / 2) + (cxp / canvas.width) * visW,
+      z: (this.viewCZ + visH / 2) - (cyp / canvas.height) * visH,   // Z flipped (north = up)
+    };
+  }
+
+  /** Keep the view centre inside the world so the visible window never runs past the map edge. At zoom 1
+   *  this pins the centre to the world centre → the exact original whole-world framing. */
+  private clampView(): void {
+    const b = this.terrainService.getWorldBounds();
+    if (!this.viewInit) { this.viewCX = (b.minX + b.maxX) / 2; this.viewCZ = (b.minZ + b.maxZ) / 2; this.viewInit = true; }
+    const visW = (b.maxX - b.minX) / this.zoom, visH = (b.maxZ - b.minZ) / this.zoom;
+    this.viewCX = Math.max(b.minX + visW / 2, Math.min(b.maxX - visW / 2, this.viewCX));
+    this.viewCZ = Math.max(b.minZ + visH / 2, Math.min(b.maxZ - visH / 2, this.viewCZ));
+  }
+
   ngOnInit(): void {
     window.addEventListener('keydown', this.keyHandler);
   }
 
   ngAfterViewInit(): void {
     this.rebuildTerrainLayers();
+    // Wheel listener outside the zone (no change detection per scroll) + non-passive so preventDefault
+    // can stop the page from scrolling while zooming the map.
+    this.zone.runOutsideAngular(() => {
+      this.canvasRef.nativeElement.addEventListener('wheel', this.wheelHandler, { passive: false });
+    });
     this.renderLoop();
   }
 
   ngOnDestroy(): void {
     if (this.animFrameId !== null) cancelAnimationFrame(this.animFrameId);
     window.removeEventListener('keydown', this.keyHandler);
+    this.canvasRef?.nativeElement.removeEventListener('wheel', this.wheelHandler);
+    window.removeEventListener('mousemove', this.onDragMove);   // in case torn down mid-drag
+    window.removeEventListener('mouseup', this.onDragUp);
   }
 
   toggleExpand(): void {
     this.expanded.update(v => !v);
+    if (!this.expanded()) { this.zoom = 1; this.viewInit = false; }   // collapsing → reset to whole-world view
   }
 
   // ── Render loop ───────────────────────────────────────────────────────────
@@ -82,14 +206,24 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     const worldW = bounds.maxX - bounds.minX;
     const worldH = bounds.maxZ - bounds.minZ;
 
-    // World → canvas
-    const wx = (x: number) => ((x - bounds.minX) / worldW) * W;
-    const wz = (z: number) => ((bounds.maxZ - z) / worldH) * H; // Z flipped (north=up)
+    // Visible window = the zoom/pan view (zoom 1 → whole world). clampView pins it inside the map.
+    this.clampView();
+    const visW = worldW / this.zoom, visH = worldH / this.zoom;
+    const viewMinX = this.viewCX - visW / 2;
+    const viewMaxZ = this.viewCZ + visH / 2;
 
-    // Terrain raster background
+    // World → canvas (view-relative)
+    const wx = (x: number) => ((x - viewMinX) / visW) * W;
+    const wz = (z: number) => ((viewMaxZ - z) / visH) * H; // Z flipped (north=up)
+
+    // Terrain raster background — blit the visible sub-rectangle of the (whole-world) layer up to fill.
     const layer = this.expanded() ? this.terrainLayerLarge : this.terrainLayerSmall;
     if (layer) {
-      ctx.drawImage(layer, 0, 0, W, H);
+      const sx = ((viewMinX - bounds.minX) / worldW) * layer.width;
+      const sy = ((bounds.maxZ - viewMaxZ) / worldH) * layer.height;
+      const sw = (visW / worldW) * layer.width;
+      const sh = (visH / worldH) * layer.height;
+      ctx.drawImage(layer, sx, sy, sw, sh, 0, 0, W, H);
     } else {
       ctx.fillStyle = '#0d2640';
       ctx.fillRect(0, 0, W, H);
@@ -235,8 +369,8 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       this.terrainLayerLarge = null;
       return;
     }
-    this.terrainLayerSmall = this.buildTerrainLayer(200, 200);
-    this.terrainLayerLarge = this.buildTerrainLayer(600, 600);
+    this.terrainLayerSmall = this.buildTerrainLayer(256, 256);
+    this.terrainLayerLarge = this.buildTerrainLayer(2048, 2048);   // hi-res so zoomed-in terrain stays crisp
   }
 
   private buildTerrainLayer(width: number, height: number): HTMLCanvasElement {
@@ -256,7 +390,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       const z = bounds.maxZ - (py / (height - 1)) * (bounds.maxZ - bounds.minZ);
       for (let px = 0; px < width; px++) {
         const x = bounds.minX + (px / (width - 1)) * (bounds.maxX - bounds.minX);
-        const e = this.terrainService.getElevation(x, z);
+        const e = this.terrainService.getElevationFast(x, z);   // nearest is plenty for a coarse raster (cheaper at 1024²)
 
         const idx = (py * width + px) * 4;
         let r = 13;

@@ -2,9 +2,8 @@
 
 # General or Current TODO Items
 
-* cheaper terrain sampling in the scatter builders
 * zoomable map
-* cannonfire smoke is occluded by clouds, clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon
+* cannonfire smoke is occluded by clouds, clouds occlude birds * distant landscape... can we default to clouds render behind everything (except sun & moon).. that way we don't even have to worry about depth
 * fix there being way too shallow of bathymetry in genereal... giant shallows areas which in reality are open ocean, but here are just barely enough for boat to fit
 * shallow water gets into boat, not displaced
 * some buildings on uneven land

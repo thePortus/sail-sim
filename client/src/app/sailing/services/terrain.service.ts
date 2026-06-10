@@ -20,11 +20,14 @@ import {
   RawTexture,
   RawTexture2DArray,
   Vector2,
+  Vector3,
   Vector4,
   Constants,
 } from '@babylonjs/core';
+import type { WebGPUEngine } from '@babylonjs/core';
 import { CustomMaterial, PBRCustomMaterial } from '@babylonjs/materials';
 import { TerrainClipmap } from './terrain/terrain-clipmap';
+import { TerrainShadowCompute } from './terrain/terrain-shadow-compute';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds, TerrainHarbor } from '../models';
 import { SceneService } from './scene.service';
@@ -115,6 +118,7 @@ export class TerrainService {
   private scatterTypes: ScatterType[] = [];
   private scatterObserver: any = null;
   private terrainShadowTexture: DynamicTexture | null = null;
+  private terrainShadowCompute: TerrainShadowCompute | null = null;   // WebGPU path (roadmap P1)
   private terrainShadowObserver: any = null;
   private terrainShadowFrame = 0;
   private shadowQualityLevel = 2;
@@ -219,6 +223,8 @@ export class TerrainService {
     }
     this.terrainShadowTexture?.dispose();
     this.terrainShadowTexture = null;
+    this.terrainShadowCompute?.dispose();
+    this.terrainShadowCompute = null;
     if (this.shoreMapObserver) {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.shoreMapObserver);
       this.shoreMapObserver = null;
@@ -537,11 +543,29 @@ export class TerrainService {
   }
 
   private setupTerrainShadowMask(scene: Scene): void {
-    if (this.terrainShadowTexture) return;
+    if (this.terrainShadowTexture || this.terrainShadowCompute) return;
 
     // Apply persisted quality before the first update runs.
     const saved = parseInt(localStorage.getItem('shadow-quality') ?? '2', 10);
     this.applyQualityLevel(saved);
+
+    // WebGPU: raymarch the mask in a compute shader over the GPU-resident heightfield
+    // (clipHeightTex) — the CPU version below costs ~360k heightfield samples + canvas
+    // ImageData churn per update, and its output is only ever consumed by the GPU.
+    // A/B escape hatch: localStorage.setItem('ignis_shadow_gpu','0') + reload forces the
+    // CPU path on WebGPU for same-spot FPS comparisons.
+    if (this.sceneService.isWebGPU && localStorage.getItem('ignis_shadow_gpu') !== '0') {
+      this.terrainShadowCompute = new TerrainShadowCompute(
+        scene.getEngine() as WebGPUEngine, this.TERRAIN_SHADOW_RES,
+      );
+      this.updateTerrainShadowMaskGPU();
+      this.terrainShadowObserver = scene.onBeforeRenderObservable.add(() => {
+        this.terrainShadowFrame++;
+        if (this.terrainShadowFrame % this.terrainShadowUpdateEvery !== 0) return;
+        this.updateTerrainShadowMaskGPU();
+      });
+      return;
+    }
 
     this.terrainShadowTexture = new DynamicTexture(
       'terrainShadowMask',
@@ -559,6 +583,64 @@ export class TerrainService {
     });
   }
 
+  // Skip-when-static gating: the mask covers a 7 km window at ~55 m/texel, so re-raymarching
+  // it (CPU or GPU) is pointless until the camera has drifted a texel's worth or the sun has
+  // visibly moved. Anchored at a town with a slow sun this drops updates from ~15/s to ~1/s.
+  private shadowLastCx = Infinity;
+  private shadowLastCz = Infinity;
+  private shadowLastSunDir = new Vector3(0, 0, 0);
+
+  private terrainShadowStale(cx: number, cz: number, dir: Vector3 | null): boolean {
+    if (Math.abs(cx - this.shadowLastCx) > 40 || Math.abs(cz - this.shadowLastCz) > 40) return true;
+    return dir !== null && Vector3.DistanceSquared(dir, this.shadowLastSunDir) > 0.004 * 0.004;
+  }
+
+  private noteTerrainShadowUpdated(cx: number, cz: number, dir: Vector3 | null): void {
+    this.shadowLastCx = cx;
+    this.shadowLastCz = cz;
+    if (dir) this.shadowLastSunDir.copyFrom(dir);
+  }
+
+  /** GPU twin of updateTerrainShadowMask: same sun gating + strength curve, compute dispatch
+   *  instead of the CPU raymarch. clipHeightTex may not exist yet on the first ticks (it is
+   *  created with the terrain material) — we simply retry on the next cadence tick. */
+  private updateTerrainShadowMaskGPU(): void {
+    const gpu = this.terrainShadowCompute;
+    const camera = this.sceneService.camera;
+    if (!gpu || !camera || !this.clipHeightTex) return;
+
+    const sun = this.sceneService.scene.lights.find(
+      (l): l is DirectionalLight => l instanceof DirectionalLight && l.name === 'sun',
+    );
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+    const size = this.TERRAIN_SHADOW_WORLD_SIZE;
+
+    const sunDir = sun ? sun.direction.normalizeToNew() : null;
+    if (!this.terrainShadowStale(cx, cz, sunDir)) return;
+
+    // Quality off / sun down: strength 0 makes the ocean ignore the mask contents entirely
+    // (terrainShadow = mask * strength), so no clear dispatch is needed.
+    if (this.shadowQualityLevel === 0 || !sunDir || sunDir.y >= -0.01) {
+      this.oceanService.setTerrainShadowMask(gpu.texture, cx, cz, size, 0);
+      this.noteTerrainShadowUpdated(cx, cz, sunDir);
+      return;
+    }
+
+    const rayRisePerMeter = Math.max(0.015, -sunDir.y);
+
+    const ok = gpu.update(
+      this.clipHeightTex, this.clipWBounds, this.clipTexSize,
+      cx, cz, size, -sunDir.x, -sunDir.z, rayRisePerMeter, this.terrainShadowSteps,
+    );
+    if (!ok) return;   // compute shader still compiling — retry next tick (stays stale)
+
+    const strength = Math.max(0.25, Math.min(0.9, 0.25 + (1 - Math.max(0, rayRisePerMeter)) * 0.45));
+    this.oceanService.setTerrainShadowMask(gpu.texture, cx, cz, size, strength);
+    this.noteTerrainShadowUpdated(cx, cz, sunDir);
+  }
+
   private updateTerrainShadowMask(): void {
     const texture = this.terrainShadowTexture;
     const camera = this.sceneService.camera;
@@ -571,6 +653,10 @@ export class TerrainService {
     const cx = camera.position.x;
     const cz = camera.position.z;
     const size = this.TERRAIN_SHADOW_WORLD_SIZE;
+
+    const sunDirCheck = sun ? sun.direction.normalizeToNew() : null;
+    if (!this.terrainShadowStale(cx, cz, sunDirCheck)) return;
+    this.noteTerrainShadowUpdated(cx, cz, sunDirCheck);
 
     if (this.shadowQualityLevel === 0 || !sun || sun.direction.y >= -0.01) {
       const clearCtx = texture.getContext();
@@ -800,6 +886,7 @@ export class TerrainService {
 
   private applyQualityLevel(level: number): void {
     this.shadowQualityLevel = level;
+    this.shadowLastCx = Infinity;   // force the next shadow-mask tick to re-render with the new steps
     switch (level) {
       case 0:  this.terrainShadowSteps =  1; this.terrainShadowUpdateEvery = 999; break;
       case 1:  this.terrainShadowSteps = 12; this.terrainShadowUpdateEvery =   8; break;

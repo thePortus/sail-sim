@@ -37,9 +37,11 @@ const lerp = (a, b, t) => a + (b - a) * t;
 // lagoonStrength 0..1 (0 = no lagoon flattening), lagoonDepth = target lagoon floor (m, negative),
 // seamountCount = baseline number of offshore seamounts/pinnacles to stamp.
 const ARCHETYPE_REEF = {
-  'atoll':                 { intensity: 0.95, crestDepth: -1.0, flatDepth: -2.6, crestDistM: 150, foreReefM: 70, passDensity: 0.30, maxBaseDepth: 38, detailAmp: 0.8, lagoonStrength: 0.85, lagoonDepth: -5,  seamountCount: 3 },
-  'reef-lagoon':           { intensity: 0.95, crestDepth: -1.0, flatDepth: -2.6, crestDistM: 150, foreReefM: 70, passDensity: 0.32, maxBaseDepth: 38, detailAmp: 0.8, lagoonStrength: 0.80, lagoonDepth: -6,  seamountCount: 3 },
-  'volcanic-barrier-reef': { intensity: 0.90, crestDepth: -1.2, flatDepth: -3.0, crestDistM: 180, foreReefM: 80, passDensity: 0.35, maxBaseDepth: 42, detailAmp: 0.8, lagoonStrength: 0.70, lagoonDepth: -9,  seamountCount: 6 },
+  // Crest/flat depths sit below storm-trough reach (~2 m + seed jitter) so re-raised reef tops are
+  // never exposed by waves — they read as bright shallows, not breaching sand (user feedback).
+  'atoll':                 { intensity: 0.95, crestDepth: -2.2, flatDepth: -3.6, crestDistM: 150, foreReefM: 70, passDensity: 0.30, maxBaseDepth: 38, detailAmp: 0.8, lagoonStrength: 0.85, lagoonDepth: -5,  seamountCount: 3 },
+  'reef-lagoon':           { intensity: 0.95, crestDepth: -2.2, flatDepth: -3.6, crestDistM: 150, foreReefM: 70, passDensity: 0.32, maxBaseDepth: 38, detailAmp: 0.8, lagoonStrength: 0.80, lagoonDepth: -6,  seamountCount: 3 },
+  'volcanic-barrier-reef': { intensity: 0.90, crestDepth: -2.4, flatDepth: -3.8, crestDistM: 180, foreReefM: 80, passDensity: 0.35, maxBaseDepth: 42, detailAmp: 0.8, lagoonStrength: 0.70, lagoonDepth: -9,  seamountCount: 6 },
   'shield-volcano':        { intensity: 0.55, crestDepth: -1.6, flatDepth: -3.5, crestDistM: 90,  foreReefM: 55, passDensity: 0.45, maxBaseDepth: 30, detailAmp: 0.7, lagoonStrength: 0.0,  lagoonDepth: -8,  seamountCount: 12 },
   'volcanic-multi-island': { intensity: 0.55, crestDepth: -1.6, flatDepth: -3.5, crestDistM: 95,  foreReefM: 55, passDensity: 0.45, maxBaseDepth: 30, detailAmp: 0.7, lagoonStrength: 0.0,  lagoonDepth: -8,  seamountCount: 12 },
   'eroded-rocky':          { intensity: 0.28, crestDepth: -1.8, flatDepth: -3.5, crestDistM: 65,  foreReefM: 45, passDensity: 0.62, maxBaseDepth: 24, detailAmp: 0.6, lagoonStrength: 0.0,  lagoonDepth: -6,  seamountCount: 2 },

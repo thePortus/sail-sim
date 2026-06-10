@@ -3,12 +3,10 @@
 # General or Current TODO Items
 
 * bathymetry correction too strong
+* Any way to get more GPU accelleration? IF it is on the device
 * biomes missing (since we did seabead deepening?) everything is beach... also shoreline looks blocky, perhaps bc of seabed deepening
-* some buildings on uneven land
 * make stuff look cool pass)
-* did we lose cloud shadows? reflections?
 * RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
-* consider cheap ocean replacement https://www.shadertoy.com/view/MdXyzX
 * shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
 * shader for water on camera https://www.shadertoy.com/view/ltffzl
 * add in pirates

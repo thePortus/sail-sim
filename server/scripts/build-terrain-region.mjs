@@ -52,6 +52,10 @@ const DETAIL  = args.includes('--no-detail')  ? 0 : numArg('detail', 2.5);     /
 // Navigable-depth floor: minimum water depth that GROWS with distance from shore (see the pass below).
 // --depth-floor=<scale> scales the whole curve (1 = default); --no-depth-floor disables it.
 const DEPTHFLOOR = args.includes('--no-depth-floor') ? 0 : numArg('depth-floor', 1.0);
+// Continental-shelf softening: MAXIMUM water depth near shore (see the pass below) — turns near-vertical
+// real-data drop-offs (Palau reef walls plunge 100s of m one texel off the beach) into a shelving fore-shore.
+// --shelf=<scale> scales the allowed depths (2 = twice as deep); --no-shelf disables it.
+const SHELF = args.includes('--no-shelf') ? 0 : numArg('shelf', 1.0);
 // Bathymetry polish (Phase 3): fringing reefs + lagoon shelves + seamounts + seabed micro-relief.
 // Per-archetype defaults; override with --reefs=<0..1> (fringing intensity), --lagoon=<0..1>,
 // --seamounts=<N>, --reef-detail=<m>; disable any with --no-reefs / --no-lagoon / --no-seamounts;
@@ -151,13 +155,46 @@ async function run() {
   // seabed is guaranteed to drop away. Water cells are only ever DEEPENED (land never touched), and the
   // pass runs BEFORE addReefs(), which re-raises all the INTENTIONAL shallow features (fringing crests,
   // reef flats, lagoon shelves, seamounts) on top — so designed shallows survive, accidental banks don't.
+  const shoreD = (DEPTHFLOOR > 0 || SHELF > 0) ? shoreDistanceField(field, OUT, cellM, 0) : null;
+
+  // ── Continental-shelf softening ──────────────────────────────────────────────────────────────
+  // The inverse of the depth floor: a MAXIMUM water depth near shore. Real bathymetry (esp. Palau's
+  // reef walls) plunges hundreds of metres within one or two 24 m texels of the beach — rendered
+  // honestly that's a single-triangle cliff at the waterline and an abyss rim under every shore.
+  // Raise (only ever RAISE; shallows untouched) the seabed onto a shelving profile that eases back
+  // to the natural depth ~1.5 km out, keeping deep-water drama offshore where it belongs. Runs
+  // BEFORE the depth floor (floor mins < shelf maxes everywhere, so they never fight) and BEFORE
+  // addReefs(), which then decorates the new shelf with crests/flats like any other shallow base.
+  if (SHELF > 0) {
+    const SHELF_CURVE = [[0, 1.5], [80, 4], [200, 10], [400, 25], [800, 80], [1500, 400]];   // [shoreDist m, MAX depth m]
+    const maxDepthAt = (d) => {
+      if (d >= SHELF_CURVE[SHELF_CURVE.length - 1][0]) return Infinity;   // beyond the shelf: natural abyss
+      for (let k = 1; k < SHELF_CURVE.length; k++) {
+        const [d1, m1] = SHELF_CURVE[k - 1], [d2, m2] = SHELF_CURVE[k];
+        if (d <= d2) return (m1 + (m2 - m1) * (d - d1) / (d2 - d1)) * SHELF;
+      }
+      return Infinity;
+    };
+    let raised = 0, maxLift = 0;
+    for (let i = 0; i < OUT * OUT; i++) {
+      if (field[i] > 0) continue;
+      const cap = -maxDepthAt(shoreD[i]);
+      if (field[i] < cap) { maxLift = Math.max(maxLift, cap - field[i]); field[i] = cap; raised++; }
+    }
+    console.log(`  continental-shelf softening (×${SHELF}): ${raised} water cells raised (max lift ${maxLift.toFixed(0)} m)`);
+  }
+
   if (DEPTHFLOOR > 0) {
-    const shoreD = shoreDistanceField(field, OUT, cellM, 0);
-    // Gentle by design: the ocean's see-through reveal reads the seabed down to ~22 m, so this curve keeps
-    // a WIDE visible shallows apron (nothing forced until 150 m out; only ~2.5 m by 350 m) and just
-    // guarantees wave troughs can't expose sand in honestly-open water. (The first curve — 3 m @ 200 m,
-    // 7 m @ 450 m — read as a cliff right off the beach; user feedback.)
-    const CURVE = [[150, 0], [350, 2.5], [750, 5.5], [1500, 9], [2800, 14]];   // [shoreDist m, min depth m]
+    // Profile (user-tuned, 3rd iteration): a ~30 m (~100 ft) true-shallows apron off the beach, then a
+    // steady visible grade — 2.5 m by 100 m, 6 m by 250 m — reaching see-through-limit depths (~20 m,
+    // the reveal reads to ~22 m) by ~1.2 km. Worst grade 3.6%, so it never reads as a cliff; the
+    // continental-shelf cap above brackets the seabed from the other side ("much deeper" arrives
+    // naturally past the shelf). (v1 — 3 m @ 200 m — read as a cliff off the beach; v2 — nothing
+    // until 150 m, 2.5 m @ 350 m — left vast bathtub-shallow banks; user feedback both times.)
+    // Leading edge tuned so wave troughs (±1.5–2 m in heavy weather, shore-attenuated near the
+    // waterline) can't expose the seabed: ~2.5 m by 50 m out, with only the first texel (~24 m,
+    // the beach entry itself) left shallower.
+    const CURVE = [[12, 0], [50, 3], [120, 5], [250, 8], [600, 13], [1200, 20]];   // [shoreDist m, min depth m]
     const minDepthAt = (d) => {
       if (d <= CURVE[0][0]) return 0;
       for (let k = 1; k < CURVE.length; k++) {

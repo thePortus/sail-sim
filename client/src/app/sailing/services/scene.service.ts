@@ -210,15 +210,26 @@ export class SceneService {
             // (an over-request would reject the device and drop us to WebGL).
             let maxUBO = 12, maxStorageTex = 8;
             try {
-              type AdapterLike = { limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number } };
-              const gpu = (navigator as { gpu?: { requestAdapter?: () => Promise<AdapterLike | null> } }).gpu;
-              const adapter = gpu?.requestAdapter ? await gpu.requestAdapter() : null;
+              type AdapterLike = {
+                limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number };
+                info?: { vendor?: string; architecture?: string; device?: string; description?: string };
+              };
+              const gpu = (navigator as { gpu?: { requestAdapter?: (o?: object) => Promise<AdapterLike | null> } }).gpu;
+              // high-performance: on dual-GPU machines (e.g. a desktop with both an iGPU and a
+              // discrete card) the default adapter can be the INTEGRATED one — measured as an RTX
+              // desktop running at half a MacBook's FPS. Must match the engine request below.
+              const adapter = gpu?.requestAdapter ? await gpu.requestAdapter({ powerPreference: 'high-performance' }) : null;
               if (adapter?.limits?.maxUniformBuffersPerShaderStage) maxUBO = adapter.limits.maxUniformBuffersPerShaderStage;
               if (adapter?.limits?.maxStorageTexturesPerShaderStage) maxStorageTex = Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
+              const inf = adapter?.info;
+              if (inf) console.log(`[Scene] WebGPU adapter: ${inf.vendor ?? '?'} ${inf.architecture ?? ''} ${inf.device ?? ''} ${inf.description ?? ''}`.trim());
             } catch { /* fall back to defaults below */ }
             console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}`);
             this.engine = await WebGPUEngine.CreateAsync(canvas, {
               antialias: true,
+              // Babylon forwards these options verbatim to navigator.gpu.requestAdapter() — without
+              // an explicit powerPreference, dual-GPU Windows boxes can land on the integrated GPU.
+              powerPreference: 'high-performance',
               // The FFT postprocess and time-evolve compute shaders bind 5–6 storage textures per stage
               // (default min is 4). Uniform-buffer headroom (see above) lets the harbor-town + terrain PBR
               // prepass variants fit. Both must be declared at device-creation time.

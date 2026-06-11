@@ -7,6 +7,11 @@ import { SceneService } from '../scene.service';
 import { TerrainService } from '../terrain.service';
 import { WeatherService } from '../weather.service';
 import { ThinInstancePatch } from './instancing/thin-instance-patch';
+import { IPatch } from './instancing/i-patch';
+import { GpuScatterPatch } from './instancing/gpu-scatter-patch';
+import {
+  ScatterCompute, PadBox, GRASS_WGSL, ROCKS_WGSL, DRIFT_WGSL, TREES_WGSL, PALMS_WGSL,
+} from './scatter-compute';
 import { PatchManager } from './instancing/patch-manager';
 import { createGrassBlade } from './grass/grass-blade';
 import { createRock } from './props/rock';
@@ -81,8 +86,11 @@ function fbm2(x: number, z: number): number {
 interface Layer {
   mat: Material;
   manager: PatchManager;
-  patches: Map<string, ThinInstancePatch | null>;
+  patches: Map<string, IPatch | null>;
   build: (cx: number, cz: number) => PatchData;
+  /** GPU placement (WebGPU-compute roadmap P3): when set, ensurePatches uses this instead of `build`
+   *  — the returned patch's instances are computed AND stored on the GPU (null = patch known-empty). */
+  buildGpu?: (cx: number, cz: number) => GpuScatterPatch | null;
   /** Hidden base/LoD meshes this layer thin-instances — disposed on teardown (/reloadassets rebuild). */
   baseMeshes: Mesh[];
   /** Optional smaller patch ring (in cells) — used by the fake-shadow layers so blobs only build/keep
@@ -270,6 +278,10 @@ export class ScatterService {
   /** Dispose every layer's patches, manager, base meshes and materials (deduped — rocks/driftwood
    *  share one material across their shape sub-layers). Used by dispose() and the /reloadassets rebuild. */
   private teardownLayers(): void {
+    // GPU scatter: drop the dispatch queues + compute shaders before the patches go (a fresh
+    // register pass recreates them — and a /reloadassets rebuild may land on a different engine).
+    for (const sc of this.scatterComputes.values()) { sc.dispose(); }
+    this.scatterComputes.clear();
     const meshes = new Set<Mesh>(), mats = new Set<Material>();
     for (const l of this.layers) {
       for (const [, p] of l.patches) { p?.dispose(); }
@@ -310,9 +322,11 @@ export class ScatterService {
   ];
 
   /** Per-instance grass tints (multiply the base→tip gradient albedo): lush → green → yellow-green →
-   *  dry → straw. Kept near 1 so the gradient still reads. */
+   *  dry → straw. Synced to the updated asset's intended palette (GRASS_ASSET.md / grass.js
+   *  GRASS_TINTS — brighter than the old set, tuned for the new gradient albedo).
+   *  KEEP IN SYNC with the GPU kernel's tints array in scatter-compute.ts GRASS_WGSL. */
   private static readonly GRASS_TINTS: ReadonlyArray<readonly [number, number, number]> = [
-    [0.82, 1.00, 0.66], [0.78, 0.92, 0.60], [0.96, 0.95, 0.54], [0.88, 0.80, 0.46], [0.93, 0.85, 0.55],
+    [0.88, 1.00, 0.78], [1.00, 1.00, 0.72], [1.05, 0.92, 0.55], [1.12, 0.84, 0.42], [1.15, 0.95, 0.55],
   ];
 
   /** Load the 3 authored grass CLUMP GLBs (geometry-only) sharing ONE matte double-sided gradient
@@ -328,6 +342,12 @@ export class ScatterService {
     new GrassFadePlugin(mat, 0);   // draw-radius dissolve only (no sway here — TreeWind does the wind)
     new TreeWindPlugin(mat, { flutter: true, swayStart: 0.05, swayFull: 0.85, ampScale: 0.7 });
     this.sceneService.excludeFromPrePass(mat);
+
+    // GPU placement (roadmap P3): the whole buildGrass loop (gates + clustering + burst + matrix
+    // compose) runs as a compute kernel writing straight into the patch's vertex buffers. CPU cost
+    // per patch drops to a coarse water pre-gate + buffer allocation.
+    const gpu = this.gpuScatterEnabled();
+
     for (let v = 0; v < ScatterService.GRASS_CLUMPS.length; v++) {
       const cfg = ScatterService.GRASS_CLUMPS[v];
       // useVertexColors=false: grass COLOR_0 is WIND data, not albedo.
@@ -336,8 +356,71 @@ export class ScatterService {
       if (!full || !lod) { console.warn(`[scatter] grass clump ${v} (${cfg.file}) failed — skipping grass`); return; }
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromGlow(lod);
-      this.layers.push(this.makeGlbLayer(full, lod, 45, (cx, cz) => this.buildGrass(cx, cz, v)));
+      const layer = this.makeGlbLayer(full, lod, 45, (cx, cz) => this.buildGrass(cx, cz, v));
+      if (gpu) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('grass', cx, cz, v); }
+      this.layers.push(layer);
     }
+  }
+
+  /** Per-layer GPU patch config: kernel kind, instance capacity, the pre-gate altitude band, the
+   *  vertical headroom for the culling box, and whether the material reads instance colors. */
+  private static readonly GPU_LAYERS = {
+    grass: { wgsl: GRASS_WGSL, capacity: 1800, yLo: 0.6,  yHi: 140, headroom: 4,  color: true },
+    rocks: { wgsl: ROCKS_WGSL, capacity: 576,  yLo: 0.25, yHi: 150, headroom: 5,  color: true },
+    drift: { wgsl: DRIFT_WGSL, capacity: 400,  yLo: 0.25, yHi: 7,   headroom: 3,  color: true },
+    trees: { wgsl: TREES_WGSL, capacity: 256,  yLo: 0.6,  yHi: 80,  headroom: 16, color: false },
+    palms: { wgsl: PALMS_WGSL, capacity: 196,  yLo: 0.6,  yHi: 45,  headroom: 12, color: false },
+  } as const;
+
+  /** Lazily-created per-kernel dispatchers (each owns its UBO → one dispatch per kernel per frame). */
+  private readonly scatterComputes = new Map<string, ScatterCompute>();
+
+  /** True when this session should place scatter on the GPU (WebGPU + not opted out). A/B escape
+   *  hatch: localStorage.setItem('ignis_scatter_gpu','0') + reload forces the CPU builders. */
+  private gpuScatterEnabled(): boolean {
+    return this.sceneService.isWebGPU && localStorage.getItem('ignis_scatter_gpu') !== '0';
+  }
+
+  private getCompute(kind: keyof typeof ScatterService.GPU_LAYERS): ScatterCompute {
+    let sc = this.scatterComputes.get(kind);
+    if (!sc) {
+      const scene = this.sceneService.scene;
+      sc = new ScatterCompute(
+        scene.getEngine() as import('@babylonjs/core').WebGPUEngine, scene,
+        kind, ScatterService.GPU_LAYERS[kind].wgsl,
+        () => this.terrainService.getHeightFieldGPU(),
+      );
+      this.scatterComputes.set(kind, sc);
+    }
+    return sc;
+  }
+
+  /** GPU scatter patch: a coarse 3×3 water/altitude pre-gate (9 fast height reads — patches over
+   *  open sea or outside the layer's band allocate nothing), then buffers + a queued compute
+   *  dispatch do the rest. shadowMode places the layer's flat blob discs instead of meshes. */
+  private buildScatterGpu(kind: keyof typeof ScatterService.GPU_LAYERS,
+                          cx: number, cz: number, variant: number, shadowMode = 0): GpuScatterPatch | null {
+    const cfg = ScatterService.GPU_LAYERS[kind];
+    const half = this.PATCH / 2;
+    let yMin = Infinity, yMax = -Infinity;
+    for (let i = -1; i <= 1; i++) {
+      for (let j = -1; j <= 1; j++) {
+        const y = this.terrainService.getElevationFast(cx + i * half, cz + j * half);
+        yMin = Math.min(yMin, y); yMax = Math.max(yMax, y);
+      }
+    }
+    // The 3×3 probe undersamples a 40 m patch — pad the band so a coastal texel can't false-reject.
+    if (yMax < cfg.yLo - 2 || yMin > cfg.yHi + 10) { return null; }
+
+    const pads: PadBox[] = this.townPadsNear(cx, cz).slice(0, 2);
+    const engine = this.sceneService.scene.getEngine() as import('@babylonjs/core').WebGPUEngine;
+    const patch = new GpuScatterPatch(
+      engine, new Vector3(cx, 0, cz), cfg.capacity, half + 1,
+      yMin - 2, yMax + cfg.headroom,
+      shadowMode ? false : cfg.color,   // shadow discs must not gain a 'color' kind either
+    );
+    this.getCompute(kind).enqueue(patch, cx, cz, variant, this.PATCH, this.densityMul, pads, shadowMode);
+    return patch;
   }
 
   // ── Beach palms (authored GLB variants) ─────────────────────────────────────
@@ -374,7 +457,9 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
-      this.layers.push(this.makeGlbLayer(full, imp, 130, (cx, cz) => this.buildPalms(cx, cz, v)));
+      const layer = this.makeGlbLayer(full, imp, 130, (cx, cz) => this.buildPalms(cx, cz, v));
+      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('palms', cx, cz, v); }
+      this.layers.push(layer);
     }
   }
 
@@ -411,7 +496,9 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
       // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
-      this.layers.push(this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v)));
+      const layer = this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v));
+      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
+      this.layers.push(layer);
     }
   }
 
@@ -470,10 +557,19 @@ export class ScatterService {
     this._shadowDisc = disc;
 
     // One near-ring shadow layer per asset type (all share the disc + material + manager-clone path).
-    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildRocks(cx, cz, -1, true)));
-    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildDriftwood(cx, cz, -1, true)));
-    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildTrees(cx, cz, -1, true)));
-    this.layers.push(this.makeShadowLayer(disc, (cx, cz) => this.buildPalms(cx, cz, -1, true)));
+    // GPU mode: the SAME placement kernels run with shadowMode=1 (variant -1 keeps all candidates)
+    // and emit flat blob discs instead of meshes.
+    const shadows: Array<[keyof typeof ScatterService.GPU_LAYERS, (cx: number, cz: number) => PatchData]> = [
+      ['rocks', (cx, cz) => this.buildRocks(cx, cz, -1, true)],
+      ['drift', (cx, cz) => this.buildDriftwood(cx, cz, -1, true)],
+      ['trees', (cx, cz) => this.buildTrees(cx, cz, -1, true)],
+      ['palms', (cx, cz) => this.buildPalms(cx, cz, -1, true)],
+    ];
+    for (const [kind, build] of shadows) {
+      const layer = this.makeShadowLayer(disc, build);
+      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu(kind, cx, cz, -1, 1); }
+      this.layers.push(layer);
+    }
   }
 
   /** A shadow sub-layer: a single-LoD (no distance swap) manager over the shared disc, capped to the
@@ -544,7 +640,9 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromGlow(lod);
       // Rocks are small — swap to the (real) low-poly LOD mesh at 60 m.
-      this.layers.push(this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildRocks(cx, cz, v)));
+      const layer = this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildRocks(cx, cz, v));
+      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('rocks', cx, cz, v); }
+      this.layers.push(layer);
     }
   }
 
@@ -589,7 +687,9 @@ export class ScatterService {
       }
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromGlow(lod);
-      this.layers.push(this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildDriftwood(cx, cz, v)));
+      const layer = this.makeGlbLayer(full, lod, 60, (cx, cz) => this.buildDriftwood(cx, cz, v));
+      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('drift', cx, cz, v); }
+      this.layers.push(layer);
     }
   }
 
@@ -696,6 +796,16 @@ export class ScatterService {
         if (l.patches.has(key)) { continue; }
         // Shadow (and any capped) layers only build within their near ring around the camera cell.
         if (l.maxRing !== undefined && (Math.abs(off.dx) > l.maxRing || Math.abs(off.dz) > l.maxRing)) { continue; }
+        if (l.buildGpu) {
+          // GPU placement: near-free on the CPU (a coarse pre-gate + buffer allocation — the actual
+          // placement happens in a queued compute dispatch).
+          const gp = l.buildGpu(ix * this.PATCH, iz * this.PATCH);
+          built++;
+          if (!gp) { l.patches.set(key, null); continue; }
+          l.manager.addPatch(gp);
+          l.patches.set(key, gp);
+          continue;
+        }
         const data = l.build(ix * this.PATCH, iz * this.PATCH);
         built++;
         if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
@@ -716,7 +826,11 @@ export class ScatterService {
         for (const [key, p] of l.patches) {
           const c = key.split(',');
           if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
-            if (p) { l.manager.removePatch(p); p.dispose(); }
+            if (p) {
+              l.manager.removePatch(p);
+              if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+              p.dispose();
+            }
             l.patches.delete(key);
           }
         }
@@ -784,17 +898,18 @@ export class ScatterService {
     }
   }
 
-  /** Build one patch's grass CLUMPS for a single variant. Each authored clump already packs 25–45
-   *  blades, so we scatter at a coarse grid. Clustering is TWO-SCALE: a low-freq `region` field makes
+  /** Build one patch's grass CLUMPS for a single variant. Each authored clump is now a FULL 60–90
+   *  blade tuft with a wide base footprint (updated asset — see GRASS_ASSET.md), so a few overlapping
+   *  clumps already read as continuous grass. Clustering is TWO-SCALE: a low-freq `region` field makes
    *  whole areas sparse vs lush, and a higher-freq `clump` field forms tussock cores. Density ramps
-   *  HARD toward each clump core (gamma curve) and dense cores pack 2–3 clumps per cell, so cores read
-   *  much denser than edges — while sparse regions stay very sparse. Deterministic (hash, not
-   *  Math.random) so the 3 variant calls partition one candidate set. Per-instance tint + size. */
+   *  HARD toward each clump core (gamma curve) — while sparse regions stay very sparse. Deterministic
+   *  (hash, not Math.random) so the 3 variant calls partition one candidate set. Per-instance tint +
+   *  size. KEEP burst/radius IN SYNC with scatter-compute.ts GRASS_WGSL. */
   private buildGrass(cx: number, cz: number, variant: number): PatchData {
     const res = 28, size = this.PATCH, cell = size / res, E = 2.0;
     const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
-    const BURST = 16;                                   // up to 16 clumps packed into one bush heart
-    const BUSH_R = 0.55;                                // bush radius (m) — a tight tuft, ~a few feet across
+    const BURST = 6;                                    // ≤6 full tufts per bush heart (was 16 sprigs)
+    const BUSH_R = 0.9;                                 // bush radius (m) — wider spread for the big tufts
     const cap = 5000;                                   // generous per-patch instance cap (bushes are rare)
     const matTmp = new Float32Array(cap * 16);
     const colTmp = new Float32Array(cap * 4);
@@ -887,7 +1002,13 @@ export class ScatterService {
     this.applyQualityParams(q);
     // Rebuild: drop every live patch so ensurePatches regenerates them at the new radius/density.
     for (const l of this.layers) {
-      for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
+      for (const [, p] of l.patches) {
+        if (p) {
+          l.manager.removePatch(p);
+          if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+          p.dispose();
+        }
+      }
       l.patches.clear();
     }
     this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // force ensurePatches to rebuild the grid

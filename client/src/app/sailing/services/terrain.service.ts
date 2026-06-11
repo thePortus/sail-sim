@@ -2781,6 +2781,14 @@ export class TerrainService {
   private clipWBounds = new Vector4(0, 0, 1, 1);
   private clipTexSize = new Vector2(1, 1);
 
+  /** The GPU-resident heightfield (R32F + world bounds), for compute passes outside this service
+   *  (e.g. GPU scatter placement). Null until the terrain material has been built. */
+  getHeightFieldGPU(): { tex: RawTexture; wbounds: Vector4; texSize: Vector2 } | null {
+    return this.clipHeightTex
+      ? { tex: this.clipHeightTex, wbounds: this.clipWBounds, texSize: this.clipTexSize }
+      : null;
+  }
+
   private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
     if (this.clipHeightTex || !this.heightfield) { return; }
     const minE = m.minElevation ?? 0, maxE = m.maxElevation ?? m.targetPeakElevation;

@@ -7,6 +7,7 @@ import {
   DynamicTexture,
   ParticleSystem,
   GPUParticleSystem,
+  BoxParticleEmitter,
   SolidParticleSystem,
   SolidParticle,
   Mesh,
@@ -328,6 +329,9 @@ export class CloudService {
     this.stormTexture?.dispose();
     this.stormTexture = null;
 
+    this.rainGpu?.dispose();
+    this.rainGpu = null;
+    this.rainGpuBox = null;
     this.rainSPS?.dispose();
     this.rainSPS = null;
     this.rainMesh?.dispose();
@@ -802,6 +806,19 @@ export class CloudService {
   // --------------------------------------------------------------------------
 
   private initRainLayer(scene: Scene): void {
+    // GPU rain (WebGPU-compute roadmap P5): the SPS rebuilt 7000 quads on the CPU every frame
+    // (setParticles → full mesh update + upload). A GPUParticleSystem keeps the whole streak
+    // lifecycle on the GPU; the per-frame CPU cost drops to a handful of uniform updates. The
+    // SPS's alpha-test-for-depth trick existed so the old volumetric-cloud POST-PROCESS would
+    // occlude behind rain — the option-C cloud dome is a depth-tested mesh, so plain blended
+    // particles layer correctly now. STRETCHED billboards align streaks with their true 3-D
+    // velocity (wind lean included), replacing the SPS's screen-space roll approximation.
+    // A/B escape hatch: localStorage.setItem('ignis_rain_gpu','0') + reload forces the SPS.
+    if (this.sceneService.isWebGPU && localStorage.getItem('ignis_rain_gpu') !== '0') {
+      this.initRainLayerGPU(scene);
+      return;
+    }
+
     this.rainTexture = this.buildRainTexture(scene);
     this.rainTexture.hasAlpha = true;
 
@@ -861,6 +878,86 @@ export class CloudService {
     this.rainSPS = sps;
     this.rainMesh = mesh;
   }
+
+  /** GPU rain: streak lifecycle entirely on the GPU. Mirrors the SPS's spawn volume (±200 m box,
+   *  110–155 m above the camera), fall speeds (70–100 m/s) and streak dimensions. */
+  private initRainLayerGPU(scene: Scene): void {
+    this.rainTexture = this.buildRainTexture(scene);
+    this.rainTexture.hasAlpha = true;
+
+    const ps = new GPUParticleSystem('rainGpu', { capacity: CloudService.RAIN_CAP, randomTextureSize: 256 }, scene);
+    ps.particleTexture = this.rainTexture;
+    ps.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+    ps.billboardMode = ParticleSystem.BILLBOARDMODE_STRETCHED;   // streaks align with velocity (3-D wind lean)
+    ps.renderingGroupId = 3;                                     // over the ocean LODs, depth-tested vs hull/terrain
+
+    // Spawn box relative to the (camera-following) emitter position.
+    const box = ps.createBoxEmitter(
+      new Vector3(0, -1, 0), new Vector3(0, -1, 0),              // tickRainLayer leans these with the wind
+      new Vector3(-200, 110, -200), new Vector3(200, 155, 200),
+    );
+    this.rainGpuBox = box;
+    ps.emitter = this.rainGpuEmitter;
+    ps.minEmitPower = 70;
+    ps.maxEmitPower = 100;
+    // ~165 m of fall at 70–100 m/s — die just past the camera plane like the SPS recycle did.
+    ps.minLifeTime = 1.7;
+    ps.maxLifeTime = 2.5;
+    // Streak dimensions (stretched billboard: X = width across velocity, Y = length along it).
+    ps.minSize = 1;
+    ps.maxSize = 1;
+    ps.minScaleX = 0.05;
+    ps.maxScaleX = 0.16;
+    ps.minScaleY = 3;
+    ps.maxScaleY = 9;
+    ps.updateSpeed = 0.016;
+    ps.preWarmCycles = 60;   // start() mid-storm fills the column instantly instead of a 2 s dry pocket
+
+    // Particle colour: HOLD it constant across the whole life (color1=color2=colorDead). The GPU
+    // default colorDead is (0,0,0,0), which faded every streak to nothing as it fell — the SPS path
+    // never did that. The boost (>1) compensates for alpha-BLEND softness vs the SPS's opaque
+    // alpha-TEST cutouts (the dim 150/166/198 texture read at full brightness when opaque); without
+    // it the blended streaks are barely visible against the sky. Multiplies the texture colour.
+    const streak = new Color4(1.5, 1.6, 1.8, 1);
+    ps.color1 = streak;
+    ps.color2 = streak;
+    ps.colorDead = streak;
+
+    this.rainGpu = ps;
+  }
+
+  /** Per-frame GPU-rain drive: emitter follows the camera, directions lean with the wind, emit
+   *  rate scales with intensity (the lifecycle itself runs on the GPU). */
+  private tickRainGpu(intens: number, camX: number, camY: number, camZ: number): void {
+    const ps = this.rainGpu;
+    if (!ps) return;
+
+    if (intens < 0.005) {
+      if (ps.isStarted()) { ps.stop(); }
+      return;
+    }
+    if (!ps.isStarted()) { ps.start(); }
+
+    this.rainGpuEmitter.set(camX, camY, camZ);
+
+    // Wind lean: drift per unit fall, same coefficient as the SPS path.
+    const tilt = this.windSpeed * 0.012;
+    if (this.rainGpuBox) {
+      this.rainGpuBox.direction1.set(this.windX * tilt, -1, this.windZ * tilt);
+      this.rainGpuBox.direction2.set(this.windX * tilt, -1, this.windZ * tilt);
+    }
+
+    // Drizzle ≈ 12 % of the cap alive, storm = full cap, with the same slow gust pulse.
+    const gustFactor = intens > 0.75
+      ? (0.85 + 0.15 * Math.sin(this.elapsed * 0.7 + 1.3))
+      : 1.0;
+    const targetAlive = CloudService.RAIN_CAP * Math.min(1, intens) * gustFactor;
+    ps.emitRate = Math.max(1, Math.floor(targetAlive / 2.1));   // alive ≈ rate × mean lifetime
+  }
+
+  private rainGpu: GPUParticleSystem | null = null;
+  private rainGpuBox: BoxParticleEmitter | null = null;
+  private readonly rainGpuEmitter = new Vector3(0, 0, 0);
 
   /** Per-particle rain update (called by the SPS each frame for every streak). */
   private updateRainParticle(p: SolidParticle): SolidParticle {
@@ -940,7 +1037,7 @@ export class CloudService {
   }
 
   private tickRainLayer(dt: number, camX: number, camZ: number): void {
-    if (!this.rainSPS || !this.rainMesh) return;
+    if (!this.rainGpu && (!this.rainSPS || !this.rainMesh)) return;
 
     // Smoothly blend toward target intensity (faster ramp-up than ramp-down).
     const lerpRate = this.precipIntensity < this.targetPrecipIntensity ? 0.9 : 0.55;
@@ -955,6 +1052,13 @@ export class CloudService {
     const camera = this.sceneService.camera;
     const camY = camera?.position.y ?? 0;
     const intens = this.precipIntensity;
+
+    // GPU rain path: lifecycle on the GPU — just steer the emitter and rate.
+    if (this.rainGpu) {
+      this.tickRainGpu(intens, camX, camY, camZ);
+      return;
+    }
+    if (!this.rainSPS || !this.rainMesh) return;
 
     // No rain → disable the mesh entirely (skips setParticles AND its depth write).
     if (intens < 0.005) {

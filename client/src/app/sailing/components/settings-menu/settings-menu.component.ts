@@ -180,7 +180,7 @@ import { BirdService } from '../../services/bird.service';
       backdrop-filter: blur(4px); cursor: pointer; }
     .set-panel { position: fixed; z-index: 211; top: 50%; left: 50%;
       transform: translate(-50%,-50%); width: min(420px, 92vw); max-height: 88vh;
-      background: linear-gradient(160deg,#0c1e35 0%,#081628 100%);
+      background: linear-gradient(160deg,#2e2013 0%,#15100a 100%);
       border: 1px solid rgba(200,170,100,0.30); border-radius: 12px;
       padding: 1.5rem 1.5rem 1.25rem; box-shadow: 0 24px 60px rgba(0,0,0,0.7);
       display: flex; flex-direction: column; gap: 1rem; }

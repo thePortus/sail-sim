@@ -177,7 +177,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .game-canvas--visible { opacity: 1; }
     .loading-overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
                         align-items: center; justify-content: center;
-                        background: radial-gradient(ellipse at center, #0d2240 0%, #08111e 70%); }
+                        background: radial-gradient(ellipse at center, #3a2817 0%, #15100a 70%); }
     .minimap-anchor { position: absolute; bottom: 1.5rem; right: 1.5rem; z-index: 50; }
     .admin-hint {
       position: absolute; bottom: 1.5rem; left: 1.5rem; z-index: 50;

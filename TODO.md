@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * streaming assets has gotten weird, trees move in and out
 * better latency handling
 * server is disconnected message

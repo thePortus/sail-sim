@@ -209,7 +209,7 @@ export class TerrainService {
       this.sceneService.excludeFromGlow(cm);
     }
 
-    this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.clipmap?.update());
+    this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('clipmap', () => this.clipmap?.update()));
   }
 
   isReady(): boolean {
@@ -1090,7 +1090,7 @@ export class TerrainService {
     }
 
     // Frustum-distance patch culling keeps medium-density forests responsive.
-    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
+    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('treecull', () => this.updateTreePatchVisibility()));
     this.updateTreePatchVisibility();
     console.log(`[Terrain] Generated ${placed} SPS trees across ${this.treePatches.length} patches.`);
   }
@@ -1149,7 +1149,7 @@ export class TerrainService {
       }),
     ];
 
-    this.scatterObserver = scene.onBeforeRenderObservable.add(() => this.updateScatter());
+    this.scatterObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('scatter', () => this.updateScatter()));
     this.updateScatter();
   }
 
@@ -1316,7 +1316,7 @@ export class TerrainService {
       }
     }
 
-    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.updateTreePatchVisibility());
+    this.treeCullingObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('treecull', () => this.updateTreePatchVisibility()));
     this.updateTreePatchVisibility();
     console.log(`[Terrain] Placed ${placed} beach palms across ${this.treePatches.length} patches.`);
   }

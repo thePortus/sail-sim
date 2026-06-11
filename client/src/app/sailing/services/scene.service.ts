@@ -39,10 +39,48 @@ export class SceneService {
   private sunMesh!:   Mesh;
   private moonMesh!:  Mesh;
   private godRays: VolumetricLightScatteringPostProcess | null = null;
+  private ssao: SSAO2RenderingPipeline | null = null;
   private starDome: Mesh | null = null;
   private starMat:  CustomMaterial | null = null;
   private _starTime = 0;
   private glowLayer!: GlowLayer;
+
+  // ── Perf probes (audit harness) ───────────────────────────────────────────
+  // Live on/off toggles for the heaviest passes, so the backtick overlay's GPU-ms counter shows
+  // each pass's cost by the delta when you flip it (the only practical per-pass measurement in
+  // BabylonJS WebGPU — timestamp queries time whole passes, so isolate by toggling). Other services
+  // register their own (clouds, ocean RTTs). Toggle with Ctrl+Shift+1..9 while the overlay is shown.
+  private _probes: { key: string; on: boolean; set: (on: boolean) => void }[] = [];
+  // Rolling window of distinct per-frame GPU-ms readings (min/median readout for stable A/B reads
+  // under boost/thermal noise). ~120 samples ≈ a few seconds; cleared on every probe toggle.
+  private readonly GPU_MS_WIN = 120;
+  private _gpuMsWin: number[] = [];
+  registerPerfProbe(key: string, set: (on: boolean) => void): void {
+    if (this._probes.some((p) => p.key === key)) return;
+    this._probes.push({ key, on: true, set });
+  }
+  private togglePerfProbe(index: number): void {
+    const p = this._probes[index];
+    if (!p) return;
+    p.on = !p.on;
+    p.set(p.on);
+    this._gpuMsWin = [];   // discard pre-toggle samples so min/median reflect the new state only
+    console.info(`[perf-probe] ${p.key} = ${p.on ? 'ON' : 'OFF'}`);
+  }
+
+  // ── Per-observer JS timing (CPU audit) ─────────────────────────────────────
+  // span() wraps a per-frame callback and accumulates its self-time, so the overlay can show which
+  // systems eat the 'interFrame' / 'mainRender' CPU budget — the in-game answer to "where does the
+  // 28 ms of CPU go?" without needing the Chrome profiler. Near-zero cost when the overlay is off
+  // (performance.now() ×2 per wrapped observer). Averages are computed + reset on each overlay tick.
+  private _spans = new Map<string, number>();
+  private _spanActive = false;
+  span<T>(name: string, fn: () => T): T {
+    if (!this._spanActive) return fn();
+    const t0 = performance.now();
+    try { return fn(); }
+    finally { this._spans.set(name, (this._spans.get(name) ?? 0) + (performance.now() - t0)); }
+  }
 
   /** Exclude a mesh from the glow/emissive composite pass (WebGPU-safe). */
   excludeFromGlow(mesh: Mesh): void {
@@ -208,11 +246,12 @@ export class SceneService {
             // only 12 — town/terrain PBR variants in the prePass blow past it. Raise toward the adapter max
             // (Apple/Metal reports far more); clamp so the request can never exceed what the adapter offers
             // (an over-request would reject the device and drop us to WebGL).
-            let maxUBO = 12, maxStorageTex = 8;
+            let maxUBO = 12, maxStorageTex = 8, hasTimestamp = false;
             try {
               type AdapterLike = {
                 limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number };
                 info?: { vendor?: string; architecture?: string; device?: string; description?: string };
+                features?: { has(name: string): boolean };
               };
               const gpu = (navigator as { gpu?: { requestAdapter?: (o?: object) => Promise<AdapterLike | null> } }).gpu;
               // high-performance: on dual-GPU machines (e.g. a desktop with both an iGPU and a
@@ -221,10 +260,11 @@ export class SceneService {
               const adapter = gpu?.requestAdapter ? await gpu.requestAdapter({ powerPreference: 'high-performance' }) : null;
               if (adapter?.limits?.maxUniformBuffersPerShaderStage) maxUBO = adapter.limits.maxUniformBuffersPerShaderStage;
               if (adapter?.limits?.maxStorageTexturesPerShaderStage) maxStorageTex = Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
+              hasTimestamp = adapter?.features?.has('timestamp-query') ?? false;   // enables the perf overlay's GPU-ms
               const inf = adapter?.info;
               if (inf) console.log(`[Scene] WebGPU adapter: ${inf.vendor ?? '?'} ${inf.architecture ?? ''} ${inf.device ?? ''} ${inf.description ?? ''}`.trim());
             } catch { /* fall back to defaults below */ }
-            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}`);
+            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}, timestamp-query=${hasTimestamp}`);
             this.engine = await WebGPUEngine.CreateAsync(canvas, {
               antialias: true,
               // Babylon forwards these options verbatim to navigator.gpu.requestAdapter() — without
@@ -234,6 +274,10 @@ export class SceneService {
               // (default min is 4). Uniform-buffer headroom (see above) lets the harbor-town + terrain PBR
               // prepass variants fit. Both must be declared at device-creation time.
               deviceDescriptor: {
+                // timestamp-query (only when the adapter offers it — requesting an unavailable feature
+                // rejects device creation → WebGL fallback) lets Babylon's EngineInstrumentation report
+                // real per-frame GPU time in the perf overlay; without it gpuFrameTimeCounter reads 0.
+                requiredFeatures: hasTimestamp ? ['timestamp-query'] : [],
                 requiredLimits: {
                   maxStorageTexturesPerShaderStage: maxStorageTex,
                   maxUniformBuffersPerShaderStage: Math.min(maxUBO, 24),
@@ -659,6 +703,7 @@ export class SceneService {
     // BEHIND it and paints their AO (wave ripples + coast-shadow) onto the hull/sails. The low strength
     // + high base make that bleed a faint wash instead of dark ripples. Proper fix: rejoin the prePass.
     const ssao            = new SSAO2RenderingPipeline('ssao2', this.scene, 0.75, [this.camera]);
+    this.ssao             = ssao;
     ssao.radius           = 2.0;   // world-space sample radius — tuned to ship-deck scale
     ssao.totalStrength    = 0.45;  // dialed down from 1.8 to minimise the boat-pixel bleed (see note)
     ssao.base             = 0.55;  // raised from 0 so fully-occluded spots only dim to ~55%, not black
@@ -715,6 +760,34 @@ export class SceneService {
     this.applyAaQuality();
     setTimeout(() => this.applyAaQuality(), 0);
 
+    // Perf probes for the post chain (SceneService owns these directly). SSAO2 is a separate
+    // pipeline (attach/detach its camera); DoF + glow have cheap enable flags. god-rays registers
+    // itself in buildGodRays (it may fail to construct). Clouds + ocean RTTs register from their
+    // own services. Order here is the Ctrl+Shift+N index shown in the overlay.
+    this.registerPerfProbe('ssao', (on) => {
+      if (!this.ssao) return;
+      if (on) this.scene.postProcessRenderPipelineManager.attachCamerasToRenderPipeline('ssao2', this.camera);
+      else this.scene.postProcessRenderPipelineManager.detachCamerasFromRenderPipeline('ssao2', this.camera);
+    });
+    this.registerPerfProbe('dof', (on) => { if (this.pipeline) this.pipeline.depthOfFieldEnabled = on; });
+    this.registerPerfProbe('glow', (on) => { if (this.glowLayer) this.glowLayer.isEnabled = on; });
+    // Draw-count probes: hide whole mesh families by name to measure how much of mainRender (CPU
+    // draw-submission) each costs. Momentary measurement only — scatter/towns stream, so toggled-off
+    // meshes may repopulate; read mainRender right after toggling. (scatter_* = foliage patches;
+    // *_gpatch = GPU-placed scatter; pier_/cabin_/town/shack/tavern/dwelling = harbor-town geometry.)
+    this.registerPerfProbe('drawScatter', (on) => {
+      for (const m of this.scene.meshes) {
+        if (/scatter|_gpatch|_patch/i.test(m.name)) m.setEnabled(on);
+      }
+    });
+    this.registerPerfProbe('drawTown', (on) => {
+      // Town buildings + piers are tagged excludeFromRefraction by HarborService; roads/square match
+      // by name. (GLB internal mesh names are unreliable, so structures go by the metadata tag.)
+      for (const m of this.scene.meshes) {
+        if ((m.metadata && m.metadata.excludeFromRefraction) || /roads_|square_/i.test(m.name)) m.setEnabled(on);
+      }
+    });
+
     this.buildGodRays();
   }
 
@@ -743,6 +816,13 @@ export class SceneService {
       const ocean = this.scene.getMeshByName('ocean_lod0');
       if (ocean) gr.excludedMeshes = [ocean];
       this.godRays = gr;
+      // Perf probe: detach/attach the whole radial-blur pass (exposure=0 still runs it). Prime
+      // daytime suspect — only active while the sun is up, matching the day/night FPS gap.
+      this.registerPerfProbe('godrays', (on) => {
+        if (!this.godRays) return;
+        if (on) this.camera.attachPostProcess(this.godRays);
+        else this.camera.detachPostProcess(this.godRays);
+      });
     } catch (e) {
       console.warn('[Scene] God-rays post-process unavailable:', e);
       this.godRays = null;
@@ -1172,11 +1252,21 @@ export class SceneService {
         'padding:6px 9px;border-radius:6px;pointer-events:none;display:none;white-space:pre;';
       document.body.appendChild(el);
       this._fpsEl = el;
+      // Debug/automation: ignis_perf_always='1' brings the overlay up already-on + capturing at load,
+      // so headless measurement never depends on a synthetic Backquote keypress landing.
+      if (localStorage.getItem('ignis_perf_always') === '1') { el.style.display = 'block'; }
       window.addEventListener('keydown', (e) => {
         if (e.code === 'Backquote' && this._fpsEl) {
           const show = this._fpsEl.style.display === 'none';
           this._fpsEl.style.display = show ? 'block' : 'none';
           this.setPerfCapture(show);   // only measure while the overlay is up
+        }
+        // Ctrl+Shift+1..9 toggles perf probe N (only while the overlay is up) — flip a pass off,
+        // read the GPU-ms drop in the overlay to price it. Digit1..Digit9 = probe index 0..8.
+        if (e.ctrlKey && e.shiftKey && this._fpsEl && this._fpsEl.style.display !== 'none'
+            && e.code.startsWith('Digit')) {
+          const n = parseInt(e.code.slice(5), 10) - 1;
+          if (n >= 0 && n < this._probes.length) { e.preventDefault(); this.togglePerfProbe(n); }
         }
       });
       window.addEventListener('resize', () => {
@@ -1197,24 +1287,73 @@ export class SceneService {
     let lastTime = performance.now();
     this.engine.runRenderLoop(() => {
       const now = performance.now();
-      const dt  = Math.min((now - lastTime) / 1000, 0.05);
+      const dtMs = now - lastTime;
+      const dt  = Math.min(dtMs / 1000, 0.05);
       lastTime  = now;
       this.tickTimeOfDay(dt);
+      this.tickAdaptiveResolution(dtMs);
       this.scene.render();
+      // Sample FRAME TIME (wall-clock ms/frame) into a rolling window every frame the overlay is up.
+      // Frame time is ALWAYS available (unlike GPU timer queries, which need the timestamp-query
+      // feature) and — since this scene is GPU-bound — tracks GPU cost directly. min = the
+      // least-throttled frame = cleanest A/B anchor under boost/thermal noise; median = robust
+      // center. Window cleared on probe toggle. First-frame/hitch outliers wash out (min ignores
+      // highs; median ignores the tail). dtMs is the real inter-frame period computed above.
+      if (fpsEl.style.display !== 'none' && dtMs > 0 && dtMs < 1000) {
+        this._gpuMsWin.push(dtMs);
+        if (this._gpuMsWin.length > this.GPU_MS_WIN) this._gpuMsWin.shift();
+      }
       if (fpsEl.style.display !== 'none' && this._sInstr && this._eInstr && (perfFrame++ % 15) === 0) {
         const sInstr = this._sInstr, eInstr = this._eInstr;
         const ms = (c: { lastSecAverage: number }) => c.lastSecAverage.toFixed(1);
         const gpuMs = (eInstr.gpuFrameTimeCounter.lastSecAverage / 1e6) || 0;
+        const win = this._gpuMsWin;
+        let gpuMin = 0, gpuMed = 0, gpuMean = 0;
+        if (win.length) {
+          gpuMin = Math.min(...win);
+          const sorted = [...win].sort((a, b) => a - b);
+          gpuMed = sorted[sorted.length >> 1];
+          // MEAN is the stat to read: the RTTs run every other frame, so frame time is BIMODAL
+          // (light frame ↔ heavy frame). min always catches a light frame, and the median flips
+          // across the 50/50 boundary — both mislead. The mean is the true amortised frame cost
+          // and is stable for a bimodal distribution.
+          gpuMean = win.reduce((a, b) => a + b, 0) / win.length;
+        }
         const ping = this.telemetry.ping();
         const pingStr = ping < 0 ? 'offline' : `${ping} ms`;
-        fpsEl.textContent =
+        const stats =
           `${this.engine.getFps().toFixed(0)} FPS   (${sInstr.frameTimeCounter.lastSecAverage.toFixed(1)} ms/frame)   ping ${pingStr}\n` +
-          `gpu        ${gpuMs ? gpuMs.toFixed(1) + ' ms' : 'n/a'}\n` +
+          `gpu        ${gpuMs ? gpuMs.toFixed(1) + ' ms' : 'n/a'}${this._adaptiveRes ? `   res×${this._adaptiveFactor.toFixed(2)}` : ''}\n` +
+          `frame win  mean ${gpuMean ? gpuMean.toFixed(1) : '–'} ms  (med ${gpuMed ? gpuMed.toFixed(1) : '–'} / min ${gpuMin ? gpuMin.toFixed(1) : '–'}, n${win.length})\n` +
           `evalMeshes ${ms(sInstr.activeMeshesEvaluationTimeCounter)} ms\n` +
           `renderTgts ${ms(sInstr.renderTargetsRenderTimeCounter)} ms\n` +
           `mainRender ${ms(sInstr.renderTimeCounter)} ms\n` +
           `interFrame ${ms(sInstr.interFrameTimeCounter)} ms (cpu/js)\n` +
-          `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}`;
+          `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}` +
+          // Per-observer JS self-time (avg ms/frame over the 15-frame display window), biggest first —
+          // this is the in-game answer to where the CPU/JS budget goes. Sum ≈ the wrapped slice of
+          // mainRender+interFrame; an "unwrapped" remainder means the cost is in something not yet
+          // spanned (or in Babylon's own render submit).
+          (this._spans.size
+            ? '\njs ' + [...this._spans.entries()].sort((a, b) => b[1] - a[1])
+                .map(([k, v]) => `${k} ${(v / 15).toFixed(1)}`).join('  ')
+            : '');
+        this._spans.clear();
+        // Per-pass probe states, colour-coded so it's obvious at a glance which passes are live:
+        // green ✓ = ON (counted in the GPU time above), red ✗ = toggled OFF. innerHTML (the element
+        // is white-space:pre, so \n still breaks lines); all tokens are hardcoded keys/ints, safe.
+        let html = stats.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+        if (this._probes.length) {
+          const chips = this._probes.map((p, i) =>
+            p.on
+              ? `<span style="color:#9effa0">${i + 1}:${p.key}✓</span>`
+              : `<span style="color:#ff6b6b;text-decoration:line-through">${i + 1}:${p.key}✗</span>`,
+          ).join('  ');
+          const anyOff = this._probes.some((p) => !p.on);
+          html += `\n<span style="opacity:0.6">passes</span>  ${chips}`
+            + (anyOff ? `  <span style="color:#ffd166">(audit: pass OFF)</span>` : '');
+        }
+        fpsEl.innerHTML = html;
       }
     });
   }
@@ -1231,6 +1370,8 @@ export class SceneService {
       s.captureInterFrameTime = on;
     }
     if (e) { e.captureGPUFrameTime = on; }
+    this._spanActive = on;
+    if (!on) this._spans.clear();
   }
 
   // Render resolution is now its own user setting (the single biggest perf/quality
@@ -1255,8 +1396,59 @@ export class SceneService {
   private applyResolutionScale(): void {
     if (!this.engine) return;
     const native = Math.min(window.devicePixelRatio || 1, this.MAX_PIXEL_RATIO);
-    const eff = Math.max(0.25, native * this._renderScale);
+    // The adaptive controller multiplies the USER's chosen scale by a dynamic 0.6..1.0 factor — it
+    // recovers FPS under load without ever exceeding the quality the player picked.
+    const eff = Math.max(0.25, native * this._renderScale * this._adaptiveFactor);
     this.engine.setHardwareScalingLevel(1 / eff);
+  }
+
+  // ── Adaptive resolution (dynamic render-scale) ─────────────────────────────
+  // Highest-leverage lever for a fill-rate/GPU-bound frame: pixel cost scales with resolution
+  // SQUARED, so a small scale drop is a quadratic fill-rate win. Drives a dynamic multiplier on top
+  // of the user's render-scale toward a frame-time budget (à la UE Dynamic Resolution). Opt-in;
+  // off → factor pinned at 1.0 (no behaviour change). Persisted.
+  private _adaptiveRes = (localStorage.getItem('ignis_adaptive_res') ?? '0') === '1';
+  private _adaptiveFactor = 1;
+  private _adaptiveTargetMs = (() => {
+    const v = parseFloat(localStorage.getItem('ignis_adaptive_target_ms') ?? '33.3');
+    return isNaN(v) ? 33.3 : Math.max(16.7, Math.min(66, v));   // 60..15 fps budget
+  })();
+  private _adaptiveAccumMs = 0;
+  private _adaptiveAccumN = 0;
+  private static readonly ADAPTIVE_MIN = 0.6;   // never drop below 60% of the user's scale
+
+  isAdaptiveResolution(): boolean { return this._adaptiveRes; }
+  setAdaptiveResolution(on: boolean): void {
+    this._adaptiveRes = on;
+    localStorage.setItem('ignis_adaptive_res', on ? '1' : '0');
+    if (!on) { this._adaptiveFactor = 1; this.applyResolutionScale(); }   // restore the user's full scale
+  }
+  getAdaptiveTargetMs(): number { return this._adaptiveTargetMs; }
+  setAdaptiveTargetMs(ms: number): void {
+    this._adaptiveTargetMs = Math.max(16.7, Math.min(66, ms));
+    localStorage.setItem('ignis_adaptive_target_ms', String(this._adaptiveTargetMs));
+  }
+
+  /** Per-frame: average real frame time over a window, then nudge the dynamic factor toward the
+   *  budget. Slow, hysteretic steps so resolution never visibly pumps. */
+  private tickAdaptiveResolution(dtMs: number): void {
+    if (!this._adaptiveRes) return;
+    this._adaptiveAccumMs += dtMs;
+    this._adaptiveAccumN++;
+    if (this._adaptiveAccumN < 30) return;   // ~0.5 s window
+    const avg = this._adaptiveAccumMs / this._adaptiveAccumN;
+    this._adaptiveAccumMs = 0;
+    this._adaptiveAccumN = 0;
+
+    const t = this._adaptiveTargetMs;
+    let f = this._adaptiveFactor;
+    if (avg > t * 1.10) { f -= 0.05; }            // over budget → shed pixels
+    else if (avg < t * 0.85) { f += 0.04; }       // headroom → restore quality (slower than the drop)
+    f = Math.max(SceneService.ADAPTIVE_MIN, Math.min(1, f));
+    if (Math.abs(f - this._adaptiveFactor) > 0.001) {
+      this._adaptiveFactor = f;
+      this.applyResolutionScale();
+    }
   }
 
   /**

@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* streaming assets has gotten weird, trees move in and out
 * better latency handling
 * server is disconnected message
 * sound is chunking on windows machines still

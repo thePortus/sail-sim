@@ -1604,6 +1604,18 @@ export class OceanService {
     scene.setRenderingAutoClearDepthStencil(2, false);
     this.registerRenderLoop(scene);
 
+    // Perf probes: each RTT re-renders the scene from another viewpoint — splice it out of
+    // customRenderTargets to price it via the overlay's GPU-ms delta (the shader then samples a
+    // stale texture, fine for a momentary measurement).
+    const toggleRtt = (rtt: RenderTargetTexture, on: boolean) => {
+      const arr = scene.customRenderTargets;
+      const i = arr.indexOf(rtt);
+      if (on && i < 0) { arr.push(rtt); }
+      else if (!on && i >= 0) { arr.splice(i, 1); }
+    };
+    this.sceneService.registerPerfProbe('oceanRefl', (on) => toggleRtt(this.reflectionRTT, on));
+    this.sceneService.registerPerfProbe('oceanRefr', (on) => toggleRtt(this.refractionRTT, on));
+
     // WGSL ShaderMaterials can't participate in Babylon's prePass G-buffer
     // compilation (used by SSAO2 + DoF).  Exclude all ocean/wake materials so
     // the prePass skips them — water doesn't need AO or DoF depth data anyway.
@@ -1630,8 +1642,12 @@ export class OceanService {
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
     this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
-    // Every other frame (perf). If the sky/sun reflection strobes at low FPS, set to 1.
-    this.reflectionRTT.refreshRate = 2;
+    // Every 4th frame (perf). The renderList is just sky + vessels + piers, which change slowly.
+    // 4 is deliberately COPRIME with the refraction's refreshRate (5): the two heavy RTTs then only
+    // render on the same frame once every lcm(4,5)=20 frames instead of every 3 — that de-stacks the
+    // bimodal frame-time spike (the every-other-frame stutter) that dominated the felt frame rate.
+    // If the sky/vessel reflection strobes at low FPS, lower this.
+    this.reflectionRTT.refreshRate = 4;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
     // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
@@ -1667,12 +1683,20 @@ export class OceanService {
     // Trees/scatter excluded for perf.
     this.refractionRTT.renderListPredicate = (m) =>
       !m.name.startsWith('ocean_') && !m.name.startsWith('tree_') && !m.name.startsWith('scatter_') &&
-      m.name !== 'skybox' && m.name !== 'proceduralSky';   // exclude the sky (both variants): where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+      m.name !== 'skybox' && m.name !== 'proceduralSky' &&   // exclude the sky (both variants): where the seabed drops off, the water must NOT reveal the sky (a bright sky-coloured band)
+      // Above-water structures (town buildings, piers) are never seen THROUGH the seabed-refraction
+      // view, so re-rendering them here is pure cost on the heavy (refraction) frame — the dominant
+      // per-frame draw spike. Tagged excludeFromRefraction in HarborService. The submerged hull stays
+      // in (it must occlude the sand behind the keel).
+      !(m.metadata && m.metadata.excludeFromRefraction);
     // Clear to a sandy tan so where the seabed drops off (no terrain behind the water) the
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
-    this.refractionRTT.refreshRate = 2;   // every other frame — seabed barely moves
+    this.refractionRTT.refreshRate = 3;   // every 3rd frame — reverted from 5: at 5 the seabed visibly lagged
+                                          // behind a fast camera spin. 3 is still coprime with the reflection's 4,
+                                          // so the two heavy RTTs only stack 1/lcm(3,4)=12 frames (vs every frame
+                                          // when both were 3) — we keep the de-stacking smoothness without the lag.
     this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 
@@ -1924,7 +1948,7 @@ export class OceanService {
   // ── Per-frame render loop ──────────────────────────────────────────────────
 
   private registerRenderLoop(scene: Scene): void {
-    scene.registerBeforeRender(() => {
+    scene.registerBeforeRender(() => this.sceneService.span('ocean', () => {
       const dt = scene.getEngine().getDeltaTime() * 0.001;
       this.elapsed += dt;
 
@@ -1988,7 +2012,7 @@ export class OceanService {
         if (depthMap) mat.setTexture('u_sceneDepth', depthMap);
       }
 
-    });
+    }));
   }
 
   /**

@@ -272,7 +272,7 @@ export class MultiplayerService {
     // Recoil animation tick — runs every render frame while connected
     const scene = this.sceneService.scene;
     if (scene) {
-      this.recoilTickFn = () => {
+      this.recoilTickFn = () => this.sceneService.span('mp', () => {
         const dt = Math.min(scene.getEngine().getDeltaTime() * 0.001, 0.05);
         const renderAt = performance.now() - this.INTERP_DELAY_MS;
         for (const entry of this.players.values()) {
@@ -282,7 +282,7 @@ export class MultiplayerService {
         // Ship-to-ship collision: bounce/deflect the LOCAL ship off any remote hull (runs after remote
         // display positions are updated above).
         this.tickCollisions(dt);
-      };
+      });
       scene.registerBeforeRender(this.recoilTickFn);
     }
 

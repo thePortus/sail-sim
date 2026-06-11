@@ -744,14 +744,14 @@ export class VesselService {
 
   private startLoop(scene: Scene): void {
     let lastTime = performance.now();
-    scene.registerBeforeRender(() => {
+    scene.registerBeforeRender(() => this.sceneService.span('vessel', () => {
       const now = performance.now();
       const dt  = Math.min((now - lastTime) / 1000, 0.05);
       lastTime  = now;
       this.simTime += dt;
       this.physicsStep(dt);
       this.updateCamera(dt);
-    });
+    }));
   }
 
   private physicsStep(dt: number): void {

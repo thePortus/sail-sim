@@ -452,7 +452,11 @@ export class HarborService {
     const env = this.skyEnv ?? (this.skyEnv = this.sceneService.getSkyEnvTexture());
     if (!env) return;
     const isWater = /water/i.test(mat.name);
-    const isMetal = (typeof mat.metallic === 'number' && mat.metallic > 0.2) || /bronze|iron/i.test(mat.name);
+    // NB: post-optimization each building/pier is ONE atlas material with metallicFactor=1.0 (real
+    // metalness lives in the MR texture). The old `mat.metallic > 0.2` test therefore tripped on every
+    // building, giving the whole shell a sky-reflection sampler + extra pipeline variant near harbors —
+    // pure cost for a dielectric. Gate env reflection on NAME only (genuine metal/water assets).
+    const isMetal = /bronze|iron/i.test(mat.name);
     if (!isWater && !isMetal) return;
     mat.reflectionTexture = env;                  // shares the LUT's FIXED_EQUIRECTANGULAR coordinatesMode
     if (isWater) {

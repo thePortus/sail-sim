@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  AnimationGroup, Color3, Mesh, MorphTarget, Nullable, Observer, PBRMaterial,
+  AbstractMesh, AnimationGroup, Color3, Mesh, MorphTarget, Nullable, Observer, PBRMaterial,
   Quaternion, Scene, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
@@ -173,6 +173,8 @@ interface CrewMember {
   climb: { path: Vector3[]; seg: number; t: number; dir: 1 | -1; pause: number } | null;
   animSpeed: number;
   rng: () => number;
+  detail: AbstractMesh[];   // tiny parts (buckles/eyes/laces/…) culled when the member is far
+  lodFar: boolean;          // true while the detail meshes are hidden (distance LOD)
 }
 
 export class CrewHandle {
@@ -242,11 +244,22 @@ export class CrewHandle {
       };
     }
 
+    // Distance-LOD: the tiny parts (buckles, eye globes, grommets, laces, cuffs, soles, fall flap)
+    // are sub-pixel beyond a few dozen metres but cost a draw call each — cull them when the member
+    // is far (other ships' crew), keeping just the silhouette (body/shirt/breeches/boots/hat). ~20→~5
+    // draws per distant crew member; near crew (your own deck) stay full detail.
+    const DETAIL = /^(BootBuckles|BootSideBuckles|BootCuff|BootSideStraps|BootStraps|BootSole|Breeches_buttons|Breeches_cuffs|Breeches_fall|Breeches_waistband|ShirtGrommets|ShirtLacing|Eyes)$/;
+    // Strip the loader's `.NNN` dedup suffix AND the `_primitiveN` split that multi-material meshes get
+    // (the 3-material Eyes mesh exports as Eyes_primitive0/1/2 — all three are detail).
+    const baseName = (me: AbstractMesh) => me.name.replace(/\.\d{3,}$/, '').replace(/_primitive\d+$/, '');
+    const detail = glbRoot.getChildMeshes(false).filter((me) => DETAIL.test(baseName(me)));
+
     const member: CrewMember = {
       holder, clips, current: null, face, state: 'station', stationId: null,
       wpId: Object.keys(this.layout.waypoints)[0], dwell: 2 + rng() * 6,
       legs: [], legT: 0, legFrom: new Vector3(), yaw: 0, yawTarget: 0,
       climb: null, animSpeed: 0.92 + rng() * 0.16, rng,
+      detail, lodFar: false,
     };
 
     // Spawn directly at a free station (no walk-in pop).
@@ -359,6 +372,25 @@ export class CrewHandle {
     this.members = [];
   }
 
+  private static readonly LOD_FAR_M = 40;    // beyond this distance, cull the member's detail meshes
+  private static readonly LOD_NEAR_M = 32;   // re-show within this (hysteresis band avoids edge flicker)
+
+  /** Distance LOD: hide the sub-pixel detail meshes (buckles/eyes/laces/…) when this member is far
+   *  from the camera — i.e. crew on other ships. Near crew (your own deck) keep every part. */
+  private tickLod(m: CrewMember): void {
+    if (!m.detail.length) return;
+    const cam = this.scene.activeCamera;
+    if (!cam) return;
+    const d = Vector3.Distance(cam.globalPosition, m.holder.getAbsolutePosition());
+    if (!m.lodFar && d > CrewHandle.LOD_FAR_M) {
+      m.lodFar = true;
+      for (const me of m.detail) me.setEnabled(false);
+    } else if (m.lodFar && d < CrewHandle.LOD_NEAR_M) {
+      m.lodFar = false;
+      for (const me of m.detail) me.setEnabled(true);
+    }
+  }
+
   /** Blink envelope + slow, subtle expression drift. Dead crew keep eyes shut. */
   private tickFace(m: CrewMember, dt: number): void {
     const f = m.face;
@@ -398,6 +430,7 @@ export class CrewHandle {
   // ── per-member state machine ────────────────────────────────────────────────
   private tick(m: CrewMember, dt: number): void {
     this.tickFace(m, dt);
+    this.tickLod(m);
     // Smooth yaw toward target everywhere except while dead.
     if (m.state !== 'dead') {
       let d = m.yawTarget - m.yaw;

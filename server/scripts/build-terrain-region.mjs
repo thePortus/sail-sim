@@ -23,13 +23,14 @@ import { fromArrayBuffer } from 'geotiff';
 import pngjs from 'pngjs';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import terrainConfig from '../config/terrain.config.js';
 import { SOURCES, regionById } from '../data/region-catalog.mjs';
-import { deriveAugment, mulberry32 } from '../data/augment.mjs';
+import { deriveAugment } from '../data/augment.mjs';
 import { hydraulicErode, thermalErode, addDetail } from '../data/erode.mjs';
 import { addReefs, shoreDistanceField } from '../data/reefs.mjs';
 import { computeAuxMaps, auxSlope, BIOME_PALETTE } from '../data/aux-maps.mjs';
+import { assignTowns } from '../data/town-layout.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCES_DIR = join(__dirname, '..', 'assets', 'maps', 'sources');
@@ -48,6 +49,13 @@ const SEED = args.some((a) => a.startsWith('--seed=')) ? numArg('seed', 0) : nul
 const ERODE   = args.includes('--no-erode')   ? 0 : numArg('erode', 120000);   // hydraulic droplet count
 const THERMAL = args.includes('--no-thermal') ? 0 : numArg('thermal', 3);      // talus relax iterations
 const DETAIL  = args.includes('--no-detail')  ? 0 : numArg('detail', 2.5);     // fBm micro-relief amp (m)
+// Navigable-depth floor: minimum water depth that GROWS with distance from shore (see the pass below).
+// --depth-floor=<scale> scales the whole curve (1 = default); --no-depth-floor disables it.
+const DEPTHFLOOR = args.includes('--no-depth-floor') ? 0 : numArg('depth-floor', 1.0);
+// Continental-shelf softening: MAXIMUM water depth near shore (see the pass below) — turns near-vertical
+// real-data drop-offs (Palau reef walls plunge 100s of m one texel off the beach) into a shelving fore-shore.
+// --shelf=<scale> scales the allowed depths (2 = twice as deep); --no-shelf disables it.
+const SHELF = args.includes('--no-shelf') ? 0 : numArg('shelf', 1.0);
 // Bathymetry polish (Phase 3): fringing reefs + lagoon shelves + seamounts + seabed micro-relief.
 // Per-archetype defaults; override with --reefs=<0..1> (fringing intensity), --lagoon=<0..1>,
 // --seamounts=<N>, --reef-detail=<m>; disable any with --no-reefs / --no-lagoon / --no-seamounts;
@@ -139,6 +147,71 @@ async function run() {
   if (THERMAL) { thermalErode(field, OUT, { iterations: THERMAL, talus: Math.tan(38 * Math.PI / 180) * cellM, seaLevel: 0 }); console.log(`  thermal erosion: ${THERMAL} iters (talus ${(Math.tan(38 * Math.PI / 180) * cellM).toFixed(1)} m/cell)`); }
   if (DETAIL)  { addDetail(field, OUT, SEED ?? 1, { amp: DETAIL, worldM: worldBounds.maxX - worldBounds.minX, seaLevel: 0 }); console.log(`  detail touch-up: ±${DETAIL} m fBm`); }
 
+  // ── Navigable-depth floor ────────────────────────────────────────────────────────────────────
+  // GEBCO's ~460 m texels smear island flanks into broad FALSE shallow shelves (measured: at 100–300 m
+  // offshore ~23% of water was <4 m deep; banks persisted past 800 m), so "open" water often barely
+  // cleared the hull and wave troughs exposed the seabed. Enforce a minimum depth that grows with
+  // distance from shore: the beach entry + shallows-transparency band (<~80 m) is untouched, then the
+  // seabed is guaranteed to drop away. Water cells are only ever DEEPENED (land never touched), and the
+  // pass runs BEFORE addReefs(), which re-raises all the INTENTIONAL shallow features (fringing crests,
+  // reef flats, lagoon shelves, seamounts) on top — so designed shallows survive, accidental banks don't.
+  const shoreD = (DEPTHFLOOR > 0 || SHELF > 0) ? shoreDistanceField(field, OUT, cellM, 0) : null;
+
+  // ── Continental-shelf softening ──────────────────────────────────────────────────────────────
+  // The inverse of the depth floor: a MAXIMUM water depth near shore. Real bathymetry (esp. Palau's
+  // reef walls) plunges hundreds of metres within one or two 24 m texels of the beach — rendered
+  // honestly that's a single-triangle cliff at the waterline and an abyss rim under every shore.
+  // Raise (only ever RAISE; shallows untouched) the seabed onto a shelving profile that eases back
+  // to the natural depth ~1.5 km out, keeping deep-water drama offshore where it belongs. Runs
+  // BEFORE the depth floor (floor mins < shelf maxes everywhere, so they never fight) and BEFORE
+  // addReefs(), which then decorates the new shelf with crests/flats like any other shallow base.
+  if (SHELF > 0) {
+    const SHELF_CURVE = [[0, 1.5], [80, 4], [200, 10], [400, 25], [800, 80], [1500, 400]];   // [shoreDist m, MAX depth m]
+    const maxDepthAt = (d) => {
+      if (d >= SHELF_CURVE[SHELF_CURVE.length - 1][0]) return Infinity;   // beyond the shelf: natural abyss
+      for (let k = 1; k < SHELF_CURVE.length; k++) {
+        const [d1, m1] = SHELF_CURVE[k - 1], [d2, m2] = SHELF_CURVE[k];
+        if (d <= d2) return (m1 + (m2 - m1) * (d - d1) / (d2 - d1)) * SHELF;
+      }
+      return Infinity;
+    };
+    let raised = 0, maxLift = 0;
+    for (let i = 0; i < OUT * OUT; i++) {
+      if (field[i] > 0) continue;
+      const cap = -maxDepthAt(shoreD[i]);
+      if (field[i] < cap) { maxLift = Math.max(maxLift, cap - field[i]); field[i] = cap; raised++; }
+    }
+    console.log(`  continental-shelf softening (×${SHELF}): ${raised} water cells raised (max lift ${maxLift.toFixed(0)} m)`);
+  }
+
+  if (DEPTHFLOOR > 0) {
+    // Profile (user-tuned, 3rd iteration): a ~30 m (~100 ft) true-shallows apron off the beach, then a
+    // steady visible grade — 2.5 m by 100 m, 6 m by 250 m — reaching see-through-limit depths (~20 m,
+    // the reveal reads to ~22 m) by ~1.2 km. Worst grade 3.6%, so it never reads as a cliff; the
+    // continental-shelf cap above brackets the seabed from the other side ("much deeper" arrives
+    // naturally past the shelf). (v1 — 3 m @ 200 m — read as a cliff off the beach; v2 — nothing
+    // until 150 m, 2.5 m @ 350 m — left vast bathtub-shallow banks; user feedback both times.)
+    // Leading edge tuned so wave troughs (±1.5–2 m in heavy weather, shore-attenuated near the
+    // waterline) can't expose the seabed: ~2.5 m by 50 m out, with only the first texel (~24 m,
+    // the beach entry itself) left shallower.
+    const CURVE = [[12, 0], [50, 3], [120, 5], [250, 8], [600, 13], [1200, 20]];   // [shoreDist m, min depth m]
+    const minDepthAt = (d) => {
+      if (d <= CURVE[0][0]) return 0;
+      for (let k = 1; k < CURVE.length; k++) {
+        const [d1, m1] = CURVE[k - 1], [d2, m2] = CURVE[k];
+        if (d <= d2) return (m1 + (m2 - m1) * (d - d1) / (d2 - d1)) * DEPTHFLOOR;
+      }
+      return CURVE[CURVE.length - 1][1] * DEPTHFLOOR;
+    };
+    let deepened = 0;
+    for (let i = 0; i < OUT * OUT; i++) {
+      if (field[i] > 0) continue;
+      const floorY = -minDepthAt(shoreD[i]);
+      if (field[i] > floorY) { field[i] = floorY; deepened++; }
+    }
+    console.log(`  navigable-depth floor (×${DEPTHFLOOR}): ${deepened} water cells deepened`);
+  }
+
   // ── Bathymetry polish (Phase 3) — fringing reefs + lagoon shelves + seamounts + seabed micro-relief ──
   let reefInfo = null;
   if (!NOBATHY) {
@@ -150,6 +223,29 @@ async function run() {
     reefInfo = r.profile;
     console.log(`  reefs [${region.archetype}]: ${r.profile.label}  → ${r.placedSeamounts} seamount(s)`);
   }
+
+  // ── Harbor towns: flat-beach pier sites + tiered town layouts (deterministic per seed) ─────────
+  // Computed BEFORE quantization/chunking so the town pads can be flattened into the field below (and so
+  // the aux maps + chunks reflect the flattened ground). slope + shore-distance drive the site detection.
+  const harborSlope = auxSlope(field, OUT, cellM);
+  const harborShore = shoreDistanceField(field, OUT, cellM, 0);
+  const harborSites = findHarbors(field, OUT, worldBounds, harborSlope, harborShore, 50);
+  // Nearest-cell elevation sampler (world → texel) for choosing each town's flat-pad elevation.
+  const elevAt = (wx, wz) => {
+    const ox = Math.max(0, Math.min(OUT - 1, Math.round((wx - worldBounds.minX) / (worldBounds.maxX - worldBounds.minX) * (OUT - 1))));
+    const oz = Math.max(0, Math.min(OUT - 1, Math.round((worldBounds.maxZ - wz) / (worldBounds.maxZ - worldBounds.minZ) * (OUT - 1))));
+    return field[oz * OUT + ox];
+  };
+  // Building footprints (width,depth in m) from the shipped asset catalogue → drive lot spacing + pads.
+  const assetCat = JSON.parse(readFileSync(join(__dirname, '..', 'assets', 'geometry', 'harbors', 'assets_manifest.json'), 'utf8'));
+  const footprints = {};
+  for (const a of assetCat.assets) footprints[a.id] = { w: a.footprint_m[0], d: a.footprint_m[1] };
+  const harbors = assignTowns(harborSites, SEED, elevAt, footprints);
+  // Bake each town's flat pad into the field (level the ground under the buildings/streets/square).
+  const flattened = flattenTownPads(field, OUT, worldBounds, harbors);
+  // Quay + basin under each pier so it crosses the waterline (landward end on land, body over water).
+  const shaped = shapeHarborBasins(field, OUT, worldBounds, harbors);
+  console.log(`  flattened ${harbors.length} town pads (${flattened} cells levelled); shaped pier quays/basins (${shaped} cells)`);
 
   let minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < field.length; i++) { const y = field[i]; if (y < minY) minY = y; if (y > maxY) maxY = y; }
@@ -186,14 +282,6 @@ async function run() {
 
   // ── Spawns: navigable open water near a coast ────────────────────────────────
   const spawns = findSpawns(field, OUT, worldBounds);
-
-  // ── Harbor towns: flat-beach pier sites + canned identities (deterministic per seed) ──────────
-  // slope + shore-distance drive the site detection; compute them here so harbors work even with
-  // --no-aux (cheap O(N) passes — the aux-PNG block below recomputes its own if enabled).
-  const harborSlope = auxSlope(field, OUT, cellM);
-  const harborShore = shoreDistanceField(field, OUT, cellM, 0);
-  const harborSites = findHarbors(field, OUT, worldBounds, harborSlope, harborShore, 50);
-  const harbors = assignTowns(harborSites, SEED);
 
   // ── Aux maps (Phase 6): slope / shore-dist / wetness / flow / biome → packed PNGs ────────────
   let auxInfo = null;
@@ -243,7 +331,11 @@ async function run() {
   writeFileSync(join(outputDir, 'ao_map.png'), PNG.sync.write(ao));
 
   console.log(`  ${chunkCountX}×${chunkCountZ} chunks + manifest + neutral ao_map written → ${outputDir}`);
-  console.log(`  ${spawns.length} spawn point(s); ${harbors.length} harbor town(s).\nDone.`);
+  const tierCount = harbors.reduce((m, t) => (m[t.tier] = (m[t.tier] || 0) + 1, m), {});
+  const totalBuildings = harbors.reduce((n, t) => n + (t.buildings?.length || 0), 0);
+  console.log(`  ${spawns.length} spawn point(s); ${harbors.length} harbor town(s) ` +
+    `[capital ${tierCount.capital || 0}, medium ${tierCount.medium || 0}, small ${tierCount.small || 0}]; ` +
+    `${totalBuildings} buildings.\nDone.`);
 }
 
 /** Colorized, hill-shaded preview of the final signed field (land ramp + bathy ramp), ~600 px. */
@@ -396,6 +488,131 @@ function findSpawns(field, OUT, worldBounds) {
 }
 
 /**
+ * Measure the flat, buildable land behind a shore point (texel space). Marches INLAND along the landward
+ * unit dir for `depthM`, then sideways at the midpoint for `widthM`, stopping where the ground is no longer
+ * low + gentle (a town needs a flat-ish apron, not a cliff). Used to tier towns and size their flat pads.
+ */
+function marchInlandFlat(field, slope, OUT, cellM, ox, oz, landTx, landTz) {
+  const FLAT = 0.30;                                  // m/m — buildable ground (looser than the beach test)
+  const idx = (x, z) => (x < 0 || z < 0 || x >= OUT || z >= OUT) ? -1 : z * OUT + x;
+  const ok = (i) => i >= 0 && field[i] > 0 && field[i] <= 18 && slope[i] <= FLAT;
+  let depthCells = 0;
+  for (let s = 1; s <= Math.round(110 / cellM); s++) {
+    const i = idx(Math.round(ox + landTx * s), Math.round(oz + landTz * s));
+    if (!ok(i)) break;
+    depthCells = s;
+  }
+  const mx = Math.round(ox + landTx * Math.max(1, depthCells / 2));
+  const mz = Math.round(oz + landTz * Math.max(1, depthCells / 2));
+  const px = -landTz, pz = landTx;                    // perpendicular to the landward dir
+  let wp = 0, wm = 0;
+  const reach = Math.round(70 / cellM);
+  for (let s = 1; s <= reach; s++) { if (!ok(idx(Math.round(mx + px * s), Math.round(mz + pz * s)))) break; wp = s; }
+  for (let s = 1; s <= reach; s++) { if (!ok(idx(Math.round(mx - px * s), Math.round(mz - pz * s)))) break; wm = s; }
+  return { depthM: depthCells * cellM, widthM: (wp + wm) * cellM };
+}
+
+/**
+ * Level the ground under each town's pad rectangle so buildings/streets sit flat (Harbor Towns v2 P2).
+ * Each pad is an oriented rect (cx,cz, halfX across, halfZ along the heading, rotY, target elev). Cells
+ * inside the rect are set to the pad elevation; a one-cell ramp blends out to the surrounding terrain so
+ * there's no cliff edge. Only GENUINELY DEEP water (elev < -3 m) is left untouched, so the pier's mooring
+ * water survives while the shallow shoreline under the apron is raised to a solid, level waterfront (stilt-
+ * shacks are excluded from the pad and stay at the waterline). Returns the number of cells modified.
+ */
+function flattenTownPads(field, OUT, worldBounds, harbors) {
+  const { minX, maxX, minZ, maxZ } = worldBounds;
+  const cellM = (maxX - minX) / (OUT - 1);
+  const ramp = cellM;                                  // one-cell blend skirt
+  let touched = 0;
+  for (const t of harbors) {
+    const pad = t.pad;
+    const hr = pad.rotY * Math.PI / 180;
+    const fwd = [-Math.sin(hr), -Math.cos(hr)];        // along the pad's halfZ axis (inland)
+    const rgt = [ Math.cos(hr), -Math.sin(hr)];        // along the pad's halfX axis (across)
+    const seaX = Math.sin(hr), seaZ = Math.cos(hr);    // SEAWARD unit (away from the shore point t.x,t.z)
+    const reach = Math.hypot(pad.halfX, pad.halfZ) + ramp + cellM;
+    const cox = (pad.cx - minX) / (maxX - minX) * (OUT - 1);
+    const coz = (maxZ - pad.cz) / (maxZ - minZ) * (OUT - 1);
+    const rCells = Math.ceil(reach / cellM) + 1;
+    for (let oz = Math.max(0, Math.floor(coz - rCells)); oz <= Math.min(OUT - 1, Math.ceil(coz + rCells)); oz++) {
+      for (let ox = Math.max(0, Math.floor(cox - rCells)); ox <= Math.min(OUT - 1, Math.ceil(cox + rCells)); ox++) {
+        const wx = minX + ox / (OUT - 1) * (maxX - minX);
+        const wz = maxZ - oz / (OUT - 1) * (maxZ - minZ);
+        const dx = wx - pad.cx, dz = wz - pad.cz;
+        const f = Math.abs(dx * fwd[0] + dz * fwd[1]);
+        const s = Math.abs(dx * rgt[0] + dz * rgt[1]);
+        // Full-flatten extends one cell beyond the manifest rect (so a building whose centre sits near the
+        // edge — its nearest texel can be up to half a cell out at this 24 m resolution — still levels), then
+        // a one-cell ramp blends to the surrounding terrain.
+        const outside = Math.hypot(Math.max(0, f - pad.halfZ - cellM), Math.max(0, s - pad.halfX - cellM));
+        if (outside > ramp) continue;
+        const i = oz * OUT + ox;
+        // Water rule: PRESERVE water near/seaward of the shore point (the pier + harbor live there — filling
+        // it would bury the pier) and PRESERVE deep water (a big fill wall looks wrong); but DO fill shallow
+        // water that sits well INLAND under the building apron (reclaimed waterfront on irregular/bay coasts,
+        // so those buildings still level). sw = signed seaward distance from the shore point (negative = inland).
+        const sw = (wx - t.x) * seaX + (wz - t.z) * seaZ;
+        if (field[i] < 0 && (sw > -12 || field[i] < -6)) continue;
+        const w = outside <= 0 ? 1 : 1 - outside / ramp;
+        field[i] = field[i] * (1 - w) + pad.elev * w;
+        touched++;
+      }
+    }
+  }
+  return touched;
+}
+
+/**
+ * Shape a quay + basin around each pier so it crosses the waterline: ONE END ON LAND, the rest over water.
+ * The pier origin is the shore (waterline) cell, and the pier (~14 m) is shorter than one 24 m terrain cell,
+ * so we can't carve the transition within that cell — instead we set the SHORE cell to a low quay (+QUAY,
+ * ~deck height → land) and the seaward cells to a deep basin (-DEPTH → water). The renderer's bilinear
+ * interpolation between them ramps the ground under the pier from land down through the waterline to water,
+ * so the landward end sits firmly on the quay and the body stands over the basin. Quay only raises; basin
+ * only deepens water/shallows (never gouges land).
+ */
+function shapeHarborBasins(field, OUT, worldBounds, harbors) {
+  const { minX, maxX, minZ, maxZ } = worldBounds;
+  const cellM = (maxX - minX) / (OUT - 1);
+  const QUAY = 1.2, DEPTH = -3.5, REACH = 36, HW_QUAY = 9, HW_BASIN = 14, ramp = cellM;
+  const cut = cellM * 0.55;                            // boundary: quay = the shore cell, basin = seaward cells
+  let touched = 0;
+  for (const t of harbors) {
+    const hr = t.heading * Math.PI / 180;
+    const seaX = Math.sin(hr), seaZ = Math.cos(hr);    // seaward (pier extends this way)
+    const rgtX = Math.cos(hr), rgtZ = -Math.sin(hr);   // across the pier
+    const ccx = t.x + seaX * REACH / 2, ccz = t.z + seaZ * REACH / 2;
+    const cox = (ccx - minX) / (maxX - minX) * (OUT - 1);
+    const coz = (maxZ - ccz) / (maxZ - minZ) * (OUT - 1);
+    const rCells = Math.ceil((Math.hypot(REACH / 2, HW_BASIN) + ramp + cellM) / cellM) + 1;
+    for (let oz = Math.max(0, Math.floor(coz - rCells)); oz <= Math.min(OUT - 1, Math.ceil(coz + rCells)); oz++) {
+      for (let ox = Math.max(0, Math.floor(cox - rCells)); ox <= Math.min(OUT - 1, Math.ceil(cox + rCells)); ox++) {
+        const wx = minX + ox / (OUT - 1) * (maxX - minX);
+        const wz = maxZ - oz / (OUT - 1) * (maxZ - minZ);
+        const a = (wx - t.x) * seaX + (wz - t.z) * seaZ;   // along-seaward from the shore point
+        const s = (wx - t.x) * rgtX + (wz - t.z) * rgtZ;   // across
+        const i = oz * OUT + ox;
+        if (a >= -cut && a < cut) {                    // QUAY: raise the shore cell → landward pier end on land
+          if (Math.max(0, Math.abs(s) - HW_QUAY) > ramp) continue;
+          const w = 1 - Math.max(0, Math.abs(s) - HW_QUAY) / ramp;
+          const nv = field[i] * (1 - w) + QUAY * w;
+          if (nv > field[i]) { field[i] = nv; touched++; }
+        } else if (a >= cut && a <= REACH) {           // BASIN: deepen seaward water → pier body over water
+          if (field[i] > 0.5) continue;                // never gouge land
+          const outside = Math.hypot(a > REACH ? a - REACH : 0, Math.max(0, Math.abs(s) - HW_BASIN));
+          if (outside > ramp) continue;
+          const w = 1 - outside / ramp;
+          const nv = field[i] * (1 - w) + DEPTH * w;
+          if (nv < field[i]) { field[i] = nv; touched++; }
+        }
+      }
+    }
+  }
+  return touched;
+}
+
+/**
  * Detect harbor-town pier sites: flat-beach shore points with open navigable water ahead, where a pier
  * can run from the sand out over the sea. Returns up to `maxSites` spread-out sites as
  * { x, z, heading } — x,z is the shore point at the waterline (pier origin), heading points SEAWARD
@@ -467,8 +684,11 @@ function findHarbors(field, OUT, worldBounds, slope, shoreDist, maxSites) {
       }
       const wp = toWorld(sx, sz);
       const heading = (Math.atan2(-gx, gy) * 180 / Math.PI + 360) % 360;   // world seaward dir → heading
-      const score = (1 - slope[li] / FLAT_SLOPE) + Math.min(1, -endDepth / 4);
-      cands.push({ ox: sx, oz: sz, x: +wp.x.toFixed(1), z: +wp.z.toFixed(1), heading: Math.round(heading), score });
+      // How much flat, buildable land lies inland behind this shore point → drives town tier + pad size.
+      const flat = marchInlandFlat(field, slope, OUT, cellM, sx, sz, landTx, landTz);
+      const score = (1 - slope[li] / FLAT_SLOPE) + Math.min(1, -endDepth / 4) + Math.min(1.5, flat.depthM / 60);
+      cands.push({ ox: sx, oz: sz, x: +wp.x.toFixed(1), z: +wp.z.toFixed(1), heading: Math.round(heading),
+        inlandFlatM: Math.round(flat.depthM), flatWidthM: Math.round(flat.widthM), score });
     }
   }
 
@@ -483,39 +703,9 @@ function findHarbors(field, OUT, worldBounds, slope, shoreDist, maxSites) {
   return kept;
 }
 
-/** Fisher–Yates shuffle driven by a seeded RNG (deterministic per map seed). */
-function seededShuffle(arr, rng) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+// Auto-run when invoked directly. argv[1] may be relative, so normalise it to a file URL before
+// comparing (so the module can also be imported without triggering a build).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error('\nFatal:', err); process.exit(1); });
 }
 
-/**
- * Turn raw pier sites into named towns. Deterministically (by seed) shuffles the canned name bank and
- * assigns one unique identity per site, capped at the number of names (extra sites are dropped so no
- * two towns share a name). Each town also gets a pier variant from the same seeded RNG.
- */
-function assignTowns(sites, seed) {
-  const bank = JSON.parse(readFileSync(join(__dirname, '..', 'data', 'town-names.json'), 'utf8')).towns;
-  const rng = mulberry32((seed ?? 1) ^ 0x70c4b0a7);            // distinct stream from terrain/reefs
-  const names = seededShuffle(bank, rng);
-  const variants = ['straight', 'l', 't'];
-  const n = Math.min(sites.length, names.length);
-  const towns = [];
-  for (let k = 0; k < n; k++) {
-    const s = sites[k], id = names[k];
-    towns.push({
-      id: `town_${k}`,
-      name: id.name,
-      description: id.description,
-      variant: variants[Math.floor(rng() * variants.length)],
-      x: s.x, z: s.z, heading: s.heading,
-    });
-  }
-  return towns;
-}
-
-run().catch((err) => { console.error('\nFatal:', err); process.exit(1); });

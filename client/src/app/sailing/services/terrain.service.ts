@@ -20,11 +20,15 @@ import {
   RawTexture,
   RawTexture2DArray,
   Vector2,
+  Vector3,
   Vector4,
   Constants,
 } from '@babylonjs/core';
+import type { WebGPUEngine } from '@babylonjs/core';
 import { CustomMaterial, PBRCustomMaterial } from '@babylonjs/materials';
 import { TerrainClipmap } from './terrain/terrain-clipmap';
+import { TerrainShadowCompute } from './terrain/terrain-shadow-compute';
+import { ShoreMapCompute } from './terrain/shore-map-compute';
 import { Settings } from '../../app.settings';
 import { TerrainManifest, TerrainWorldBounds, TerrainHarbor } from '../models';
 import { SceneService } from './scene.service';
@@ -115,6 +119,7 @@ export class TerrainService {
   private scatterTypes: ScatterType[] = [];
   private scatterObserver: any = null;
   private terrainShadowTexture: DynamicTexture | null = null;
+  private terrainShadowCompute: TerrainShadowCompute | null = null;   // WebGPU path (roadmap P1)
   private terrainShadowObserver: any = null;
   private terrainShadowFrame = 0;
   private shadowQualityLevel = 2;
@@ -219,12 +224,18 @@ export class TerrainService {
     }
     this.terrainShadowTexture?.dispose();
     this.terrainShadowTexture = null;
+    this.terrainShadowCompute?.dispose();
+    this.terrainShadowCompute = null;
     if (this.shoreMapObserver) {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.shoreMapObserver);
       this.shoreMapObserver = null;
     }
     this.shoreMapTexture?.dispose();
     this.shoreMapTexture = null;
+    this.shoreMapCompute?.dispose();
+    this.shoreMapCompute = null;
+    this.shoreLastCx = Infinity;
+    this.shoreLastCz = Infinity;
     if (this.clipmapObserver) {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.clipmapObserver);
       this.clipmapObserver = null;
@@ -314,6 +325,31 @@ export class TerrainService {
       return (hq / quantizationLevels) * (maxElevation - minElevation) + minElevation;
     }
     return (hq / quantizationLevels) * targetPeakElevation;
+  }
+
+  /** NEAREST-texel elevation — one heightfield read + decode, NO bilinear interpolation (~3–4× cheaper
+   *  than getElevation). For SCATTER GATING (elevation-band + slope rejection) where sub-cell precision
+   *  doesn't matter; an accepted instance's FINAL placement Y still uses getElevation so it sits flush on
+   *  slopes. Same texel convention as getElevation (uv·size − 0.5, rounded) so the two agree at texel centres. */
+  getElevationFast(worldX: number, worldZ: number): number {
+    const m = this.manifest;
+    if (!m || !this.heightfield) return 0;
+    const ux = (worldX - m.worldBounds.minX) / (m.worldBounds.maxX - m.worldBounds.minX);
+    const uz = (m.worldBounds.maxZ - worldZ) / (m.worldBounds.maxZ - m.worldBounds.minZ);
+    const x = Math.round(ux * m.width  - 0.5);
+    const z = Math.round(uz * m.height - 0.5);
+    const hq = this.sampleQuantized(x, z);   // clamps to edge internally
+    return m.minElevation != null && m.maxElevation != null
+      ? (hq / m.quantizationLevels) * (m.maxElevation - m.minElevation) + m.minElevation
+      : (hq / m.quantizationLevels) * m.targetPeakElevation;
+  }
+
+  /** World metres per heightfield texel (~24 m). Scatter uses this as the slope-sampling baseline so a
+   *  NEAREST forward difference spans a full texel (otherwise two nearest samples land in the same cell →
+   *  a constant 0 slope). One cell over ≈ the same gradient bilinear gives within a cell, so thresholds carry. */
+  getCellSizeM(): number {
+    const m = this.manifest;
+    return m ? (m.worldBounds.maxX - m.worldBounds.minX) / Math.max(1, m.width - 1) : 24;
   }
 
   isOnLand(worldX: number, worldZ: number): boolean {
@@ -512,11 +548,37 @@ export class TerrainService {
   }
 
   private setupTerrainShadowMask(scene: Scene): void {
-    if (this.terrainShadowTexture) return;
+    if (this.terrainShadowTexture || this.terrainShadowCompute) return;
 
     // Apply persisted quality before the first update runs.
     const saved = parseInt(localStorage.getItem('shadow-quality') ?? '2', 10);
     this.applyQualityLevel(saved);
+
+    // WebGPU: raymarch the mask in a compute shader over the GPU-resident heightfield
+    // (clipHeightTex) — the CPU version below costs ~360k heightfield samples + canvas
+    // ImageData churn per update, and its output is only ever consumed by the GPU.
+    // A/B escape hatch: localStorage.setItem('ignis_shadow_gpu','0') + reload forces the
+    // CPU path on WebGPU for same-spot FPS comparisons.
+    if (this.sceneService.isWebGPU && localStorage.getItem('ignis_shadow_gpu') !== '0') {
+      this.terrainShadowCompute = new TerrainShadowCompute(
+        scene.getEngine() as WebGPUEngine, this.TERRAIN_SHADOW_RES,
+      );
+      // Publish synchronously before the first dispatch — same reason as the shore map: the FFT
+      // ocean material bakes its shadow define at build time from whether a mask exists. Strength 0
+      // keeps the (zero-initialized) contents inert until the first real dispatch lands.
+      const cam0 = this.sceneService.camera;
+      this.oceanService.setTerrainShadowMask(
+        this.terrainShadowCompute.texture, cam0?.position.x ?? 0, cam0?.position.z ?? 0,
+        this.TERRAIN_SHADOW_WORLD_SIZE, 0,
+      );
+      this.updateTerrainShadowMaskGPU();
+      this.terrainShadowObserver = scene.onBeforeRenderObservable.add(() => {
+        this.terrainShadowFrame++;
+        if (this.terrainShadowFrame % this.terrainShadowUpdateEvery !== 0) return;
+        this.updateTerrainShadowMaskGPU();
+      });
+      return;
+    }
 
     this.terrainShadowTexture = new DynamicTexture(
       'terrainShadowMask',
@@ -534,6 +596,64 @@ export class TerrainService {
     });
   }
 
+  // Skip-when-static gating: the mask covers a 7 km window at ~55 m/texel, so re-raymarching
+  // it (CPU or GPU) is pointless until the camera has drifted a texel's worth or the sun has
+  // visibly moved. Anchored at a town with a slow sun this drops updates from ~15/s to ~1/s.
+  private shadowLastCx = Infinity;
+  private shadowLastCz = Infinity;
+  private shadowLastSunDir = new Vector3(0, 0, 0);
+
+  private terrainShadowStale(cx: number, cz: number, dir: Vector3 | null): boolean {
+    if (Math.abs(cx - this.shadowLastCx) > 40 || Math.abs(cz - this.shadowLastCz) > 40) return true;
+    return dir !== null && Vector3.DistanceSquared(dir, this.shadowLastSunDir) > 0.004 * 0.004;
+  }
+
+  private noteTerrainShadowUpdated(cx: number, cz: number, dir: Vector3 | null): void {
+    this.shadowLastCx = cx;
+    this.shadowLastCz = cz;
+    if (dir) this.shadowLastSunDir.copyFrom(dir);
+  }
+
+  /** GPU twin of updateTerrainShadowMask: same sun gating + strength curve, compute dispatch
+   *  instead of the CPU raymarch. clipHeightTex may not exist yet on the first ticks (it is
+   *  created with the terrain material) — we simply retry on the next cadence tick. */
+  private updateTerrainShadowMaskGPU(): void {
+    const gpu = this.terrainShadowCompute;
+    const camera = this.sceneService.camera;
+    if (!gpu || !camera || !this.clipHeightTex) return;
+
+    const sun = this.sceneService.scene.lights.find(
+      (l): l is DirectionalLight => l instanceof DirectionalLight && l.name === 'sun',
+    );
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+    const size = this.TERRAIN_SHADOW_WORLD_SIZE;
+
+    const sunDir = sun ? sun.direction.normalizeToNew() : null;
+    if (!this.terrainShadowStale(cx, cz, sunDir)) return;
+
+    // Quality off / sun down: strength 0 makes the ocean ignore the mask contents entirely
+    // (terrainShadow = mask * strength), so no clear dispatch is needed.
+    if (this.shadowQualityLevel === 0 || !sunDir || sunDir.y >= -0.01) {
+      this.oceanService.setTerrainShadowMask(gpu.texture, cx, cz, size, 0);
+      this.noteTerrainShadowUpdated(cx, cz, sunDir);
+      return;
+    }
+
+    const rayRisePerMeter = Math.max(0.015, -sunDir.y);
+
+    const ok = gpu.update(
+      this.clipHeightTex, this.clipWBounds, this.clipTexSize,
+      cx, cz, size, -sunDir.x, -sunDir.z, rayRisePerMeter, this.terrainShadowSteps,
+    );
+    if (!ok) return;   // compute shader still compiling — retry next tick (stays stale)
+
+    const strength = Math.max(0.25, Math.min(0.9, 0.25 + (1 - Math.max(0, rayRisePerMeter)) * 0.45));
+    this.oceanService.setTerrainShadowMask(gpu.texture, cx, cz, size, strength);
+    this.noteTerrainShadowUpdated(cx, cz, sunDir);
+  }
+
   private updateTerrainShadowMask(): void {
     const texture = this.terrainShadowTexture;
     const camera = this.sceneService.camera;
@@ -546,6 +666,10 @@ export class TerrainService {
     const cx = camera.position.x;
     const cz = camera.position.z;
     const size = this.TERRAIN_SHADOW_WORLD_SIZE;
+
+    const sunDirCheck = sun ? sun.direction.normalizeToNew() : null;
+    if (!this.terrainShadowStale(cx, cz, sunDirCheck)) return;
+    this.noteTerrainShadowUpdated(cx, cz, sunDirCheck);
 
     if (this.shadowQualityLevel === 0 || !sun || sun.direction.y >= -0.01) {
       const clearCtx = texture.getContext();
@@ -612,7 +736,36 @@ export class TerrainService {
   // ── Shore elevation map ───────────────────────────────────────────────────
 
   private setupShoreMap(scene: Scene): void {
-    if (this.shoreMapTexture) return;
+    if (this.shoreMapTexture || this.shoreMapCompute) return;
+
+    // WebGPU: land scan + proximity search in a compute shader over the GPU-resident heightfield
+    // (roadmap P2) — the CPU version below costs ~1M array ops + canvas churn per update. The CPU
+    // buoyancy twin (_shoreProx) is refreshed by a small async readback of the same texture, so
+    // hull shoaling keeps reading the exact data the vertex shader samples.
+    // A/B escape hatch: localStorage.setItem('ignis_shore_gpu','0') + reload forces the CPU path.
+    if (this.sceneService.isWebGPU && localStorage.getItem('ignis_shore_gpu') !== '0') {
+      this.shoreMapCompute = new ShoreMapCompute(
+        scene.getEngine() as WebGPUEngine, this.SHORE_MAP_RES,
+      );
+      // Publish the texture to the ocean SYNCHRONOUSLY, before the first dispatch. The FFT ocean
+      // material bakes '#define HAS_SHORE' (shoaling + refraction) at build time from whether a
+      // shore map EXISTS — the CPU path always registered one here, synchronously. Waiting for the
+      // async compute-shader compile would let the FFT material build WITHOUT shoaling (waves wash
+      // over towns). Content is deterministically black until the first dispatch (WebGPU zero-
+      // initializes textures), which just means "open water" for the first few frames.
+      const cam0 = this.sceneService.camera;
+      this.oceanService.setShoreMap(
+        this.shoreMapCompute.texture, cam0?.position.x ?? 0, cam0?.position.z ?? 0,
+        this.SHORE_MAP_WORLD_SIZE, (x, z) => this.shoreProximityAt(x, z),
+      );
+      this.updateShoreMapGPU();
+      this.shoreMapObserver = scene.onBeforeRenderObservable.add(() => {
+        this.shoreMapFrame++;
+        if (this.shoreMapFrame % 10 !== 0) return;
+        this.updateShoreMapGPU();
+      });
+      return;
+    }
 
     this.shoreMapTexture = new DynamicTexture(
       'shoreElevationMap',
@@ -632,6 +785,61 @@ export class TerrainService {
       this.updateShoreMap();
     });
   }
+
+  /** GPU twin of updateShoreMap: one compute dispatch + an async readback for the CPU shoaling
+   *  sampler. Skips entirely while the camera sits still (the map depends only on camera x/z). */
+  private updateShoreMapGPU(): void {
+    const gpu = this.shoreMapCompute;
+    const camera = this.sceneService.camera;
+    const m = this.manifest;
+    if (!gpu || !camera || !m || !this.clipHeightTex) return;
+
+    const cx = camera.position.x;
+    const cz = camera.position.z;
+    const size = this.SHORE_MAP_WORLD_SIZE;
+    const res = this.SHORE_MAP_RES;
+
+    // Static skip: half a texel (~8 m) of drift can't change any texel's land/water rounding.
+    if (this._shoreProx && Math.abs(cx - this.shoreLastCx) < 8 && Math.abs(cz - this.shoreLastCz) < 8) return;
+
+    // The quantized land test (hf > waterlineQ) as an exact metre threshold against the
+    // dequantized height texture: anything at or below the waterline quantum is water.
+    const minE = m.minElevation ?? 0;
+    const maxE = m.maxElevation ?? m.targetPeakElevation;
+    const qSpan = (maxE - minE) / (m.quantizationLevels || 65535);
+    const landThreshold = (this.waterlineQ + 0.5) * qSpan + minE;
+
+    const ok = gpu.update(this.clipHeightTex, this.clipWBounds, this.clipTexSize, cx, cz, size, landThreshold);
+    if (!ok) return;   // compute shader still compiling — retry next tick
+    this.shoreLastCx = cx;
+    this.shoreLastCz = cz;
+
+    this.oceanService.setShoreMap(gpu.texture, cx, cz, size, (x, z) => this.shoreProximityAt(x, z));
+
+    // Refresh the CPU twin from the texture we just wrote (one in-flight readback at a time; it
+    // lands 1–2 frames later, harmless for shoaling). Window params are committed WITH the data
+    // so shoreProximityAt never mixes a new centre with old contents.
+    if (this.shoreReadbackPending) return;
+    this.shoreReadbackPending = true;
+    gpu.texture.readPixels(undefined, undefined, undefined, undefined, true)?.then((buf) => {
+      const px = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      if (!this._shoreProx || this._shoreProx.length !== res * res) this._shoreProx = new Float32Array(res * res);
+      // The kernel stores rows Y-flipped (texture v=1 = north, matching the DynamicTexture
+      // convention); shoreProximityAt indexes rows north-first — un-flip while copying.
+      for (let py = 0; py < res; py++) {
+        const src = (res - 1 - py) * res;
+        const dst = py * res;
+        for (let x = 0; x < res; x++) this._shoreProx[dst + x] = px[(src + x) * 4] / 255;
+      }
+      this._shoreProxCX = cx; this._shoreProxCZ = cz; this._shoreProxSize = size; this._shoreProxRes = res;
+      this.shoreReadbackPending = false;
+    }).catch(() => { this.shoreReadbackPending = false; });
+  }
+
+  private shoreMapCompute: ShoreMapCompute | null = null;   // WebGPU path (roadmap P2)
+  private shoreLastCx = Infinity;
+  private shoreLastCz = Infinity;
+  private shoreReadbackPending = false;
 
   // Returns true if the raw heightfield cell nearest to (wx, wz) is land.
   // Uses nearest-neighbour sampling (one Uint16Array read, zero interpolation)
@@ -684,6 +892,12 @@ export class TerrainService {
     const imageData = ctx.getImageData(0, 0, res, res);
     const data = imageData.data;
 
+    // CPU twin of the texture: the ocean's buoyancy sampler needs the SAME shore proximity the vertex
+    // shader reads, so the hull bobs with the shore-attenuated (shoaling-flattened) waves.
+    if (!this._shoreProx || this._shoreProx.length !== res * res) { this._shoreProx = new Float32Array(res * res); }
+    const prox = this._shoreProx;
+    this._shoreProxCX = cx; this._shoreProxCZ = cz; this._shoreProxSize = size; this._shoreProxRes = res;
+
     let ptr = 0;
     for (let py = 0; py < res; py++) {
       for (let px = 0; px < res; px++) {
@@ -707,6 +921,7 @@ export class TerrainService {
           encoded = Math.max(0, 1.0 - (minDist - 1) / (MAX_STEPS - 1));
         }
 
+        prox[py * res + px] = encoded;   // CPU copy → ocean buoyancy shore attenuation (see below)
         const v = Math.round(encoded * 255);
         data[ptr++] = v;    // R channel
         data[ptr++] = 0;    // G
@@ -717,7 +932,24 @@ export class TerrainService {
 
     ctx.putImageData(imageData, 0, 0);
     texture.update();
-    this.oceanService.setShoreMap(texture, cx, cz, size);
+    this.oceanService.setShoreMap(texture, cx, cz, size, (x, z) => this.shoreProximityAt(x, z));
+  }
+
+  // Backing store for the CPU shore-proximity twin (mirrors the painted shore-map window).
+  private _shoreProx: Float32Array | null = null;
+  private _shoreProxCX = 0; private _shoreProxCZ = 0; private _shoreProxSize = 1; private _shoreProxRes = 0;
+
+  /** Land proximity at a world point (1 at the waterline → 0 in open water), from the same data the
+   *  shore-map texture was painted with. Nearest texel; 0 outside the camera window / before first paint. */
+  private shoreProximityAt(x: number, z: number): number {
+    const prox = this._shoreProx;
+    if (!prox || this._shoreProxRes < 2) { return 0; }
+    const res = this._shoreProxRes, half = this._shoreProxSize * 0.5;
+    const wpt = this._shoreProxSize / (res - 1);
+    const px = Math.round((x - this._shoreProxCX + half) / wpt);
+    const py = Math.round((this._shoreProxCZ + half - z) / wpt);
+    if (px < 0 || px >= res || py < 0 || py >= res) { return 0; }
+    return prox[py * res + px];
   }
 
   // ── Shadow quality ────────────────────────────────────────────────────────
@@ -751,6 +983,7 @@ export class TerrainService {
 
   private applyQualityLevel(level: number): void {
     this.shadowQualityLevel = level;
+    this.shadowLastCx = Infinity;   // force the next shadow-mask tick to re-render with the new steps
     switch (level) {
       case 0:  this.terrainShadowSteps =  1; this.terrainShadowUpdateEvery = 999; break;
       case 1:  this.terrainShadowSteps = 12; this.terrainShadowUpdateEvery =   8; break;
@@ -759,6 +992,8 @@ export class TerrainService {
     }
     // Also drive the cascaded shadow MAP (was previously never wired to this slider).
     this.sceneService.setShadowMapQuality(level);
+    // …and the full-screen ocean depth pass: every-frame on High, every-other-frame on low/mid tiers.
+    this.sceneService.setOceanDepthQuality(level);
   }
 
   private buildTreeFoliage(scene: Scene, manifest: TerrainManifest): void {
@@ -1421,9 +1656,7 @@ export class TerrainService {
     material.disableLighting = false;
     material.specularColor   = Color3.Black();  // fully matte
     material.specularPower   = 256;
-    // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby flash
-    // can light the beach/cliffs without displacing the sun (which would darken the terrain).
-    material.maxSimultaneousLights = 6;
+    material.maxSimultaneousLights = 6;        // forward pass; the prePass UBO budget is governed by scene light count
 
     // ── Helper: load a server-generated terrain map (png) ────────────────────
     const loadTerrainTex = (path: string, label: string): Texture => {
@@ -2150,7 +2383,7 @@ export class TerrainService {
     mat.metallic = 0.0;
     mat.roughness = 0.92;                       // matte; per-biome roughness maps arrive in S1
     mat.backFaceCulling = true;
-    mat.maxSimultaneousLights = 6;             // sun + cannon flashes (matches the Standard path)
+    mat.maxSimultaneousLights = 6;             // forward pass; the prePass UBO budget is governed by scene light count
 
     // Biome PBR via texture arrays (S1b): two sampler2DArray (albedo + orm) instead of 5 diffuse
     // samplers — big sampler-budget headroom. Async load; a placeholder binds until the real tiles land.

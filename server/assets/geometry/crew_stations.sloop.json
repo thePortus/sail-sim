@@ -1,0 +1,432 @@
+{
+  "ship": "bermuda_sloop",
+  "glb": "bermuda_sloop_rigged.glb",
+  "schema_version": 1,
+  "space": "ship-local GLB coordinates; parent crew to the ship root node",
+  "axes": {
+    "up": "+Y",
+    "bow": "-Z (NOTE: actual GLB geometry; manifest claims +Z - verify against in-game orientation)",
+    "port": "-X"
+  },
+  "heading_convention": "yaw degrees about +Y; 0 = facing +Z (stern), 180 = facing -Z (bow)",
+  "deck_levels": {
+    "main_deck_amidships": 1.12,
+    "main_deck_waist": 1.52,
+    "fore_deck": 1.94,
+    "forecastle": 2.27,
+    "poop": 2.03
+  },
+  "waypoints": {
+    "wp_poop_aft": [
+      0.0,
+      2.03,
+      4.8
+    ],
+    "wp_helm": [
+      0.0,
+      2.03,
+      3.85
+    ],
+    "wp_ladder_top": [
+      -0.62,
+      2.03,
+      4.05
+    ],
+    "wp_ladder_bot": [
+      -0.62,
+      1.45,
+      3.15
+    ],
+    "wp_main_aft": [
+      0.0,
+      1.3,
+      2.2
+    ],
+    "wp_main_mid": [
+      0.0,
+      1.12,
+      0.9
+    ],
+    "wp_center_gap": [
+      0.0,
+      1.27,
+      -1.05
+    ],
+    "wp_port_lane1": [
+      -0.95,
+      1.52,
+      -2.1
+    ],
+    "wp_port_lane2": [
+      -0.95,
+      1.6,
+      -3.1
+    ],
+    "wp_port_lane3": [
+      -0.95,
+      1.94,
+      -4.1
+    ],
+    "wp_stbd_lane1": [
+      0.95,
+      1.52,
+      -2.1
+    ],
+    "wp_stbd_lane2": [
+      0.95,
+      1.6,
+      -3.1
+    ],
+    "wp_stbd_lane3": [
+      0.95,
+      1.94,
+      -4.1
+    ],
+    "wp_fore_center": [
+      0.0,
+      2.1,
+      -4.7
+    ],
+    "wp_forecastle": [
+      0.0,
+      2.27,
+      -5.1
+    ]
+  },
+  "edges": [
+    [
+      "wp_poop_aft",
+      "wp_helm",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_helm",
+      "wp_ladder_top",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_ladder_top",
+      "wp_ladder_bot",
+      {
+        "kind": "ladder",
+        "note": "cabin ladder, port side"
+      }
+    ],
+    [
+      "wp_ladder_bot",
+      "wp_main_aft",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_main_aft",
+      "wp_main_mid",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_main_mid",
+      "wp_center_gap",
+      {
+        "kind": "walk",
+        "note": "passes between Main_Hatch (aft) and Fore_Hatch (fwd) at the z-1.05 gap"
+      }
+    ],
+    [
+      "wp_center_gap",
+      "wp_port_lane1",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_port_lane1",
+      "wp_port_lane2",
+      {
+        "kind": "walk",
+        "note": "threads the z-2.97..-3.31 gap between port guns"
+      }
+    ],
+    [
+      "wp_port_lane2",
+      "wp_port_lane3",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_port_lane3",
+      "wp_fore_center",
+      {
+        "kind": "step",
+        "note": "forecastle sheer step"
+      }
+    ],
+    [
+      "wp_center_gap",
+      "wp_stbd_lane1",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_stbd_lane1",
+      "wp_stbd_lane2",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_stbd_lane2",
+      "wp_stbd_lane3",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_stbd_lane3",
+      "wp_fore_center",
+      {
+        "kind": "step"
+      }
+    ],
+    [
+      "wp_fore_center",
+      "wp_forecastle",
+      {
+        "kind": "walk"
+      }
+    ]
+  ],
+  "stations": [
+    {
+      "id": "helm",
+      "kind": "helm",
+      "pos": [
+        0.0,
+        2.03,
+        3.9
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_helm",
+      "note": "aft of wheel (B_Wheel z3.28), facing bow"
+    },
+    {
+      "id": "gun_P_0",
+      "kind": "cannon",
+      "pos": [
+        -0.95,
+        1.52,
+        -1.1
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_lane1",
+      "note": "aft of port gun 0 (z-1.58)"
+    },
+    {
+      "id": "gun_P_1",
+      "kind": "cannon",
+      "pos": [
+        -0.95,
+        1.52,
+        -2.15
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_lane1"
+    },
+    {
+      "id": "gun_P_2",
+      "kind": "cannon",
+      "pos": [
+        -0.95,
+        1.6,
+        -3.15
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_lane2"
+    },
+    {
+      "id": "gun_S_0",
+      "kind": "cannon",
+      "pos": [
+        0.95,
+        1.52,
+        -1.1
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_lane1"
+    },
+    {
+      "id": "gun_S_1",
+      "kind": "cannon",
+      "pos": [
+        0.95,
+        1.52,
+        -2.15
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_lane1"
+    },
+    {
+      "id": "gun_S_2",
+      "kind": "cannon",
+      "pos": [
+        0.95,
+        1.6,
+        -3.15
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_lane2"
+    },
+    {
+      "id": "ropes_P",
+      "kind": "ropes",
+      "pos": [
+        -1.35,
+        1.4,
+        -0.7
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Ropes",
+      "wp": "wp_center_gap",
+      "note": "port pin rail"
+    },
+    {
+      "id": "ropes_S",
+      "kind": "ropes",
+      "pos": [
+        1.35,
+        1.4,
+        -0.7
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Ropes",
+      "wp": "wp_center_gap"
+    },
+    {
+      "id": "ropes_mast",
+      "kind": "ropes",
+      "pos": [
+        0.0,
+        1.27,
+        -1.2
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Ropes",
+      "wp": "wp_center_gap",
+      "note": "halyards at mast/bitts"
+    },
+    {
+      "id": "lookout",
+      "kind": "lookout",
+      "pos": [
+        0.0,
+        2.27,
+        -4.95
+      ],
+      "heading_deg": 180,
+      "clip": "Lookout",
+      "wp": "wp_forecastle"
+    }
+  ],
+  "climb_paths": [
+    {
+      "id": "climb_P",
+      "side": "port",
+      "clip": "Climb",
+      "approach_wp": "wp_center_gap",
+      "polyline": [
+        [
+          -1.9,
+          2.0,
+          -0.85
+        ],
+        [
+          -2.0,
+          3.0,
+          -0.96
+        ],
+        [
+          -1.58,
+          4.5,
+          -1.39
+        ],
+        [
+          -1.15,
+          5.5,
+          -1.81
+        ],
+        [
+          -0.78,
+          7.0,
+          -2.19
+        ],
+        [
+          -0.5,
+          8.5,
+          -2.47
+        ]
+      ],
+      "note": "port ratlines, deck rail to lower masthead; face the polyline (outboard->inboard as he rises)"
+    },
+    {
+      "id": "climb_S",
+      "side": "starboard",
+      "clip": "Climb",
+      "approach_wp": "wp_center_gap",
+      "polyline": [
+        [
+          1.9,
+          2.0,
+          -0.85
+        ],
+        [
+          2.0,
+          3.0,
+          -0.96
+        ],
+        [
+          1.58,
+          4.5,
+          -1.39
+        ],
+        [
+          1.15,
+          5.5,
+          -1.81
+        ],
+        [
+          0.78,
+          7.0,
+          -2.19
+        ],
+        [
+          0.5,
+          8.5,
+          -2.47
+        ]
+      ],
+      "note": "mirror of climb_P"
+    }
+  ],
+  "notes": [
+    "COORDINATE WARNING: geometry analysis shows bow at -Z in this GLB (anchors z-4.85, bowsprit to z-13.9, rudder z+6); its manifest says bow +Z. All coords here are raw GLB-local - if the controller rotates the model, crew inherit it (parent to ship node) and nothing changes.",
+    "Deck has sheer: per-waypoint Y values are baked from the deck mesh; lerp Y linearly along edges.",
+    "Gun stations face +Z (gun is aft of the station) so Work_Cannon's forward reach lands on the carriage.",
+    "Death footprint (1.8m along facing): fine anywhere on the waist lanes and poop.",
+    "max_crew_suggested: 8 (helm, 3 guns manned, ropes x2, lookout, 1 climber)."
+  ]
+}

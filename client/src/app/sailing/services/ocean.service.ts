@@ -33,9 +33,23 @@ uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s
 uniform float u_wakeCount;      // number of valid points in u_wakePath
 uniform vec4  u_splashData[8];  // cannonball water impacts: xy = world pos, z = age (s)
 uniform float u_splashCount;    // number of active splashes
+uniform int   u_waveIter;       // VERTEX wave octaves: 24 full / 12 on the Cheap ocean tier
+uniform sampler2D u_shoreMap;   // land proximity (R: 1 at shore → 0 by ~190 m out), camera-window
+uniform vec2  u_shoreMapCenter;
+uniform float u_shoreMapSize;
 
 #define DRAG_MULT 0.38
-#define ITERATIONS 24
+#define ITERATIONS u_waveIter
+
+// Shoaling: waves flatten approaching land. Without this the crests (±0.5·u_WaveDepth) persistently
+// wash over low-lying beaches/town aprons — the FFT tiers never show that, so the procedural ocean
+// read as "the coast is submerged". 1 in open water → ~0.12 at the waterline.
+float shoreAttenuation(vec2 wpos) {
+  vec2 uv = (wpos - u_shoreMapCenter) / u_shoreMapSize + 0.5;
+  if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) { return 1.0; }
+  float proximity = texture2D(u_shoreMap, uv).r;
+  return 1.0 - smoothstep(0.30, 0.90, proximity) * 0.88;
+}
 
 vec2 wavedx(vec2 position, vec2 direction, float frequency, float timeshift) {
   float x = dot(direction, position) * frequency + timeshift;
@@ -159,7 +173,7 @@ void main() {
 
   if (fade > 0.001) {
     vec2 wavePos = vec2(wx, wz) * u_WaveFreq;
-    float h = (getwaves(wavePos) - 0.5) * u_WaveDepth;
+    float h = (getwaves(wavePos) - 0.5) * u_WaveDepth * shoreAttenuation(vec2(wx, wz));
     h += wakeDisplacement(vec2(wx, wz)) * 1.9;
     pos.y += h * fade;
   }
@@ -183,6 +197,7 @@ uniform vec2  u_BoatPos;
 uniform vec2  u_BoatDir;
 uniform float u_BoatSpeed;
 uniform float u_innerCull;      // >0: discard frags within this chebyshev half-size of the boat (inner-LOD footprint)
+uniform float u_innerCullCam;   // >0: discard frags within this chebyshev half-size of the CAMERA (FAR plane under LOD1)
 uniform vec4  u_wakePath[24];   // recent ship track: xy = world pos, z = age (s)
 uniform float u_wakeCount;      // number of valid points in u_wakePath
 uniform vec4  u_splashData[8];  // cannonball water impacts: xy = world pos, z = age (s)
@@ -361,7 +376,12 @@ vec3 getAtmosphere(vec3 dir) {
 }
 
 float getSun(vec3 dir) {
-  return pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0;
+  // Shadertoy original: pow(d,720)*210 — a pinpoint sparkle under its crisp per-pixel raymarched
+  // normals. On our smoother interpolated mesh normals the reflected ray aligns with the sun over
+  // LARGE coherent areas, so the unclamped 210 HDR blew out into blinding white patch fields (worst
+  // with reflections off, where the analytic term is 100% of the mirror; still 20% leak with it on —
+  // the long-standing "white patches" artifact). Cap the energy: sparkle stays, blowout can't.
+  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2);
 }
 
 vec3 aces_tonemap(vec3 color) {
@@ -488,6 +508,16 @@ void main() {
     discard;
   }
 
+  // Camera-centred cull (FAR plane only): cut the flat far plane out from under LOD1.
+  // With depth now continuous across rendering groups (no group-1 clear), the far
+  // plane's y=0 depth would otherwise clip every wave trough that dips below 0.
+  // LOD1's displacement is fully edge-faded by 0.97 * halfSize, so cutting inside that
+  // radius leaves only flat-on-flat overlap (deterministic LEQUAL, later group wins).
+  if (u_innerCullCam > 0.0 &&
+      max(abs(v_worldPos.x - u_cameraPosition.x), abs(v_worldPos.z - u_cameraPosition.z)) < u_innerCullCam) {
+    discard;
+  }
+
   // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
   // hull reads dry inside while the sea still laps the outer planking. World-space (not a
   // screen-space mask), so it never removes the water in front of or around the hull.
@@ -563,6 +593,13 @@ void main() {
     color = mix(color, vec3(0.92, 0.96, 1.0), froth * 0.03);
   }
 
+  // Water depth along the view ray (opaque-scene depth minus this fragment's depth). Computed up here
+  // because BOTH the shore block (caustics gating) and the seabed-reveal below consume it.
+  vec2 sceneUV = clamp((v_projPos.xy / v_projPos.w) * 0.5 + 0.5, 0.0, 1.0);
+  float sceneZ = texture2D(u_sceneDepth, sceneUV).r;     // 1e8 where nothing opaque
+  float waterZ = (view * vec4(v_worldPos, 1.0)).z;       // same space as sceneZ
+  float dz     = sceneZ - waterZ;                        // >0: opaque just behind surface
+
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
   // Three layers build up as the shore approaches:
@@ -576,13 +613,14 @@ void main() {
     // 1. Subtle turquoise water column on the broad shallows.
     float shallowF = smoothstep(0.05, 0.65, proximity);
     color = mix(color, vec3(0.10, 0.48, 0.50), shallowF * 0.25);
-    // 2. Seabed reveal — the see-through effect. Lerp the reflective surface
-    // toward the wet seabed sand as the water shallows, strongly near the edge,
-    // so the thin water at the waterline reads as clear (depth-fade illusion).
+    // 2. A LIGHT proximity-based sand hint only. The heavy lifting is the DEPTH-graded seabed reveal
+    // further down (which works at every tier now) — a strong flat sand band here just paints shallow
+    // bays into a featureless sheet, because proximity is distance-to-land, not water depth.
     float reveal = smoothstep(0.40, 0.92, proximity);
-    color = mix(color, vec3(0.40, 0.34, 0.25), reveal * 0.88);
-    // 3. Caustics over the shallows and the revealed sand.
-    float causMask = smoothstep(0.12, 0.95, proximity);
+    color = mix(color, vec3(0.40, 0.34, 0.25), reveal * 0.22);
+    // 3. Caustics — gated by ACTUAL shallowness (dz), not just land proximity, so they dapple genuinely
+    // thin water rather than washing the whole near-shore zone.
+    float causMask = smoothstep(0.12, 0.95, proximity) * (1.0 - smoothstep(2.0, 12.0, dz));
     float caus = causticPattern(worldXZ * 0.18, u_Time * 0.9)
                + causticPattern(worldXZ * 0.33 + 7.3, u_Time * 1.3) * 0.6;
     color += vec3(0.80, 1.0, 0.92) * caus * causMask * 0.24;
@@ -613,15 +651,7 @@ void main() {
     }
   }
 
-  // ── Soft waterline ─────────────────────────────────────────────────────────
-  // Hide the hard, aliased edge where the hull (and shore) meet the water.
-  // Sample the opaque-scene camera-space depth (ocean excluded) at this pixel and
-  // compare it to this water fragment's own camera-space depth. Where opaque
-  // geometry sits just behind the water surface, feather a soft foam wash.
-  vec2 sceneUV = clamp((v_projPos.xy / v_projPos.w) * 0.5 + 0.5, 0.0, 1.0);
-  float sceneZ = texture2D(u_sceneDepth, sceneUV).r;     // 1e8 where nothing opaque
-  float waterZ = (view * vec4(v_worldPos, 1.0)).z;       // same space as sceneZ
-  float dz     = sceneZ - waterZ;                        // >0: opaque just behind surface
+  // ── Soft waterline + depth-graded shallows (dz computed above the shore block) ──────────────
 
   // Depth-based shallow water: where the seabed (u_sceneDepth, ocean excluded)
   // is only just behind the surface, the water is a thin sheet — show the REAL
@@ -636,12 +666,23 @@ void main() {
                     revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0)
                  ? texture2D(u_shoreMap, revShoreUV).r : 0.0;
   seabedReveal *= smoothstep(0.18, 0.55, landProx);
-  seabedReveal *= u_seabedStrength;   // 0 → shallow-water transparency off (refraction+depth RTTs also stopped)
   if (seabedReveal > 0.001) {
-    vec2 refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, 0.001, 0.999);
-    // Cool the submerged sand — water absorbs warm light, so the bottom seen
-    // through water reads cooler/greener than dry sand (kills the "yellow water").
-    vec3 seabed = texture2D(u_refraction, refrUV).rgb * vec3(0.40, 0.49, 0.56);
+    vec3 seabed;
+    if (u_seabedStrength > 0.001) {
+      // TRUE refraction (High tiers): the real terrain re-rendered into the refraction RTT.
+      vec2 refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, 0.001, 0.999);
+      // Cool the submerged sand — water absorbs warm light, so the bottom seen
+      // through water reads cooler/greener than dry sand (kills the "yellow water").
+      seabed = texture2D(u_refraction, refrUV).rgb * vec3(0.40, 0.49, 0.56);
+    } else {
+      // Cheap tier (refraction RTT off): PROCEDURAL seabed — depth-graded wet sand from the always-on
+      // depth map, no extra render passes. Gives the same readable bright-sand→teal shallows as the
+      // refraction path; without it the Cheap shallows were an opaque proximity-flat sheet that made
+      // low sandy bays read as "the land is submerged" (it was never above water — High just shows
+      // the sand THROUGH the water).
+      float shal = 1.0 - smoothstep(0.0, 10.0, dz);
+      seabed = vec3(0.46, 0.40, 0.30) * (0.55 + 0.45 * shal);
+    }
     // Fish: dark drifting silhouettes on the seabed — only when the camera is above the
     // surface (avoids artifacts when the view dips underwater).
     float fish = (u_cameraPosition.y > 0.05) ? fishField(worldXZ, u_Time) : 0.0;
@@ -706,7 +747,11 @@ void main() {
   float dayLight = mix(0.12, 1.0, smoothstep(-0.12, 0.22, u_sunElevation));
   color *= dayLight;
 
-  vec4 outCol = vec4(aces_tonemap(color * 2.0), 1.0);
+  // Output LINEAR HDR — the scene's post pipeline applies ACES + exposure + gamma. The Shadertoy
+  // original self-tonemapped (aces_tonemap(color*2.0), incl. a pow(1/2.2) gamma encode), which DOUBLE
+  // tone-mapped under our pipeline and crushed the whole surface toward pale white — the long-standing
+  // "washed white water" on the procedural ocean. The 1.5 gain roughly preserves the old mid-tone level.
+  vec4 outCol = vec4(color * 1.2, 1.0);
   gl_FragColor = outCol;
 }
 `;
@@ -734,9 +779,21 @@ uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z 
 uniform u_wakeCount: f32;               // number of valid points in u_wakePath
 uniform u_splashData: array<vec4f, 8>;  // cannonball water impacts: xy = world pos, z = age (s)
 uniform u_splashCount: f32;             // number of active splashes
+uniform u_waveIter: i32;                // VERTEX wave octaves: 24 full / 12 on the Cheap ocean tier
+var u_shoreMapSampler: sampler;
+var u_shoreMap: texture_2d<f32>;        // land proximity (R: 1 at shore → 0 by ~190 m), camera-window
+uniform u_shoreMapCenter: vec2f;
+uniform u_shoreMapSize: f32;
 
 const DRAG_MULT: f32 = 0.38;
-const ITERATIONS: i32 = 24;
+
+// Shoaling — waves flatten approaching land (see GLSL note). textureSampleLevel: vertex stage.
+fn shoreAttenuation(wpos: vec2f) -> f32 {
+  let uv = (wpos - uniforms.u_shoreMapCenter) / uniforms.u_shoreMapSize + vec2f(0.5);
+  if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) { return 1.0; }
+  let proximity = textureSampleLevel(u_shoreMap, u_shoreMapSampler, uv, 0.0).r;
+  return 1.0 - smoothstep(0.30, 0.90, proximity) * 0.88;
+}
 
 fn wavedx(position: vec2f, direction: vec2f, frequency: f32, timeshift: f32) -> vec2f {
   let x = dot(direction, position) * frequency + timeshift;
@@ -755,7 +812,7 @@ fn getwaves(positionIn: vec2f) -> f32 {
   var sum = 0.0;
   var sumW = 0.0;
 
-  for (var i: i32 = 0; i < ITERATIONS; i = i + 1) {
+  for (var i: i32 = 0; i < uniforms.u_waveIter; i = i + 1) {
     let p = vec2f(sin(iter), cos(iter));
     let res = wavedx(position, p, frequency, uniforms.u_Time * timeMultiplier + wavePhaseShift);
     position += p * res.y * weight * DRAG_MULT;
@@ -853,7 +910,7 @@ fn main(input: VertexInputs) -> FragmentInputs {
 
   if (fade > 0.001) {
     let wavePos = vec2f(wx, wz) * uniforms.u_WaveFreq;
-    var h = (getwaves(wavePos) - 0.5) * uniforms.u_WaveDepth;
+    var h = (getwaves(wavePos) - 0.5) * uniforms.u_WaveDepth * shoreAttenuation(vec2f(wx, wz));
     h += wakeDisplacement(vec2f(wx, wz)) * 1.9;
     pos.y += h * fade;
   }
@@ -875,6 +932,7 @@ uniform u_BoatPos: vec2f;
 uniform u_BoatDir: vec2f;
 uniform u_BoatSpeed: f32;
 uniform u_innerCull: f32;               // >0: discard frags within this chebyshev half-size of the boat
+uniform u_innerCullCam: f32;            // >0: discard frags within this chebyshev half-size of the CAMERA (FAR plane under LOD1)
 uniform u_wakePath: array<vec4f, 24>;   // recent ship track: xy = world pos, z = age (s)
 uniform u_wakeCount: f32;               // number of valid points in u_wakePath
 uniform u_splashData: array<vec4f, 8>;  // cannonball water impacts: xy = world pos, z = age (s)
@@ -1053,7 +1111,9 @@ fn getAtmosphere(dir: vec3f) -> vec3f {
 }
 
 fn getSun(dir: vec3f) -> f32 {
-  return pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0;
+  // Energy-capped sun glint — see the GLSL twin for why (unclamped 210 HDR blew out into white patch
+  // fields on our smooth mesh normals; this was the long-standing "white patches" artifact).
+  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2);
 }
 
 fn aces_tonemap(color: vec3f) -> vec3f {
@@ -1172,6 +1232,17 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     discard;
   }
 
+  // Camera-centred cull (FAR plane only): cut the flat far plane out from under LOD1.
+  // With depth now continuous across rendering groups (no group-1 clear), the far
+  // plane's y=0 depth would otherwise clip every wave trough that dips below 0.
+  // LOD1's displacement is fully edge-faded by 0.97 * halfSize, so cutting inside that
+  // radius leaves only flat-on-flat overlap (deterministic LEQUAL, later group wins).
+  if (uniforms.u_innerCullCam > 0.0 &&
+      max(abs(input.v_worldPos.x - uniforms.u_cameraPosition.x),
+          abs(input.v_worldPos.z - uniforms.u_cameraPosition.z)) < uniforms.u_innerCullCam) {
+    discard;
+  }
+
   // Hull interior cut: discard sea inside the boat-oriented interior ellipse so an open
   // hull reads dry inside while the sea still laps the outer planking. World-space (not a
   // screen-space mask), so it never removes the water in front of or around the hull.
@@ -1237,6 +1308,13 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     color = mix(color, vec3f(0.92, 0.96, 1.0), vec3f(froth * 0.03));
   }
 
+  // Water depth along the view ray — computed BEFORE the shore block (both it and the seabed reveal
+  // consume dz). Same logic as the GLSL path.
+  let sceneUV = clamp((input.v_projPos.xy / input.v_projPos.w) * 0.5 + vec2f(0.5), vec2f(0.0), vec2f(1.0));
+  let sceneZ  = textureSampleLevel(u_sceneDepth, u_sceneDepthSampler, sceneUV, 0.0).r;
+  let waterZ  = (uniforms.view * vec4f(input.v_worldPos, 1.0)).z;
+  let dz      = sceneZ - waterZ;
+
   // ── Shore: shallow-water transparency + tint + animated foam ───────────────
   // u_shoreMap R channel = proximity to nearest land (0=open ocean, 1=waterline).
   // Three layers build up as the shore approaches:
@@ -1253,11 +1331,11 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     // 1. Subtle turquoise water column on the broad shallows.
     let shallowF = smoothstep(0.05, 0.65, proximity);
     color = mix(color, vec3f(0.10, 0.48, 0.50), vec3f(shallowF * 0.25));
-    // 2. Seabed reveal — the see-through effect (depth-fade toward wet sand).
+    // 2. LIGHT proximity sand hint only — the DEPTH-graded reveal below does the real work (see GLSL note).
     let reveal = smoothstep(0.40, 0.92, proximity);
-    color = mix(color, vec3f(0.40, 0.34, 0.25), vec3f(reveal * 0.88));
-    // 3. Caustics over the shallows AND the revealed sand.
-    let causMask = smoothstep(0.12, 0.95, proximity);
+    color = mix(color, vec3f(0.40, 0.34, 0.25), vec3f(reveal * 0.22));
+    // 3. Caustics — gated by ACTUAL shallowness (dz), not just land proximity (see GLSL note).
+    let causMask = smoothstep(0.12, 0.95, proximity) * (1.0 - smoothstep(2.0, 12.0, dz));
     let caus = causticPattern(worldXZ * 0.18, uniforms.u_Time * 0.9)
              + causticPattern(worldXZ * 0.33 + vec2f(7.3), uniforms.u_Time * 1.3) * 0.6;
     color += vec3f(0.80, 1.0, 0.92) * (caus * causMask * 0.24);
@@ -1283,27 +1361,26 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     }
   }
 
-  // ── Soft waterline ─────────────────────────────────────────────────────────
-  // (same logic as the GLSL path) feather a soft foam wash where opaque geometry
-  // sits just behind the water surface, hiding the hard aliased waterline edge.
-  let sceneUV = clamp((input.v_projPos.xy / input.v_projPos.w) * 0.5 + vec2f(0.5), vec2f(0.0), vec2f(1.0));
-  let sceneZ  = textureSampleLevel(u_sceneDepth, u_sceneDepthSampler, sceneUV, 0.0).r;
-  let waterZ  = (uniforms.view * vec4f(input.v_worldPos, 1.0)).z;
-  let dz      = sceneZ - waterZ;
-
-  // Depth-based shallow water (same as GLSL path): show the REAL terrain through
-  // thin water by sampling the seabed refraction RTT, blended by shallowness.
+  // ── Soft waterline + depth-graded shallows (dz computed above the shore block) ──────────────
+  // Depth-based shallow water (same as GLSL path): show the seabed through thin water — the real
+  // terrain via the refraction RTT on the High tiers, a PROCEDURAL depth-graded sand on Cheap.
   var seabedReveal = 1.0 - smoothstep(0.0, 44.0, dz);
   // Gate by distance to land (shore-map proximity) — only reveal near islands.
   let revShoreUV = (worldXZ - uniforms.u_shoreMapCenter) / uniforms.u_shoreMapSize + vec2f(0.5);
   let revInB = revShoreUV.x >= 0.0 && revShoreUV.x <= 1.0 && revShoreUV.y >= 0.0 && revShoreUV.y <= 1.0;
   let landProx = select(0.0, textureSampleLevel(u_shoreMap, u_shoreMapSampler, clamp(revShoreUV, vec2f(0.001), vec2f(0.999)), 0.0).r, revInB);
   seabedReveal *= smoothstep(0.18, 0.55, landProx);
-  seabedReveal *= uniforms.u_seabedStrength;   // 0 → shallow-water transparency off
   if (seabedReveal > 0.001) {
-    let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
-    // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
-    var seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
+    var seabed: vec3f;
+    if (uniforms.u_seabedStrength > 0.001) {
+      let refrUV = clamp(sceneUV + N.xz * 0.015 * seabedReveal, vec2f(0.001), vec2f(0.999));
+      // Cool the submerged sand (water absorbs warm light) → kills "yellow water".
+      seabed = textureSampleLevel(u_refraction, u_refractionSampler, refrUV, 0.0).rgb * vec3f(0.40, 0.49, 0.56);
+    } else {
+      // Cheap tier: procedural depth-graded wet sand (see GLSL note).
+      let shal = 1.0 - smoothstep(0.0, 10.0, dz);
+      seabed = vec3f(0.46, 0.40, 0.30) * (0.55 + 0.45 * shal);
+    }
     // Fish: dark drifting silhouettes — only with the camera above the surface.
     var fish = 0.0;
     if (uniforms.u_cameraPosition.y > 0.05) { fish = fishField(worldXZ, uniforms.u_Time); }
@@ -1351,7 +1428,8 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let dayLight = mix(0.12, 1.0, smoothstep(-0.12, 0.22, uniforms.u_sunElevation));
   color *= dayLight;
 
-  fragmentOutputs.color = vec4f(aces_tonemap(color * 2.0), 1.0);
+  // LINEAR HDR out — the scene pipeline tone-maps; self-tonemapping double-applied (see GLSL note).
+  fragmentOutputs.color = vec4f(color * 1.2, 1.0);
 }
 `;
 
@@ -1372,8 +1450,9 @@ function _wavedx(px: number, py: number, dx: number, dy: number, frequency: numb
   return [wave, -ddx];
 }
 
-/** CPU port of playground getwaves() — used by buoyancy parity path. */
-function _getWaves(px0: number, py0: number, t: number): number {
+/** CPU port of playground getwaves() — used by buoyancy parity path. `iterations` MUST match the
+ *  vertex shader's u_waveIter (24 full / 12 Cheap tier) or the boat floats off the visible surface. */
+function _getWaves(px0: number, py0: number, t: number, iterations = 24): number {
   let px = px0;
   let py = py0;
   const wavePhaseShift = Math.hypot(px, py) * 0.1;
@@ -1384,7 +1463,7 @@ function _getWaves(px0: number, py0: number, t: number): number {
   let sum = 0.0;
   let sumW = 0.0;
 
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < iterations; i++) {
     const dx = Math.sin(iter);
     const dy = Math.cos(iter);
     const [wave, negDx] = _wavedx(px, py, dx, dy, frequency, t * timeMultiplier + wavePhaseShift);
@@ -1432,6 +1511,9 @@ export class OceanService {
   // tElev=−15 m so wDep≈15 m, both foam and tint thresholds fail to trigger.
   // This prevents the foamAnim polka-dot artefact before the real map arrives.
   private shoreMap: Texture | null = null;
+  // CPU twin of the shore map's proximity channel (set by TerrainService via setShoreMap); 0 = open
+  // water until the first paint arrives → attenuation 1 → unchanged waves.
+  private shoreProximityAt: (x: number, z: number) => number = () => 0;
   private shoreMapBlackTexture: DynamicTexture | null = null;
   private shoreMapCenter = new Vector2(0, 0);
   private shoreMapSize = 3000;  // correct world width; placeholder is always black
@@ -1509,6 +1591,17 @@ export class OceanService {
     this.buildLod1(scene);
     this.buildLod0(scene);
     this.buildLodNear(scene);
+    // Babylon clears the DEPTH buffer at the start of every non-empty rendering group by
+    // default. ocean_lod1 lives in group 1, so the moment this ocean is active, that clear
+    // wipes the group-0 depth (terrain clipmap, scatter) before groups 1 AND 2 render —
+    // the ocean then paints over ALL land ("towns floating on water") and group-2 meshes
+    // (boat, palms, roads) draw through hills. FFT mode never hit this because group 1 is
+    // empty there (empty groups don't clear). Keep depth continuous across all groups; the
+    // far plane's depth no longer being discarded is handled by u_innerCullCam (see
+    // buildLodFar). Group 2 is also set in vessel.service, but that runs at vessel load —
+    // set it here too so the first frames are correct.
+    scene.setRenderingAutoClearDepthStencil(1, false);
+    scene.setRenderingAutoClearDepthStencil(2, false);
     this.registerRenderLoop(scene);
 
     // WGSL ShaderMaterials can't participate in Babylon's prePass G-buffer
@@ -1623,6 +1716,11 @@ export class OceanService {
     this.oceanMeshFar.renderingGroupId = 0;
     // FAR: flat (displaceScale 0), so edge fade is moot; no inner cull.
     this.oceanMatFar = this.buildOceanMaterial(scene, 'oceanMatFar', 0.0, this.FAR_SIZE / 2, -1, 1, 0);
+    // Cut the flat far plane out from under LOD1 (both camera-centred). Depth is now
+    // continuous across rendering groups, so without this cut the far plane's y=0 depth
+    // would clip every LOD1/LOD0/near wave trough that dips below 0. 0.97 = the radius
+    // at which LOD1's edge fade has fully flattened its displacement.
+    this.oceanMatFar.setFloat('u_innerCullCam', (this.LOD1_SIZE / 2) * 0.97);
     this.oceanMeshFar.material = this.oceanMatFar;
   }
 
@@ -1693,14 +1791,14 @@ export class OceanService {
         attributes: ['position'],
         uniforms: [
           'world', 'worldViewProjection',
-          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale', 'u_edgeFade', 'u_innerCull',
+          'u_WorldOffset', 'u_MeshHalfSize', 'u_DisplaceScale', 'u_edgeFade', 'u_innerCull', 'u_innerCullCam',
           'u_Time', 'u_WaveDepth', 'u_WaveFreq',
           'u_BoatPos', 'u_BoatDir', 'u_BoatSpeed',
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
           'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir', 'u_fishStartle',
-          'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter',
+          'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter', 'u_waveIter',
           'u_wakePath', 'u_wakeCount', 'u_splashData', 'u_splashCount',
         ],
         samplers: ['u_reflectionSampler', 'u_terrainShadowMask', 'u_shoreMap', 'u_sceneDepth', 'u_refraction'],
@@ -1709,12 +1807,14 @@ export class OceanService {
       },
     );
 
-    const waveDepth = (maxCascade >= 2 ? this.WAVE_DEPTH_NEAR : maxCascade >= 1 ? this.WAVE_DEPTH_MID : this.WAVE_DEPTH_FAR) * this.waveDepthScale;
+    const waveDepth = (maxCascade >= 2 ? this.WAVE_DEPTH_NEAR : maxCascade >= 1 ? this.WAVE_DEPTH_MID : this.WAVE_DEPTH_FAR)
+      * this.waveDepthScale * this.tierWaveDepth();
 
     mat.setFloat('u_DisplaceScale', displaceScale);
     mat.setFloat('u_MeshHalfSize',  meshHalfSize);
     mat.setFloat('u_edgeFade',      edgeFade);
     mat.setFloat('u_innerCull',     innerCull);
+    mat.setFloat('u_innerCullCam',  0);   // FAR plane overrides (see buildLodFar)
     mat.setFloat('u_WaveDepth',   waveDepth);
     mat.setFloat('u_WaveFreq',    this.WAVE_FREQ);
 
@@ -1728,7 +1828,10 @@ export class OceanService {
     if (this.terrainShadowMask) {
       mat.setTexture('u_terrainShadowMask', this.terrainShadowMask);
     } else {
-      mat.setTexture('u_terrainShadowMask', this.reflectionRTT);
+      // BLACK placeholder (= no shadow), NOT the reflection RTT: on the Cheap ocean tier the mirror is
+      // removed from the render loop, so it can be a NEVER-rendered texture — undefined GPU memory that
+      // shows as a checkerboard darkening pattern on the water wherever this mask is sampled.
+      mat.setTexture('u_terrainShadowMask', this.shoreMapBlackTexture ?? this.reflectionRTT);
     }
     mat.setVector2('u_terrainShadowCenter', this.terrainShadowCenter);
     mat.setFloat('u_terrainShadowSize', this.terrainShadowSize);
@@ -1743,13 +1846,15 @@ export class OceanService {
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
     mat.setVector4('u_fishStartle', this._fishStartle);
-    mat.setFloat('u_reflectionStrength', this._reflectionsEnabled ? 1 : 0);
-    mat.setFloat('u_seabedStrength',     this._transparencyEnabled ? 1 : 0);
+    mat.setFloat('u_reflectionStrength', this.effectiveReflections() ? 1 : 0);
+    mat.setFloat('u_seabedStrength',     this.effectiveTransparency() ? 1 : 0);
     // Per-LOD fragment-normal detail: near/LOD0 stay smooth (reflections read clearly),
     // LOD1 + far drop low — the far sea is most of the screen but its reflections are
     // tiny, so the faceting is invisible there while the iteration savings are large.
+    // The Cheap ocean tier halves these (and the vertex octaves) — see applyOceanTierKnobs.
     const normalIter = maxCascade >= 2 ? 16 : (maxCascade >= 1 ? 10 : 6);
-    mat.setInt('u_normalIter', normalIter);
+    mat.setInt('u_normalIter', this.tierNormalIter(normalIter));
+    mat.setInt('u_waveIter', this.tierWaveIter());
     mat.setVector3('u_sunDir', new Vector3(0, 1, 0));
     mat.setArray4('u_wakePath', Array(this.WAKE_PATH_MAX * 4).fill(0));
     mat.setFloat('u_wakeCount', 0);
@@ -1758,7 +1863,8 @@ export class OceanService {
     // Soft-waterline depth map (ocean excluded). Fall back to the reflection RTT
     // until the scene's depth map exists — harmless because its colour values are
     // < the water's camera-space Z, so dz is negative and no foam is drawn.
-    mat.setTexture('u_sceneDepth', this.sceneService.oceanDepthMap ?? this.reflectionRTT);
+    // Black fallback (0 < waterZ → dz negative → no foam), not the possibly-never-rendered mirror RTT.
+    mat.setTexture('u_sceneDepth', this.sceneService.oceanDepthMap ?? this.shoreMapBlackTexture ?? this.reflectionRTT);
     mat.setTexture('u_refraction', this.refractionRTT);
 
     return mat;
@@ -2076,7 +2182,13 @@ export class OceanService {
     }
     const px = wx * this.WAVE_FREQ;
     const py = wz * this.WAVE_FREQ;
-    const h = (_getWaves(px, py, t) - 0.5) * this.WAVE_DEPTH_NEAR * this.waveDepthScale;
+    // Same shore-proximity (shoaling) attenuation as the vertex shader, so the hull sits flush with
+    // the flattened near-shore water.
+    const prox = this.shoreProximityAt(wx, wz);
+    const sT = Math.min(1, Math.max(0, (prox - 0.30) / 0.60));
+    const shoreAtten = 1 - (sT * sT * (3 - 2 * sT)) * 0.88;
+    const h = (_getWaves(px, py, t, this.tierWaveIter()) - 0.5)
+      * this.WAVE_DEPTH_NEAR * this.waveDepthScale * this.tierWaveDepth() * shoreAtten;
     return h;
   }
 
@@ -2095,16 +2207,28 @@ export class OceanService {
     // (was 0.95→1.47, barely perceptible). Buoyancy follows automatically because
     // getWaveHeightAt / getVisualHeightAt use the same waveDepthScale.
     this.waveDepthScale = 0.6 + chop * 0.9 + windT * 0.8;
-
-    if (this.oceanMatNear) this.oceanMatNear.setFloat('u_WaveDepth', this.WAVE_DEPTH_NEAR * this.waveDepthScale);
-    if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * this.waveDepthScale);
-    if (this.oceanMat1)    this.oceanMat1.setFloat('u_WaveDepth',    this.WAVE_DEPTH_MID  * this.waveDepthScale);
-    if (this.oceanMatFar)  this.oceanMatFar.setFloat('u_WaveDepth',  this.WAVE_DEPTH_FAR  * this.waveDepthScale);
+    this.applyWaveDepths();
   }
 
-  /** Called every ~10 frames by TerrainService with the freshly-painted shore elevation map. */
-  setShoreMap(map: Texture, centerX: number, centerZ: number, size: number): void {
+  /** Push the weather × tier wave amplitude to all LOD materials. The Cheap tier scales amplitude down
+   *  (×0.65): the procedural crests reach +0.5·WAVE_DEPTH — well above the FFT ocean's calm surface —
+   *  and persistently flooded low-lying land that stays dry on the FFT tiers. The CPU buoyancy twin
+   *  applies the same factor so the hull stays flush. */
+  private applyWaveDepths(): void {
+    const s = this.waveDepthScale * this.tierWaveDepth();
+    if (this.oceanMatNear) this.oceanMatNear.setFloat('u_WaveDepth', this.WAVE_DEPTH_NEAR * s);
+    if (this.oceanMat0)    this.oceanMat0.setFloat('u_WaveDepth',    this.WAVE_DEPTH_NEAR * s);
+    if (this.oceanMat1)    this.oceanMat1.setFloat('u_WaveDepth',    this.WAVE_DEPTH_MID  * s);
+    if (this.oceanMatFar)  this.oceanMatFar.setFloat('u_WaveDepth',  this.WAVE_DEPTH_FAR  * s);
+  }
+
+  /** Called every ~10 frames by TerrainService with the freshly-painted shore elevation map.
+   *  `proximityAt` is the CPU twin of the texture's R channel — used by the buoyancy height sampler so
+   *  the hull bobs with the same shore-attenuated waves the vertex shader displaces. */
+  setShoreMap(map: Texture, centerX: number, centerZ: number, size: number,
+              proximityAt?: (x: number, z: number) => number): void {
     this.shoreMap = map;
+    if (proximityAt) { this.shoreProximityAt = proximityAt; }
     this.shoreMapCenter.set(centerX, centerZ);
     this.shoreMapSize = Math.max(1, size);
 
@@ -2135,6 +2259,49 @@ export class OceanService {
 
   // ── Quality toggles (Settings) ─────────────────────────────────────────────
 
+  // Ocean quality dial: 0 Cheap (procedural afl_ext waves — the Low/Potato tier ONLY; user verdict:
+  // too big a visual downgrade for Medium) · 1 High (FFT 128²) · 2 Ultra (FFT 256²). WebGL clamps to
+  // Cheap (FFT unavailable). This service OWNS the persisted value; OceanFFTRenderer.applyQuality()
+  // acts on it, and the Cheap tier's cost knobs (iterations / RTT shutdown) hang off it in P2.
+  private _oceanQuality = (() => {
+    const q = parseInt(localStorage.getItem('ignis_ocean_tier') ?? '1', 10);
+    return Number.isFinite(q) ? Math.max(0, Math.min(2, q)) : 1;
+  })();
+
+  getOceanQuality(): number { return this._oceanQuality; }
+
+  setOceanQuality(level: number): void {
+    this._oceanQuality = Math.max(0, Math.min(2, Math.round(level)));
+    localStorage.setItem('ignis_ocean_tier', String(this._oceanQuality));
+    this.applyOceanTierKnobs();
+  }
+
+  // ── Cheap ocean tier (level 0) cost knobs ──────────────────────────────────
+  // The wave maths is uniform-driven (no shader rebuild): vertex octaves 24→12 and per-LOD fragment
+  // normal octaves halved. The two RTT re-renders (mirror reflection + seabed refraction) are FORCED
+  // off at Cheap regardless of the user toggles — those are the dominant cost — and the CPU buoyancy
+  // twin follows the vertex octave count so the boat stays flush with the cheaper surface.
+  private tierWaveIter(): number { return this._oceanQuality === 0 ? 12 : 24; }
+  private tierNormalIter(base: number): number { return this._oceanQuality === 0 ? Math.max(2, base >> 1) : base; }
+  private tierWaveDepth(): number { return this._oceanQuality === 0 ? 0.65 : 1; }   // see applyWaveDepths
+  private effectiveReflections(): boolean { return this._reflectionsEnabled && this._oceanQuality > 0; }
+  private effectiveTransparency(): boolean { return this._transparencyEnabled && this._oceanQuality > 0; }
+
+  /** Re-apply every tier-dependent knob to the LIVE materials (called on dial change). */
+  private applyOceanTierKnobs(): void {
+    const lods: Array<[ShaderMaterial | undefined, number]> = [
+      [this.oceanMatNear, 16], [this.oceanMat0, 16], [this.oceanMat1, 10], [this.oceanMatFar, 6],
+    ];
+    for (const [mat, base] of lods) {
+      if (!mat) continue;
+      mat.setInt('u_waveIter', this.tierWaveIter());
+      mat.setInt('u_normalIter', this.tierNormalIter(base));
+    }
+    this.applyWaveDepths();
+    this.applyReflectionsState();
+    this.applyTransparencyState();
+  }
+
   isReflectionsEnabled(): boolean { return this._reflectionsEnabled; }
   isWaterTransparencyEnabled(): boolean { return this._transparencyEnabled; }
 
@@ -2143,10 +2310,15 @@ export class OceanService {
   setReflectionsEnabled(enabled: boolean): void {
     this._reflectionsEnabled = enabled;
     localStorage.setItem('ignis_reflections', enabled ? '1' : '0');
+    this.applyReflectionsState();
+  }
+
+  private applyReflectionsState(): void {
+    const eff = this.effectiveReflections();
     for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
-      if (mat) mat.setFloat('u_reflectionStrength', enabled ? 1 : 0);
+      if (mat) mat.setFloat('u_reflectionStrength', eff ? 1 : 0);
     }
-    this.toggleCustomRenderTarget(this.reflectionRTT, enabled);
+    this.toggleCustomRenderTarget(this.reflectionRTT, eff);
   }
 
   /** Shallow-water see-through on/off. Off → no seabed reveal in-shader AND the
@@ -2155,10 +2327,15 @@ export class OceanService {
   setWaterTransparencyEnabled(enabled: boolean): void {
     this._transparencyEnabled = enabled;
     localStorage.setItem('ignis_water_transparency', enabled ? '1' : '0');
+    this.applyTransparencyState();
+  }
+
+  private applyTransparencyState(): void {
+    const eff = this.effectiveTransparency();
     for (const mat of [this.oceanMatNear, this.oceanMat0, this.oceanMat1, this.oceanMatFar]) {
-      if (mat) mat.setFloat('u_seabedStrength', enabled ? 1 : 0);
+      if (mat) mat.setFloat('u_seabedStrength', eff ? 1 : 0);
     }
-    this.toggleCustomRenderTarget(this.refractionRTT, enabled);
+    this.toggleCustomRenderTarget(this.refractionRTT, eff);
   }
 
   /** Add/remove an RTT from the scene's per-frame render list (stops its GPU pass). */

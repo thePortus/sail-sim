@@ -2,14 +2,20 @@
 
 # General or Current TODO Items
 
-* clouds occlude birds
-* shallow water gets into boat, not displaced
+* bathymetry correction too strong
+* Any way to get more GPU accelleration? IF it is on the device
+* biomes missing (since we did seabead deepening?) everything is beach... also shoreline looks blocky, perhaps bc of seabed deepening
+* make stuff look cool pass)
+* RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
+* shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
+* shader for water on camera https://www.shadertoy.com/view/ltffzl
+* add in pirates
 * keypress makes songs lock up
-* cannonfire smoke is occluded by clouds
+* Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * adjust water displacement to better fit hull of pinnace
 * add dedication
+* draw distance (for other players, etc)
 * add damage from collisions and aground
-* fix speed of asset scattering loading in?
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * add keymap help screen
 * clouds don't seem to meet water at horizon.. not for spherical world?
@@ -29,7 +35,6 @@
 * Add /teleport playername x y and /teleportTo playername to admins
 * Add lost server connection detection
 * encrypt websocket server? wss instead of ws?
-* Add swear list filter, see if we can source from not us and build into the pipeline
 * Optimization pass
 * Security pass
 

@@ -18,6 +18,7 @@
 import {
   Scene, Camera, PostProcess, Effect, Texture, RawTexture,
   Vector2, Vector3, Vector4, Matrix, Constants,
+  Mesh, MeshBuilder, ShaderMaterial,
 } from '@babylonjs/core';
 import { ShaderStore } from '@babylonjs/core/Engines/shaderStore';
 import { ShaderLanguage } from '@babylonjs/core/Materials/shaderLanguage';
@@ -522,7 +523,36 @@ void main(void) {
 //   • return fragmentOutputs;        — explicit return on early exit
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CLOUD_WGSL = `
+// The WGSL is split into SHARED pieces composed into two variants that use the IDENTICAL cloud model:
+//  • post-process variant (legacy): scene+depth+terrain composited in-shader (still the WebGL-era path).
+//  • DOME variant: an in-scene backdrop mesh (renderingGroupId 0) — geometry, particles and birds all
+//    rasterise OVER it, so the occlusion artifacts of the post-process approach are impossible.
+const CLOUD_WGSL_COMMON_UNIFORMS = `
+uniform cameraPosition: vec3f;
+uniform sunDirection: vec3f;
+uniform sunColor: vec3f;
+uniform skyColor: vec3f;
+uniform groundColor: vec3f;   // upward bounce light (ocean/terrain) onto cloud bases
+uniform cloudBase: f32;
+uniform cloudTop: f32;
+uniform cloudCoverage: f32;
+uniform cloudDensity: f32;
+uniform absorptionCoeff: f32;
+uniform cloudType: f32;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 = towering cumulonimbus
+uniform time: f32;
+// Accumulated horizontal cloud drift (metres), integrated on the CPU so wind changes never jump it.
+uniform cloudDrift: vec2f;
+uniform farZ: f32;
+uniform marchSteps: i32;
+uniform lightSteps: i32;
+uniform noiseSliceDim: f32;
+uniform noiseDepth: f32;
+uniform atlasW: f32;
+uniform atlasH: f32;
+uniform atlasCols: f32;
+`;
+
+const CLOUD_WGSL_PP_HEADER = `
 varying vUV: vec2f;
 
 var textureSamplerSampler: sampler;
@@ -542,35 +572,15 @@ var terrainHeightSamplerSampler: sampler;
 var terrainHeightSampler: texture_2d<f32>;
 
 uniform invViewProjection: mat4x4f;
-uniform cameraPosition: vec3f;
+uniform cameraForward: vec3f;
 uniform terrainBounds: vec4f;
 uniform terrainTexSize: vec2f;
 uniform terrainMaxAlt: f32;
 uniform terrainHasField: f32;
-uniform cameraForward: vec3f;
-uniform sunDirection: vec3f;
-uniform sunColor: vec3f;
-uniform skyColor: vec3f;
-uniform groundColor: vec3f;   // upward bounce light (ocean/terrain) onto cloud bases
-uniform cloudBase: f32;
-uniform cloudTop: f32;
-uniform cloudCoverage: f32;
-uniform cloudDensity: f32;
-uniform absorptionCoeff: f32;
-uniform cloudType: f32;   // 0 = flat stratus, ~0.4 = fair-weather cumulus, 1 = towering cumulonimbus
-uniform time: f32;
-// Accumulated horizontal cloud drift (metres), integrated on the CPU so wind changes never jump it.
-uniform cloudDrift: vec2f;
 uniform nearZ: f32;
-uniform farZ: f32;
-uniform marchSteps: i32;
-uniform lightSteps: i32;
-uniform noiseSliceDim: f32;
-uniform noiseDepth: f32;
-uniform atlasW: f32;
-uniform atlasH: f32;
-uniform atlasCols: f32;
+`;
 
+const CLOUD_WGSL_HELPERS = `
 const PI: f32 = 3.14159265;
 // Scaled-down earth radius for the spherical cloud shell (see GLSL note) — keeps
 // float32 precision while curving the deck to the horizon. Tunable.
@@ -738,7 +748,9 @@ fn vc_lightMarch(p: vec3f, phase: f32, dC: f32, mu: f32, jOff: f32) -> f32 {
     return beersLaw * phase
          * mix(0.05 + 1.5 * pow(min(1.0, dC * 8.5), 0.3 + 5.5 * ch), 1.0, clamp(den * 0.4, 0.0, 1.0));
 }
+`;
 
+const CLOUD_WGSL_PP_MAIN = `
 @fragment
 fn main(input: FragmentInputs)->FragmentOutputs {
     let scene_color = textureSample(textureSampler, textureSamplerSampler, input.vUV);
@@ -877,6 +889,118 @@ fn main(input: FragmentInputs)->FragmentOutputs {
 }
 `;
 
+// Identical content to the historical single-string shader (header + uniforms + helpers + main).
+const CLOUD_WGSL = CLOUD_WGSL_PP_HEADER + CLOUD_WGSL_COMMON_UNIFORMS + CLOUD_WGSL_HELPERS + CLOUD_WGSL_PP_MAIN;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOME variant — the raymarch rendered as an in-scene backdrop mesh (option C).
+// Same cloud model/uniforms; differences vs the post-process:
+//  • the ray comes from the mesh fragment's world position (no invViewProjection / vUV);
+//  • NO scene/depth/terrain sampling — geometry simply rasterises over the dome afterwards;
+//  • output is PREMULTIPLIED (scatter, 1−transmit), blended over the sky with ONE/ONE_MINUS_SRC_ALPHA.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CLOUD_DOME_VERTEX_WGSL = `
+attribute position: vec3f;
+#include<sceneUboDeclaration>
+#include<meshUboDeclaration>
+varying vWorldPos: vec3f;
+
+@vertex
+fn main(input: VertexInputs) -> FragmentInputs {
+    let wp = mesh.world * vec4f(vertexInputs.position, 1.0);
+    vertexOutputs.vWorldPos = wp.xyz;
+    vertexOutputs.position = scene.viewProjection * wp;
+}
+`;
+
+const CLOUD_DOME_HEADER = `
+varying vWorldPos: vec3f;
+
+var noiseSamplerSampler: sampler;
+var noiseSampler: texture_2d<f32>;
+var weatherSamplerSampler: sampler;
+var weatherSampler: texture_2d<f32>;
+`;
+
+const CLOUD_DOME_MAIN = `
+@fragment
+fn main(input: FragmentInputs) -> FragmentOutputs {
+    // The dome is an infiniteDistance box centred on the camera, so the fragment's world position is
+    // camera + a fixed offset — normalising the difference gives the view ray exactly like the old
+    // far-plane NDC reconstruction, with no matrix work.
+    let rd = normalize(input.vWorldPos - uniforms.cameraPosition);
+
+    var tNear = vc_intersectShell(uniforms.cameraPosition, rd, uniforms.cloudBase);
+    var tFar  = vc_intersectShell(uniforms.cameraPosition, rd, uniforms.cloudTop);
+
+    if (rd.y < 0.02 || tNear < 0.0 || tFar <= tNear) {
+        fragmentOutputs.color = vec4f(0.0);
+        return fragmentOutputs;
+    }
+    tNear = max(tNear, 0.01);
+    tFar  = min(tFar, uniforms.farZ);
+
+    let dist      = max(tFar - tNear, 0.0);
+    let step_size = dist / f32(uniforms.marchSteps);
+
+    // Static per-pixel jitter — Interleaved Gradient Noise on the frag coord, same as the PP variant.
+    let jit01 = fract(52.9829189 * fract(dot(input.position.xy, vec2f(0.06711056, 0.00583715))));
+    let jit   = jit01 * step_size;
+
+    let cosA  = dot(rd, uniforms.sunDirection);
+    let phase = vc_mieFit(cosA);
+
+    var transmit: f32  = 1.0;
+    var scatter:  vec3f = vec3f(0.0);
+    var t: f32 = tNear + jit;
+
+    // Adaptive empty-space skipping — identical to the PP variant.
+    let bigStep = step_size * 3.0;
+    var fine = false;
+
+    for (var i: i32 = 0; i < uniforms.marchSteps; i++) {
+        if (t >= tFar || transmit < 0.02) { break; }
+
+        let p   = uniforms.cameraPosition + rd * t;
+        let rho = vc_getDensity(p, 0.0);
+
+        if (!fine) {
+            if (rho > 0.001) { t -= bigStep; fine = true; continue; }
+            t += bigStep;
+            continue;
+        }
+
+        if (rho > 0.001) {
+            let lt = vc_lightMarch(p, phase, rho, cosA, jit01);
+            let ch = vc_cloudHeight(p);
+            let ambLift = mix(3.2, 1.5, smoothstep(0.10, 0.78, uniforms.cloudCoverage));
+            let ambient = (uniforms.skyColor    * (0.5 + 0.6 * ch) * 0.34
+                        +  uniforms.skyColor    * max(0.0, 1.0 - 2.0 * ch) * 0.10
+                        +  uniforms.groundColor * (1.0 - ch) * 0.45) * ambLift;
+            let radiance = ambient + uniforms.sunColor * 15.0 * lt;
+
+            let sT = exp(-rho * step_size);
+            scatter  += transmit * radiance * (1.0 - sT);
+            transmit *= sT;
+        }
+
+        t += step_size;
+    }
+
+    // Same storm detail-reveal + fair-weather lift as the PP variant.
+    let stormDetail = smoothstep(0.45, 0.85, uniforms.cloudCoverage);
+    scatter = mix(scatter, pow(max(scatter, vec3f(0.0)), vec3f(0.62)), vec3f(stormDetail));
+    scatter *= mix(1.45, 1.0, smoothstep(0.12, 0.55, uniforms.cloudCoverage));
+
+    // PREMULTIPLIED: rgb = in-scattered light, a = cloud opacity. ONE/ONE_MINUS_SRC_ALPHA over the sky
+    // reproduces exactly the PP composite (sky·transmit + scatter).
+    fragmentOutputs.color = vec4f(scatter, 1.0 - transmit);
+}
+`;
+
+const CLOUD_DOME_FRAG_WGSL = CLOUD_DOME_HEADER + CLOUD_WGSL_COMMON_UNIFORMS + CLOUD_WGSL_HELPERS + CLOUD_DOME_MAIN;
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DENOISE_WGSL = `
@@ -923,6 +1047,10 @@ fn main(input: FragmentInputs)->FragmentOutputs {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface VolumetricCloudsOptions {
+  /** 'dome' (default on WebGPU): in-scene backdrop mesh — geometry/particles/birds draw OVER the clouds,
+   *  occlusion artifacts impossible; no depth renderer needed. 'postprocess': the legacy screen-space
+   *  composite (WebGL fallback — the dome shaders are WGSL-only). */
+  mode?:             'dome' | 'postprocess';
   cloudBaseHeight?:  number;
   cloudThickness?:   number;
   cloudCoverage?:    number;
@@ -963,6 +1091,10 @@ export class VolumetricCloudsPlugin {
 
   private cloudPass:    PostProcess | null = null;
   private denoisePass:  PostProcess | null = null;
+  // DOME mode (option C): the raymarch as an in-scene backdrop mesh instead of a post-process.
+  private domeMode = false;
+  private domeMesh: Mesh | null = null;
+  private domeMat:  ShaderMaterial | null = null;
   private weatherTex:  Texture    | null = null;
   private noiseTex:    RawTexture | null = null;
   // true → procedural grey value-noise weather map (Shadertoy-style); false → pebbles.png.
@@ -1035,11 +1167,19 @@ export class VolumetricCloudsPlugin {
     this.windSpeed       = options.windSpeed       ?? 8;
 
     const isWebGPU = scene.getEngine().isWebGPU;
+    // Dome mode is WGSL-only → WebGL keeps the legacy post-process path.
+    this.domeMode = (options.mode ?? (isWebGPU ? 'dome' : 'postprocess')) === 'dome' && isWebGPU;
     this.buildPlaceholders();
-    // storeNonLinearDepth = false → stores linear metric (eyeZ - nearZ) / (farZ - nearZ).
-    this.depthRenderer = scene.enableDepthRenderer(camera, false);
     this.registerShaders(isWebGPU);
-    this.buildPostProcesses(options.renderScale ?? 0.82, isWebGPU);
+    if (this.domeMode) {
+      // No depth renderer in dome mode: occlusion comes free from the raster order (the dome draws
+      // first, everything else over it) — that's a whole every-frame depth pass saved, too.
+      this.buildDome();
+    } else {
+      // storeNonLinearDepth = false → stores linear metric (eyeZ - nearZ) / (farZ - nearZ).
+      this.depthRenderer = scene.enableDepthRenderer(camera, false);
+      this.buildPostProcesses(options.renderScale ?? 0.82, isWebGPU);
+    }
     this.loadTextures(
       options.weatherTextureUrl ?? 'https://celeste-twinkle.github.io/Babylon-App-Show/clouds/pebbles.png',
       options.volumeNoiseUrl    ?? 'https://celeste-twinkle.github.io/Babylon-App-Show/clouds/greyNoise3D.bin',
@@ -1109,7 +1249,52 @@ export class VolumetricCloudsPlugin {
       if (!ShaderStore.ShadersStoreWGSL['volumetricCloudsDenoisePixelShader']) {
         ShaderStore.ShadersStoreWGSL['volumetricCloudsDenoisePixelShader'] = DENOISE_WGSL;
       }
+      ShaderStore.ShadersStoreWGSL['volCloudDomeVertexShader']   = CLOUD_DOME_VERTEX_WGSL;
+      ShaderStore.ShadersStoreWGSL['volCloudDomeFragmentShader'] = CLOUD_DOME_FRAG_WGSL;
     }
+  }
+
+  // ── Dome mode (option C) ──────────────────────────────────────────────────
+
+  /** Build the in-scene cloud backdrop: an infiniteDistance box (like the skybox) carrying the raymarch
+   *  as a ShaderMaterial. renderingGroupId 0 + transparent + huge alphaIndex → draws right after the
+   *  sky/sun/moon/stars within group 0, and EVERYTHING in groups 1+ (terrain, ocean LODs, ships, birds)
+   *  plus all the group-3 particle FX rasterises over it. Premultiplied blend reproduces the exact
+   *  composite the post-process produced (sky·transmit + scatter). */
+  private buildDome(): void {
+    const mat = new ShaderMaterial('volCloudDome', this.scene, 'volCloudDome', {
+      attributes: ['position'],
+      uniformBuffers: ['Scene', 'Mesh'],
+      samplers: ['noiseSampler', 'weatherSampler'],
+      needAlphaBlending: true,
+      shaderLanguage: ShaderLanguage.WGSL,
+    });
+    mat.backFaceCulling   = false;            // viewed from inside
+    mat.disableDepthWrite = true;             // backdrop never occludes anything
+    mat.fogEnabled        = false;            // infiniteDistance + EXP2 fog would wash it to fog colour
+    mat.alphaMode         = Constants.ALPHA_PREMULTIPLIED;   // ONE / ONE_MINUS_SRC_ALPHA
+    // NOTE: the regular depth test stays ON — it is what lets terrain/mountains (which write depth in
+    // this same group) occlude the clouds. (A depthFunction=ALWAYS experiment painted clouds over the
+    // whole landscape.) The mesh must therefore be UNIFORMLY nearer than the sky objects — see below.
+    mat.onBindObservable.add(() => {
+      const eff = mat.getEffect();
+      if (eff && this._enabled) { this.applyCloudUniforms(eff); }
+    });
+    this.domeMat = mat;
+
+    // A SPHERE, not a box, at a UNIFORM ~55 km radius: nearer than the sun disc (65 km), moon (62 km)
+    // and skybox (65+ km) in EVERY direction — so the depth test always passes against the sky objects
+    // and the clouds composite over them — while still farther than any terrain, so mountains' depth
+    // occludes the clouds correctly. (A box failed both ways: its surface ranges 60–104 km by direction,
+    // so toward the corners the discs sat NEARER than the dome and punched through the clouds.)
+    const dome = MeshBuilder.CreateSphere('volCloudDome', { diameter: 110000, segments: 16 }, this.scene);
+    dome.material         = mat;
+    dome.infiniteDistance = true;
+    dome.renderingGroupId = 0;
+    dome.alphaIndex       = 5000;
+    dome.isPickable       = false;
+    dome.applyFog         = false;
+    this.domeMesh = dome;
   }
 
   // ── Post-process chain ────────────────────────────────────────────────────
@@ -1198,18 +1383,20 @@ export class VolumetricCloudsPlugin {
     this.cloudDrift.y += this.windDirection.z * this.windSpeed * 0.08 * dt;
 
     const sunDir = this.getSunDir();
-    // Build the inverse view-projection from THIS camera explicitly. scene.getTransformMatrix() returns
-    // whatever transform was set last in the frame — the ocean reflection/refraction RTTs and the depth
-    // renderer each render with their own camera, so reading the shared matrix here can flicker between
-    // camera states frame-to-frame, which the far clouds amplify into a constant jitter. The camera's
-    // own view×projection is stable and correct.
-    const invVP = Matrix.Invert(this.camera.getViewMatrix().multiply(this.camera.getProjectionMatrix()));
-
-    effect.setMatrix('invViewProjection', invVP);
+    if (!this.domeMode) {
+      // Build the inverse view-projection from THIS camera explicitly. scene.getTransformMatrix() returns
+      // whatever transform was set last in the frame — the ocean reflection/refraction RTTs and the depth
+      // renderer each render with their own camera, so reading the shared matrix here can flicker between
+      // camera states frame-to-frame, which the far clouds amplify into a constant jitter. The camera's
+      // own view×projection is stable and correct. (Dome mode: the ray comes from the mesh fragment's
+      // world position — no matrices, no depth, no terrain needed.)
+      const invVP = Matrix.Invert(this.camera.getViewMatrix().multiply(this.camera.getProjectionMatrix()));
+      effect.setMatrix('invViewProjection', invVP);
+      // World-space unit vector the camera is looking toward; used to convert
+      // linear eye-depth back into a ray-parameter t for occlusion comparison.
+      effect.setVector3('cameraForward', this.camera.getDirection(Vector3.Forward()));
+    }
     effect.setVector3('cameraPosition', this.camera.globalPosition);
-    // World-space unit vector the camera is looking toward; used to convert
-    // linear eye-depth back into a ray-parameter t for occlusion comparison.
-    effect.setVector3('cameraForward', this.camera.getDirection(Vector3.Forward()));
     effect.setVector3('sunDirection', sunDir);
     // ── Time-of-day lighting ───────────────────────────────────────────────
     // sunDir.y is sin(elevation): +1 = noon zenith, 0 = horizon, -1 = midnight.
@@ -1274,7 +1461,7 @@ export class VolumetricCloudsPlugin {
     effect.setFloat('time',        this.elapsedSecs);
     effect.setVector2('cloudDrift', this.cloudDrift);
 
-    effect.setFloat('nearZ', this.camera.minZ);
+    if (!this.domeMode) { effect.setFloat('nearZ', this.camera.minZ); }
     effect.setFloat('farZ',  this.camera.maxZ);
     effect.setInt('marchSteps', this.marchSteps);
     effect.setInt('lightSteps', this.lightSteps);
@@ -1297,29 +1484,33 @@ export class VolumetricCloudsPlugin {
       this.weatherTex?.isReady() ? this.weatherTex : this.weatherPlaceholder,
     );
 
-    // Depth map — supplied by Babylon's DepthRenderer each frame.
-    // Fall back to the zero-placeholder (= no occlusion) if not yet ready.
-    const depthMap = this.depthRenderer?.getDepthMap() ?? null;
-    effect.setTexture(
-      'depthSampler',
-      depthMap?.isReady() ? depthMap : this.depthPlaceholder,
-    );
+    // Depth + terrain occlusion inputs — POST-PROCESS MODE ONLY. The dome needs neither: scene geometry
+    // simply rasterises over the backdrop in raster order.
+    if (!this.domeMode) {
+      // Depth map — supplied by Babylon's DepthRenderer each frame.
+      // Fall back to the zero-placeholder (= no occlusion) if not yet ready.
+      const depthMap = this.depthRenderer?.getDepthMap() ?? null;
+      effect.setTexture(
+        'depthSampler',
+        depthMap?.isReady() ? depthMap : this.depthPlaceholder,
+      );
 
-    // Terrain heightfield (published by TerrainService via scene.metadata) for cloud-vs-mountain
-    // occlusion. Fall back to the deep-negative placeholder (= never occludes) until it's ready.
-    const thf = (this.scene.metadata as { terrainHeightField?: {
-      tex: Texture; bounds: Vector4; texSize: Vector2; maxAlt: number } } | null)?.terrainHeightField;
-    const haveTerrain = !!(thf && thf.tex?.isReady());
-    effect.setTexture('terrainHeightSampler', haveTerrain ? thf!.tex : this.terrainPlaceholder);
-    effect.setFloat('terrainHasField', haveTerrain ? 1 : 0);
-    if (haveTerrain) {
-      effect.setVector4('terrainBounds', thf!.bounds);
-      effect.setVector2('terrainTexSize', thf!.texSize);
-      effect.setFloat('terrainMaxAlt', thf!.maxAlt);
-    } else {
-      effect.setVector4('terrainBounds', new Vector4(0, 0, 1, 1));
-      effect.setVector2('terrainTexSize', new Vector2(1, 1));
-      effect.setFloat('terrainMaxAlt', 0);
+      // Terrain heightfield (published by TerrainService via scene.metadata) for cloud-vs-mountain
+      // occlusion. Fall back to the deep-negative placeholder (= never occludes) until it's ready.
+      const thf = (this.scene.metadata as { terrainHeightField?: {
+        tex: Texture; bounds: Vector4; texSize: Vector2; maxAlt: number } } | null)?.terrainHeightField;
+      const haveTerrain = !!(thf && thf.tex?.isReady());
+      effect.setTexture('terrainHeightSampler', haveTerrain ? thf!.tex : this.terrainPlaceholder);
+      effect.setFloat('terrainHasField', haveTerrain ? 1 : 0);
+      if (haveTerrain) {
+        effect.setVector4('terrainBounds', thf!.bounds);
+        effect.setVector2('terrainTexSize', thf!.texSize);
+        effect.setFloat('terrainMaxAlt', thf!.maxAlt);
+      } else {
+        effect.setVector4('terrainBounds', new Vector4(0, 0, 1, 1));
+        effect.setVector2('terrainTexSize', new Vector2(1, 1));
+        effect.setFloat('terrainMaxAlt', 0);
+      }
     }
   }
 
@@ -1402,6 +1593,10 @@ export class VolumetricCloudsPlugin {
       }
     }
 
+    // Keep a CPU copy: getSunTransmittance() samples the same field to dim the sun glare behind clouds.
+    this.weatherData = data;
+    this.weatherSize = size;
+
     const tex = new RawTexture(
       data, size, size, Constants.TEXTUREFORMAT_R, this.scene,
       /*generateMipMaps=*/false, /*invertY=*/false,
@@ -1410,6 +1605,57 @@ export class VolumetricCloudsPlugin {
     tex.wrapU = Texture.MIRROR_ADDRESSMODE;
     tex.wrapV = Texture.MIRROR_ADDRESSMODE;
     return tex;
+  }
+
+  // CPU copy of the procedural weather field (grey-noise path only) for sun-glare occlusion.
+  private weatherData: Uint8Array | null = null;
+  private weatherSize = 0;
+
+  /**
+   * Cloud transmittance toward `dir` (unit, typically the sun): 1 = clear sky, →0 = thick cloud in the
+   * way. CPU twin of vc_getDensity's WEATHER/coverage term, sampled where the ray crosses the middle of
+   * the cloud shell. The cloud DOME composites over the sun DISC already — but the god-rays + glow are
+   * post-processes drawn over the final image, so they need this factor to stop shining through clouds.
+   */
+  getSunTransmittance(dir: Vector3): number {
+    if (!this._enabled || !this.weatherData || dir.y <= 0.02) { return 1; }
+    const cam = this.camera.globalPosition;
+    const midH = this.cloudBaseHeight + this.cloudThickness * 0.5;
+    // Same shell intersection as vc_intersectShell (EARTH_RADIUS = 2e6), origin at the camera.
+    const R = 2000000;
+    const b = 2 * (cam.y + R) * dir.y;
+    const c = (cam.y - midH) * (cam.y + 2 * R + midH);
+    const disc = b * b - 4 * c;
+    if (disc < 0) { return 1; }
+    const q = (-b + (b < 0 ? -Math.sqrt(disc) : Math.sqrt(disc))) / 2;
+    let t0 = q, t1 = c / q;
+    if (t0 > t1) { const tmp = t0; t0 = t1; t1 = tmp; }
+    const t = t0 >= 0 ? t0 : t1;
+    if (t <= 0) { return 1; }
+
+    // Shader convention: pzx = p.zx + drift.yx; uv = scale * pzx (MIRROR addressing).
+    const sx = (cam.z + dir.z * t) + this.cloudDrift.y;
+    const sy = (cam.x + dir.x * t) + this.cloudDrift.x;
+    const mirror = (u: number) => { const f = Math.abs((u / 2 - Math.floor(u / 2)) * 2 - 1); return f; };
+    const sampleW = (u: number, v: number): number => {
+      const size = this.weatherSize;
+      const fx = mirror(u) * (size - 1), fy = mirror(v) * (size - 1);
+      const x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const x1 = Math.min(size - 1, x0 + 1), y1 = Math.min(size - 1, y0 + 1);
+      const tx = fx - x0, ty = fy - y0;
+      const d = this.weatherData!;
+      const a = d[y0 * size + x0], bb = d[y0 * size + x1], cc = d[y1 * size + x0], dd = d[y1 * size + x1];
+      return ((a * (1 - tx) + bb * tx) * (1 - ty) + (cc * (1 - tx) + dd * tx) * ty) / 255;
+    };
+
+    const large = Math.max(0, Math.min(2, (sampleW(-0.00005 * sx, -0.00005 * sy) - 0.18) * 5));
+    const st = Math.max(0, Math.min(1, (this.cloudType - 0.40) / (0.95 - 0.40)));
+    const storm = st * st * (3 - 2 * st);
+    const covThresh = 0.28 - (this.cloudCoverage - 0.5) * 0.5 - storm * 0.05;
+    const weather = large * Math.max(0, sampleW(0.0002 * sx, 0.0002 * sy) - covThresh) / 0.72;
+    const shape = Math.pow(Math.max(0, weather), 1.8);   // mid-shell height envelope ≈ 1 → exponent 1.8
+    // Beer-ish falloff; floor keeps a faint glow even under a solid deck (real skies do).
+    return Math.max(0.05, Math.exp(-2.4 * Math.min(2, shape)));
   }
 
   /**
@@ -1508,9 +1754,12 @@ export class VolumetricCloudsPlugin {
 
   setEnabled(enabled: boolean): void {
     this._enabled = enabled;
+    this.domeMesh?.setEnabled(enabled);   // dome mode: stop drawing the backdrop entirely
   }
 
   dispose(): void {
+    this.domeMesh?.dispose(); this.domeMesh = null;
+    this.domeMat?.dispose();  this.domeMat  = null;
     if (this.cloudPass)    { this.cloudPass.dispose(this.camera);    this.cloudPass    = null; }
     if (this.denoisePass)  { this.denoisePass.dispose(this.camera);  this.denoisePass  = null; }
     if (this.depthRenderer) {

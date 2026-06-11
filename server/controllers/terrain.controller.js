@@ -51,21 +51,13 @@ exports.getAuxMap      = serveTerrainPng('aux_map.png',      'Aux map');   // S4
  * Files live in assets/terrain/tiles/ and are downloaded via:
  *   npm run download:terrain-tiles
  *
- * :name must be one of:
- *   sand_diff, sand_nor, grass_diff, grass_nor,
- *   gravel_diff, gravel_nor, rock_diff, rock_nor,
- *   snow_diff, snow_nor
+ * :name must be <biome>_<map> where biome ∈ {sand,sand2,grass,grass2,gravel,rock,rock2,snow} and
+ * map ∈ {diff (albedo), nor (normal), rough (roughness), ao (ambient occlusion)}. The S1b PBR terrain
+ * skinning consumes diff+rough+ao; the older Standard path used diff+nor. Files: assets/terrain/tiles/.
  */
-const VALID_TILES = new Set([
-  'sand_diff',    'sand_nor',
-  'sand2_diff',   'sand2_nor',
-  'grass_diff',   'grass_nor',
-  'grass2_diff',  'grass2_nor',
-  'gravel_diff',  'gravel_nor',
-  'rock_diff',    'rock_nor',
-  'rock2_diff',   'rock2_nor',
-  'snow_diff',    'snow_nor',
-]);
+const TILE_BIOMES = ['sand', 'sand2', 'grass', 'grass2', 'gravel', 'rock', 'rock2', 'snow'];
+const TILE_MAPS   = ['diff', 'nor', 'rough', 'ao'];
+const VALID_TILES = new Set(TILE_BIOMES.flatMap((b) => TILE_MAPS.map((m) => `${b}_${m}`)));
 
 exports.getTile = (req, res) => {
   const name = req.params.name;

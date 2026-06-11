@@ -6,7 +6,7 @@ import { TerrainService } from '../../services/terrain.service';
 import { CloudService } from '../../services/cloud.service';
 import { SceneService } from '../../services/scene.service';
 import { OceanService } from '../../services/ocean.service';
-import { OceanFFTEngine } from '../../services/ocean-fft-engine.service';
+import { OceanFFTRenderer } from '../../services/ocean-fft-renderer.service';
 import { ScatterService } from '../../services/scatter/scatter.service';
 import { BirdService } from '../../services/bird.service';
 
@@ -123,14 +123,17 @@ import { BirdService } from '../../services/bird.service';
           </div>
           <div class="q-hint">Physically-based terrain surfacing (richer rock/sand). Off uses the simpler classic skin.</div>
 
-          @if (oceanDetailAvailable) {
-            <div class="q-row" style="margin-top:0.7rem">
-              <span class="q-label">Ocean Detail</span>
-              <button class="toggle-btn" [class.toggle-btn--on]="oceanUltra"
-                      (click)="toggleOceanDetail()">{{ oceanUltra ? 'Ultra' : 'Standard' }}</button>
-            </div>
-            <div class="q-hint">FFT wave-simulation grid. Ultra (256²) is crisper but heavier; Standard (128²) is faster.</div>
-          }
+          <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">Ocean Quality</span>
+            <span class="q-value">{{ oceanLabels[oceanQuality] }}</span>
+          </div>
+          <input type="range" min="0" max="2" step="1"
+                 [value]="oceanQuality"
+                 (input)="onOceanQuality($event)"
+                 class="q-slider" />
+          <div class="q-ticks"><span>Cheap</span><span>High</span><span>Ultra</span></div>
+          <div class="q-hint">Cheap: fast procedural waves (big FPS save, simpler look). High/Ultra: full FFT
+            wave simulation (WebGPU only — falls back to procedural otherwise); Ultra uses a crisper 256² grid.</div>
         </div>
 
         <!-- ── Audio ────────────────────────────────────────────────────── -->
@@ -234,12 +237,13 @@ export class SettingsMenuComponent {
   private readonly cloudSvc = inject(CloudService);
   private readonly sceneSvc = inject(SceneService);
   private readonly ocean    = inject(OceanService);
-  private readonly oceanFft = inject(OceanFFTEngine);
+  private readonly oceanFftR = inject(OceanFFTRenderer);
   private readonly scatter  = inject(ScatterService);
   private readonly birds    = inject(BirdService);
 
   readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
   readonly cloudLabels  = ['Low', 'Medium', 'High', 'Ultra'];
+  readonly oceanLabels  = ['Cheap', 'High (FFT)', 'Ultra (FFT)'];
   readonly aaLabels     = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
   readonly grassLabels  = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
   readonly wildlifeLabels = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
@@ -253,9 +257,7 @@ export class SettingsMenuComponent {
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
   terrainPbrOn   = this.terrain.isTerrainPBREnabled();
-  // FFT-ocean grid detail (WebGPU only — the FFT engine is inactive on WebGL).
-  oceanDetailAvailable = this.oceanFft.isActive;
-  oceanUltra = this.oceanFft.ultra;
+  oceanQuality   = this.ocean.getOceanQuality();
 
   // ── Graphics presets ───────────────────────────────────────────────────────
   // Each bundles every graphics dial. Tweaking an individual control afterwards
@@ -263,13 +265,13 @@ export class SettingsMenuComponent {
   readonly presetNames = ['Potato', 'Low', 'Medium', 'High', 'Ultra'] as const;
   private readonly PRESETS: Record<string, {
     render: number; shadows: number; clouds: number; aa: number; grass: number; wildlife: number;
-    reflections: boolean; transparency: boolean;
+    ocean: number; reflections: boolean; transparency: boolean;
   }> = {
-    Potato: { render: 0.50, shadows: 0, clouds: 0, aa: 0, grass: 0, wildlife: 0, reflections: false, transparency: false },
-    Low:    { render: 0.65, shadows: 1, clouds: 0, aa: 1, grass: 1, wildlife: 1, reflections: false, transparency: false },
-    Medium: { render: 0.80, shadows: 2, clouds: 1, aa: 1, grass: 2, wildlife: 2, reflections: false, transparency: true  },
-    High:   { render: 1.00, shadows: 2, clouds: 2, aa: 2, grass: 3, wildlife: 3, reflections: true,  transparency: true  },
-    Ultra:  { render: 1.00, shadows: 3, clouds: 3, aa: 3, grass: 4, wildlife: 4, reflections: true,  transparency: true  },
+    Potato: { render: 0.50, shadows: 0, clouds: 0, aa: 0, grass: 0, wildlife: 0, ocean: 0, reflections: false, transparency: false },
+    Low:    { render: 0.65, shadows: 1, clouds: 0, aa: 1, grass: 1, wildlife: 1, ocean: 0, reflections: false, transparency: false },
+    Medium: { render: 0.80, shadows: 2, clouds: 1, aa: 1, grass: 2, wildlife: 2, ocean: 1, reflections: false, transparency: true  },
+    High:   { render: 1.00, shadows: 2, clouds: 2, aa: 2, grass: 3, wildlife: 3, ocean: 1, reflections: true,  transparency: true  },
+    Ultra:  { render: 1.00, shadows: 3, clouds: 3, aa: 3, grass: 4, wildlife: 4, ocean: 2, reflections: true,  transparency: true  },
   };
   activePreset: string | null = localStorage.getItem('ignis_graphics_preset');
 
@@ -326,9 +328,11 @@ export class SettingsMenuComponent {
     this.ocean.setWaterTransparencyEnabled(this.transparencyOn);
     this.markCustom();
   }
-  toggleOceanDetail(): void {
-    this.oceanUltra = !this.oceanUltra;
-    this.oceanFft.setUltra(this.oceanUltra);
+  onOceanQuality(e: Event): void {
+    this.oceanQuality = +(e.target as HTMLInputElement).value;
+    this.ocean.setOceanQuality(this.oceanQuality);
+    void this.oceanFftR.applyQuality(this.oceanQuality);
+    this.markCustom();
   }
   toggleTerrainPbr(): void {
     this.terrainPbrOn = !this.terrainPbrOn;
@@ -346,6 +350,8 @@ export class SettingsMenuComponent {
     this.aaQuality = p.aa;                this.sceneSvc.setAaQuality(p.aa);
     this.reflectionsOn = p.reflections;   this.ocean.setReflectionsEnabled(p.reflections);
     this.transparencyOn = p.transparency; this.ocean.setWaterTransparencyEnabled(p.transparency);
+    this.oceanQuality = p.ocean;          this.ocean.setOceanQuality(p.ocean);
+    void this.oceanFftR.applyQuality(p.ocean);
     this.activePreset = name;
     localStorage.setItem('ignis_graphics_preset', name);
   }

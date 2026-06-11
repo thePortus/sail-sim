@@ -55,6 +55,12 @@ export class SceneService {
     this.glowLayer?.addIncludedOnlyMesh(mesh);
   }
 
+  /** Remove a mesh from the glow include list — REQUIRED before disposing a glow-included mesh
+   *  (streamed piers), so the layer's include list doesn't accumulate dead references. */
+  removeFromGlow(mesh: Mesh): void {
+    this.glowLayer?.removeIncludedOnlyMesh(mesh);
+  }
+
   /**
    * Exclude a material from the prePass G-buffer render (normals/depth).
    * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't
@@ -77,6 +83,11 @@ export class SceneService {
   // FPS overlay element — created once and reused across sessions (the engine is reused, so the
   // overlay + its global hotkey/resize listeners must NOT be re-installed each scene rebuild).
   private _fpsEl: HTMLDivElement | null = null;
+  // Perf instrumentation — capture is toggled ON only while the overlay is visible (see setPerfCapture):
+  // each captured metric adds per-frame timing hooks, and GPU frame timing forces a sync, so leaving them
+  // on when nobody's reading them is wasted work every frame.
+  private _sInstr: SceneInstrumentation | null = null;
+  private _eInstr: EngineInstrumentation | null = null;
 
   // Lightning flash: additive boost to ambient light, driven by CloudService.
   // 0 = no flash; ~1 = full strike. Applied on top of the time-of-day ambient.
@@ -102,6 +113,12 @@ export class SceneService {
 
   // Sun glare occlusion: 0 = fully blocked by terrain, 1 = fully visible.
   private sunOcclusionT = 1.0;
+  // Cloud transmittance toward a sky direction (1 = clear). Set by CloudService (same hook pattern as
+  // the volumetric plugin's atmo-colour callbacks); smoothed here and folded into the sun AND moon
+  // disc / god-rays / glow so the glare post-processes stop shining straight through the cloud deck.
+  cloudTransmittance: ((dir: Vector3) => number) | null = null;
+  private sunCloudT = 1.0;
+  private moonCloudT = 1.0;
   private sunOcclusionFrame = 0;
   private lastSunOccluded = false;
 
@@ -186,14 +203,30 @@ export class SceneService {
 
         if (gpuSupported) {
           try {
+            // Read the adapter's real per-stage limits so we can REQUEST more than WebGPU's tiny spec
+            // minimums (which are what you get by default). The default maxUniformBuffersPerShaderStage is
+            // only 12 — town/terrain PBR variants in the prePass blow past it. Raise toward the adapter max
+            // (Apple/Metal reports far more); clamp so the request can never exceed what the adapter offers
+            // (an over-request would reject the device and drop us to WebGL).
+            let maxUBO = 12, maxStorageTex = 8;
+            try {
+              type AdapterLike = { limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number } };
+              const gpu = (navigator as { gpu?: { requestAdapter?: () => Promise<AdapterLike | null> } }).gpu;
+              const adapter = gpu?.requestAdapter ? await gpu.requestAdapter() : null;
+              if (adapter?.limits?.maxUniformBuffersPerShaderStage) maxUBO = adapter.limits.maxUniformBuffersPerShaderStage;
+              if (adapter?.limits?.maxStorageTexturesPerShaderStage) maxStorageTex = Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
+            } catch { /* fall back to defaults below */ }
+            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}`);
             this.engine = await WebGPUEngine.CreateAsync(canvas, {
               antialias: true,
-              // The FFT postprocess and time-evolve compute shaders bind 5–6 storage
-              // textures per stage.  The WebGPU default minimum is 4; the adapter
-              // supports 8.  We must declare this in requiredLimits at device creation
-              // time — it cannot be patched later without recreating the device.
+              // The FFT postprocess and time-evolve compute shaders bind 5–6 storage textures per stage
+              // (default min is 4). Uniform-buffer headroom (see above) lets the harbor-town + terrain PBR
+              // prepass variants fit. Both must be declared at device-creation time.
               deviceDescriptor: {
-                requiredLimits: { maxStorageTexturesPerShaderStage: 8 },
+                requiredLimits: {
+                  maxStorageTexturesPerShaderStage: maxStorageTex,
+                  maxUniformBuffersPerShaderStage: Math.min(maxUBO, 24),
+                },
               },
             });
             this._isWebGPU = true;
@@ -224,6 +257,11 @@ export class SceneService {
       this.scene = new Scene(this.engine);
       this.scene.fogMode    = Scene.FOGMODE_EXP2;
       this.scene.fogDensity = 0.000035;
+      // By default Babylon runs a full scene pick on EVERY pointer-move to fire hover/over events. We
+      // have no hover triggers (the only pointer-move handler reads raw DOM coords for camera drag, not
+      // pickInfo), so that pick is pure waste — and during a camera drag over hundreds of meshes it's a
+      // real CPU hit. Skip it. (Click/down still picks; cannon aim uses an explicit pickWithRay.)
+      this.scene.skipPointerMovePicking = true;
 
       this.buildSky();             // Preetham SkyMaterial dome (kept as the WebGL fallback sky)
       this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
@@ -342,7 +380,12 @@ export class SceneService {
     this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
     this.sunMesh.isPickable = false;
-    this.sunMesh.renderingGroupId = 2;
+    // Group 0 = the sky layer. The volumetric cloud DOME (group 0, alphaIndex 5000) composites over the
+    // disc → clouds pass in front of the sun. alphaIndex MUST be set low: Babylon's default is
+    // Number.MAX_VALUE, so a fading disc (visibility < 1 → transparent bucket) would sort AFTER the dome
+    // and punch through the clouds. Everything in groups 1+ still paints over both.
+    this.sunMesh.renderingGroupId = 0;
+    this.sunMesh.alphaIndex = 10;
     this.glowLayer.addIncludedOnlyMesh(this.sunMesh);
 
     // Moon — a self-glowing sphere wrapped in NASA's real lunar colour map (CGI Moon Kit LROC colour,
@@ -370,7 +413,8 @@ export class SceneService {
     this.moonMesh = MeshBuilder.CreateSphere('moonDisk', { diameter: 1900, segments: 32 }, this.scene);
     this.moonMesh.material = moonMat;
     this.moonMesh.isPickable = false;
-    this.moonMesh.renderingGroupId = 2;
+    this.moonMesh.renderingGroupId = 0;   // sky layer — clouds (group 0 dome) pass in front (see sunDisk)
+    this.moonMesh.alphaIndex = 10;        // below the dome's 5000 (default is MAX_VALUE → would draw over clouds)
     this.moonMesh.visibility = 0;
     // CRITICAL for disc brightness: the moon sits ~62 km out where EXP2 fog saturates, washing the
     // disc toward the (dark, at night) fog colour. Exempt it from fog like the star dome.
@@ -430,6 +474,7 @@ export class SceneService {
     dome.renderingGroupId = 0;            // with the skybox; transparent → draws over it
     dome.applyFog         = false;        // stars must not be tinted by scene fog
     dome.isPickable       = false;
+    dome.alphaIndex       = 5;            // before the cloud dome (5000) → clouds cover the stars
     dome.setEnabled(false);               // off during the day
     this.starDome = dome;
   }
@@ -563,9 +608,14 @@ export class SceneService {
     // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
     // water with soft-waterline foam.
     depthMap.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.metadata?.excludeFromOceanDepth;
-    // Every frame: at low FPS an every-other-frame depth pass makes the soft-waterline
-    // foam around the bobbing hull strobe. (Was 2 for perf; the strobe wasn't worth it.)
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.metadata?.excludeFromOceanDepth;
+    // ^ scatter_* = inland foliage (grass/trees/palms/rocks — hundreds of patch meshes). They're above
+    // water and never want shoreline foam, so drawing them into this FULL-SCREEN, EVERY-FRAME depth pass
+    // was pure cost (the refraction RTT already excludes them for the same reason).
+    // EVERY frame, ALWAYS. A quality-driven every-other-frame throttle was tried TWICE and reverted
+    // TWICE: a one-frame-stale depth map misaligns with the camera during rotation, and the waterline
+    // foam reads the misaligned depths as "geometry just behind the surface" → bright foam STROBES
+    // across the water with every camera move. Not a subtle shimmer — a flashing artifact. Don't.
     depthMap.refreshRate = 1;
     this.scene.customRenderTargets.push(depthMap);
 
@@ -739,6 +789,15 @@ export class SceneService {
     return new Vector3(a.r, a.g, a.b);
   }
 
+  /** The baked equirect sky LUT, reusable as a SCOPED IBL/reflection source for select PBR materials
+   *  (harbor metals + fountain water) that otherwise read black — we run NO scene-wide environmentTexture,
+   *  so assigning this per-material is the only way those surfaces pick up sky radiance. It's HDR, in
+   *  FIXED_EQUIRECTANGULAR mode (shared with the skybox), and re-bakes with the sun, so the reflections
+   *  it drives track time of day for free. Returns null on the WebGL fallback (no procedural sky). */
+  getSkyEnvTexture(): Texture | null {
+    return this.proceduralSky?.lutTexture ?? null;
+  }
+
   updateFogDensity(density: number): void {
     if (this.scene) this.scene.fogDensity = density;
   }
@@ -803,11 +862,15 @@ export class SceneService {
       // God rays: anchor the shaft source at the sun, and fade them out at night and at
       // high noon (shafts read as long, dramatic streaks when the sun is low — golden
       // hour — and vanish overhead). above = max(0, sun elevation).
+      // Cloud cover between camera and sun (smoothed — the sample moves with the cloud drift).
+      const cloudTarget = this.cloudTransmittance?.(dir) ?? 1.0;
+      this.sunCloudT += (cloudTarget - this.sunCloudT) * Math.min(1, dt * 2.5);
+
       if (this.godRays) {
         this.godRays.customMeshPosition = sunPos;
         const lowSun = 1.0 - Math.min(1, Math.max(0, h) / 0.55);   // 1 near horizon → 0 high
         const dayUp  = Math.max(0, Math.min(1, (h + 0.02) / 0.10)); // fade in just above horizon
-        this.godRays.exposure = 0.55 * dayUp * (0.35 + 0.65 * lowSun);
+        this.godRays.exposure = 0.55 * dayUp * (0.35 + 0.65 * lowSun) * this.sunCloudT;
       }
 
       const sunShouldBeOn = h > -0.06;
@@ -819,7 +882,7 @@ export class SceneService {
       } else {
         this.sunOcclusionT = 1.0;
       }
-      occT = this.sunOcclusionT;
+      occT = this.sunOcclusionT * this.sunCloudT;
 
       this.sunMesh.scaling.setAll((1.0 + Math.max(0, 0.88 - above) * 3.0) * occT);
       this.sunMesh.visibility = Math.max(0.0, above) * occT;
@@ -836,8 +899,12 @@ export class SceneService {
       const moonDir = dir.scale(-1);
       const moonBlocked = this.isMoonOccluded(moonDir);
       this.moonOcclusionT += ((moonBlocked ? 0.0 : 1.0) - this.moonOcclusionT) * 0.50;
+      // Cloud cover between camera and moon — same treatment as the sun, along the anti-solar direction.
+      // moonVis feeds both the disc visibility and the lunar glow, so one factor dims them together.
+      const moonCloudTarget = this.cloudTransmittance?.(moonDir) ?? 1.0;
+      this.moonCloudT += (moonCloudTarget - this.moonCloudT) * Math.min(1, dt * 2.5);
 
-      const moonVis = Math.max(0, Math.min(1, (0.04 - h) / 0.16)) * this.moonOcclusionT;
+      const moonVis = Math.max(0, Math.min(1, (0.04 - h) / 0.16)) * this.moonOcclusionT * this.moonCloudT;
       this.moonMesh.position.copyFrom(this.camera.position.add(moonDir.scale(62000)));
       this.moonMesh.visibility = moonVis;
       this.moonMesh.rotation.y += dt * 0.012;
@@ -1096,7 +1163,9 @@ export class SceneService {
       this._fpsEl = el;
       window.addEventListener('keydown', (e) => {
         if (e.code === 'Backquote' && this._fpsEl) {
-          this._fpsEl.style.display = this._fpsEl.style.display === 'none' ? 'block' : 'none';
+          const show = this._fpsEl.style.display === 'none';
+          this._fpsEl.style.display = show ? 'block' : 'none';
+          this.setPerfCapture(show);   // only measure while the overlay is up
         }
       });
       window.addEventListener('resize', () => {
@@ -1106,17 +1175,12 @@ export class SceneService {
     }
     const fpsEl = this._fpsEl;
 
-    // Perf instrumentation — only read when the overlay is visible. Breaks the
-    // frame into CPU (active-mesh eval, render-targets, inter-frame JS) and GPU
-    // time so we can see exactly what's pinning the frame rate.
-    const sInstr = new SceneInstrumentation(this.scene);
-    sInstr.captureActiveMeshesEvaluationTime = true;
-    sInstr.captureRenderTargetsRenderTime = true;
-    sInstr.captureRenderTime = true;
-    sInstr.captureFrameTime = true;
-    sInstr.captureInterFrameTime = true;
-    const eInstr = new EngineInstrumentation(this.engine);
-    eInstr.captureGPUFrameTime = true;
+    // Perf instrumentation — breaks the frame into CPU (active-mesh eval, render-targets, inter-frame JS)
+    // and GPU time. Capture is OFF until the overlay is shown (setPerfCapture), so it costs nothing in
+    // normal play; enabled here only if the overlay is already visible across a scene rebuild.
+    this._sInstr = new SceneInstrumentation(this.scene);
+    this._eInstr = new EngineInstrumentation(this.engine);
+    this.setPerfCapture(fpsEl.style.display !== 'none');
     let perfFrame = 0;
 
     let lastTime = performance.now();
@@ -1126,7 +1190,8 @@ export class SceneService {
       lastTime  = now;
       this.tickTimeOfDay(dt);
       this.scene.render();
-      if (fpsEl.style.display !== 'none' && (perfFrame++ % 15) === 0) {
+      if (fpsEl.style.display !== 'none' && this._sInstr && this._eInstr && (perfFrame++ % 15) === 0) {
+        const sInstr = this._sInstr, eInstr = this._eInstr;
         const ms = (c: { lastSecAverage: number }) => c.lastSecAverage.toFixed(1);
         const gpuMs = (eInstr.gpuFrameTimeCounter.lastSecAverage / 1e6) || 0;
         const ping = this.telemetry.ping();
@@ -1141,6 +1206,20 @@ export class SceneService {
           `draws ${sInstr.drawCallsCounter.lastSecAverage | 0}   activeMeshes ${this.scene.getActiveMeshes().length}`;
       }
     });
+  }
+
+  /** Toggle perf-counter capture. Each metric adds per-frame timing hooks and the GPU timer forces a
+   *  sync, so we only measure while the backtick overlay is actually on screen. */
+  private setPerfCapture(on: boolean): void {
+    const s = this._sInstr, e = this._eInstr;
+    if (s) {
+      s.captureActiveMeshesEvaluationTime = on;
+      s.captureRenderTargetsRenderTime = on;
+      s.captureRenderTime = on;
+      s.captureFrameTime = on;
+      s.captureInterFrameTime = on;
+    }
+    if (e) { e.captureGPUFrameTime = on; }
   }
 
   // Render resolution is now its own user setting (the single biggest perf/quality
@@ -1193,6 +1272,13 @@ export class SceneService {
     if (sm) sm.refreshRate = level <= 0 ? 2 : 1;
   }
 
+  /** The ocean depth pass runs EVERY frame, at every quality level. An every-other-frame throttle here
+   *  has now been tried twice (once pre-history per the original comment, once via this dial) and makes
+   *  the waterline foam STROBE during camera rotation — a stale depth map misaligns with the view and
+   *  the foam term reads garbage dz. Kept as a no-op so the quality plumbing stays in place if a safer
+   *  lever (e.g. half-RESOLUTION depth) is ever wanted here. */
+  setOceanDepthQuality(_level: number): void { /* intentionally a no-op — see above */ }
+
   /** Tear down the per-session Scene but KEEP the engine alive for the next session (Return to
    *  Harbour). scene.dispose() releases every mesh/material/texture/light/camera/RTT/post-process the
    *  scene owns; the engine + its WebGPU device/canvas context persist so the next initAsync rebuilds
@@ -1202,6 +1288,8 @@ export class SceneService {
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;
+    this._sInstr?.dispose(); this._sInstr = null;
+    this._eInstr?.dispose(); this._eInstr = null;
     this.scene?.dispose();
   }
 

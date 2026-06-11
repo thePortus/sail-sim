@@ -84,7 +84,7 @@ interface SideGun {
 /** One self-contained remote muzzle rig: a flash light + flame/smoke/linger plumes, pooled and
  *  assigned per remote shooter so concurrent broadsides don't share (and overwrite) one rig. */
 interface RemoteMuzzleRig {
-  light:        PointLight;
+  light:        PointLight | null;   // null = particle-only rig (lights decoupled to stay under the GPU light budget)
   lightEndT:    number;
   flamePS:      ParticleSystem;  flameEmit:   Vector3;  flameCutoffT:  number;
   smokePS:      ParticleSystem;  smokeEmit:   Vector3;  smokeCutoffT:  number;
@@ -211,7 +211,13 @@ export class CannonService {
   // Remote shot effects — a POOL of independent muzzle rigs (light + flame/smoke/linger), one
   // assigned per remote shooter (sticky, LRU-evicted), so several ships firing at once each get
   // their OWN flash, smoke & light instead of fighting over one shared rig.
-  private readonly REMOTE_RIG_COUNT = 4;
+  // NOTE: each rig owns a real PointLight, and the scene's TOTAL enabled-light count is baked into every
+  // material's prePass G-buffer variant (which ignores maxSimultaneousLights). On GPUs at WebGPU's 12-
+  // uniform-buffer/stage minimum (Metal), 3 base + pierLight + 3 player flashes + N remote rigs must stay
+  // ≤ 9 lights (→ 3+9 = 12 UBOs). N=2 keeps us at the limit; raising it crashes the prePass once another
+  // opaque PBR mesh (harbor towns) forces that variant to compile. To scale past this, decouple the rig
+  // light from its particles (a small shared light pool + many particle-only rigs).
+  private readonly REMOTE_RIG_COUNT = 2;
   private remoteRigs: RemoteMuzzleRig[] = [];
   private remoteRigByShooter = new Map<string, number>();
   private remoteRigClock = 0;   // ticks up on each assignment — drives LRU eviction
@@ -408,7 +414,7 @@ export class CannonService {
     // plumes are filled in by the particle builders below (which run after this).
     for (let i = 0; i < this.REMOTE_RIG_COUNT; i++) {
       this.remoteRigs.push({
-        light: make(`cannonFlashRemote${i}`), lightEndT: -1,
+        light: null, lightEndT: -1,   // decoupled: remote shots use particles + terrain/water glow, no point light
         flamePS:  null as unknown as ParticleSystem, flameEmit:  new Vector3(0, 0, 0), flameCutoffT:  -1,
         smokePS:  null as unknown as ParticleSystem, smokeEmit:  new Vector3(0, 0, 0), smokeCutoffT:  -1,
         lingerPS: null as unknown as ParticleSystem, lingerEmit: new Vector3(0, 0, 0), lingerCutoffT: -1,
@@ -1026,7 +1032,7 @@ export class CannonService {
     }
   }
 
-  private decayFlash(light: PointLight, endT: number): void {
+  private decayFlash(light: PointLight | null, endT: number): void {
     if (!light || endT < 0 || this.elapsed >= endT) {
       if (light) light.intensity = 0;
       return;
@@ -1155,7 +1161,7 @@ export class CannonService {
     const rig = this.acquireRemoteRig(shooterId);
 
     // Muzzle flash
-    rig.light.position.set(ox, oy, oz);
+    rig.light?.position.set(ox, oy, oz);
     rig.lightEndT = this.elapsed + FLASH_DUR;
     // Warm glow on the sea below the remote muzzle too (dx,dz is the unit beam direction).
     this.oceanService.addCannonFlash(ox, oz, dx, dz);

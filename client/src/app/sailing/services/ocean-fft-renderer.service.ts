@@ -114,8 +114,18 @@ export class OceanFFTRenderer {
     });
 
     this._installToggleKey();
-    // The FFT ocean is the default on WebGPU; Ctrl+Shift+O switches back to the procedural one.
-    void this.toggleFFT();
+    // Engage per the persisted Ocean quality dial (default High → FFT on WebGPU). Ctrl+Shift+O stays
+    // as a debug override that flips the mode without touching the dial.
+    void this.applyQuality(this.oceanService.getOceanQuality());
+  }
+
+  /** Apply the Ocean quality dial: ≥1 → FFT ocean (2 = ultra 256² grid), 0 (Cheap) → procedural ocean.
+   *  Safe no-op on WebGL / when the FFT pipeline is unavailable (the procedural ocean stays). */
+  async applyQuality(level: number): Promise<void> {
+    if (!this._geometry || !this._material) { return; }
+    const wantFft = level >= 1;
+    if (wantFft) { this.fft.setUltra(level >= 2); }   // engine no-ops when the grid size is unchanged
+    if (wantFft !== (this._mode === 'fft')) { await this.toggleFFT(); }
   }
 
   /** Record/extend every ship's wake path, then pack the nearest few for the material. */

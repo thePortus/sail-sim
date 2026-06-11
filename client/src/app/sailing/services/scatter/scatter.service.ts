@@ -131,6 +131,9 @@ export class ScatterService {
   private readonly _mat = new Matrix();
   private readonly _stride = new Float32Array(16);   // scratch for the instance shuffle
 
+  // Harbor-town pad rectangles (cached) — NO scatter is placed inside them (no trees in the fountain).
+  private townPads: { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number; r: number }[] | null = null;
+
   // ── Tuning ──────────────────────────────────────────────────────────────────
   private readonly PATCH = 40;          // metres per patch
   private readonly MAX_BUILDS_PER_FRAME = 3;  // builds (across all layers) per frame — stream in gently
@@ -154,6 +157,18 @@ export class ScatterService {
   // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
   // patches built. _patchPending = still filling in this cell (build cap not yet drained).
   private _lastCx = NaN; private _lastCz = NaN; private _patchPending = true;
+  // Adaptive streaming. _hasFilledOnce = have we completed the FIRST fill-from-empty yet? Until then we run
+  // "aggressive" (bigger time/commit budget) so the initial load snaps in — a brief stutter is invisible
+  // while the screen is still appearing. Once filled, every later top-up (sailing across a cell boundary)
+  // is GENTLE so it never hiccups, even though a leading edge legitimately takes a few frames to fill. NOT
+  // streak-based on purpose: a cell-cross adds a multi-frame backlog too, so "sustained backlog" can't tell
+  // sailing apart from the initial load — "have we ever finished filling" can. _ringOffsets = cell deltas
+  // sorted NEAREST-FIRST so the budget always lands on the most-visible patches; cached per RADIUS.
+  private _hasFilledOnce = false;
+  private _aggressive = false;
+  private _ringOffsets: { dx: number; dz: number }[] | null = null;
+  private _ringR = -1;
+  private _cellM = 0;   // world m per heightfield texel (~24) — slope-sampling baseline (lazy from terrain)
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -209,7 +224,20 @@ export class ScatterService {
         this._shadowMat.alpha = 0.30 * smoothstep(0.0, 0.16, sun.y) * (1.0 - 0.12 * (stretch - 1.0));
       }
       this.ensurePatches();
-      for (const l of this.layers) { l.manager.update(); }
+      // LoD re-eval is cheap (rate-limited internally); the queue DRAIN is the GPU-heavy bit (geometry
+      // clone + thin-instance buffer upload). Drain it on ONE budget shared across all layers, round-robin,
+      // so a leading ring of several layers can't spike into 3×N clones in a single frame (the sailing
+      // hiccup). Generous during an aggressive fill, tight while cruising.
+      for (const l of this.layers) { l.manager.reevaluateLod(); }
+      let commitBudget = this._aggressive ? 24 : 6;
+      let drainedAny = true;
+      while (commitBudget > 0 && drainedAny) {
+        drainedAny = false;
+        for (const l of this.layers) {
+          if (commitBudget <= 0) { break; }
+          if (l.manager.drainQueue(1) > 0) { commitBudget--; drainedAny = true; }
+        }
+      }
     });
   }
 
@@ -254,6 +282,7 @@ export class ScatterService {
     for (const mm of mats) { mm.dispose(); }
     this.layers = [];
     this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
+    this.townPads = null;                              // re-fetch town pads after a region/manifest change
   }
 
   /** /reloadassets: bump the cache-bust version, drop the cached containers, tear down the live layers
@@ -267,7 +296,7 @@ export class ScatterService {
     clearScatterCache();
     this.teardownLayers();
     await this.buildLayers(scene);
-    this._lastCx = NaN; this._patchPending = true;   // fresh layers → rebuild the grid
+    this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // fresh layers → aggressive refill
     if (this.enabled) { this.ensurePatches(); }
     for (const l of this.layers) { l.manager.initInstances(); }
   }
@@ -615,7 +644,22 @@ export class ScatterService {
     return { mat, manager, patches: new Map(), build, baseMeshes: meshes };
   }
 
-  /** Build any new cells entering the radius (budgeted across all layers), cull cells that left. */
+  /** Cell deltas within radius R, sorted NEAREST-FIRST (Euclidean) so patch building always favours the
+   *  patches closest to the camera — fastest to appear on initial load, and the leading edge first while
+   *  sailing. Cached per R (cheap to rebuild when quality changes the radius). */
+  private buildRingOffsets(R: number): { dx: number; dz: number }[] {
+    const out: { dx: number; dz: number }[] = [];
+    for (let dx = -R; dx <= R; dx++) {
+      for (let dz = -R; dz <= R; dz++) { out.push({ dx, dz }); }
+    }
+    out.sort((a, b) => (a.dx * a.dx + a.dz * a.dz) - (b.dx * b.dx + b.dz * b.dz));
+    return out;
+  }
+
+  /** Build any new cells entering the radius (NEAREST-FIRST, on an adaptive TIME budget), cull cells that
+   *  left. Steady cruising only adds a thin leading edge → clears in ~1 frame, gently. A sustained backlog
+   *  (initial fill / fast travel) flips "aggressive" → a bigger time/count budget fills fast. Either way the
+   *  per-frame build time is capped, so a single frame never spikes regardless of how heavy the patches are. */
   private ensurePatches(): void {
     const cam = this.sceneService.camera;
     if (!cam || !this.layers.length || !this.enabled) { return; }
@@ -624,32 +668,46 @@ export class ScatterService {
     const R = this.RADIUS;
 
     // The patch grid only changes when the camera crosses into a new 40 m cell. While it's parked in the
-    // same cell with everything built, there's nothing to add or cull — so skip the whole (2R+1)²×layers
-    // scan + per-patch cull entirely (the common case, since the camera moves far less than a cell/frame).
+    // same cell with everything built, there's nothing to add or cull — so skip the whole scan + cull
+    // entirely (the common case, since the camera moves far less than a cell/frame).
     const cellChanged = cx !== this._lastCx || cz !== this._lastCz;
-    if (!cellChanged && !this._patchPending) { return; }
+    if (!cellChanged && !this._patchPending) { this._hasFilledOnce = true; this._aggressive = false; return; }
     this._lastCx = cx; this._lastCz = cz;
 
+    if (!this._ringOffsets || this._ringR !== R) { this._ringOffsets = this.buildRingOffsets(R); this._ringR = R; }
+
+    // Adaptive budget: the first fill-from-empty builds punchy (a stutter is invisible while the screen is
+    // still appearing); every later top-up while cruising builds gently so it never hiccups. The time cap
+    // bounds the per-frame spike either way.
+    const aggressive = !this._hasFilledOnce;
+    this._aggressive = aggressive;
+    const budgetMs = aggressive ? 6 : 2;
+    const maxBuilds = aggressive ? 64 : 8;
+
+    const t0 = performance.now();
     let built = 0;
-    for (let ix = cx - R; ix <= cx + R && built < this.MAX_BUILDS_PER_FRAME; ix++) {
-      for (let iz = cz - R; iz <= cz + R && built < this.MAX_BUILDS_PER_FRAME; iz++) {
-        const key = ix + ',' + iz;
-        for (const l of this.layers) {
-          if (built >= this.MAX_BUILDS_PER_FRAME) { break; }
-          if (l.patches.has(key)) { continue; }
-          // Shadow (and any capped) layers only build within their near ring around the camera cell.
-          if (l.maxRing !== undefined && (Math.abs(ix - cx) > l.maxRing || Math.abs(iz - cz) > l.maxRing)) { continue; }
-          const data = l.build(ix * this.PATCH, iz * this.PATCH);
-          built++;
-          if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
-          const p = new ThinInstancePatch(new Vector3(ix * this.PATCH, 0, iz * this.PATCH), data.matrix, data.color);
-          l.manager.addPatch(p);
-          l.patches.set(key, p);
-        }
+    let incomplete = false;
+    for (const off of this._ringOffsets) {
+      // Always build at least the nearest cell; thereafter stop on the time OR count cap.
+      if (built >= maxBuilds || (built > 0 && performance.now() - t0 > budgetMs)) { incomplete = true; break; }
+      const ix = cx + off.dx, iz = cz + off.dz;
+      const key = ix + ',' + iz;
+      for (const l of this.layers) {
+        if (l.patches.has(key)) { continue; }
+        // Shadow (and any capped) layers only build within their near ring around the camera cell.
+        if (l.maxRing !== undefined && (Math.abs(off.dx) > l.maxRing || Math.abs(off.dz) > l.maxRing)) { continue; }
+        const data = l.build(ix * this.PATCH, iz * this.PATCH);
+        built++;
+        if (data.matrix.length === 0) { l.patches.set(key, null); continue; }
+        const p = new ThinInstancePatch(new Vector3(ix * this.PATCH, 0, iz * this.PATCH), data.matrix, data.color);
+        l.manager.addPatch(p);
+        l.patches.set(key, p);
       }
     }
-    // Hit the per-frame build cap → more patches still to fill in; keep scanning next frame.
-    this._patchPending = built >= this.MAX_BUILDS_PER_FRAME;
+    // Broke out on a budget cap → more patches still to fill; keep going next frame. The first time we
+    // fully drain (incomplete=false) the initial load is done → drop to gentle streaming forever after.
+    this._patchPending = incomplete;
+    if (!incomplete) { this._hasFilledOnce = true; }
 
     // Cull only when the cell moved (the cull boundary is relative to it) — otherwise nothing left the ring.
     if (cellChanged) {
@@ -698,13 +756,17 @@ export class ScatterService {
     return { matrix, color };
   }
 
-  /** Slope magnitude (rise/run) from a FORWARD difference reusing the already-sampled height — 2
-   *  terrain lookups instead of 4, which roughly halves the dominant cost of a patch build. */
-  private slopeAt(px: number, pz: number, baseY: number, E: number): number {
+  /** Slope magnitude (rise/run) from a FORWARD difference reusing the already-sampled (fast) height. Uses
+   *  the NEAREST sampler over a ONE-TEXEL baseline (~24 m): two nearest samples closer than a texel land in
+   *  the same cell → a constant 0 slope, so the baseline must span a full texel. Within a cell the bilinear
+   *  gradient equals the cell gradient, so the values (and the tuned thresholds) match the old E≈2 m bilinear
+   *  difference — at ~⅓ the cost (2 nearest reads, no interpolation). `baseY` must be the FAST centre height. */
+  private slopeAt(px: number, pz: number, baseY: number, _E: number): number {
     const g = this.terrainService;
-    const dyx = g.getElevation(px + E, pz) - baseY;
-    const dyz = g.getElevation(px, pz + E) - baseY;
-    return Math.sqrt(dyx * dyx + dyz * dyz) / E;
+    const D = this._cellM || (this._cellM = g.getCellSizeM());
+    const dyx = g.getElevationFast(px + D, pz) - baseY;
+    const dyz = g.getElevationFast(px, pz + D) - baseY;
+    return Math.sqrt(dyx * dyx + dyz * dyz) / D;
   }
 
   /**
@@ -730,12 +792,14 @@ export class ScatterService {
    *  Math.random) so the 3 variant calls partition one candidate set. Per-instance tint + size. */
   private buildGrass(cx: number, cz: number, variant: number): PatchData {
     const res = 28, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const BURST = 16;                                   // up to 16 clumps packed into one bush heart
     const BUSH_R = 0.55;                                // bush radius (m) — a tight tuft, ~a few feet across
     const cap = 5000;                                   // generous per-patch instance cap (bushes are rare)
     const matTmp = new Float32Array(cap * 16);
     const colTmp = new Float32Array(cap * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     const NCLUMPS = ScatterService.GRASS_CLUMPS.length;
     const TINTS = ScatterService.GRASS_TINTS;
@@ -762,7 +826,8 @@ export class ScatterService {
       for (let z = 0; z < res; z++) {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.6) { continue; }
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.7) { continue; }
@@ -788,6 +853,8 @@ export class ScatterService {
         // Deal each accepted cell to one clump variant.
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NCLUMPS) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (gating used the fast sampler)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline — no clumps in the surf
         place(px, pz, y);
 
         // Burst the bush heart: pack many clumps into a TIGHT tuft (~BUSH_R radius, a few feet across), so
@@ -823,7 +890,7 @@ export class ScatterService {
       for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
       l.patches.clear();
     }
-    this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to rebuild the grid
+    this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // force ensurePatches to rebuild the grid
     if (this.enabled) { this.ensurePatches(); }
   }
 
@@ -842,9 +909,11 @@ export class ScatterService {
    *  bigger ones and the rare boulder, each a random size, tumble orientation and stone colour. */
   private buildRocks(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 24, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV;
     const NSHAPES = ScatterService.ROCK_SHAPES.length;
     const TINTS = ScatterService.ROCK_TINTS;
@@ -855,7 +924,8 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 150) { continue; }            // beach band → all the way up the rocky uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.85) { continue; }
@@ -876,6 +946,8 @@ export class ScatterService {
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + mesh settle)
+        if (y < 0.25) { continue; }        // confirm against the precise waterline
         // Size mix: mostly small, some bigger, the occasional boulder (real metres — base mesh ≈ 1 m).
         const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
         const base = r < 0.05 ? 1.8 + hash2(px * 2.2, pz * 2.2) * 1.7       // ~5% boulders (1.8–3.5 m)
@@ -911,9 +983,11 @@ export class ScatterService {
    *  length/thickness, random yaw with a slight settle, bleached wood colours. */
   private buildDriftwood(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 20, size = this.PATCH, cell = size / res, E = 2.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const matTmp = new Float32Array(res * res * 16);
     const colTmp = new Float32Array(res * res * 4);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV;
     const NSHAPES = ScatterService.DRIFT_SHAPES.length;
     const TINTS = ScatterService.DRIFT_TINTS;
@@ -924,7 +998,8 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all shape calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
         if (y < 0.25 || y > 7) { continue; }              // sand / low beach band (up to the sand line)
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.75) { continue; }
@@ -938,6 +1013,8 @@ export class ScatterService {
         // Deal each accepted candidate to one shape (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * NSHAPES) !== variant) { continue; }
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + settle)
+        if (y < 0.25) { continue; }        // confirm against the precise waterline
         // Size mix: uniform scale (the 5 GLB shapes already carry their own proportions) — mostly
         // small/medium with some big logs/planks. Base meshes are ~0.8–2.8 m long, so this spans twig→log.
         const r = hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0);
@@ -966,12 +1043,68 @@ export class ScatterService {
     return this.finish(matTmp, kept, shadow ? null : colTmp);
   }
 
+  /** Harbor-town pad rectangles (oriented), each padded by a small margin. Lazily cached once the terrain
+   *  manifest is loaded; re-fetched until the harbors are present. Used to keep ALL scatter out of towns. */
+  private getTownPads(): { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number; r: number }[] {
+    if (this.townPads && this.townPads.length) { return this.townPads; }
+    const harbors = this.terrainService.getHarbors();
+    if (!harbors || !harbors.length) { return []; }   // manifest not loaded yet — don't cache empty
+    const M = 6;                                       // keep scatter this far back from the town edge too
+    const pads = [];
+    for (const h of harbors) {
+      if (!h.pad) { continue; }
+      const p = h.pad, hr = (p.rotY * Math.PI) / 180, hx = p.halfX + M, hz = p.halfZ + M;
+      pads.push({ cx: p.cx, cz: p.cz, hx, hz, sin: Math.sin(hr), cos: Math.cos(hr), r: Math.hypot(hx, hz) });
+    }
+    this.townPads = pads;
+    return pads;
+  }
+
+  /** The town pads whose footprint can reach into the patch centred at (cx,cz) — usually none, so the
+   *  per-candidate test below is skipped entirely away from towns. */
+  private townPadsNear(cx: number, cz: number) {
+    const reach = this.PATCH; // patch half-extent (20) + headroom
+    return this.getTownPads().filter((p) => Math.hypot(p.cx - cx, p.cz - cz) < p.r + reach);
+  }
+
+  /** True if (px,pz) is inside any of the given (oriented) town pads → no scatter there. */
+  private inTown(px: number, pz: number, pads: { cx: number; cz: number; hx: number; hz: number; sin: number; cos: number }[]): boolean {
+    for (const p of pads) {
+      const dx = px - p.cx, dz = pz - p.cz;
+      const along = dx * p.sin + dz * p.cos;     // along the town's heading axis (halfZ)
+      const across = dx * p.cos - dz * p.sin;    // across (halfX)
+      if (Math.abs(along) <= p.hz && Math.abs(across) <= p.hx) { return true; }
+    }
+    return false;
+  }
+
+  /** True if the shore/shallows lie within `minDist` m of (px,pz) — used to keep beach trees a few metres
+   *  back from the water so no trunks stand in the surf or float over the transparent coastal shallows.
+   *  Scans a FILLED DISK (3 rings × 8 spokes), not a single ring: a lone ring at exactly `minDist` misses
+   *  water that sits closer than that (e.g. a sandbar tip with water 2 m off but land again at the 5 m
+   *  sample), which let trees float over the shallows. The reject threshold is +0.4 m (not ≈0), so trees
+   *  also stay off the low transition band where the seabed is just under water and rendered transparent. */
+  private nearShoreline(px: number, pz: number, minDist: number): boolean {
+    const g = this.terrainService;
+    const RINGS = 3, SPOKES = 8, MARGIN = 0.4;
+    for (let r = 1; r <= RINGS; r++) {
+      const d = (r / RINGS) * minDist;
+      for (let i = 0; i < SPOKES; i++) {
+        const a = (i / SPOKES) * Math.PI * 2 + r * 0.4;   // stagger rings so spokes don't all align
+        if (g.getElevation(px + Math.cos(a) * d, pz + Math.sin(a) * d) <= MARGIN) { return true; }
+      }
+    }
+    return false;
+  }
+
   /** Build one patch's forest trees: clustered in the inland forest-mask zone (mid elevation, gentle
    *  slope), broken into stands by low-freq noise with clearings. Sparse — trees are big. */
   private buildTrees(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 16, size = this.PATCH, cell = size / res, E = 3.0;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     let kept = 0;
 
@@ -980,8 +1113,9 @@ export class ScatterService {
         // Deterministic jitter (hash, not Math.random) so all variant calls partition one candidate set.
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
-        if (y < 20 || y > 80) { continue; }                // high inland only (shoreline float hidden), below uplands
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
+        if (y < 0.6 || y > 80) { continue; }               // on solid land (beaches included), below the uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }                     // trees on gentle ground only
 
@@ -994,7 +1128,10 @@ export class ScatterService {
 
         // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
@@ -1015,8 +1152,10 @@ export class ScatterService {
    *  single-mesh primitive fallback). The GLB palms are real metres, so scale is a gentle ±8 % only. */
   private buildPalms(cx: number, cz: number, variant: number, shadow = false): PatchData {
     const res = 14, size = this.PATCH, cell = size / res, E = 2.5;
+    const tpads = this.townPadsNear(cx, cz);            // exclude town footprints from scatter
     const tmp = new Float32Array(res * res * 16);
     const getY = (x: number, z: number) => this.terrainService.getElevation(x, z);
+    const getYFast = (x: number, z: number) => this.terrainService.getElevationFast(x, z);
     const scaleV = this._scaleV, posV = this._posV, up = this._up;
     let kept = 0;
 
@@ -1024,8 +1163,9 @@ export class ScatterService {
       for (let z = 0; z < res; z++) {
         const px = cx + (x + hash2(cx + x * 12.9, cz + z * 78.2)) * cell - size / 2;
         const pz = cz + (z + hash2(cx + x * 39.3 + 7.1, cz + z * 11.7 - 3.3)) * cell - size / 2;
-        const y = getY(px, pz);
-        if (y < 27 || y > 42) { continue; }                // FAR up off the shoreline (~3x) — keeps the float well out of view
+        let y = getYFast(px, pz);                                      // fast nearest height for gating
+        if (tpads.length && this.inTown(px, pz, tpads)) { continue; }   // no scatter in towns
+        if (y < 0.6 || y > 45) { continue; }               // beach + low coast (was 27–42, off the shore); off the uplands
         const slope = this.slopeAt(px, pz, y, E);
         if (slope > 0.5) { continue; }
 
@@ -1036,7 +1176,10 @@ export class ScatterService {
 
         // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).
         if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
+        y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)
+        if (y < 0.6) { continue; }         // confirm against the precise waterline
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }

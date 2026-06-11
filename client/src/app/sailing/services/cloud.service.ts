@@ -271,10 +271,10 @@ export class CloudService {
     this.initLensRain();
     this.initVolumetricLayer();
 
-    this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => {
+    this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('cloud', () => {
       const dt = Math.min(scene.getEngine().getDeltaTime() / 1000, 0.05);
       this.tick(dt);
-    });
+    }));
 
     this.initialized = true;
   }
@@ -402,6 +402,8 @@ export class CloudService {
     // And the reverse hook: the scene dims the sun/moon discs, god-rays and glow by the cloud cover
     // along the given direction, so the glare post-processes stop punching straight through the deck.
     this.sceneService.cloudTransmittance = (dir) => this.volClouds?.getSunTransmittance(dir) ?? 1;
+    // Perf probe: price the raymarch dome (a prime fill-rate suspect) via the overlay's GPU-ms delta.
+    this.sceneService.registerPerfProbe('clouds', (on) => this.volClouds?.setDomeDrawForProbe(on));
   }
 
   // --------------------------------------------------------------------------

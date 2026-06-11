@@ -1757,6 +1757,12 @@ export class VolumetricCloudsPlugin {
     this.domeMesh?.setEnabled(enabled);   // dome mode: stop drawing the backdrop entirely
   }
 
+  /** Perf-probe only: stop/resume DRAWING the dome without touching the logical enabled state, so
+   *  the overlay's GPU-ms delta prices the raymarch pass. */
+  setDomeDrawForProbe(draw: boolean): void {
+    this.domeMesh?.setEnabled(draw && this._enabled);
+  }
+
   dispose(): void {
     this.domeMesh?.dispose(); this.domeMesh = null;
     this.domeMat?.dispose();  this.domeMat  = null;

@@ -203,7 +203,10 @@ export class OceanFFTEngine {
     if (!this._generator) { return; }
     try {
       this._generator.update(performance.now() / 1000);
-      this._readbackHeight();
+      // Perf A/B: localStorage.ignis_no_fft_readback='1' skips the per-frame height readback (buoyancy
+      // freezes — fine for a measurement). If the frame time drops with this on, the readback was
+      // stalling the pipeline on GPU completion.
+      if (localStorage.getItem('ignis_no_fft_readback') !== '1') { this._readbackHeight(); }
     } catch (err) {
       // A GPU/validation fault would otherwise throw every frame — disable cleanly once.
       console.warn('[OceanFFT] tick failed — disabling FFT ocean:', err);

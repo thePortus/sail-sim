@@ -103,7 +103,7 @@ export class HarborService {
     this.squareLight.range = 85;   // square sits ~28 m inland; reach the pier/waterfront too
     this.squareLight.intensity = 0;
 
-    this.tickObs = scene.onBeforeRenderObservable.add(() => this.tick());
+    this.tickObs = scene.onBeforeRenderObservable.add(() => this.sceneService.span('harbor', () => this.tick()));
     console.log(`[Harbor] ${this.harbors.length} harbors; piers + buildings stream by range`);
     // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to
     // build up front. The 3 variant GLBs parse once into the shared cache on first use.
@@ -410,6 +410,9 @@ export class HarborService {
       m.receiveShadows = false;
       m.computeWorldMatrix(true);
       m.freezeWorldMatrix();
+      // Above-water structure: skip the ocean's seabed-refraction RTT (never seen through the water),
+      // cutting the heavy refraction-frame draw count. See OceanService.buildReflectionRTT.
+      m.metadata = { ...(m.metadata ?? {}), excludeFromRefraction: true };
       const mat = m.material;
       if (mat && !this.frozenMats.has(mat)) {
         this.frozenMats.add(mat);
@@ -425,6 +428,15 @@ export class HarborService {
           mat.anisotropy.isEnabled = false;
           mat.detailMap.isEnabled = false;
           this.applyEnvReflection(mat);
+        }
+        // Freeze: building materials never change after setup — this skips the per-frame, per-submesh
+        // effect readiness re-check (_isReadyInternal) + texture/IBL re-bind (BindTextureMatrix /
+        // _afterBind) that the profiler showed dominating mainRender. The container's textures are
+        // already loaded by instantiate time, so freezing here won't lock in an unready effect. The
+        // sky-IBL reflection still tracks time of day (the LUT texture content updates; freeze only
+        // skips material recompilation, not texture sampling). A/B: localStorage ignis_no_matfreeze.
+        if (localStorage.getItem('ignis_no_matfreeze') !== '1') {
+          (mat as unknown as { freeze?: () => void }).freeze?.();
         }
       }
     }
@@ -490,6 +502,8 @@ export class HarborService {
       m.receiveShadows = false;
       m.computeWorldMatrix(true);
       m.freezeWorldMatrix();
+      // Above-water structure → skip the seabed-refraction RTT (cuts the heavy refraction frame).
+      m.metadata = { ...(m.metadata ?? {}), excludeFromRefraction: true };
 
       // The lantern (the `*_glass` mesh) is the pier's night beacon. 50 real lights would blow the
       // per-mesh light cap + the WebGPU varying budget, so instead we make the lantern strongly

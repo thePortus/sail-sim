@@ -106,12 +106,12 @@ export class OceanFFTRenderer {
     this._geometry.initializeMeshes();
     this._geometry.root.setEnabled(false);
 
-    this._tick = scene.onBeforeRenderObservable.add(() => {
+    this._tick = scene.onBeforeRenderObservable.add(() => this.sceneService.span('fft', () => {
       if (this._enabled) {
         this._geometry!.update();
         this._updateWakes(scene);
       }
-    });
+    }));
 
     this._installToggleKey();
     // Engage per the persisted Ocean quality dial (default High → FFT on WebGPU). Ctrl+Shift+O stays

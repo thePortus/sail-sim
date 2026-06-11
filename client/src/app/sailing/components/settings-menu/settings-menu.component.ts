@@ -51,6 +51,13 @@ import { BirdService } from '../../services/bird.service';
           <div class="q-hint">Lower = much faster, softer image. The biggest FPS lever.</div>
 
           <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">Adaptive Resolution</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="adaptiveRes"
+                    (click)="toggleAdaptiveRes()">{{ adaptiveRes ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">Auto-lowers render scale under load to hold a steady frame rate (never above your Render Scale). Recovers FPS in heavy scenes; the image softens only when needed.</div>
+
+          <div class="q-row" style="margin-top:0.7rem">
             <span class="q-label">Shadows</span>
             <span class="q-value">{{ shadowLabels[shadowQuality] }}</span>
           </div>
@@ -254,6 +261,7 @@ export class SettingsMenuComponent {
   wildlifeQuality = this.birds.getWildlifeQuality();
   aaQuality     = this.sceneSvc.getAaQuality();
   renderScale   = this.sceneSvc.getRenderScale();
+  adaptiveRes   = this.sceneSvc.isAdaptiveResolution();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
   terrainPbrOn   = this.terrain.isTerrainPBREnabled();
@@ -282,6 +290,11 @@ export class SettingsMenuComponent {
     this.renderScale = +(e.target as HTMLInputElement).value;
     this.sceneSvc.setRenderScale(this.renderScale);
     this.markCustom();
+  }
+
+  toggleAdaptiveRes(): void {
+    this.adaptiveRes = !this.adaptiveRes;
+    this.sceneSvc.setAdaptiveResolution(this.adaptiveRes);
   }
 
   volumePct(): number { return Math.round(this.music.volume() * 100); }

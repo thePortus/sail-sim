@@ -3,9 +3,8 @@
   align-items: center;
   justify-content: center;
   min-height: 100vh;
-  background: linear-gradient(160deg, #1a2a4a 0%, #0d1b2a 100%);
-  font-family: 'Roboto', sans-serif;
-  color: #e8eaf6;
+  background: radial-gradient(120% 100% at 50% 0%, var(--bp-walnut-edge) 0%, var(--bp-walnut-2) 75%);
+  color: var(--bp-cream);
 }
 
 .home-card {
@@ -14,39 +13,41 @@
   align-items: center;
   gap: 1.5rem;
   padding: 3rem 4rem;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 16px;
-  backdrop-filter: blur(10px);
+  background: linear-gradient(170deg, var(--bp-parchment) 0%, var(--bp-parchment-2) 100%);
+  border: 1px solid var(--bp-oak);
+  box-shadow: inset 0 0 0 1px rgba(184, 138, 62, 0.5), 0 10px 28px rgba(0, 0, 0, 0.45);
+  border-radius: 12px;
   text-align: center;
   max-width: 700px;
   width: 90%;
+  color: var(--bp-ink);
 }
 
 .home-image {
-  border-radius: 15px;
+  border-radius: 10px;
+  border: 1px solid var(--bp-oak);
 }
 
 h1 {
   font-size: 2.8rem;
   font-weight: 700;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.04em;
   margin: 0;
-  color: #ffffff;
-  text-shadow: 0 0 20px rgba(100, 160, 255, 0.5);
+  color: var(--bp-ink);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 
 .subtitle {
-  color: #90a4ae;
+  color: var(--bp-ink-muted);
   font-size: 0.95rem;
   margin: 0;
 }
 
 .fly-error {
   font-size: 0.85rem;
-  color: #ff8080;
-  background: rgba(255, 80, 80, 0.1);
-  border: 1px solid rgba(255, 80, 80, 0.25);
+  color: var(--bp-ensign);
+  background: rgba(158, 59, 44, 0.1);
+  border: 1px solid rgba(158, 59, 44, 0.35);
   border-radius: 8px;
   padding: 0.5rem 1rem;
   text-align: center;
@@ -55,7 +56,6 @@ h1 {
 
 .btn {
   border: none;
-  font-family: 'Roboto', sans-serif;
   cursor: pointer;
 
   &:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -64,17 +64,19 @@ h1 {
 .btn-primary {
   display: inline-block;
   padding: 0.85rem 3rem;
-  background: #3d7eff;
-  color: white;
+  background: linear-gradient(180deg, var(--bp-brass-btn) 0%, var(--bp-brass-btn-2) 100%);
+  color: #2c1d09;
   text-decoration: none;
+  border: 1px solid var(--bp-brass-dark);
   border-radius: 8px;
+  font-family: 'IBM Plex Serif', serif;
   font-size: 1.1rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  transition: background 0.2s, transform 0.1s;
+  transition: filter 0.2s, transform 0.1s;
 
   &:hover {
-    background: #5a9aff;
+    filter: brightness(1.08);
     transform: translateY(-1px);
   }
   &:active {
@@ -87,18 +89,18 @@ h1 {
   gap: 0.75rem;
   align-items: center;
   font-size: 0.9rem;
-  color: #90a4ae;
+  color: var(--bp-ink-muted);
 
   a, button {
-    color: #90caf9;
-    text-decoration: none;
+    color: #9c6f2c;
+    text-decoration: underline;
     background: none;
     border: none;
     cursor: pointer;
     font-size: inherit;
     padding: 0;
 
-    &:hover { color: #ffffff; }
+    &:hover { color: var(--bp-ink); }
   }
 }
 
@@ -113,6 +115,7 @@ h1 {
   font-size: 3rem;
   line-height: 1;
   margin-bottom: 0.25rem;
+  color: var(--bp-oak);
 }
 
 .controls-preview {
@@ -123,7 +126,7 @@ h1 {
     font-size: 0.8rem;
     text-transform: uppercase;
     letter-spacing: 0.1em;
-    color: #546e7a;
+    color: var(--bp-ink-label);
     margin: 0 0 0.75rem;
   }
 
@@ -135,11 +138,11 @@ h1 {
     td {
       padding: 0.3rem 0.5rem;
       text-align: left;
-      color: #78909c;
+      color: var(--bp-ink-muted);
 
       &:first-child {
         font-family: monospace;
-        color: #b0bec5;
+        color: var(--bp-ink);
         font-weight: 600;
         white-space: nowrap;
         width: 30%;
@@ -150,7 +153,7 @@ h1 {
   .controls-hint {
     margin: 0.75rem 0 0;
     font-size: 0.8rem;
-    color: #546e7a;
+    color: var(--bp-ink-label);
     line-height: 1.5;
     text-align: left;
   }

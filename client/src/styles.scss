@@ -17,6 +17,18 @@
 html, body { height: 100%; }
 body { margin: 0; }
 
+/* ── Nautical theme palette (1700s logbook: parchment menus, dark-wood+brass HUD) ── */
+:root {
+  --bp-walnut:      #241810;   --bp-walnut-2: #15100a;   --bp-walnut-edge: #3a2817;
+  --bp-parchment:   #ecdcb0;   --bp-parchment-2: #dfc998; --bp-parchment-inset: #f2e7c8;
+  --bp-oak:         #6b4a26;   --bp-oak-line: #b89b63;
+  --bp-brass:       #b88a3e;   --bp-brass-hi: #d8b15e;   --bp-brass-dark: #7d5a24;
+  --bp-brass-btn:   #c89a4a;   --bp-brass-btn-2: #a3792f;
+  --bp-ink:         #3a2a16;   --bp-ink-muted: #7a6440;  --bp-ink-label: #8a6f44;
+  --bp-cream:       #f0e3c6;   --bp-cream-muted: #bfa980;
+  --bp-ensign:      #9e3b2c;   --bp-verdigris: #6cb39f;
+}
+
 $custom-color: (
     primary: theme-colors.$primary-palette,
     tertiary: theme-colors.$tertiary-palette,
@@ -78,13 +90,23 @@ p {
 
 .hud-panel {
   position: absolute;
-  background: rgba(8, 17, 30, 0.72);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
+  background: linear-gradient(170deg, rgba(46, 32, 19, 0.86) 0%, rgba(28, 18, 10, 0.88) 100%);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--bp-brass-dark);
+  box-shadow: inset 0 0 0 1px rgba(184, 138, 62, 0.22), 0 4px 14px rgba(0, 0, 0, 0.4);
+  border-radius: 10px;
   padding: 14px 16px;
-  color: white;
+  color: var(--bp-cream);
   font-family: ui-monospace, 'Cascadia Code', monospace;
+
+  // Retint the Tailwind utility classes used inline in hud.component.html → brass/cream.
+  .text-white { color: var(--bp-cream) !important; }
+  .text-blue-300, .text-blue-200, .text-blue-400, .text-sky-300, .text-sky-400 { color: var(--bp-brass-hi) !important; }
+  .text-slate-300, .text-slate-400, .text-slate-500, .text-slate-600 { color: var(--bp-cream-muted) !important; }
+  .bg-blue-400 { background-color: var(--bp-verdigris) !important; }
+  .border-blue-400 { border-color: var(--bp-brass) !important; }
+  .bg-white\/10, .bg-white\/5 { background-color: rgba(240, 227, 198, 0.10) !important; }
+  .border-white\/10, .border-white\/5 { border-color: rgba(184, 138, 62, 0.28) !important; }
 
   &.top-left    { top: 1.25rem; left: 1.25rem; min-width: 220px; }
   // top-right starts below the fullscreen button (34 px button + 1.25 rem gap × 2 ≈ 74 px)
@@ -112,6 +134,12 @@ p {
   }
 }
 
+// ── Kill any stray blue Tailwind utilities app-wide (nautical theme has no blue) ──
+// Unlayered rules beat Tailwind's @layer utilities, so no !important needed.
+.text-blue-200, .text-blue-300, .text-blue-400, .text-sky-300, .text-sky-400 { color: var(--bp-brass-hi); }
+.bg-blue-400, .bg-blue-500 { background-color: var(--bp-verdigris); }
+.border-blue-400, .border-blue-500 { border-color: var(--bp-brass); }
+
 // ── Hull damage diagram ───────────────────────────────────────────────────────
 .damage-diagram {
   cursor: grab;
@@ -124,7 +152,7 @@ p {
     font-size: 0.7rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: rgba(207, 227, 245, 0.55);
+    color: rgba(240, 227, 198, 0.55);
     text-align: center;
     margin-bottom: 6px;
   }
@@ -157,7 +185,7 @@ p {
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.04);
-  color: rgba(207, 227, 245, 0.7);
+  color: rgba(240, 227, 198, 0.7);
   font: 600 11px ui-monospace, monospace;
   cursor: pointer;
   transition: all 0.12s;
@@ -190,8 +218,8 @@ p {
   &:hover { background: rgba(255,255,255,0.1); color: white; }
 
   &--active {
-    background: rgba(59, 130, 246, 0.25);
-    border-color: rgba(59, 130, 246, 0.5);
+    background: rgba(184, 138, 62, 0.25);
+    border-color: rgba(184, 138, 62, 0.5);
     color: #93c5fd;
   }
 }
@@ -270,7 +298,7 @@ p {
   &.active {
     color: #93c5fd;
     border-color: rgba(96, 165, 250, 0.55);
-    background: rgba(59, 130, 246, 0.22);
+    background: rgba(184, 138, 62, 0.22);
   }
 }
 
@@ -337,8 +365,8 @@ kbd {
   margin-top: 8px;
   padding: 10px 28px;
   border-radius: 10px;
-  border: 1px solid rgba(59, 130, 246, 0.5);
-  background: rgba(59, 130, 246, 0.18);
+  border: 1px solid rgba(184, 138, 62, 0.5);
+  background: rgba(184, 138, 62, 0.18);
   color: #93c5fd;
   font-size: 1rem;
   font-family: ui-monospace, 'Cascadia Code', monospace;
@@ -347,8 +375,8 @@ kbd {
   transition: all 0.15s ease;
 
   &:hover {
-    background: rgba(59, 130, 246, 0.35);
-    border-color: rgba(59, 130, 246, 0.8);
+    background: rgba(184, 138, 62, 0.35);
+    border-color: rgba(184, 138, 62, 0.8);
     color: #fff;
   }
 }
@@ -404,10 +432,11 @@ app-chat {
 
 .chat-panel {
   width: 310px;
-  background: rgba(8, 17, 30, 0.72);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
+  background: linear-gradient(170deg, rgba(46, 32, 19, 0.88) 0%, rgba(28, 18, 10, 0.9) 100%);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--bp-brass-dark);
+  box-shadow: inset 0 0 0 1px rgba(184, 138, 62, 0.2);
+  border-radius: 10px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -469,7 +498,7 @@ app-chat {
   line-height: 1;
   padding: 2px 5px;
   cursor: pointer;
-  &:hover { color: #93c5fd; background: rgba(59, 130, 246, 0.15); }
+  &:hover { color: #93c5fd; background: rgba(184, 138, 62, 0.15); }
 }
 
 .chat-resize-handle {
@@ -511,7 +540,7 @@ app-chat {
 
   &--active {
     color: #93c5fd;
-    background: rgba(59, 130, 246, 0.12);
+    background: rgba(184, 138, 62, 0.12);
   }
 }
 
@@ -654,14 +683,14 @@ app-chat {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: radial-gradient(ellipse at 50% 60%, #0d2a45 0%, #06101c 65%);
+  background: radial-gradient(ellipse at 50% 60%, #3a2817 0%, #15100a 65%);
   z-index: 100;
 }
 
 .selector-card {
-  background: rgba(10, 20, 36, 0.92);
-  backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: linear-gradient(170deg, rgba(46, 32, 19, 0.94) 0%, rgba(28, 18, 10, 0.95) 100%);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--bp-brass-dark);
   border-radius: 20px;
   padding: 2.5rem;
   width: 100%;
@@ -683,8 +712,8 @@ app-chat {
   &:hover { background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.15); }
 
   &--selected {
-    background: rgba(59, 130, 246, 0.15);
-    border-color: rgba(59, 130, 246, 0.4);
+    background: rgba(184, 138, 62, 0.15);
+    border-color: rgba(184, 138, 62, 0.4);
   }
 }
 
@@ -707,7 +736,7 @@ app-chat {
   box-sizing: border-box;
   transition: border-color 0.15s;
 
-  &:focus { border-color: rgba(59, 130, 246, 0.5); }
+  &:focus { border-color: rgba(184, 138, 62, 0.5); }
   &::placeholder { color: rgba(255,255,255,0.25); }
 }
 
@@ -738,7 +767,7 @@ app-chat {
 
   &:hover:not(:disabled) {
     background: linear-gradient(135deg, #2563eb, #3b82f6);
-    box-shadow: 0 6px 28px rgba(59, 130, 246, 0.5);
+    box-shadow: 0 6px 28px rgba(184, 138, 62, 0.5);
     transform: translateY(-1px);
   }
 

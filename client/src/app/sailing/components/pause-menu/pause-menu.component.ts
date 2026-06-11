@@ -77,7 +77,7 @@ import { SfxService } from '../../services/sfx.service';
       position: fixed; z-index: 201;
       top: 50%; left: 50%; transform: translate(-50%, -50%);
       width: min(400px, 90vw);
-      background: linear-gradient(160deg, #0c1e35 0%, #081628 100%);
+      background: linear-gradient(160deg, #2e2013 0%, #15100a 100%);
       border: 1px solid rgba(200, 170, 100, 0.30);
       border-radius: 12px;
       padding: 2rem 2rem 1.5rem;
@@ -143,9 +143,9 @@ import { SfxService } from '../../services/sfx.service';
     .pause-btn:hover  { filter: brightness(1.12); transform: translateY(-1px); }
     .pause-btn:active { transform: translateY(0); }
     .pause-btn--primary {
-      background: linear-gradient(135deg, #1e5a8a, #1a4a72);
-      color: #d0e8ff;
-      border: 1px solid rgba(100, 180, 255, 0.25);
+      background: linear-gradient(135deg, #c89a4a, #a3792f);
+      color: #2c1d09;
+      border: 1px solid #7d5a24;
     }
     .pause-btn--settings {
       background: rgba(255,255,255,0.06);

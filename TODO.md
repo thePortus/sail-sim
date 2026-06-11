@@ -2,14 +2,16 @@
 
 # General or Current TODO Items
 
-* bathymetry correction too strong
-* Any way to get more GPU accelleration? IF it is on the device
-* biomes missing (since we did seabead deepening?) everything is beach... also shoreline looks blocky, perhaps bc of seabed deepening
+* better latency handling
+* server is disconnected message
+* sound is chunking on windows machines still
+* get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space
+* impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
 * make stuff look cool pass)
 * RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
 * shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
 * shader for water on camera https://www.shadertoy.com/view/ltffzl
-* add in pirates
+* docking tie up animation
 * keypress makes songs lock up
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * adjust water displacement to better fit hull of pinnace

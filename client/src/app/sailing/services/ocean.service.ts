@@ -1642,9 +1642,12 @@ export class OceanService {
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
     this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
-    // Every 3rd frame (perf). The renderList is just the sky, which changes slowly. If the sky/sun
-    // reflection strobes at low FPS, lower this.
-    this.reflectionRTT.refreshRate = 3;
+    // Every 4th frame (perf). The renderList is just sky + vessels + piers, which change slowly.
+    // 4 is deliberately COPRIME with the refraction's refreshRate (5): the two heavy RTTs then only
+    // render on the same frame once every lcm(4,5)=20 frames instead of every 3 — that de-stacks the
+    // bimodal frame-time spike (the every-other-frame stutter) that dominated the felt frame rate.
+    // If the sky/vessel reflection strobes at low FPS, lower this.
+    this.reflectionRTT.refreshRate = 4;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
     // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
@@ -1690,7 +1693,10 @@ export class OceanService {
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
-    this.refractionRTT.refreshRate = 3;   // every 3rd frame — seabed barely moves; thins the heavy refraction frame
+    this.refractionRTT.refreshRate = 3;   // every 3rd frame — reverted from 5: at 5 the seabed visibly lagged
+                                          // behind a fast camera spin. 3 is still coprime with the reflection's 4,
+                                          // so the two heavy RTTs only stack 1/lcm(3,4)=12 frames (vs every frame
+                                          // when both were 3) — we keep the de-stacking smoothness without the lag.
     this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 

@@ -6,6 +6,9 @@ import { CommonModule } from '@angular/common';
 import { TerrainService } from '../../services/terrain.service';
 import { VesselService } from '../../services/vessel.service';
 import { MultiplayerService } from '../../services/multiplayer.service';
+import { SceneService } from '../../services/scene.service';
+import { MinimapBakeCompute } from '../../services/terrain/minimap-bake-compute';
+import type { WebGPUEngine } from '@babylonjs/core';
 
 @Component({
   selector: 'app-minimap',
@@ -20,6 +23,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private terrainService     = inject(TerrainService);
   private vesselService      = inject(VesselService);
   private multiplayerService = inject(MultiplayerService);
+  private sceneService       = inject(SceneService);
   private zone               = inject(NgZone);
 
   expanded = signal(false);
@@ -363,14 +367,56 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     ctx.strokeRect(0, 0, W, H);
   }
 
+  // Stale-bake guard: rebuilds can overlap (terrain reload while a GPU bake is in flight) — only
+  // the newest generation's results are applied.
+  private bakeGeneration = 0;
+
   private rebuildTerrainLayers(): void {
     if (!this.terrainService.isReady()) {
       this.terrainLayerSmall = null;
       this.terrainLayerLarge = null;
       return;
     }
+
+    // GPU bake (roadmap P4): one compute pass + readback per layer instead of 4.2M CPU height
+    // reads (~400 ms hitch at 2048²). The layers pop in a few frames later — drawFrame already
+    // tolerates null layers. A/B hatch: localStorage.setItem('ignis_minimap_gpu','0') forces CPU.
+    const hf = this.terrainService.getHeightFieldGPU();
+    if (hf && this.sceneService.isWebGPU && localStorage.getItem('ignis_minimap_gpu') !== '0') {
+      const gen = ++this.bakeGeneration;
+      const peak = this.terrainService.getManifest()?.targetPeakElevation ?? 920;
+      const baker = new MinimapBakeCompute(
+        this.sceneService.engine as WebGPUEngine, this.sceneService.scene);
+      const apply = (res: number, assign: (c: HTMLCanvasElement) => void) =>
+        baker.bake(res, hf.tex, hf.texSize, peak).then((px) => {
+          if (gen === this.bakeGeneration) { assign(this.pixelsToCanvas(res, px)); }
+        });
+      apply(256, (c) => { this.terrainLayerSmall = c; })
+        .then(() => apply(2048, (c) => { this.terrainLayerLarge = c; }))
+        .catch((e) => {
+          console.warn('[Minimap] GPU bake failed — falling back to CPU raster:', e);
+          if (gen === this.bakeGeneration) {
+            this.terrainLayerSmall = this.buildTerrainLayer(256, 256);
+            this.terrainLayerLarge = this.buildTerrainLayer(2048, 2048);
+          }
+        })
+        .finally(() => baker.dispose());
+      return;
+    }
+
     this.terrainLayerSmall = this.buildTerrainLayer(256, 256);
     this.terrainLayerLarge = this.buildTerrainLayer(2048, 2048);   // hi-res so zoomed-in terrain stays crisp
+  }
+
+  /** Wrap GPU-baked RGBA bytes (canvas row order) in a canvas for drawImage. */
+  private pixelsToCanvas(res: number, px: Uint8Array): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = res;
+    canvas.height = res;
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+    const image = new ImageData(new Uint8ClampedArray(px.buffer, px.byteOffset, res * res * 4), res, res);
+    ctx.putImageData(image, 0, 0);
+    return canvas;
   }
 
   private buildTerrainLayer(width: number, height: number): HTMLCanvasElement {

@@ -6,7 +6,6 @@
 * server is disconnected message
 * get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space
 * impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
-* biomes missing (since we did seabead deepening?) everything is beach... also shoreline looks blocky, perhaps bc of seabed deepening
 * make stuff look cool pass)
 * RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
 * shader for volumetric explosions https://www.shadertoy.com/view/lsySzd

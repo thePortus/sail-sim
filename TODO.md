@@ -10,6 +10,7 @@
 * streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
 * better latency handling
 * server is disconnected message
+* Plan to make towns or areas "different"... things to see, special marvels
 * For landscape.... distant trees scattered and then node material editor PBR
 * sound is chunking on windows machines still
 * get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space

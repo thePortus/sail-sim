@@ -440,6 +440,7 @@ function sendWallet(p) {
     p.ws.send(JSON.stringify({
       type: 'wallet', gold: p.gold | 0, cargo: p.cargo || {},
       capacity: economy.capacityFor(p.state && p.state.vesselSlug),
+      catalog: economy.goodsCatalog(),
     }));
   }
 }
@@ -507,6 +508,7 @@ function attachMultiplayer(server) {
   let broadcastCooldown = 0;
   setInterval(() => {
     weatherState.tick();
+    economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
@@ -519,6 +521,7 @@ function attachMultiplayer(server) {
   setInterval(() => {
     // economy save = backstop (trades persist inline); location + hull damage persist here + on disconnect.
     for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); saveCombatState(p); }
+    economy.flushState();   // town-market drift (global) — once, not per-player; no-op unless dirty
   }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change

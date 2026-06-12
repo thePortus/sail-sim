@@ -14,6 +14,7 @@ db.Sequelize = Sequelize;
 db.sequelize = sequelize;
 
 db.User = require('./user.model')(sequelize, Sequelize.DataTypes);
+db.EconomyState = require('./economy-state.model')(sequelize, Sequelize.DataTypes);
 
 /**
  * Self-applying, NON-destructive schema top-up. This project has no sequelize.sync(), so new columns
@@ -37,6 +38,26 @@ db.ensureColumns = async () => {
     } catch {
       /* already exists (or DB unreachable) — a genuinely missing column surfaces at query time */
     }
+  }
+};
+
+/**
+ * Idempotent table top-up (dev/runtime backstop; the migration in server/migrations is the prod authority).
+ * Mirrors ensureColumns — createTable swallows "already exists". AWAIT this before serving traffic so a fresh
+ * DB has the table before the first economy query (economy.loadState also tolerates a missing table).
+ */
+db.ensureTables = async () => {
+  const qi = sequelize.getQueryInterface();
+  const DT = Sequelize.DataTypes;
+  try {
+    await qi.createTable('economyStates', {
+      mapVersion:  { type: DT.INTEGER, primaryKey: true, allowNull: false },
+      lastTickDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
+      towns:       { type: DT.TEXT('medium'), allowNull: false },
+    });
+    console.log('[db] created table economyStates');
+  } catch {
+    /* already exists (or DB unreachable) */
   }
 };
 

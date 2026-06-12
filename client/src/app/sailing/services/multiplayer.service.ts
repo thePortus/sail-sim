@@ -104,6 +104,7 @@ export class MultiplayerService {
   cargo    = signal<Record<string, number>>({});
   capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
   market   = signal<MarketState | null>(null);
+  goodsCatalog = signal<Record<string, string>>({});   // goodId → display name (for the inventory panel anywhere)
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -482,6 +483,11 @@ export class MultiplayerService {
       this.gold.set(+msg.gold || 0);
       this.cargo.set((msg.cargo && typeof msg.cargo === 'object') ? msg.cargo as Record<string, number> : {});
       if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+      if (Array.isArray(msg.catalog)) {
+        const cat: Record<string, string> = {};
+        for (const g of msg.catalog) cat[String(g.id)] = String(g.name);
+        this.goodsCatalog.set(cat);
+      }
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.

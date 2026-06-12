@@ -48,7 +48,9 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
           </div>
           @for (g of m.goods; track g.goodId) {
             <div class="tr-row">
-              <span class="tr-good">{{ g.name }}</span>
+              <span class="tr-good">{{ g.name }}
+                @if (scarcity(g.level); as sc) { <span class="tr-tag" [class]="'tr-tag--' + sc.cls">{{ sc.label }}</span> }
+              </span>
               <span class="tr-num">{{ g.ask }}</span>
               <span class="tr-num">{{ g.bid }}</span>
               <span class="tr-num" [class.tr-have]="held(g.goodId) > 0">{{ held(g.goodId) }}</span>
@@ -71,9 +73,9 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
     </div>
   `,
   styles: [`
-    .tr-backdrop { position: fixed; inset: 0; background: rgba(8, 6, 3, 0.55); z-index: 40; }
+    .tr-backdrop { position: fixed; inset: 0; background: rgba(8, 6, 3, 0.55); z-index: 70; }
     .tr-panel {
-      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 41;
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 71;
       width: min(440px, 92vw); max-height: 86vh; overflow: hidden auto;
       background: linear-gradient(160deg, #2e2013, #15100a);
       border: 1px solid #6e5326; border-radius: 12px; padding: 1.1rem 1.2rem 1.2rem;
@@ -97,6 +99,9 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
     .tr-row:not(.tr-row--head):nth-child(odd) { background: rgba(255,255,255,0.03); }
     .tr-row--head { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; color: #b89a62; border-bottom: 1px solid rgba(184,138,62,0.2); }
     .tr-good { color: #f0e3c6; }
+    .tr-tag { display: inline-block; margin-left: 0.35rem; padding: 0.02rem 0.32rem; border-radius: 4px; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; vertical-align: middle; }
+    .tr-tag--scarce { background: rgba(190,80,60,0.28); color: #f0b8a8; }
+    .tr-tag--abundant { background: rgba(110,150,90,0.28); color: #c6e0b0; }
     .tr-num { text-align: right; color: #cdbb95; font-variant-numeric: tabular-nums; }
     .tr-have { color: #f0c869; font-weight: 600; }
     .tr-acts { display: flex; gap: 0.3rem; justify-content: flex-end; }
@@ -143,11 +148,19 @@ export class TraderMenuComponent {
     this.mp.tradeSell(m.townId, goodId, this.qty());
   }
 
+  /** Scarcity badge from the server's `level` (stock/priceRef). Scarce → dear, Abundant → cheap. */
+  scarcity(level?: number): { label: string; cls: string } | null {
+    if (level == null) return null;
+    if (level < 0.7) return { label: 'Scarce', cls: 'scarce' };
+    if (level > 1.6) return { label: 'Abundant', cls: 'abundant' };
+    return null;
+  }
+
   prettyError(reason: string): string {
     const map: Record<string, string> = {
       no_gold: 'Not enough gold.', no_space: 'Hold is full.', no_goods: "You don't have that to sell.",
       not_docked: 'You must be docked here.', bad_qty: 'Invalid quantity.', bad_good: 'Unknown good.',
-      no_town: 'No market here.',
+      no_town: 'No market here.', town_out: 'Sold out here.', town_broke: "The town can't afford that right now.",
     };
     return map[reason] ?? `Trade failed (${reason}).`;
   }

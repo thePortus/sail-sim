@@ -42,43 +42,32 @@ const SPECIALTIES = {
   port:       { label: 'Trade Port',  produces: ['cloth', 'spices'],            consumes: ['sugar', 'cotton', 'tobacco', 'timber', 'salt_fish'] },
 };
 
-// Specialty modifier on the mid price: produced here → cheap; consumed here → dear; otherwise par.
-const PRODUCE_MULT = 0.6;
-const CONSUME_MULT = 1.6;
-const NEUTRAL_MULT = 1.0;
-
-// Merchant's cut (ask>bid). Wider at smaller/rougher ports. The produce/consume gradient dominates the spread
-// so a producer→consumer run is always profitable even worst-case (both small): buy 0.6·1.15 vs sell 1.6·0.85.
+// Merchant's cut (ask>bid). Wider at smaller/rougher ports.
 const SPREAD_BY_TIER = { capital: 0.15, medium: 0.22, small: 0.30 };
 
 const REPAIR_FEE = 40;          // gold per dock repair (the first gold sink)
 const STARTING_GOLD = 500;
 
+// ── Phase 2: dynamic economy config (all tunable) ────────────────────────────
+// Price is driven purely by STOCK relative to a per-good price-neutral anchor (priceRef): surplus → cheap,
+// scarcity → dear. mid = base × clamp((priceRef/S)^ELASTICITY, lo, hi). The producer-cheap / consumer-dear
+// gradient comes from SEEDING stock at different ratios of priceRef (not a static multiplier), so it
+// strengthens as surplus/scarcity actually accrue and a producer→consumer run stays profitable.
+const ELASTICITY = 0.6;
+const STOCK_CLAMP = { lo: 0.4, hi: 2.5 };                 // mid is base×[0.4 … 2.5]
+// Seed-stock ÷ priceRef for each role, chosen so opening prices ≈ Phase-1 (0.6× producer / 1.6× consumer / 1×):
+//   (priceRef/S)^0.6 = 0.6  → S/priceRef = 2.343   |   = 1.6 → 0.457   |   = 1.0 → 1.0
+const SEED_RATIO   = { produced: 2.343, consumed: 0.457, neutral: 1.0 };
+const TIER_SCALE   = { capital: 3, medium: 1.5, small: 1 };   // bigger towns trade bigger absolute volumes
+const ROLE_RATE    = 6;        // base units/day a town produces (or consumes) of a role good, ×TIER_SCALE
+const REF_DAYS      = 60;      // priceRef = ratePerDay × REF_DAYS → ~weeks of buffer ⇒ gradual daily drift
+const NEUTRAL_REF   = 20;      // priceRef for goods a town neither makes nor needs (thin, ×TIER_SCALE)
+const STOCK_CAP_MULT = 3;      // a glutted producer's stock caps at STOCK_CAP_MULT × priceRef
+const TREASURY0     = { capital: 6000, medium: 2500, small: 1000 };   // a town's starting (and max) gold purse
+const TREASURY_REGEN = 0.05;   // per day, fraction of (cap − treasury) regained (self-heals when drained)
+
 /** All valid specialty keys. */
 function specialtyKeys() { return Object.keys(SPECIALTIES); }
-
-/** The mid/ask/bid a town of the given specialty+tier quotes for one good. Deterministic, no state. */
-function priceFor(specialty, goodId, tier) {
-  const g = GOOD_BY_ID.get(goodId);
-  const spec = SPECIALTIES[specialty];
-  if (!g || !spec) return null;
-  const mult = spec.produces.includes(goodId) ? PRODUCE_MULT
-            : spec.consumes.includes(goodId) ? CONSUME_MULT
-            : NEUTRAL_MULT;
-  const mid = g.base * mult;
-  const s = SPREAD_BY_TIER[tier] ?? SPREAD_BY_TIER.medium;
-  const ask = Math.max(1, Math.round(mid * (1 + s / 2)));   // player BUYS at ask
-  const bid = Math.max(1, Math.round(mid * (1 - s / 2)));   // player SELLS at bid
-  return { ask, bid };
-}
-
-/** The full market a town quotes: one row per good. Returned to the client verbatim. */
-function market(specialty, tier) {
-  return GOODS.map((g) => {
-    const p = priceFor(specialty, g.id, tier);
-    return { goodId: g.id, name: g.name, ask: p.ask, bid: p.bid };
-  });
-}
 
 /** Cargo slots one unit of a good occupies (uniform 1 in Phase 1). */
 function goodVolume(goodId) { return GOOD_BY_ID.get(goodId)?.volume ?? 1; }
@@ -86,7 +75,41 @@ function goodVolume(goodId) { return GOOD_BY_ID.get(goodId)?.volume ?? 1; }
 /** Whether a good id is real (validation guard). */
 function isGood(goodId) { return GOOD_BY_ID.has(goodId); }
 
+/** Base reference price of a good. */
+function basePrice(goodId) { return GOOD_BY_ID.get(goodId)?.base ?? 1; }
+
+/**
+ * The economic profile of one good at a town (specialty+tier). Deterministic from config — NOT persisted, so
+ * retuning the constants re-derives it from the saved live stock. role ∈ produced|consumed|neutral.
+ */
+function townGoodProfile(specialty, tier, goodId) {
+  const spec = SPECIALTIES[specialty] || SPECIALTIES.port;
+  const scale = TIER_SCALE[tier] ?? TIER_SCALE.medium;
+  const role = spec.produces.includes(goodId) ? 'produced'
+             : spec.consumes.includes(goodId) ? 'consumed'
+             : 'neutral';
+  const ratePerDay = role === 'neutral' ? 0 : ROLE_RATE * scale;
+  const priceRef = role === 'neutral' ? NEUTRAL_REF * scale : ratePerDay * REF_DAYS;
+  const stockCap = STOCK_CAP_MULT * priceRef;
+  const seedStock = SEED_RATIO[role] * priceRef;
+  return { role, ratePerDay, priceRef, stockCap, seedStock };
+}
+
+/** Ask/bid for ONE unit of a good given the town's live stock + its priceRef + tier. Player BUYS at ask,
+ *  SELLS at bid. Stock floored at 1 to avoid div-by-zero (the caller walks multi-unit orders unit-by-unit). */
+function quote(base, priceRef, stock, tier) {
+  const S = Math.max(1, stock);
+  const factor = Math.min(STOCK_CLAMP.hi, Math.max(STOCK_CLAMP.lo, Math.pow(priceRef / S, ELASTICITY)));
+  const mid = base * factor;
+  const s = SPREAD_BY_TIER[tier] ?? SPREAD_BY_TIER.medium;
+  const ask = Math.max(1, Math.round(mid * (1 + s / 2)));
+  const bid = Math.max(1, Math.round(mid * (1 - s / 2)));
+  return { ask, bid };
+}
+
 module.exports = {
   GOODS, SPECIALTIES, SPREAD_BY_TIER, REPAIR_FEE, STARTING_GOLD,
-  specialtyKeys, priceFor, market, goodVolume, isGood,
+  ELASTICITY, STOCK_CLAMP, SEED_RATIO, TIER_SCALE, ROLE_RATE, REF_DAYS,
+  NEUTRAL_REF, STOCK_CAP_MULT, TREASURY0, TREASURY_REGEN,
+  specialtyKeys, goodVolume, isGood, basePrice, townGoodProfile, quote,
 };

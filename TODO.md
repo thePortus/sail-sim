@@ -2,10 +2,15 @@
 
 # General or Current TODO Items
 
+* improved landscape with NME & more scatter to distant
+* ship status in db... start all players in pinnace, allow switch via menu... ship inventory.. persistent ship damage... leave slots for ship upgrade
+* town economies... goods they produce, consume... all produce one or two goods for export, will need the rest, prices based on amount in town... step 1
+* AI ships... step 2
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-* streaming assets has gotten weird, trees move in and out
+* streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
 * better latency handling
 * server is disconnected message
+* For landscape.... distant trees scattered and then node material editor PBR
 * sound is chunking on windows machines still
 * get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space
 * impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics

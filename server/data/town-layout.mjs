@@ -262,5 +262,48 @@ export function assignTowns(sites, seed, elevAt, footprints) {
     t.streets = layout.streets;
     delete t._site;
   }
+
+  assignSpecialties(towns, seed);
+  return towns;
+}
+
+// Specialty pools per tier (capitals are trade hubs → mostly ports). Keep keys in sync with
+// server/trade-goods.js SPECIALTIES.
+const SPEC_POOLS = {
+  capital: ['port', 'port', 'port', 'forge', 'distillery', 'plantation'],
+  medium:  ['plantation', 'plantation', 'distillery', 'forge', 'logging', 'fishing'],
+  small:   ['farmstead', 'fishing', 'logging', 'plantation'],
+};
+const ALL_SPECS = ['plantation', 'distillery', 'forge', 'logging', 'fishing', 'farmstead', 'port'];
+
+/**
+ * Assign each town an economic `specialty` (Town Economy). Uses a DEDICATED rng stream so it never perturbs
+ * the geometry streams in assignTowns (the global `rng` / per-town `lr`) — geometry stays byte-identical and
+ * only the `specialty` field is added. Then a guarantee pass ensures every specialty appears ≥1 town (so every
+ * consumed good has a producer somewhere). Deterministic given (towns order + tiers + seed). Exported so a
+ * one-off manifest patch can apply the SAME assignment without a full terrain re-bake.
+ */
+export function assignSpecialties(towns, seed) {
+  for (let i = 0; i < towns.length; i++) {
+    const sr = mulberry32((((seed ?? 1) ^ ((0x85ebca6b * (i + 1)) >>> 0) ^ 0x53504543) >>> 0));
+    const pool = SPEC_POOLS[towns[i].tier] || SPEC_POOLS.medium;
+    towns[i].specialty = pool[Math.floor(sr() * pool.length)];
+  }
+  // Fill any missing specialty onto the least-disruptive towns first (small, then medium; never a capital).
+  const tierRank = { small: 0, medium: 1, capital: 2 };
+  const present = new Set(towns.map((t) => t.specialty));
+  const missing = ALL_SPECS.filter((s) => !present.has(s));
+  if (missing.length) {
+    const fillOrder = towns
+      .map((t, i) => ({ i, rank: tierRank[t.tier] ?? 1 }))
+      .sort((a, b) => a.rank - b.rank || a.i - b.i);
+    let fi = 0;
+    for (const spec of missing) {
+      while (fi < fillOrder.length && towns[fillOrder[fi].i].tier === 'capital') fi++;
+      if (fi >= fillOrder.length) break;
+      towns[fillOrder[fi].i].specialty = spec;
+      fi++;
+    }
+  }
   return towns;
 }

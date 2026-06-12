@@ -40,6 +40,7 @@ import { VesselSelectorComponent } from '../sailing/components/vessel-selector/v
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
+import { TraderMenuComponent }     from './trader-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -49,7 +50,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -115,10 +116,17 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
             <div class="dock-menu">
               <div class="dock-name">{{ town.name }}</div>
               <div class="dock-desc">{{ town.description }}</div>
-              <button class="dock-opt" (click)="onRepairVessel()">Repair Vessel</button>
+              <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
+              <button class="dock-opt" [disabled]="multiplayerService.gold() < repairFee"
+                      (click)="onRepairVessel()">Repair Vessel ({{ repairFee }}g)</button>
               <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
             </div>
           }
+        }
+
+        <!-- Trader panel (opened from the dock menu's Trade button) -->
+        @if (tradeMenuOpen()) {
+          <app-trader-menu (close)="tradeMenuOpen.set(false)" />
         }
 
         <!-- Sunk overlay — acknowledge to respawn at the nearest port -->
@@ -218,7 +226,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private reedService        = inject(ReedService);
   private shipBellService    = inject(ShipBellService);
   private sailAudioService   = inject(SailAudioService);
-  private multiplayerService = inject(MultiplayerService);
+  protected multiplayerService = inject(MultiplayerService);   // template reads gold()/etc. for the trader
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
@@ -230,6 +238,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
+  tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
+  protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
@@ -316,10 +326,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
-    // Sailed away from the pier → close the town menu if it was open.
+    // Sailed away from the pier → close the town menu (and trader panel) if they were open.
     effect(() => {
-      if (!this.harborService.dockable() && untracked(() => this.dockMenuOpen())) {
-        this.dockMenuOpen.set(false);
+      if (!this.harborService.dockable()) {
+        untracked(() => {
+          if (this.dockMenuOpen()) this.dockMenuOpen.set(false);
+          if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+        });
       }
     });
   }
@@ -565,6 +578,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
     this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
     this.multiplayerService.requestRespawn();
+  }
+
+  /** Dock action: open the town trader (asks the server for this town's market quote). */
+  onTrade(townId: string): void {
+    this.multiplayerService.openTrade(townId);
+    this.tradeMenuOpen.set(true);
   }
 
   /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */

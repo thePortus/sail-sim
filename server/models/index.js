@@ -24,6 +24,10 @@ db.ensureColumns = async () => {
   const qi = sequelize.getQueryInterface();
   const adds = [
     ['lastMapVersion', { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
+    // Town Economy: gold defaults to 500 so the addColumn backfills existing players with a starting purse.
+    ['gold',        { type: Sequelize.DataTypes.INTEGER, allowNull: false, defaultValue: 500 }],
+    ['cargo',       { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
+    ['tradeLedger', { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {

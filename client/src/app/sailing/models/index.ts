@@ -105,7 +105,15 @@ export interface TerrainHarbor {
   buildings?: TownBuilding[];
   square?: TownRect | null;
   streets?: TownStreet[];
+  // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
+  specialty?: string;
 }
+
+// ── Town Economy (Phase 1) ──────────────────────────────────────────────────
+/** One good's quoted prices at a town: ask = player buys, bid = player sells. */
+export interface MarketRow { goodId: string; name: string; ask: number; bid: number; }
+/** A town's market quote, pushed by the server when the trader is opened or a trade resolves. */
+export interface MarketState { townId: string; name: string; specialty: string; goods: MarketRow[]; }
 
 export interface TerrainManifest {
   version: number;

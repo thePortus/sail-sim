@@ -15,7 +15,7 @@ import { CombatService } from './combat.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
-import { OtherPlayer, SailState, ChatMessage } from '../models';
+import { OtherPlayer, SailState, ChatMessage, MarketState } from '../models';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
 
@@ -96,6 +96,16 @@ export class MultiplayerService {
   // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
   // watches this to force a fresh login — the session token can no longer be trusted.
   authFailed    = signal<boolean>(false);
+
+  // ── Town Economy ────────────────────────────────────────────────────────────
+  // Authoritative purse + hold (server-pushed via 'wallet'/'market_state'), and the currently open town's
+  // market quote (null when the trader panel is closed / no market loaded). The trader UI reads these signals.
+  gold     = signal<number>(0);
+  cargo    = signal<Record<string, number>>({});
+  capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
+  market   = signal<MarketState | null>(null);
+  /** Last trade rejection reason (transient; the panel may surface it as a toast). */
+  tradeError = signal<string | null>(null);
 
   // Callsigns this user has muted/blocked — their chat is dropped on receipt.
   // Persisted in localStorage so the block list survives reloads.
@@ -190,6 +200,22 @@ export class MultiplayerService {
     this.vesselService.stopSinking();                  // refloat the hull (eases buoyancy back to normal)
     if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
   }
+
+  // ── Town Economy: trade actions (server-authoritative) ──────────────────────
+  /** Open a town's trader → server replies with its market quote + our wallet. */
+  openTrade(townId: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_open', townId }));
+  }
+  /** Buy `qty` of a good at a town (validated server-side; reply updates market + wallet). */
+  tradeBuy(townId: string, goodId: string, qty: number): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_buy', townId, goodId, qty }));
+  }
+  /** Sell `qty` of a good at a town (validated server-side; reply updates market + wallet). */
+  tradeSell(townId: string, goodId: string, qty: number): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_sell', townId, goodId, qty }));
+  }
+  /** Close the trader panel locally (clears the open market quote). */
+  closeTrade(): void { this.market.set(null); }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
    *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
@@ -448,6 +474,28 @@ export class MultiplayerService {
         chatType:  msg.chatType === 'dm' ? 'dm' : 'global',
       };
       this.chatMessages.update(msgs => [...msgs.slice(-199), chatMsg]);
+
+    } else if (msg.type === 'wallet') {
+      // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).
+      this.gold.set(+msg.gold || 0);
+      this.cargo.set((msg.cargo && typeof msg.cargo === 'object') ? msg.cargo as Record<string, number> : {});
+      if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+
+    } else if (msg.type === 'market_state') {
+      // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
+      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [] });
+      if (msg.gold != null) this.gold.set(+msg.gold || 0);
+      if (msg.cargo && typeof msg.cargo === 'object') this.cargo.set(msg.cargo as Record<string, number>);
+      if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+
+    } else if (msg.type === 'repair_result') {
+      // Dock repair adjudication. On denial (insufficient gold) the wallet message that accompanies it
+      // already corrected our gold; nothing to refloat here (the UI gates the button by gold).
+      this.gold.set(+msg.gold || this.gold());
+      if (!msg.ok) this.tradeError.set('Not enough gold to repair.');
+
+    } else if (msg.type === 'trade_error') {
+      this.tradeError.set(String(msg.reason ?? 'trade failed'));
     }
   }
 

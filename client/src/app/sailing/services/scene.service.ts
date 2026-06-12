@@ -663,10 +663,14 @@ export class SceneService {
     // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
     // water with soft-waterline foam.
     depthMap.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.metadata?.excludeFromOceanDepth;
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.skeleton && !m.metadata?.excludeFromOceanDepth;
     // ^ scatter_* = inland foliage (grass/trees/palms/rocks — hundreds of patch meshes). They're above
     // water and never want shoreline foam, so drawing them into this FULL-SCREEN, EVERY-FRAME depth pass
     // was pure cost (the refraction RTT already excludes them for the same reason).
+    // !m.skeleton = the SKINNED meshes (ship crew figures, sails, rigging — ~73 draws on the player vessel
+    // alone, and the single most expensive thing in this pass). They sit ABOVE the waterline, so they have
+    // zero effect on shoreline depth or seabed/hull occlusion — excluding them reclaims ~4 ms/frame
+    // (measured live: 41→37 ms) with no visual change, and scales with crew count in multiplayer.
     // EVERY frame, ALWAYS. A quality-driven every-other-frame throttle was tried TWICE and reverted
     // TWICE: a one-frame-stale depth map misaligns with the camera during rotation, and the waterline
     // foam reads the misaligned depths as "geometry just behind the surface" → bright foam STROBES

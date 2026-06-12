@@ -1,6 +1,6 @@
 import {
   Component, ElementRef, ViewChild,
-  AfterViewInit, OnDestroy, inject, signal, effect,
+  AfterViewInit, OnDestroy, inject, signal, computed, effect,
   HostListener, untracked,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
@@ -40,6 +40,7 @@ import { VesselSelectorComponent } from '../sailing/components/vessel-selector/v
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
+import { TraderMenuComponent }     from './trader-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -49,7 +50,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -115,10 +116,45 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
             <div class="dock-menu">
               <div class="dock-name">{{ town.name }}</div>
               <div class="dock-desc">{{ town.description }}</div>
-              <button class="dock-opt" (click)="onRepairVessel()">Repair Vessel</button>
+              <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
+              <button class="dock-opt" (click)="onRepairVessel()">
+                Repair Vessel ({{ multiplayerService.gold() >= repairFee ? repairFee + 'g' : 'free' }})
+              </button>
               <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
             </div>
           }
+        }
+
+        <!-- Trader panel (opened from the dock menu's Trade button) -->
+        @if (tradeMenuOpen()) {
+          <app-trader-menu (close)="tradeMenuOpen.set(false)" />
+        }
+
+        <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
+        @if (salvageNotice(); as note) {
+          <div class="salvage-toast">📦 {{ note }}</div>
+        }
+
+        <!-- Ship's Hold — gold + cargo, viewable anytime with I or Tab -->
+        @if (inventoryOpen()) {
+          <div class="inv-backdrop" (click)="inventoryOpen.set(false)"></div>
+          <div class="inv-panel">
+            <div class="inv-header">
+              <span class="inv-title">Ship's Hold</span>
+              <span class="inv-gold">⚜ {{ multiplayerService.gold() }} gold</span>
+            </div>
+            <div class="inv-cap">Hold {{ inventoryUsed() }}/{{ multiplayerService.capacity() }}</div>
+            @if (inventoryList().length) {
+              <div class="inv-list">
+                @for (it of inventoryList(); track it.id) {
+                  <div class="inv-row"><span>{{ it.name }}</span><span class="inv-qty">{{ it.qty }}</span></div>
+                }
+              </div>
+            } @else {
+              <div class="inv-empty">Your hold is empty — visit a town's trader to buy goods.</div>
+            }
+            <div class="inv-hint">Press I or Tab to close</div>
+          </div>
         }
 
         <!-- Sunk overlay — acknowledge to respawn at the nearest port -->
@@ -171,6 +207,29 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                  border: 1px solid rgba(255,255,255,0.15); background: transparent;
                  color: rgba(255,255,255,0.6); font-family: ui-monospace, monospace; }
     .dock-cast:hover { color: #fff; }
+    /* Salvage toast (top-centre) */
+    .salvage-toast { position: absolute; top: 5.5rem; left: 50%; transform: translateX(-50%); z-index: 85;
+                     padding: 8px 16px; border-radius: 9px; border: 1px solid rgba(232,211,160,0.5);
+                     background: rgba(20,28,40,0.92); color: #ffe9b0; font-weight: 600;
+                     font-family: 'IBM Plex Serif', Georgia, serif; box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
+    /* Ship's Hold (inventory) — walnut/brass, viewable anytime with I / Tab */
+    .inv-backdrop { position: absolute; inset: 0; z-index: 80; background: rgba(8,6,3,0.45); }
+    .inv-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 81;
+                 width: min(360px, 90vw); max-height: 80vh; overflow: hidden auto;
+                 padding: 1.1rem 1.2rem; border-radius: 12px; border: 1px solid #6e5326;
+                 background: linear-gradient(160deg, #2e2013, #15100a); color: #f0e3c6;
+                 font-family: 'IBM Plex Serif', Georgia, serif; box-shadow: 0 18px 50px rgba(0,0,0,0.6); }
+    .inv-header { display: flex; align-items: baseline; justify-content: space-between;
+                  border-bottom: 1px solid rgba(184,138,62,0.3); padding-bottom: 0.5rem; }
+    .inv-title { font-size: 1.2rem; font-weight: 600; color: #e8d3a0; }
+    .inv-gold { color: #f0c869; font-weight: 600; }
+    .inv-cap { color: #cdbb95; font-size: 0.85rem; margin: 0.55rem 0 0.4rem; }
+    .inv-list { display: flex; flex-direction: column; gap: 2px; }
+    .inv-row { display: flex; justify-content: space-between; padding: 0.32rem 0.2rem; border-radius: 5px; }
+    .inv-row:nth-child(odd) { background: rgba(255,255,255,0.03); }
+    .inv-qty { color: #f0c869; font-variant-numeric: tabular-nums; font-weight: 600; }
+    .inv-empty { padding: 1.2rem 0; text-align: center; color: #b89a62; font-style: italic; }
+    .inv-hint { margin-top: 0.8rem; text-align: center; color: #8a7448; font-size: 0.72rem; }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                    opacity: 0; transition: opacity 0.8s ease; }
@@ -218,7 +277,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private reedService        = inject(ReedService);
   private shipBellService    = inject(ShipBellService);
   private sailAudioService   = inject(SailAudioService);
-  private multiplayerService = inject(MultiplayerService);
+  protected multiplayerService = inject(MultiplayerService);   // template reads gold()/etc. for the trader
   protected combatService    = inject(CombatService);
   readonly cannonService      = inject(CannonService);    // public: template reads signals
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
@@ -230,13 +289,33 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
+  tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
+  inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
+  salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
+  private salvageTimer: ReturnType<typeof setTimeout> | null = null;
+  protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
+
+  /** Cargo as a sorted display list { id, name, qty } using the server-sent goods catalogue. */
+  protected inventoryList = computed(() => {
+    const cat = this.multiplayerService.goodsCatalog();
+    return Object.entries(this.multiplayerService.cargo())
+      .filter(([, q]) => q > 0)
+      .map(([id, qty]) => ({ id, name: cat[id] ?? id, qty }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  });
+  protected inventoryUsed = computed(() =>
+    Object.values(this.multiplayerService.cargo()).reduce((a, b) => a + (b || 0), 0));
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
   @HostListener('window:keydown.escape')
   onEscKey(): void {
     if (this.phase() !== 'sailing') return;
-    // Esc backs out of Settings first; then stands down an armed gun; then pause.
+    // Esc backs out of the hold first; then Settings; then stands down an armed gun; then pause.
+    if (this.inventoryOpen()) {
+      this.inventoryOpen.set(false);
+      return;
+    }
     if (this.showSettings()) {
       this.showSettings.set(false);
       return;
@@ -246,6 +325,23 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       return;
     }
     this.paused.update(v => !v);
+  }
+
+  // Toggle the Ship's Hold (inventory + gold) with I or Tab — viewable anytime while sailing.
+  @HostListener('window:keydown.i', ['$event'])
+  @HostListener('window:keydown.tab', ['$event'])
+  onInventoryKey(e: KeyboardEvent): void {
+    if (this.phase() !== 'sailing' || this.typingInField()) return;
+    e.preventDefault();                          // Tab would otherwise move focus
+    this.inventoryOpen.update(v => !v);
+  }
+
+  /** True when a text field (e.g. chat) is focused, so game hotkeys don't hijack typing. */
+  private typingInField(): boolean {
+    const el = document.activeElement as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
   }
 
   /** True if the logged-in user has admin or owner role — controls admin panel visibility. */
@@ -316,11 +412,44 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
-    // Sailed away from the pier → close the town menu if it was open.
+    // Sailed away from the pier → close the town menu (and trader panel) if they were open.
     effect(() => {
-      if (!this.harborService.dockable() && untracked(() => this.dockMenuOpen())) {
-        this.dockMenuOpen.set(false);
+      if (!this.harborService.dockable()) {
+        untracked(() => {
+          if (this.dockMenuOpen()) this.dockMenuOpen.set(false);
+          if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+        });
       }
+    });
+
+    // Closing the town menu (Cast Off, or any path) closes the trader panel too — the trader lives "inside" it.
+    effect(() => {
+      if (!this.dockMenuOpen() && untracked(() => this.tradeMenuOpen())) {
+        untracked(() => { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); });
+      }
+    });
+
+    // Arrived at the rumoured town → the rumour is fulfilled, clear its map beacon.
+    effect(() => {
+      const here = this.harborService.dockable();
+      if (here && here.id === this.multiplayerService.hintedHarbor()) {
+        untracked(() => this.multiplayerService.hintedHarbor.set(null));
+      }
+    });
+
+    // Collected salvage → flash a transient "Salvaged: …" toast (good names from the catalogue).
+    effect(() => {
+      const t = this.multiplayerService.salvageToast();
+      if (!t) return;
+      untracked(() => {
+        const cat = this.multiplayerService.goodsCatalog();
+        const parts = Object.entries(t.goods).map(([id, q]) => `${q} ${cat[id] ?? id}`);
+        if (t.gold > 0) parts.push(`${t.gold} gold`);
+        this.salvageNotice.set(parts.length ? 'Salvaged: ' + parts.join(', ') : 'Salvaged the wreck');
+        this.multiplayerService.salvageToast.set(null);
+        if (this.salvageTimer) clearTimeout(this.salvageTimer);
+        this.salvageTimer = setTimeout(() => this.salvageNotice.set(null), 3500);
+      });
     });
   }
 
@@ -381,6 +510,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       await this.runInitStep('init-harbors', 'Raising the harbours…', async () => {
         await this.harborService.init();
       });
+      // Floating salvage crates (from sunk NPC merchants) — render + sail-over collection.
+      this.multiplayerService.salvageService.init(this.sceneService.scene);
 
       // 3b. Asset scattering (grass/rocks/driftwood/trees/palms) — needs the terrain ready.
       // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.
@@ -565,6 +696,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
     this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
     this.multiplayerService.requestRespawn();
+  }
+
+  /** Dock action: open the town trader (asks the server for this town's market quote). */
+  onTrade(townId: string): void {
+    this.multiplayerService.openTrade(townId);
+    this.tradeMenuOpen.set(true);
   }
 
   /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */

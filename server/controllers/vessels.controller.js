@@ -60,6 +60,7 @@ const VESSELS = [
       stbd: [{ x:  0.95, y: 0.85, z: -0.15 }],
     },
     zoneHp: { bow: 55, stern: 55, port: 80, starboard: 80, masts: 60 },
+    cargo: 20,                    // hold capacity in cargo slots (Town Economy) — small, nimble
     parts: [],
   },
   {
@@ -81,6 +82,7 @@ const VESSELS = [
     // Helm — just aft of the wheel, on the centreline, standing eye height, looking forward.
     firstPersonCam: { x: 0.6, y: 2.6, z: -2.8 },
     zoneHp: { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
+    cargo: 40,                    // hold capacity in cargo slots (Town Economy) — stout merchantman
     parts: [],
   },
 ];

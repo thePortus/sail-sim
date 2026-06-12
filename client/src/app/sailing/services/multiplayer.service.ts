@@ -12,10 +12,11 @@ import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
+import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
-import { OtherPlayer, SailState, ChatMessage } from '../models';
+import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
 
@@ -85,6 +86,7 @@ export class MultiplayerService {
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
   private authService    = inject(AuthService);
+  readonly salvageService = inject(SalvageService);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
   chatMessages  = signal<ChatMessage[]>([]);
@@ -96,6 +98,27 @@ export class MultiplayerService {
   // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
   // watches this to force a fresh login — the session token can no longer be trusted.
   authFailed    = signal<boolean>(false);
+
+  // ── Town Economy ────────────────────────────────────────────────────────────
+  // Authoritative purse + hold (server-pushed via 'wallet'/'market_state'), and the currently open town's
+  // market quote (null when the trader panel is closed / no market loaded). The trader UI reads these signals.
+  gold     = signal<number>(0);
+  cargo    = signal<Record<string, number>>({});
+  capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
+  market   = signal<MarketState | null>(null);
+  goodsCatalog = signal<Record<string, string>>({});   // goodId → display name (for the inventory panel anywhere)
+  // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
+  ledger       = signal<Record<string, LedgerEntry>>({});
+  hint         = signal<MarketHint | null>(null);
+  hintedHarbor = signal<string | null>(null);
+  // Position of the single nearest NPC merchant (any distance) — for the minimap marker only.
+  nearestMerchant = signal<{ x: number; z: number } | null>(null);
+  // Set when the player collects salvage — the game overlay shows a transient toast.
+  salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
+  /** Last trade rejection reason (transient; the panel may surface it as a toast). */
+  tradeError = signal<string | null>(null);
+  /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
+  lastRepairMercy = signal<boolean>(false);
 
   // Callsigns this user has muted/blocked — their chat is dropped on receipt.
   // Persisted in localStorage so the block list survives reloads.
@@ -190,6 +213,22 @@ export class MultiplayerService {
     this.vesselService.stopSinking();                  // refloat the hull (eases buoyancy back to normal)
     if (this.myId) this.onCombatRepair?.(this.myId);   // wipe our own scorch marks now
   }
+
+  // ── Town Economy: trade actions (server-authoritative) ──────────────────────
+  /** Open a town's trader → server replies with its market quote + our wallet. */
+  openTrade(townId: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_open', townId }));
+  }
+  /** Buy `qty` of a good at a town (validated server-side; reply updates market + wallet). */
+  tradeBuy(townId: string, goodId: string, qty: number): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_buy', townId, goodId, qty }));
+  }
+  /** Sell `qty` of a good at a town (validated server-side; reply updates market + wallet). */
+  tradeSell(townId: string, goodId: string, qty: number): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'trade_sell', townId, goodId, qty }));
+  }
+  /** Close the trader panel locally (clears the open market quote). */
+  closeTrade(): void { this.market.set(null); }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
    *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
@@ -292,6 +331,11 @@ export class MultiplayerService {
     const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
     this.ws = new WebSocket(url);
 
+    // Let the salvage service ask the server to collect a crate the local ship sailed over.
+    this.salvageService.sendCollect = (crateId) => {
+      if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'salvage_collect', crateId }));
+    };
+
     this.ws.addEventListener('open', () => {
       this.updateTimer = setInterval(() => this.sendUpdate(), 100);
       // Round-trip ping for the debug overlay (everyone, backtick).
@@ -341,6 +385,13 @@ export class MultiplayerService {
     this.otherPlayers.set([]);
     this.myFriends.set([]);
     this.mutualFriends.set([]);
+    this.market.set(null);
+    this.ledger.set({});
+    this.hint.set(null);
+    this.hintedHarbor.set(null);
+    this.nearestMerchant.set(null);
+    this.salvageToast.set(null);
+    this.salvageService.clear();
   }
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
@@ -448,6 +499,58 @@ export class MultiplayerService {
         chatType:  msg.chatType === 'dm' ? 'dm' : 'global',
       };
       this.chatMessages.update(msgs => [...msgs.slice(-199), chatMsg]);
+
+    } else if (msg.type === 'wallet') {
+      // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).
+      this.gold.set(+msg.gold || 0);
+      this.cargo.set((msg.cargo && typeof msg.cargo === 'object') ? msg.cargo as Record<string, number> : {});
+      if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+      if (Array.isArray(msg.catalog)) {
+        const cat: Record<string, string> = {};
+        for (const g of msg.catalog) cat[String(g.id)] = String(g.name);
+        this.goodsCatalog.set(cat);
+      }
+
+    } else if (msg.type === 'market_state') {
+      // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
+      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [], hint: msg.hint ?? null });
+      this.hint.set(msg.hint ?? null);
+      this.hintedHarbor.set(msg.hint?.townId ?? null);
+      if (msg.gold != null) this.gold.set(+msg.gold || 0);
+      if (msg.cargo && typeof msg.cargo === 'object') this.cargo.set(msg.cargo as Record<string, number>);
+      if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+
+    } else if (msg.type === 'nearest_merchant') {
+      this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
+
+    } else if (msg.type === 'salvage_spawn') {
+      this.salvageService.spawn(String(msg.id), +msg.x, +msg.z);
+
+    } else if (msg.type === 'salvage_despawn') {
+      this.salvageService.despawn(String(msg.id));
+
+    } else if (msg.type === 'salvage_snapshot') {
+      this.salvageService.snapshot(Array.isArray(msg.crates) ? msg.crates : []);
+
+    } else if (msg.type === 'salvage_collected') {
+      // The wallet update arrives separately; surface a transient toast of what we scooped.
+      this.salvageToast.set({ goods: (msg.goods && typeof msg.goods === 'object') ? msg.goods : {}, gold: +msg.gold || 0 });
+
+    } else if (msg.type === 'ledger') {
+      // Full discovered-towns ledger (on connect).
+      this.ledger.set((msg.towns && typeof msg.towns === 'object') ? msg.towns as Record<string, LedgerEntry> : {});
+
+    } else if (msg.type === 'ledger_entry') {
+      // One town's discovery record refreshed (on opening its trader / trading there).
+      this.ledger.update(l => ({ ...l, [String(msg.townId)]: { specialty: msg.specialty, day: +msg.day || 0, goods: msg.goods || [] } }));
+
+    } else if (msg.type === 'repair_result') {
+      // Dock repair always succeeds (mercy free repair when broke). The wallet message alongside corrects gold.
+      this.gold.set(+msg.gold || this.gold());
+      this.lastRepairMercy.set(!!msg.mercy);
+
+    } else if (msg.type === 'trade_error') {
+      this.tradeError.set(String(msg.reason ?? 'trade failed'));
     }
   }
 
@@ -484,6 +587,7 @@ export class MultiplayerService {
         sailState:  'full',
         vesselName: 'Sloop', vesselSlug: 'sloop',
         callsign:   String(data.callsign ?? ''),
+        npc:        !!data.npc,
         buffer:      [],
         dispX:       sx,
         dispZ:       sz,
@@ -518,6 +622,7 @@ export class MultiplayerService {
     entry.callsign   = String(data.callsign   ?? '').slice(0, 32);
     entry.vesselName = String(data.vesselName ?? 'Sloop').slice(0, 64);
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
+    entry.npc        = !!data.npc;
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
     entry.anchored   = !!data.anchored;
@@ -1088,8 +1193,9 @@ export class MultiplayerService {
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
-    // Callsign label (billboard above masthead)
-    this.buildCallsignLabel(prefix + 'label', callsign, entry.root, scene);
+    // Nameplate (billboard above masthead) — NPC merchants show their ship name + a merchant tint.
+    const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
+    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, !!entry.npc);
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1120,7 +1226,7 @@ export class MultiplayerService {
   // ── Floating callsign label ───────────────────────────────────────────────
 
   private buildCallsignLabel(
-    name: string, callsign: string, root: TransformNode, scene: Scene,
+    name: string, callsign: string, root: TransformNode, scene: Scene, merchant = false,
   ): Mesh {
     const texW = 768, texH = 128;
 
@@ -1133,13 +1239,13 @@ export class MultiplayerService {
     ctx.rect(10, 10, texW - 20, texH - 20);
     ctx.fill();
 
-    ctx.fillStyle = '#FFFFFF';
+    ctx.fillStyle = merchant ? '#f0d99a' : '#FFFFFF';
     ctx.font      = 'bold 56px Arial, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(callsign.toUpperCase(), texW / 2, texH / 2);
 
-    ctx.strokeStyle = 'rgba(130, 200, 255, 0.55)';
+    ctx.strokeStyle = merchant ? 'rgba(232, 200, 120, 0.6)' : 'rgba(130, 200, 255, 0.55)';
     ctx.lineWidth   = 3;
     ctx.strokeRect(10, 10, texW - 20, texH - 20);
 

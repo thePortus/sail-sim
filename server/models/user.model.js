@@ -29,5 +29,23 @@ module.exports = (sequelize, DataTypes) => {
     // JSON array of callsigns this user has explicitly friended.
     // Mutual friendship requires both players to have each other in their list.
     friends: { type: DataTypes.TEXT, allowNull: true, defaultValue: null },
+
+    // ── Town Economy ───────────────────────────────────────────────────────────
+    // gold: the player's purse (gold pieces). New players start with 500.
+    // cargo: JSON object { goodId: qty } of held trade goods (the ship's hold).
+    // tradeLedger: JSON array of recent transactions (written now; surfaced in a later phase).
+    // gold/cargo persist across server restart AND across map regen (they are the player's, not the world's).
+    gold:        { type: DataTypes.INTEGER, allowNull: false, defaultValue: 500 },
+    cargo:       { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
+    tradeLedger: { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
+
+    // Persistent ship damage: JSON { zones, slug, mapVersion } of the player's last hull state. Restored on
+    // reconnect (so battle damage survives logout/restart) UNLESS its mapVersion is stale (new map → full
+    // hull). Cleared to full by a dock repair or a sunk→respawn.
+    combatState: { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
+
+    // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } } of
+    // the towns whose trader this player has opened (specialty + last-seen prices). MAP_VERSION-gated on load.
+    marketLedger: { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
   });
 };

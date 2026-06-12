@@ -51,6 +51,9 @@ const combat = require('./combat');
 const movement = require('./movement');
 const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
+const economy = require('./economy');
+const npc = require('./npc');
+const salvage = require('./salvage');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -365,6 +368,126 @@ async function savePlayerLocation(p) {
   }
 }
 
+// ── Town Economy: persistence + wallet/market messaging ──────────────────────
+/** Safe-parse a player's tradeLedger TEXT column → array. */
+function parseLedger(text) {
+  if (!text) return [];
+  try { const a = JSON.parse(text); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+
+/** Safe-parse the marketLedger TEXT column → { mapVersion, towns } or null. */
+function parseMarketLedger(text) {
+  if (!text) return null;
+  try { const o = JSON.parse(text); return (o && typeof o === 'object') ? o : null; } catch { return null; }
+}
+
+/** Persist a player's purse + hold + transaction log + discovery ledger to their user row (keyed by the
+ *  verified userId). Trades call this inline (money safety); the 30 s loop + disconnect call it as a backstop. */
+async function saveEconomyState(p) {
+  if (!p || !p.auth || p.auth.userId == null) return;
+  try {
+    await User.update(
+      {
+        gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []),
+        marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
+      },
+      { where: { id: p.auth.userId } },
+    );
+  } catch (err) {
+    console.warn('[WS] saveEconomyState failed:', err.message);
+  }
+}
+
+/** Safe-parse the persisted combatState TEXT column → object or null. */
+function parseCombat(text) {
+  if (!text) return null;
+  try { const o = JSON.parse(text); return (o && typeof o === 'object') ? o : null; } catch { return null; }
+}
+
+/** Persist a player's hull damage (per-zone HP + vessel + map version) so it survives logout/restart.
+ *  The mapVersion stamp makes the save stale after a map re-bake → full hull on the new map. */
+async function saveCombatState(p) {
+  if (!p || !p.auth || p.auth.userId == null || !p.combat) return;
+  try {
+    await User.update(
+      { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) },
+      { where: { id: p.auth.userId } },
+    );
+  } catch (err) {
+    console.warn('[WS] saveCombatState failed:', err.message);
+  }
+}
+
+/** Load a player's purse + hold + persistent hull damage from the DB, restore them in memory, and send the
+ *  wallet + the (restored or fresh) hull state. Damage is restored UNLESS its map version is stale (new map →
+ *  full hull) or the saved hull is sunk (rescue to full — never log in sunk). */
+async function loadAndSendWallet(id, p, players) {
+  if (!p || !p.auth || p.auth.userId == null) return;
+  try {
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger'] });
+    if (!u) return;
+    p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
+    p.cargo = economy.parseCargo(u.cargo);
+    p.tradeLedger = parseLedger(u.tradeLedger);
+
+    // Discovery ledger — restore only if it belongs to the current map (else a new map starts undiscovered).
+    const ml = parseMarketLedger(u.marketLedger);
+    p.ledger = (ml && ml.mapVersion === moveConst.MAP_VERSION && ml.towns && typeof ml.towns === 'object') ? ml.towns : {};
+
+    const saved = parseCombat(u.combatState);
+    if (saved && saved.mapVersion === moveConst.MAP_VERSION && saved.zones) {
+      const restored = combat.restoreCombatState(saved.slug || 'sloop', saved.zones);
+      if (!restored.sunk) p.combat = restored;   // keep battle damage; never restore a sunk hull
+    }
+
+    sendWallet(p);
+    p.ws.send(JSON.stringify({ type: 'ledger', towns: p.ledger }));   // the player's discovered-towns ledger
+    // Broadcast the current hull (restored damage or fresh) so the player's HUD and everyone's listing match.
+    const stateMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(stateMsg);
+  } catch (err) {
+    console.warn('[WS] loadAndSendWallet failed:', err.message);
+  }
+}
+
+/** Send the player their authoritative purse + hold + current cargo capacity (from their vessel). */
+function sendWallet(p) {
+  if (p && p.ws.readyState === 1) {
+    p.ws.send(JSON.stringify({
+      type: 'wallet', gold: p.gold | 0, cargo: p.cargo || {},
+      capacity: economy.capacityFor(p.state && p.state.vesselSlug),
+      catalog: economy.goodsCatalog(),
+    }));
+  }
+}
+
+/** Record that this player has seen a town's market (specialty + last-seen prices + day) in their discovery
+ *  ledger. Driven from sendMarket → fires on trade_open AND after each trade (keeps prices fresh). */
+function recordVisit(p, mk) {
+  if (!p || !mk) return;
+  if (!p.ledger || typeof p.ledger !== 'object') p.ledger = {};
+  p.ledger[mk.townId] = {
+    specialty: mk.specialty,
+    day: economy.currentDay(),
+    goods: mk.goods.map((g) => ({ id: g.goodId, ask: g.ask, bid: g.bid })),
+  };
+}
+
+/** Send the player a town's market quote (+ their wallet so the panel can gate buttons). Also records the
+ *  visit in their ledger, sends the matching ledger_entry, and attaches a demand-hint (best buyer elsewhere). */
+function sendMarket(p, townId) {
+  if (!p || p.ws.readyState !== 1) return;
+  const mk = economy.marketFor(townId);
+  if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
+  recordVisit(p, mk);
+  const hint = economy.hintFor(townId);
+  p.ws.send(JSON.stringify({
+    type: 'market_state', ...mk, hint, gold: p.gold | 0, cargo: p.cargo || {},
+    capacity: economy.capacityFor(p.state && p.state.vesselSlug),
+  }));
+  p.ws.send(JSON.stringify({ type: 'ledger_entry', townId, ...p.ledger[townId] }));
+}
+
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
@@ -401,10 +524,20 @@ function attachMultiplayer(server) {
    *  changes from a collision it didn't itself report). */
   const broadcastPose = (pid, p) => {
     if (!p.state) return;
-    const m = JSON.stringify({ type: 'update', id: pid, ...p.state, ts: Date.now(), seq: p.lastSeq || 0 });
+    const m = JSON.stringify({ type: 'update', id: pid, ...p.state, npc: !!p.isNpc, ts: Date.now(), seq: p.lastSeq || 0 });
     for (const [qid, q] of players) {
       if (qid !== pid && q.ws.readyState === 1) q.ws.send(m);
     }
+  };
+  /** Broadcast that an entity (player or NPC) has left so clients drop its vessel. */
+  const broadcastLeave = (lid) => {
+    const m = JSON.stringify({ type: 'leave', id: lid });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
+  };
+  /** Broadcast that a salvage crate is gone (collected dry or expired) so clients dispose its mesh. */
+  const broadcastSalvageDespawn = (cid) => {
+    const m = JSON.stringify({ type: 'salvage_despawn', id: cid });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
   };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
@@ -417,17 +550,30 @@ function attachMultiplayer(server) {
   let broadcastCooldown = 0;
   setInterval(() => {
     weatherState.tick();
+    economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
+    npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
+    for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
     }
   }, 1000);
 
+  // ── NPC merchant movement (5 Hz): integrate routes + steer, then interest-managed broadcast ────
+  const NPC_DT = 0.2;
+  setInterval(() => {
+    const now = Date.now();
+    npc.tickNpcs(players, NPC_DT, broadcastLeave, now);   // integrate + despawn sunk
+    npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
+  }, NPC_DT * 1000);
+
   // ── Authoritative location autosave (every 30 s) ──────────────────────────────
   // Persist each connected player's validated pose so they resume where they actually were. Replaces
   // the old client-initiated PUT /player-location (removed) — the server is the sole writer now.
   setInterval(() => {
-    for (const [, p] of players) savePlayerLocation(p);
+    // economy save = backstop (trades persist inline); location + hull damage persist here + on disconnect.
+    for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); saveCombatState(p); }
+    economy.flushState();   // town-market drift (global) — once, not per-player; no-op unless dirty
   }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change
@@ -463,14 +609,30 @@ function attachMultiplayer(server) {
     for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
     if (justSunk) {
-      const sinker   = shooter?.state?.callsign || 'an unknown ship';
-      const sunkName = victim.state?.callsign || 'a ship';
-      sysReply(victim.ws, `You were sunk by ${sinker}.`);
-      if (shooter) sysReply(shooter.ws, `You sank ${sunkName}!`);
+      const sinker = shooter?.state?.callsign || 'an unknown ship';
       const sunkMsg = JSON.stringify({
         type: 'combat_sunk', victimId: hit.victimId, shooterId: shot.shooterId, shooterName: sinker,
       });
-      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
+      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
+
+      if (victim.isNpc) {
+        // A merchant sank → drop floating salvage (a fraction of its cargo + gold) at the wreck; the ship is
+        // despawned after a short capsize-linger by the NPC tick. Anyone can sail over and collect.
+        const LOOT = 0.5;
+        const contents = {};
+        for (const [g, q] of Object.entries(victim.cargo || {})) { const k = Math.floor((q || 0) * LOOT); if (k > 0) contents[g] = k; }
+        const lootGold = Math.floor((victim.gold || 0) * LOOT);
+        if (Object.keys(contents).length || lootGold > 0) {
+          const crate = salvage.spawnCrate(victim.state.x, victim.state.z, contents, lootGold, Date.now());
+          const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+        }
+        if (shooter) sysReply(shooter.ws, `You sank the ${victim.state.vesselName || 'merchant'}! Salvage floats nearby.`);
+        victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
+      } else {
+        sysReply(victim.ws, `You were sunk by ${sinker}.`);
+        if (shooter) sysReply(shooter.ws, `You sank ${victim.state?.callsign || 'a ship'}!`);
+      }
     }
   };
 
@@ -504,19 +666,28 @@ function attachMultiplayer(server) {
     }
 
     const id = String(nextId++);
-    players.set(id, { ws, state: null, friends: [], combat: combat.newCombatState(), auth });
+    players.set(id, {
+      ws, state: null, friends: [], combat: combat.newCombatState(), auth,
+      gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
+    });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
     ws.send(JSON.stringify(currentWaveState()));
+    loadAndSendWallet(id, players.get(id), players);   // load purse + hold + persistent hull damage from the DB
 
     const existing = [];
     const nowTs = Date.now();
     for (const [pid, p] of players) {
-      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
+      // NPCs are NOT in the join snapshot — they arrive via interest-managed updates once we know the
+      // joiner's position (so a fresh client never builds the whole fleet at once).
+      if (pid !== id && p.state && !p.isNpc) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
     }
+    // Existing floating salvage crates, so a joiner sees ones dropped before they connected.
+    const crates = salvage.list().map((c) => ({ id: c.id, x: c.x, z: c.z }));
+    if (crates.length) ws.send(JSON.stringify({ type: 'salvage_snapshot', crates }));
 
     ws.on('message', (raw) => {
       let msg;
@@ -608,6 +779,7 @@ function attachMultiplayer(server) {
           // connection already holds this callsign, kick the OLDER one — the newest
           // login wins. Prevents the "two ghost ships of the same player" bug.
           for (const [pid, p] of players) {
+            if (p.isNpc) continue;   // merchants never hold an account callsign
             if (pid !== id && p.state?.callsign === state.callsign) {
               if (p.ws.readyState === 1) {
                 p.ws.send(JSON.stringify({
@@ -737,10 +909,18 @@ function attachMultiplayer(server) {
         activeShots.push({ shooterId: id, seq, ...shotData, fireTime: now, lastT: 0 });
 
       } else if (msg.type === 'combat_reset') {
-        // Player acknowledged a sinking → restore their hull to full.
+        // Dock "Repair Vessel" → restore the hull to full, for a gold fee (the first gold sink). The sunk→
+        // respawn path ('respawn' below) stays FREE so a broke player isn't trapped at the bottom of the sea.
         const me = players.get(id);
         if (me && me.combat) {
+          // Mercy repair: charge the fee if affordable, otherwise free — the harbourmaster never turns away
+          // a broke captain. Always proceeds to a full hull.
+          const rep = economy.applyRepair(me);
+          saveEconomyState(me);   // persist the (possibly zero) gold deduction
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy }));
+          sendWallet(me);
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          saveCombatState(me);   // persist the repaired (full) hull
           // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones,
@@ -762,6 +942,7 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat && me.combat.sunk) {
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          saveCombatState(me);  // persist the fresh hull (respawn = full repair)
           me.authPose = null;   // trust the next update — the respawn teleport
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
@@ -770,6 +951,47 @@ function attachMultiplayer(server) {
           const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
           for (const [pid, p] of players) {
             if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
+        }
+
+      } else if (msg.type === 'trade_open') {
+        // Open a town's trader: send its (static) market quote + the player's wallet. Read-only.
+        const me = players.get(id);
+        if (me) sendMarket(me, String(msg.townId ?? ''));
+
+      } else if (msg.type === 'trade_buy' || msg.type === 'trade_sell') {
+        // Buy/sell a good at a town. Validated server-side against the AUTHORITATIVE pose (must be docked
+        // there), gold, cargo capacity, and held quantity. Atomic (no partial fills). Persist BEFORE replying
+        // so the client never sees gold the server didn't durably record (money safety).
+        const me = players.get(id);
+        if (me) {
+          const apply = msg.type === 'trade_buy' ? economy.applyBuy : economy.applySell;
+          const r = apply(me, me.authPose, String(msg.townId ?? ''), String(msg.goodId ?? ''), msg.qty);
+          if (r.ok) {
+            saveEconomyState(me).then(() => { sendMarket(me, String(msg.townId ?? '')); sendWallet(me); });
+          } else {
+            sendWallet(me);   // authoritative correction
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'trade_error', reason: r.reason }));
+          }
+        }
+
+      } else if (msg.type === 'salvage_collect') {
+        // Sail-over salvage pickup. Validated: the crate exists + the player is within reach of it (authPose).
+        // Awards gold (full) + goods up to free hold; overflow stays floating. Atomic (single-threaded handler).
+        const me = players.get(id);
+        const crate = salvage.getCrate(String(msg.crateId ?? ''));
+        if (me && crate && me.authPose) {
+          const dx = me.authPose.x - crate.x, dz = me.authPose.z - crate.z;
+          if (dx * dx + dz * dz <= salvage.COLLECT_RADIUS_M * salvage.COLLECT_RADIUS_M) {
+            const free = Math.max(0, economy.capacityFor(me.state && me.state.vesselSlug) - economy.usedSlots(me.cargo));
+            const res = salvage.collect(crate, free);
+            if (res.gold > 0 || res.took > 0) {
+              me.gold = (me.gold | 0) + res.gold;
+              for (const [g, q] of Object.entries(res.goods)) me.cargo[g] = (me.cargo[g] || 0) + q;
+              saveEconomyState(me).then(() => sendWallet(me));
+              if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'salvage_collected', goods: res.goods, gold: res.gold }));
+            }
+            if (res.empty) { salvage.remove(crate.id); broadcastSalvageDespawn(crate.id); }
           }
         }
 
@@ -844,6 +1066,8 @@ function attachMultiplayer(server) {
       const closing = players.get(id);
       const closingCallsign = closing?.state?.callsign;
       savePlayerLocation(closing);   // persist final authoritative pose before dropping the player
+      saveEconomyState(closing);     // backstop persist of purse + hold (trades already persist inline)
+      saveCombatState(closing);      // persist hull damage so it survives logout/restart
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a

@@ -166,7 +166,26 @@ function applyDamage(combat, zone, dmg) {
   return { justSunk };
 }
 
+/**
+ * Rebuild a combat state from persisted per-zone HP (damage persistence). Starts from a fresh full hull for
+ * the vessel (so maxHp/zone list are authoritative for the current vessel), then clamps in the saved current
+ * HP and recomputes the sunk flag. Used on reconnect to restore battle damage.
+ */
+function restoreCombatState(slug, savedZones) {
+  const s = newCombatState(slug);
+  if (savedZones && typeof savedZones === 'object') {
+    for (const z of C.ZONES) {
+      const v = savedZones[z];
+      if (typeof v === 'number' && isFinite(v)) s.zones[z] = Math.max(0, Math.min(s.maxHp[z], v));
+    }
+    for (const z of C.ZONES) {
+      if (z !== 'masts' && s.zones[z] === 0) s.sunk = true;
+    }
+  }
+  return s;
+}
+
 module.exports = {
-  newCombatState, zoneAtLocal, deadReckon, computeDamage,
+  newCombatState, restoreCombatState, zoneAtLocal, deadReckon, computeDamage,
   stepShot, validateShot, allowShot, applyDamage,
 };

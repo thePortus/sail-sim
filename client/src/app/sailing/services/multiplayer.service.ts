@@ -688,10 +688,14 @@ export class MultiplayerService {
     entry.crew = null;
     entry.controller?.dispose();
     entry.controller = null;
-    // Unregister from the ocean reflection list before disposing so stale meshes don't
-    // pile up in the RTT across many join/leaves.
+    // Unregister from the ocean reflection list AND the shadow generator before disposing so stale meshes
+    // don't pile up across many join/leaves. (Babylon does NOT auto-remove a disposed mesh from a
+    // ShadowGenerator's manual render list — left unpruned, churning NPC merchants accumulate dead refs
+    // until the shadow/depth pass dereferences one (black screen) and the GPU descriptor heap exhausts.)
+    const sg = this.sceneService.shadowGenerator;
     entry.root.getChildMeshes(false).forEach(m => {
       this.oceanService.removeFromRenderList(m);
+      sg?.removeShadowCaster(m, true);
       // dispose(doNotRecurse=false, disposeMaterialAndTextures=FALSE): vessels are
       // instantiated with cloneMaterials=false, so every ship (local + remote) shares ONE
       // material + texture set owned by the asset container. Disposing them here would strip
@@ -1181,13 +1185,17 @@ export class MultiplayerService {
 
     // Animated deck crew, seeded from the player id — every client derives the same
     // seed from the same id, so this remote's pirates look identical everywhere.
-    void this.crewService
-      .attach(slug, rigged.root, scene, crewSeedFrom(playerId))
-      .then((h) => {
-        if (!h) return;
-        if (this.players.get(playerId) === entry) entry.crew = h;
-        else h.dispose();   // player left while the crew GLB was loading
-      });
+    // NPC merchants skip the crew: they churn through the interest range constantly, and the crew is the
+    // heaviest build/dispose cost (cloned materials + skeleton + observer per member).
+    if (!entry.npc) {
+      void this.crewService
+        .attach(slug, rigged.root, scene, crewSeedFrom(playerId))
+        .then((h) => {
+          if (!h) return;
+          if (this.players.get(playerId) === entry) entry.crew = h;
+          else h.dispose();   // player left while the crew GLB was loading
+        });
+    }
 
     // Snapshot of vessel meshes before the label is added (for shadow casting +
     // ocean registration — we don't want the billboard label in either).
@@ -1212,7 +1220,7 @@ export class MultiplayerService {
     const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
     for (const m of vesselMeshes) {
-      sg?.addShadowCaster(m, true);
+      if (!entry.npc) sg?.addShadowCaster(m, true);   // merchants don't cast shadows (churn perf + leak surface)
       m.receiveShadows = false;
       const mat = m.material;
       if (mat && !seenMats.has(mat)) {

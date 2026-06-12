@@ -291,6 +291,10 @@ async function run() {
     console.log(`  aux maps: slope/shoreDist/wetness/flow → aux_map.png + biome_map.png (${auxInfo.resolution}²)`);
   }
 
+  // ── Navigable-water grid (NPC sea routing) ───────────────────────────────────
+  const navInfo = writeNavGrid(field, harborShore, OUT, cellM, outputDir);
+  console.log(`  nav grid: ${navInfo.resolution}² navigable mask → navgrid.bin (${navInfo.navigablePct}% open water)`);
+
   const manifest = {
     version: 2,
     source: region.id,
@@ -316,6 +320,7 @@ async function run() {
       detailAmp: +reefInfo.detailAmp.toFixed(2), lagoonStrength: +reefInfo.lagoonStrength.toFixed(3),
       lagoonDepth: +reefInfo.lagoonDepth.toFixed(1), seamountCount: reefInfo.seamountCount, label: reefInfo.label } : null,
     auxMaps: auxInfo,
+    navGrid: navInfo,
     worldBounds,
     spawns,
     harbors,
@@ -376,6 +381,44 @@ function writeFieldPreview(field, OUT, minY, maxY, path) {
     }
   }
   writeFileSync(path, PNG.sync.write(png));
+}
+
+/**
+ * Bake a coarse NAVIGABLE-WATER grid for NPC sea-routing (NPC Traders). A 256² bitpacked mask (bit set =
+ * open water a ship can sail). A nav cell is navigable iff the SHALLOWEST source point in its block is still
+ * ≥ DEPTH_MIN deep AND the closest-to-shore point is ≥ CLEARANCE_M out — conservative, so routes keep hulls
+ * off reefs/rocks. Reuses the already-computed signed `field` (depth) + `shore` (shoreDistanceField; 0 on
+ * land). Writes navgrid.bin and returns the manifest descriptor. Consumed at runtime by server/nav.js.
+ */
+function writeNavGrid(field, shore, OUT, cellM, outputDir) {
+  const RES = 256;
+  const DEPTH_MIN = 4;        // m of draft clearance
+  const CLEARANCE_M = 100;    // m a hull stays off the nearest shore
+  const block = OUT / RES;    // source cells per nav cell
+  const bits = new Uint8Array(Math.ceil((RES * RES) / 8));
+  let navCount = 0;
+  for (let cz = 0; cz < RES; cz++) {
+    for (let cx = 0; cx < RES; cx++) {
+      const sx0 = Math.floor(cx * block), sz0 = Math.floor(cz * block);
+      const sx1 = Math.min(OUT, Math.floor((cx + 1) * block)), sz1 = Math.min(OUT, Math.floor((cz + 1) * block));
+      let maxField = -Infinity, minShore = Infinity;
+      for (let sz = sz0; sz < sz1; sz++) {
+        for (let sx = sx0; sx < sx1; sx++) {
+          const i = sz * OUT + sx;
+          if (field[i] > maxField) maxField = field[i];
+          if (shore[i] < minShore) minShore = shore[i];
+        }
+      }
+      if (maxField <= -DEPTH_MIN && minShore >= CLEARANCE_M) {
+        const bi = cz * RES + cx; bits[bi >> 3] |= (1 << (bi & 7)); navCount++;
+      }
+    }
+  }
+  writeFileSync(join(outputDir, 'navgrid.bin'), Buffer.from(bits.buffer));
+  return {
+    resolution: RES, file: 'navgrid.bin', depthMin: DEPTH_MIN, clearanceM: CLEARANCE_M,
+    cellM: +(cellM * block).toFixed(1), navigablePct: +(100 * navCount / (RES * RES)).toFixed(1),
+  };
 }
 
 /** Pack the aux maps into aux_map.png (RGBA = slope, shoreDist, wetness, flow) + biome_map.png

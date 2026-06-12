@@ -31,7 +31,7 @@ const startTown = m.curTownId;
 let trips = 0, inBounds = true, movedWhileTraveling = false;
 let lastTown = startTown, prev = { x: m.state.x, z: m.state.z };
 for (let i = 0; i < 2500; i++) {
-  npc.tickNpcs(players, 0.2, () => {}, () => {}, Date.now());
+  npc.tickNpcs(players, 0.2, () => {}, Date.now());
   if (m.curTownId !== lastTown) { trips++; lastTown = m.curTownId; }
   if (Math.abs(m.state.x) > 25000 || Math.abs(m.state.z) > 25000) inBounds = false;
   if (m.route && (m.state.x !== prev.x || m.state.z !== prev.z)) movedWhileTraveling = true;
@@ -52,6 +52,32 @@ ok(Math.abs(npc._test.angleDelta(350, 10) - 20) < 1e-9, 'angleDelta wraps the ci
 const fleet = targetTest();
 ok(fleet === true, 'targetFleet clamps to [8,15]');
 function targetTest() { return npc.targetFleet(2) === 8 && npc.targetFleet(40) === 10 && npc.targetFleet(100) === 15; }
+
+console.log('interest management (only the nearest few merchants are sent to a client):');
+{
+  const sent = [];
+  const recipient = { id: 'p1', isNpc: false, state: { x: 0, z: 0 }, ws: { readyState: 1, send: (j) => sent.push(JSON.parse(j)) } };
+  const pm = new Map([['p1', recipient]]);
+  const mk = (i, x) => pm.set('npc_' + i, { id: 'npc_' + i, isNpc: true, ws: { readyState: 3 }, state: { x, z: 0, vesselSlug: 'sloop' } });
+  for (let i = 0; i < 6; i++) mk(i, 100 + i * 100);   // 6 merchants within VIEW_RADIUS (x=100..600)
+  mk(99, 12000);                                       // 1 merchant BEYOND VIEW_RADIUS (10000)
+  npc.broadcastInterest(pm, Date.now());
+  const updates = sent.filter((m) => m.type === 'update');
+  const ids = new Set(updates.map((m) => m.id));
+  ok(updates.length === npc._test.MAX_VISIBLE, `client receives exactly MAX_VISIBLE (${npc._test.MAX_VISIBLE}) nearest merchants, got ${updates.length}`);
+  ok(!ids.has('npc_99'), 'a merchant beyond VIEW_RADIUS is NOT sent');
+  ok(!ids.has('npc_5'), 'the 6th-nearest merchant is capped out (only the 5 nearest)');
+  ok([...ids].every((id) => id.startsWith('npc_')) && updates.every((m) => m.npc === true), 'sent updates are tagged npc:true');
+  const beacon = sent.find((m) => m.type === 'nearest_merchant');
+  ok(beacon && beacon.x != null, 'a nearest_merchant beacon is sent (the closest trader, for the map)');
+  // sail the player far away → all previously-visible merchants drop out → 'leave' each, but the beacon persists
+  sent.length = 0; recipient.state.x = 50000;
+  npc.broadcastInterest(pm, Date.now());
+  const leaves = sent.filter((m) => m.type === 'leave');
+  ok(leaves.length === npc._test.MAX_VISIBLE, 'sailing out of range sends a leave for each dropped merchant');
+  const beacon2 = sent.find((m) => m.type === 'nearest_merchant');
+  ok(beacon2 && beacon2.x === 12000, 'beacon still reports the nearest merchant (x=12000) even though it is BEYOND render range');
+}
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

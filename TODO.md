@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* lod + imposters for ships at distance
 * improved landscape with NME & more scatter to distant
 * ship status in db... start all players in pinnace, allow switch via menu... ship inventory.. persistent ship damage... leave slots for ship upgrade
 * town economies... goods they produce, consume... all produce one or two goods for export, will need the rest, prices based on amount in town... step 1

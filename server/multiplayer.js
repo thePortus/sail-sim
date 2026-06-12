@@ -552,9 +552,13 @@ function attachMultiplayer(server) {
     }
   }, 1000);
 
-  // ── NPC merchant movement (5 Hz): integrate routes + steer + broadcast pose ────
+  // ── NPC merchant movement (5 Hz): integrate routes + steer, then interest-managed broadcast ────
   const NPC_DT = 0.2;
-  setInterval(() => npc.tickNpcs(players, NPC_DT, broadcastPose, broadcastLeave, Date.now()), NPC_DT * 1000);
+  setInterval(() => {
+    const now = Date.now();
+    npc.tickNpcs(players, NPC_DT, broadcastLeave, now);   // integrate + despawn sunk
+    npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
+  }, NPC_DT * 1000);
 
   // ── Authoritative location autosave (every 30 s) ──────────────────────────────
   // Persist each connected player's validated pose so they resume where they actually were. Replaces
@@ -651,7 +655,9 @@ function attachMultiplayer(server) {
     const existing = [];
     const nowTs = Date.now();
     for (const [pid, p] of players) {
-      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, npc: !!p.isNpc, ts: nowTs, seq: 0 });
+      // NPCs are NOT in the join snapshot — they arrive via interest-managed updates once we know the
+      // joiner's position (so a fresh client never builds the whole fleet at once).
+      if (pid !== id && p.state && !p.isNpc) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));

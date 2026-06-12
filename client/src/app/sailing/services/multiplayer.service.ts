@@ -109,6 +109,8 @@ export class MultiplayerService {
   ledger       = signal<Record<string, LedgerEntry>>({});
   hint         = signal<MarketHint | null>(null);
   hintedHarbor = signal<string | null>(null);
+  // Position of the single nearest NPC merchant (any distance) — for the minimap marker only.
+  nearestMerchant = signal<{ x: number; z: number } | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -378,6 +380,7 @@ export class MultiplayerService {
     this.ledger.set({});
     this.hint.set(null);
     this.hintedHarbor.set(null);
+    this.nearestMerchant.set(null);
   }
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
@@ -505,6 +508,9 @@ export class MultiplayerService {
       if (msg.gold != null) this.gold.set(+msg.gold || 0);
       if (msg.cargo && typeof msg.cargo === 'object') this.cargo.set(msg.cargo as Record<string, number>);
       if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+
+    } else if (msg.type === 'nearest_merchant') {
+      this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
 
     } else if (msg.type === 'ledger') {
       // Full discovered-towns ledger (on connect).

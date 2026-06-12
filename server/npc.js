@@ -25,6 +25,11 @@ const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering 
 const CRUISE_FRAC = 0.7;     // merchants cruise below max
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
 const AVOID_R = 140;         // world units: NPC↔NPC separation radius
+// Interest management — a client only RECEIVES (and so only renders) the nearest few merchants. Distant ships
+// are never sent, so their GLB + crew are never built. Keeps draw cost bounded regardless of fleet size.
+const VIEW_RADIUS = 3000;    // world units: merchant draw distance (only nearby merchants are sent + rendered)
+const VIEW_R2 = VIEW_RADIUS * VIEW_RADIUS;
+const MAX_VISIBLE = 5;       // at most this many merchants per client (the nearest ones)
 let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
@@ -89,8 +94,9 @@ function planMove(npc, towns) {
   npc.route = null;
 }
 
-/** Advance every NPC one step (dtSec), steering toward its route + away from other merchants, and broadcast. */
-function tickNpcs(players, dtSec, broadcastPose, broadcastLeave, nowMs) {
+/** Advance every NPC one step (dtSec), steering toward its route + away from other merchants. Pose is sent
+ *  separately by broadcastInterest (interest-managed), NOT here. */
+function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
   const towns = economy.townList();
   if (towns.length < 2) return;
   const fleet = [];
@@ -124,7 +130,42 @@ function tickNpcs(players, dtSec, broadcastPose, broadcastLeave, nowMs) {
     npc.authPose.x = npc.state.x; npc.authPose.z = npc.state.z;
     npc.authPose.heading = npc.state.heading; npc.authPose.speed = npc.state.speed;
     npc.lastUpdateMs = nowMs;
-    broadcastPose(npc.id, npc);
+  }
+}
+
+/**
+ * Interest-managed broadcast: each connected player only receives the MAX_VISIBLE nearest merchants within
+ * VIEW_RADIUS — distant ones are never sent, so the client never builds their GLB + crew (the perf lever).
+ * Sends an 'update' for each newly/still-visible NPC and a 'leave' for any that dropped out of range.
+ */
+function broadcastInterest(players, nowMs) {
+  const npcs = [];
+  for (const [, p] of players) if (p.isNpc) npcs.push(p);
+  const msgCache = new Map();
+  const msgFor = (n) => {
+    let m = msgCache.get(n.id);
+    if (!m) { m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, ts: nowMs, seq: 0 }); msgCache.set(n.id, m); }
+    return m;
+  };
+  for (const [, p] of players) {
+    if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
+    const near = [];
+    let nrX = null, nrZ = null, nrD2 = Infinity;   // the single GLOBAL nearest merchant (any distance, for the map)
+    for (const n of npcs) {
+      const dx = n.state.x - p.state.x, dz = n.state.z - p.state.z, d2 = dx * dx + dz * dz;
+      if (d2 < nrD2) { nrD2 = d2; nrX = n.state.x; nrZ = n.state.z; }
+      if (d2 <= VIEW_R2) near.push({ n, d2 });
+    }
+    near.sort((a, b) => a.d2 - b.d2);
+    const visible = new Set();
+    for (let i = 0; i < near.length && i < MAX_VISIBLE; i++) visible.add(near[i].n.id);
+    if (!p._visNpcs) p._visNpcs = new Set();
+    for (const id of visible) p.ws.send(msgFor(players.get(id)));               // RENDER updates for nearby merchants
+    for (const id of p._visNpcs) if (!visible.has(id)) p.ws.send(JSON.stringify({ type: 'leave', id })); // dropped → despawn client-side
+    p._visNpcs = visible;
+    // Map beacon: the nearest merchant's position regardless of render distance (no ship is built for it).
+    p.ws.send(nrX === null ? JSON.stringify({ type: 'nearest_merchant', x: null })
+      : JSON.stringify({ type: 'nearest_merchant', x: +nrX.toFixed(1), z: +nrZ.toFixed(1) }));
   }
 }
 
@@ -138,6 +179,6 @@ function spawnerTick(players) {
 }
 
 module.exports = {
-  tickNpcs, spawnerTick, targetFleet, npcCount,
-  _test: { spawnNpc, planMove, tickNpcs, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta },
+  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount,
+  _test: { spawnNpc, planMove, tickNpcs, broadcastInterest, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE },
 };

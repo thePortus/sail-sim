@@ -326,19 +326,32 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
 
     // Other players — split into friends (gold) and strangers (orange)
     const mutuals = this.multiplayerService.mutualFriends();
+    const others = this.multiplayerService.otherPlayers();
 
-    for (const p of this.multiplayerService.otherPlayers()) {
+    // Nearest merchant beacon — the server reports the single closest merchant's position at ANY distance
+    // (no ship is built for a far one), so the map always points to the nearest trader.
+    const nm = this.multiplayerService.nearestMerchant();
+    if (nm) {
+      const mx = wx(nm.x), mz = wz(nm.z), s = this.expanded() ? 7 : 6;
+      ctx.fillStyle   = '#22e3d0';
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+      ctx.lineWidth   = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(mx,     mz - s);
+      ctx.lineTo(mx + s, mz);
+      ctx.lineTo(mx,     mz + s);
+      ctx.lineTo(mx - s, mz);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    for (const p of others) {
+      if (p.npc) continue;   // merchants are shown via the nearest-merchant beacon above, not per-ship
       const px = wx(p.x);
       const pz = wz(p.z);
 
-      if (p.npc) {
-        // NPC merchant — small cyan square (distinct from players + towns)
-        ctx.fillStyle   = 'rgba(120, 210, 200, 0.9)';
-        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-        ctx.lineWidth   = 0.7;
-        ctx.fillRect(px - 2, pz - 2, 4, 4);
-        ctx.strokeRect(px - 2, pz - 2, 4, 4);
-      } else if (mutuals.includes(p.callsign)) {
+      if (mutuals.includes(p.callsign)) {
         // Mutual friend — gold diamond with callsign label
         const s = this.expanded() ? 6 : 5;
         ctx.fillStyle   = '#fbbf24';

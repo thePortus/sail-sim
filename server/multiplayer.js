@@ -373,13 +373,22 @@ function parseLedger(text) {
   try { const a = JSON.parse(text); return Array.isArray(a) ? a : []; } catch { return []; }
 }
 
-/** Persist a player's purse + hold + ledger to their user row (keyed by the verified userId). Trades call
- *  this inline (money safety) and the 30 s loop + disconnect call it as a backstop. Fire-and-forget. */
+/** Safe-parse the marketLedger TEXT column → { mapVersion, towns } or null. */
+function parseMarketLedger(text) {
+  if (!text) return null;
+  try { const o = JSON.parse(text); return (o && typeof o === 'object') ? o : null; } catch { return null; }
+}
+
+/** Persist a player's purse + hold + transaction log + discovery ledger to their user row (keyed by the
+ *  verified userId). Trades call this inline (money safety); the 30 s loop + disconnect call it as a backstop. */
 async function saveEconomyState(p) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
     await User.update(
-      { gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []) },
+      {
+        gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []),
+        marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
+      },
       { where: { id: p.auth.userId } },
     );
   } catch (err) {
@@ -413,11 +422,15 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
+
+    // Discovery ledger — restore only if it belongs to the current map (else a new map starts undiscovered).
+    const ml = parseMarketLedger(u.marketLedger);
+    p.ledger = (ml && ml.mapVersion === moveConst.MAP_VERSION && ml.towns && typeof ml.towns === 'object') ? ml.towns : {};
 
     const saved = parseCombat(u.combatState);
     if (saved && saved.mapVersion === moveConst.MAP_VERSION && saved.zones) {
@@ -426,6 +439,7 @@ async function loadAndSendWallet(id, p, players) {
     }
 
     sendWallet(p);
+    p.ws.send(JSON.stringify({ type: 'ledger', towns: p.ledger }));   // the player's discovered-towns ledger
     // Broadcast the current hull (restored damage or fresh) so the player's HUD and everyone's listing match.
     const stateMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(stateMsg);
@@ -445,15 +459,31 @@ function sendWallet(p) {
   }
 }
 
-/** Send the player a town's market quote (+ their wallet so the panel can gate buttons). */
+/** Record that this player has seen a town's market (specialty + last-seen prices + day) in their discovery
+ *  ledger. Driven from sendMarket → fires on trade_open AND after each trade (keeps prices fresh). */
+function recordVisit(p, mk) {
+  if (!p || !mk) return;
+  if (!p.ledger || typeof p.ledger !== 'object') p.ledger = {};
+  p.ledger[mk.townId] = {
+    specialty: mk.specialty,
+    day: economy.currentDay(),
+    goods: mk.goods.map((g) => ({ id: g.goodId, ask: g.ask, bid: g.bid })),
+  };
+}
+
+/** Send the player a town's market quote (+ their wallet so the panel can gate buttons). Also records the
+ *  visit in their ledger, sends the matching ledger_entry, and attaches a demand-hint (best buyer elsewhere). */
 function sendMarket(p, townId) {
   if (!p || p.ws.readyState !== 1) return;
   const mk = economy.marketFor(townId);
   if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
+  recordVisit(p, mk);
+  const hint = economy.hintFor(townId);
   p.ws.send(JSON.stringify({
-    type: 'market_state', ...mk, gold: p.gold | 0, cargo: p.cargo || {},
+    type: 'market_state', ...mk, hint, gold: p.gold | 0, cargo: p.cargo || {},
     capacity: economy.capacityFor(p.state && p.state.vesselSlug),
   }));
+  p.ws.send(JSON.stringify({ type: 'ledger_entry', townId, ...p.ledger[townId] }));
 }
 
 function attachMultiplayer(server) {
@@ -600,7 +630,7 @@ function attachMultiplayer(server) {
     const id = String(nextId++);
     players.set(id, {
       ws, state: null, friends: [], combat: combat.newCombatState(), auth,
-      gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [],   // Town Economy — overwritten by the DB load below
+      gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));

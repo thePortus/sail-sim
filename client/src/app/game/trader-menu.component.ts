@@ -22,6 +22,10 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
         <div class="tr-specialty">{{ specialtyLabel() }}</div>
       </div>
 
+      @if (mp.hint(); as h) {
+        <div class="tr-rumour">🗣 They say <b>{{ h.townName }}</b> pays well for <b>{{ h.goodName }}</b> ({{ h.bid }}g) — marked on your map.</div>
+      }
+
       <div class="tr-purse">
         <span class="tr-gold">⚜ {{ mp.gold() }} gold</span>
         <span class="tr-hold">
@@ -85,6 +89,9 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
     .tr-header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; border-bottom: 1px solid rgba(184,138,62,0.3); padding-bottom: 0.5rem; }
     .tr-title { font-size: 1.25rem; font-weight: 600; color: #e8d3a0; }
     .tr-specialty { font-size: 0.82rem; color: #b89a62; text-transform: capitalize; letter-spacing: 0.02em; }
+    .tr-rumour { margin-top: 0.55rem; padding: 0.4rem 0.6rem; border-radius: 6px; font-size: 0.82rem;
+                 background: rgba(184,138,62,0.15); border: 1px solid rgba(184,138,62,0.35); color: #e8d3a0; }
+    .tr-rumour b { color: #f0c869; }
     .tr-purse { display: flex; align-items: center; justify-content: space-between; margin: 0.7rem 0 0.4rem; font-size: 0.92rem; }
     .tr-gold { color: #f0c869; font-weight: 600; }
     .tr-hold { display: flex; align-items: center; gap: 0.45rem; color: #cdbb95; }

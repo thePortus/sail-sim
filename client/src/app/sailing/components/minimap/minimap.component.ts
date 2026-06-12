@@ -240,15 +240,29 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     for (let gx = 0; gx <= W; gx += gridStep) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke(); }
     for (let gy = 0; gy <= H; gy += gridStep) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
 
-    // Harbor towns (expanded map only) — markers + a name/description tooltip on hover.
+    // Harbor towns (expanded map only) — markers + a tooltip on hover. Discovered towns (in the player's
+    // ledger) are tinted + reveal specialty/prices; a pulsing beacon marks the trader's current rumour town.
     if (this.expanded()) {
       const harbors = this.terrainService.getHarbors();
       const hp = this.hoverPx;
-      let hovered: { name: string; description: string; x: number; y: number } | null = null;
+      const ledger = this.multiplayerService.ledger();
+      const hinted = this.multiplayerService.hintedHarbor();
+      const cat = this.multiplayerService.goodsCatalog();
+      const now = performance.now();
+      const cap = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+      let hovered: { lines: string[]; x: number; y: number } | null = null;
       let bestD = 8;   // px hover radius
       for (const h of harbors) {
         const hxp = wx(h.x), hyp = wz(h.z);
-        ctx.fillStyle   = '#e8d3a0';            // tan — distinct from player gold/orange
+        const known = !!ledger[h.id];
+        // Pulsing beacon ring at the rumoured town (drawn under the marker dot).
+        if (hinted && h.id === hinted) {
+          const pulse = 0.5 + 0.5 * Math.sin(now / 350);
+          ctx.strokeStyle = `rgba(240,200,105,${0.4 + 0.5 * pulse})`;
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(hxp, hyp, 7 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
+        }
+        ctx.fillStyle   = known ? '#9fe0a0' : '#e8d3a0';   // green = discovered, tan = unexplored
         ctx.strokeStyle = 'rgba(0,0,0,0.6)';
         ctx.lineWidth   = 0.8;
         ctx.beginPath();
@@ -257,39 +271,56 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
         ctx.stroke();
         if (hp) {
           const d = Math.hypot(hp.x - hxp, hp.y - hyp);
-          if (d < bestD) { bestD = d; hovered = { name: h.name, description: h.description, x: hxp, y: hyp }; }
+          if (d < bestD) {
+            bestD = d;
+            const lines = [h.name, h.description];
+            const led = ledger[h.id];
+            if (led) {
+              lines.push(`Trade: ${cap(led.specialty)}`);
+              const cheap = [...led.goods].sort((a, b) => a.ask - b.ask)[0];
+              const dear  = [...led.goods].sort((a, b) => b.bid - a.bid)[0];
+              if (cheap) lines.push(`Buy ${cat[cheap.id] ?? cheap.id} @ ${cheap.ask}g`);
+              if (dear)  lines.push(`Pays ${dear.bid}g for ${cat[dear.id] ?? dear.id}`);
+            } else {
+              lines.push('(unexplored — dock to learn its trade)');
+            }
+            hovered = { lines, x: hxp, y: hyp };
+          }
         }
       }
       if (hovered) {
-        // Highlight the hovered marker, then draw a name (+ description) pill above it.
+        // Highlight the hovered marker, then draw a multi-line pill above it.
         ctx.fillStyle = '#fff4d0';
         ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 4, 0, Math.PI * 2); ctx.fill();
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'alphabetic';
-        ctx.font = 'bold 11px monospace';
-        const nameW = ctx.measureText(hovered.name).width;
-        ctx.font = '9px monospace';
-        const descW = ctx.measureText(hovered.description).width;
-        const padX = 6, boxW = Math.max(nameW, descW) + padX * 2, boxH = 30;
+        let maxW = 0;
+        hovered.lines.forEach((ln, i) => {
+          ctx.font = i === 0 ? 'bold 11px monospace' : '9px monospace';
+          maxW = Math.max(maxW, ctx.measureText(ln).width);
+        });
+        const padX = 6, lineH = 12, boxW = maxW + padX * 2, boxH = 9 + hovered.lines.length * lineH;
         let bx = hovered.x - boxW / 2;
         let by = hovered.y - 8 - boxH;
         bx = Math.max(2, Math.min(W - boxW - 2, bx));   // keep the pill on-map
         by = Math.max(2, by);
 
-        ctx.fillStyle = 'rgba(10,16,26,0.86)';
+        ctx.fillStyle = 'rgba(10,16,26,0.9)';
         ctx.strokeStyle = 'rgba(232,211,160,0.5)';
         ctx.lineWidth = 1;
         ctx.fillRect(bx, by, boxW, boxH);
         ctx.strokeRect(bx, by, boxW, boxH);
 
         const cx = bx + boxW / 2;
-        ctx.fillStyle = '#ffe9b0';
-        ctx.font = 'bold 11px monospace';
-        ctx.fillText(hovered.name, cx, by + 13);
-        ctx.fillStyle = 'rgba(220,220,210,0.85)';
-        ctx.font = '9px monospace';
-        ctx.fillText(hovered.description, cx, by + 25);
+        let ty = by + 13;
+        hovered.lines.forEach((ln, i) => {
+          if (i === 0)      { ctx.fillStyle = '#ffe9b0'; ctx.font = 'bold 11px monospace'; }
+          else if (i === 1) { ctx.fillStyle = 'rgba(220,220,210,0.85)'; ctx.font = '9px monospace'; }
+          else              { ctx.fillStyle = '#9fe0a0'; ctx.font = '9px monospace'; }
+          ctx.fillText(ln, cx, ty);
+          ty += lineH;
+        });
       }
     }
 

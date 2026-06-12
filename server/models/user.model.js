@@ -43,5 +43,9 @@ module.exports = (sequelize, DataTypes) => {
     // reconnect (so battle damage survives logout/restart) UNLESS its mapVersion is stale (new map → full
     // hull). Cleared to full by a dock repair or a sunk→respawn.
     combatState: { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
+
+    // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } } of
+    // the towns whose trader this player has opened (specialty + last-seen prices). MAP_VERSION-gated on load.
+    marketLedger: { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
   });
 };

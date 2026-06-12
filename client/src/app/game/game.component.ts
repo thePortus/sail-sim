@@ -416,6 +416,14 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         untracked(() => { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); });
       }
     });
+
+    // Arrived at the rumoured town → the rumour is fulfilled, clear its map beacon.
+    effect(() => {
+      const here = this.harborService.dockable();
+      if (here && here.id === this.multiplayerService.hintedHarbor()) {
+        untracked(() => this.multiplayerService.hintedHarbor.set(null));
+      }
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).

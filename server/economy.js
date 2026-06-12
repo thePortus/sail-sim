@@ -147,6 +147,38 @@ function marketFor(townId) {
   return { townId: t.id, name: t.name, specialty: t.specialty, goods: list };
 }
 
+// ── demand hints (Phase 3) ────────────────────────────────────────────────────
+/** The town currently paying the highest BID for `goodId` (a scarce consumer) — the best place to SELL it.
+ *  Excludes `excludeTownId` (the town giving the hint). Returns { townId, townName, bid } or null. */
+function bestBuyerFor(goodId, excludeTownId) {
+  ensureSeeded();
+  let best = null;
+  for (const t of towns.values()) {
+    if (t.id === excludeTownId) continue;
+    const mk = marketFor(t.id);
+    const row = mk && mk.goods.find((g) => g.goodId === goodId);
+    if (row && (!best || row.bid > best.bid)) best = { townId: t.id, townName: t.name, bid: row.bid };
+  }
+  return best;
+}
+
+/** A trade rumour for a town: among the goods it PRODUCES (its exports), the one with the best buyer elsewhere
+ *  right now → { goodId, goodName, townId, townName, bid }. null if the town produces nothing / no buyer. */
+function hintFor(townId) {
+  const t = getTown(townId);
+  if (!t) return null;
+  const prof = profileFor(t);
+  let best = null;
+  for (const g of goods.GOODS) {
+    if (prof[g.id].role !== 'produced') continue;
+    const buyer = bestBuyerFor(g.id, townId);
+    if (buyer && (!best || buyer.bid > best.bid)) {
+      best = { goodId: g.id, goodName: g.name, townId: buyer.townId, townName: buyer.townName, bid: buyer.bid };
+    }
+  }
+  return best;
+}
+
 // ── cargo helpers (cargo is a JSON object { goodId: qty }) ─────────────────────
 function parseCargo(text) {
   if (!text) return {};
@@ -305,12 +337,13 @@ module.exports = {
   load, ensureLoaded, townAt, getTown, marketFor,
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
+  bestBuyerFor, hintFor, currentDay: economyDay,
   tick, tickToToday, loadState, flushState, seedMarkets,
   REPAIR_FEE: goods.REPAIR_FEE, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
   // test seam (headless harness — no manifest/DB): inject towns + drive state directly.
   _test: {
     setTowns(arr) { towns = new Map(arr.map((t) => [t.id, t])); profiles = new Map(); markets = new Map(); loaded = true; },
-    seedMarkets, tick, marketFor, serializeTowns, hydrateTowns, economyDayAt,
+    seedMarkets, tick, marketFor, bestBuyerFor, hintFor, serializeTowns, hydrateTowns, economyDayAt,
     setLastTickDay(d) { lastTickDay = d; }, getLastTickDay() { return lastTickDay; },
     getMarket(id) { return markets.get(id); }, profileFor: (t) => profileFor(t),
   },

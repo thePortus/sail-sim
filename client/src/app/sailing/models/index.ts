@@ -113,8 +113,12 @@ export interface TerrainHarbor {
 /** One good's quoted prices at a town: ask = player buys, bid = player sells. Phase 2 adds a scarcity hint:
  *  `level` = stock/priceRef (1≈normal, <1 scarce/dear, >1 abundant/cheap); `role` = produced|consumed|neutral. */
 export interface MarketRow { goodId: string; name: string; ask: number; bid: number; level?: number; role?: string; }
+/** A trade rumour: the best place to SELL one of this town's exports right now. */
+export interface MarketHint { goodId: string; goodName: string; townId: string; townName: string; bid: number; }
 /** A town's market quote, pushed by the server when the trader is opened or a trade resolves. */
-export interface MarketState { townId: string; name: string; specialty: string; goods: MarketRow[]; }
+export interface MarketState { townId: string; name: string; specialty: string; goods: MarketRow[]; hint?: MarketHint | null; }
+/** A discovered town in the player's ledger: its specialty + last-seen prices + the in-game day seen. */
+export interface LedgerEntry { specialty: string; day: number; goods: { id: string; ask: number; bid: number }[]; }
 
 export interface TerrainManifest {
   version: number;

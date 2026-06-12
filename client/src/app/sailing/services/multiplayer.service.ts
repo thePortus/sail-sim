@@ -15,7 +15,7 @@ import { CombatService } from './combat.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
-import { OtherPlayer, SailState, ChatMessage, MarketState } from '../models';
+import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
 
@@ -105,6 +105,10 @@ export class MultiplayerService {
   capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
   market   = signal<MarketState | null>(null);
   goodsCatalog = signal<Record<string, string>>({});   // goodId → display name (for the inventory panel anywhere)
+  // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
+  ledger       = signal<Record<string, LedgerEntry>>({});
+  hint         = signal<MarketHint | null>(null);
+  hintedHarbor = signal<string | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -370,6 +374,10 @@ export class MultiplayerService {
     this.otherPlayers.set([]);
     this.myFriends.set([]);
     this.mutualFriends.set([]);
+    this.market.set(null);
+    this.ledger.set({});
+    this.hint.set(null);
+    this.hintedHarbor.set(null);
   }
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
@@ -491,10 +499,20 @@ export class MultiplayerService {
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
-      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [] });
+      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [], hint: msg.hint ?? null });
+      this.hint.set(msg.hint ?? null);
+      this.hintedHarbor.set(msg.hint?.townId ?? null);
       if (msg.gold != null) this.gold.set(+msg.gold || 0);
       if (msg.cargo && typeof msg.cargo === 'object') this.cargo.set(msg.cargo as Record<string, number>);
       if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
+
+    } else if (msg.type === 'ledger') {
+      // Full discovered-towns ledger (on connect).
+      this.ledger.set((msg.towns && typeof msg.towns === 'object') ? msg.towns as Record<string, LedgerEntry> : {});
+
+    } else if (msg.type === 'ledger_entry') {
+      // One town's discovery record refreshed (on opening its trader / trading there).
+      this.ledger.update(l => ({ ...l, [String(msg.townId)]: { specialty: msg.specialty, day: +msg.day || 0, goods: msg.goods || [] } }));
 
     } else if (msg.type === 'repair_result') {
       // Dock repair always succeeds (mercy free repair when broke). The wallet message alongside corrects gold.

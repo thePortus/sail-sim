@@ -30,6 +30,8 @@ db.ensureColumns = async () => {
     ['cargo',       { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
     ['tradeLedger', { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
     ['combatState', { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
+    // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } }.
+    ['marketLedger', { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {

@@ -130,6 +130,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-trader-menu (close)="tradeMenuOpen.set(false)" />
         }
 
+        <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
+        @if (salvageNotice(); as note) {
+          <div class="salvage-toast">📦 {{ note }}</div>
+        }
+
         <!-- Ship's Hold — gold + cargo, viewable anytime with I or Tab -->
         @if (inventoryOpen()) {
           <div class="inv-backdrop" (click)="inventoryOpen.set(false)"></div>
@@ -202,6 +207,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                  border: 1px solid rgba(255,255,255,0.15); background: transparent;
                  color: rgba(255,255,255,0.6); font-family: ui-monospace, monospace; }
     .dock-cast:hover { color: #fff; }
+    /* Salvage toast (top-centre) */
+    .salvage-toast { position: absolute; top: 5.5rem; left: 50%; transform: translateX(-50%); z-index: 85;
+                     padding: 8px 16px; border-radius: 9px; border: 1px solid rgba(232,211,160,0.5);
+                     background: rgba(20,28,40,0.92); color: #ffe9b0; font-weight: 600;
+                     font-family: 'IBM Plex Serif', Georgia, serif; box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
     /* Ship's Hold (inventory) — walnut/brass, viewable anytime with I / Tab */
     .inv-backdrop { position: absolute; inset: 0; z-index: 80; background: rgba(8,6,3,0.45); }
     .inv-panel { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 81;
@@ -281,6 +291,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
+  salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
+  private salvageTimer: ReturnType<typeof setTimeout> | null = null;
   protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
 
   /** Cargo as a sorted display list { id, name, qty } using the server-sent goods catalogue. */
@@ -424,6 +436,21 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         untracked(() => this.multiplayerService.hintedHarbor.set(null));
       }
     });
+
+    // Collected salvage → flash a transient "Salvaged: …" toast (good names from the catalogue).
+    effect(() => {
+      const t = this.multiplayerService.salvageToast();
+      if (!t) return;
+      untracked(() => {
+        const cat = this.multiplayerService.goodsCatalog();
+        const parts = Object.entries(t.goods).map(([id, q]) => `${q} ${cat[id] ?? id}`);
+        if (t.gold > 0) parts.push(`${t.gold} gold`);
+        this.salvageNotice.set(parts.length ? 'Salvaged: ' + parts.join(', ') : 'Salvaged the wreck');
+        this.multiplayerService.salvageToast.set(null);
+        if (this.salvageTimer) clearTimeout(this.salvageTimer);
+        this.salvageTimer = setTimeout(() => this.salvageNotice.set(null), 3500);
+      });
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
@@ -483,6 +510,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       await this.runInitStep('init-harbors', 'Raising the harbours…', async () => {
         await this.harborService.init();
       });
+      // Floating salvage crates (from sunk NPC merchants) — render + sail-over collection.
+      this.multiplayerService.salvageService.init(this.sceneService.scene);
 
       // 3b. Asset scattering (grass/rocks/driftwood/trees/palms) — needs the terrain ready.
       // PERF DIAGNOSTIC: ?noscatter skips all grass/reed instancing to isolate its cost.

@@ -33,6 +33,7 @@ const MAX_VISIBLE = 5;       // at most this many merchants per client (the near
 const MERCHANT_LOAD = 8;     // units a merchant tries to buy + carry per trip
 const SEED_GOLD = 1500;      // working capital a merchant spawns with (looted on a sinking — NP4)
 const DISTRESS_SPREAD = 3;   // dispatch among the top-N distress needs so merchants don't all chase the worst one
+const SINK_LINGER_MS = 4000; // keep a sunk merchant around this long so the capsize animation plays, then despawn
 let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
@@ -177,8 +178,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
   for (const [, p] of players) if (p.isNpc) fleet.push(p);
 
   for (const npc of fleet) {
-    // A sunk merchant despawns (NP4 will instead drop salvage here first).
-    if (npc.combat && npc.combat.sunk) { players.delete(npc.id); broadcastLeave(npc.id); continue; }
+    // A sunk merchant (salvage already dropped by resolveHit) lingers briefly so its capsize plays, then despawns.
+    if (npc.combat && npc.combat.sunk) {
+      if (!npc.sinkAt) npc.sinkAt = nowMs;
+      if (nowMs - npc.sinkAt >= SINK_LINGER_MS) { players.delete(npc.id); broadcastLeave(npc.id); }
+      continue;
+    }
 
     if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
     const wp = npc.route[npc.routeIdx];

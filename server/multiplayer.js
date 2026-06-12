@@ -53,6 +53,7 @@ const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const salvage = require('./salvage');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -533,6 +534,11 @@ function attachMultiplayer(server) {
     const m = JSON.stringify({ type: 'leave', id: lid });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
   };
+  /** Broadcast that a salvage crate is gone (collected dry or expired) so clients dispose its mesh. */
+  const broadcastSalvageDespawn = (cid) => {
+    const m = JSON.stringify({ type: 'salvage_despawn', id: cid });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
+  };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
   const broadcastWeather = () => {
@@ -546,6 +552,7 @@ function attachMultiplayer(server) {
     weatherState.tick();
     economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
     npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
+    for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
@@ -602,14 +609,30 @@ function attachMultiplayer(server) {
     for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
     if (justSunk) {
-      const sinker   = shooter?.state?.callsign || 'an unknown ship';
-      const sunkName = victim.state?.callsign || 'a ship';
-      sysReply(victim.ws, `You were sunk by ${sinker}.`);
-      if (shooter) sysReply(shooter.ws, `You sank ${sunkName}!`);
+      const sinker = shooter?.state?.callsign || 'an unknown ship';
       const sunkMsg = JSON.stringify({
         type: 'combat_sunk', victimId: hit.victimId, shooterId: shot.shooterId, shooterName: sinker,
       });
-      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);
+      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
+
+      if (victim.isNpc) {
+        // A merchant sank → drop floating salvage (a fraction of its cargo + gold) at the wreck; the ship is
+        // despawned after a short capsize-linger by the NPC tick. Anyone can sail over and collect.
+        const LOOT = 0.5;
+        const contents = {};
+        for (const [g, q] of Object.entries(victim.cargo || {})) { const k = Math.floor((q || 0) * LOOT); if (k > 0) contents[g] = k; }
+        const lootGold = Math.floor((victim.gold || 0) * LOOT);
+        if (Object.keys(contents).length || lootGold > 0) {
+          const crate = salvage.spawnCrate(victim.state.x, victim.state.z, contents, lootGold, Date.now());
+          const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+        }
+        if (shooter) sysReply(shooter.ws, `You sank the ${victim.state.vesselName || 'merchant'}! Salvage floats nearby.`);
+        victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
+      } else {
+        sysReply(victim.ws, `You were sunk by ${sinker}.`);
+        if (shooter) sysReply(shooter.ws, `You sank ${victim.state?.callsign || 'a ship'}!`);
+      }
     }
   };
 
@@ -662,6 +685,9 @@ function attachMultiplayer(server) {
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
     }
+    // Existing floating salvage crates, so a joiner sees ones dropped before they connected.
+    const crates = salvage.list().map((c) => ({ id: c.id, x: c.x, z: c.z }));
+    if (crates.length) ws.send(JSON.stringify({ type: 'salvage_snapshot', crates }));
 
     ws.on('message', (raw) => {
       let msg;
@@ -946,6 +972,26 @@ function attachMultiplayer(server) {
           } else {
             sendWallet(me);   // authoritative correction
             if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'trade_error', reason: r.reason }));
+          }
+        }
+
+      } else if (msg.type === 'salvage_collect') {
+        // Sail-over salvage pickup. Validated: the crate exists + the player is within reach of it (authPose).
+        // Awards gold (full) + goods up to free hold; overflow stays floating. Atomic (single-threaded handler).
+        const me = players.get(id);
+        const crate = salvage.getCrate(String(msg.crateId ?? ''));
+        if (me && crate && me.authPose) {
+          const dx = me.authPose.x - crate.x, dz = me.authPose.z - crate.z;
+          if (dx * dx + dz * dz <= salvage.COLLECT_RADIUS_M * salvage.COLLECT_RADIUS_M) {
+            const free = Math.max(0, economy.capacityFor(me.state && me.state.vesselSlug) - economy.usedSlots(me.cargo));
+            const res = salvage.collect(crate, free);
+            if (res.gold > 0 || res.took > 0) {
+              me.gold = (me.gold | 0) + res.gold;
+              for (const [g, q] of Object.entries(res.goods)) me.cargo[g] = (me.cargo[g] || 0) + q;
+              saveEconomyState(me).then(() => sendWallet(me));
+              if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'salvage_collected', goods: res.goods, gold: res.gold }));
+            }
+            if (res.empty) { salvage.remove(crate.id); broadcastSalvageDespawn(crate.id); }
           }
         }
 

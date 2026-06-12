@@ -12,6 +12,7 @@ import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
+import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
@@ -85,6 +86,7 @@ export class MultiplayerService {
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
   private authService    = inject(AuthService);
+  readonly salvageService = inject(SalvageService);
 
   otherPlayers  = signal<OtherPlayer[]>([]);
   chatMessages  = signal<ChatMessage[]>([]);
@@ -111,6 +113,8 @@ export class MultiplayerService {
   hintedHarbor = signal<string | null>(null);
   // Position of the single nearest NPC merchant (any distance) — for the minimap marker only.
   nearestMerchant = signal<{ x: number; z: number } | null>(null);
+  // Set when the player collects salvage — the game overlay shows a transient toast.
+  salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -327,6 +331,11 @@ export class MultiplayerService {
     const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
     this.ws = new WebSocket(url);
 
+    // Let the salvage service ask the server to collect a crate the local ship sailed over.
+    this.salvageService.sendCollect = (crateId) => {
+      if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'salvage_collect', crateId }));
+    };
+
     this.ws.addEventListener('open', () => {
       this.updateTimer = setInterval(() => this.sendUpdate(), 100);
       // Round-trip ping for the debug overlay (everyone, backtick).
@@ -381,6 +390,8 @@ export class MultiplayerService {
     this.hint.set(null);
     this.hintedHarbor.set(null);
     this.nearestMerchant.set(null);
+    this.salvageToast.set(null);
+    this.salvageService.clear();
   }
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
@@ -511,6 +522,19 @@ export class MultiplayerService {
 
     } else if (msg.type === 'nearest_merchant') {
       this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
+
+    } else if (msg.type === 'salvage_spawn') {
+      this.salvageService.spawn(String(msg.id), +msg.x, +msg.z);
+
+    } else if (msg.type === 'salvage_despawn') {
+      this.salvageService.despawn(String(msg.id));
+
+    } else if (msg.type === 'salvage_snapshot') {
+      this.salvageService.snapshot(Array.isArray(msg.crates) ? msg.crates : []);
+
+    } else if (msg.type === 'salvage_collected') {
+      // The wallet update arrives separately; surface a transient toast of what we scooped.
+      this.salvageToast.set({ goods: (msg.goods && typeof msg.goods === 'object') ? msg.goods : {}, gold: +msg.gold || 0 });
 
     } else if (msg.type === 'ledger') {
       // Full discovered-towns ledger (on connect).

@@ -381,6 +381,16 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     }
 
+    // Floating salvage crates (from sunk merchants) — small amber boxes.
+    for (const c of this.multiplayerService.salvageService.crateList()) {
+      const cx = wx(c.x), cz = wz(c.z);
+      ctx.fillStyle   = 'rgba(240, 200, 105, 0.95)';
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.lineWidth   = 0.7;
+      ctx.fillRect(cx - 2, cz - 2, 4, 4);
+      ctx.strokeRect(cx - 2, cz - 2, 4, 4);
+    }
+
     // Local vessel — arrow pointing in heading direction
     const vs = this.vesselService.state();
     const vx = wx(vs.x);

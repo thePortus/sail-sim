@@ -284,6 +284,7 @@ export interface OtherPlayer {
   vesselName:  string;
   vesselSlug:  string;
   callsign:    string;
+  npc?:        boolean;    // an NPC merchant trader (server-controlled), not a real player
 }
 
 export interface ChatMessage {

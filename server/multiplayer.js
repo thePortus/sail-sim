@@ -52,6 +52,7 @@ const movement = require('./movement');
 const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
+const npc = require('./npc');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -522,10 +523,15 @@ function attachMultiplayer(server) {
    *  changes from a collision it didn't itself report). */
   const broadcastPose = (pid, p) => {
     if (!p.state) return;
-    const m = JSON.stringify({ type: 'update', id: pid, ...p.state, ts: Date.now(), seq: p.lastSeq || 0 });
+    const m = JSON.stringify({ type: 'update', id: pid, ...p.state, npc: !!p.isNpc, ts: Date.now(), seq: p.lastSeq || 0 });
     for (const [qid, q] of players) {
       if (qid !== pid && q.ws.readyState === 1) q.ws.send(m);
     }
+  };
+  /** Broadcast that an entity (player or NPC) has left so clients drop its vessel. */
+  const broadcastLeave = (lid) => {
+    const m = JSON.stringify({ type: 'leave', id: lid });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
   };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
@@ -539,11 +545,16 @@ function attachMultiplayer(server) {
   setInterval(() => {
     weatherState.tick();
     economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
+    npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
     }
   }, 1000);
+
+  // ── NPC merchant movement (5 Hz): integrate routes + steer + broadcast pose ────
+  const NPC_DT = 0.2;
+  setInterval(() => npc.tickNpcs(players, NPC_DT, broadcastPose, broadcastLeave, Date.now()), NPC_DT * 1000);
 
   // ── Authoritative location autosave (every 30 s) ──────────────────────────────
   // Persist each connected player's validated pose so they resume where they actually were. Replaces
@@ -640,7 +651,7 @@ function attachMultiplayer(server) {
     const existing = [];
     const nowTs = Date.now();
     for (const [pid, p] of players) {
-      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, ts: nowTs, seq: 0 });
+      if (pid !== id && p.state) existing.push({ id: pid, ...p.state, npc: !!p.isNpc, ts: nowTs, seq: 0 });
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
@@ -736,6 +747,7 @@ function attachMultiplayer(server) {
           // connection already holds this callsign, kick the OLDER one — the newest
           // login wins. Prevents the "two ghost ships of the same player" bug.
           for (const [pid, p] of players) {
+            if (p.isNpc) continue;   // merchants never hold an account callsign
             if (pid !== id && p.state?.callsign === state.callsign) {
               if (p.ws.readyState === 1) {
                 p.ws.send(JSON.stringify({

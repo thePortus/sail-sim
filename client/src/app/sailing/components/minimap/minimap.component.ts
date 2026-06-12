@@ -331,7 +331,14 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       const px = wx(p.x);
       const pz = wz(p.z);
 
-      if (mutuals.includes(p.callsign)) {
+      if (p.npc) {
+        // NPC merchant — small cyan square (distinct from players + towns)
+        ctx.fillStyle   = 'rgba(120, 210, 200, 0.9)';
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth   = 0.7;
+        ctx.fillRect(px - 2, pz - 2, 4, 4);
+        ctx.strokeRect(px - 2, pz - 2, 4, 4);
+      } else if (mutuals.includes(p.callsign)) {
         // Mutual friend — gold diamond with callsign label
         const s = this.expanded() ? 6 : 5;
         ctx.fillStyle   = '#fbbf24';

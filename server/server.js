@@ -3,6 +3,7 @@ const http = require('http');
 const app  = require('./app.js');
 const db   = require('./models');
 const economy = require('./economy');
+const nav = require('./nav');
 const { attachMultiplayer } = require('./multiplayer.js');
 
 // start webserver
@@ -17,6 +18,7 @@ async function boot() {
     await db.ensureColumns();
     await db.ensureTables();
     await economy.loadState();
+    nav.loadNavGrid();   // navigable-water grid for NPC sea-routing (lazy-loads anyway; warm it at boot)
   } catch (err) {
     console.warn('[boot] schema/economy init issue (continuing):', err.message);
   }

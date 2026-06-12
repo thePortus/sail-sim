@@ -557,6 +557,7 @@ export class MultiplayerService {
         sailState:  'full',
         vesselName: 'Sloop', vesselSlug: 'sloop',
         callsign:   String(data.callsign ?? ''),
+        npc:        !!data.npc,
         buffer:      [],
         dispX:       sx,
         dispZ:       sz,
@@ -591,6 +592,7 @@ export class MultiplayerService {
     entry.callsign   = String(data.callsign   ?? '').slice(0, 32);
     entry.vesselName = String(data.vesselName ?? 'Sloop').slice(0, 64);
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
+    entry.npc        = !!data.npc;
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
     entry.anchored   = !!data.anchored;
@@ -1161,8 +1163,9 @@ export class MultiplayerService {
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
-    // Callsign label (billboard above masthead)
-    this.buildCallsignLabel(prefix + 'label', callsign, entry.root, scene);
+    // Nameplate (billboard above masthead) — NPC merchants show their ship name + a merchant tint.
+    const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
+    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, !!entry.npc);
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1193,7 +1196,7 @@ export class MultiplayerService {
   // ── Floating callsign label ───────────────────────────────────────────────
 
   private buildCallsignLabel(
-    name: string, callsign: string, root: TransformNode, scene: Scene,
+    name: string, callsign: string, root: TransformNode, scene: Scene, merchant = false,
   ): Mesh {
     const texW = 768, texH = 128;
 
@@ -1206,13 +1209,13 @@ export class MultiplayerService {
     ctx.rect(10, 10, texW - 20, texH - 20);
     ctx.fill();
 
-    ctx.fillStyle = '#FFFFFF';
+    ctx.fillStyle = merchant ? '#f0d99a' : '#FFFFFF';
     ctx.font      = 'bold 56px Arial, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(callsign.toUpperCase(), texW / 2, texH / 2);
 
-    ctx.strokeStyle = 'rgba(130, 200, 255, 0.55)';
+    ctx.strokeStyle = merchant ? 'rgba(232, 200, 120, 0.6)' : 'rgba(130, 200, 255, 0.55)';
     ctx.lineWidth   = 3;
     ctx.strokeRect(10, 10, texW - 20, texH - 20);
 

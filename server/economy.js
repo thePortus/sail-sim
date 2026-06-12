@@ -129,6 +129,9 @@ function townAt(x, z) {
 }
 function getTown(townId) { ensureLoaded(); return towns.get(townId) || null; }
 
+/** All towns as a plain array (for NPC spawning/routing). */
+function townList() { ensureLoaded(); return [...towns.values()]; }
+
 /** Live market quote for a town: per good { goodId, name, ask, bid, level, role }. level = stock/priceRef
  *  (1 ≈ neutral, <1 scarce/dear, >1 abundant/cheap) — a scarcity hint for the UI. */
 function marketFor(townId) {
@@ -334,7 +337,7 @@ async function flushState(force) {
 }
 
 module.exports = {
-  load, ensureLoaded, townAt, getTown, marketFor,
+  load, ensureLoaded, townAt, getTown, townList, marketFor,
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
   bestBuyerFor, hintFor, currentDay: economyDay,

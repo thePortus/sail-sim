@@ -1,0 +1,143 @@
+'use strict';
+
+/**
+ * NPC merchant ships (NPC Traders — NP2 fleet sim).
+ *
+ * NPCs are entries in the SAME multiplayer `players` Map (id 'npc_<n>', isNpc:true, ws:{readyState:3}=CLOSED)
+ * so the joiner snapshot, broadcastPose, combat shot-adjudication, and player↔ship collision all include them
+ * for free, while every `ws.readyState===1` send loop skips them as recipients. The server integrates their
+ * movement each tick along a baked sea route (nav.js) and broadcasts pose to everyone — so all players see the
+ * same ships in the same place. They steer to avoid each other; players bump off them via the existing
+ * ship-to-ship collision (NPCs carry an authPose). Trip logic here is a placeholder town→town hop; NP3 makes
+ * it a real buy-at-source / sell-at-destination trade.
+ */
+
+const nav = require('./nav');
+const economy = require('./economy');
+const combat = require('./combat');
+const moveConst = require('./movement-constants');
+const { getVesselDef } = require('./controllers/vessels.controller');
+
+const DEG = Math.PI / 180;
+const MERCHANT_SLUGS = ['sloop', 'pinnace'];
+const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
+  'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne'];
+const CRUISE_FRAC = 0.7;     // merchants cruise below max
+const ARRIVE_M = 45;         // world units: "reached this waypoint"
+const AVOID_R = 140;         // world units: NPC↔NPC separation radius
+let seq = 0;
+
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+function targetFleet(townCount) { return Math.max(8, Math.min(15, Math.round(townCount * 0.25))); }
+function npcCount(players) { let n = 0; for (const [, p] of players) if (p.isNpc) n++; return n; }
+
+/** Heading (deg, atan2(x,z) convention) from a→b. */
+function headingTo(ax, az, bx, bz) { return (Math.atan2(bx - ax, bz - az) * 180 / Math.PI + 360) % 360; }
+/** Smallest signed angle a→b in degrees, in [-180,180]. */
+function angleDelta(a, b) { let d = (b - a + 540) % 360 - 180; return d; }
+/** Turn `cur` toward `target` by at most `maxStep` degrees. */
+function turnToward(cur, target, maxStep) { const d = angleDelta(cur, target); return (cur + Math.max(-maxStep, Math.min(maxStep, d)) + 360) % 360; }
+/** Blend two headings on the circle (t=0→a, 1→b) via unit vectors. */
+function blendHeading(a, b, t) {
+  const ax = Math.sin(a * DEG), az = Math.cos(a * DEG), bx = Math.sin(b * DEG), bz = Math.cos(b * DEG);
+  const x = ax * (1 - t) + bx * t, z = az * (1 - t) + bz * t;
+  return (Math.atan2(x, z) * 180 / Math.PI + 360) % 360;
+}
+
+/** A heading pointing away from nearby merchants (separation), or null if none are close. */
+function avoidanceHeading(npc, fleet) {
+  let sx = 0, sz = 0, n = 0;
+  for (const o of fleet) {
+    if (o === npc) continue;
+    const dx = npc.state.x - o.state.x, dz = npc.state.z - o.state.z, d = Math.hypot(dx, dz);
+    if (d > 1e-3 && d < AVOID_R) { const w = (AVOID_R - d) / AVOID_R; sx += (dx / d) * w; sz += (dz / d) * w; n++; }
+  }
+  return n ? (Math.atan2(sx, sz) * 180 / Math.PI + 360) % 360 : null;
+}
+
+function spawnNpc(players, towns) {
+  const town = pick(towns);
+  const slug = pick(MERCHANT_SLUGS);
+  const id = 'npc_' + (++seq);
+  const npc = {
+    id, isNpc: true, ws: { readyState: 3 },
+    state: {
+      x: town.x, z: town.z, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
+      isPortTack: false, anchored: false, sailState: 'full',
+      vesselName: 'Merchant ' + pick(MERCHANT_NAMES), vesselSlug: slug, callsign: '',
+    },
+    authPose: { x: town.x, z: town.z, heading: 0, speed: 0 },
+    combat: combat.newCombatState(slug),
+    lastUpdateMs: Date.now(),
+    cruise: (getVesselDef(slug)?.physics?.maxSpeed || 8) * CRUISE_FRAC,
+    route: null, routeIdx: 0, curTownId: town.id, destTownId: null,
+    gold: 0, cargo: {}, trip: null,   // populated in NP3
+  };
+  players.set(id, npc);
+  return npc;
+}
+
+/** NP2 placeholder: route to a random different town. (NP3 replaces this with planTrip — buy→deliver.) */
+function planMove(npc, towns) {
+  for (let tries = 0; tries < 6; tries++) {
+    const t = pick(towns);
+    if (t.id === npc.curTownId) continue;
+    const r = nav.findPath(npc.state.x, npc.state.z, t.x, t.z);
+    if (r && r.length >= 2) { npc.route = r; npc.routeIdx = 1; npc.destTownId = t.id; return; }
+  }
+  npc.route = null;
+}
+
+/** Advance every NPC one step (dtSec), steering toward its route + away from other merchants, and broadcast. */
+function tickNpcs(players, dtSec, broadcastPose, broadcastLeave, nowMs) {
+  const towns = economy.townList();
+  if (towns.length < 2) return;
+  const fleet = [];
+  for (const [, p] of players) if (p.isNpc) fleet.push(p);
+
+  for (const npc of fleet) {
+    // A sunk merchant despawns (NP4 will instead drop salvage here first).
+    if (npc.combat && npc.combat.sunk) { players.delete(npc.id); broadcastLeave(npc.id); continue; }
+
+    if (!npc.route) { planMove(npc, towns); if (!npc.route) continue; }
+    const wp = npc.route[npc.routeIdx];
+    const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
+    if (dist < ARRIVE_M) {
+      if (++npc.routeIdx >= npc.route.length) {   // arrived at the destination town
+        npc.curTownId = npc.destTownId; npc.route = null; npc.state.speed = 0;
+        continue;                                  // NP3: trade here, then plan the next trip
+      }
+      continue;
+    }
+    let desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
+    const avoid = avoidanceHeading(npc, fleet);
+    if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
+    const prev = npc.state.heading;
+    npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec);
+    npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
+    npc.state.speed = npc.cruise;
+    const hr = npc.state.heading * DEG, step = npc.cruise * moveConst.TRAVEL_SCALE * dtSec;
+    npc.state.x += Math.sin(hr) * step;
+    npc.state.z += Math.cos(hr) * step;
+    // keep the authoritative pose in sync so player↔NPC collision (which reads authPose) works
+    npc.authPose.x = npc.state.x; npc.authPose.z = npc.state.z;
+    npc.authPose.heading = npc.state.heading; npc.authPose.speed = npc.state.speed;
+    npc.lastUpdateMs = nowMs;
+    broadcastPose(npc.id, npc);
+  }
+}
+
+/** Keep the merchant fleet topped up to the target size; spawn fresh ships at town piers. */
+function spawnerTick(players) {
+  const towns = economy.townList();
+  if (towns.length < 2) return;
+  const target = targetFleet(towns.length);
+  let spawned = 0;
+  while (npcCount(players) < target && spawned < 3) { spawnNpc(players, towns); spawned++; }   // ramp up gradually
+}
+
+module.exports = {
+  tickNpcs, spawnerTick, targetFleet, npcCount,
+  _test: { spawnNpc, planMove, tickNpcs, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta },
+};

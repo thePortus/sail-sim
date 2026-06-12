@@ -2,6 +2,10 @@
 
 # General or Current TODO Items
 
+* make trade hints not show you ports you can't get to
+* make all merchants visible to admins on the map, admins repair free, can /repair others, and /teleport and /teleportto
+* add occasional bosun whistle (no more than once a day)
+* all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
 * lod + imposters for ships at distance
 * improved landscape with NME & more scatter to distant
 * ship status in db... start all players in pinnace, allow switch via menu... ship inventory.. persistent ship damage... leave slots for ship upgrade

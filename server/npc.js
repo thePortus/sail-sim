@@ -30,6 +30,9 @@ const AVOID_R = 140;         // world units: NPC↔NPC separation radius
 const VIEW_RADIUS = 3000;    // world units: merchant draw distance (only nearby merchants are sent + rendered)
 const VIEW_R2 = VIEW_RADIUS * VIEW_RADIUS;
 const MAX_VISIBLE = 5;       // at most this many merchants per client (the nearest ones)
+const MERCHANT_LOAD = 8;     // units a merchant tries to buy + carry per trip
+const SEED_GOLD = 1500;      // working capital a merchant spawns with (looted on a sinking — NP4)
+const DISTRESS_SPREAD = 3;   // dispatch among the top-N distress needs so merchants don't all chase the worst one
 let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
@@ -76,22 +79,93 @@ function spawnNpc(players, towns) {
     combat: combat.newCombatState(slug),
     lastUpdateMs: Date.now(),
     cruise: (getVesselDef(slug)?.physics?.maxSpeed || 8) * CRUISE_FRAC,
-    route: null, routeIdx: 0, curTownId: town.id, destTownId: null,
-    gold: 0, cargo: {}, trip: null,   // populated in NP3
+    route: null, routeIdx: 0, curTownId: town.id, legTarget: null,
+    gold: SEED_GOLD, cargo: {}, trip: null, phase: null,   // trip = {goodId,srcTownId,destTownId,qty}; phase = toSource|toDest
   };
   players.set(id, npc);
   return npc;
 }
 
-/** NP2 placeholder: route to a random different town. (NP3 replaces this with planTrip — buy→deliver.) */
-function planMove(npc, towns) {
+/** Route the NPC from its current position to `town`. Returns true if a route was found. */
+function routeTo(npc, town) {
+  const r = town && nav.findPath(npc.state.x, npc.state.z, town.x, town.z);
+  if (r && r.length >= 2) { npc.route = r; npc.routeIdx = 1; npc.legTarget = town.id; return true; }
+  npc.route = null; return false;
+}
+
+/** Idle wander to a random different town (fallback when there's nothing to trade). */
+function wander(npc, towns) {
   for (let tries = 0; tries < 6; tries++) {
     const t = pick(towns);
-    if (t.id === npc.curTownId) continue;
-    const r = nav.findPath(npc.state.x, npc.state.z, t.x, t.z);
-    if (r && r.length >= 2) { npc.route = r; npc.routeIdx = 1; npc.destTownId = t.id; return; }
+    if (t.id !== npc.curTownId && routeTo(npc, t)) { npc.phase = 'wander'; return; }
   }
   npc.route = null;
+}
+
+/** Choose a trade: a persistent shortage to relieve (distress-first, spread among the top few), else the most
+ *  profitable arbitrage route. Returns { goodId, srcTownId, destTownId } or null. */
+function chooseTrip() {
+  const distress = economy.distressList();
+  if (distress.length) {
+    const need = pick(distress.slice(0, Math.min(DISTRESS_SPREAD, distress.length)));
+    const src = economy.bestSellerFor(need.goodId, need.townId);
+    if (src && src.townId !== need.townId) return { goodId: need.goodId, srcTownId: src.townId, destTownId: need.townId };
+  }
+  const arb = economy.bestArbitrage();
+  if (arb) return { goodId: arb.goodId, srcTownId: arb.srcTownId, destTownId: arb.destTownId };
+  return null;
+}
+
+/** Buy up to the trip's qty at the source (unit-by-unit so partial fills are fine). Returns units bought. */
+function doBuy(npc) {
+  let bought = 0;
+  for (let i = 0; i < npc.trip.qty; i++) {
+    if (!economy.npcBuy(npc, npc.trip.srcTownId, npc.trip.goodId, 1).ok) break;
+    bought++;
+  }
+  return bought;
+}
+
+/** Sell everything held of the trip good at the destination (unit-by-unit; stops if the town can't afford more). */
+function doSell(npc) {
+  while ((npc.cargo[npc.trip.goodId] || 0) > 0) {
+    if (!economy.npcSell(npc, npc.trip.destTownId, npc.trip.goodId, 1).ok) break;
+  }
+}
+
+/** Plan a new trip and start sailing to its source (buying immediately if already there). */
+function planTrip(npc, towns) {
+  npc.route = null; npc.trip = null; npc.phase = null;
+  const chosen = chooseTrip();
+  if (!chosen) { wander(npc, towns); return; }
+  npc.trip = { ...chosen, qty: Math.min(MERCHANT_LOAD, economy.capacityFor(npc.state.vesselSlug)) };
+  if (npc.curTownId === chosen.srcTownId) {
+    // already at the source → buy + head to the destination
+    doBuy(npc);
+    const dest = economy.getTown(chosen.destTownId);
+    if ((npc.cargo[chosen.goodId] || 0) > 0 && dest && routeTo(npc, dest)) { npc.phase = 'toDest'; return; }
+    wander(npc, towns);
+  } else {
+    const src = economy.getTown(chosen.srcTownId);
+    if (routeTo(npc, src)) { npc.phase = 'toSource'; return; }
+    wander(npc, towns);
+  }
+}
+
+/** Reached the end of the current route leg — act on it and start the next leg. */
+function onArrive(npc, towns) {
+  npc.curTownId = npc.legTarget; npc.route = null; npc.state.speed = 0;
+  if (npc.phase === 'toSource' && npc.trip) {
+    doBuy(npc);
+    const dest = economy.getTown(npc.trip.destTownId);
+    if ((npc.cargo[npc.trip.goodId] || 0) > 0 && dest && routeTo(npc, dest)) { npc.phase = 'toDest'; return; }
+    planTrip(npc, towns);           // bought nothing / no route → re-plan
+  } else if (npc.phase === 'toDest' && npc.trip) {
+    doSell(npc);                    // deliver — relieves the shortage on the shared market
+    planTrip(npc, towns);
+  } else {
+    planTrip(npc, towns);           // finished a wander → look for real trade
+  }
 }
 
 /** Advance every NPC one step (dtSec), steering toward its route + away from other merchants. Pose is sent
@@ -106,14 +180,11 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
     // A sunk merchant despawns (NP4 will instead drop salvage here first).
     if (npc.combat && npc.combat.sunk) { players.delete(npc.id); broadcastLeave(npc.id); continue; }
 
-    if (!npc.route) { planMove(npc, towns); if (!npc.route) continue; }
+    if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
     const wp = npc.route[npc.routeIdx];
     const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
     if (dist < ARRIVE_M) {
-      if (++npc.routeIdx >= npc.route.length) {   // arrived at the destination town
-        npc.curTownId = npc.destTownId; npc.route = null; npc.state.speed = 0;
-        continue;                                  // NP3: trade here, then plan the next trip
-      }
+      if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
       continue;
     }
     let desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
@@ -180,5 +251,5 @@ function spawnerTick(players) {
 
 module.exports = {
   tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount,
-  _test: { spawnNpc, planMove, tickNpcs, broadcastInterest, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE },
+  _test: { spawnNpc, planTrip, chooseTrip, onArrive, tickNpcs, broadcastInterest, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE },
 };

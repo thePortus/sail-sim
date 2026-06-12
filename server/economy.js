@@ -143,11 +143,12 @@ function applySell(player, authPose, townId, goodId, qty) {
   return { ok: true, unit: price.bid };
 }
 
-/** Dock repair — deduct the flat fee. Returns { ok:false } if the player can't afford it. */
+/** Dock repair — charge the flat fee if the player can afford it, otherwise a MERCY free repair (the
+ *  harbourmaster patches you up for nothing). Always succeeds. Returns the amount charged + mercy flag. */
 function applyRepair(player) {
-  if (player.gold < goods.REPAIR_FEE) return { ok: false, fee: goods.REPAIR_FEE };
-  player.gold -= goods.REPAIR_FEE;
-  return { ok: true, fee: goods.REPAIR_FEE };
+  const fee = goods.REPAIR_FEE;
+  if (player.gold >= fee) { player.gold -= fee; return { ok: true, charged: fee, mercy: false }; }
+  return { ok: true, charged: 0, mercy: true };
 }
 
 module.exports = {

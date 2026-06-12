@@ -106,6 +106,8 @@ export class MultiplayerService {
   market   = signal<MarketState | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
+  /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
+  lastRepairMercy = signal<boolean>(false);
 
   // Callsigns this user has muted/blocked — their chat is dropped on receipt.
   // Persisted in localStorage so the block list survives reloads.
@@ -489,10 +491,9 @@ export class MultiplayerService {
       if (msg.capacity != null) this.capacity.set(+msg.capacity || 0);
 
     } else if (msg.type === 'repair_result') {
-      // Dock repair adjudication. On denial (insufficient gold) the wallet message that accompanies it
-      // already corrected our gold; nothing to refloat here (the UI gates the button by gold).
+      // Dock repair always succeeds (mercy free repair when broke). The wallet message alongside corrects gold.
       this.gold.set(+msg.gold || this.gold());
-      if (!msg.ok) this.tradeError.set('Not enough gold to repair.');
+      this.lastRepairMercy.set(!!msg.mercy);
 
     } else if (msg.type === 'trade_error') {
       this.tradeError.set(String(msg.reason ?? 'trade failed'));

@@ -38,5 +38,10 @@ module.exports = (sequelize, DataTypes) => {
     gold:        { type: DataTypes.INTEGER, allowNull: false, defaultValue: 500 },
     cargo:       { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
     tradeLedger: { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
+
+    // Persistent ship damage: JSON { zones, slug, mapVersion } of the player's last hull state. Restored on
+    // reconnect (so battle damage survives logout/restart) UNLESS its mapVersion is stale (new map → full
+    // hull). Cleared to full by a dock repair or a sunk→respawn.
+    combatState: { type: DataTypes.TEXT,    allowNull: true,  defaultValue: null },
   });
 };

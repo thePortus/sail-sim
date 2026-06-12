@@ -387,16 +387,48 @@ async function saveEconomyState(p) {
   }
 }
 
-/** Load a player's purse + hold from the DB into memory and send them their wallet. */
-async function loadAndSendWallet(p) {
+/** Safe-parse the persisted combatState TEXT column → object or null. */
+function parseCombat(text) {
+  if (!text) return null;
+  try { const o = JSON.parse(text); return (o && typeof o === 'object') ? o : null; } catch { return null; }
+}
+
+/** Persist a player's hull damage (per-zone HP + vessel + map version) so it survives logout/restart.
+ *  The mapVersion stamp makes the save stale after a map re-bake → full hull on the new map. */
+async function saveCombatState(p) {
+  if (!p || !p.auth || p.auth.userId == null || !p.combat) return;
+  try {
+    await User.update(
+      { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) },
+      { where: { id: p.auth.userId } },
+    );
+  } catch (err) {
+    console.warn('[WS] saveCombatState failed:', err.message);
+  }
+}
+
+/** Load a player's purse + hold + persistent hull damage from the DB, restore them in memory, and send the
+ *  wallet + the (restored or fresh) hull state. Damage is restored UNLESS its map version is stale (new map →
+ *  full hull) or the saved hull is sunk (rescue to full — never log in sunk). */
+async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
+
+    const saved = parseCombat(u.combatState);
+    if (saved && saved.mapVersion === moveConst.MAP_VERSION && saved.zones) {
+      const restored = combat.restoreCombatState(saved.slug || 'sloop', saved.zones);
+      if (!restored.sunk) p.combat = restored;   // keep battle damage; never restore a sunk hull
+    }
+
     sendWallet(p);
+    // Broadcast the current hull (restored damage or fresh) so the player's HUD and everyone's listing match.
+    const stateMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
+    for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(stateMsg);
   } catch (err) {
     console.warn('[WS] loadAndSendWallet failed:', err.message);
   }
@@ -485,7 +517,8 @@ function attachMultiplayer(server) {
   // Persist each connected player's validated pose so they resume where they actually were. Replaces
   // the old client-initiated PUT /player-location (removed) — the server is the sole writer now.
   setInterval(() => {
-    for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); }   // economy save = backstop; trades persist inline
+    // economy save = backstop (trades persist inline); location + hull damage persist here + on disconnect.
+    for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); saveCombatState(p); }
   }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change
@@ -569,7 +602,7 @@ function attachMultiplayer(server) {
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
     ws.send(JSON.stringify(currentWaveState()));
-    loadAndSendWallet(players.get(id));   // load purse + hold from the DB, then send the wallet
+    loadAndSendWallet(id, players.get(id), players);   // load purse + hold + persistent hull damage from the DB
 
     const existing = [];
     const nowTs = Date.now();
@@ -803,17 +836,14 @@ function attachMultiplayer(server) {
         // respawn path ('respawn' below) stays FREE so a broke player isn't trapped at the bottom of the sea.
         const me = players.get(id);
         if (me && me.combat) {
+          // Mercy repair: charge the fee if affordable, otherwise free — the harbourmaster never turns away
+          // a broke captain. Always proceeds to a full hull.
           const rep = economy.applyRepair(me);
-          if (!rep.ok) {
-            // Can't afford it — deny, correct the wallet, leave the hull as-is.
-            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: false, gold: me.gold | 0, fee: rep.fee }));
-            sendWallet(me);
-            return;
-          }
-          saveEconomyState(me);   // persist the gold deduction
-          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, fee: rep.fee }));
+          saveEconomyState(me);   // persist the (possibly zero) gold deduction
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy }));
           sendWallet(me);
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          saveCombatState(me);   // persist the repaired (full) hull
           // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones,
@@ -835,6 +865,7 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat && me.combat.sunk) {
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          saveCombatState(me);  // persist the fresh hull (respawn = full repair)
           me.authPose = null;   // trust the next update — the respawn teleport
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
@@ -939,6 +970,7 @@ function attachMultiplayer(server) {
       const closingCallsign = closing?.state?.callsign;
       savePlayerLocation(closing);   // persist final authoritative pose before dropping the player
       saveEconomyState(closing);     // backstop persist of purse + hold (trades already persist inline)
+      saveCombatState(closing);      // persist hull damage so it survives logout/restart
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a

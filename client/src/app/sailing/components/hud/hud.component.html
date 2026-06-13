@@ -1,5 +1,20 @@
 <div class="hud-overlay pointer-events-none select-none" [class.photo-mode]="photoMode()">
 
+  <!-- ── Mast jury-rig repair bar (top-centre popup; shows only while the mast is being repaired) ─────── -->
+  @if (combatService.mastRepairProgress() !== null) {
+    <div class="absolute left-1/2 top-24 -translate-x-1/2 w-72 max-w-[80vw] rounded-lg border border-amber-500/40
+                bg-slate-900/85 px-4 py-2 font-mono text-amber-200 shadow-lg backdrop-blur-sm">
+      <div class="flex items-center justify-between text-xs uppercase tracking-wider mb-1.5">
+        <span>⚒ Jury-rigging mast…</span>
+        <span class="text-amber-300">{{ (combatService.mastRepairProgress() ?? 0) * 100 | number:'1.0-0' }}%</span>
+      </div>
+      <div class="h-2 rounded-full bg-slate-700/80 overflow-hidden">
+        <div class="h-full bg-gradient-to-r from-amber-500 to-amber-300 transition-[width] duration-150"
+             [style.width.%]="(combatService.mastRepairProgress() ?? 0) * 100"></div>
+      </div>
+    </div>
+  }
+
   <!-- ── Fullscreen toggle (top-right corner, above sail panel) ─────────── -->
   <button class="fullscreen-btn pointer-events-auto" (click)="toggleFullscreen()"
           [title]="isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen'">

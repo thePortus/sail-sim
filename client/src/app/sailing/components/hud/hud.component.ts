@@ -4,6 +4,7 @@ import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
 import { SceneService } from '../../services/scene.service';
 import { CannonService } from '../../services/cannon.service';
+import { CombatService } from '../../services/combat.service';
 import { SailState } from '../../models';
 import { ChatComponent } from '../chat/chat.component';
 import { DamageDiagramComponent } from './damage-diagram.component';
@@ -19,6 +20,7 @@ export class HudComponent implements OnInit, OnDestroy {
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
   cannonService  = inject(CannonService);
+  combatService  = inject(CombatService);
   private zone   = inject(NgZone);
 
   @ViewChild(ChatComponent) private chat?: ChatComponent;

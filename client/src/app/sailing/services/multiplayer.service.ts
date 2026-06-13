@@ -476,6 +476,10 @@ export class MultiplayerService {
       if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState, maxHp);
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
+    } else if (msg.type === 'mast_repair') {
+      // Server armed our mast jury-rig (sent only to us) → run the HUD repair bar over its duration.
+      this.combatService.startMastRepair(+msg.ms || 0);
+
     } else if (msg.type === 'combat_sunk') {
       if (msg.victimId === this.myId) {
         // Start the capsize NOW, but delay the "you were sunk" card until the wreck animation has played.

@@ -600,9 +600,14 @@ function attachMultiplayer(server) {
     // mast-raise visual, and (for the owner) the sailing penalty.
     const nowMast = Date.now();
     for (const [id, p] of players) {
-      if (combat.tickMastRepair(p.combat, nowMast)) {
+      const r = combat.tickMastRepair(p.combat, nowMast);
+      if (r === 'repaired') {
         const m = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
         for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+      } else if (r === 'armed' && p.ws && p.ws.readyState === 1) {
+        // Tell the OWNER how long the jury-rig will take (ms) so their HUD can show a repair progress bar.
+        // Server-driven duration → when crew later makes it variable, the bar follows with no client change.
+        p.ws.send(JSON.stringify({ type: 'mast_repair', ms: Math.max(0, p.combat.mastRepairUntil - nowMast) }));
       }
     }
 

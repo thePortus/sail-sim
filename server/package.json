@@ -12,6 +12,7 @@
   ],
   "scripts": {
     "start": "npx postcss ./pages/tailwind.css -o ./pages/tailwind.min.css && npx apidoc -i . -o pages/docs/ && NODE_ENV=production node server.js",
+    "backup": "node scripts/backup.mjs",
     "terrain": "node scripts/make-world.mjs",
     "fetch:terrain-sources": "node scripts/fetch-terrain-sources.mjs",
     "build:terrain-region": "node scripts/build-terrain-region.mjs",

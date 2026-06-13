@@ -178,17 +178,20 @@ function applyDamage(combat, zone, dmg) {
  * itself on any newCombatState (respawn / port repair / vessel change) and is never persisted.
  */
 function tickMastRepair(combat, nowMs) {
-  if (!combat || combat.sunk) return false;   // sinking ships respawn (which resets the mast) — don't repair
+  if (!combat || combat.sunk) return null;    // sinking ships respawn (which resets the mast) — don't repair
   if (combat.mastRepairUntil) {
     if (nowMs >= combat.mastRepairUntil) {
       combat.zones.masts = Math.round(combat.maxHp.masts * C.MAST_REPAIR_FRAC);
       combat.mastRepairUntil = 0;
-      return true;
+      return 'repaired';
     }
   } else if (combat.zones.masts <= 0) {
+    // Arm the jury-rig. Flat MAST_REPAIR_MS for now; crew/morale will scale this later — keep that decision
+    // HERE (the single source of truth), since the client is TOLD the duration and just follows it.
     combat.mastRepairUntil = nowMs + C.MAST_REPAIR_MS;
+    return 'armed';
   }
-  return false;
+  return null;
 }
 
 /**

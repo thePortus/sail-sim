@@ -55,6 +55,7 @@ const economy = require('./economy');
 const npc = require('./npc');
 const salvage = require('./salvage');
 const factions = require('./factions');
+const { getVesselDef } = require('./controllers/vessels.controller');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -410,6 +411,7 @@ async function saveEconomyState(p) {
         gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []),
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
+        ship: p.ship || 'pinnace',
       },
       { where: { id: p.auth.userId } },
     );
@@ -444,11 +446,15 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
+    // Owned vessel — map-independent. The 'update' handler forces the broadcast slug to this, so a client
+    // can't sail a hull it doesn't own. capacity/physics derive from it too.
+    p.ship = (u.ship && getVesselDef(u.ship)) ? u.ship : 'pinnace';
+    if (p.state) p.state.vesselSlug = p.ship;
 
     // Faction reputation — persists across maps (it's the player's standing, not the world's). Normalized so a
     // newly-added nation always appears at neutral.
@@ -480,9 +486,10 @@ function sendWallet(p) {
   if (p && p.ws.readyState === 1) {
     p.ws.send(JSON.stringify({
       type: 'wallet', gold: p.gold | 0, cargo: p.cargo || {},
-      capacity: economy.capacityFor(p.state && p.state.vesselSlug),
+      capacity: economy.capacityFor(p.ship || (p.state && p.state.vesselSlug)),
       catalog: economy.goodsCatalog(),
       factionRep: p.factionRep || factions.defaultRep(),
+      ship: p.ship || 'pinnace',
     }));
   }
 }
@@ -705,6 +712,7 @@ function attachMultiplayer(server) {
       ws, state: null, friends: [], combat: combat.newCombatState(), auth,
       gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
       factionRep: factions.defaultRep(),                                      // Factions reputation — overwritten by the DB load below
+      ship: 'pinnace',                                                        // Ships-as-economy: owned hull — overwritten by the DB load below
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
@@ -746,7 +754,10 @@ function attachMultiplayer(server) {
           anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
-          vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
+          // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
+          // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
+          // bought. capacity + movement physics then derive from the real hull.
+          vesselSlug: (players.get(id).ship) || 'pinnace',
           // Authoritative identity from the verified JWT — a forged `msg.callsign` is ignored, so a
           // client can't impersonate another player or hijack their single-session slot.
           callsign:   players.get(id).auth.callsign,

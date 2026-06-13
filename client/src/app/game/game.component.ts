@@ -38,7 +38,6 @@ import { AuthService }        from '../services/auth.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
-import { VesselSelectorComponent } from '../sailing/components/vessel-selector/vessel-selector.component';
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
@@ -52,16 +51,25 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
       <canvas #gameCanvas class="game-canvas"
               [class.game-canvas--visible]="phase() === 'sailing'"></canvas>
 
-      <!-- Vessel selection screen -->
-      @if (phase() === 'selecting') {
-        <app-vessel-selector (vesselSelected)="onVesselSelected($event)" />
+      <!-- No vessel-selection screen anymore: the game auto-boots into the player's OWNED ship (bought at a
+           port shipwright). The 'selecting' phase is now just a transient pre-boot state; if startup fails it
+           shows a retry card. -->
+      @if (phase() === 'selecting' && initError()) {
+        <div class="kick-notice-backdrop">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚓</div>
+            <div class="kick-notice-title">Becalmed</div>
+            <div class="kick-notice-text">{{ initError() }}</div>
+            <button class="kick-notice-btn" (click)="startGame()">Retry</button>
+          </div>
+        </div>
       }
 
       <!-- Kicked / banned notice (prominent, dismissable) -->
@@ -310,6 +318,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
+  initError  = signal<string | null>(null);   // shown as a retry card if auto-boot fails
   /** True once the BabylonJS scene/engine has been booted this session. Gates teardown so it runs for
    *  a partially-initialised game (e.g. aborting mid-init on an auth failure), not just while sailing. */
   private sceneStarted = false;
@@ -504,11 +513,14 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   }
 
   ngAfterViewInit(): void {
-    // Scene initialises only after vessel selection (canvas not yet visible)
+    // No vessel-selection step anymore — boot straight into the player's owned ship once the canvas exists.
+    void this.startGame();
   }
 
-  async onVesselSelected(event: { slug: string }): Promise<void> {
-    this.selectedSlug = event.slug;
+  /** Boot straight into the game with the player's OWNED ship (no vessel-selection screen — ships are now
+   *  bought at a port shipwright). Re-runnable: a Retry on the error card calls it again. */
+  async startGame(): Promise<void> {
+    this.initError.set(null);
     // Read the permanent callsign from stored credentials
     try {
       const raw = this.authService.getUserDetails();
@@ -521,6 +533,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     try {
       await this.runInitStep('verify-auth', 'Verifying credentials…', async () => {
         await firstValueFrom(this.http.get(`${Settings.apiUrl}user/me`));
+      });
+
+      // Owned vessel (map-independent) — build whatever hull the player owns. Defaults to the pinnace for
+      // a brand-new player. Fetched here, before the vessel build below reads this.selectedSlug.
+      this.selectedSlug = await this.runInitStep('fetch-ship', 'Mustering your crew…', async () => {
+        try {
+          const r = await firstValueFrom(this.http.get<{ ship: string }>(`${Settings.apiUrl}player-ship`));
+          return (r?.ship) || 'pinnace';
+        } catch { return 'pinnace'; }
       });
 
       // 1. Boot BabylonJS scene (WebGPU/WebGL)
@@ -657,6 +678,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);
       this.loadingMsg.set('Startup failed. Check browser console for [GameInit] logs.');
+      this.initError.set('Could not set sail. Check your connection and try again.');
       this.phase.set('selecting');
       return;
     }

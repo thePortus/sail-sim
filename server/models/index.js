@@ -35,6 +35,10 @@ db.ensureColumns = async () => {
     // Factions: JSON { [factionId]: standing } reputation (neutral 0 start). Persists across maps (it's the
     // player's, not the world's). Scaffold only — no gameplay effects yet (the events module wires those in).
     ['factionRep',   { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
+    // Ships-as-economy: the player's OWNED vessel slug. Persists across maps (it's the player's, NOT the
+    // world's — unlike lastVesselSlug which rides the map-gated position save). Everyone (incl. existing
+    // players, via the backfill) starts in the 'pinnace' — ships are now bought at a shipwright for gold.
+    ['ship',         { type: Sequelize.DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' }],
   ];
   for (const [name, spec] of adds) {
     try {

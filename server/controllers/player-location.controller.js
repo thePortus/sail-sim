@@ -45,5 +45,19 @@ exports.getLocation = async (req, res) => {
   }
 };
 
+/**
+ * The player's OWNED vessel slug — map-INDEPENDENT (persists across map regens, unlike position). The client
+ * fetches this before building its hull so a new map still opens in the ship you own. Defaults to 'pinnace'.
+ *   GET /player-ship  → { ship }
+ */
+exports.getShip = async (req, res) => {
+  try {
+    const user = await User.findByPk(req.user.id, { attributes: ['ship'] });
+    res.json({ ship: (user && user.ship) || 'pinnace' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 // NOTE: there is intentionally NO saveLocation here. Position is persisted SERVER-side from the
 // validated movement stream (multiplayer.js savePlayerLocation) so a client can't write a fake one.

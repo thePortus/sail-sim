@@ -1213,6 +1213,28 @@ function attachMultiplayer(server) {
             }
           }
 
+        } else if (text.startsWith('/givegold ')) {
+          // /givegold "<player>" <amount> — gift gold to another player (admin). Amount is a positive integer.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may give gold.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/givegold '.length).trim());
+            const amount = Math.floor(Number((parsed?.rest || '').trim()));
+            if (!parsed?.target || !Number.isFinite(amount) || amount <= 0) {
+              sysReply(me.ws, 'Usage: /givegold "<player>" <amount>   (amount must be a positive number)');
+            } else {
+              let target = null;
+              for (const [, p] of players) { if (!p.isNpc && p.state && p.state.callsign === parsed.target) { target = p; break; } }
+              if (!target) { sysReply(me.ws, `No online player named "${parsed.target}".`); }
+              else {
+                target.gold = (target.gold | 0) + amount;
+                saveEconomyState(target).then(() => sendWallet(target));   // persist BEFORE the client sees it
+                sysReply(target.ws, `The admins have granted you ${amount} gold.`);
+                sysReply(me.ws, `Gave ${amount} gold to "${parsed.target}" (now ${target.gold}).`);
+              }
+            }
+          }
+
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
 

@@ -9,7 +9,8 @@ import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { catchError, of } from 'rxjs';
 
-import { FACTIONS }           from '../sailing/faction.config';
+import { FACTIONS, factionColor, factionName } from '../sailing/faction.config';
+import type { TerrainHarbor }  from '../sailing/models';
 import { SceneService }       from '../sailing/services/scene.service';
 import { OceanService }       from '../sailing/services/ocean.service';
 import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.service';
@@ -116,6 +117,9 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           } @else {
             <div class="dock-menu">
               <div class="dock-name">{{ town.name }}</div>
+              @if (town.faction) {
+                <div class="dock-faction"><span class="dock-faction-dot" [style.background]="factionColor(town.faction)"></span>{{ factionLabel(town) }}</div>
+              }
               <div class="dock-desc">{{ town.description }}</div>
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onRepairVessel()">
@@ -208,6 +212,8 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                  border-radius: 14px; border: 1px solid rgba(232,211,160,0.4);
                  background: rgba(12,20,32,0.95); box-shadow: 0 14px 44px rgba(0,0,0,0.6); }
     .dock-name { color: #ffe9b0; font-size: 1.2rem; font-weight: 700; }
+    .dock-faction { display: flex; align-items: center; gap: 6px; margin-top: 4px; color: #dbe7f0; font-size: 0.82rem; }
+    .dock-faction-dot { width: 10px; height: 10px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.5); flex: none; }
     .dock-desc { color: #cfe3f5; opacity: 0.75; font-size: 0.85rem; margin: 6px 0 16px;
                  font-family: ui-monospace, monospace; }
     .dock-opt  { display: block; width: 100%; padding: 10px; margin-bottom: 8px; cursor: pointer;
@@ -326,6 +332,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   });
   protected inventoryUsed = computed(() =>
     Object.values(this.multiplayerService.cargo()).reduce((a, b) => a + (b || 0), 0));
+
+  /** Faction colour for a town (dock menu swatch). */
+  protected factionColor(id?: string | null): string { return factionColor(id); }
+  /** Dock-menu faction label: nation (+ "contested by Rival" note). */
+  protected factionLabel(town: TerrainHarbor): string {
+    return factionName(town.faction) + (town.contested && town.rivalFaction ? ` — contested by ${factionName(town.rivalFaction)}` : '');
+  }
 
   /** Faction standings for the Ship's Hold readout — every nation, neutral by default (scaffold; no effects). */
   protected factionStandings = computed(() => {

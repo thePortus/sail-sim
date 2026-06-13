@@ -8,6 +8,7 @@ import { VesselService } from '../../services/vessel.service';
 import { MultiplayerService } from '../../services/multiplayer.service';
 import { SceneService } from '../../services/scene.service';
 import { MinimapBakeCompute } from '../../services/terrain/minimap-bake-compute';
+import { factionColor, factionName } from '../../faction.config';
 import type { WebGPUEngine } from '@babylonjs/core';
 
 @Component({
@@ -262,18 +263,29 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
           ctx.lineWidth = 2;
           ctx.beginPath(); ctx.arc(hxp, hyp, 7 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
         }
-        ctx.fillStyle   = known ? '#9fe0a0' : '#e8d3a0';   // green = discovered, tan = unexplored
-        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-        ctx.lineWidth   = 0.8;
+        // Dot coloured by the owning nation (dimmed until the player has discovered it). Contested towns get a
+        // ring in their rival's colour; discovered towns get a thin white ring.
+        ctx.globalAlpha = known ? 1 : 0.5;
+        ctx.fillStyle   = h.faction ? factionColor(h.faction) : (known ? '#9fe0a0' : '#e8d3a0');
         ctx.beginPath();
         ctx.arc(hxp, hyp, 3, 0, Math.PI * 2);
         ctx.fill();
+        ctx.globalAlpha = 1;
+        if (h.contested && h.rivalFaction) { ctx.strokeStyle = factionColor(h.rivalFaction); ctx.lineWidth = 1.8; }
+        else                               { ctx.strokeStyle = 'rgba(0,0,0,0.6)';            ctx.lineWidth = 0.8; }
         ctx.stroke();
+        if (known) {
+          ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 0.8;
+          ctx.beginPath(); ctx.arc(hxp, hyp, 4.6, 0, Math.PI * 2); ctx.stroke();
+        }
         if (hp) {
           const d = Math.hypot(hp.x - hxp, hp.y - hyp);
           if (d < bestD) {
             bestD = d;
-            const lines = [h.name, h.description];
+            const facLine = h.faction
+              ? `${factionName(h.faction)}${h.contested && h.rivalFaction ? ` (contested by ${factionName(h.rivalFaction)})` : ''}`
+              : null;
+            const lines = facLine ? [h.name, facLine, h.description] : [h.name, h.description];
             const led = ledger[h.id];
             if (led) {
               lines.push(`Trade: ${cap(led.specialty)}`);

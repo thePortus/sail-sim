@@ -2,6 +2,7 @@ import { Component, Output, EventEmitter, computed, signal, inject } from '@angu
 import { CommonModule } from '@angular/common';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
 import { MarketRow } from '../sailing/models';
+import { factionColor, factionName } from '../sailing/faction.config';
 
 /**
  * Trader panel (Town Economy — Phase 1). Opened from the dock menu's "Trade" button. Renders the town's
@@ -20,7 +21,12 @@ import { MarketRow } from '../sailing/models';
     <div class="tr-panel" (click)="$event.stopPropagation()">
       <div class="tr-header">
         <div class="tr-title">{{ mp.market()?.name || 'Trader' }}</div>
-        <div class="tr-specialty">{{ specialtyLabel() }}</div>
+        <div class="tr-headmeta">
+          @if (faction(); as f) {
+            <span class="tr-faction"><span class="tr-faction-dot" [style.background]="f.color"></span>{{ f.label }}</span>
+          }
+          <span class="tr-specialty">{{ specialtyLabel() }}</span>
+        </div>
       </div>
 
       @if (mp.hint(); as h) {
@@ -91,6 +97,9 @@ import { MarketRow } from '../sailing/models';
     }
     .tr-header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; border-bottom: 1px solid rgba(184,138,62,0.3); padding-bottom: 0.5rem; }
     .tr-title { font-size: 1.25rem; font-weight: 600; color: #e8d3a0; }
+    .tr-headmeta { display: flex; flex-direction: column; align-items: flex-end; gap: 0.15rem; }
+    .tr-faction { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; color: #e8d3a0; }
+    .tr-faction-dot { width: 9px; height: 9px; border-radius: 2px; border: 1px solid rgba(0,0,0,0.5); }
     .tr-specialty { font-size: 0.82rem; color: #b89a62; text-transform: capitalize; letter-spacing: 0.02em; }
     .tr-rumour { margin-top: 0.55rem; padding: 0.4rem 0.6rem; border-radius: 6px; font-size: 0.82rem;
                  background: rgba(184,138,62,0.15); border: 1px solid rgba(184,138,62,0.35); color: #e8d3a0; }
@@ -141,6 +150,13 @@ export class TraderMenuComponent {
   protected specialtyLabel = computed(() => {
     const s = this.mp.market()?.specialty ?? '';
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  });
+  /** Faction badge for the trader header: nation name (+ contested note) and its colour. */
+  protected faction = computed(() => {
+    const m = this.mp.market();
+    if (!m?.faction) return null;
+    const label = factionName(m.faction) + (m.contested && m.rivalFaction ? ` · contested` : '');
+    return { label, color: factionColor(m.faction) };
   });
 
   held(goodId: string): number { return this.mp.cargo()[goodId] ?? 0; }

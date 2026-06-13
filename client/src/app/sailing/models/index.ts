@@ -125,7 +125,10 @@ export interface MarketRow {
 /** A trade rumour: the best place to SELL one of this town's exports right now. */
 export interface MarketHint { goodId: string; goodName: string; townId: string; townName: string; bid: number; }
 /** A town's market quote, pushed by the server when the trader is opened or a trade resolves. */
-export interface MarketState { townId: string; name: string; specialty: string; goods: MarketRow[]; hint?: MarketHint | null; }
+export interface MarketState {
+  townId: string; name: string; specialty: string; goods: MarketRow[]; hint?: MarketHint | null;
+  faction?: string | null; contested?: boolean; rivalFaction?: string | null;
+}
 /** A discovered town in the player's ledger: its specialty + last-seen prices + the in-game day seen. */
 export interface LedgerEntry { specialty: string; day: number; goods: { id: string; ask: number; bid: number }[]; }
 

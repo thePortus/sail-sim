@@ -17,6 +17,7 @@ import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
+import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
 
@@ -520,7 +521,11 @@ export class MultiplayerService {
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
-      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [], hint: msg.hint ?? null });
+      this.market.set({
+        townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty),
+        goods: msg.goods || [], hint: msg.hint ?? null,
+        faction: msg.faction ?? null, contested: !!msg.contested, rivalFaction: msg.rivalFaction ?? null,
+      });
       this.hint.set(msg.hint ?? null);
       this.hintedHarbor.set(msg.hint?.townId ?? null);
       if (msg.gold != null) this.gold.set(+msg.gold || 0);
@@ -1213,9 +1218,10 @@ export class MultiplayerService {
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
-    // Nameplate (billboard above masthead) — NPC merchants show their ship name + a merchant tint.
+    // Nameplate (billboard above masthead). NPC merchants show their ship name + a faction-coloured "⚑ NATION
+    // MERCHANT" tag; players show their callsign.
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
-    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, !!entry.npc);
+    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, entry.npc ? (entry.faction || null) : null);
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1246,8 +1252,9 @@ export class MultiplayerService {
   // ── Floating callsign label ───────────────────────────────────────────────
 
   private buildCallsignLabel(
-    name: string, callsign: string, root: TransformNode, scene: Scene, merchant = false,
+    name: string, text: string, root: TransformNode, scene: Scene, faction: string | null = null,
   ): Mesh {
+    const merchant = !!faction;
     const texW = 768, texH = 128;
 
     const tex = new DynamicTexture(name + '_tex', { width: texW, height: texH }, scene, false);
@@ -1258,16 +1265,30 @@ export class MultiplayerService {
     ctx.beginPath();
     ctx.rect(10, 10, texW - 20, texH - 20);
     ctx.fill();
-
-    ctx.fillStyle = merchant ? '#f0d99a' : '#FFFFFF';
-    ctx.font      = 'bold 56px Arial, sans-serif';
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(callsign.toUpperCase(), texW / 2, texH / 2);
 
-    ctx.strokeStyle = merchant ? 'rgba(232, 200, 120, 0.6)' : 'rgba(130, 200, 255, 0.55)';
-    ctx.lineWidth   = 3;
-    ctx.strokeRect(10, 10, texW - 20, texH - 20);
+    if (merchant) {
+      const col = factionColor(faction);
+      // Ship name (top) in cream, then a faction-coloured "⚑ NATION MERCHANT" tag (bottom).
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#f3ead0';
+      ctx.font = 'bold 50px Arial, sans-serif';
+      ctx.fillText(text, texW / 2, 62);
+      ctx.fillStyle = col;
+      ctx.font = 'bold 30px Arial, sans-serif';
+      ctx.fillText(`⚑ ${factionName(faction).toUpperCase()} MERCHANT`, texW / 2, 104);
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 5;
+      ctx.strokeRect(8, 8, texW - 16, texH - 16);
+    } else {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 56px Arial, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text.toUpperCase(), texW / 2, texH / 2);
+      ctx.strokeStyle = 'rgba(130, 200, 255, 0.55)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(10, 10, texW - 20, texH - 20);
+    }
 
     tex.update();
     tex.hasAlpha = true;

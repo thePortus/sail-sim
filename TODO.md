@@ -2,9 +2,6 @@
 
 # General or Current TODO Items
 
-* make stock of products in each port... limited number of each items which causes them to need... if there already is, it isn't apparent... this is what should drive prices up/down, actual scarcity... you should be able to buy out the stock
-* make trade hints not show you ports you can't get to
-* make all merchants visible to admins on the map, admins repair free, can /repair others, and /teleport and /teleportto
 * add occasional bosun whistle (no more than once a day)
 * all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
 * lod + imposters for ships at distance
@@ -55,3 +52,7 @@
 * Security pass
 
 # TODO Items by Module
+
+Next module I'd like to add: factions...
+
+I want to have several factions in the game, and every town should belong to one of these factions. We will eventually build in reputation with factions. For now, I want the factions to be English, French, Spanish, Dutch, Portugese, Ottoman

@@ -165,6 +165,35 @@ function stringPull(cells) {
   return out;
 }
 
+/** Component id of the nearest navigable cell to (x,z) — searching outward, NOT forced to the main sea (unlike
+ *  snapToNav). This is the LOCAL water body a point touches. -1 if no navigable cell within SNAP_MAX_RINGS. */
+function componentAt(x, z) {
+  if (!loaded) loadNavGrid();
+  if (!bits || !comp) return -1;
+  const { cx, cz } = worldToCell(x, z);
+  if (isNav(cx, cz)) return comp[cz * res + cx];
+  for (let r = 1; r <= SNAP_MAX_RINGS; r++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+        const nx = cx + dx, nz = cz + dz;
+        if (inGrid(nx, nz) && isNav(nx, nz)) return comp[nz * res + nx];
+      }
+    }
+  }
+  return -1;
+}
+
+/** True if a sea route plausibly connects A and B — i.e. their local water bodies are the SAME connected
+ *  component (no land barrier between them). Fail-open (true) when no navgrid is loaded, so trading still
+ *  works on maps built before the grid existed. Used to keep demand hints / NPC sourcing to reachable ports. */
+function reachable(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  if (!bits || !comp) return true;   // no grid → don't filter
+  const a = componentAt(ax, az);
+  return a >= 0 && a === componentAt(bx, bz);
+}
+
 // ── public ──────────────────────────────────────────────────────────────────────
 /**
  * World-space sea route from A to B. Returns [{x,z}, …] starting at A and ending at B (the real pier points),
@@ -207,7 +236,7 @@ function loadNavGrid() {
 }
 
 module.exports = {
-  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav,
+  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable,
   // test seam — inject a synthetic grid (bitset) without a baked manifest.
   _test: {
     setGrid(resolution, bitset, worldBounds) { res = resolution; bits = bitset; wb = worldBounds; loaded = true; pathCache.clear(); computeComponents(); },

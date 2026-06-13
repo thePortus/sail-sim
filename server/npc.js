@@ -32,7 +32,7 @@ const VIEW_R2 = VIEW_RADIUS * VIEW_RADIUS;
 const MAX_VISIBLE = 5;       // at most this many merchants per client (the nearest ones)
 const MERCHANT_LOAD = 8;     // units a merchant tries to buy + carry per trip
 const SEED_GOLD = 1500;      // working capital a merchant spawns with (looted on a sinking — NP4)
-const DISTRESS_SPREAD = 3;   // dispatch among the top-N distress needs so merchants don't all chase the worst one
+const NEED_SPREAD = 4;       // dispatch among the top-N shortages so merchants don't all chase the single worst one
 const SINK_LINGER_MS = 4000; // keep a sunk merchant around this long so the capsize animation plays, then despawn
 let seq = 0;
 
@@ -103,17 +103,21 @@ function wander(npc, towns) {
   npc.route = null;
 }
 
-/** Choose a trade: a persistent shortage to relieve (distress-first, spread among the top few), else the most
- *  profitable arbitrage route. Returns { goodId, srcTownId, destTownId } or null. */
+/** Choose a trade, driven ENTIRELY by demand: pick a town that is short of a good it consumes (worst shortages
+ *  first — long-unmet "distress" outranks), then source that good from the cheapest producer the needy town can
+ *  actually be reached from. Spread among the top few needs so the fleet doesn't all converge on one shortage.
+ *  Returns { goodId, srcTownId, destTownId } or null (nothing needed right now → the caller idles/wanders).
+ *  NOTE: no generic arbitrage fallback — merchants move only because somewhere needs the cargo. */
 function chooseTrip() {
-  const distress = economy.distressList();
-  if (distress.length) {
-    const need = pick(distress.slice(0, Math.min(DISTRESS_SPREAD, distress.length)));
+  const needs = economy.needList();
+  if (!needs.length) return null;
+  const top = needs.slice(0, Math.min(NEED_SPREAD, needs.length));
+  // Try a few of the most urgent needs until one has a reachable producer with stock to sell.
+  for (let tries = 0; tries < top.length; tries++) {
+    const need = pick(top);
     const src = economy.bestSellerFor(need.goodId, need.townId);
     if (src && src.townId !== need.townId) return { goodId: need.goodId, srcTownId: src.townId, destTownId: need.townId };
   }
-  const arb = economy.bestArbitrage();
-  if (arb) return { goodId: arb.goodId, srcTownId: arb.srcTownId, destTownId: arb.destTownId };
   return null;
 }
 

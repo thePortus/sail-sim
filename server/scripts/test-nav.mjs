@@ -53,6 +53,13 @@ ok(snappedPocket && !(snappedPocket.cx <= 2 && snappedPocket.cz <= 2), 'an enclo
 const seaPt = nav.cellToWorld(40, 40);
 ok(nav.findPath(seaPt.x, seaPt.z, nav.cellToWorld(1, 1).x, nav.cellToWorld(1, 1).z) !== null, 'open sea → enclosed town routes (via the snapped sea cell + approach)');
 
+console.log('reachable() — two basins split by a solid wall (no gap):');
+// left basin (cx<30) + right basin (cx>34), a full-height land wall between → two separate components.
+nav._test.setGrid(RES, nav._test.packGrid(RES, (cx) => cx < 30 || cx > 34), WB);
+const lA = nav.cellToWorld(10, 20), lB = nav.cellToWorld(20, 50), rC = nav.cellToWorld(50, 30);
+ok(nav.reachable(lA.x, lA.z, lB.x, lB.z), 'two points in the SAME basin are reachable');
+ok(!nav.reachable(lA.x, lA.z, rC.x, rC.z), 'points in DIFFERENT basins (land between) are NOT reachable');
+
 // ── NP1b: real baked navgrid (only if present) ──
 console.log('\nNP1b — real baked navgrid (skipped if not yet baked):');
 let realGrid = false;

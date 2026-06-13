@@ -22,6 +22,7 @@ const path = require('path');
 const terrainConfig = require('./config/terrain.config');
 const moveConst = require('./movement-constants');
 const goods = require('./trade-goods');
+const nav = require('./nav');
 const { getVesselDef } = require('./controllers/vessels.controller');
 
 const DOCK_RADIUS_M = 70;         // generous: anti-cheat backstop, never tighter than the client dock test
@@ -31,6 +32,7 @@ const MAX_CATCHUP_DAYS = 30;      // cap downtime simulation so a long outage do
 const MIN_STOCK = 1;              // a town never sells its last unit (also avoids div-by-zero in pricing)
 const SCARCE_FRAC = 0.25;        // a consumed good is "in distress" below this fraction of its priceRef
 const DISTRESS_TRIGGER = 3;      // days a shortage must persist before merchants are dispatched to relieve it
+const NEED_FRAC = 0.85;          // a consumed good is "needed" (a dispatch trigger) below this fraction of priceRef
 
 let loaded = false;
 let towns = new Map();            // townId → { id, name, tier, specialty, x, z }
@@ -154,19 +156,34 @@ function marketFor(townId) {
     const stock = mk ? (mk.stock[g.id] ?? 0) : pr.seedStock;
     const q = goods.quote(g.base, pr.priceRef, stock, t.tier);
     const level = +Math.max(0, Math.min(3, stock / pr.priceRef)).toFixed(2);
-    return { goodId: g.id, name: g.name, ask: q.ask, bid: q.bid, level, role: pr.role };
+    // `stock` = units physically on hand; `buyable` = how many the player may buy now (a town never sells its
+    // last MIN_STOCK). Both let the trader UI show real scarcity, not just a badge.
+    return {
+      goodId: g.id, name: g.name, ask: q.ask, bid: q.bid, level, role: pr.role,
+      stock: Math.round(stock), buyable: Math.max(0, Math.floor(stock) - MIN_STOCK), cap: Math.round(pr.stockCap),
+    };
   });
   return { townId: t.id, name: t.name, specialty: t.specialty, goods: list };
 }
 
 // ── demand hints (Phase 3) ────────────────────────────────────────────────────
+/** True if `cand` is sea-reachable from the anchor town (same connected water body). When `anchorId` is null
+ *  (no anchor), nothing is filtered. Fail-open when no navgrid is loaded. */
+function reachableFrom(anchorId, cand) {
+  if (!anchorId) return true;
+  const a = getTown(anchorId);
+  return a ? nav.reachable(a.x, a.z, cand.x, cand.z) : true;
+}
+
 /** The town currently paying the highest BID for `goodId` (a scarce consumer) — the best place to SELL it.
- *  Excludes `excludeTownId` (the town giving the hint). Returns { townId, townName, bid } or null. */
+ *  Excludes `excludeTownId` (the anchor town giving the hint) AND any port not sea-reachable from it, so a
+ *  rumour never names a harbour walled off by land. Returns { townId, townName, bid } or null. */
 function bestBuyerFor(goodId, excludeTownId) {
   ensureSeeded();
   let best = null;
   for (const t of towns.values()) {
     if (t.id === excludeTownId) continue;
+    if (!reachableFrom(excludeTownId, t)) continue;
     const mk = marketFor(t.id);
     const row = mk && mk.goods.find((g) => g.goodId === goodId);
     if (row && (!best || row.bid > best.bid)) best = { townId: t.id, townName: t.name, bid: row.bid };
@@ -299,6 +316,34 @@ function npcSell(npc, townId, goodId, qty) {
   const r = tradeCore(actor, town, goodId, n, 'sell'); if (r.ok) npc.gold = actor.gold; return r;
 }
 
+/** Every active SHORTAGE that should pull a merchant: a town holding less than NEED_FRAC×priceRef of a good it
+ *  CONSUMES. This is the primary dispatch driver — merchant transit is triggered by real need, not generic
+ *  arbitrage. Sorted most-urgent first: long-unmet distress outranks, then the deepest shortage by stock level.
+ *  Each entry: { townId, townName, goodId, goodName, level (stock/priceRef), distressDays }. */
+function needList() {
+  ensureSeeded();
+  const out = [];
+  for (const t of towns.values()) {
+    const prof = profileFor(t);
+    const mk = markets.get(t.id);
+    if (!mk) continue;
+    for (const g of goods.GOODS) {
+      const pr = prof[g.id];
+      if (pr.role !== 'consumed') continue;
+      const stock = mk.stock[g.id] ?? 0;
+      const level = stock / pr.priceRef;
+      if (level < NEED_FRAC) {
+        out.push({
+          townId: t.id, townName: t.name, goodId: g.id, goodName: g.name,
+          level: +level.toFixed(3), distressDays: (mk.distress && mk.distress[g.id]) || 0,
+        });
+      }
+    }
+  }
+  out.sort((a, b) => (b.distressDays - a.distressDays) || (a.level - b.level));
+  return out;
+}
+
 /** Towns whose need for a good has stayed unmet ≥ DISTRESS_TRIGGER days, worst-first — merchant delivery targets. */
 function distressList() {
   ensureSeeded();
@@ -313,12 +358,14 @@ function distressList() {
   return out;
 }
 
-/** The town selling `goodId` cheapest right now (a stocked producer) — where a merchant SOURCES it. */
+/** The town selling `goodId` cheapest right now (a stocked producer) — where a merchant SOURCES it. Skips ports
+ *  not sea-reachable from `excludeTownId` (the needy town being supplied), so the route actually exists. */
 function bestSellerFor(goodId, excludeTownId) {
   ensureSeeded();
   let best = null;
   for (const t of towns.values()) {
     if (t.id === excludeTownId) continue;
+    if (!reachableFrom(excludeTownId, t)) continue;
     const mk = markets.get(t.id);
     if (!mk || (mk.stock[goodId] ?? 0) < MIN_STOCK + 4) continue;   // must have some to sell
     const m = marketFor(t.id);
@@ -418,14 +465,14 @@ module.exports = {
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
   bestBuyerFor, hintFor, currentDay: economyDay,
-  npcBuy, npcSell, distressList, bestSellerFor, bestArbitrage,
+  npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
   tick, tickToToday, loadState, flushState, seedMarkets,
   REPAIR_FEE: goods.REPAIR_FEE, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
   // test seam (headless harness — no manifest/DB): inject towns + drive state directly.
   _test: {
     setTowns(arr) { towns = new Map(arr.map((t) => [t.id, t])); profiles = new Map(); markets = new Map(); loaded = true; },
     seedMarkets, tick, marketFor, bestBuyerFor, hintFor, serializeTowns, hydrateTowns, economyDayAt,
-    npcBuy, npcSell, distressList, bestSellerFor, bestArbitrage,
+    npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
     setLastTickDay(d) { lastTickDay = d; }, getLastTickDay() { return lastTickDay; },
     getMarket(id) { return markets.get(id); }, profileFor: (t) => profileFor(t),
   },

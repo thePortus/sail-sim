@@ -112,7 +112,12 @@ export interface TerrainHarbor {
 // ── Town Economy (Phase 1) ──────────────────────────────────────────────────
 /** One good's quoted prices at a town: ask = player buys, bid = player sells. Phase 2 adds a scarcity hint:
  *  `level` = stock/priceRef (1≈normal, <1 scarce/dear, >1 abundant/cheap); `role` = produced|consumed|neutral. */
-export interface MarketRow { goodId: string; name: string; ask: number; bid: number; level?: number; role?: string; }
+export interface MarketRow {
+  goodId: string; name: string; ask: number; bid: number; level?: number; role?: string;
+  stock?: number;    // units physically on hand at this town
+  buyable?: number;  // how many the player may buy right now (a town never sells its last unit)
+  cap?: number;      // the town's stock cap for this good
+}
 /** A trade rumour: the best place to SELL one of this town's exports right now. */
 export interface MarketHint { goodId: string; goodName: string; townId: string; townName: string; bid: number; }
 /** A town's market quote, pushed by the server when the trader is opened or a trade resolves. */

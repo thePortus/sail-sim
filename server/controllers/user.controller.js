@@ -147,22 +147,21 @@ exports.delete = (req, res) => {
  * The route guard (verifyOwnerToken) ensures only the Owner can call this.
  */
 exports.exportUsers = (req, res) => {
-  User.findAll({
-    attributes: ['username', 'callsign', 'password', 'role', 'friends', 'banned'],
-    order: [['id', 'ASC']],
-  })
+  // Every restorable PER-PLAYER column: credentials + each player's purse (gold), faction standing, owned
+  // ship, hold/ledgers, battle damage and last-known position. The world town-economy is intentionally NOT
+  // exported — it re-seeds fresh on restore. raw:true returns plain rows with exactly these keys, so the
+  // import seeder inserts them verbatim. id/createdAt/updatedAt are omitted (the import stamps fresh ones).
+  const cols = [
+    'username', 'callsign', 'password', 'role', 'banned', 'friends',
+    'lastX', 'lastZ', 'lastHeading', 'lastVesselSlug', 'lastCallsign', 'locationSavedAt', 'lastMapVersion',
+    'gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship',
+  ];
+  User.findAll({ attributes: cols, order: [['id', 'ASC']], raw: true })
     .then(users => {
       const payload = {
         exportedAt: new Date().toISOString(),
-        version: 1,
-        users: users.map(u => ({
-          username: u.username,
-          callsign: u.callsign,
-          password: u.password,   // already an MD5 hash
-          role:     u.role,
-          friends:  u.friends ?? null,
-          banned:   !!u.banned,
-        })),
+        version: 2,   // v2 = full per-player state (was v1 = credentials only)
+        users,
       };
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Disposition', 'attachment; filename="users.json"');

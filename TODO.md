@@ -2,10 +2,8 @@
 
 # General or Current TODO Items
 
-* return to harbor should take you to /home
-* hitting enter on chat clears focus from chat menu
 * Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
-* add factions going to war, making peace
+* add factions going to war, making peace (diplomacy module)
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance
 * NPC Ship combat... & make NPCs obey the physics of winds

@@ -92,6 +92,18 @@ const RATE_WINDOW_MS   = 7000;      // sliding window for the fire-rate cap
 const RATE_MAX_SHOTS   = 7;         // <= 2 full 3-ball broadsides + slack per window
 const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
 
+// ── Shot types (ammunition) ─────────────────────────────────────────────────────
+// Per-type muzzle speed `v` (range ∝ v², so a slower ball falls short), the anti-exploit speed band
+// the server checks the claimed |velocity| against, and per-zone damage multipliers applied in
+// computeDamage (`hull` covers bow/stern/port/starboard; `masts` is the rigging column).
+//   round = solid shot: full range, full hull damage, but poor against rigging (×0.33 mast).
+//   bar   = bar/dismantling shot: ~45% range (37/55)², 1.6× mast damage, 0.6× hull damage.
+const SHOT_TYPES = {
+  round: { v: 55, vMin: VALID_V_MIN, vMax: VALID_V_MAX, dmg: { masts: 0.33, hull: 1.0 } },
+  bar:   { v: 37, vMin: 30,          vMax: 45,          dmg: { masts: 1.6,  hull: 0.6 } },
+};
+function shotDef(type) { return SHOT_TYPES[type] || SHOT_TYPES.round; }
+
 module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
@@ -102,4 +114,5 @@ module.exports = {
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,
+  SHOT_TYPES, shotDef,
 };

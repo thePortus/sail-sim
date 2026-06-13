@@ -948,15 +948,16 @@ function attachMultiplayer(server) {
           vx: +msg.vx || 0, vy: +msg.vy || 0, vz: +msg.vz || 0,
         };
         const seq = +msg.seq || 0;
+        const shotType = msg.shotType === 'bar' ? 'bar' : 'round';   // ammo type (default round)
         const now = Date.now();
 
         // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
-        if (!combat.validateShot(shotData, me?.state) || !combat.allowShot(me?.combat, now)) {
+        if (!combat.validateShot(shotData, me?.state, shotType) || !combat.allowShot(me?.combat, now)) {
           return;
         }
 
-        // Relay the flight visual to everyone else (carries the shot seq).
-        const shot = JSON.stringify({ type: 'cannon_shot', id, seq, ...shotData });
+        // Relay the flight visual to everyone else (carries the shot seq + ammo type).
+        const shot = JSON.stringify({ type: 'cannon_shot', id, seq, ...shotData, shotType });
         for (const [pid, p] of players) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(shot);
         }
@@ -965,7 +966,7 @@ function attachMultiplayer(server) {
         // The step loop flies it over real time and tests it against each victim's ACTUAL
         // evolving pose, so manoeuvring during the flight genuinely dodges it. fireTime is
         // `now` (when the muzzle data is valid); lastT tracks how far it's been tested.
-        activeShots.push({ shooterId: id, seq, ...shotData, fireTime: now, lastT: 0 });
+        activeShots.push({ shooterId: id, seq, ...shotData, shotType, fireTime: now, lastT: 0 });
 
       } else if (msg.type === 'combat_reset') {
         // Dock "Repair Vessel" → restore the hull to full, for a gold fee (the first gold sink). The sunk→

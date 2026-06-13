@@ -21,7 +21,8 @@ const BALL_POOL  = 24;           // max simultaneous cannonballs (broadsides = 3
 
 // Fixed broadside ballistics (no aiming/charging — guns fire straight out the beam).
 const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
-const MUZZLE_V   = 55;                   // fixed muzzle velocity (m/s)
+const MUZZLE_V_ROUND = 55;               // solid round shot muzzle velocity (m/s)
+const MUZZLE_V_BAR   = 37;               // bar shot: ~45% range (range ∝ v²) — must match server SHOT_TYPES.bar.v
 // Gap between the 3 cannons of a broadside — randomized per shot so the volley reads
 // as a human gun crew firing in sequence, not a single mechanical burst.
 const STAGGER_MIN = 0.18;
@@ -60,7 +61,9 @@ const DEFAULT_MUZZLES: Record<'port' | 'stbd', Muz[]> = {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Ball {
-  mesh:  Mesh;
+  mesh:    Mesh;                            // round-shot sphere (the parent; drives position for both)
+  barMesh: Mesh;                            // bar-shot assembly (two halves + iron bar), child of mesh
+  bar:     boolean;                         // this flight is bar shot → show barMesh + tumble fast
   ox:    number; oy: number; oz: number;  // world-space origin
   vx:    number; vy: number; vz: number;  // world-space velocity (m/s)
   t:     number;                           // elapsed seconds since launch
@@ -124,6 +127,17 @@ export class CannonService {
   private readonly ELEV_MAST = 12;
   readonly gunElevDeg = signal(this.ELEV_HULL);
   readonly targetMode = signal<'hull' | 'mast'>('hull');
+
+  // ── Ammunition ──────────────────────────────────────────────────────────────
+  // 'round' = solid shot (full range, anti-hull). 'bar' = bar shot (~45% range, anti-mast / anti-rigging).
+  // The velocity carries the shorter range, and the type rides the cannon_shot message for server damage.
+  readonly shotType = signal<'round' | 'bar'>('round');
+  /** Current muzzle velocity for the selected ammo (lower for bar shot → shorter range). */
+  private muzzleV(): number { return this.shotType() === 'bar' ? MUZZLE_V_BAR : MUZZLE_V_ROUND; }
+  /** Set the ammo type (HUD buttons). */
+  setShotType(t: 'round' | 'bar'): void { this.zone.run(() => this.shotType.set(t)); }
+  /** Toggle round ↔ bar (G key). */
+  toggleShotType(): void { this.setShotType(this.shotType() === 'round' ? 'bar' : 'round'); }
 
   // Continuous elevation: hold Shift to raise / Control to lower; tick() swings the angle smoothly at
   // ELEV_RATE_DPS (so the granularity is sub-degree, not whole-degree key-repeat steps).
@@ -284,8 +298,8 @@ export class CannonService {
     this.setupInput();
 
     // Wire remote-shot + combat callbacks (avoids circular injection with MultiplayerService)
-    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq) => {
-      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq);
+    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq, bar) => {
+      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq, bar);
       this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
       this.birds.startleAt(ox, oz);   // a remote ship's broadside startles gulls near its muzzle too
       this.dolphins.scatterFrom(ox, oz);   // …and scatters any nearby dolphins
@@ -381,8 +395,36 @@ export class CannonService {
       m.setEnabled(false);
       this.sceneService.shadowGenerator?.addShadowCaster(m);
       this.oceanService.addToRenderList(m);
-      this.balls.push({ mesh: m, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
+
+      // Bar-shot assembly (two ball-halves joined by an iron bar = a dumbbell), tumbled fast in flight to
+      // scythe rigging. Bar lies along local X so a Z spin whirls the heads end-over-end. Built per ball
+      // (own geometry) and parented to the sphere, so the sphere's flight + enabled-state drive it.
+      const bm = this.buildBarShotMesh(`cbar_${i}`, mat);
+      bm.renderingGroupId = 2;
+      bm.isPickable       = false;
+      bm.parent           = m;
+      bm.position.set(0, 0, 0);
+      bm.isVisible        = false;        // shown only for bar shot (see launchBall)
+      this.sceneService.shadowGenerator?.addShadowCaster(bm);
+      this.oceanService.addToRenderList(bm);
+
+      this.balls.push({ mesh: m, barMesh: bm, bar: false, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
     }
+  }
+
+  /** Build one bar-shot projectile mesh: two hemispherical heads on a short iron bar, merged into one. */
+  private buildBarShotMesh(name: string, mat: StandardMaterial): Mesh {
+    const head1 = MeshBuilder.CreateSphere('bs_h1', { diameter: 0.15, segments: 6 }, this.scene);
+    head1.position.x =  0.20;
+    const head2 = MeshBuilder.CreateSphere('bs_h2', { diameter: 0.15, segments: 6 }, this.scene);
+    head2.position.x = -0.20;
+    const bar = MeshBuilder.CreateCylinder('bs_bar', { height: 0.40, diameter: 0.045, tessellation: 6 }, this.scene);
+    bar.rotation.z = Math.PI / 2;        // default cylinder runs along Y → lay it along X
+    for (const p of [head1, head2, bar]) p.material = mat;
+    const merged = Mesh.MergeMeshes([head1, bar, head2], true, true)!;
+    merged.name = name;
+    merged.material = mat;
+    return merged;
   }
 
   // ── Flash lights ──────────────────────────────────────────────────────────
@@ -739,6 +781,7 @@ export class CannonService {
       if (e.repeat) return;
       if (e.code === 'KeyZ')      this.armOrFire('port');
       else if (e.code === 'KeyC') this.armOrFire('stbd');
+      else if (e.code === 'KeyG') this.toggleShotType();   // swap round ↔ bar shot
     };
     // Keyup is unconditional (no input-focus guard) so the elevation can never get stuck "held".
     this.keyUpHandler = (e: KeyboardEvent) => {
@@ -879,8 +922,9 @@ export class CannonService {
     const dirX    = side === 'port' ? -cosH :  cosH;
     const dirZ    = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
-    const vh      = MUZZLE_V * Math.cos(elevRad);
-    const vy0     = MUZZLE_V * Math.sin(elevRad);
+    const mv      = this.muzzleV();
+    const vh      = mv * Math.cos(elevRad);
+    const vy0     = mv * Math.sin(elevRad);
     const bvx     = dirX * vh, bvz = dirZ * vh;
 
     const m = this.muzzles[side];
@@ -941,7 +985,10 @@ export class CannonService {
       const by = ball.oy + ball.vy * ball.t - 0.5 * G * ball.t * ball.t;
       const bz = ball.oz + ball.vz * ball.t;
       ball.mesh.position.set(bx, by, bz);
-      ball.mesh.rotation.z += dt * 5;
+      // Round shot rolls lazily; bar shot whirls end-over-end (the bar lies along X → fast Z spin
+      // throws the two heads around, plus a little Y wobble for a chaotic tumble).
+      if (ball.bar) { ball.mesh.rotation.z += dt * 26; ball.mesh.rotation.y += dt * 6; }
+      else          { ball.mesh.rotation.z += dt * 5; }
 
       // Ship hits are adjudicated by the SERVER (combat_hit). We defer the cosmetic until
       // THIS ball has flown the server's time-of-flight, so the impact lands in sync with
@@ -1056,8 +1103,9 @@ export class CannonService {
     const dirX = side === 'port' ? -cosH :  cosH;
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
-    const vh   = MUZZLE_V * Math.cos(elevRad);
-    const vy   = MUZZLE_V * Math.sin(elevRad);
+    const mv   = this.muzzleV();
+    const vh   = mv * Math.cos(elevRad);
+    const vy   = mv * Math.sin(elevRad);
     const bvx  = dirX * vh;
     const bvz  = dirZ * vh;
 
@@ -1069,8 +1117,8 @@ export class CannonService {
 
     const seq = ++this.shotSeq;
     const myId = this.multiplayerService.getMyId() ?? 'local';
-    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq);
-    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq);
+    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq, this.shotType() === 'bar');
+    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq, this.shotType());
     this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
     this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting
     this.oceanService.startleFish(mwx, mwz);   // …and scatters the drifting shallow-water fish
@@ -1202,13 +1250,15 @@ export class CannonService {
   launchBall(
     ox: number, oy: number, oz: number,
     vx: number, vy: number, vz: number,
-    shooterId = 'local', seq = 0,
+    shooterId = 'local', seq = 0, bar = false,
   ): void {
     const ball = this.balls.find(b => !b.alive);
     if (!ball) return;
-    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, key: `${shooterId}:${seq}`, pendingHit: null, hitAt: 0 });
+    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, bar, key: `${shooterId}:${seq}`, pendingHit: null, hitAt: 0 });
     ball.mesh.position.set(ox, oy, oz);
     ball.mesh.rotation.setAll(0);
+    ball.mesh.isVisible    = !bar;    // round shot = the sphere; bar shot = hide it, show the dumbbell
+    ball.barMesh.isVisible = bar;
     ball.mesh.setEnabled(true);
   }
 

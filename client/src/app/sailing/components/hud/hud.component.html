@@ -284,8 +284,18 @@
                 [class]="'tgt-btn ' + (cannonService.targetMode() === 'mast' ? 'tgt-btn--active' : '')">Mast</button>
       </div>
     </div>
+    <!-- Shot type (ammunition) -->
+    <div class="flex items-center justify-between gap-3 mt-1 font-mono text-xs">
+      <span class="text-slate-400">Shot</span>
+      <div class="flex gap-1">
+        <button (click)="cannonService.setShotType('round')"
+                [class]="'tgt-btn ' + (cannonService.shotType() === 'round' ? 'tgt-btn--active' : '')">Round</button>
+        <button (click)="cannonService.setShotType('bar')"
+                [class]="'tgt-btn ' + (cannonService.shotType() === 'bar' ? 'tgt-btn--active' : '')">Bar</button>
+      </div>
+    </div>
     <div class="text-slate-500 text-[10px] font-mono text-center mt-1">
-      <kbd>Shift</kbd>/<kbd>Ctrl</kbd> raise/lower
+      <kbd>Shift</kbd>/<kbd>Ctrl</kbd> raise/lower · <kbd>G</kbd> round/bar
     </div>
   </div>
 

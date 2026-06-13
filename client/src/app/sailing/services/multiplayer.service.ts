@@ -207,16 +207,17 @@ export class MultiplayerService {
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
                   vx: number, vy: number, vz: number,
-                  shooterId: string, seq: number) => void) | null = null;
+                  shooterId: string, seq: number, bar: boolean) => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
   /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
   onCombatRepair: ((playerId: string) => void) | null = null;
 
   broadcastShot(ox: number, oy: number, oz: number,
-                vx: number, vy: number, vz: number, seq: number): void {
+                vx: number, vy: number, vz: number, seq: number,
+                shotType: 'round' | 'bar' = 'round'): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType }));
   }
 
   /** Ask the server to restore our hull to full IN PLACE (dock "Repair Vessel"; no teleport). */
@@ -455,7 +456,7 @@ export class MultiplayerService {
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
-                          String(msg.id), +msg.seq || 0);
+                          String(msg.id), +msg.seq || 0, msg.shotType === 'bar');
 
     } else if (msg.type === 'combat_hit') {
       // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)

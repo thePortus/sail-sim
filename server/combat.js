@@ -57,7 +57,7 @@ function deadReckon(state, t) {
  * Damage from a hit: heavier when fast + head-on (closing), lighter when slow + glancing,
  * and amplified for a strike at/near the waterline (`hy` = hull-local impact height).
  */
-function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
+function computeDamage(bvx, bvy, bvz, pose, zone, hy, shotType) {
   const relSpeed = Math.hypot(bvx - pose.vvx, bvy, bvz - pose.vvz);
   let perp;
   if (zone === 'masts') {
@@ -77,7 +77,10 @@ function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
     const prox = Math.max(0, Math.min(1, (C.WATERLINE_BAND - hy) / C.WATERLINE_BAND));
     waterline = 1 + C.WATERLINE_BONUS_MAX * prox;
   }
-  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP) * waterline;
+  // Ammunition multiplier: round shot barely scratches rigging (×0.33 mast); bar shot is the
+  // dismaster (×1.6 mast, ×0.6 hull). `hull` covers every non-mast zone.
+  const ammo = C.shotDef(shotType).dmg[zone === 'masts' ? 'masts' : 'hull'];
+  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP) * waterline * ammo;
 }
 
 /**
@@ -128,7 +131,7 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
       const zone = zoneAtLocal(lat, lon, by);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
-      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by);
+      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType);
       return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg, tof: t };
     }
   }
@@ -136,10 +139,11 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 }
 
 /** Plausibility check on a claimed shot (origin near shooter, speed in band). */
-function validateShot(shot, shooterState) {
+function validateShot(shot, shooterState, shotType) {
   if (!shooterState) return false;
   const speed = Math.hypot(shot.vx, shot.vy, shot.vz);
-  if (speed < C.VALID_V_MIN || speed > C.VALID_V_MAX) return false;
+  const band = C.shotDef(shotType);   // bar shot has a lower plausible-velocity band than round
+  if (speed < band.vMin || speed > band.vMax) return false;
   const dx = shot.ox - shooterState.x, dz = shot.oz - shooterState.z;
   return dx * dx + dz * dz <= C.VALID_ORIGIN_RADIUS * C.VALID_ORIGIN_RADIUS;
 }

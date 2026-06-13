@@ -25,4 +25,13 @@ function factionColor(id) { return byId.get(id) ? byId.get(id).color : '#9a9a9a'
 function factionName(id) { return byId.get(id) ? byId.get(id).name : 'Unaligned'; }
 function isFaction(id) { return byId.has(id); }
 
-module.exports = { FACTIONS, factionById, factionIds, factionColor, factionName, isFaction };
+/** A fresh neutral reputation map { [factionId]: 0 } for every nation. */
+function defaultRep() { const r = {}; for (const f of FACTIONS) r[f.id] = 0; return r; }
+/** Coerce a parsed/persisted rep object to a complete, numeric map (unknown keys dropped, missing → 0). */
+function normalizeRep(obj) {
+  const r = defaultRep();
+  if (obj && typeof obj === 'object') for (const f of FACTIONS) if (Number.isFinite(obj[f.id])) r[f.id] = obj[f.id];
+  return r;
+}
+
+module.exports = { FACTIONS, factionById, factionIds, factionColor, factionName, isFaction, defaultRep, normalizeRep };

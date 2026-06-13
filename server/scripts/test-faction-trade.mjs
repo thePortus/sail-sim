@@ -57,5 +57,13 @@ for (let i = 0; i < n; i++) if (npc._test.pickFaction([ENG, SPA, EPR]) === 'engl
 console.log(`    pickFaction English share: ${(100 * eng / n).toFixed(0)}% (expect ~67%)`);
 ok(eng > n * 0.5, 'pickFaction is weighted by town count (English ≈ 2/3 here)');
 
+console.log('(e) reputation scaffold — default + normalize:');
+const factions = require('../factions.js');
+const def = factions.defaultRep();
+ok(ids.every((id) => def[id] === 0) && Object.keys(def).length === ids.length, 'defaultRep is every nation at neutral 0');
+const norm = factions.normalizeRep({ english: 5, spanish: -3, bogus: 99 });
+ok(norm.english === 5 && norm.spanish === -3, 'normalizeRep keeps known numeric standings');
+ok(norm.french === 0 && norm.dutch === 0 && norm.bogus === undefined, 'normalizeRep fills missing nations with 0 and drops unknown keys');
+
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

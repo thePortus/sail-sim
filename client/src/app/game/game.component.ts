@@ -9,6 +9,7 @@ import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { catchError, of } from 'rxjs';
 
+import { FACTIONS }           from '../sailing/faction.config';
 import { SceneService }       from '../sailing/services/scene.service';
 import { OceanService }       from '../sailing/services/ocean.service';
 import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.service';
@@ -153,6 +154,16 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
             } @else {
               <div class="inv-empty">Your hold is empty — visit a town's trader to buy goods.</div>
             }
+            <div class="inv-rep-title">Standing with the Powers</div>
+            <div class="inv-rep">
+              @for (f of factionStandings(); track f.id) {
+                <div class="inv-rep-row">
+                  <span class="inv-rep-swatch" [style.background]="f.color"></span>
+                  <span class="inv-rep-name">{{ f.name }}</span>
+                  <span class="inv-rep-val" [class.pos]="f.value > 0" [class.neg]="f.value < 0">{{ f.label }}</span>
+                </div>
+              }
+            </div>
             <div class="inv-hint">Press I or Tab to close</div>
           </div>
         }
@@ -229,6 +240,16 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .inv-row:nth-child(odd) { background: rgba(255,255,255,0.03); }
     .inv-qty { color: #f0c869; font-variant-numeric: tabular-nums; font-weight: 600; }
     .inv-empty { padding: 1.2rem 0; text-align: center; color: #b89a62; font-style: italic; }
+    .inv-rep-title { margin: 0.9rem 0 0.4rem; padding-top: 0.6rem; border-top: 1px solid rgba(184,138,62,0.25);
+                     color: #b89a62; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .inv-rep { display: flex; flex-direction: column; gap: 2px; }
+    .inv-rep-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.28rem 0.2rem; border-radius: 5px; }
+    .inv-rep-row:nth-child(odd) { background: rgba(255,255,255,0.03); }
+    .inv-rep-swatch { width: 11px; height: 11px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.45); flex: none; }
+    .inv-rep-name { flex: 1; color: #f0e3c6; }
+    .inv-rep-val { color: #cdbb95; font-variant-numeric: tabular-nums; }
+    .inv-rep-val.pos { color: #9fe0a0; }
+    .inv-rep-val.neg { color: #f0a8a0; }
     .inv-hint { margin-top: 0.8rem; text-align: center; color: #8a7448; font-size: 0.72rem; }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
@@ -305,6 +326,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   });
   protected inventoryUsed = computed(() =>
     Object.values(this.multiplayerService.cargo()).reduce((a, b) => a + (b || 0), 0));
+
+  /** Faction standings for the Ship's Hold readout — every nation, neutral by default (scaffold; no effects). */
+  protected factionStandings = computed(() => {
+    const rep = this.multiplayerService.factionRep();
+    return FACTIONS.map((f) => {
+      const v = Math.round(rep[f.id] ?? 0);
+      return { id: f.id, name: f.name, color: f.color, value: v, label: v === 0 ? 'Neutral' : (v > 0 ? `+${v}` : String(v)) };
+    });
+  });
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 

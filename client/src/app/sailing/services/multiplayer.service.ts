@@ -107,6 +107,8 @@ export class MultiplayerService {
   capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
   market   = signal<MarketState | null>(null);
   goodsCatalog = signal<Record<string, string>>({});   // goodId → display name (for the inventory panel anywhere)
+  // Factions reputation — the player's standing per nation (neutral 0). Scaffold only; shown in the Ship's Hold.
+  factionRep   = signal<Record<string, number>>({});
   // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
   ledger       = signal<Record<string, LedgerEntry>>({});
   hint         = signal<MarketHint | null>(null);
@@ -393,6 +395,7 @@ export class MultiplayerService {
     this.hintedHarbor.set(null);
     this.nearestMerchant.set(null);
     this.allMerchants.set([]);
+    this.factionRep.set({});
     this.salvageToast.set(null);
     this.salvageService.clear();
   }
@@ -513,6 +516,7 @@ export class MultiplayerService {
         for (const g of msg.catalog) cat[String(g.id)] = String(g.name);
         this.goodsCatalog.set(cat);
       }
+      if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.

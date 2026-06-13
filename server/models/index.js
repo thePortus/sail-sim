@@ -32,6 +32,9 @@ db.ensureColumns = async () => {
     ['combatState', { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
     // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } }.
     ['marketLedger', { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
+    // Factions: JSON { [factionId]: standing } reputation (neutral 0 start). Persists across maps (it's the
+    // player's, not the world's). Scaffold only — no gameplay effects yet (the events module wires those in).
+    ['factionRep',   { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {

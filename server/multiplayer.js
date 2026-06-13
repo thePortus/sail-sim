@@ -54,6 +54,7 @@ const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
 const salvage = require('./salvage');
+const factions = require('./factions');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -408,6 +409,7 @@ async function saveEconomyState(p) {
       {
         gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []),
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
+        factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
       },
       { where: { id: p.auth.userId } },
     );
@@ -442,11 +444,16 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
+
+    // Faction reputation — persists across maps (it's the player's standing, not the world's). Normalized so a
+    // newly-added nation always appears at neutral.
+    let rep = null; try { rep = JSON.parse(u.factionRep || 'null'); } catch { /* corrupt → neutral */ }
+    p.factionRep = factions.normalizeRep(rep);
 
     // Discovery ledger — restore only if it belongs to the current map (else a new map starts undiscovered).
     const ml = parseMarketLedger(u.marketLedger);
@@ -475,6 +482,7 @@ function sendWallet(p) {
       type: 'wallet', gold: p.gold | 0, cargo: p.cargo || {},
       capacity: economy.capacityFor(p.state && p.state.vesselSlug),
       catalog: economy.goodsCatalog(),
+      factionRep: p.factionRep || factions.defaultRep(),
     }));
   }
 }
@@ -696,6 +704,7 @@ function attachMultiplayer(server) {
     players.set(id, {
       ws, state: null, friends: [], combat: combat.newCombatState(), auth,
       gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
+      factionRep: factions.defaultRep(),                                      // Factions reputation — overwritten by the DB load below
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));

@@ -47,5 +47,9 @@ module.exports = (sequelize, DataTypes) => {
     // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } } of
     // the towns whose trader this player has opened (specialty + last-seen prices). MAP_VERSION-gated on load.
     marketLedger: { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
+
+    // Factions reputation: JSON { [factionId]: standing } (neutral 0 start). Persists across maps. Scaffold
+    // only for now — surfaced in the Ship's Hold readout; the events module will move these values later.
+    factionRep:   { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
   });
 };

@@ -293,7 +293,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   // Commands handled entirely on the server (passed through verbatim).
   private readonly SERVER_COMMANDS = [
     't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban', 'reloadassets',
-    'godmode', 'teleport', 'teleporto',
+    'godmode', 'teleport', 'teleporto', 'repair',
   ];
 
   sendMessage(): void {
@@ -428,6 +428,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         '/godmode — toggle invulnerability for yourself',
         '/teleport "<name>" <X> <Y> — move a player to map coords (X=E/W, Y=N/S)',
         '/teleporto "<name>" — jump yourself to open water beside a player',
+        '/repair "<name>" — fully repair a player\'s ship',
       );
     }
     if (this.isOwner) {

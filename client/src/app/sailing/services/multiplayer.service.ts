@@ -485,10 +485,18 @@ export class MultiplayerService {
       }
 
     } else if (msg.type === 'combat_repair') {
-      // A remote ship was restored to full → clear its persistent battle damage AND refloat it.
-      const e = this.players.get(String(msg.playerId));
-      if (e) { e.sinking = false; }
-      this.onCombatRepair?.(String(msg.playerId));
+      // A ship was restored to full → clear its persistent battle damage AND refloat it. If it's US (an admin
+      // /repair'd our hull), also clear the sinking/sunk state locally — the dock-repair path does this
+      // client-side, but an admin repair only reaches us over the wire.
+      const pid = String(msg.playerId);
+      if (pid === this.myId) {
+        this.combatService.clearSunk();
+        this.vesselService.stopSinking();
+      } else {
+        const e = this.players.get(pid);
+        if (e) { e.sinking = false; }
+      }
+      this.onCombatRepair?.(pid);
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;

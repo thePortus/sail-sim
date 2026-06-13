@@ -1189,6 +1189,30 @@ function attachMultiplayer(server) {
             }
           }
 
+        } else if (text.startsWith('/repair ')) {
+          // /repair "<player>" — fully restore another player's hull (admin courtesy). Resets their combat
+          // state to a fresh hull of their owned ship, refloats them if sinking, and notifies them.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may repair players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/repair '.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              target.combat = combat.newCombatState((target.ship) || (target.state && target.state.vesselSlug));
+              saveCombatState(target);
+              // Full hull → everyone's HUD/listing resets; combat_repair clears scorch decals AND (for the
+              // target's own client) refloats a sinking/sunk hull. Sent to ALL incl. the target.
+              const hull = JSON.stringify({ type: 'combat_state', playerId: targetId, zones: target.combat.zones, maxHp: target.combat.maxHp });
+              const repaired = JSON.stringify({ type: 'combat_repair', playerId: targetId });
+              for (const [, p] of players) if (p.ws.readyState === 1) { p.ws.send(hull); p.ws.send(repaired); }
+              sysReply(target.ws, 'Your ship has been fully repaired by the admins.');
+              sysReply(me.ws, `Repaired "${name}".`);
+            }
+          }
+
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
 

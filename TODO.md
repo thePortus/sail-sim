@@ -2,16 +2,11 @@
 
 # General or Current TODO Items
 
-* add /repair <player> to admin commands
-* if players sink a merchant, let another spawn after awhile
 * add factions going to war, making peace
 * add occasional bosun whistle (no more than once a day)
-* all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
 * lod + imposters for ships at distance
+* NPC Ship combat
 * improved landscape with NME & more scatter to distant
-* ship status in db... start all players in pinnace, allow switch via menu... ship inventory.. persistent ship damage... leave slots for ship upgrade
-* town economies... goods they produce, consume... all produce one or two goods for export, will need the rest, prices based on amount in town... step 1
-* AI ships... step 2
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
 * better latency handling

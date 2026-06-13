@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
 * add factions going to war, making peace
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance

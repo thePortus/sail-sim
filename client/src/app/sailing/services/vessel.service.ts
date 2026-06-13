@@ -429,9 +429,13 @@ export class VesselService {
   async reloadModel(): Promise<void> {
     const scene = this.sceneService.scene;
     if (!scene || !this.root) return;
+    const sg = this.sceneService.shadowGenerator;
     const oldRoot = this.controller?.root ?? null;
     if (oldRoot) {
-      for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m);
+      // Unregister from BOTH the ocean reflection list AND the shadow generator before disposing. Babylon
+      // does NOT auto-prune a disposed mesh from a ShadowGenerator's manual render list, so skipping this
+      // leaks dead refs every reload/refit — wasted shadow-pass work and, eventually, a descriptor-heap crash.
+      for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); }
     }
     this.controller?.dispose();
     this.controller = null;
@@ -472,9 +476,12 @@ export class VesselService {
     const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
     this.fpEye = new Vector3(fp.x, fp.y, fp.z);
 
-    // Dispose the old model + controller and rebuild from the new rig (same as reloadModel).
+    // Dispose the old model + controller and rebuild from the new rig (same as reloadModel). Unregister from
+    // BOTH the ocean list AND the shadow generator (Babylon won't auto-prune disposed meshes from the
+    // shadow render list — leaking them every refit wastes shadow-pass work and risks a descriptor-heap crash).
+    const sg = this.sceneService.shadowGenerator;
     const oldRoot = this.controller?.root ?? null;
-    if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m); }
+    if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); } }
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();

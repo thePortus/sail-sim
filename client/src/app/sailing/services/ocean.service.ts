@@ -1693,10 +1693,10 @@ export class OceanService {
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
-    this.refractionRTT.refreshRate = 1;   // PERF EXPERIMENT: every frame (was 3) — crispest seabed (no lag on a
-                                          // fast camera spin), but the heaviest RTT now fires every frame and
-                                          // stacks with the reflection (4) once every 4 frames. Compare the FPS
-                                          // overlay vs 3; if it's a meaningful hit, revert to 3 (coprime de-stack).
+    this.refractionRTT.refreshRate = 3;   // every 3rd frame — reverted from the every-frame (1) experiment, which
+                                          // was a real FPS hit (the seabed RTT is the heaviest GPU cost). 3 is
+                                          // coprime with the reflection's 4, so the two heavy RTTs only stack 1/12
+                                          // frames — keeps the de-stacking smoothness without the seabed lag.
     this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 

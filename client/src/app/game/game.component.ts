@@ -42,6 +42,7 @@ import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
 import { TraderMenuComponent }     from './trader-menu.component';
+import { ShipwrightMenuComponent } from './shipwright-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -51,7 +52,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -130,6 +131,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               }
               <div class="dock-desc">{{ town.description }}</div>
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
+              <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
               <button class="dock-opt" (click)="onRepairVessel()">
                 Repair Vessel ({{ isAdmin || multiplayerService.gold() < repairFee ? 'free' : repairFee + 'g' }})
               </button>
@@ -141,6 +143,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <!-- Trader panel (opened from the dock menu's Trade button) -->
         @if (tradeMenuOpen()) {
           <app-trader-menu (close)="tradeMenuOpen.set(false)" />
+        }
+
+        <!-- Shipwright panel (opened from the dock menu's Shipwright button) -->
+        @if (shipwrightOpen()) {
+          <app-shipwright-menu [admin]="isAdmin" (close)="shipwrightOpen.set(false)" />
         }
 
         <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
@@ -326,6 +333,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   showSettings = signal<boolean>(false);
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
+  shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
   salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
   private salvageTimer: ReturnType<typeof setTimeout> | null = null;
@@ -464,21 +472,37 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
-    // Sailed away from the pier → close the town menu (and trader panel) if they were open.
+    // Sailed away from the pier → close the town menu (and trader/shipwright panels) if they were open.
     effect(() => {
       if (!this.harborService.dockable()) {
         untracked(() => {
           if (this.dockMenuOpen()) this.dockMenuOpen.set(false);
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+          if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
         });
       }
     });
 
-    // Closing the town menu (Cast Off, or any path) closes the trader panel too — the trader lives "inside" it.
+    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright panels too — they live "inside" it.
     effect(() => {
-      if (!this.dockMenuOpen() && untracked(() => this.tradeMenuOpen())) {
-        untracked(() => { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); });
+      if (!this.dockMenuOpen()) {
+        untracked(() => {
+          if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+          if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
+        });
       }
+    });
+
+    // Shipwright purchase succeeded → refit the in-world vessel into the new hull (fetch its full def, then
+    // hot-swap in place), close the panel, and clear the signal. Server already updated gold + ownedShip.
+    effect(() => {
+      const slug = this.multiplayerService.purchasedShip();
+      if (!slug) return;
+      untracked(() => {
+        this.multiplayerService.purchasedShip.set(null);
+        this.shipwrightOpen.set(false);
+        void this.refitVessel(slug);
+      });
     });
 
     // Arrived at the rumoured town → the rumour is fulfilled, clear its map beacon.
@@ -767,6 +791,23 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onTrade(townId: string): void {
     this.multiplayerService.openTrade(townId);
     this.tradeMenuOpen.set(true);
+  }
+
+  /** Dock action: open the shipwright (buy/commission vessels). The panel fetches the catalogue itself. */
+  onShipwright(): void {
+    this.multiplayerService.shipError.set(null);
+    this.shipwrightOpen.set(true);
+  }
+
+  /** Refit the local vessel into a freshly-bought hull: fetch its full def, then hot-swap in place. */
+  private async refitVessel(slug: string): Promise<void> {
+    try {
+      const vessel = await firstValueFrom(this.http.get<Vessel>(`${Settings.apiUrl}vessels/${slug}`));
+      await this.vesselService.swapVessel(vessel);
+      this.selectedSlug = slug;
+    } catch (err) {
+      console.warn('[Shipwright] refit failed:', err);
+    }
   }
 
   /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */

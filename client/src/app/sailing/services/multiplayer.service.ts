@@ -36,6 +36,8 @@ interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
   controller:      VesselController | null;  // drives this remote's trim/sail/rudder/flag
   crew:            CrewHandle | null;        // animated deck crew (seeded from playerId)
+  builtSlug?:      string;                   // slug the current mesh was built with — a change triggers a rebuild
+  rebuilding?:     boolean;                  // a hull-swap rebuild is in flight (guards re-entry)
   recoilRoll:      number;
   recoilRollVel:   number;
   recoilSway:      number;
@@ -112,6 +114,10 @@ export class MultiplayerService {
   factionRep   = signal<Record<string, number>>({});
   // Ships-as-economy — the player's OWNED vessel slug (server-authoritative; drives the shipwright UI).
   ownedShip    = signal<string>('pinnace');
+  // Set to the new slug when a shipwright purchase succeeds → the game swaps the in-world vessel, then clears it.
+  purchasedShip = signal<string | null>(null);
+  // Last shipwright rejection reason (transient; the shipwright panel surfaces it).
+  shipError    = signal<string | null>(null);
   // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
   ledger       = signal<Record<string, LedgerEntry>>({});
   hint         = signal<MarketHint | null>(null);
@@ -236,6 +242,13 @@ export class MultiplayerService {
   }
   /** Close the trader panel locally (clears the open market quote). */
   closeTrade(): void { this.market.set(null); }
+
+  /** Shipwright: ask the server to buy/commission a vessel (validated server-side: docked, gold/admin,
+   *  cargo fits). On success the server sends a fresh wallet + a `ship_bought` that drives the in-world swap. */
+  buyShip(slug: string): void {
+    this.shipError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ship_buy', slug }));
+  }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
    *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
@@ -400,6 +413,8 @@ export class MultiplayerService {
     this.allMerchants.set([]);
     this.factionRep.set({});
     this.ownedShip.set('pinnace');
+    this.purchasedShip.set(null);
+    this.shipError.set(null);
     this.salvageToast.set(null);
     this.salvageService.clear();
   }
@@ -570,6 +585,14 @@ export class MultiplayerService {
 
     } else if (msg.type === 'trade_error') {
       this.tradeError.set(String(msg.reason ?? 'trade failed'));
+
+    } else if (msg.type === 'ship_bought') {
+      // The wallet message arriving alongside already updated gold/ownedShip; trigger the in-world swap.
+      this.shipError.set(null);
+      this.purchasedShip.set(String(msg.slug ?? ''));
+
+    } else if (msg.type === 'ship_error') {
+      this.shipError.set(String(msg.reason ?? 'purchase failed'));
     }
   }
 
@@ -628,6 +651,7 @@ export class MultiplayerService {
 
       const callsign = String(data.callsign ?? '').slice(0, 32);
       const slug     = String(data.vesselSlug ?? 'sloop').slice(0, 64);
+      entry.builtSlug = slug;   // track what the mesh is built as, so a later slug change rebuilds it
       this.buildPlayerVessel(data.id, slug, callsign, entry, scene)
         .catch(err => console.warn('Multiplayer mesh build failed:', err));
     }
@@ -644,6 +668,11 @@ export class MultiplayerService {
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
     entry.npc        = !!data.npc;
     if (data.faction !== undefined) entry.faction = data.faction ?? null;
+    // Hull swapped under us (a remote player bought a new ship at a shipwright) → rebuild their mesh so
+    // everyone sees the new vessel, not the old one. Guarded against re-entry; keeps the same root + pose.
+    if (!isNew && entry.controller && entry.builtSlug && entry.builtSlug !== entry.vesselSlug && !entry.rebuilding) {
+      this.rebuildRemoteVessel(data.id, entry, scene);
+    }
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
     entry.anchored   = !!data.anchored;
@@ -704,7 +733,9 @@ export class MultiplayerService {
     this.publishSignal();
   }
 
-  private disposeEntry(entry: OtherPlayerEntry): void {
+  /** Tear down a remote's vessel meshes/crew/controller/label but KEEP its root TransformNode (used by both
+   *  full disposal and an in-place hull swap). See the shadow-caster note below. */
+  private clearVesselMeshes(entry: OtherPlayerEntry): void {
     entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
     entry.crew = null;
     entry.controller?.dispose();
@@ -724,7 +755,25 @@ export class MultiplayerService {
       (m as Mesh).dispose(false, false);
     });
     entry.root.getChildTransformNodes(false).forEach(n => n.dispose());
+  }
+
+  private disposeEntry(entry: OtherPlayerEntry): void {
+    this.clearVesselMeshes(entry);
     entry.root.dispose();
+  }
+
+  /** A remote player swapped hulls at a shipwright: rebuild their mesh in place (same root + pose) with the
+   *  new vessel slug. Clears the old meshes/crew/label first, then re-instantiates via buildPlayerVessel. */
+  private rebuildRemoteVessel(playerId: string, entry: OtherPlayerEntry, scene: Scene): void {
+    entry.rebuilding = true;
+    const slug = entry.vesselSlug;
+    this.clearVesselMeshes(entry);
+    void this.buildPlayerVessel(playerId, slug, entry.callsign, entry, scene)
+      .catch(err => console.warn('[Multiplayer] hull-swap rebuild failed for', playerId, err))
+      .finally(() => {
+        // Only the freshest entry for this id may clear the flag (it may have left + rejoined mid-rebuild).
+        if (this.players.get(playerId) === entry) { entry.builtSlug = slug; entry.rebuilding = false; }
+      });
   }
 
   private publishSignal(): void {

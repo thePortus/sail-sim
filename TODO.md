@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* add /repair <player> to admin commands
 * if players sink a merchant, let another spawn after awhile
 * add factions going to war, making peace
 * add occasional bosun whistle (no more than once a day)

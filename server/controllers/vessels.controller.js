@@ -61,6 +61,7 @@ const VESSELS = [
     },
     zoneHp: { bow: 55, stern: 55, port: 80, starboard: 80, masts: 60 },
     cargo: 20,                    // hold capacity in cargo slots (Town Economy) — small, nimble
+    price: 0,                     // Ships-as-economy: the free starter hull
     parts: [],
   },
   {
@@ -83,6 +84,7 @@ const VESSELS = [
     firstPersonCam: { x: 0.6, y: 2.6, z: -2.8 },
     zoneHp: { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
     cargo: 40,                    // hold capacity in cargo slots (Town Economy) — stout merchantman
+    price: 60000,                 // Ships-as-economy: bought at a port shipwright
     parts: [],
   },
 ];
@@ -92,11 +94,17 @@ const VESSELS = [
 exports.getVesselDef = (slug) => VESSELS.find(v => v.slug === slug) || VESSELS.find(v => v.slug === 'sloop') || VESSELS[0];
 
 exports.getVessels = (req, res) => {
+  // Summary feeds the shipwright menu: name + description + the economic/handling stats a buyer compares.
   const summaries = VESSELS.map(v => ({
     id: v.id, name: v.name, slug: v.slug, description: v.description,
+    price: v.price | 0, cargo: v.cargo | 0,
+    maxSpeed: v.physics?.maxSpeed ?? 0, guns: (v.cannons?.port?.length ?? 3),
   }));
   res.json(summaries);
 };
+
+/** The buyable-vessel catalogue as a plain array — used server-side by the ship-purchase validator. */
+exports.listVessels = () => VESSELS.map(v => ({ slug: v.slug, name: v.name, price: v.price | 0, cargo: v.cargo | 0 }));
 
 exports.getDefaultVessel = (req, res) => {
   res.json(VESSELS[0]);

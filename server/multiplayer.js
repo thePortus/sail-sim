@@ -1022,6 +1022,48 @@ function attachMultiplayer(server) {
           }
         }
 
+      } else if (msg.type === 'ship_buy') {
+        // Shipwright purchase at a port. Server-authoritative: must be docked at a town; owned ship + gold are
+        // the source of truth. Buying REPLACES the current hull with a 50% trade-in credit toward the new one
+        // (cost clamped ≥0 — no cash-back on a downgrade). Blocks if current cargo wouldn't fit the new hold.
+        // Owners/Admins commission ANY vessel for free. Persists BEFORE replying (money safety).
+        const me = players.get(id);
+        if (me) {
+          const slug = String(msg.slug ?? '');
+          const def = getVesselDef(slug);
+          const shipErr = (reason) => { if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_error', reason })); };
+          if (!def || def.slug !== slug) {
+            shipErr('bad_ship');
+          } else if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) {
+            shipErr('not_docked');
+          } else if (me.ship === slug) {
+            shipErr('already_owned');
+          } else if (economy.usedSlots(me.cargo) > (def.cargo | 0)) {
+            shipErr('hold_too_small');   // decision: BLOCK — sell cargo down before refitting
+          } else {
+            const admin = isStaff(me);
+            const owned = getVesselDef(me.ship);
+            const tradeIn = Math.floor((owned.price | 0) * 0.5);   // 50% of the old hull's value
+            const cost = admin ? 0 : Math.max(0, (def.price | 0) - tradeIn);
+            if (!admin && me.gold < cost) {
+              shipErr('no_gold');
+            } else {
+              if (!admin) me.gold -= cost;
+              me.ship = slug;
+              if (me.state) me.state.vesselSlug = slug;   // the 'update' handler keeps forcing this to me.ship
+              // A newly-acquired hull arrives whole AND with the new vessel's zone HP (pinnace ≠ sloop).
+              me.combat = combat.newCombatState(slug);
+              saveCombatState(me);
+              const hullMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hullMsg);
+              saveEconomyState(me).then(() => {
+                sendWallet(me);   // authoritative new gold + ship + capacity
+                if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_bought', slug, cost }));
+              });
+            }
+          }
+        }
+
       } else if (msg.type === 'salvage_collect') {
         // Sail-over salvage pickup. Validated: the crate exists + the player is within reach of it (authPose).
         // Awards gold (full) + goods up to free hold; overflow stays floating. Atomic (single-threaded handler).

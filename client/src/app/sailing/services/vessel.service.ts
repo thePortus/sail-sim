@@ -444,6 +444,47 @@ export class VesselService {
     }
   }
 
+  /** Refit into a DIFFERENT vessel in place (shipwright purchase): adopt the new def's rig/physics/guns and
+   *  rebuild the model at the CURRENT pose, keeping input, camera, the sim loop, and the wake particles.
+   *  The cannon battery resyncs from the new layout on the next broadside (CannonService.syncGuns). */
+  async swapVessel(vessel: Vessel): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.root) return;
+
+    // Adopt the new vessel def — mirrors init()'s setup, minus pose/input/loop.
+    if (vessel.physics) Object.assign(this.physics, vessel.physics);
+    this.vesselSlug = vessel.slug;
+    const base = rigForSlug(vessel.slug);
+    this.rig = {
+      glb:         vessel.glb         ?? base.glb,
+      manifest:    vessel.manifest    ?? base.manifest,
+      importFlipY: vessel.importFlipY ?? base.importFlipY,
+      rightSign:   vessel.rightSign   ?? base.rightSign,
+      controller:  base.controller,
+      floatDraft:  base.floatDraft,
+      hullCut:     base.hullCut,
+      buoyancy:    base.buoyancy,
+      hullHalfLen:  base.hullHalfLen,
+      hullHalfBeam: base.hullHalfBeam,
+    };
+    this.rightSign = this.rig.rightSign;
+    this.vesselCannons = vessel.cannons ?? null;
+    const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
+    this.fpEye = new Vector3(fp.x, fp.y, fp.z);
+
+    // Dispose the old model + controller and rebuild from the new rig (same as reloadModel).
+    const oldRoot = this.controller?.root ?? null;
+    if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m); }
+    this.controller?.dispose();
+    this.controller = null;
+    oldRoot?.dispose();
+    await this.buildGLBMeshes(scene);
+    if (this.controller) {
+      this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
+      this.applyHullCut();
+    }
+  }
+
   // ── GLB geometry loading ──────────────────────────────────────────────────
   // Loads the single rigged sloop GLB (skeleton clips + morph targets, Draco +
   // WEBP) from the /geometry/ static route, plus its companion manifest, and wraps

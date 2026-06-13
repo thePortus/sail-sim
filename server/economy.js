@@ -343,8 +343,10 @@ function bestArbitrage() {
   return best;
 }
 
-/** Dock repair — charge the flat fee if affordable, otherwise a MERCY free repair. Always succeeds. */
-function applyRepair(player) {
+/** Dock repair — charge the flat fee if affordable, otherwise a MERCY free repair. Always succeeds.
+ *  Staff (Owner/Admin) repair gratis: pass free=true to skip the fee entirely (not a "mercy"). */
+function applyRepair(player, free = false) {
+  if (free) return { ok: true, charged: 0, mercy: false, free: true };
   const fee = goods.REPAIR_FEE;
   if (player.gold >= fee) { player.gold -= fee; return { ok: true, charged: fee, mercy: false }; }
   return { ok: true, charged: 0, mercy: true };

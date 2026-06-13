@@ -119,6 +119,24 @@ function sysReply(ws, text) {
   }
 }
 
+/** True if a player entry's VERIFIED token role (from the signed JWT — unspoofable) is staff. */
+function isStaff(p) { return !!(p && p.auth && (p.auth.role === 'Owner' || p.auth.role === 'Admin')); }
+
+/** Find an open-water spot near (x,z): ring-search outward (skipping the player's own cell) for the first
+ *  cell that isn't land. Returns {x,z} or null if nothing within range. Used by /teleporto to drop the
+ *  admin beside a target without grounding them. (terrain-mask fails open → returns the first ring if the
+ *  heightfield is unavailable, which is fine — open sea.) */
+function findWaterNear(x, z, startR = 70, maxR = 1200) {
+  for (let r = startR; r <= maxR; r += 40) {
+    for (let a = 0; a < 12; a++) {
+      const ang = (a / 12) * Math.PI * 2;
+      const wx = x + Math.cos(ang) * r, wz = z + Math.sin(ang) * r;
+      if (!terrainMask.isOnLand(wx, wz)) return { x: wx, z: wz };
+    }
+  }
+  return null;
+}
+
 /**
  * Handle a /promote or /demote chat command. The WS layer is unauthenticated, so we
  * verify the SENDER's privilege from the DB (by their callsign) rather than trusting
@@ -529,6 +547,14 @@ function attachMultiplayer(server) {
       if (qid !== pid && q.ws.readyState === 1) q.ws.send(m);
     }
   };
+  /** Teleport a player to a pose: set the server authority, snap their own client (correction), and broadcast
+   *  the jump to everyone else. Used by the /teleport and /teleporto admin commands. Speed is zeroed on arrival;
+   *  a regular target can't escape because their next update is clamped back toward this new authPose. */
+  const teleportTo = (pid, p, x, z, heading) => {
+    applyPose(p, { x: +x, z: +z, heading: ((+heading % 360) + 360) % 360, speed: 0 });
+    sendCorrection(p);
+    broadcastPose(pid, p);
+  };
   /** Broadcast that an entity (player or NPC) has left so clients drop its vessel. */
   const broadcastLeave = (lid) => {
     const m = JSON.stringify({ type: 'leave', id: lid });
@@ -591,6 +617,7 @@ function attachMultiplayer(server) {
     const shooter = players.get(shot.shooterId);
     const victim  = players.get(hit.victimId);
     if (!victim || !victim.combat) return;
+    if (victim.godmode) return;   // /godmode: invulnerable admin — the ball passes harmlessly, no damage or cosmetics
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
@@ -914,10 +941,10 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat) {
           // Mercy repair: charge the fee if affordable, otherwise free — the harbourmaster never turns away
-          // a broke captain. Always proceeds to a full hull.
-          const rep = economy.applyRepair(me);
+          // a broke captain. Always proceeds to a full hull. Staff (Owner/Admin) always repair gratis.
+          const rep = economy.applyRepair(me, isStaff(me));
           saveEconomyState(me);   // persist the (possibly zero) gold deduction
-          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy }));
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy, free: !!rep.free }));
           sendWallet(me);
           me.combat = combat.newCombatState(me.state?.vesselSlug);
           saveCombatState(me);   // persist the repaired (full) hull
@@ -1044,6 +1071,61 @@ function attachMultiplayer(server) {
           const arg    = text.slice(action.length + 2).trim();
           const parsed = parseTargetAndRest(arg);
           handleModCommand(id, senderCallsign, action, parsed?.target, players);
+
+        } else if (text === '/godmode' || text.startsWith('/godmode ')) {
+          // Toggle invulnerability for the calling admin (session-only; cleared on disconnect).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may use /godmode.'); }
+          else {
+            me.godmode = !me.godmode;
+            sysReply(me.ws, me.godmode
+              ? 'Godmode ON — your hull is invulnerable to cannon fire.'
+              : 'Godmode OFF — you can take damage again.');
+          }
+
+        } else if (text.startsWith('/teleporto ')) {
+          // /teleporto "<player>" — teleport the calling admin to open water beside another player.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may teleport.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/teleporto '.length).trim());
+            const name = parsed?.target;
+            let target = null;
+            for (const [, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              const spot = findWaterNear(target.state.x, target.state.z);
+              if (!spot) { sysReply(me.ws, `Couldn't find open water near "${name}".`); }
+              else {
+                const heading = (Math.atan2(target.state.x - spot.x, target.state.z - spot.z) * 180 / Math.PI + 360) % 360;
+                teleportTo(id, me, spot.x, spot.z, heading);
+                sysReply(me.ws, `Teleported beside "${name}".`);
+              }
+            }
+          }
+
+        } else if (text.startsWith('/teleport ')) {
+          // /teleport "<player>" <X> <Y> — teleport another player to world coords (X = east/west, Y = north/south).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may teleport players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/teleport '.length).trim());
+            const coords = (parsed?.rest || '').trim().split(/\s+/).filter(Boolean);
+            const tx = Number(coords[0]), ty = Number(coords[1]);
+            if (!parsed?.target || coords.length < 2 || !Number.isFinite(tx) || !Number.isFinite(ty)) {
+              sysReply(me.ws, 'Usage: /teleport "<player>" <X> <Y>   (X = east/west, Y = north/south)');
+            } else {
+              let target = null, targetId = null;
+              for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === parsed.target) { target = p; targetId = pid; break; } }
+              if (!target) { sysReply(me.ws, `No online player named "${parsed.target}".`); }
+              else if (terrainMask.isOnLand(tx, ty)) { sysReply(me.ws, `(${tx.toFixed(0)}, ${ty.toFixed(0)}) is on land — pick a spot of open water.`); }
+              else {
+                teleportTo(targetId, target, tx, ty, target.state.heading || 0);
+                sysReply(me.ws, `Teleported "${parsed.target}" to (${tx.toFixed(0)}, ${ty.toFixed(0)}).`);
+                sysReply(target.ws, `You were teleported to (${tx.toFixed(0)}, ${ty.toFixed(0)}) by ${senderCallsign}.`);
+              }
+            }
+          }
 
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);

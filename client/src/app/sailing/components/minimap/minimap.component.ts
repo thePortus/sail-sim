@@ -328,11 +328,9 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     const mutuals = this.multiplayerService.mutualFriends();
     const others = this.multiplayerService.otherPlayers();
 
-    // Nearest merchant beacon — the server reports the single closest merchant's position at ANY distance
-    // (no ship is built for a far one), so the map always points to the nearest trader.
-    const nm = this.multiplayerService.nearestMerchant();
-    if (nm) {
-      const mx = wx(nm.x), mz = wz(nm.z), s = this.expanded() ? 7 : 6;
+    // Merchant markers (cyan diamonds). Owners/Admins get the WHOLE fleet's positions (any distance); regular
+    // players get a single beacon to the nearest merchant. Either way no ship is built for a far one — map only.
+    const drawMerchant = (mx: number, mz: number, s: number) => {
       ctx.fillStyle   = '#22e3d0';
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth   = 1.4;
@@ -344,6 +342,14 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+    };
+    const fleet = this.multiplayerService.allMerchants();
+    if (fleet.length) {
+      const s = this.expanded() ? 6 : 5;   // slightly smaller — there are many
+      for (const m of fleet) drawMerchant(wx(m.x), wz(m.z), s);
+    } else {
+      const nm = this.multiplayerService.nearestMerchant();
+      if (nm) drawMerchant(wx(nm.x), wz(nm.z), this.expanded() ? 7 : 6);
     }
 
     for (const p of others) {

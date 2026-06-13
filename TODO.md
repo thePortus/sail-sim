@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* make stock of products in each port... limited number of each items which causes them to need... if there already is, it isn't apparent... this is what should drive prices up/down, actual scarcity... you should be able to buy out the stock
 * make trade hints not show you ports you can't get to
 * make all merchants visible to admins on the map, admins repair free, can /repair others, and /teleport and /teleportto
 * add occasional bosun whistle (no more than once a day)

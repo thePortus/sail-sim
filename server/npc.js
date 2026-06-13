@@ -223,6 +223,18 @@ function broadcastInterest(players, nowMs) {
     if (!m) { m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, ts: nowMs, seq: 0 }); msgCache.set(n.id, m); }
     return m;
   };
+  // Full-fleet map feed for staff: Owners/Admins get every merchant's position on the minimap (render is still
+  // interest-managed below — this is map markers only, no extra ships built). Built once, reused for all staff.
+  let allMsg = null;
+  const allMerchantsMsg = () => {
+    if (allMsg === null) {
+      allMsg = JSON.stringify({
+        type: 'all_merchants',
+        ships: npcs.map((n) => ({ x: +n.state.x.toFixed(1), z: +n.state.z.toFixed(1) })),
+      });
+    }
+    return allMsg;
+  };
   for (const [, p] of players) {
     if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
     const near = [];
@@ -239,9 +251,15 @@ function broadcastInterest(players, nowMs) {
     for (const id of visible) p.ws.send(msgFor(players.get(id)));               // RENDER updates for nearby merchants
     for (const id of p._visNpcs) if (!visible.has(id)) p.ws.send(JSON.stringify({ type: 'leave', id })); // dropped → despawn client-side
     p._visNpcs = visible;
-    // Map beacon: the nearest merchant's position regardless of render distance (no ship is built for it).
-    p.ws.send(nrX === null ? JSON.stringify({ type: 'nearest_merchant', x: null })
-      : JSON.stringify({ type: 'nearest_merchant', x: +nrX.toFixed(1), z: +nrZ.toFixed(1) }));
+    // Map markers. Staff see the whole fleet; everyone else sees a beacon to the single nearest merchant
+    // (position-only, regardless of render distance — no ship is built for a far one).
+    const staff = p.auth && (p.auth.role === 'Owner' || p.auth.role === 'Admin');
+    if (staff) {
+      p.ws.send(allMerchantsMsg());
+    } else {
+      p.ws.send(nrX === null ? JSON.stringify({ type: 'nearest_merchant', x: null })
+        : JSON.stringify({ type: 'nearest_merchant', x: +nrX.toFixed(1), z: +nrZ.toFixed(1) }));
+    }
   }
 }
 

@@ -113,6 +113,8 @@ export class MultiplayerService {
   hintedHarbor = signal<string | null>(null);
   // Position of the single nearest NPC merchant (any distance) — for the minimap marker only.
   nearestMerchant = signal<{ x: number; z: number } | null>(null);
+  // Owners/Admins receive every merchant's position for the minimap (full-fleet view); empty for regular players.
+  allMerchants = signal<{ x: number; z: number }[]>([]);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
@@ -390,6 +392,7 @@ export class MultiplayerService {
     this.hint.set(null);
     this.hintedHarbor.set(null);
     this.nearestMerchant.set(null);
+    this.allMerchants.set([]);
     this.salvageToast.set(null);
     this.salvageService.clear();
   }
@@ -522,6 +525,9 @@ export class MultiplayerService {
 
     } else if (msg.type === 'nearest_merchant') {
       this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
+
+    } else if (msg.type === 'all_merchants') {
+      this.allMerchants.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({ x: +s.x, z: +s.z })) : []);
 
     } else if (msg.type === 'salvage_spawn') {
       this.salvageService.spawn(String(msg.id), +msg.x, +msg.z);

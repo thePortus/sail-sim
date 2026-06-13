@@ -118,7 +118,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <div class="dock-desc">{{ town.description }}</div>
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onRepairVessel()">
-                Repair Vessel ({{ multiplayerService.gold() >= repairFee ? repairFee + 'g' : 'free' }})
+                Repair Vessel ({{ isAdmin || multiplayerService.gold() < repairFee ? 'free' : repairFee + 'g' }})
               </button>
               <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
             </div>

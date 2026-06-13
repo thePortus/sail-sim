@@ -67,7 +67,7 @@ import { ApiService } from '../../../services/api.service';
           type="text"
           class="chat-input"
           [(ngModel)]="inputValue"
-          (keydown.enter)="sendMessage()"
+          (keydown.enter)="sendMessage(); chatInput.blur()"
           (keydown.escape)="chatInput.blur()"
           (keydown)="$event.stopImmediatePropagation()"
           [placeholder]="inputPlaceholder()"

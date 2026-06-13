@@ -99,11 +99,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
       <!-- In-game HUD -->
       @if (phase() === 'sailing') {
-        <app-hud (exitGame)="onExitGame()" (photoModeChange)="photoMode.set($event)" />
+        <app-hud (exitGame)="onReturnToHarbor()" (photoModeChange)="photoMode.set($event)" />
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
-          <app-pause-menu (resume)="onResume()" (quit)="onExitGame()"
+          <app-pause-menu (resume)="onResume()" (quit)="onReturnToHarbor()"
                           (openSettings)="showSettings.set(true)" />
         }
         <!-- Settings panel — opened from the pause menu -->
@@ -825,6 +825,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.callsign     = '';
     this.loadingMsg.set('Charting the archipelago…');
     this.phase.set('selecting');
+  }
+
+  /** "Return to Harbour" → leave the game session entirely and go to the home screen.
+   *  Navigation destroys this component, so ngOnDestroy → teardown() disconnects multiplayer and
+   *  disposes the scene/engine (teardown is idempotent, so the explicit path stays clean). */
+  onReturnToHarbor(): void {
+    this.paused.set(false);
+    this.showSettings.set(false);
+    this.router.navigate(['/home']);
   }
 
   ngOnDestroy(): void {

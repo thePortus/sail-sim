@@ -2,6 +2,10 @@
 
 # General or Current TODO Items
 
+* automate bumping map version of map build?
+* Try doing ocean refraction every frame
+* better sun disk rather than a square
+* if players sink a merchant, let another spawn after awhile
 * add occasional bosun whistle (no more than once a day)
 * all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
 * lod + imposters for ships at distance
@@ -52,7 +56,3 @@
 * Security pass
 
 # TODO Items by Module
-
-Next module I'd like to add: factions...
-
-I want to have several factions in the game, and every town should belong to one of these factions. We will eventually build in reputation with factions. For now, I want the factions to be English, French, Spanish, Dutch, Portugese, Ottoman

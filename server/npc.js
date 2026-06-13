@@ -15,6 +15,7 @@
 const nav = require('./nav');
 const economy = require('./economy');
 const combat = require('./combat');
+const factions = require('./factions');
 const moveConst = require('./movement-constants');
 const { getVesselDef } = require('./controllers/vessels.controller');
 
@@ -32,7 +33,16 @@ const VIEW_R2 = VIEW_RADIUS * VIEW_RADIUS;
 const MAX_VISIBLE = 5;       // at most this many merchants per client (the nearest ones)
 const MERCHANT_LOAD = 8;     // units a merchant tries to buy + carry per trip
 const SEED_GOLD = 1500;      // working capital a merchant spawns with (looted on a sinking — NP4)
-const NEED_SPREAD = 4;       // dispatch among the top-N shortages so merchants don't all chase the single worst one
+// Trip selection — a soft-weighted score over the most urgent shortages. Each merchant flies a nation's flag
+// and PREFERS to keep trade within it (own-faction destination + source add a bonus), but a severe enough rival
+// shortage still wins, so goods flow where they're truly needed. Jitter < OWN_DEST_BONUS so the fleet spreads
+// across similar needs without overturning a clear faction preference.
+const CONSIDER = 12;         // evaluate the N most-urgent shortages
+const W_DISTRESS = 1.0;      // urgency per day a shortage has gone unmet
+const W_SCARCITY = 8.0;      // urgency per (1 - stock level) — fresh-but-deep shortages still pull
+const OWN_DEST_BONUS = 6.0;  // delivering to a home-nation town in need
+const OWN_SRC_BONUS  = 2.0;  // sourcing from a home-nation producer
+let TRIP_JITTER = 3.0;       // random spread so same-faction merchants don't all chase the single top need (test seam can zero it)
 const SINK_LINGER_MS = 4000; // keep a sunk merchant around this long so the capsize animation plays, then despawn
 let seq = 0;
 
@@ -65,12 +75,27 @@ function avoidanceHeading(npc, fleet) {
   return n ? (Math.atan2(sx, sz) * 180 / Math.PI + 360) % 360 : null;
 }
 
+/** Pick a nation for a new merchant, weighted by how many towns each nation holds (more towns → more traders). */
+function pickFaction(towns) {
+  const ids = factions.factionIds();
+  const counts = {}; for (const id of ids) counts[id] = 0;
+  for (const t of towns) if (t.faction && counts[t.faction] != null) counts[t.faction]++;
+  const total = ids.reduce((s, id) => s + counts[id], 0);
+  if (!total) return pick(ids);
+  let r = Math.random() * total;
+  for (const id of ids) { r -= counts[id]; if (r < 0) return id; }
+  return ids[ids.length - 1];
+}
+
 function spawnNpc(players, towns) {
-  const town = pick(towns);
+  const faction = pickFaction(towns);
+  // Prefer to spawn at one of its own nation's towns (falls back to anywhere if it holds none yet).
+  const home = towns.filter((t) => t.faction === faction);
+  const town = pick(home.length ? home : towns);
   const slug = pick(MERCHANT_SLUGS);
   const id = 'npc_' + (++seq);
   const npc = {
-    id, isNpc: true, ws: { readyState: 3 },
+    id, isNpc: true, ws: { readyState: 3 }, faction,
     state: {
       x: town.x, z: town.z, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
@@ -103,22 +128,35 @@ function wander(npc, towns) {
   npc.route = null;
 }
 
-/** Choose a trade, driven ENTIRELY by demand: pick a town that is short of a good it consumes (worst shortages
- *  first — long-unmet "distress" outranks), then source that good from the cheapest producer the needy town can
- *  actually be reached from. Spread among the top few needs so the fleet doesn't all converge on one shortage.
- *  Returns { goodId, srcTownId, destTownId } or null (nothing needed right now → the caller idles/wanders).
- *  NOTE: no generic arbitrage fallback — merchants move only because somewhere needs the cargo. */
-function chooseTrip() {
+/** Demand × faction score for a candidate need: urgency (unmet days + scarcity) plus a home-nation bonus when
+ *  the destination — and/or the source — flies the merchant's flag. Jitter spreads the fleet across like needs. */
+function scoreNeed(npc, need, srcFaction) {
+  const destFaction = (economy.getTown(need.townId) || {}).faction || null;
+  let s = need.distressDays * W_DISTRESS + Math.max(0, 1 - need.level) * W_SCARCITY;
+  if (npc && npc.faction) {
+    if (destFaction === npc.faction) s += OWN_DEST_BONUS;
+    if (srcFaction === npc.faction) s += OWN_SRC_BONUS;
+  }
+  return s + Math.random() * TRIP_JITTER;
+}
+
+/** Choose a trade, driven by demand AND nation: among the most urgent shortages (a town low on a good it
+ *  consumes), score each by urgency + faction affinity and pick the best with a reachable producer. Merchants
+ *  thus prefer to keep goods flowing within their own nation, but a severe enough rival shortage still wins —
+ *  "willing to go beyond to get the goods they need." Returns { goodId, srcTownId, destTownId } or null (nothing
+ *  needed → the caller idles/wanders). No generic arbitrage — they move only because somewhere needs the cargo. */
+function chooseTrip(npc) {
   const needs = economy.needList();
   if (!needs.length) return null;
-  const top = needs.slice(0, Math.min(NEED_SPREAD, needs.length));
-  // Try a few of the most urgent needs until one has a reachable producer with stock to sell.
-  for (let tries = 0; tries < top.length; tries++) {
-    const need = pick(top);
+  let best = null, bestScore = -Infinity;
+  for (const need of needs.slice(0, CONSIDER)) {
     const src = economy.bestSellerFor(need.goodId, need.townId);
-    if (src && src.townId !== need.townId) return { goodId: need.goodId, srcTownId: src.townId, destTownId: need.townId };
+    if (!src || src.townId === need.townId) continue;          // no reachable producer with stock → skip
+    const srcFaction = (economy.getTown(src.townId) || {}).faction || null;
+    const score = scoreNeed(npc, need, srcFaction);
+    if (score > bestScore) { bestScore = score; best = { goodId: need.goodId, srcTownId: src.townId, destTownId: need.townId }; }
   }
-  return null;
+  return best;
 }
 
 /** Buy up to the trip's qty at the source (unit-by-unit so partial fills are fine). Returns units bought. */
@@ -141,7 +179,7 @@ function doSell(npc) {
 /** Plan a new trip and start sailing to its source (buying immediately if already there). */
 function planTrip(npc, towns) {
   npc.route = null; npc.trip = null; npc.phase = null;
-  const chosen = chooseTrip();
+  const chosen = chooseTrip(npc);
   if (!chosen) { wander(npc, towns); return; }
   npc.trip = { ...chosen, qty: Math.min(MERCHANT_LOAD, economy.capacityFor(npc.state.vesselSlug)) };
   if (npc.curTownId === chosen.srcTownId) {
@@ -224,7 +262,7 @@ function broadcastInterest(players, nowMs) {
   const msgCache = new Map();
   const msgFor = (n) => {
     let m = msgCache.get(n.id);
-    if (!m) { m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, ts: nowMs, seq: 0 }); msgCache.set(n.id, m); }
+    if (!m) { m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, faction: n.faction || null, ts: nowMs, seq: 0 }); msgCache.set(n.id, m); }
     return m;
   };
   // Full-fleet map feed for staff: Owners/Admins get every merchant's position on the minimap (render is still
@@ -278,5 +316,9 @@ function spawnerTick(players) {
 
 module.exports = {
   tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount,
-  _test: { spawnNpc, planTrip, chooseTrip, onArrive, tickNpcs, broadcastInterest, avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE },
+  _test: {
+    spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
+    avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,
+    setJitter(j) { TRIP_JITTER = j; }, OWN_DEST_BONUS, OWN_SRC_BONUS,
+  },
 };

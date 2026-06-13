@@ -41,7 +41,7 @@ const COLL_RESTITUTION = 0.15;
 const COLL_MIN_SPEED   = 0.4;
 
 // Bump whenever the terrain is re-baked so stale saved positions are discarded on spawn. Phase 5.
-const MAP_VERSION = 7;   // 7: re-bake — + navgrid.bin (navigable-water mask) for NPC sea-routing
+const MAP_VERSION = 8;   // 8: re-bake — town factions (spheres of interest) + faction-matched names baked in
 
 module.exports = {
   worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX,

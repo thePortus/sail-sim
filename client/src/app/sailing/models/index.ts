@@ -107,6 +107,10 @@ export interface TerrainHarbor {
   streets?: TownStreet[];
   // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
   specialty?: string;
+  // Factions — the owning nation (e.g. 'english'); contested border towns also carry a rivalFaction.
+  faction?: string;
+  contested?: boolean;
+  rivalFaction?: string;
 }
 
 // ── Town Economy (Phase 1) ──────────────────────────────────────────────────
@@ -290,6 +294,7 @@ export interface OtherPlayer {
   vesselSlug:  string;
   callsign:    string;
   npc?:        boolean;    // an NPC merchant trader (server-controlled), not a real player
+  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players
 }
 
 export interface ChatMessage {

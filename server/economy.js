@@ -50,7 +50,10 @@ function load() {
     if (!fs.existsSync(manifestPath)) { console.warn('[economy] manifest not found — trading disabled'); return; }
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     for (const h of (m.harbors || [])) {
-      towns.set(h.id, { id: h.id, name: h.name, tier: h.tier || 'medium', specialty: h.specialty || 'port', x: h.x, z: h.z });
+      towns.set(h.id, {
+        id: h.id, name: h.name, tier: h.tier || 'medium', specialty: h.specialty || 'port', x: h.x, z: h.z,
+        faction: h.faction || null, contested: !!h.contested, rivalFaction: h.rivalFaction || null,
+      });
     }
     const present = new Set([...towns.values()].map((t) => t.specialty));
     const missing = goods.specialtyKeys().filter((s) => !present.has(s));
@@ -163,7 +166,7 @@ function marketFor(townId) {
       stock: Math.round(stock), buyable: Math.max(0, Math.floor(stock) - MIN_STOCK), cap: Math.round(pr.stockCap),
     };
   });
-  return { townId: t.id, name: t.name, specialty: t.specialty, goods: list };
+  return { townId: t.id, name: t.name, specialty: t.specialty, faction: t.faction || null, contested: !!t.contested, rivalFaction: t.rivalFaction || null, goods: list };
 }
 
 // ── demand hints (Phase 3) ────────────────────────────────────────────────────

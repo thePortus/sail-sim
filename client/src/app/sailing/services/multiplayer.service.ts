@@ -594,6 +594,7 @@ export class MultiplayerService {
         vesselName: 'Sloop', vesselSlug: 'sloop',
         callsign:   String(data.callsign ?? ''),
         npc:        !!data.npc,
+        faction:    data.faction ?? null,
         buffer:      [],
         dispX:       sx,
         dispZ:       sz,
@@ -629,6 +630,7 @@ export class MultiplayerService {
     entry.vesselName = String(data.vesselName ?? 'Sloop').slice(0, 64);
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
     entry.npc        = !!data.npc;
+    if (data.faction !== undefined) entry.faction = data.faction ?? null;
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
     entry.anchored   = !!data.anchored;

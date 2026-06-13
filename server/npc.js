@@ -18,12 +18,12 @@ const combat = require('./combat');
 const factions = require('./factions');
 const moveConst = require('./movement-constants');
 const { getVesselDef } = require('./controllers/vessels.controller');
+const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
 
 const DEG = Math.PI / 180;
 const MERCHANT_SLUGS = ['sloop', 'pinnace'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
   'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne'];
-const CRUISE_FRAC = 0.7;     // merchants cruise below max
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
 const AVOID_R = 140;         // world units: NPC↔NPC separation radius
 // Interest management — a client only RECEIVES (and so only renders) the nearest few merchants. Distant ships
@@ -48,7 +48,9 @@ let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 
-function targetFleet(townCount) { return Math.max(8, Math.min(15, Math.round(townCount * 0.25))); }
+// Fleet size scales with the number of towns. Bumped (8–15 → 11–20, 0.25 → 0.33/town) to offset the
+// wind-bound merchants now sailing ~40% slower + tacking upwind, so overall trade throughput holds up.
+function targetFleet(townCount) { return Math.max(11, Math.min(20, Math.round(townCount * 0.5))); }
 function npcCount(players) { let n = 0; for (const [, p] of players) if (p.isNpc) n++; return n; }
 
 /** Heading (deg, atan2(x,z) convention) from a→b. */
@@ -62,6 +64,43 @@ function blendHeading(a, b, t) {
   const ax = Math.sin(a * DEG), az = Math.cos(a * DEG), bx = Math.sin(b * DEG), bz = Math.cos(b * DEG);
   const x = ax * (1 - t) + bx * t, z = az * (1 - t) + bz * t;
   return (Math.atan2(x, z) * 180 / Math.PI + 360) % 360;
+}
+
+// ── Wind sailing model — MIRRORS the player's VesselService.sailEfficiency so merchants are bound by the
+// exact same wind envelope (no more flat "insanely fast" cruise). NPCs sail full-canvas, perfectly trimmed.
+
+/** Angle (deg) between a heading and the wind's FROM-bearing, in [0,180] — 0 = bow into the wind. */
+function angleFromWind(heading, windBearing) {
+  const d = ((heading - windBearing) % 360 + 360) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+/** Point-of-sail efficiency curve (identical thresholds/multipliers to the player). <minTack = no-go zone. */
+function sailEff(aw, minTack) {
+  if (aw < minTack) return -0.30;   // in irons
+  if (aw < 45)  return 0.52;        // close-hauled
+  if (aw < 60)  return 0.72;        // close reach
+  if (aw < 90)  return 0.86;        // beam reach
+  if (aw < 115) return 0.95;
+  if (aw < 145) return 1.00;        // broad reach — peak
+  if (aw < 165) return 0.88;        // running
+  return 0.72;                      // dead downwind
+}
+
+/**
+ * Upwind tacking: a sailing ship can't make way straight into the wind, so if the bearing to the waypoint
+ * lies in the no-go zone (within minTack of the wind), return a close-hauled heading on a maintained tack
+ * (zig-zagging toward it) instead. Hysteresis (TACK_HYST) stops it chattering near dead-upwind. Otherwise
+ * sail straight at the waypoint.
+ */
+const TACK_HYST = 6;   // deg the waypoint must swing past the wind axis before the tack flips
+function tackedHeading(bearingToWp, windBearing, minTack, npc) {
+  const rel = ((bearingToWp - windBearing + 540) % 360) - 180;   // signed [-180,180]; 0 = dead upwind
+  if (Math.abs(rel) >= minTack) return bearingToWp;              // sailable directly
+  if (npc.tack !== 1 && npc.tack !== -1) npc.tack = rel >= 0 ? 1 : -1;
+  if      (rel >  TACK_HYST) npc.tack = 1;
+  else if (rel < -TACK_HYST) npc.tack = -1;
+  return (windBearing + npc.tack * minTack + 360) % 360;
 }
 
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
@@ -104,7 +143,8 @@ function spawnNpc(players, towns) {
     authPose: { x: town.x, z: town.z, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),
     lastUpdateMs: Date.now(),
-    cruise: (getVesselDef(slug)?.physics?.maxSpeed || 8) * CRUISE_FRAC,
+    physics: getVesselDef(slug)?.physics || { maxSpeed: 8, accelerationRate: 0.28, minTackAngle: 36, sailAreaFactor: 0.34 },
+    tack: 1,   // current tack (+1/−1) for upwind zig-zagging
     route: null, routeIdx: 0, curTownId: town.id, legTarget: null,
     gold: SEED_GOLD, cargo: {}, trip: null, phase: null,   // trip = {goodId,srcTownId,destTownId,qty}; phase = toSource|toDest
   };
@@ -218,6 +258,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
   if (towns.length < 2) return;
   const fleet = [];
   for (const [, p] of players) if (p.isNpc) fleet.push(p);
+  const wind = weatherState.snapshot();   // { windSpeed (m/s), windBearing (deg FROM) } — same wind the player feels
 
   for (const npc of fleet) {
     // A sunk merchant (salvage already dropped by resolveHit) lingers briefly so its capsize plays, then despawns.
@@ -234,14 +275,22 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
       if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
       continue;
     }
+    const ph = npc.physics;
     let desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
+    desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
     const prev = npc.state.heading;
     npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec);
     npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
-    npc.state.speed = npc.cruise;
-    const hr = npc.state.heading * DEG, step = npc.cruise * moveConst.TRAVEL_SCALE * dtSec;
+
+    // Speed from wind strength × point of sail — the EXACT player envelope (full sail, perfect trim, no
+    // gust). Eased toward target like the player so it accelerates/decelerates smoothly through tacks.
+    const aw     = angleFromWind(npc.state.heading, wind.windBearing);
+    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * sailEff(aw, ph.minTackAngle) * ph.sailAreaFactor));
+    npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
+    npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
+    const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
     npc.state.x += Math.sin(hr) * step;
     npc.state.z += Math.cos(hr) * step;
     // keep the authoritative pose in sync so player↔NPC collision (which reads authPose) works

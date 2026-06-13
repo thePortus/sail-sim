@@ -14,6 +14,7 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
+import { MastCrackService } from './mast-crack.service';
 import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH,
          mastHealth, mastSpeedMult, MAST_DOWN_TURN_MAX } from './combat.constants';
 import { Vessel, VesselPart, VesselCannon, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
@@ -29,7 +30,11 @@ export class VesselService {
   private assetCache       = inject(VesselAssetCacheService);
   private crewService      = inject(CrewService);
   private combatService    = inject(CombatService);
+  private mastCrackService = inject(MastCrackService);
   private zone             = inject(NgZone);
+
+  /** Previous mast-health fraction, for one-shotting the demasting crack on the 0-crossing (−1 = unset). */
+  private prevMastH = -1;
 
   /** Animated deck crew on the local vessel (null until the GLB + crew assets load). */
   private crewHandle: CrewHandle | null = null;
@@ -1078,6 +1083,10 @@ export class VesselService {
       this.controller.dropAnchor('P', this.anchorSide === 'P' ? this.anchorDeploy : 0);
 
       // Mast collapse/repair visual — driven off the same masts-zone health as the speed/helm penalty.
+      // The instant the mast crosses to destroyed, play the drawn-out demasting crack (full volume — it's
+      // your own ship). prevMastH starts at -1 so a ship that spawns already-dismasted doesn't crack.
+      if (this.prevMastH > 0.001 && mastH <= 0.001) { this.mastCrackService.crack(1.0); }
+      this.prevMastH = mastH;
       this.controller.setMastDamage(mastH);
 
       // Ease trim / boom-swing / furl toward their targets (no teleporting on tack/auto-trim).

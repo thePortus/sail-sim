@@ -2,7 +2,10 @@
 
 # General or Current TODO Items
 
+* Okay, I want to now make some landscape improvements... starting with restoring the green color to the forest biome, which only renders black... and by trying to smooth out the landscape, which looks visibly polygonal.... can you analyze the problem and come up with a plan to restore both?
 * Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
+* Make /export give me all the current state of things so I can back players up fully, including their current wallets and ships, have seeders for it all
+* Make a "repair progress" bar for the mast while it is being repaired
 * add factions going to war, making peace (diplomacy module)
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance

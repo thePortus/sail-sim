@@ -14,6 +14,7 @@ import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
+import { MastCrackService } from './mast-crack.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
@@ -38,6 +39,7 @@ interface OtherPlayerEntry extends OtherPlayer {
   crew:            CrewHandle | null;        // animated deck crew (seeded from playerId)
   builtSlug?:      string;                   // slug the current mesh was built with — a change triggers a rebuild
   rebuilding?:     boolean;                  // a hull-swap rebuild is in flight (guards re-entry)
+  prevMastH?:      number;                   // last mast-health fraction, for the demasting-crack 0-crossing
   recoilRoll:      number;
   recoilRollVel:   number;
   recoilSway:      number;
@@ -85,6 +87,7 @@ export class MultiplayerService {
   private vesselService  = inject(VesselService);
   private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
+  private mastCrackService = inject(MastCrackService);
   private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
@@ -981,8 +984,15 @@ export class MultiplayerService {
       entry.controller.dropAnchor('P', side === 'P' ? entry.anchorDeploy : 0);
 
       // Mast collapse/repair: drive off this remote's authoritative masts-zone HP (same source as its
-      // damage-listing tilt), so every client sees her mast come down and rise again in lockstep.
-      entry.controller.setMastDamage(mastHealth(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug)));
+      // damage-listing tilt), so every client sees her mast come down and rise again in lockstep. On the
+      // 0-crossing, play the demasting crack at her position (distance-attenuated). prevMastH is undefined
+      // until the first observation, so a ship that comes into view already-dismasted doesn't crack.
+      const mastH = mastHealth(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug));
+      if (entry.prevMastH !== undefined && entry.prevMastH > 0.001 && mastH <= 0.001) {
+        this.mastCrackService.crackAt(entry.x, entry.z);
+      }
+      entry.prevMastH = mastH;
+      entry.controller.setMastDamage(mastH);
 
       // Last: ease trim/boom/furl AND re-prepare the skeleton from all posed bone nodes.
       entry.controller.tickRig(dt);

@@ -123,6 +123,46 @@ export function capsizeFor(
   return { roll: CAPSIZE_ROLL_MAX * clampU(rollN), pitch: CAPSIZE_PITCH_MAX * clampU(pitchN) };
 }
 
+// ── Mast damage (dismasting): visual collapse + sailing penalty from the `masts` zone ──
+// All derived from the authoritative masts-zone HP, so local + remote + the controller stay in
+// lockstep. Onset is the HUD green→yellow boundary: above it the mast is fine; below it she leans,
+// cracks, and slows; at 0 HP the mast comes down and the ship acts as if her sails were furled.
+export const MAST_DAMAGE_ONSET  = SEV_GREEN_MIN;   // 0.60 — damage shows / penalty begins below this health
+export const MAST_SLOW_FLOOR    = 0.70;            // worst partial sail-power multiplier (just above destroyed)
+export const MAST_DOWN_TURN_MAX = 6;               // deg/s helm cap once the mast is down (pivots slowly only)
+
+/** Mast health fraction (1 = intact .. 0 = destroyed) from a hull state. Unknown hull → 1. */
+export function mastHealth(z: ZoneState | null | undefined, maxHp: Record<Zone, number> = ZONE_HP): number {
+  if (!z) return 1;
+  return Math.max(0, Math.min(1, (z.masts ?? maxHp.masts) / maxHp.masts));
+}
+
+/** MastDown scrub (0 = upright .. 1 = fully collapsed). Below the onset the mast leans VISIBLY and
+ *  progressively (front-loaded so even moderate damage shows), topping out at ~0.55 just above destroyed;
+ *  the clip's 0.55..1 range is the final topple, reserved for 0 HP — she only fully comes down when the
+ *  mast is totally shot through. */
+export function mastDownAmount(health: number): number {
+  if (health <= 0)               return 1;   // destroyed → full collapse
+  if (health >= MAST_DAMAGE_ONSET) return 0; // intact
+  const t = (MAST_DAMAGE_ONSET - health) / MAST_DAMAGE_ONSET;   // 0 at onset .. 1 approaching destroyed
+  return Math.sqrt(t) * 0.55;                                   // sqrt front-loads the lean so it reads early
+}
+
+/** Splinter/break morph influence (0..1) — cracks grow linearly across the whole damage band (onset → 0),
+ *  so a moderately-damaged mast already shows splintering, not just a clean lean. */
+export function mastBreakAmount(health: number): number {
+  if (health >= MAST_DAMAGE_ONSET) return 0;
+  return (MAST_DAMAGE_ONSET - Math.max(0, health)) / MAST_DAMAGE_ONSET;
+}
+
+/** Sail-power multiplier from mast health: 1 above onset, easing to MAST_SLOW_FLOOR just above
+ *  destroyed, 0 when fully destroyed (no drive → coasts to a stop, like furled sails). */
+export function mastSpeedMult(health: number): number {
+  if (health <= 0)               return 0;
+  if (health >= MAST_DAMAGE_ONSET) return 1;
+  return MAST_SLOW_FLOOR + (1 - MAST_SLOW_FLOOR) * (health / MAST_DAMAGE_ONSET);
+}
+
 export type Severity = 'none' | 'green' | 'yellow' | 'red' | 'destroyed';
 
 /** Map a zone's current HP to a severity band for the HUD (against the vessel's per-zone max). */

@@ -14,7 +14,8 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
-import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH } from './combat.constants';
+import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH,
+         mastHealth, mastSpeedMult, MAST_DOWN_TURN_MAX } from './combat.constants';
 import { Vessel, VesselPart, VesselCannon, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 // The rigged GLB + manifest are now resolved per-vessel (see this.rig in init / vessel-controller.ts).
@@ -824,8 +825,13 @@ export class VesselService {
     const angleFromWind = diff > 180 ? 360 - diff : diff;
     const isPortTack    = diff <= 180;
 
+    // Mast damage: a wounded mast (< 60 % HP) bleeds sail power; a fully destroyed mast gives NO drive at
+    // all (she coasts to a stop as if furled — see the helm cap below). Read from our authoritative hull.
+    const mastH   = mastHealth(this.combatService.zones(), zoneHpFor(this.vesselSlug));
+    const mastMul = mastSpeedMult(mastH);
+
     const eff    = this.sailEfficiency(angleFromWind);
-    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor));
+    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul));
     // speedModifier applied below after buoyancy is computed.
     // While sinking, control is frozen: glide to a dead stop (no sail drive) and ignore the helm.
     const spdTarget = this.sinking ? 0 : baseTarget;
@@ -833,10 +839,13 @@ export class VesselService {
     this.speed  += (spdTarget - this.speed) * spdRate * dt;
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
 
-    // Steering
+    // Steering. With the mast totally down she still answers the helm, but only just — capped to a slow
+    // pivot (she's lost her sail-driven way; this is the "can turn very slowly but that is it" rule).
     if ((this.keys.left || this.keys.right) && !this.sinking) {
       const dir = this.keys.left ? -1 : 1;
-      this.heading = ((this.heading + dir * this.turnRate(this.speed) * dt) + 360) % 360;
+      let rate = this.turnRate(this.speed);
+      if (mastH <= 0) rate = Math.min(rate, MAST_DOWN_TURN_MAX);
+      this.heading = ((this.heading + dir * rate * dt) + 360) % 360;
     }
 
     // ── Position update ──────────────────────────────────────────────────────
@@ -1067,6 +1076,9 @@ export class VesselService {
       this.anchorDeploy += ((this.isAnchored ? 1 : 0) - this.anchorDeploy) * Math.min(1, dt * 2.5);
       this.controller.dropAnchor('S', this.anchorSide === 'S' ? this.anchorDeploy : 0);
       this.controller.dropAnchor('P', this.anchorSide === 'P' ? this.anchorDeploy : 0);
+
+      // Mast collapse/repair visual — driven off the same masts-zone health as the speed/helm penalty.
+      this.controller.setMastDamage(mastH);
 
       // Ease trim / boom-swing / furl toward their targets (no teleporting on tack/auto-trim).
       this.controller.tickRig(dt);

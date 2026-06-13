@@ -187,6 +187,18 @@ export interface RiggedClip {
   [extra: string]: unknown;
 }
 
+/** Optional dismasting descriptor — the `MastDown` scrub clip + the splinter `Break` morph that the
+ *  game drives off the `masts` damage zone. Absent on older GLBs (controllers no-op gracefully). */
+export interface RiggedMastDamage {
+  fall_clip:    string;          // scrub clip that topples the rig (0 upright .. 1 collapsed)
+  hinge_bone?:  string;
+  mast_node?:   string;
+  break_morph:  RiggedMorphRef;  // splinter/buckle morph on the mast mesh
+  fall_side?:   string;
+  range_label?: string;
+  note?:        string;
+}
+
 export interface RiggedManifest {
   model:        string;
   frame_range:  [number, number];
@@ -197,6 +209,7 @@ export interface RiggedManifest {
   morph_targets: Record<string, Record<string, number>>;
   sail_sheet_pairs: RiggedSailSheetPair[];
   free_rotation_bones: Record<string, { role: string; drive: string; suggestion: string }>;
+  mast_damage?: RiggedMastDamage;
 }
 
 export interface VesselPhysics {

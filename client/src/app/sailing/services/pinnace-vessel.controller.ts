@@ -6,6 +6,7 @@ import { RiggedManifest, SailState } from '../models';
 import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
+import { mastDownAmount, mastBreakAmount } from './combat.constants';
 
 /**
  * Animation driver for the RN 28-ft pinnace (manifest schema_version 2). Implements the same
@@ -57,6 +58,17 @@ export class PinnaceController implements VesselController {
   private anchorCur = 0;
   private readonly ANCHOR_RATE = 0.7;
 
+  // Mast damage / dismasting (see SloopController): scrub `MastDown` + ramp the `Break` morph off the
+  // masts-zone health, eased so the rig falls/rises over ~1-2 s. No-op without manifest.mast_damage.
+  private readonly mastFallClip:  string | null;
+  private readonly mastBreakNode: string | null;
+  private readonly mastBreakIndex: number;
+  private mastDownCur   = 0;
+  private mastDownTarget = 0;
+  private mastBreakCur   = 0;
+  private mastBreakTarget = 0;
+  private readonly MAST_FALL_RATE = 0.4;
+
   // Sail-state → per-sail furl. USER CHOICE: reef the main, keep the jib.
   private static readonly SAIL_STATE_FURL: Record<SailState, Record<string, number>> = {
     full:     { Mainsail: 0.0, Jib: 0 },
@@ -104,6 +116,11 @@ export class PinnaceController implements VesselController {
 
     for (const p of manifest.sail_sheet_pairs ?? []) this.pairBySail.set(p.sail, p);
 
+    const md = manifest.mast_damage;
+    this.mastFallClip   = md && this.clips.has(md.fall_clip) ? md.fall_clip : null;
+    this.mastBreakNode  = md?.break_morph?.node ?? null;
+    this.mastBreakIndex = md?.break_morph?.index ?? 0;
+
     // Capture rest rotation for the code-driven flag chain (the rudder is set absolutely, no rest needed).
     for (const name of ['Flag1', 'Flag2', 'Flag3']) {
       const n = this.nodes.get(name);
@@ -128,6 +145,15 @@ export class PinnaceController implements VesselController {
     if (!g.animatables.length) { g.start(false, 1.0, g.from, g.to); g.pause(); }
     g.goToFrame(frame);
     return g;
+  }
+
+  /** Scrub a clip to a NORMALIZED 0..1 over its ACTUAL [from, to] (full authored pose). Used only for the
+   *  mast collapse — Babylon resamples glTF frames so g.to != frameEnd. See SloopController.poseNorm. */
+  private poseNorm(clipName: string, t01: number): void {
+    const g = this.clips.get(clipName);
+    if (!g) return;
+    if (!g.animatables.length) { g.start(false, 1.0, g.from, g.to); g.pause(); }
+    g.goToFrame(g.from + Math.max(0, Math.min(1, t01)) * (g.to - g.from));
   }
 
   // ── control surface ─────────────────────────────────────────────────────────
@@ -157,6 +183,13 @@ export class PinnaceController implements VesselController {
     return Math.abs(this.gunCur[side] - this.gunTarget[side]) < 0.01 && this.gunRecoil[side] < 0.02;
   }
   setGunports(): void { /* pinnace has no gunport lids */ }
+
+  /** Mast damage (1 intact .. 0 destroyed). Sets collapse + splinter targets; tickRig eases them. */
+  setMastDamage(health: number): void {
+    if (!this.mastFallClip) return;
+    this.mastDownTarget  = mastDownAmount(health);
+    this.mastBreakTarget = mastBreakAmount(health);
+  }
 
   dropAnchor(side: GunSide, t: number): void { this.anchorReq[side] = Math.max(0, Math.min(1, t)); }
 
@@ -205,6 +238,15 @@ export class PinnaceController implements VesselController {
     this.anchorCur = approach(this.anchorCur, anchorT, this.ANCHOR_RATE * dt);
     if (this.anchorCur > 0.0001 || anchorT > 0) { this.pose('AnchorDrop', this.anchorCur * this.frameEnd); }
 
+    // Mast damage — ease the collapse scrub + splinter morph, then pose the MastDown clip (B_Mast) and
+    // drive the Break morph, BEFORE the skeleton recompute so the skinned mast + rigging fall this frame.
+    if (this.mastFallClip) {
+      this.mastDownCur  = approach(this.mastDownCur,  this.mastDownTarget,  this.MAST_FALL_RATE * dt);
+      this.poseNorm(this.mastFallClip, this.mastDownCur);
+      this.mastBreakCur = approach(this.mastBreakCur, this.mastBreakTarget, this.MAST_FALL_RATE * dt);
+      if (this.mastBreakNode) this.setMorph(this.mastBreakNode, this.mastBreakIndex, this.mastBreakCur);
+    }
+
     // Recompute the skinned rigging (MainTrim/JibTrim bones + flag chain were just posed).
     if (this.skeleton) {
       (this.skeleton as unknown as { _isDirty: boolean })._isDirty = true;
@@ -228,7 +270,10 @@ export class PinnaceController implements VesselController {
     const n = this.nodes.get('Rudder');
     if (n) n.rotationQuaternion = Quaternion.RotationAxis(Vector3.Up(), this.rudderCur * this.RUDDER_MAX_RAD * this.RUDDER_SIGN);
   }
-  private applyTrim(): void { this.pose('Trim', this.trimCur * this.frameEnd); }
+  // SYMMETRIC trim (0=port, 0.5=centre, 1=starboard) → must scrub the clip's FULL range so 0.5 lands on the
+  // true centre. (pose()'s frameEnd scrub under-shoots into the port half because the glTF loader resampled
+  // the clip onto a wider frame range — that left the sail + running rigging swung out to port at rest.)
+  private applyTrim(): void { this.poseNorm('Trim', this.trimCur); }
 
   /** Drive a sail's furl morph + all its rigging morphs (sheets/tack/clew block) to the same value. */
   private applyFurl(sail: string, v: number): void {

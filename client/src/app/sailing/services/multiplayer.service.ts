@@ -15,7 +15,7 @@ import { CombatService } from './combat.service';
 import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
+import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
 import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
@@ -978,6 +978,10 @@ export class MultiplayerService {
       entry.anchorDeploy += ((entry.anchored ? 1 : 0) - entry.anchorDeploy) * Math.min(1, dt * 2.5);
       entry.controller.dropAnchor('S', side === 'S' ? entry.anchorDeploy : 0);
       entry.controller.dropAnchor('P', side === 'P' ? entry.anchorDeploy : 0);
+
+      // Mast collapse/repair: drive off this remote's authoritative masts-zone HP (same source as its
+      // damage-listing tilt), so every client sees her mast come down and rise again in lockstep.
+      entry.controller.setMastDamage(mastHealth(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug)));
 
       // Last: ease trim/boom/furl AND re-prepare the skeleton from all posed bone nodes.
       entry.controller.tickRig(dt);

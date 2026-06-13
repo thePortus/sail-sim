@@ -167,6 +167,27 @@ function applyDamage(combat, zone, dmg) {
 }
 
 /**
+ * Mast self-repair tick (call ~1 Hz per player). The first time the masts zone is at 0 (and the ship
+ * isn't sunk) this arms a jury-rig timer; once it elapses the mast is restored to MAST_REPAIR_FRAC of
+ * max (a partial fix — full repair still needs a port). Returns true the instant it repairs, so the
+ * caller broadcasts the new combat_state. The timer rides on `combat.mastRepairUntil`, so it clears
+ * itself on any newCombatState (respawn / port repair / vessel change) and is never persisted.
+ */
+function tickMastRepair(combat, nowMs) {
+  if (!combat || combat.sunk) return false;   // sinking ships respawn (which resets the mast) — don't repair
+  if (combat.mastRepairUntil) {
+    if (nowMs >= combat.mastRepairUntil) {
+      combat.zones.masts = Math.round(combat.maxHp.masts * C.MAST_REPAIR_FRAC);
+      combat.mastRepairUntil = 0;
+      return true;
+    }
+  } else if (combat.zones.masts <= 0) {
+    combat.mastRepairUntil = nowMs + C.MAST_REPAIR_MS;
+  }
+  return false;
+}
+
+/**
  * Rebuild a combat state from persisted per-zone HP (damage persistence). Starts from a fresh full hull for
  * the vessel (so maxHp/zone list are authoritative for the current vessel), then clamps in the saved current
  * HP and recomputes the sunk flag. Used on reconnect to restore battle damage.
@@ -187,5 +208,5 @@ function restoreCombatState(slug, savedZones) {
 
 module.exports = {
   newCombatState, restoreCombatState, zoneAtLocal, deadReckon, computeDamage,
-  stepShot, validateShot, allowShot, applyDamage,
+  stepShot, validateShot, allowShot, applyDamage, tickMastRepair,
 };

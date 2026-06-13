@@ -23,6 +23,7 @@
     "armature_node": "PinnaceRig",
     "joints": [
       "Root",
+      "B_Mast",
       "MainTrim",
       "JibTrim",
       "Flag1",
@@ -40,6 +41,7 @@
     "AnchorDrop: 0=stowed (canted in the cathead), 1=lowered. The anchor swings upright over the first ~quarter of the clip then lowers; the cable (AnchorCable morph 'Drop') pays out with it. One anchor, starboard bow.",
     "Furl: 0=full sail, 1=furled. Furl_Main and Furl_Jib each drive the sail AND its running-rigging/clew-block morphs together so the sheets, tack and clew block rise with the sail. Morph weights can be driven directly (0..1) instead of via the Furl_* clips — see morph_targets / sail_sheet_pairs.",
     "Flag (Flag1>Flag2>Flag3 bone chain, red ensign) has NO clip — oscillate in code (see free_rotation_bones).",
+    "MAST DAMAGE (see mast_damage): scrub 'MastDown' 0->1 by mast-zone damage (0=intact, 0.5=cracked/leaning, 1=collapsed over the side, snapping low at the deck). Ramp the 'Break' morph on Pinnace_Mast near full for the splintered snap. The whole rig topples as a unit — MainTrim (main yard+lug sail) and JibTrim (jib) bones are children of the new B_Mast hinge; the shrouds/stays were split out of the static hull into Pinnace_Mast and skinned to B_Mast with a foot->hull gradient so they drag down but stay attached at the hull. Costs +3 draws (Pinnace_Mast = SHIP_MATTE + SHIP_METAL + SHIP_GLASS masthead lantern); no new materials. Ensign staff (Flag1) is at the stern, unaffected.",
     "Rudder, GunMount_P/S and Anchor are TRANSFORM (object) nodes, not skeleton joints; scrub their clips by name like any other.",
     "Lantern glass is emissive (KHR_materials_emissive_strength); 3 warm point lights ship with them: Lantern_Bow_L, Lantern_Mast_L, Lantern_Stern_L. Add a glow/bloom layer. The model also animates, so prefer runtime SSAO over the lightly-baked AO."
   ],
@@ -182,6 +184,22 @@
       ],
       "kind": "scrub",
       "range_label": "0=full_sail 1=furled"
+    },
+    "MastDown": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Mast",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=intact 0.5=cracked/leaning 1=collapsed(over the side)",
+      "center_frame": 15,
+      "note": "Topples the whole rig over the side, snapping low at the deck. Pair with the 'Break' morph (see mast_damage)."
     }
   },
   "morph_targets": {
@@ -208,7 +226,23 @@
     },
     "AnchorCable": {
       "Drop": 0
+    },
+    "Pinnace_Mast": {
+      "Break": 0
     }
+  },
+  "mast_damage": {
+    "fall_clip": "MastDown",
+    "hinge_bone": "B_Mast",
+    "mast_node": "Pinnace_Mast",
+    "break_morph": {
+      "node": "Pinnace_Mast",
+      "target": "Break",
+      "index": 0
+    },
+    "fall_side": "side",
+    "range_label": "scrub MastDown 0->1 with mast damage; ramp Break 0->1 over the last ~third",
+    "note": "Single driver from the mast HP zone: mastFrac = 1 - (masts_hp / masts_maxHp). scrub('MastDown', mastFrac) tops out leaning at 0.5 and fully collapsed at 1; setMorph('Pinnace_Mast','Break', smoothstep(0.6,1.0,mastFrac)) adds the splintered snap near the end. The rig falls as one unit (MainTrim main yard+sail and JibTrim jib bones are children of B_Mast); shrouds/stays were moved into Pinnace_Mast and skinned to B_Mast with a foot->hull gradient so they drag down but stay tied to the hull. +3 draws (Pinnace_Mast = SHIP_MATTE + SHIP_METAL + SHIP_GLASS); no new materials. Ease the scrub over ~1.5-2.5s in code so it falls rather than snapping instantly."
   },
   "sail_sheet_pairs": [
     {

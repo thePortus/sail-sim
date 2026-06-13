@@ -2,11 +2,13 @@
 
 # General or Current TODO Items
 
+* return to harbor should take you to /home
+* hitting enter on chat clears focus from chat menu
 * Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
 * add factions going to war, making peace
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance
-* NPC Ship combat
+* NPC Ship combat... & make NPCs obey the physics of winds
 * improved landscape with NME & more scatter to distant
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
@@ -15,7 +17,6 @@
 * Plan to make towns or areas "different"... things to see, special marvels
 * For landscape.... distant trees scattered and then node material editor PBR
 * sound is chunking on windows machines still
-* get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space
 * impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
 * make stuff look cool pass)
 * RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG

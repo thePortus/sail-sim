@@ -24,6 +24,9 @@ export interface VesselController {
   isGunReady(side: GunSide): boolean;
   gunSettled(side: GunSide): boolean;
   setGunports(side: GunSide, open: number): void;   // no-op on rigs without gunport lids
+  /** Mast damage from the `masts` HP zone: 1 = intact .. 0 = destroyed (mast comes down). Eased in
+   *  tickRig; no-op on GLBs without a `mast_damage` rig. */
+  setMastDamage(health: number): void;
   dropAnchor(side: GunSide, t: number): void;
   idleWind(windDirLocalRad: number, strength: number, t: number): void;
   tickRig(dt: number): void;

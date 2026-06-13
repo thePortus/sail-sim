@@ -594,6 +594,18 @@ function attachMultiplayer(server) {
     economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
     npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
     for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
+
+    // Mast self-repair: jury-rig a shot-away mast back to 50 % after 45 s. tickMastRepair arms the timer
+    // when masts hit 0 and restores them on elapse; broadcast the new hull so every client updates HUD,
+    // mast-raise visual, and (for the owner) the sailing penalty.
+    const nowMast = Date.now();
+    for (const [id, p] of players) {
+      if (combat.tickMastRepair(p.combat, nowMast)) {
+        const m = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
+        for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+      }
+    }
+
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
@@ -1232,6 +1244,32 @@ function attachMultiplayer(server) {
                 sysReply(target.ws, `The admins have granted you ${amount} gold.`);
                 sysReply(me.ws, `Gave ${amount} gold to "${parsed.target}" (now ${target.gold}).`);
               }
+            }
+          }
+
+        } else if (text === '/mast' || text.startsWith('/mast ')) {
+          // /mast [hp] — set YOUR OWN masts-zone HP, for testing the dismasting arc solo (admin). No arg
+          // shoots it clean away (0 → leans/slows below 60%, collapses + "furled" at 0, then the 45 s
+          // jury-rig restores it to 50%). A number sets it directly (e.g. /mast 50, /mast 60). Broadcasts
+          // your hull so every other client sees your mast drop/rise too.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may use /mast.'); }
+          else if (!me.combat) { sysReply(me.ws, 'No combat state yet — try again in a moment.'); }
+          else {
+            const arg = text.slice('/mast'.length).trim();
+            const maxM = me.combat.maxHp.masts;
+            const hp   = arg === '' ? 0 : Number(arg);
+            if (!Number.isFinite(hp)) {
+              sysReply(me.ws, 'Usage: /mast [hp]   (omit hp to dismast; e.g. /mast 0, /mast 50)');
+            } else {
+              const clamped = Math.max(0, Math.min(maxM, Math.round(hp)));
+              me.combat.zones.masts  = clamped;
+              me.combat.mastRepairUntil = 0;   // clear any pending jury-rig; the 1 Hz tick re-arms it if 0
+              const hull = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hull);
+              sysReply(me.ws, clamped === 0
+                ? `Mast shot away (0/${maxM}) — she'll jury-rig back to ${Math.round(maxM * 0.5)} in 45 s.`
+                : `Mast HP set to ${clamped}/${maxM}.`);
             }
           }
 

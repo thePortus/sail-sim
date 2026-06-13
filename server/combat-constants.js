@@ -71,6 +71,13 @@ const WATERLINE_BAND      = 1.6;   // metres above the waterline over which the 
 const SEV_GREEN_MIN  = 0.60;
 const SEV_YELLOW_MIN = 0.30;
 
+// ── Mast self-repair ──────────────────────────────────────────────────────────
+// When the masts zone is shot to 0, a jury-rig repair starts automatically and, after this long,
+// brings the mast back to a fraction of full (a partial fix — full repair still needs a port). The
+// base duration; crew/morale modifiers will scale it later.
+const MAST_REPAIR_MS   = 45000;   // 45 s base time to jury-rig the mast back up
+const MAST_REPAIR_FRAC = 0.5;     // restore to 50 % of max masts HP
+
 // ── Ballistic simulation ──────────────────────────────────────────────────────
 const SIM_DT        = 0.02;   // integration step (s)
 const SIM_MAX_T     = 6.0;    // give up after this long in flight
@@ -91,6 +98,7 @@ module.exports = {
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
+  MAST_REPAIR_MS, MAST_REPAIR_FRAC,
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,

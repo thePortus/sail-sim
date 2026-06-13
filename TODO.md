@@ -2,10 +2,8 @@
 
 # General or Current TODO Items
 
-* automate bumping map version of map build?
-* Try doing ocean refraction every frame
-* better sun disk rather than a square
 * if players sink a merchant, let another spawn after awhile
+* add factions going to war, making peace
 * add occasional bosun whistle (no more than once a day)
 * all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
 * lod + imposters for ships at distance

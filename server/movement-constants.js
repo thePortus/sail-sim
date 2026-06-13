@@ -7,7 +7,10 @@
  * combat. Keep the capsule dims in sync with the client COLL_DIMS_BY_SLUG (multiplayer.service.ts).
  */
 
-const { worldBounds }  = require('./config/terrain.config');
+const fs = require('fs');
+const path = require('path');
+const terrainConfig = require('./config/terrain.config');
+const { worldBounds }  = terrainConfig;
 const { TRAVEL_SCALE } = require('./combat-constants');
 
 // Slack multiplier applied to every kinematic limit. Absorbs gusts, leeway, wave-surf nudges,
@@ -41,7 +44,17 @@ const COLL_RESTITUTION = 0.15;
 const COLL_MIN_SPEED   = 0.4;
 
 // Bump whenever the terrain is re-baked so stale saved positions are discarded on spawn. Phase 5.
-const MAP_VERSION = 8;   // 8: re-bake — town factions (spheres of interest) + faction-matched names baked in
+// Map version: now AUTO-STAMPED into the manifest by the terrain build (build-terrain-region.mjs increments
+// it every bake). Read it once at boot; any new map → a new version → saved player positions + economy reset.
+// Falls back to 8 for legacy manifests baked before mapVersion was stamped (matches the last hand-set value).
+function bakedMapVersion() {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(terrainConfig.outputDir, 'manifest.json'), 'utf8'));
+    if (Number.isFinite(m.mapVersion)) return m.mapVersion | 0;
+  } catch { /* no manifest / parse error → legacy fallback */ }
+  return 8;
+}
+const MAP_VERSION = bakedMapVersion();
 
 module.exports = {
   worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX,

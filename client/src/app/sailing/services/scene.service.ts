@@ -430,8 +430,15 @@ export class SceneService {
     sunMat.disableLighting = true;
     sunMat.emissiveColor = new Color3(1.0, 0.95, 0.68);
     sunMat.specularColor = Color3.Black();
+    // Round, soft-edged disc: a radial-gradient texture drives both the emissive colour and the opacity, so
+    // the billboard reads as a circular sun (bright core → feathered limb) instead of a flat square quad. The
+    // glow layer blooms the emissive halo on top. Without this mask the plane is a literal square.
+    const sunTex = this.buildSunTexture();
+    sunMat.emissiveTexture = sunTex;
+    sunMat.opacityTexture  = sunTex;   // alpha channel = the circular falloff
+    sunMat.useAlphaFromDiffuseTexture = false;
 
-    this.sunMesh = MeshBuilder.CreatePlane('sunDisk', { size: 2200 }, this.scene);
+    this.sunMesh = MeshBuilder.CreatePlane('sunDisk', { size: 2600 }, this.scene);
     this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
     this.sunMesh.isPickable = false;
@@ -627,6 +634,30 @@ export class SceneService {
       ctx.beginPath(); ctx.arc(x, y, r * 0.95, 0, Math.PI * 2); ctx.stroke();
     }
 
+    tex.update();
+    return tex;
+  }
+
+  /**
+   * Round sun disc: a radial gradient (warm-white core → feathered transparent limb) in both colour and
+   * alpha, so the billboard plane reads as a circular sun rather than a square quad. Premultiplied-feel:
+   * the alpha falls to 0 before the texture edge so there's no hard square boundary. Built once.
+   */
+  private buildSunTexture(): DynamicTexture {
+    const S = 256;
+    const tex = new DynamicTexture('sunTex', { width: S, height: S }, this.scene, true);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, S, S);
+    const c = S / 2;
+    const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+    g.addColorStop(0.00, 'rgba(255,252,242,1)');   // hot near-white core
+    g.addColorStop(0.42, 'rgba(255,244,212,1)');   // solid warm disc
+    g.addColorStop(0.62, 'rgba(255,226,168,0.75)'); // limb
+    g.addColorStop(0.82, 'rgba(255,210,150,0.22)'); // soft halo
+    g.addColorStop(1.00, 'rgba(255,205,145,0)');    // fully transparent before the square edge
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(c, c, c, 0, Math.PI * 2); ctx.fill();
+    tex.hasAlpha = true;
     tex.update();
     return tex;
   }

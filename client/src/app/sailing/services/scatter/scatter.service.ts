@@ -539,7 +539,7 @@ export class ScatterService {
     const peak = man?.maxElevation ?? man?.targetPeakElevation ?? 920;
     const yLo = Math.max(0.6, 0.04 * peak), yHi = 0.74 * peak;
 
-    const BUDGET = 80000;   // ~9× — far billboards are cheap (instanced, alpha-tested, faded-in); fills the slopes into a canopy
+    const BUDGET = 300000;   // far billboards are cheap (instanced into ~3 variant meshes → few draws); dense distant canopy
     // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
     // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
     const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]

@@ -20,6 +20,7 @@ import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { FarFadePlugin } from './far-fade.plugin';
+import { ImpostorHazePlugin } from './impostor-haze.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
@@ -530,7 +531,7 @@ export class ScatterService {
     const cell = tg.getCellSizeM() || 24;
     const nx = Math.max(2, Math.round((b.maxX - b.minX) / cell) + 1);
     const nz = Math.max(2, Math.round((b.maxZ - b.minZ) / cell) + 1);
-    const stride = Math.max(1, Math.ceil(Math.sqrt((nx * nz) / 1_000_000)));   // cap cells visited at ~1M
+    const stride = Math.max(1, Math.ceil(Math.sqrt((nx * nz) / 8_000_000)));   // cap cells visited at ~8M (fine sampling → stride 1 on most maps)
     const spanX = b.maxX - b.minX, spanZ = b.maxZ - b.minZ;
     // Match the §8d shader canopy's elevation band (treeline) so impostors cover the SAME green hills, not
     // just the lower slopes the near scatter ring caps at (80 m). _forestF uses [0.035 .. 0.74] × peak.
@@ -538,7 +539,7 @@ export class ScatterService {
     const peak = man?.maxElevation ?? man?.targetPeakElevation ?? 920;
     const yLo = Math.max(0.6, 0.04 * peak), yHi = 0.74 * peak;
 
-    const BUDGET = 9000;
+    const BUDGET = 80000;   // ~9× — far billboards are cheap (instanced, alpha-tested, faded-in); fills the slopes into a canopy
     // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
     // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
     const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]
@@ -553,7 +554,10 @@ export class ScatterService {
         const slope = this.slopeAt(px, pz, y, 3.0);
         if (slope > 0.6) { continue; }                             // gentle-ish ground
         const stand = fbm2(px / 45, pz / 45), clearing = fbm2(px / 13 + 9, pz / 13 - 4);
-        const dens = smoothstep(0.42, 0.70, stand) * smoothstep(0.36, 0.60, clearing) * (1 - slope * 0.6);
+        // Dense canopy: high BASE acceptance in forested stands (so slopes read as continuous forest, not dotted),
+        // with the clearing fbm only THINNING toward natural gaps/edges. Softer slope penalty keeps the hills full.
+        const standC = smoothstep(0.28, 0.62, stand), clearC = smoothstep(0.18, 0.52, clearing);
+        const dens = (0.45 + 0.55 * standC) * clearC * (1 - slope * 0.35);
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
         if (this.nearShoreline(px, pz, 6)) { continue; }
         let slot = seen;
@@ -584,8 +588,9 @@ export class ScatterService {
       const info = this.beechImpostors[v];
       const m = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
       if (m.material) {
-        m.material.unfreeze();                       // FarFadePlugin needs live per-frame uniform binds
+        m.material.unfreeze();                       // FarFade + haze need live per-frame uniform binds
         new FarFadePlugin(m.material);
+        new ImpostorHazePlugin(m.material);          // aerial-perspective haze → recedes WITH the terrain (not vivid/dark)
         this.sceneService.excludeFromPrePass(m.material);
       }
       this.sceneService.excludeFromGlow(m);

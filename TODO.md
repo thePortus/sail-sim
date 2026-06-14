@@ -2,10 +2,9 @@
 
 # General or Current TODO Items
 
-* LOD tree imposters not affected by fog, too vivid
 * Chain and grape shot, Crew, number, recruiting, paying
-* Paying for powder and shot
 * add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping
+* Paying for powder and shot
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance
 * improved landscape with NME & more scatter to distant

@@ -12,6 +12,7 @@ import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
+import { SquadronService } from './squadron.service';
 import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { MastCrackService } from './mast-crack.service';
@@ -87,6 +88,7 @@ export class MultiplayerService {
   private vesselService  = inject(VesselService);
   private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
+  readonly squadronService = inject(SquadronService);
   private mastCrackService = inject(MastCrackService);
   private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
@@ -319,6 +321,26 @@ export class MultiplayerService {
     this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign }));
   }
 
+  // ── Squadrons (Phase B) — typed lifecycle messages (the server also accepts the /squad chat commands). ──
+  squadronInvite(callsign: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_invite', callsign }));
+  }
+  squadronAccept(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_accept' }));
+    this.squadronService.clearInvite();
+  }
+  squadronDecline(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_decline' }));
+    this.squadronService.clearInvite();
+  }
+  squadronLeave(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_leave' }));
+  }
+
   // Current local state — kept updated by updateLocalState()
   private localState: Omit<OtherPlayer, 'id'> = {
     x: 0, z: 0, heading: 0, speed: 0, turnRate: 0, sheetAngle: 30, isPortTack: false,
@@ -537,9 +559,32 @@ export class MultiplayerService {
         to:        msg.to ? String(msg.to) : undefined,
         text:      String(msg.text ?? ''),
         timestamp: new Date(),
-        chatType:  msg.chatType === 'dm' ? 'dm' : 'global',
+        chatType:  msg.chatType === 'dm' ? 'dm' : (msg.chatType === 'squadron' ? 'squadron' : 'global'),
       };
       this.chatMessages.update(msgs => [...msgs.slice(-199), chatMsg]);
+
+    } else if (msg.type === 'squadron_invited') {
+      // A captain invited us → surface the accept/decline prompt (Phase B).
+      this.squadronService.setInvite({
+        squadronId:   String(msg.squadronId ?? ''),
+        fromId:       String(msg.fromId ?? ''),
+        fromCallsign: String(msg.fromCallsign ?? ''),
+      });
+
+    } else if (msg.type === 'squadron_state') {
+      // Authoritative roster (squadronId:null = we left / it disbanded → clear the UI).
+      if (msg.squadronId == null) {
+        this.squadronService.setRoster(null);
+      } else {
+        this.squadronService.setRoster({
+          squadronId: String(msg.squadronId),
+          leaderId:   String(msg.leaderId ?? ''),
+          members:    Array.isArray(msg.members)
+            ? msg.members.map((m: any) => ({ id: String(m.id), callsign: String(m.callsign) }))
+            : [],
+        });
+      }
+      this.squadronService.clearInvite();   // any pending invite is now resolved
 
     } else if (msg.type === 'wallet') {
       // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).

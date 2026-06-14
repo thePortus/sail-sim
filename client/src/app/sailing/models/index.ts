@@ -319,5 +319,22 @@ export interface ChatMessage {
   to?:      string;
   text:     string;
   timestamp: Date;
-  chatType: 'global' | 'dm';
+  chatType: 'global' | 'dm' | 'squadron';
+}
+
+/** A squadron member as sent in the server's `squadron_state` roster. */
+export interface SquadronMember { id: string; callsign: string; }
+
+/** The player's current squadron (null = not in one), mirrored from `squadron_state`. */
+export interface SquadronState {
+  squadronId: string;
+  leaderId:   string;
+  members:    SquadronMember[];
+}
+
+/** A pending squadron invite awaiting accept/decline, from `squadron_invited`. */
+export interface SquadronInvite {
+  squadronId:   string;
+  fromId:       string;
+  fromCallsign: string;
 }

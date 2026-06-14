@@ -15,6 +15,44 @@
     </div>
   }
 
+  <!-- ── Squadron invite prompt (top-centre popup; appears when another captain invites you) ─────────── -->
+  @if (squadronService.invite(); as inv) {
+    <div class="absolute left-1/2 top-16 -translate-x-1/2 w-80 max-w-[85vw] rounded-lg border border-sky-500/40
+                bg-slate-900/90 px-5 py-3 font-mono text-sky-200 shadow-xl backdrop-blur-sm pointer-events-auto">
+      <div class="text-center mb-2.5">
+        <div class="text-sm font-bold text-sky-300">⚔ {{ inv.fromCallsign }}</div>
+        <div class="text-xs text-slate-400 mt-0.5">invites you to join their squadron</div>
+      </div>
+      <div class="flex gap-3">
+        <button (click)="acceptSquadron()"
+                class="flex-1 px-3 py-1.5 rounded text-xs font-bold bg-green-600/40 text-green-200 border border-green-500/50 hover:bg-green-600/60">
+          Accept
+        </button>
+        <button (click)="declineSquadron()"
+                class="flex-1 px-3 py-1.5 rounded text-xs font-bold bg-slate-700/40 text-slate-300 border border-slate-600/50 hover:bg-slate-700/60">
+          Decline
+        </button>
+      </div>
+    </div>
+  }
+
+  <!-- ── Squadron roster (top-centre pill; your squadron-mates, leader starred, with a leave button) ──── -->
+  @if (squadronService.roster(); as sq) {
+    <div class="absolute left-1/2 top-2 -translate-x-1/2 flex items-center gap-2 rounded-full border border-sky-500/40
+                bg-slate-900/80 px-3 py-1 font-mono text-xs text-sky-200 shadow-lg backdrop-blur-sm pointer-events-auto">
+      <span class="text-sky-400" title="Squadron">⚔</span>
+      @for (m of sq.members; track m.id) {
+        <span [class.text-amber-300]="m.id === sq.leaderId" [class.font-bold]="m.id === sq.leaderId">
+          {{ m.id === sq.leaderId ? '★ ' : '' }}{{ m.callsign }}
+        </span>
+      }
+      <button (click)="leaveSquadron()" title="Leave squadron"
+              class="ml-1 rounded-full px-2 py-0.5 text-[10px] font-bold bg-rose-700/40 text-rose-200 border border-rose-500/50 hover:bg-rose-700/60">
+        Leave
+      </button>
+    </div>
+  }
+
   <!-- ── Fullscreen toggle (top-right corner, above sail panel) ─────────── -->
   <button class="fullscreen-btn pointer-events-auto" (click)="toggleFullscreen()"
           [title]="isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen'">

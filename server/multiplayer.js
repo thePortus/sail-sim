@@ -53,6 +53,7 @@ const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
 const { getVesselDef } = require('./controllers/vessels.controller');
@@ -524,6 +525,7 @@ function sendMarket(p, townId) {
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
+  const squadrons = new Map();   // Squadrons (Phase B): session-only fireteams, id → { id, leaderId, members:[] }
   let nextId = 1;
 
   // ── Movement helpers (authoritative pose application + correction/broadcast) ───────────────────
@@ -661,6 +663,7 @@ function attachMultiplayer(server) {
     const victim  = players.get(hit.victimId);
     if (!victim || !victim.combat) return;
     if (victim.godmode) return;   // /godmode: invulnerable admin — the ball passes harmlessly, no damage or cosmetics
+    if (squadron.sameSquadron(shooter, victim)) return;   // Squadrons (B2): mates' shots pass harmlessly through each other
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
@@ -746,6 +749,7 @@ function attachMultiplayer(server) {
       gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
       factionRep: factions.defaultRep(),                                      // Factions reputation — overwritten by the DB load below
       ship: 'pinnace',                                                        // Ships-as-economy: owned hull — overwritten by the DB load below
+      squadron: null, pendingInvite: null,                                    // Squadrons (Phase B): session-only, never persisted
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
@@ -961,6 +965,15 @@ function attachMultiplayer(server) {
             console.warn('[WS] friend_toggle error:', err.message);
           }
         })();
+
+      } else if (msg.type === 'squadron_invite') {
+        squadron.invite(players, squadrons, id, String(msg.callsign ?? ''), Date.now());
+      } else if (msg.type === 'squadron_accept') {
+        squadron.accept(players, squadrons, id, Date.now());
+      } else if (msg.type === 'squadron_decline') {
+        squadron.decline(players, id);
+      } else if (msg.type === 'squadron_leave') {
+        squadron.leave(players, squadrons, id);
 
       } else if (msg.type === 'cannon_shot') {
         const me = players.get(id);
@@ -1298,6 +1311,31 @@ function attachMultiplayer(server) {
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
 
+        } else if (text === '/squad' || text.startsWith('/squad ')) {
+          // /squad invite "<callsign>" · /squad accept · /squad decline · /squad leave — squadron lifecycle (Phase B).
+          const arg  = text.slice('/squad'.length).trim();
+          const m    = arg.match(/^(\S+)\s*([\s\S]*)$/);
+          const sub  = (m?.[1] || '').toLowerCase();
+          const rest = m?.[2] || '';
+          if (sub === 'invite') {
+            const tgt = parseTargetAndRest(rest)?.target || rest.trim();
+            squadron.invite(players, squadrons, id, tgt, Date.now());
+          } else if (sub === 'accept') {
+            squadron.accept(players, squadrons, id, Date.now());
+          } else if (sub === 'decline') {
+            squadron.decline(players, id);
+          } else if (sub === 'leave' || sub === 'disband') {
+            squadron.leave(players, squadrons, id);
+          } else {
+            sysReply(players.get(id)?.ws, 'Usage: /squad invite "<callsign>" · /squad accept · /squad decline · /squad leave');
+          }
+
+        } else if (text === '/s' || text.startsWith('/s ')) {
+          // /s <message> — talk privately to your squadron (Phase B).
+          const body = text.slice(2).trim();
+          if (body) squadron.chat(players, squadrons, id, body);
+          else sysReply(players.get(id)?.ws, 'Usage: /s <message>   (squadron chat)');
+
         } else if (text.startsWith('/')) {
           // Strict command parsing: anything starting with '/' that wasn't matched
           // above (or handled client-side) is an unknown command — never broadcast it.
@@ -1318,6 +1356,7 @@ function attachMultiplayer(server) {
       savePlayerLocation(closing);   // persist final authoritative pose before dropping the player
       saveEconomyState(closing);     // backstop persist of purse + hold (trades already persist inline)
       saveCombatState(closing);      // persist hull damage so it survives logout/restart
+      squadron.handleDisconnect(players, squadrons, id);   // Squadrons (B): drop from any squadron (disband if <2), void invites
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a

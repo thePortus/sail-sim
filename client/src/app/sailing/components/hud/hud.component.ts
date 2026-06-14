@@ -5,6 +5,8 @@ import { WeatherService } from '../../services/weather.service';
 import { SceneService } from '../../services/scene.service';
 import { CannonService } from '../../services/cannon.service';
 import { CombatService } from '../../services/combat.service';
+import { MultiplayerService } from '../../services/multiplayer.service';
+import { SquadronService } from '../../services/squadron.service';
 import { SailState } from '../../models';
 import { ChatComponent } from '../chat/chat.component';
 import { DamageDiagramComponent } from './damage-diagram.component';
@@ -21,6 +23,8 @@ export class HudComponent implements OnInit, OnDestroy {
   sceneService   = inject(SceneService);
   cannonService  = inject(CannonService);
   combatService  = inject(CombatService);
+  multiplayerService = inject(MultiplayerService);
+  squadronService    = inject(SquadronService);
   private zone   = inject(NgZone);
 
   @ViewChild(ChatComponent) private chat?: ChatComponent;
@@ -243,6 +247,11 @@ export class HudComponent implements OnInit, OnDestroy {
   refloat(): void {
     this.vesselService.refloat();
   }
+
+  // ── Squadrons (Phase B) ─────────────────────────────────────────────────────
+  acceptSquadron(): void  { this.multiplayerService.squadronAccept(); }
+  declineSquadron(): void { this.multiplayerService.squadronDecline(); }
+  leaveSquadron(): void   { this.multiplayerService.squadronLeave(); }
 
   exit(): void {
     this.exitGame.emit();

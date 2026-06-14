@@ -13,6 +13,7 @@
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
+* any way to reduce load times?
 * streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
 * server is disconnected message
 * Plan to make towns or areas "different"... things to see, special marvels

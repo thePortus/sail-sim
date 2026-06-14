@@ -35,7 +35,7 @@ struct Params {
   densityMul: f32,        // quality-tier density multiplier
   variant: f32,           // variant this layer owns, or -1 = keep all (shadow blobs)
   capacity: f32,          // instance capacity of the patch buffers
-  texSizeMinus1: vec2f,   // heightfield texel count - 1
+  texSize: vec2f,         // heightfield texel count (full width/height)
   wbounds: vec4f,         // heightfield world bounds: minX, minZ, sizeX, sizeZ
   pad0a: vec4f,           // town pad 0: cx, cz, halfX, halfZ
   pad0b: vec4f,           // town pad 0: sin, cos, enabled, unused
@@ -97,10 +97,10 @@ fn step01(a: f32, b: f32, x: f32) -> f32 {
 fn groundAt(wx: f32, wz: f32) -> f32 {
   let u = (wx - params.wbounds.x) / params.wbounds.z;
   let v = (params.wbounds.y + params.wbounds.w - wz) / params.wbounds.w;
-  let fxy = vec2f(u, v) * params.texSizeMinus1 - vec2f(0.5, 0.5);
+  let fxy = vec2f(u, v) * params.texSize - vec2f(0.5, 0.5);
   let i0 = vec2i(floor(fxy));
   let f = fxy - floor(fxy);
-  let mx = vec2i(params.texSizeMinus1);
+  let mx = vec2i(params.texSize) - vec2i(1, 1);
   let h00 = textureLoad(heightTex, clamp(i0,                vec2i(0), mx), 0).r;
   let h10 = textureLoad(heightTex, clamp(i0 + vec2i(1, 0),  vec2i(0), mx), 0).r;
   let h01 = textureLoad(heightTex, clamp(i0 + vec2i(0, 1),  vec2i(0), mx), 0).r;
@@ -110,7 +110,7 @@ fn groundAt(wx: f32, wz: f32) -> f32 {
 
 // Local slope in m/m over one heightfield texel — mirrors the CPU slopeAt (which uses cellM, not E)
 fn slopeAt(px: f32, pz: f32, baseY: f32) -> f32 {
-  let d = params.wbounds.z / params.texSizeMinus1.x;
+  let d = params.wbounds.z / params.texSize.x;
   return length(vec2f(groundAt(px + d, pz) - baseY, groundAt(px, pz + d) - baseY)) / d;
 }
 
@@ -414,7 +414,7 @@ export class ScatterCompute {
     this.params.addUniform('densityMul', 1);
     this.params.addUniform('variant', 1);
     this.params.addUniform('capacity', 1);
-    this.params.addUniform('texSizeMinus1', 2);
+    this.params.addUniform('texSize', 2);
     this.params.addUniform('wbounds', 4);
     this.params.addUniform('pad0a', 4);
     this.params.addUniform('pad0b', 4);
@@ -457,7 +457,7 @@ export class ScatterCompute {
     this.params.updateFloat('densityMul', densityMul);
     this.params.updateFloat('variant', variant);
     this.params.updateFloat('capacity', patch.capacity);
-    this.params.updateFloat2('texSizeMinus1', hf.texSize.x - 1, hf.texSize.y - 1);
+    this.params.updateFloat2('texSize', hf.texSize.x, hf.texSize.y);
     this.params.updateVector4('wbounds', hf.wbounds);
     const p0 = pads[0], p1 = pads[1];
     this.params.updateFloat4('pad0a', p0?.cx ?? 0, p0?.cz ?? 0, p0?.hx ?? 0, p0?.hz ?? 0);

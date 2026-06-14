@@ -170,11 +170,13 @@ export class ScatterService {
   })();
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
   private densityMul = 1;               // grass acceptance multiplier (set from quality)
-  // Per-asset planting depth = the GLB's authored trunk-base height (local units), applied ×instance-scale so
-  // the base plants at the ground at ANY size. Palms need a big value (their bbox min is a low root/frond
-  // vertex at y=0, with the visible bark base authored well above it); beeches sit near their origin.
-  // Live-tunable via palmSink()/treeSink() while dialling it in.
-  private palmSink = 2.4;
+  // The palm GLB's trunk base is authored this high above its origin (its lowest vertex is a drooping frond,
+  // not the base). recenterTrunkXZ bakes this down so the base sits at local y=0 — then placement just plants
+  // the origin at the ground (no per-scale sink), correctly on BOTH the CPU and GPU paths.
+  private static readonly PALM_TRUNK_Y = 2.4;
+  // Small constant "planted" depth below the (correct) sampled ground — same idea as the trees. Live-tunable
+  // via palmSink()/treeSink() while dialling it in.
+  private palmSink = 0.35;
   private treeSink = 0.35;
   private enabled = true;               // false → no grass built at all (Potato)
   // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
@@ -273,8 +275,8 @@ export class ScatterService {
     // Land grass — authored CLUMP GLBs (3 tussock variants, scattered at clump density, NOT per-blade).
     // Retires the old custom grass ShaderMaterial (which failed to compile on WebGPU). (Names start with
     // `scatter_` so the ocean refraction RTT's exclusion predicate skips foliage.)
-    // DISABLED for now (GRASS_ENABLED=false): the current clump models are too expensive — awaiting
-    // better authored grass. Flip the flag back to true to restore it.
+    // Re-enabled: the updated clump models are fuller (60–90 blades, wider footprint) so far fewer
+    // instances fill a field, and the scatter bottleneck that forced this off has since been resolved.
     if (ScatterService.GRASS_ENABLED) { await this.registerGrass(scene); }
 
     // Authored-GLB groups (streamed from the server, cached): beach rocks (5 shapes, size pebble→
@@ -356,9 +358,9 @@ export class ScatterService {
    *  material, with a real *_lod.glb far-LOD per clump, and register one scatter sub-layer per variant.
    *  Wind: draw-radius dissolve (GrassFadePlugin) + clump-scale sway/flutter (TreeWindPlugin). On any
    *  load failure → no grass (the old ShaderMaterial blade system is retired). */
-  /** Master on/off for the grass layer. Off while the current clump GLBs are too costly to render —
-   *  set true again once the replacement grass models land. */
-  private static readonly GRASS_ENABLED = false;
+  /** Master on/off for the grass layer. ON: the replacement fuller-clump GLBs landed (cheaper per field)
+   *  and the scatter bottleneck is resolved. */
+  private static readonly GRASS_ENABLED = true;
 
   private async registerGrass(scene: Scene): Promise<void> {
     const mat = buildGrassMaterial(scene, 'scatter_grass_mat', 'grass_albedo.png');
@@ -425,14 +427,20 @@ export class ScatterService {
                           cx: number, cz: number, variant: number, shadowMode = 0): GpuScatterPatch | null {
     const cfg = ScatterService.GPU_LAYERS[kind];
     const half = this.PATCH / 2;
+    // Probe the patch's terrain min/max for the (GPU-resident, CPU-unreadable) culling box. The old 3×3 grid
+    // undersampled a 40 m patch — a hill BETWEEN probe points left the box too short, so correctly-placed
+    // instances poked out of it and got frustum-culled except at extreme foreground. Sample densely enough to
+    // hit every heightfield texel in the patch so the box truly bounds the terrain.
+    const cell = this.terrainService.getCellSizeM() || 24;
+    const steps = Math.max(2, Math.min(12, Math.ceil(this.PATCH / cell) + 1));
     let yMin = Infinity, yMax = -Infinity;
-    for (let i = -1; i <= 1; i++) {
-      for (let j = -1; j <= 1; j++) {
-        const y = this.terrainService.getElevationFast(cx + i * half, cz + j * half);
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps; j++) {
+        const y = this.terrainService.getElevationFast(cx + ((i / steps) * 2 - 1) * half, cz + ((j / steps) * 2 - 1) * half);
         yMin = Math.min(yMin, y); yMax = Math.max(yMax, y);
       }
     }
-    // The 3×3 probe undersamples a 40 m patch — pad the band so a coastal texel can't false-reject.
+    // Pad the band so a coastal texel can't false-reject the whole patch.
     if (yMax < cfg.yLo - 2 || yMin > cfg.yHi + 10) { return null; }
 
     const pads: PadBox[] = this.townPadsNear(cx, cz).slice(0, 2);
@@ -466,7 +474,7 @@ export class ScatterService {
         return;
       }
       this.groundToBase(full);
-      this.recenterTrunkXZ(full);   // palm origin sits under an off-centre frond tip → put the trunk over the origin
+      this.recenterTrunkXZ(full, ScatterService.PALM_TRUNK_Y);   // bake the off-centre + raised trunk base to the origin (both paths)
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -507,6 +515,7 @@ export class ScatterService {
         return;
       }
       this.groundToBase(full);
+      this.recenterTrunkXZ(full);   // (also) put the beech trunk over the origin if its GLB origin is off-axis
       new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -1029,15 +1038,18 @@ export class ScatterService {
    * shadow). The frond canopy is roughly symmetric about the trunk, so the vertex CENTROID ≈ the trunk axis;
    * baking −centroid into the geometry plants the trunk under the origin (and thus under its shadow).
    */
-  private recenterTrunkXZ(mesh: Mesh): void {
+  private recenterTrunkXZ(mesh: Mesh, trunkY = 0): void {
     const pos = mesh.getVerticesData('position');
     if (!pos || !pos.length) { return; }
     let sx = 0, sz = 0; const n = pos.length / 3;
     for (let i = 0; i < pos.length; i += 3) { sx += pos[i]; sz += pos[i + 2]; }
     const cx = sx / n, cz = sz / n;
-    if (Math.abs(cx) > 0.03 || Math.abs(cz) > 0.03) {
-      console.info(`[scatter] ${mesh.name}: trunk axis off origin by (${cx.toFixed(2)}, ${cz.toFixed(2)}) m → re-centred`);
-      mesh.position.x = -cx; mesh.position.z = -cz;
+    // `trunkY` (>0 for palms) is the authored height of the trunk BASE above the GLB origin — baking it down
+    // moves the base to local y=0 so BOTH the CPU and GPU placement plant the trunk at the ground with no
+    // per-scale sink (the GLB's lowest vertex is a drooping frond, which groundToBase can't use).
+    if (Math.abs(cx) > 0.03 || Math.abs(cz) > 0.03 || trunkY !== 0) {
+      console.info(`[scatter] ${mesh.name}: origin→trunk (${cx.toFixed(2)}, ${trunkY.toFixed(2)}, ${cz.toFixed(2)}) m → baked to base`);
+      mesh.position.set(-cx, -trunkY, -cz);
       mesh.bakeCurrentTransformIntoVertices();
     }
   }
@@ -1476,7 +1488,7 @@ export class ScatterService {
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }
-        posV.set(px, y - this.palmSink * s, pz);   // sink = authored trunk-base height × instance scale → plants at any size
+        posV.set(px, y - this.palmSink, pz);   // trunk base is baked to the origin → just plant it at the ground
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);

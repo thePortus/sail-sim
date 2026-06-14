@@ -2629,7 +2629,7 @@ export class TerrainService {
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 4.0)).r*mrSn;
       float wet = (1.0 - smoothstep(0.0, 2.2, vPositionW.y)) * (1.0 - smoothstep(0.35, 0.70, 1.0 - clamp(nWr.y, 0.0, 1.0)));
       metallicRoughness.r = 0.0;                                    /* terrain is never metallic */
-      metallicRoughness.g = clamp(mix(rgh, rgh * 0.78, wet), 0.62, 1.0);   /* matte floor 0.62: low-roughness sky sheen was reading as wet/transparent water */
+      metallicRoughness.g = clamp(mix(rgh, rgh * 0.82, wet), 0.82, 1.0);   /* matte floor 0.82: smooth (bilinear) normals + low roughness read as plasticy sky sheen; keep land matte, wet channels below still glossy */
       vec4 auxR = _aux(vPositionW);                                 /* S4: water-polished drainage channels */
       float chanR = smoothstep(0.45, 0.82, auxR.a) * smoothstep(-0.2, 1.5, vPositionW.y);
       metallicRoughness.g = clamp(mix(metallicRoughness.g, metallicRoughness.g * 0.70, chanR), 0.50, 1.0);
@@ -2764,7 +2764,7 @@ export class TerrainService {
       float pe = 0.7;
       float pHL=_detailH(vPositionW.xz-vec2(pe,0.0)), pHR=_detailH(vPositionW.xz+vec2(pe,0.0));
       float pHD=_detailH(vPositionW.xz-vec2(0.0,pe)), pHU=_detailH(vPositionW.xz+vec2(0.0,pe));
-      float pStr=(0.55+slope*2.4)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);
+      float pStr=(0.85+slope*2.1)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);  // raised flat-ground floor (0.55->0.85): break the mirror-smooth bilinear normal so flats aren't plasticy
       float pLand=smoothstep(0.4,4.0,vPositionW.y);
       normalW = normalize(nW + vec3(-(pHR-pHL), 0.0, -(pHU-pHD)) * (1.5*pdFade*pLand*pStr));
       // Lumpy canopy normal (§8d): treetops catch the sun, valleys self-shade — dimensional forest relief.

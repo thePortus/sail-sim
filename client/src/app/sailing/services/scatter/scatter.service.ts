@@ -361,6 +361,12 @@ export class ScatterService {
   /** Master on/off for the grass layer. ON: the replacement fuller-clump GLBs landed (cheaper per field)
    *  and the scatter bottleneck is resolved. */
   private static readonly GRASS_ENABLED = true;
+  /** Grass leans HARD on the cheap LOD impostor for perf: full-detail clumps only in the patch RIGHT
+   *  next to the ship (`GRASS_NEAR` m), the cheap baked impostor for everything past that, and grass is
+   *  not built at all beyond `GRASS_RING` patch rings (distant terrain — too small to read). The fade
+   *  band (applyQualityParams) is sized to dissolve grass before this ring's hard cull, so no pop. */
+  private static readonly GRASS_NEAR = 30;    // metres: full clump LoD only within this of the patch centre
+  private static readonly GRASS_RING = 4;     // patch rings (×40 m ≈ 180 m) — no grass past this
 
   private async registerGrass(scene: Scene): Promise<void> {
     const mat = buildGrassMaterial(scene, 'scatter_grass_mat', 'grass_albedo.png');
@@ -381,7 +387,8 @@ export class ScatterService {
       if (!full || !lod) { console.warn(`[scatter] grass clump ${v} (${cfg.file}) failed — skipping grass`); return; }
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromGlow(lod);
-      const layer = this.makeGlbLayer(full, lod, 45, (cx, cz) => this.buildGrass(cx, cz, v));
+      const layer = this.makeGlbLayer(full, lod, ScatterService.GRASS_NEAR, (cx, cz) => this.buildGrass(cx, cz, v));
+      layer.maxRing = ScatterService.GRASS_RING;   // cull distant grass — too small to read, costs FPS
       if (gpu) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('grass', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -390,7 +397,7 @@ export class ScatterService {
   /** Per-layer GPU patch config: kernel kind, instance capacity, the pre-gate altitude band, the
    *  vertical headroom for the culling box, and whether the material reads instance colors. */
   private static readonly GPU_LAYERS = {
-    grass: { wgsl: GRASS_WGSL, capacity: 1800, yLo: 0.6,  yHi: 140, headroom: 4,  color: true },
+    grass: { wgsl: GRASS_WGSL, capacity: 3072, yLo: 0.6,  yHi: 140, headroom: 4,  color: true },
     rocks: { wgsl: ROCKS_WGSL, capacity: 576,  yLo: 0.25, yHi: 150, headroom: 5,  color: true },
     drift: { wgsl: DRIFT_WGSL, capacity: 400,  yLo: 0.25, yHi: 7,   headroom: 3,  color: true },
     trees: { wgsl: TREES_WGSL, capacity: 256,  yLo: 0.6,  yHi: 80,  headroom: 16, color: false },
@@ -560,7 +567,7 @@ export class ScatterService {
     const peak = man?.maxElevation ?? man?.targetPeakElevation ?? 920;
     const yLo = Math.max(0.6, 0.04 * peak), yHi = 0.74 * peak;
 
-    const BUDGET = 300000;   // far billboards are cheap (instanced into ~3 variant meshes → few draws); dense distant canopy
+    const BUDGET = 600000;   // far billboards are cheap (instanced into ~3 variant meshes → few draws); doubled for denser distant canopy on faraway islands
     // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
     // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
     const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]
@@ -1109,16 +1116,21 @@ export class ScatterService {
         // lush spots. No base floor → between bushes (even inside a lush region) there is zero grass.
         const region = fbm2(px / 45 + 120, pz / 45 - 60);             // where bushes are ALLOWED at all
         const bush   = fbm2(px / 5 + 31, pz / 5 + 17);                // small scale → small, tight bushes
-        const regionGate = step01(0.54, 0.64, region);                // ~0 almost everywhere → 1 in rare lush spots
-        const core = step01(0.56, 0.80, bush);                        // 0 between bushes → 1 at a bush heart
+        const core = step01(0.50, 0.78, bush);                        // 0 between bushes → 1 at a bush heart
         const coreD = core * core * core;                             // cubed: concentrates hard into the heart
-        const lowland = smoothstep(1.5, 13, y);                       // shore → lowland
         const alt = 1 - smoothstep(90, 140, y);                       // fade out toward the rocky uplands
-        const envFac = lowland * alt * (1 - slope * 0.7) * this.densityMul;
 
-        // No meadow base: density is purely region × bush-core, so barren gaps are genuinely empty and the
-        // only grass is the bush hearts (which then get heavily over-packed below).
-        const density = coreD * regionGate * envFac;
+        // FOREST: lush, near-continuous coverage on inland/higher ground. Permissive region gate + a base
+        // meadow floor (0.55) so most of the forest carries grass, denser still toward bush hearts.
+        const forestRegion = step01(0.34, 0.50, region);
+        const forestCover = 0.55 + 0.45 * coreD;
+        const lowland = smoothstep(1.5, 13, y);                       // favors higher ground (forest)
+        const forestDens = forestRegion * forestCover * lowland;
+        // BEACH: modest grass on the sand band (~old forest amount) — cubed bush cores only, no meadow floor.
+        const beachBand = smoothstep(0.7, 1.8, y) * (1 - smoothstep(4, 11, y));
+        const beachRegion = step01(0.50, 0.62, region);
+        const beachDens = beachRegion * coreD * beachBand * 0.85;
+        const density = Math.max(forestDens, beachDens) * alt * (1 - slope * 0.7) * this.densityMul;
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > density) { continue; }
 
         // Deal each accepted cell to one clump variant.
@@ -1206,8 +1218,12 @@ export class ScatterService {
     this.densityMul = t.density;
     this.RADIUS = Math.max(1, t.radius);
     this.shadowRing = Math.min(this.RADIUS, 3);   // blobs only near the camera (~120 m)
-    GrassFadePlugin.fade.end   = (this.RADIUS - 0.4) * this.PATCH;
-    GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 110);
+    // Grass dissolves at its OWN (smaller) ring cap, not the global draw radius — so the cheap-LoD grass
+    // shrinks to nothing just before GRASS_RING's hard patch cull (no pop), and never reaches out to the
+    // distant terrain where it isn't worth the FPS. Fade plugin is grass-only in the active asset path.
+    const grassRing = Math.min(ScatterService.GRASS_RING, this.RADIUS);
+    GrassFadePlugin.fade.end   = (grassRing + 0.5) * this.PATCH;
+    GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 60);
   }
 
   /** Build one patch's beach rocks: scattered on the sand/low-dune band, mostly small with some

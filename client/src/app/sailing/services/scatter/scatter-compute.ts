@@ -244,13 +244,19 @@ fn emitClump(px: f32, pz: f32, y: f32) -> bool {
 
   let region = fbm2(vec2f(px / 45.0 + 120.0, pz / 45.0 - 60.0));
   let bush = fbm2(vec2f(px / 5.0 + 31.0, pz / 5.0 + 17.0));
-  let regionGate = step01(0.54, 0.64, region);
-  let core = step01(0.56, 0.80, bush);
+  let core = step01(0.50, 0.78, bush);
   let coreD = core * core * core;
-  let lowland = smoothstep(1.5, 13.0, y);
   let alt = 1.0 - smoothstep(90.0, 140.0, y);
-  let envFac = lowland * alt * (1.0 - slope * 0.7) * params.densityMul;
-  let density = coreD * regionGate * envFac;
+  // FOREST: lush, near-continuous coverage on inland/higher ground (base meadow floor + denser bush hearts).
+  let forestRegion = step01(0.34, 0.50, region);
+  let forestCover = 0.55 + 0.45 * coreD;
+  let lowland = smoothstep(1.5, 13.0, y);
+  let forestDens = forestRegion * forestCover * lowland;
+  // BEACH: modest grass on the sand band (~old forest amount) — cubed bush cores only, no meadow floor.
+  let beachBand = smoothstep(0.7, 1.8, y) * (1.0 - smoothstep(4.0, 11.0, y));
+  let beachRegion = step01(0.50, 0.62, region);
+  let beachDens = beachRegion * coreD * beachBand * 0.85;
+  let density = max(forestDens, beachDens) * alt * (1.0 - slope * 0.7) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > density) { return; }
   if (dealtAway(px, pz, 3.0)) { return; }
 

@@ -190,8 +190,10 @@ export class VesselService {
   isGunSettled(side: 'port' | 'stbd'): boolean {
     return this.controller?.gunSettled(this.gunSide(side)) ?? true;
   }
-  /** Per-ship reload window (seconds). */
-  getReloadWindow(): number { return this.physics.reloadWindow ?? 6; }
+  /** Per-ship reload window (seconds), stretched when short-handed: fewer gun crew → slower reload (up to ~2×
+   *  with no crew, via the 0.5 crew-efficiency floor). The cannon service reads this for both the progress bar
+   *  and the reload-complete check, so the whole gun cycle slows with crew losses. */
+  getReloadWindow(): number { return (this.physics.reloadWindow ?? 6) / this.combatService.crewFactor(); }
 
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
   getRoot(): TransformNode { return this.root; }
@@ -836,7 +838,10 @@ export class VesselService {
     const mastMul = mastSpeedMult(mastH);
 
     const eff    = this.sailEfficiency(angleFromWind);
-    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul));
+    // Crew: fewer hands work the sails (and helm) less effectively — scale top speed + turn rate by the
+    // crew-efficiency factor (0.5..1). Even solo you still sail/turn, just at half pace (the 0.5 floor).
+    const crewMul = this.combatService.crewFactor();
+    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul)) * crewMul;
     // speedModifier applied below after buoyancy is computed.
     // While sinking, control is frozen: glide to a dead stop (no sail drive) and ignore the helm.
     const spdTarget = this.sinking ? 0 : baseTarget;
@@ -850,6 +855,7 @@ export class VesselService {
       const dir = this.keys.left ? -1 : 1;
       let rate = this.turnRate(this.speed);
       if (mastH <= 0) rate = Math.min(rate, MAST_DOWN_TURN_MAX);
+      rate *= crewMul;   // short-handed → slower on the helm too (floor 0.5)
       this.heading = ((this.heading + dir * rate * dt) + 360) % 360;
     }
 

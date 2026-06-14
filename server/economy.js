@@ -470,7 +470,7 @@ module.exports = {
   bestBuyerFor, hintFor, currentDay: economyDay,
   npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
   tick, tickToToday, loadState, flushState, seedMarkets,
-  REPAIR_FEE: goods.REPAIR_FEE, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
+  REPAIR_FEE: goods.REPAIR_FEE, RECRUIT_COST: goods.RECRUIT_COST, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
   // test seam (headless harness — no manifest/DB): inject towns + drive state directly.
   _test: {
     setTowns(arr) { towns = new Map(arr.map((t) => [t.id, t])); profiles = new Map(); markets = new Map(); loaded = true; },

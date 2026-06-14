@@ -56,7 +56,7 @@ const npc = require('./npc');
 const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
-const { getVesselDef } = require('./controllers/vessels.controller');
+const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -432,10 +432,9 @@ function parseCombat(text) {
 async function saveCombatState(p) {
   if (!p || !p.auth || p.auth.userId == null || !p.combat) return;
   try {
-    await User.update(
-      { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) },
-      { where: { id: p.auth.userId } },
-    );
+    const upd = { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) };
+    if (typeof p.crew === 'number') upd.crew = p.crew | 0;   // Crew resource persists alongside hull damage
+    await User.update(upd, { where: { id: p.auth.userId } });
   } catch (err) {
     console.warn('[WS] saveCombatState failed:', err.message);
   }
@@ -447,7 +446,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -456,6 +455,12 @@ async function loadAndSendWallet(id, p, players) {
     // can't sail a hull it doesn't own. capacity/physics derive from it too.
     p.ship = (u.ship && getVesselDef(u.ship)) ? u.ship : 'pinnace';
     if (p.state) p.state.vesselSlug = p.ship;
+
+    // Crew resource — clamp the saved count to the owned vessel's complement (NULL → full). crewWound is the
+    // in-memory fractional-casualty accumulator (grapeshot), never persisted (a partial wound heals on relog).
+    p.maxCrew = crewFor(p.ship);
+    p.crew = (u.crew == null) ? p.maxCrew : Math.max(0, Math.min(p.maxCrew, u.crew | 0));
+    p.crewWound = 0;
 
     // Faction reputation — persists across maps (it's the player's standing, not the world's). Normalized so a
     // newly-added nation always appears at neutral.
@@ -477,9 +482,27 @@ async function loadAndSendWallet(id, p, players) {
     // Broadcast the current hull (restored damage or fresh) so the player's HUD and everyone's listing match.
     const stateMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(stateMsg);
+    broadcastCrew(id, p, players);   // everyone renders this ship's sailor count; the owner's HUD shows N/max
   } catch (err) {
     console.warn('[WS] loadAndSendWallet failed:', err.message);
   }
+}
+
+/** Crew resource (C1): the JSON every client needs to render N-of-max sailors on this ship + (for the owner)
+ *  drive sail/turn/reload scaling. Broadcast to ALL on change (like combat_state) — crew changes are rare. */
+function crewStateMsg(pid, p) {
+  return JSON.stringify({ type: 'crew_state', playerId: pid, crew: p.crew | 0, maxCrew: p.maxCrew | 0 });
+}
+/** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew, 1.0 fully manned). Mirrors the client's formula;
+ *  scales mast-repair speed here (and sail/turn/reload client-side). NPCs (no maxCrew) → 1 (unaffected). */
+function crewFactor(p) {
+  const max = p && p.maxCrew | 0;
+  if (!max || max <= 0) return 1;
+  return 0.5 + 0.5 * Math.max(0, Math.min(1, (p.crew | 0) / max));
+}
+function broadcastCrew(pid, p, players) {
+  const m = crewStateMsg(pid, p);
+  for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
 }
 
 /** Send the player their authoritative purse + hold + current cargo capacity (from their vessel). */
@@ -602,7 +625,7 @@ function attachMultiplayer(server) {
     // mast-raise visual, and (for the owner) the sailing penalty.
     const nowMast = Date.now();
     for (const [id, p] of players) {
-      const r = combat.tickMastRepair(p.combat, nowMast);
+      const r = combat.tickMastRepair(p.combat, nowMast, crewFactor(p));
       if (r === 'repaired') {
         const m = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
         for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
@@ -664,6 +687,21 @@ function attachMultiplayer(server) {
     if (!victim || !victim.combat) return;
     if (victim.godmode) return;   // /godmode: invulnerable admin — the ball passes harmlessly, no damage or cosmetics
     if (squadron.sameSquadron(shooter, victim)) return;   // Squadrons (B2): mates' shots pass harmlessly through each other
+
+    // ── Grapeshot (C3): anti-crew, NO hull/mast damage. Each pellet that connects attrites the victim's crew
+    // (players only — NPCs carry none). Still aggros an NPC you fire grape at. Cosmetic combat_hit (grape flag)
+    // shows the pellet strike; NO combat_state since the hull is untouched.
+    if (shot.shotType === 'grape') {
+      if (victim.isNpc && shooter && !shooter.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
+      const killed = combat.applyGrapeCrew(victim);
+      if (killed > 0) broadcastCrew(hit.victimId, victim, players);
+      const grapeMsg = JSON.stringify({
+        type: 'combat_hit', shooterId: shot.shooterId, victimId: hit.victimId, seq: shot.seq,
+        zone: hit.zone, hx: hit.hx, hy: hit.hy, hz: hit.hz, side: hit.side, tof: hit.tof, grape: true,
+      });
+      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(grapeMsg);
+      return;
+    }
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
@@ -750,6 +788,7 @@ function attachMultiplayer(server) {
       factionRep: factions.defaultRep(),                                      // Factions reputation — overwritten by the DB load below
       ship: 'pinnace',                                                        // Ships-as-economy: owned hull — overwritten by the DB load below
       squadron: null, pendingInvite: null,                                    // Squadrons (Phase B): session-only, never persisted
+      crew: 0, maxCrew: 0, crewWound: 0,                                      // Crew resource — set from the DB + vessel def in loadAndSendWallet
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
@@ -765,6 +804,10 @@ function attachMultiplayer(server) {
     }
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
+    }
+    // Crew counts for everyone already aboard, so the joiner renders the right sailor count on each remote ship.
+    for (const [pid, p] of players) {
+      if (pid !== id && !p.isNpc && p.state && typeof p.crew === 'number') ws.send(crewStateMsg(pid, p));
     }
     // Existing floating salvage crates, so a joiner sees ones dropped before they connected.
     const crates = salvage.list().map((c) => ({ id: c.id, x: c.x, z: c.z }));
@@ -982,11 +1025,11 @@ function attachMultiplayer(server) {
           vx: +msg.vx || 0, vy: +msg.vy || 0, vz: +msg.vz || 0,
         };
         const seq = +msg.seq || 0;
-        const shotType = msg.shotType === 'bar' ? 'bar' : 'round';   // ammo type (default round)
+        const shotType = (msg.shotType === 'bar' || msg.shotType === 'grape') ? msg.shotType : 'round';   // ammo type (default round)
         const now = Date.now();
 
         // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
-        if (!combat.validateShot(shotData, me?.state, shotType) || !combat.allowShot(me?.combat, now)) {
+        if (!combat.validateShot(shotData, me?.state, shotType) || !combat.allowShot(me?.combat, now, shotType)) {
           return;
         }
 
@@ -1036,15 +1079,46 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat && me.combat.sunk) {
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          // Crew carries over a respawn too (no free refill — recruit at a tavern to replace losses). Hull is
+          // restored, but lost hands stay lost.
+          me.maxCrew = crewFor(me.state?.vesselSlug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
           saveCombatState(me);  // persist the fresh hull (respawn = full repair)
           me.authPose = null;   // trust the next update — the respawn teleport
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
           });
           for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+          broadcastCrew(id, me, players);
           const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
           for (const [pid, p] of players) {
             if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
+        }
+
+      } else if (msg.type === 'recruit_crew') {
+        // Tavern (Crew C4): hire ONE sailor. Must be docked. Charges RECRUIT_COST; if you can't afford it you
+        // can still take on hands free "on commission" up to ceil(60% of complement) — so a broke captain can
+        // always limp back to a fighting crew, but filling the top ~40% costs gold (keeps it a real sink).
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, reason, charged = 0) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({
+              type: 'recruit_result', ok, reason: reason || null, charged,
+              crew: me.crew | 0, maxCrew: me.maxCrew | 0, gold: me.gold | 0,
+            }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, 'not_docked'); }
+          else if ((me.crew | 0) >= (me.maxCrew | 0)) { reply(false, 'full'); }
+          else {
+            const cost = economy.RECRUIT_COST;
+            const freeFloor = Math.ceil(0.6 * (me.maxCrew | 0));   // ≥60% complement is hireable free when broke
+            let charged = 0;
+            if ((me.gold | 0) >= cost) { me.gold -= cost; charged = cost; }
+            else if ((me.crew | 0) < freeFloor) { charged = 0; }   // free commission hire
+            else { reply(false, 'no_gold'); return; }
+            me.crew = Math.min(me.maxCrew | 0, (me.crew | 0) + 1);
+            saveCombatState(me);   // persist the new crew count
+            saveEconomyState(me).then(() => { sendWallet(me); broadcastCrew(id, me, players); reply(true, charged === 0 ? 'free' : null, charged); });
           }
         }
 
@@ -1100,9 +1174,13 @@ function attachMultiplayer(server) {
               if (me.state) me.state.vesselSlug = slug;   // the 'update' handler keeps forcing this to me.ship
               // A newly-acquired hull arrives whole AND with the new vessel's zone HP (pinnace ≠ sloop).
               me.combat = combat.newCombatState(slug);
+              // Crew CARRIES OVER to the new hull (clamped to its complement) — buying a bigger ship doesn't
+              // refill the crew; you must recruit at a tavern to man the extra stations.
+              me.maxCrew = crewFor(slug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
               saveCombatState(me);
               const hullMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
               for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hullMsg);
+              broadcastCrew(id, me, players);
               saveEconomyState(me).then(() => {
                 sendWallet(me);   // authoritative new gold + ship + capacity
                 if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_bought', slug, cost }));

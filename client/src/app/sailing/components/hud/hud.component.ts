@@ -144,6 +144,16 @@ export class HudComponent implements OnInit, OnDestroy {
     return '🌙';
   });
 
+  /** Crew readout colour: green when well-crewed, amber/red as casualties mount. */
+  crewColor = computed(() => {
+    const max = this.combatService.maxCrew();
+    if (max <= 0) return 'text-white';
+    const f = this.combatService.crew() / max;
+    if (f > 0.66) return 'text-green-400';
+    if (f > 0.33) return 'text-yellow-400';
+    return 'text-red-400';
+  });
+
   grounded  = this.vesselService.grounded;
   anchored  = this.vesselService.anchored;
   exitGame  = output<void>();

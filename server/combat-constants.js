@@ -98,11 +98,21 @@ const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
 // computeDamage (`hull` covers bow/stern/port/starboard; `masts` is the rigging column).
 //   round = solid shot: full range, full hull damage, but poor against rigging (×0.33 mast).
 //   bar   = bar/dismantling shot: ~45% range (37/55)², 1.6× mast damage, 0.6× hull damage.
+//   grape = grapeshot/canister: SHORTEST range ((26/55)²≈22%), does NO hull/mast damage — it's anti-crew. A
+//           gun throws a fanned SPREAD of pellets; each pellet that connects attrites `crew` sailors (a small
+//           fraction, so it takes several broadsides to clear a full crew). `crew` is the per-pellet attrition.
 const SHOT_TYPES = {
   round: { v: 55, vMin: VALID_V_MIN, vMax: VALID_V_MAX, dmg: { masts: 0.33, hull: 1.0 } },
   bar:   { v: 37, vMin: 30,          vMax: 45,          dmg: { masts: 1.6,  hull: 0.6 } },
+  grape: { v: 26, vMin: 20,          vMax: 32,          dmg: { masts: 0,    hull: 0   }, crew: 0.15 },
 };
 function shotDef(type) { return SHOT_TYPES[type] || SHOT_TYPES.round; }
+
+// Grapeshot fires many pellets per broadside, so the standard fire-rate cap (RATE_MAX_SHOTS) would reject the
+// burst. Grape gets its own generous per-window budget (a sloop broadside ≈ 15 pellets; this allows ~4-5
+// broadsides per window) and no min-gap, since the pellets leave together. Harmless if abused — grape can't
+// sink a ship, only thin its crew (which is capped at the crew count).
+const GRAPE_RATE_MAX = 72;
 
 module.exports = {
   G, TRAVEL_SCALE,
@@ -114,5 +124,5 @@ module.exports = {
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,
-  SHOT_TYPES, shotDef,
+  SHOT_TYPES, shotDef, GRAPE_RATE_MAX,
 };

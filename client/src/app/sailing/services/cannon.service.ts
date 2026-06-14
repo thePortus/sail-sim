@@ -23,6 +23,12 @@ const BALL_POOL  = 24;           // max simultaneous cannonballs (broadsides = 3
 const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
 const MUZZLE_V_ROUND = 55;               // solid round shot muzzle velocity (m/s)
 const MUZZLE_V_BAR   = 37;               // bar shot: ~45% range (range ∝ v²) — must match server SHOT_TYPES.bar.v
+const MUZZLE_V_GRAPE = 26;               // grapeshot: ~22% range (shortest) — must match server SHOT_TYPES.grape.v
+// Grapeshot fans a SPREAD of pellets out of each gun (a true canister burst). Each pellet is its own
+// server-adjudicated shot; the server attrites crew per pellet that connects.
+const GRAPE_PELLETS    = 5;               // pellets thrown per gun
+const GRAPE_SPREAD_RAD = 7 * Math.PI / 180;   // azimuth cone half-angle (fan width)
+const GRAPE_ELEV_RAD   = 4 * Math.PI / 180;   // elevation jitter half-angle (vertical scatter)
 // Gap between the 3 cannons of a broadside — randomized per shot so the volley reads
 // as a human gun crew firing in sequence, not a single mechanical burst.
 const STAGGER_MIN = 0.18;
@@ -60,10 +66,13 @@ const DEFAULT_MUZZLES: Record<'port' | 'stbd', Muz[]> = {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/** Ammunition / projectile kind. round = solid shot, bar = dismantling bar, grape = anti-crew canister. */
+type ShotKind = 'round' | 'bar' | 'grape';
+
 interface Ball {
-  mesh:    Mesh;                            // round-shot sphere (the parent; drives position for both)
+  mesh:    Mesh;                            // round/grape sphere (the parent; drives position for both)
   barMesh: Mesh;                            // bar-shot assembly (two halves + iron bar), child of mesh
-  bar:     boolean;                         // this flight is bar shot → show barMesh + tumble fast
+  kind:    ShotKind;                        // this flight's ammo → drives visual (dumbbell / small pellet) + spin
   ox:    number; oy: number; oz: number;  // world-space origin
   vx:    number; vy: number; vz: number;  // world-space velocity (m/s)
   t:     number;                           // elapsed seconds since launch
@@ -130,14 +139,21 @@ export class CannonService {
 
   // ── Ammunition ──────────────────────────────────────────────────────────────
   // 'round' = solid shot (full range, anti-hull). 'bar' = bar shot (~45% range, anti-mast / anti-rigging).
-  // The velocity carries the shorter range, and the type rides the cannon_shot message for server damage.
-  readonly shotType = signal<'round' | 'bar'>('round');
-  /** Current muzzle velocity for the selected ammo (lower for bar shot → shorter range). */
-  private muzzleV(): number { return this.shotType() === 'bar' ? MUZZLE_V_BAR : MUZZLE_V_ROUND; }
+  // 'grape' = canister (~22% range, anti-CREW — a fanned pellet spread, no hull damage).
+  // The velocity carries the (shorter) range, and the type rides the cannon_shot message for server damage.
+  readonly shotType = signal<ShotKind>('round');
+  /** Current muzzle velocity for the selected ammo (lower = shorter range). */
+  private muzzleV(): number {
+    const t = this.shotType();
+    return t === 'bar' ? MUZZLE_V_BAR : t === 'grape' ? MUZZLE_V_GRAPE : MUZZLE_V_ROUND;
+  }
   /** Set the ammo type (HUD buttons). */
-  setShotType(t: 'round' | 'bar'): void { this.zone.run(() => this.shotType.set(t)); }
-  /** Toggle round ↔ bar (G key). */
-  toggleShotType(): void { this.setShotType(this.shotType() === 'round' ? 'bar' : 'round'); }
+  setShotType(t: ShotKind): void { this.zone.run(() => this.shotType.set(t)); }
+  /** Cycle round → bar → grape → round (G key). */
+  toggleShotType(): void {
+    const next: ShotKind = this.shotType() === 'round' ? 'bar' : this.shotType() === 'bar' ? 'grape' : 'round';
+    this.setShotType(next);
+  }
 
   // Continuous elevation: hold Shift to raise / Control to lower; tick() swings the angle smoothly at
   // ELEV_RATE_DPS (so the granularity is sub-degree, not whole-degree key-repeat steps).
@@ -298,8 +314,8 @@ export class CannonService {
     this.setupInput();
 
     // Wire remote-shot + combat callbacks (avoids circular injection with MultiplayerService)
-    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq, bar) => {
-      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq, bar);
+    this.multiplayerService.onRemoteShot = (ox, oy, oz, vx, vy, vz, shooterId, seq, kind) => {
+      this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq, kind);
       this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
       this.birds.startleAt(ox, oz);   // a remote ship's broadside startles gulls near its muzzle too
       this.dolphins.scatterFrom(ox, oz);   // …and scatters any nearby dolphins
@@ -408,7 +424,7 @@ export class CannonService {
       this.sceneService.shadowGenerator?.addShadowCaster(bm);
       this.oceanService.addToRenderList(bm);
 
-      this.balls.push({ mesh: m, barMesh: bm, bar: false, ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
+      this.balls.push({ mesh: m, barMesh: bm, kind: 'round', ox:0, oy:0, oz:0, vx:0, vy:0, vz:0, t:0, alive: false, key: '' });
     }
   }
 
@@ -986,9 +1002,10 @@ export class CannonService {
       const bz = ball.oz + ball.vz * ball.t;
       ball.mesh.position.set(bx, by, bz);
       // Round shot rolls lazily; bar shot whirls end-over-end (the bar lies along X → fast Z spin
-      // throws the two heads around, plus a little Y wobble for a chaotic tumble).
-      if (ball.bar) { ball.mesh.rotation.z += dt * 26; ball.mesh.rotation.y += dt * 6; }
-      else          { ball.mesh.rotation.z += dt * 5; }
+      // throws the two heads around, plus a little Y wobble for a chaotic tumble); grape pellets buzz briskly.
+      if      (ball.kind === 'bar')   { ball.mesh.rotation.z += dt * 26; ball.mesh.rotation.y += dt * 6; }
+      else if (ball.kind === 'grape') { ball.mesh.rotation.z += dt * 14; }
+      else                            { ball.mesh.rotation.z += dt * 5; }
 
       // Ship hits are adjudicated by the SERVER (combat_hit). We defer the cosmetic until
       // THIS ball has flown the server's time-of-flight, so the impact lands in sync with
@@ -1104,10 +1121,6 @@ export class CannonService {
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
     const mv   = this.muzzleV();
-    const vh   = mv * Math.cos(elevRad);
-    const vy   = mv * Math.sin(elevRad);
-    const bvx  = dirX * vh;
-    const bvz  = dirZ * vh;
 
     // Muzzle world position from this cannon's local offset, rotated by heading.
     const muz = this.muzzles[side][idx] ?? this.muzzles[side][0];
@@ -1115,10 +1128,27 @@ export class CannonService {
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;
 
-    const seq = ++this.shotSeq;
-    const myId = this.multiplayerService.getMyId() ?? 'local';
-    this.launchBall(mwx, mwy, mwz, bvx, vy, bvz, myId, seq, this.shotType() === 'bar');
-    this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vy, bvz, seq, this.shotType());
+    const kind  = this.shotType();
+    const myId  = this.multiplayerService.getMyId() ?? 'local';
+    // Round/bar = one shot out the beam. Grape = a fan of GRAPE_PELLETS, each its own server-adjudicated shot
+    // with scattered azimuth + elevation (a true canister spread). Magnitude stays `mv`, so each pellet sits in
+    // the server's grape speed band.
+    const pellets = kind === 'grape' ? GRAPE_PELLETS : 1;
+    for (let k = 0; k < pellets; k++) {
+      let ddx = dirX, ddz = dirZ, el = elevRad;
+      if (kind === 'grape') {
+        const az = (Math.random() * 2 - 1) * GRAPE_SPREAD_RAD;   // rotate the beam in the horizontal plane
+        const ca = Math.cos(az), sa = Math.sin(az);
+        ddx = dirX * ca - dirZ * sa;
+        ddz = dirX * sa + dirZ * ca;
+        el  = elevRad + (Math.random() * 2 - 1) * GRAPE_ELEV_RAD;
+      }
+      const vh = mv * Math.cos(el), vyk = mv * Math.sin(el);
+      const bvx = ddx * vh, bvz = ddz * vh;
+      const seq = ++this.shotSeq;
+      this.launchBall(mwx, mwy, mwz, bvx, vyk, bvz, myId, seq, kind);
+      this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vyk, bvz, seq, kind);
+    }
     this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
     this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting
     this.oceanService.startleFish(mwx, mwz);   // …and scatters the drifting shallow-water fish
@@ -1250,15 +1280,17 @@ export class CannonService {
   launchBall(
     ox: number, oy: number, oz: number,
     vx: number, vy: number, vz: number,
-    shooterId = 'local', seq = 0, bar = false,
+    shooterId = 'local', seq = 0, kind: ShotKind = 'round',
   ): void {
     const ball = this.balls.find(b => !b.alive);
     if (!ball) return;
-    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, bar, key: `${shooterId}:${seq}`, pendingHit: null, hitAt: 0 });
+    Object.assign(ball, { ox, oy, oz, vx, vy, vz, t: 0, alive: true, kind, key: `${shooterId}:${seq}`, pendingHit: null, hitAt: 0 });
     ball.mesh.position.set(ox, oy, oz);
     ball.mesh.rotation.setAll(0);
-    ball.mesh.isVisible    = !bar;    // round shot = the sphere; bar shot = hide it, show the dumbbell
-    ball.barMesh.isVisible = bar;
+    const isBar = kind === 'bar';
+    ball.mesh.isVisible    = !isBar;   // round + grape = the sphere; bar = hide it, show the dumbbell
+    ball.barMesh.isVisible = isBar;
+    ball.mesh.scaling.setAll(kind === 'grape' ? 0.4 : 1);   // grape = a small pellet
     ball.mesh.setEnabled(true);
   }
 

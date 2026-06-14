@@ -43,6 +43,7 @@ import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
 import { TraderMenuComponent }     from './trader-menu.component';
 import { ShipwrightMenuComponent } from './shipwright-menu.component';
+import { TavernMenuComponent } from './tavern-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -52,7 +53,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -132,6 +133,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <div class="dock-desc">{{ town.description }}</div>
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
+              <button class="dock-opt" (click)="onTavern()">Tavern</button>
               <button class="dock-opt" (click)="onRepairVessel()">
                 Repair Vessel ({{ isAdmin || multiplayerService.gold() < repairFee ? 'free' : repairFee + 'g' }})
               </button>
@@ -148,6 +150,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <!-- Shipwright panel (opened from the dock menu's Shipwright button) -->
         @if (shipwrightOpen()) {
           <app-shipwright-menu [admin]="isAdmin" (close)="shipwrightOpen.set(false)" />
+        }
+
+        <!-- Tavern panel (opened from the dock menu's Tavern button) -->
+        @if (tavernOpen()) {
+          <app-tavern-menu (close)="tavernOpen.set(false)" />
         }
 
         <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
@@ -334,6 +341,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
   shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
+  tavernOpen = signal<boolean>(false);     // the tavern panel (opened from the town menu's Tavern button — recruit crew)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
   salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
   private salvageTimer: ReturnType<typeof setTimeout> | null = null;
@@ -479,16 +487,18 @@ export class GameComponent implements AfterViewInit, OnDestroy {
           if (this.dockMenuOpen()) this.dockMenuOpen.set(false);
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
           if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
+          if (this.tavernOpen()) this.tavernOpen.set(false);
         });
       }
     });
 
-    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright panels too — they live "inside" it.
+    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright + tavern panels too — they live "inside" it.
     effect(() => {
       if (!this.dockMenuOpen()) {
         untracked(() => {
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
           if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
+          if (this.tavernOpen()) this.tavernOpen.set(false);
         });
       }
     });
@@ -797,6 +807,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onShipwright(): void {
     this.multiplayerService.shipError.set(null);
     this.shipwrightOpen.set(true);
+  }
+
+  /** Dock action: open the tavern (recruit crew lost to grapeshot). The panel reads the live crew count. */
+  onTavern(): void {
+    this.multiplayerService.recruitError.set(null);
+    this.tavernOpen.set(true);
   }
 
   /** Refit the local vessel into a freshly-bought hull: fetch its full def, then hot-swap in place. */

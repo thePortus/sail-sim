@@ -1,4 +1,4 @@
-import { Injectable, NgZone, inject, signal } from '@angular/core';
+import { Injectable, NgZone, computed, inject, signal } from '@angular/core';
 import { Zone, ZoneState, Severity, severityFor, ZONE_HP } from './combat.constants';
 
 /**
@@ -19,6 +19,22 @@ export class CombatService {
   /** True while the local ship is sunk (shows the sunk overlay until confirmed). */
   readonly sunk   = signal(false);
   readonly sunkBy = signal<string>('');
+
+  // ── Crew resource (C1/C2) — local sailor count + the efficiency factor it drives ───────────────────────
+  /** Remaining sailors aboard / full complement (authoritative, from the server's crew_state). */
+  readonly crew    = signal<number>(0);
+  readonly maxCrew = signal<number>(0);
+  /** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew, 1.0 fully manned). Scales sail speed, turn rate,
+   *  and reload time; the server scales mast-repair duration with the same formula. */
+  readonly crewFactor = computed(() => {
+    const max = this.maxCrew();
+    if (max <= 0) return 1;
+    return 0.5 + 0.5 * Math.max(0, Math.min(1, this.crew() / max));
+  });
+  /** Apply an authoritative crew count from the server. */
+  setCrew(crew: number, maxCrew: number): void {
+    this.zoneNg.run(() => { this.crew.set(Math.max(0, crew)); this.maxCrew.set(Math.max(0, maxCrew)); });
+  }
 
   /** Mast jury-rig progress for the HUD repair bar: null = not repairing, 0..1 = filling. Driven by the
    *  server-supplied duration (mast_repair message) so it stays accurate when crew later makes it variable. */

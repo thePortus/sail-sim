@@ -148,15 +148,37 @@ function validateShot(shot, shooterState, shotType) {
   return dx * dx + dz * dz <= C.VALID_ORIGIN_RADIUS * C.VALID_ORIGIN_RADIUS;
 }
 
-/** Fire-rate gate (sliding window + min spacing). Mutates combat.shotTimes. */
-function allowShot(combat, nowMs) {
+/** Fire-rate gate (sliding window + min spacing). Mutates combat.shotTimes. Grapeshot fires a many-pellet
+ *  burst, so it uses a SEPARATE, generous budget with no min-gap (the pellets leave together) — kept apart
+ *  from the round/bar counter so a grape burst can't lock out solid shot or vice-versa. */
+function allowShot(combat, nowMs, shotType = 'round') {
   if (!combat) return false;
+  if (shotType === 'grape') {
+    const gt = combat.grapeTimes || (combat.grapeTimes = []);
+    while (gt.length && nowMs - gt[0] > C.RATE_WINDOW_MS) gt.shift();
+    if (gt.length >= C.GRAPE_RATE_MAX) return false;
+    gt.push(nowMs);
+    return true;
+  }
   const times = combat.shotTimes;
   while (times.length && nowMs - times[0] > C.RATE_WINDOW_MS) times.shift();
   if (times.length >= C.RATE_MAX_SHOTS) return false;
   if (times.length && nowMs - times[times.length - 1] < C.RATE_MIN_GAP_MS) return false;
   times.push(nowMs);
   return true;
+}
+
+/**
+ * Apply one grapeshot pellet's crew attrition to a victim player entry. Adds the per-pellet `crew` fraction to
+ * a running wound accumulator; each whole point removes one sailor. Returns the number killed by THIS pellet
+ * (0 or 1 — per-pellet damage is < 1). No effect on a crewless entry (NPCs) or an already-empty crew.
+ */
+function applyGrapeCrew(victim) {
+  if (!victim || (victim.maxCrew | 0) <= 0 || (victim.crew | 0) <= 0) return 0;
+  victim.crewWound = (victim.crewWound || 0) + C.shotDef('grape').crew;
+  let killed = 0;
+  while (victim.crewWound >= 1 && victim.crew > 0) { victim.crew -= 1; victim.crewWound -= 1; killed++; }
+  return killed;
 }
 
 /** Apply damage to a zone; returns { sunk } where sunk=true the instant a non-mast zone hits 0. */
@@ -177,7 +199,7 @@ function applyDamage(combat, zone, dmg) {
  * caller broadcasts the new combat_state. The timer rides on `combat.mastRepairUntil`, so it clears
  * itself on any newCombatState (respawn / port repair / vessel change) and is never persisted.
  */
-function tickMastRepair(combat, nowMs) {
+function tickMastRepair(combat, nowMs, crewFactor = 1) {
   if (!combat || combat.sunk) return null;    // sinking ships respawn (which resets the mast) — don't repair
   if (combat.mastRepairUntil) {
     if (nowMs >= combat.mastRepairUntil) {
@@ -186,9 +208,10 @@ function tickMastRepair(combat, nowMs) {
       return 'repaired';
     }
   } else if (combat.zones.masts <= 0) {
-    // Arm the jury-rig. Flat MAST_REPAIR_MS for now; crew/morale will scale this later — keep that decision
-    // HERE (the single source of truth), since the client is TOLD the duration and just follows it.
-    combat.mastRepairUntil = nowMs + C.MAST_REPAIR_MS;
+    // Arm the jury-rig. Fewer hands → slower work: the base MAST_REPAIR_MS is divided by the crew-efficiency
+    // factor (0.5..1), so a skeleton crew takes up to ~2× as long. The client is TOLD this duration and just
+    // follows it, so the HUD bar stays accurate — this is the single source of truth for the timing.
+    combat.mastRepairUntil = nowMs + Math.round(C.MAST_REPAIR_MS / Math.max(0.1, crewFactor));
     return 'armed';
   }
   return null;
@@ -215,5 +238,5 @@ function restoreCombatState(slug, savedZones) {
 
 module.exports = {
   newCombatState, restoreCombatState, zoneAtLocal, deadReckon, computeDamage,
-  stepShot, validateShot, allowShot, applyDamage, tickMastRepair,
+  stepShot, validateShot, allowShot, applyDamage, applyGrapeCrew, tickMastRepair,
 };

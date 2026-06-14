@@ -60,6 +60,7 @@ const VESSELS = [
       stbd: [{ x:  0.95, y: 0.85, z: -0.15 }],
     },
     zoneHp: { bow: 55, stern: 55, port: 80, starboard: 80, masts: 60 },
+    crew: 4,                      // Crew resource: full complement (grapeshot attrites it; tavern re-hires)
     cargo: 20,                    // hold capacity in cargo slots (Town Economy) — small, nimble
     price: 0,                     // Ships-as-economy: the free starter hull
     parts: [],
@@ -83,6 +84,7 @@ const VESSELS = [
     // Helm — just aft of the wheel, on the centreline, standing eye height, looking forward.
     firstPersonCam: { x: 0.6, y: 2.6, z: -2.8 },
     zoneHp: { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
+    crew: 7,                      // Crew resource: full complement (grapeshot attrites it; tavern re-hires)
     cargo: 40,                    // hold capacity in cargo slots (Town Economy) — stout merchantman
     price: 60000,                 // Ships-as-economy: bought at a port shipwright
     parts: [],
@@ -92,6 +94,9 @@ const VESSELS = [
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
  *  read per-vessel physics (maxSpeed, etc.) when checking the plausibility of a position update. */
 exports.getVesselDef = (slug) => VESSELS.find(v => v.slug === slug) || VESSELS.find(v => v.slug === 'sloop') || VESSELS[0];
+
+/** Full crew complement for a vessel (the Crew resource's max). Defaults to the sloop's if unknown. */
+exports.crewFor = (slug) => (exports.getVesselDef(slug)?.crew | 0) || 4;
 
 exports.getVessels = (req, res) => {
   // Summary feeds the shipwright menu: name + description + the economic/handling stats a buyer compares.

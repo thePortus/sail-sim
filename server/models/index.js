@@ -39,6 +39,9 @@ db.ensureColumns = async () => {
     // world's — unlike lastVesselSlug which rides the map-gated position save). Everyone (incl. existing
     // players, via the backfill) starts in the 'pinnace' — ships are now bought at a shipwright for gold.
     ['ship',         { type: Sequelize.DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' }],
+    // Crew resource: remaining sailors (NULL backfills as "full complement" on next load). Persists across
+    // maps (the player's, not the world's). Grapeshot lowers it; a port tavern raises it back.
+    ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {

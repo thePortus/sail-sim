@@ -46,6 +46,7 @@ const SPECIALTIES = {
 const SPREAD_BY_TIER = { capital: 0.15, medium: 0.22, small: 0.30 };
 
 const REPAIR_FEE = 40;          // gold per dock repair (the first gold sink)
+const RECRUIT_COST = 50;        // gold to hire one sailor at a port tavern (Crew resource)
 const STARTING_GOLD = 500;
 
 // ── Phase 2: dynamic economy config (all tunable) ────────────────────────────
@@ -108,7 +109,7 @@ function quote(base, priceRef, stock, tier) {
 }
 
 module.exports = {
-  GOODS, SPECIALTIES, SPREAD_BY_TIER, REPAIR_FEE, STARTING_GOLD,
+  GOODS, SPECIALTIES, SPREAD_BY_TIER, REPAIR_FEE, RECRUIT_COST, STARTING_GOLD,
   ELASTICITY, STOCK_CLAMP, SEED_RATIO, TIER_SCALE, ROLE_RATE, REF_DAYS,
   NEUTRAL_REF, STOCK_CAP_MULT, TREASURY0, TREASURY_REGEN,
   specialtyKeys, goodVolume, isGood, basePrice, townGoodProfile, quote,

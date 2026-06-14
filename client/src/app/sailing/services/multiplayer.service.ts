@@ -107,6 +107,10 @@ export class MultiplayerService {
   // watches this to force a fresh login — the session token can no longer be trusted.
   authFailed    = signal<boolean>(false);
 
+  // Crew resource (C1/C2): the LOCAL player's crew lives on CombatService (it drives the crewFactor used by
+  // vessel + cannon). Here we only keep REMOTE ships' crew counts for rendering their on-deck sailor count.
+  readonly remoteCrew = new Map<string, { crew: number; maxCrew: number }>();
+
   // ── Town Economy ────────────────────────────────────────────────────────────
   // Authoritative purse + hold (server-pushed via 'wallet'/'market_state'), and the currently open town's
   // market quote (null when the trader panel is closed / no market loaded). The trader UI reads these signals.
@@ -123,6 +127,8 @@ export class MultiplayerService {
   purchasedShip = signal<string | null>(null);
   // Last shipwright rejection reason (transient; the shipwright panel surfaces it).
   shipError    = signal<string | null>(null);
+  /** Last tavern-recruit rejection reason (transient; the tavern panel surfaces it). null = ok/cleared. */
+  recruitError = signal<string | null>(null);
   // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
   ledger       = signal<Record<string, LedgerEntry>>({});
   hint         = signal<MarketHint | null>(null);
@@ -212,7 +218,7 @@ export class MultiplayerService {
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
                   vx: number, vy: number, vz: number,
-                  shooterId: string, seq: number, bar: boolean) => void) | null = null;
+                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape') => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
   /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
@@ -220,7 +226,7 @@ export class MultiplayerService {
 
   broadcastShot(ox: number, oy: number, oz: number,
                 vx: number, vy: number, vz: number, seq: number,
-                shotType: 'round' | 'bar' = 'round'): void {
+                shotType: 'round' | 'bar' | 'grape' = 'round'): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType }));
   }
@@ -254,6 +260,13 @@ export class MultiplayerService {
   buyShip(slug: string): void {
     this.shipError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ship_buy', slug }));
+  }
+
+  /** Tavern (Crew C4): hire one sailor at the docked port. Server-authoritative (docked + gold/free-floor);
+   *  the new count arrives via crew_state and the purse via wallet. recruit_result carries any rejection. */
+  recruitCrew(): void {
+    this.recruitError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'recruit_crew' }));
   }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
@@ -481,7 +494,8 @@ export class MultiplayerService {
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
-                          String(msg.id), +msg.seq || 0, msg.shotType === 'bar');
+                          String(msg.id), +msg.seq || 0,
+                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
 
     } else if (msg.type === 'combat_hit') {
       // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)
@@ -585,6 +599,18 @@ export class MultiplayerService {
         });
       }
       this.squadronService.clearInvite();   // any pending invite is now resolved
+
+    } else if (msg.type === 'crew_state') {
+      // Crew resource (C1): authoritative sailor count for a ship. Self → HUD signals; remotes → stored for
+      // rendering their visible crew (C5 wires the on-deck casualties).
+      const pid = String(msg.playerId ?? '');
+      const crew = Math.max(0, +msg.crew || 0), maxCrew = Math.max(0, +msg.maxCrew || 0);
+      if (pid === this.myId) { this.combatService.setCrew(crew, maxCrew); }
+      else                   { this.remoteCrew.set(pid, { crew, maxCrew }); }
+
+    } else if (msg.type === 'recruit_result') {
+      // Tavern hire outcome — crew/gold already arrived via crew_state/wallet; here we just surface rejections.
+      this.recruitError.set(msg.ok ? null : String(msg.reason ?? 'recruit failed'));
 
     } else if (msg.type === 'wallet') {
       // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).

@@ -621,7 +621,7 @@ function attachMultiplayer(server) {
   const NPC_DT = 0.2;
   setInterval(() => {
     const now = Date.now();
-    npc.tickNpcs(players, NPC_DT, broadcastLeave, now);   // integrate + despawn sunk
+    npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot);   // integrate, despawn sunk, return fire
     npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
   }, NPC_DT * 1000);
 
@@ -644,6 +644,17 @@ function attachMultiplayer(server) {
   // the ball's multi-second flight actually dodges it (unlike fire-time prediction).
   const activeShots = [];   // { shooterId, seq, ox,oy,oz, vx,vy,vz, fireTime, lastT }
 
+  /** An NPC merchant fires (A3): relay the flight visual to every client and register the shot for the SAME
+   *  wait-and-see adjudication a player's shot gets — so the merchant's ball is dodgeable exactly like a
+   *  player's, and can damage/sink whatever its leading solution actually hits. */
+  const fireNpcShot = (npcShip, shotData, shotType) => {
+    const now = Date.now();
+    const seq = (npcShip.shotSeq = (npcShip.shotSeq || 0) + 1);
+    const msg = JSON.stringify({ type: 'cannon_shot', id: npcShip.id, seq, ...shotData, shotType });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);   // NPCs don't receive
+    activeShots.push({ shooterId: npcShip.id, seq, ...shotData, shotType, fireTime: now, lastT: 0 });
+  };
+
   /** Apply a resolved hit: damage the victim and broadcast the cosmetics / hull state. */
   const resolveHit = (shot, hit) => {
     const shooter = players.get(shot.shooterId);
@@ -653,9 +664,10 @@ function attachMultiplayer(server) {
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
-    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). The tactical helm +
-    // return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
-    if (victim.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
+    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). Only a PLAYER
+    // hit provokes it — collateral from another NPC's shot doesn't spark merchant-vs-merchant brawls. The
+    // tactical helm + return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
+    if (victim.isNpc && shooter && !shooter.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
     const hitMsg = JSON.stringify({
@@ -672,7 +684,7 @@ function attachMultiplayer(server) {
     for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
     if (justSunk) {
-      const sinker = shooter?.state?.callsign || 'an unknown ship';
+      const sinker = shooter?.state?.callsign || shooter?.state?.vesselName || 'an unknown ship';
       const sunkMsg = JSON.stringify({
         type: 'combat_sunk', victimId: hit.victimId, shooterId: shot.shooterId, shooterName: sinker,
       });

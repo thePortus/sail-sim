@@ -2,9 +2,7 @@
 
 # General or Current TODO Items
 
-* Okay, I want to now make some landscape improvements... starting with restoring the green color to the forest biome, which only renders black... and by trying to smooth out the landscape, which looks visibly polygonal.... can you analyze the problem and come up with a plan to restore both?
-* Squadrons and squadron faction effects, NPC Ship combat...
-* Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
+* LOD tree imposters not affected by fog, too vivid
 * Chain and grape shot, Crew, number, recruiting, paying
 * Paying for powder and shot
 * add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping
@@ -53,4 +51,3 @@
 * Security pass
 
 # TODO Items by Module
-

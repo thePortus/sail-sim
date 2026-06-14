@@ -15,6 +15,7 @@
 const nav = require('./nav');
 const economy = require('./economy');
 const combat = require('./combat');
+const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
 const moveConst = require('./movement-constants');
 const { getVesselDef } = require('./controllers/vessels.controller');
@@ -125,6 +126,108 @@ function markHostile(npc, shooterId, nowMs) {
 /** True while the merchant is actively hostile (has a target and the aggro timer hasn't lapsed). */
 function isHostile(npc, nowMs) {
   return !!(npc.hostileToward && npc.aggroUntil > nowMs);
+}
+
+// ── Tactical helm (A2) ────────────────────────────────────────────────────────────────────────────────────
+// A hostile merchant abandons its trade route and jockeys to lay a broadside on its attacker. It steers for a
+// heading perpendicular to the bearing-to-target (a clean side-on shot), closing when out of range and opening
+// when too near so it never bow-rushes. Crucially it's still bound by the wind: of the two broadside options
+// (target ±90°) it commits to whichever sails better in the current wind, so a merchant pinned on a bad point
+// of sail manoeuvres realistically rather than magically holding the slot.
+const FIRE_RANGE = 150;       // world units: ideal broadside standoff (well within round-shot reach) — tunable
+const BROADSIDE_HYST = 0.12;  // point-of-sail-efficiency margin the other tack must beat to flip the broadside side
+
+/** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished or sunk. */
+function engageTarget(npc, players, nowMs) {
+  if (!isHostile(npc, nowMs)) return null;
+  const foe = players.get(npc.hostileToward);
+  if (!foe || !foe.state || (foe.combat && foe.combat.sunk)) {   // disconnected / sunk → stand down
+    npc.hostileToward = null; npc.aggroUntil = 0; return null;
+  }
+  return foe;
+}
+
+/** Desired heading to present a broadside to `foeState`, biased to close/open toward FIRE_RANGE and to take the
+ *  more sailable of the two beam options in the current wind (with hysteresis so it doesn't chatter tacks). */
+function engageHeading(npc, foeState, wind, ph) {
+  const B = headingTo(npc.state.x, npc.state.z, foeState.x, foeState.z);
+  const dist = Math.hypot(foeState.x - npc.state.x, foeState.z - npc.state.z);
+  let offset;
+  if (dist > FIRE_RANGE * 1.3)      offset = 55;    // well out → angle in to close (not a bow-on charge)
+  else if (dist < FIRE_RANGE * 0.7) offset = 120;   // too near → open out, avoid fouling / ramming
+  else                              offset = 90;     // in the slot → hold a clean broadside (orbits at range)
+  const hPlus  = (B + offset + 360) % 360;
+  const hMinus = (B - offset + 360) % 360;
+  const effPlus  = sailEff(angleFromWind(hPlus,  wind.windBearing), ph.minTackAngle);
+  const effMinus = sailEff(angleFromWind(hMinus, wind.windBearing), ph.minTackAngle);
+  let side = (npc.broadsideSide === 1 || npc.broadsideSide === -1) ? npc.broadsideSide
+           : (effPlus >= effMinus ? 1 : -1);
+  if      (side === 1  && effMinus > effPlus  + BROADSIDE_HYST) side = -1;
+  else if (side === -1 && effPlus  > effMinus + BROADSIDE_HYST) side = 1;
+  npc.broadsideSide = side;
+  return side === 1 ? hPlus : hMinus;
+}
+
+// ── Gunnery (A3) — the merchant returns fire ────────────────────────────────────────────────────────────────
+// When a gun bears (target roughly abeam) and within range, the NPC computes a leading ballistic solution at
+// fixed muzzle speed, scatters it for moderate accuracy, and hands the shot to the server's shared adjudicator
+// (same activeShots the player feeds — so the merchant's ball can be dodged exactly like a player's). Everything
+// is in COMBAT world units (HALF_BEAM/G/TRAVEL_SCALE), NOT the GLB-scale cannon offsets in the vessel def.
+const NPC_MUZZLE_V    = Cc.SHOT_TYPES.round.v;  // 55 u/s — NPCs fire solid round shot (anti-hull)
+const FIRE_ARC        = 50;        // deg off pure-beam the target may be for a gun to bear
+const MAX_FIRE_RANGE  = 260;       // world units: don't open fire beyond this (well inside round-shot max reach)
+const NPC_RELOAD_MS   = 4200;      // min ms between a merchant's shots (one aimed ball per reload — deliberately unhurried)
+const NPC_AZ_SPREAD   = 4.5;       // deg: half-width of random bearing scatter (moderate accuracy → dodgeable)
+const NPC_EL_SPREAD   = 2.0;       // deg: half-width of random elevation scatter
+const MUZZLE_Y        = 2.6;       // gun height above the waterline (world units, ~deck)
+const AIM_Y           = 1.4;       // aim point on the target hull (mid-freeboard)
+
+/** Uniform scatter in [-half, half] degrees, returned in radians. */
+function spreadRad(halfDeg) { return (Math.random() * 2 - 1) * halfDeg * DEG; }
+
+/**
+ * Leading ballistic firing solution against a moving target, or null if no gun bears / target is out of range /
+ * the range is unreachable at muzzle speed. Iterates the lead (aim where the target WILL be after the ball's
+ * flight), solves the low-arc launch elevation for that range + height drop, then adds azimuth/elevation
+ * scatter. Speed of the returned velocity stays exactly NPC_MUZZLE_V, so it sits in the round-shot band.
+ * Returns world-space { ox, oy, oz, vx, vy, vz }.
+ */
+function firingSolution(npc, foeState) {
+  const hr = npc.state.heading * DEG;
+  const sx = Math.cos(hr), sz = -Math.sin(hr);   // starboard (right) unit vector in world XZ
+  const dx = foeState.x - npc.state.x, dz = foeState.z - npc.state.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist < 1e-3 || dist > MAX_FIRE_RANGE) return null;
+  // Which beam faces the target (lat>0 = starboard), and does a gun on that side actually bear?
+  const lat = dx * Math.cos(hr) - dz * Math.sin(hr);
+  const sgn = lat >= 0 ? 1 : -1;
+  const beamX = sgn * sx, beamZ = sgn * sz;            // unit vector out the firing rail
+  const cosOff = (dx * beamX + dz * beamZ) / dist;     // alignment of target with the beam
+  if (cosOff < Math.cos(FIRE_ARC * DEG)) return null;  // target not abeam yet → hold fire (helm still turning)
+
+  // Muzzle: ship centre pushed out to the firing rail at gun height.
+  const ox = npc.state.x + beamX * Cc.HALF_BEAM, oz = npc.state.z + beamZ * Cc.HALF_BEAM;
+  // Target world velocity (same dead-reckoning the adjudicator uses).
+  const vW = (foeState.speed || 0) * Cc.TRAVEL_SCALE;
+  const tvx = Math.sin(foeState.heading * DEG) * vW, tvz = Math.cos(foeState.heading * DEG) * vW;
+  const v = NPC_MUZZLE_V, v2 = v * v, dY = AIM_Y - MUZZLE_Y;
+
+  // Iterate: lead → range → flight-time → re-lead.
+  let tof = dist / (v * 0.97), vh = v, theta = 0, px = foeState.x, pz = foeState.z, R = dist;
+  for (let k = 0; k < 3; k++) {
+    px = foeState.x + tvx * tof; pz = foeState.z + tvz * tof;   // where the target will be
+    R = Math.hypot(px - ox, pz - oz);
+    const disc = v2 * v2 - Cc.G * (Cc.G * R * R + 2 * dY * v2);
+    if (disc < 0) return null;                                  // out of ballistic reach
+    theta = Math.atan2(v2 - Math.sqrt(disc), Cc.G * R);         // low (direct-fire) arc
+    vh = v * Math.cos(theta);
+    tof = R / vh;
+  }
+  // Aim azimuth at the lead point, then scatter both axes (speed magnitude preserved → stays in band).
+  const az = Math.atan2(px - ox, pz - oz) + spreadRad(NPC_AZ_SPREAD);
+  const el = theta + spreadRad(NPC_EL_SPREAD);
+  const vhs = v * Math.cos(el);
+  return { ox, oy: MUZZLE_Y, oz, vx: vhs * Math.sin(az), vy: v * Math.sin(el), vz: vhs * Math.cos(az) };
 }
 
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
@@ -279,7 +382,7 @@ function onArrive(npc, towns) {
 
 /** Advance every NPC one step (dtSec), steering toward its route + away from other merchants. Pose is sent
  *  separately by broadcastInterest (interest-managed), NOT here. */
-function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
+function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
   const towns = economy.townList();
   if (towns.length < 2) return;
   const fleet = [];
@@ -294,16 +397,26 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
       continue;
     }
 
-    if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
-    const wp = npc.route[npc.routeIdx];
-    const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
-    if (dist < ARRIVE_M) {
-      if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
-      continue;
-    }
     const ph = npc.physics;
-    let desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
-    desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
+    let desired;
+    const foe = engageTarget(npc, players, nowMs);   // hostile + live attacker → fight; else trade route
+    if (foe) {
+      // ── Combat helm: drop the route and manoeuvre for a broadside (A2). Route is left untouched so the
+      // merchant resumes its trade run once the grudge lapses (A4 refines fight-vs-flee).
+      npc.engaged = true;
+      desired = engageHeading(npc, foe.state, wind, ph);
+    } else {
+      npc.engaged = false;
+      if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
+      const wp = npc.route[npc.routeIdx];
+      const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
+      if (dist < ARRIVE_M) {
+        if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
+        continue;
+      }
+      desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
+      desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
+    }
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
     const prev = npc.state.heading;
@@ -323,6 +436,13 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs) {
     npc.authPose.x = npc.state.x; npc.authPose.z = npc.state.z;
     npc.authPose.heading = npc.state.heading; npc.authPose.speed = npc.state.speed;
     npc.lastUpdateMs = nowMs;
+
+    // ── Return fire (A3): when engaged, a gun bears, and the reload is up, hand a leading solution to the
+    // server's shared shot adjudicator. Fires at most one aimed ball per NPC_RELOAD_MS.
+    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= NPC_RELOAD_MS) {
+      const sol = firingSolution(npc, foe.state);
+      if (sol) { fireShot(npc, sol, 'round'); npc.lastShotAt = nowMs; }
+    }
   }
 }
 
@@ -395,6 +515,7 @@ module.exports = {
     spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
     avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,
     setJitter(j) { TRIP_JITTER = j; }, OWN_DEST_BONUS, OWN_SRC_BONUS,
-    markHostile, isHostile, AGGRO_MS,
+    markHostile, isHostile, AGGRO_MS, engageTarget, engageHeading, angleFromWind, sailEff, FIRE_RANGE,
+    firingSolution, NPC_MUZZLE_V, MAX_FIRE_RANGE, FIRE_ARC, NPC_RELOAD_MS,
   },
 };

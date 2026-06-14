@@ -1693,8 +1693,9 @@ export class CannonService {
       );
       if (pick?.hit && pick.pickedPoint) {
         px = pick.pickedPoint.x; py = pick.pickedPoint.y; pz = pick.pickedPoint.z;
-        // Burn a lasting scorch mark onto the actual surface we struck.
-        if (pick.pickedMesh) {
+        // Burn a lasting scorch mark onto the actual surface we struck — but NOT for grapeshot, which peppers
+        // the crew, not the timbers (no hull damage → no char).
+        if (pick.pickedMesh && !msg.grape) {
           const n = pick.getNormal(true) ?? new Vector3(-dirX, -dirY, -dirZ);
           const small = msg.zone === 'masts';
           this.addScorchDecal(String(msg.victimId), pick.pickedMesh, pick.pickedPoint, n, small);

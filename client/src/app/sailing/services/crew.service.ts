@@ -359,6 +359,25 @@ export class CrewHandle {
     }
   }
 
+  /** Bring ONE casualty back to work (a fresh hand at the tavern). Returns false if none are down. */
+  reviveOne(): boolean {
+    const dead = this.members.find((m) => m.state === 'dead');
+    if (!dead) return false;
+    dead.state = 'station';
+    const st = this.pickStation(dead);
+    if (st) this.arriveAt(dead, st, true);
+    return true;
+  }
+
+  /** Drive the number of living crew to `target` (authoritative count from the server). Drops the difference
+   *  as casualties (Death → Dead) or revives downed hands — so grapeshot losses and tavern hires both show. */
+  setAliveCount(target: number): void {
+    const t = Math.max(0, Math.min(this.members.length, Math.round(target)));
+    let alive = this.aliveCount;
+    while (alive > t) { if (!this.killOne()) break; alive--; }
+    while (alive < t) { if (!this.reviveOne()) break; alive++; }
+  }
+
   get aliveCount(): number { return this.members.filter((m) => m.state !== 'dead').length; }
 
   dispose(): void {

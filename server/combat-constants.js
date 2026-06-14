@@ -71,6 +71,17 @@ const WATERLINE_BAND      = 1.6;   // metres above the waterline over which the 
 const SEV_GREEN_MIN  = 0.60;
 const SEV_YELLOW_MIN = 0.30;
 
+// ── Mast → sail-power curve (mirrors client combat.constants.ts mastSpeedMult) ─────────────────────────────
+// Sail drive falls once mast health drops below the onset, easing to MAST_SLOW_FLOOR just above destroyed and
+// 0 at fully destroyed (coasts like furled sails). Used server-side to slow NPC merchants when demasted.
+const MAST_DAMAGE_ONSET = SEV_GREEN_MIN;   // 0.60 — penalty begins below this mast-health fraction
+const MAST_SLOW_FLOOR   = 0.70;            // worst partial sail-power just above destroyed
+function mastSpeedMult(h) {
+  if (h <= 0) return 0;
+  if (h >= MAST_DAMAGE_ONSET) return 1;
+  return MAST_SLOW_FLOOR + (1 - MAST_SLOW_FLOOR) * (h / MAST_DAMAGE_ONSET);
+}
+
 // ── Mast self-repair ──────────────────────────────────────────────────────────
 // When the masts zone is shot to 0, a jury-rig repair starts automatically and, after this long,
 // brings the mast back to a fraction of full (a partial fix — full repair still needs a port). The
@@ -120,6 +131,7 @@ module.exports = {
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
+  MAST_DAMAGE_ONSET, MAST_SLOW_FLOOR, mastSpeedMult,
   MAST_REPAIR_MS, MAST_REPAIR_FRAC,
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,

@@ -1,4 +1,4 @@
-import { Injectable, NgZone, inject, signal } from '@angular/core';
+import { Injectable, NgZone, effect, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
   AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
@@ -38,6 +38,13 @@ export class VesselService {
 
   /** Animated deck crew on the local vessel (null until the GLB + crew assets load). */
   private crewHandle: CrewHandle | null = null;
+
+  /** Reflect the authoritative crew count onto the deck as it changes — grapeshot casualties drop, tavern
+   *  hires return. Runs in the injection context (field initializer); the handle may be null early (guarded). */
+  private readonly _crewCasualtySync = effect(() => {
+    const n = this.combatService.crew();
+    this.crewHandle?.setAliveCount(n);
+  });
 
   // ── Public reactive state ─────────────────────────────────────────────────
   grounded = signal<boolean>(false);
@@ -527,7 +534,7 @@ export class VesselService {
     this.crewHandle = null;
     void this.crewService
       .attach(this.vesselSlug, rigged.root, scene, crewSeedFrom('local_' + this.vesselSlug))
-      .then((h) => { this.crewHandle = h; });
+      .then((h) => { this.crewHandle = h; h?.setAliveCount(this.combatService.crew()); });   // reflect current casualties
   }
 
   /** Animated deck crew handle (casualties via killOne()/reviveAll()); null until loaded. */

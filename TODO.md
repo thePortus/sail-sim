@@ -2,22 +2,22 @@
 
 # General or Current TODO Items
 
-* Chain and grape shot, Crew, number, recruiting, paying
+* UI positions of chat and hull integrity fixed
 * add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping
-* Paying for powder and shot
+* fix pinnace water displacement
+* better latency handling
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance
+* Paying for powder and shot
 * improved landscape with NME & more scatter to distant
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
-* better latency handling
 * server is disconnected message
 * Plan to make towns or areas "different"... things to see, special marvels
 * For landscape.... distant trees scattered and then node material editor PBR
 * sound is chunking on windows machines still
 * impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
-* make stuff look cool pass)
-* RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
+* make stuff look cool pass
 * shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
 * shader for water on camera https://www.shadertoy.com/view/ltffzl
 * docking tie up animation

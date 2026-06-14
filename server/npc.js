@@ -18,7 +18,7 @@ const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
 const moveConst = require('./movement-constants');
-const { getVesselDef } = require('./controllers/vessels.controller');
+const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
 
 const DEG = Math.PI / 180;
@@ -128,6 +128,14 @@ function isHostile(npc, nowMs) {
   return !!(npc.hostileToward && npc.aggroUntil > nowMs);
 }
 
+/** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew) — mirrors the player/server formula; scales the
+ *  merchant's sailing + turn when grapeshot has thinned its crew. */
+function crewFactor(npc) {
+  const max = npc.maxCrew | 0;
+  if (!max) return 1;
+  return 0.5 + 0.5 * Math.max(0, Math.min(1, (npc.crew | 0) / max));
+}
+
 // ── Tactical helm (A2) ────────────────────────────────────────────────────────────────────────────────────
 // A hostile merchant abandons its trade route and jockeys to lay a broadside on its attacker. It steers for a
 // heading perpendicular to the bearing-to-target (a clean side-on shot), closing when out of range and opening
@@ -217,8 +225,8 @@ const NPC_MUZZLE_V    = Cc.SHOT_TYPES.round.v;  // 55 u/s — NPCs fire solid ro
 const FIRE_ARC        = 50;        // deg off pure-beam the target may be for a gun to bear
 const MAX_FIRE_RANGE  = 260;       // world units: don't open fire beyond this (well inside round-shot max reach)
 const NPC_RELOAD_MS   = 4200;      // min ms between a merchant's shots (one aimed ball per reload — deliberately unhurried)
-const NPC_AZ_SPREAD   = 4.5;       // deg: half-width of random bearing scatter (moderate accuracy → dodgeable)
-const NPC_EL_SPREAD   = 2.0;       // deg: half-width of random elevation scatter
+const NPC_AZ_SPREAD   = 7.5;       // deg: half-width of random bearing scatter (loosened — merchants miss more)
+const NPC_EL_SPREAD   = 3.5;       // deg: half-width of random elevation scatter (more over/undershoot)
 const MUZZLE_Y        = 2.6;       // gun height above the waterline (world units, ~deck)
 const AIM_Y           = 1.4;       // aim point on the target hull (mid-freeboard)
 
@@ -316,6 +324,8 @@ function spawnNpc(players, towns) {
     gold: SEED_GOLD, cargo: {}, trip: null, phase: null,   // trip = {goodId,srcTownId,destTownId,qty}; phase = toSource|toDest
     // NP-combat: set by markHostile() when this merchant is hit; consumed by the tactical helm + gunnery (A2–A4).
     hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
+    // Crew: merchants carry a full complement too, so grapeshot attrites it (and slows them) like a player ship.
+    maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
   };
   players.set(id, npc);
   return npc;
@@ -461,14 +471,24 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     }
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
+
+    // Combat attrition slows a merchant just like a player: a demasted hull (bar shot) bleeds sail power, and
+    // a thinned crew (grapeshot) slows BOTH sailing and the helm. mastMul mirrors the player's mast curve;
+    // crewMul is the 0.5..1 crew-efficiency factor. A fully-downed mast pivots only slowly.
+    const mastFrac = (npc.combat && npc.combat.maxHp && npc.combat.maxHp.masts)
+      ? (npc.combat.zones.masts / npc.combat.maxHp.masts) : 1;
+    const mastMul = Cc.mastSpeedMult(mastFrac);
+    const crewMul = crewFactor(npc);
+    const turnMul = crewMul * (mastFrac <= 0 ? 0.4 : 1);
+
     const prev = npc.state.heading;
-    npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec);
+    npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec * turnMul);
     npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
 
     // Speed from wind strength × point of sail — the EXACT player envelope (full sail, perfect trim, no
-    // gust). Eased toward target like the player so it accelerates/decelerates smoothly through tacks.
+    // gust), now also scaled by mast + crew condition. Eased toward target like the player.
     const aw     = angleFromWind(npc.state.heading, wind.windBearing);
-    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * sailEff(aw, ph.minTackAngle) * ph.sailAreaFactor));
+    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * sailEff(aw, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul));
     npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;

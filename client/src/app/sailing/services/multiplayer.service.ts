@@ -606,7 +606,10 @@ export class MultiplayerService {
       const pid = String(msg.playerId ?? '');
       const crew = Math.max(0, +msg.crew || 0), maxCrew = Math.max(0, +msg.maxCrew || 0);
       if (pid === this.myId) { this.combatService.setCrew(crew, maxCrew); }
-      else                   { this.remoteCrew.set(pid, { crew, maxCrew }); }
+      else {
+        this.remoteCrew.set(pid, { crew, maxCrew });
+        this.players.get(pid)?.crew?.setAliveCount(crew);   // drop/raise sailors on the remote deck
+      }
 
     } else if (msg.type === 'recruit_result') {
       // Tavern hire outcome — crew/gold already arrived via crew_state/wallet; here we just surface rejections.
@@ -1360,8 +1363,11 @@ export class MultiplayerService {
         .attach(slug, rigged.root, scene, crewSeedFrom(playerId))
         .then((h) => {
           if (!h) return;
-          if (this.players.get(playerId) === entry) entry.crew = h;
-          else h.dispose();   // player left while the crew GLB was loading
+          if (this.players.get(playerId) === entry) {
+            entry.crew = h;
+            const rc = this.remoteCrew.get(playerId);   // reflect casualties that arrived before the crew built
+            if (rc) h.setAliveCount(rc.crew);
+          } else h.dispose();   // player left while the crew GLB was loading
         });
     }
 

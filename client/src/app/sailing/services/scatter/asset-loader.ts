@@ -34,13 +34,14 @@ export function scatterTextureUrl(name: string): string { return withV(`${SCATTE
  * drift — so we measure the post-bake bounding box and shift the geometry down by its min Y. No-op (≤1 cm) when
  * already aligned. Logs the measured offset once per asset so a real base-drift is visible in the console.
  */
-function alignBaseToGround(mesh: Mesh, name: string): void {
-  // DIAGNOSTIC ONLY (no longer translates — the measured offsets are mostly NEGATIVE, i.e. the assets are
-  // authored origin-at-contact with a little geometry embedded below, so re-grounding to the bbox base would
-  // LIFT them. We just log the offset to see which assets actually have a base above origin (positive).
+function alignBaseToGround(mesh: Mesh, _name: string): void {
+  // Sit the mesh's LOWEST vertex at local y=0 so placing the origin on the terrain rests the asset on its base.
+  // Correct for rocks/driftwood/beeches (the lowest vertex IS the ground-contact point, often authored below a
+  // centre origin → otherwise half-buried). Palms are a no-op here (their lowest vertex is already y=0, a stray
+  // root/frond below the real trunk base) — that offset is handled by the scale-proportional palmSink instead.
   mesh.refreshBoundingInfo();
   const minY = mesh.getBoundingInfo().boundingBox.minimum.y;
-  console.info(`[scatter] ${name}: base minY = ${minY.toFixed(3)} m (origin→lowest-vertex)`);
+  if (Math.abs(minY) > 0.01) { mesh.bakeTransformIntoVertices(Matrix.Translation(0, -minY, 0)); }
 }
 
 /** filename → in-flight or resolved container load (load-once). */

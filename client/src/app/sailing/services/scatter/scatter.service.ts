@@ -98,6 +98,10 @@ interface Layer {
   /** Optional smaller patch ring (in cells) — used by the fake-shadow layers so blobs only build/keep
    *  within a near radius around the camera (cheap). Undefined → the full scatter RADIUS. */
   maxRing?: number;
+  /** Identifier for debug toggles (e.g. 'shadow_palms'). */
+  tag?: string;
+  /** When true, ensurePatches skips this layer entirely (debug). */
+  disabled?: boolean;
 }
 
 /** A patch's instance data: the N×16 matrix buffer, and an optional N×4 per-instance colour buffer. */
@@ -462,6 +466,7 @@ export class ScatterService {
         return;
       }
       this.groundToBase(full);
+      this.recenterTrunkXZ(full);   // palm origin sits under an off-centre frond tip → put the trunk over the origin
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -584,7 +589,14 @@ export class ScatterService {
       const v = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));
       const s = 0.85 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.30;
       scaleV.set(s, s, s);
-      posV.set(px, py - 0.4, pz);
+      // Distant hills are drawn at COARSE clipmap LOD whose chord cuts UNDER convex hilltops, so an impostor at
+      // the true height floats above the visible hill. Sink it by the local convexity (height above a ~far-LOD-
+      // cell-radius average) so hilltop impostors settle onto the drawn hill; flats/valleys are untouched.
+      const d = 24;
+      const avg = (tg.getElevationFast(px + d, pz) + tg.getElevationFast(px - d, pz)
+                 + tg.getElevationFast(px, pz + d) + tg.getElevationFast(px, pz - d)) * 0.25;
+      const convexSink = Math.min(10, Math.max(0, py - avg) * 1.15);   // sharper peaks undershoot more → sink more
+      posV.set(px, py - 0.4 - convexSink, pz);
       Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, q);
       Matrix.ComposeToRef(scaleV, q, posV, mat);
       const arr = mats[v]; mat.copyToArray(arr, arr.length);
@@ -676,6 +688,7 @@ export class ScatterService {
     ];
     for (const [kind, build] of shadows) {
       const layer = this.makeShadowLayer(disc, build);
+      layer.tag = 'shadow_' + kind;   // debug toggle: shadow('palms', false) etc.
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu(kind, cx, cz, -1, 1); }
       this.layers.push(layer);
     }
@@ -902,6 +915,7 @@ export class ScatterService {
       const ix = cx + off.dx, iz = cz + off.dz;
       const key = ix + ',' + iz;
       for (const l of this.layers) {
+        if (l.disabled) { continue; }   // debug: layer toggled off
         if (l.patches.has(key)) { continue; }
         // Shadow (and any capped) layers only build within their near ring around the camera cell.
         if (l.maxRing !== undefined && (Math.abs(off.dx) > l.maxRing || Math.abs(off.dz) > l.maxRing)) { continue; }
@@ -1004,6 +1018,27 @@ export class ScatterService {
     if (Math.abs(minY) > 0.02) {
       mesh.position.y = -minY;                  // lift the base to y=0
       mesh.bakeCurrentTransformIntoVertices();  // fold the shift into the geometry; origin now == base
+    }
+  }
+
+  /**
+   * Re-centre a tree/palm so its TRUNK AXIS sits at object-space X/Z = 0. Some authored GLBs put the origin
+   * under an off-centre vertex (e.g. a drooping palm frond tip that also defeats groundToBase by sitting at
+   * y=0), so the trunk lands laterally offset from the placement origin — and since each instance is yaw-
+   * rotated, that offset swings to a different direction per tree (shadows scattered, trunk never over its
+   * shadow). The frond canopy is roughly symmetric about the trunk, so the vertex CENTROID ≈ the trunk axis;
+   * baking −centroid into the geometry plants the trunk under the origin (and thus under its shadow).
+   */
+  private recenterTrunkXZ(mesh: Mesh): void {
+    const pos = mesh.getVerticesData('position');
+    if (!pos || !pos.length) { return; }
+    let sx = 0, sz = 0; const n = pos.length / 3;
+    for (let i = 0; i < pos.length; i += 3) { sx += pos[i]; sz += pos[i + 2]; }
+    const cx = sx / n, cz = sz / n;
+    if (Math.abs(cx) > 0.03 || Math.abs(cz) > 0.03) {
+      console.info(`[scatter] ${mesh.name}: trunk axis off origin by (${cx.toFixed(2)}, ${cz.toFixed(2)}) m → re-centred`);
+      mesh.position.x = -cx; mesh.position.z = -cz;
+      mesh.bakeCurrentTransformIntoVertices();
     }
   }
 
@@ -1137,7 +1172,19 @@ export class ScatterService {
     // Register both bare + underscored names so either form works in the console.
     w['palmSink'] = palm; w['__palmSink'] = palm;
     w['treeSink'] = tree; w['__treeSink'] = tree;
-    console.info('[probe] sink tuner ready → type  palmSink(0.7)  or  treeSink(0.35)  in the console');
+    // Per-kind shadow toggle: shadow('drift', false) hides drift shadows (kinds: palms/trees/rocks/drift/all).
+    (w as unknown as Record<string, (k: string, on?: boolean) => void>)['shadow'] = (kind: string, on = false) => {
+      for (const l of this.layers) {
+        if (l.tag === 'shadow_' + kind || (kind === 'all' && l.tag?.startsWith('shadow_'))) {
+          l.disabled = !on;
+          for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
+          l.patches.clear();
+        }
+      }
+      this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to re-scan
+      console.info(`[probe] shadow '${kind}' ${on ? 'ON' : 'OFF'}`);
+    };
+    console.info('[probe] tuners ready → palmSink(0.7) · treeSink(0.35) · shadow("drift",false)');
   }
 
   /** Apply a quality tier's radius/density/enabled flags + the matching fade band (no rebuild). */

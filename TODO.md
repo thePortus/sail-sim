@@ -8,6 +8,7 @@
 * better latency handling
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * add occasional bosun whistle (no more than once a day)
+* grapeshot doesn't make cannonball impacts on the water
 * lod + imposters for ships at distance
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant

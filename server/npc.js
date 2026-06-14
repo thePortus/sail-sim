@@ -136,12 +136,30 @@ function isHostile(npc, nowMs) {
 // of sail manoeuvres realistically rather than magically holding the slot.
 const FIRE_RANGE = 150;       // world units: ideal broadside standoff (well within round-shot reach) — tunable
 const BROADSIDE_HYST = 0.12;  // point-of-sail-efficiency margin the other tack must beat to flip the broadside side
+const GIVE_UP_RANGE = 700;    // world units: a foe that opens past this is "lost" → drop the grudge, resume trade
+const FLEE_HEALTH = 0.35;     // hull fraction at/below which a merchant breaks off and runs (fighting → fleeing)
 
-/** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished or sunk. */
+/** Fraction of total HULL hit points (non-mast zones) remaining, 0..1. Drives the fight-vs-flee decision. */
+function hullFraction(combat) {
+  if (!combat) return 1;
+  let cur = 0, max = 0;
+  for (const z of Cc.ZONES) {
+    if (z === 'masts') continue;
+    cur += combat.zones[z] || 0; max += combat.maxHp[z] || 0;
+  }
+  return max > 0 ? cur / max : 1;
+}
+
+/** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished, sunk, or
+ *  opened past GIVE_UP_RANGE (it escaped / was lost) — at which point the merchant resumes its trade route. */
 function engageTarget(npc, players, nowMs) {
   if (!isHostile(npc, nowMs)) return null;
   const foe = players.get(npc.hostileToward);
   if (!foe || !foe.state || (foe.combat && foe.combat.sunk)) {   // disconnected / sunk → stand down
+    npc.hostileToward = null; npc.aggroUntil = 0; return null;
+  }
+  const dx = foe.state.x - npc.state.x, dz = foe.state.z - npc.state.z;
+  if (dx * dx + dz * dz > GIVE_UP_RANGE * GIVE_UP_RANGE) {        // foe broke contact → give up the chase
     npc.hostileToward = null; npc.aggroUntil = 0; return null;
   }
   return foe;
@@ -166,6 +184,28 @@ function engageHeading(npc, foeState, wind, ph) {
   else if (side === -1 && effPlus  > effMinus + BROADSIDE_HYST) side = 1;
   npc.broadsideSide = side;
   return side === 1 ? hPlus : hMinus;
+}
+
+/**
+ * Flee helm (A4): a badly-hurt merchant runs for it. Picks the heading that best trades off OPENING distance
+ * from the foe against SPEED — so it doesn't blindly point straight away onto a dead-slow upwind beat; it bears
+ * off downwind onto a fast broad reach that still carries it clear. (It keeps firing opportunistically: the
+ * gunnery's arc gate lets a stern-chasing foe eat a parting broadside whenever it swings abeam — no extra code.)
+ */
+function escapeHeading(npc, foeState, wind, ph) {
+  const away = (headingTo(npc.state.x, npc.state.z, foeState.x, foeState.z) + 180) % 360;   // straight away from foe
+  const awayX = Math.sin(away * DEG), awayZ = Math.cos(away * DEG);
+  // Maximise the OUTBOUND velocity component = boat speed × (heading · away). Sweeping all headings finds the
+  // fastest way to actually pull clear: if dead-away is upwind (slow), it bears off onto a reach that opens
+  // distance faster despite the angle; if away is downwind, it just runs. In-irons efficiency is clamped to 0
+  // (a stalled heading makes no progress, however "away" it points).
+  let best = away, bestRate = -Infinity;
+  for (let h = 0; h < 360; h += 15) {
+    const opening = Math.sin(h * DEG) * awayX + Math.cos(h * DEG) * awayZ;   // -1 (toward foe) .. 1 (dead away)
+    const rate = Math.max(0, sailEff(angleFromWind(h, wind.windBearing), ph.minTackAngle)) * opening;
+    if (rate > bestRate) { bestRate = rate; best = h; }
+  }
+  return best;
 }
 
 // ── Gunnery (A3) — the merchant returns fire ────────────────────────────────────────────────────────────────
@@ -401,12 +441,14 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     let desired;
     const foe = engageTarget(npc, players, nowMs);   // hostile + live attacker → fight; else trade route
     if (foe) {
-      // ── Combat helm: drop the route and manoeuvre for a broadside (A2). Route is left untouched so the
-      // merchant resumes its trade run once the grudge lapses (A4 refines fight-vs-flee).
+      // ── Combat helm: drop the route to fight. Healthy → jockey for a broadside (A2); once the hull is shot
+      // below FLEE_HEALTH it commits to running (A4) — hull doesn't self-heal, so the decision never flip-flops.
+      // The route is left untouched so the merchant resumes its trade run once it disengages (escapes / lapses).
       npc.engaged = true;
-      desired = engageHeading(npc, foe.state, wind, ph);
+      if (!npc.fleeing && hullFraction(npc.combat) < FLEE_HEALTH) npc.fleeing = true;
+      desired = npc.fleeing ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
     } else {
-      npc.engaged = false;
+      npc.engaged = false; npc.fleeing = false;   // disengaged → clear the flee commitment
       if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
       const wp = npc.route[npc.routeIdx];
       const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
@@ -517,5 +559,6 @@ module.exports = {
     setJitter(j) { TRIP_JITTER = j; }, OWN_DEST_BONUS, OWN_SRC_BONUS,
     markHostile, isHostile, AGGRO_MS, engageTarget, engageHeading, angleFromWind, sailEff, FIRE_RANGE,
     firingSolution, NPC_MUZZLE_V, MAX_FIRE_RANGE, FIRE_ARC, NPC_RELOAD_MS,
+    escapeHeading, hullFraction, FLEE_HEALTH, GIVE_UP_RANGE,
   },
 };

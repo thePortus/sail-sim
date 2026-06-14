@@ -3,7 +3,7 @@
 # General or Current TODO Items
 
 * UI positions of chat and hull integrity fixed
-* add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping
+* add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping... make merchants flee if your faction is bad enough (or attack if you get close enough) (make AI strategy consider relative ship powers)
 * fix pinnace water displacement
 * better latency handling
 * add occasional bosun whistle (no more than once a day)

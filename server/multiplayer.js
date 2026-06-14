@@ -11,6 +11,10 @@ const { fn, col, where } = db.Sequelize;
 // avoid spamming a crowded harbour.
 const JOIN_LEAVE_MAX_PLAYERS = 30;
 
+// When a PLAYER is sunk, this fraction of their CARGO (not gold) spills into a floating crate at the wreck —
+// a real but RECOVERABLE penalty: anyone can scoop it, including the owner once they respawn and sail back.
+const PLAYER_WRECK_LOOT = 0.5;
+
 /**
  * Sailing multiplayer WebSocket server.
  *
@@ -748,6 +752,22 @@ function attachMultiplayer(server) {
       } else {
         sysReply(victim.ws, `You were sunk by ${sinker}.`);
         if (shooter) sysReply(shooter.ws, `You sank ${victim.state?.callsign || 'a ship'}!`);
+        // A sunk player spills a fraction of their CARGO (gold stays safe) into a floating crate at the wreck.
+        // The goods leave their hold immediately (persisted), so being sunk has a real cost — but anyone can
+        // scoop the crate, INCLUDING the owner once they respawn and sail back (player recovery).
+        const contents = {};
+        for (const [g, q] of Object.entries(victim.cargo || {})) { const k = Math.floor((q || 0) * PLAYER_WRECK_LOOT); if (k > 0) contents[g] = k; }
+        if (Object.keys(contents).length) {
+          for (const [g, k] of Object.entries(contents)) {
+            victim.cargo[g] = (victim.cargo[g] || 0) - k;
+            if (victim.cargo[g] <= 0) delete victim.cargo[g];
+          }
+          const crate = salvage.spawnCrate(victim.state.x, victim.state.z, contents, 0, Date.now());
+          const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+          saveEconomyState(victim).then(() => sendWallet(victim));   // persist the lighter hold + refresh the owner's UI
+          sysReply(victim.ws, 'Some of your cargo floats free at the wreck — sail back to recover it before others do.');
+        }
       }
     }
   };

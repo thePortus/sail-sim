@@ -1776,12 +1776,18 @@ export class TerrainService {
       `);
       material.Fragment_Definitions(`
         float _clipHF(vec2 wxz) {
+          // BILINEAR tap (was nearest texelFetch → flat ~24 m shading facets); see PBR path note.
           vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
-          ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
-          return texelFetch(heightTex, t, 0).r;
+          vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+          ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+          float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+          float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+          float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+          float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+          return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
         }
         vec3 _clipNormal(vec2 wxz) {
-          float e = wbounds.z / texSize.x;   // 1 texel in world metres
+          float e = 1.5 * wbounds.z / texSize.x;   // ~1.5 texels in world metres (slightly wider = softer)
           float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
           float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
           return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
@@ -2461,12 +2467,19 @@ export class TerrainService {
 
     mat.Fragment_Definitions(`
       float _clipHF(vec2 wxz) {
+        // BILINEAR heightfield tap (was nearest texelFetch → constant normal per ~24 m texel = flat facets).
+        // Smooth sampling makes the Sobel normal vary continuously, de-faceting the shading.
         vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
-        ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
-        return texelFetch(heightTex, t, 0).r;
+        vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+        ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+        float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+        float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+        float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+        float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
       }
       vec3 _clipNormal(vec2 wxz) {
-        float e = wbounds.z / texSize.x;
+        float e = 1.5 * wbounds.z / texSize.x;   // ~1.5-texel Sobel span: a touch wider softens the slope
         float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
         float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
         return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
@@ -2544,6 +2557,27 @@ export class TerrainService {
         vec2 uv = vec2((wp.x - wbounds.x)/wbounds.z, (wbounds.y + wbounds.w - wp.z)/wbounds.w);
         return texture2D(uAux, uv);
       }
+      // Forest moisture field (low-frequency, matches the Standard path) + canopy COVERAGE [0,1] (mid-
+      // elevation + gentle-slope + moist, broken into clumps). Shared by the albedo (paint green) AND the
+      // roughness (matte vegetation) so they agree. Gates relaxed vs §8d so the canopy climbs steeper slopes
+      // -> less bare-rock black between beach and forest.
+      float _forestMoist(vec3 wp) {
+        return 0.5
+          + 0.34 * sin(wp.x * 0.00080 + 1.3)
+          + 0.24 * sin(wp.z * 0.00095 - 0.7)
+          + 0.18 * sin((wp.x - wp.z) * 0.00060 + 2.1)
+          + 0.12 * sin((wp.x * 0.7 + wp.z * 1.1) * 0.0022 - 1.1);
+      }
+      float _forestF(vec3 wp, float slope) {
+        float h = clamp(wp.y / uPeakH, 0.0, 1.0);
+        float fElev  = smoothstep(0.035, 0.10, h) * (1.0 - smoothstep(0.62, 0.74, h));
+        float fSlope = clamp(1.0 - slope * 1.02, 0.0, 1.0);   // was 1.45 -> canopy reaches steeper faces
+        float fMoist = smoothstep(0.24, 0.56, _forestMoist(wp));
+        float fpw = sin(wp.x * 0.0021 + wp.z * 0.0013)
+                  + sin(wp.z * 0.0026 - wp.x * 0.0009 + 2.0)
+                  + sin((wp.x + wp.z) * 0.0015 - 1.0);
+        return clamp(fElev * fSlope * fMoist * smoothstep(-0.4, 1.1, fpw), 0.0, 1.0);
+      }
     `);
 
     // Roughness (metallic stays 0). Procedural for now - wet, low, flat ground near the waterline reads
@@ -2567,6 +2601,8 @@ export class TerrainService {
       vec4 auxR = _aux(vPositionW);                                 /* S4: water-polished drainage channels */
       float chanR = smoothstep(0.45, 0.82, auxR.a) * smoothstep(-0.2, 1.5, vPositionW.y);
       metallicRoughness.g = clamp(mix(metallicRoughness.g, metallicRoughness.g * 0.70, chanR), 0.50, 1.0);
+      float ffR = _forestF(vPositionW, 1.0 - clamp(nWr.y, 0.0, 1.0));   /* matte the canopy: foliage isn't glossy */
+      metallicRoughness.g = clamp(mix(metallicRoughness.g, 0.98, ffR * 0.9), 0.50, 1.0);
     `);
 
     // Albedo + normal (before the PBR light loop).
@@ -2678,6 +2714,17 @@ export class TerrainService {
                   + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,4.0), alod).g*wSnow;
         aoT = mix(1.0, ao5, aoFade);
       }
+      // ── Forest canopy: paint deep green on the wooded hillsides. The PBR splat has no forest biome, so
+      // these otherwise read as dark rock / wet-darkened grass (the "black forest"). _forestF (shared with
+      // the roughness block) gates it; greener when wet, clump-mottled.
+      float forestF = _forestF(vPositionW, slope);
+      if (forestF > 0.003) {
+        float fWet = smoothstep(0.25, 0.78, clamp(_forestMoist(vPositionW), 0.0, 1.0));
+        float mott = sin(vPositionW.x * 0.045) * sin(vPositionW.z * 0.045) * 0.5 + 0.5;
+        vec3 canopyDark = mix(vec3(0.07, 0.15, 0.06), vec3(0.10, 0.20, 0.07), fWet);
+        vec3 canopyLit  = mix(vec3(0.14, 0.27, 0.11), vec3(0.20, 0.34, 0.14), fWet);
+        splatC = mix(splatC, mix(canopyDark, canopyLit, mott), forestF * 0.94);
+      }
       surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB->linear, AO darkens crevices
 
       // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.
@@ -2688,6 +2735,14 @@ export class TerrainService {
       float pStr=(0.55+slope*2.4)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);
       float pLand=smoothstep(0.4,4.0,vPositionW.y);
       normalW = normalize(nW + vec3(-(pHR-pHL), 0.0, -(pHU-pHD)) * (1.5*pdFade*pLand*pStr));
+      // Lumpy canopy normal (§8d): treetops catch the sun, valleys self-shade — dimensional forest relief.
+      if (forestF > 0.003) {
+        vec2  cq  = vPositionW.xz * 0.085;
+        float c0  = sin(cq.x) * sin(cq.y);
+        float cgx = (sin(cq.x + 0.15) * sin(cq.y) - c0) / 0.15;
+        float cgz = (sin(cq.x) * sin(cq.y + 0.15) - c0) / 0.15;
+        normalW = normalize(normalW + vec3(-cgx, 0.0, -cgz) * (forestF * 0.32));   // softer: cut canopy sheen
+      }
     `);
 
     // Cloud shadows + aerial haze on the lit colour (matches the Standard path + the ocean).

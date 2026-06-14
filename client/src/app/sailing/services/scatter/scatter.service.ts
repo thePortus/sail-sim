@@ -19,6 +19,7 @@ import { createDriftwood } from './props/driftwood';
 import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
+import { FarFadePlugin } from './far-fade.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
@@ -125,6 +126,9 @@ export class ScatterService {
   // Fake-shadow blobs (shared flat disc + dark decal material, thin-instanced under each land asset).
   private _shadowDisc: Mesh | null = null;
   private _shadowMat: StandardMaterial | null = null;
+  // Static far-forest impostor layer: the beech impostor textures (captured on load) + the built meshes.
+  private beechImpostors: { tex: Texture; w: number; h: number; pad: number }[] = [];
+  private farMeshes: Mesh[] = [];
   private shadowRing = 3;                            // near ring (cells) the blobs build within
   private _sunAcc = 1;                               // throttle the sun-drive recompute (the sun crawls)
   private static readonly SHADOWS_ENABLED = true;
@@ -192,7 +196,10 @@ export class ScatterService {
 
     this.observer = scene.onBeforeRenderObservable.add(() => {
       const c = this.sceneService.camera;
-      if (c) { GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z; }
+      if (c) {
+        GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z;
+        FarFadePlugin.camera.x   = c.position.x; FarFadePlugin.camera.z   = c.position.z;   // far-forest fade
+      }
       // Drive the palm wind from the weather wind (the same source the sails use): unit direction +
       // a gust amplitude that grows with wind speed, plus a steadily-advancing clock.
       const wd = this.weatherService.weather()?.wind;
@@ -292,6 +299,10 @@ export class ScatterService {
     }
     for (const m of meshes) { m.dispose(); }
     for (const mm of mats) { mm.dispose(); }
+    // Static far-forest layer (own meshes + materials; textures are shared with the ring impostors above).
+    for (const m of this.farMeshes) { m.material?.dispose(); m.dispose(); }
+    this.farMeshes = [];
+    this.beechImpostors = [];
     this.layers = [];
     this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
     this.townPads = null;                              // re-fetch town pads after a region/manifest change
@@ -494,12 +505,98 @@ export class ScatterService {
       const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h, pad);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
+      this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
       // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
       const layer = this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v));
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
     }
+    this.buildFarForest(scene);   // static whole-island impostor layer for the distant hillsides
+  }
+
+  /**
+   * Static FAR-FOREST impostor layer: tree billboards blanketing the WHOLE island's forested slopes, faded
+   * IN at distance (FarFadePlugin) so the camera-following scatter ring owns near trees and these give the
+   * distant hillsides real tree texture over the §8d shader canopy. Built once (not camera-following): walk
+   * the heightfield, gate with the same forest recipe as buildTrees, keep a capped budget, thin-instance the
+   * (reused) beech impostors per variant. Cheap — a few instanced draws of unlit alpha-tested billboards.
+   */
+  private buildFarForest(scene: Scene): void {
+    const V = this.beechImpostors.length;
+    if (V < 1) { return; }
+    const tg = this.terrainService;
+    const b = tg.getWorldBounds();
+    const cell = tg.getCellSizeM() || 24;
+    const nx = Math.max(2, Math.round((b.maxX - b.minX) / cell) + 1);
+    const nz = Math.max(2, Math.round((b.maxZ - b.minZ) / cell) + 1);
+    const stride = Math.max(1, Math.ceil(Math.sqrt((nx * nz) / 1_000_000)));   // cap cells visited at ~1M
+    const spanX = b.maxX - b.minX, spanZ = b.maxZ - b.minZ;
+    // Match the §8d shader canopy's elevation band (treeline) so impostors cover the SAME green hills, not
+    // just the lower slopes the near scatter ring caps at (80 m). _forestF uses [0.035 .. 0.74] × peak.
+    const man = tg.getManifest();
+    const peak = man?.maxElevation ?? man?.targetPeakElevation ?? 920;
+    const yLo = Math.max(0.6, 0.04 * peak), yHi = 0.74 * peak;
+
+    const BUDGET = 9000;
+    // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
+    // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
+    const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]
+    let seen = 0;
+    for (let iz = 0; iz < nz; iz += stride) {
+      for (let ix = 0; ix < nx; ix += stride) {
+        const jx = hash2(ix * 12.9 + iz, iz * 78.2 + ix), jz = hash2(ix * 39.3 + 7.1, iz * 11.7 - 3.3);
+        const px = b.minX + ((ix + jx) / (nx - 1)) * spanX;
+        const pz = b.maxZ - ((iz + jz) / (nz - 1)) * spanZ;
+        const y = tg.getElevationFast(px, pz);
+        if (y < yLo || y > yHi) { continue; }                      // forested elevation band (matches canopy)
+        const slope = this.slopeAt(px, pz, y, 3.0);
+        if (slope > 0.6) { continue; }                             // gentle-ish ground
+        const stand = fbm2(px / 45, pz / 45), clearing = fbm2(px / 13 + 9, pz / 13 - 4);
+        const dens = smoothstep(0.42, 0.70, stand) * smoothstep(0.36, 0.60, clearing) * (1 - slope * 0.6);
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
+        if (this.nearShoreline(px, pz, 6)) { continue; }
+        let slot = seen;
+        if (seen >= BUDGET) { slot = (Math.random() * (seen + 1)) | 0; }
+        if (slot < BUDGET) { res[slot * 3] = px; res[slot * 3 + 1] = pz; res[slot * 3 + 2] = y; }
+        seen++;
+      }
+    }
+    const take = Math.min(BUDGET, seen);
+    if (!take) { return; }
+
+    // Deal each kept point to a variant, compose its thin-instance matrix.
+    const mats: number[][] = Array.from({ length: V }, () => []);
+    const scaleV = new Vector3(), posV = new Vector3(), up = Vector3.Up(), q = new Quaternion(), mat = new Matrix();
+    for (let k = 0; k < take; k++) {
+      const px = res[k * 3], pz = res[k * 3 + 1], py = res[k * 3 + 2];
+      const v = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));
+      const s = 0.85 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.30;
+      scaleV.set(s, s, s);
+      posV.set(px, py - 0.4, pz);
+      Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, q);
+      Matrix.ComposeToRef(scaleV, q, posV, mat);
+      const arr = mats[v]; mat.copyToArray(arr, arr.length);
+    }
+
+    for (let v = 0; v < V; v++) {
+      if (!mats[v].length) { continue; }
+      const info = this.beechImpostors[v];
+      const m = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
+      if (m.material) {
+        m.material.unfreeze();                       // FarFadePlugin needs live per-frame uniform binds
+        new FarFadePlugin(m.material);
+        this.sceneService.excludeFromPrePass(m.material);
+      }
+      this.sceneService.excludeFromGlow(m);
+      m.renderingGroupId = 2;                         // world layer (terrain/ocean/vessels)
+      m.isPickable = false;
+      m.alwaysSelectAsActiveMesh = true;             // spans the whole map → don't frustum-cull the source
+      m.isVisible = true;
+      m.thinInstanceSetBuffer('matrix', new Float32Array(mats[v]), 16, true);
+      this.farMeshes.push(m);
+    }
+    console.log(`[scatter] far-forest: ${take} impostors across ${this.farMeshes.length} variant meshes`);
   }
 
   /** A GLB tree sub-layer: full mesh near, crossed-quad impostor far, swapped per-patch by distance. */

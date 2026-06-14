@@ -653,6 +653,10 @@ function attachMultiplayer(server) {
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
+    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). The tactical helm +
+    // return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
+    if (victim.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
+
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
     const hitMsg = JSON.stringify({
       type: 'combat_hit', shooterId: shot.shooterId, victimId: hit.victimId, seq: shot.seq,

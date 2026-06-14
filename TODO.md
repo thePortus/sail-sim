@@ -7,7 +7,7 @@
 * Great! Hey, can we return to our landscape improvements and do the improvement of expanding out the scatter draw distance and seeing how that does now that we have it on GPU? As a way of giving the profile of the landscape shape,.... even if it is just the LOD imposters
 * Chain and grape shot, Crew, number, recruiting, paying
 * Paying for powder and shot
-* add factions going to war, making peace (diplomacy module)
+* add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping
 * add occasional bosun whistle (no more than once a day)
 * lod + imposters for ships at distance
 * improved landscape with NME & more scatter to distant
@@ -53,3 +53,4 @@
 * Security pass
 
 # TODO Items by Module
+

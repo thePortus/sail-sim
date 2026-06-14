@@ -44,6 +44,12 @@ const OWN_DEST_BONUS = 6.0;  // delivering to a home-nation town in need
 const OWN_SRC_BONUS  = 2.0;  // sourcing from a home-nation producer
 let TRIP_JITTER = 3.0;       // random spread so same-faction merchants don't all chase the single top need (test seam can zero it)
 const SINK_LINGER_MS = 4000; // keep a sunk merchant around this long so the capsize animation plays, then despawn
+
+// ── NPC combat (NP-combat) — a merchant shoots back when fired upon ───────────────────────────────────────
+// Aggro is a timed grudge against the last attacker: each new hit refreshes it, and it lapses after AGGRO_MS
+// of no further damage (the merchant then resumes its trade route). The tactical helm + gunnery that consume
+// these fields live in later phases (A2–A4); A1 only records who's shooting and until when.
+const AGGRO_MS = 45000;      // ms a merchant stays hostile after the last hit (refreshed per hit)
 let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
@@ -103,6 +109,24 @@ function tackedHeading(bearingToWp, windBearing, minTack, npc) {
   return (windBearing + npc.tack * minTack + 360) % 360;
 }
 
+/**
+ * Record that `npc` was just hit by `shooterId`: make it hostile toward that attacker and (re)arm the aggro
+ * timer. Called from the combat shot-resolver for any NPC victim. No-op on a non-NPC or already-sunk ship, or
+ * if the shooter is the merchant itself. The actual fighting (steer-for-broadside + return fire) is driven by
+ * these fields in tickNpcs (A2–A4) — this just flips the switch.
+ */
+function markHostile(npc, shooterId, nowMs) {
+  if (!npc || !npc.isNpc || !shooterId || shooterId === npc.id) return;
+  if (npc.combat && npc.combat.sunk) return;
+  npc.hostileToward = shooterId;
+  npc.aggroUntil = nowMs + AGGRO_MS;
+}
+
+/** True while the merchant is actively hostile (has a target and the aggro timer hasn't lapsed). */
+function isHostile(npc, nowMs) {
+  return !!(npc.hostileToward && npc.aggroUntil > nowMs);
+}
+
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
 function avoidanceHeading(npc, fleet) {
   let sx = 0, sz = 0, n = 0;
@@ -147,6 +171,8 @@ function spawnNpc(players, towns) {
     tack: 1,   // current tack (+1/−1) for upwind zig-zagging
     route: null, routeIdx: 0, curTownId: town.id, legTarget: null,
     gold: SEED_GOLD, cargo: {}, trip: null, phase: null,   // trip = {goodId,srcTownId,destTownId,qty}; phase = toSource|toDest
+    // NP-combat: set by markHostile() when this merchant is hit; consumed by the tactical helm + gunnery (A2–A4).
+    hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
   };
   players.set(id, npc);
   return npc;
@@ -364,10 +390,11 @@ function spawnerTick(players) {
 }
 
 module.exports = {
-  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount,
+  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount, markHostile, isHostile,
   _test: {
     spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
     avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,
     setJitter(j) { TRIP_JITTER = j; }, OWN_DEST_BONUS, OWN_SRC_BONUS,
+    markHostile, isHostile, AGGRO_MS,
   },
 };

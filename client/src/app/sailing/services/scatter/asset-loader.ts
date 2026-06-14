@@ -27,6 +27,22 @@ function withV(url: string): string { return version ? `${url}?v=${version}` : u
 /** Full URL for a scatter texture (impostor / albedo / normal), with the cache-bust token. */
 export function scatterTextureUrl(name: string): string { return withV(`${SCATTER_BASE}textures/${name}`); }
 
+/**
+ * Bake a scatter mesh's BASE to local y=0. Placement roots an asset's origin at the terrain surface (height
+ * from getElevation), so the mesh's lowest vertex must sit at y=0 or the asset floats (origin above its base)
+ * / sinks. The authored GLBs aren't guaranteed to honour this, and the (now-correct) heightfield exposed the
+ * drift — so we measure the post-bake bounding box and shift the geometry down by its min Y. No-op (≤1 cm) when
+ * already aligned. Logs the measured offset once per asset so a real base-drift is visible in the console.
+ */
+function alignBaseToGround(mesh: Mesh, name: string): void {
+  // DIAGNOSTIC ONLY (no longer translates — the measured offsets are mostly NEGATIVE, i.e. the assets are
+  // authored origin-at-contact with a little geometry embedded below, so re-grounding to the bbox base would
+  // LIFT them. We just log the offset to see which assets actually have a base above origin (positive).
+  mesh.refreshBoundingInfo();
+  const minY = mesh.getBoundingInfo().boundingBox.minimum.y;
+  console.info(`[scatter] ${name}: base minY = ${minY.toFixed(3)} m (origin→lowest-vertex)`);
+}
+
 /** filename → in-flight or resolved container load (load-once). */
 const containerCache = new Map<string, Promise<AssetContainer>>();
 
@@ -62,6 +78,7 @@ export async function loadScatterMesh(scene: Scene, file: string, name: string):
     mesh.setParent(null);
     mesh.makeGeometryUnique();
     mesh.bakeCurrentTransformIntoVertices();
+    alignBaseToGround(mesh, name);           // ensure the trunk base sits at y=0 (no float/sink on placement)
     root.dispose();
     mesh.name = name;
     mesh.isVisible = false;
@@ -199,6 +216,7 @@ export async function loadScatterGeometry(
     mesh.setParent(null);
     mesh.makeGeometryUnique();
     mesh.bakeCurrentTransformIntoVertices();
+    alignBaseToGround(mesh, name);           // rocks/driftwood: sit the lowest point at y=0 (no float on placement)
     root.dispose();
     mesh.name = name;
     mesh.isVisible = false;

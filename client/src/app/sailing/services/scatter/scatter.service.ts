@@ -166,6 +166,12 @@ export class ScatterService {
   })();
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
   private densityMul = 1;               // grass acceptance multiplier (set from quality)
+  // Per-asset planting depth = the GLB's authored trunk-base height (local units), applied ×instance-scale so
+  // the base plants at the ground at ANY size. Palms need a big value (their bbox min is a low root/frond
+  // vertex at y=0, with the visible bark base authored well above it); beeches sit near their origin.
+  // Live-tunable via palmSink()/treeSink() while dialling it in.
+  private palmSink = 2.4;
+  private treeSink = 0.35;
   private enabled = true;               // false → no grass built at all (Potato)
   // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
   // patches built. _patchPending = still filling in this cell (build cap not yet drained).
@@ -274,6 +280,7 @@ export class ScatterService {
     await this.registerDriftwood(scene);
     await this.registerBeeches(scene);
     await this.registerPalms(scene);
+    this.setupSinkDebug();   // console tuner: __palmSink()/__treeSink()
 
     // Cheap fake shadows: a flat dark blob under each static land asset, near-ring only. Skipped on
     // Potato (no scatter) and via ?noshadows. Must come AFTER the asset layers so the asset placement
@@ -1102,7 +1109,11 @@ export class ScatterService {
     this._quality = q;
     localStorage.setItem('ignis_scatter_quality', String(q));
     this.applyQualityParams(q);
-    // Rebuild: drop every live patch so ensurePatches regenerates them at the new radius/density.
+    this.rebuildPatches();
+  }
+
+  /** Drop every live patch so ensurePatches regenerates them (after a quality/density/placement change). */
+  private rebuildPatches(): void {
     for (const l of this.layers) {
       for (const [, p] of l.patches) {
         if (p) {
@@ -1115,6 +1126,18 @@ export class ScatterService {
     }
     this._lastCx = NaN; this._patchPending = true; this._hasFilledOnce = false;   // force ensurePatches to rebuild the grid
     if (this.enabled) { this.ensurePatches(); }
+  }
+
+  /** DEBUG: live-tune the per-asset planting sink from the console — __palmSink(0.9) / __treeSink(0.5), then
+   *  the value that looks right gets baked as the default. Rebuilds patches on each call. */
+  private setupSinkDebug(): void {
+    const w = window as unknown as Record<string, (v: number) => void>;
+    const palm = (v: number) => { this.palmSink = v; this.rebuildPatches(); console.info(`[probe] palmSink = ${v}`); };
+    const tree = (v: number) => { this.treeSink = v; this.rebuildPatches(); console.info(`[probe] treeSink = ${v}`); };
+    // Register both bare + underscored names so either form works in the console.
+    w['palmSink'] = palm; w['__palmSink'] = palm;
+    w['treeSink'] = tree; w['__treeSink'] = tree;
+    console.info('[probe] sink tuner ready → type  palmSink(0.7)  or  treeSink(0.35)  in the console');
   }
 
   /** Apply a quality tier's radius/density/enabled flags + the matching fade band (no rebuild). */
@@ -1358,7 +1381,7 @@ export class ScatterService {
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
-        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
+        posV.set(px, y - this.treeSink * s, pz);   // sink = authored base height × instance scale → plants at any size
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);
@@ -1406,7 +1429,7 @@ export class ScatterService {
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }
-        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
+        posV.set(px, y - this.palmSink * s, pz);   // sink = authored trunk-base height × instance scale → plants at any size
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);

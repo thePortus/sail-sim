@@ -159,6 +159,7 @@ export class TerrainService {
     }
 
     this.buildTerrainMesh();
+    this.setupGroundDebug();
 
   }
 
@@ -325,6 +326,37 @@ export class TerrainService {
       return (hq / quantizationLevels) * (maxElevation - minElevation) + minElevation;
     }
     return (hq / quantizationLevels) * targetPeakElevation;
+  }
+
+  // ── DEBUG: ground-truth probe for asset placement ───────────────────────────
+  // Call __markGround() in the browser console: drops magenta posts whose BOTTOM sits at exactly
+  // getElevation(x,z) on a grid around the camera target. If the post bottoms rest on the visible sand,
+  // getElevation matches the rendered terrain (so any asset float is the ASSET's base, not the height); if the
+  // posts themselves float, getElevation reads higher than the drawn surface (a terrain-sampling bug).
+  private _groundMarks: Mesh[] = [];
+  private setupGroundDebug(): void {
+    const w = window as unknown as { __markGround?: (span?: number, step?: number) => void; __clearGround?: () => void };
+    if (w.__markGround) { return; }
+    w.__clearGround = () => { for (const m of this._groundMarks) { m.dispose(); } this._groundMarks = []; };
+    w.__markGround = (span = 50, step = 5) => {
+      const scene = this.sceneService.scene, cam = this.sceneService.camera;
+      if (!scene || !cam) { return; }
+      w.__clearGround!();
+      const tgt = (cam as unknown as { getTarget?: () => Vector3 }).getTarget?.() ?? cam.position;
+      const mat = new StandardMaterial('gmark', scene);
+      mat.emissiveColor = new Color3(1, 0, 1); mat.disableLighting = true;
+      for (let dx = -span; dx <= span; dx += step) {
+        for (let dz = -span; dz <= span; dz += step) {
+          const x = tgt.x + dx, z = tgt.z + dz, y = this.getElevation(x, z);
+          const post = MeshBuilder.CreateBox('gm', { width: 0.25, depth: 0.25, height: 2 }, scene);
+          post.position.set(x, y + 1, z);   // 2 m post, centre +1 → BOTTOM exactly at getElevation
+          post.material = mat; post.isPickable = false;
+          this._groundMarks.push(post);
+        }
+      }
+      console.info(`[probe] placed ${this._groundMarks.length} magenta posts — each post BOTTOM = getElevation. __clearGround() to remove.`);
+    };
+    console.info('[probe] ground debug ready → run __markGround() in the console');
   }
 
   /** NEAREST-texel elevation — one heightfield read + decode, NO bilinear interpolation (~3–4× cheaper

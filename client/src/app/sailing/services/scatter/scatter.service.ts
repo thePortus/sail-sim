@@ -10,7 +10,7 @@ import { ThinInstancePatch } from './instancing/thin-instance-patch';
 import { IPatch } from './instancing/i-patch';
 import { GpuScatterPatch } from './instancing/gpu-scatter-patch';
 import {
-  ScatterCompute, PadBox, GRASS_WGSL, ROCKS_WGSL, DRIFT_WGSL, TREES_WGSL, PALMS_WGSL,
+  ScatterCompute, ShadowCompute, PadBox, GRASS_WGSL, ROCKS_WGSL, DRIFT_WGSL, TREES_WGSL, PALMS_WGSL,
 } from './scatter-compute';
 import { PatchManager } from './instancing/patch-manager';
 import { createGrassBlade } from './grass/grass-blade';
@@ -98,7 +98,7 @@ interface Layer {
   /** Optional smaller patch ring (in cells) — used by the fake-shadow layers so blobs only build/keep
    *  within a near radius around the camera (cheap). Undefined → the full scatter RADIUS. */
   maxRing?: number;
-  /** Identifier for debug toggles (e.g. 'shadow_palms'). */
+  /** Identifier for debug toggles (e.g. 'shadow'). */
   tag?: string;
   /** When true, ensurePatches skips this layer entirely (debug). */
   disabled?: boolean;
@@ -303,6 +303,7 @@ export class ScatterService {
     // register pass recreates them — and a /reloadassets rebuild may land on a different engine).
     for (const sc of this.scatterComputes.values()) { sc.dispose(); }
     this.scatterComputes.clear();
+    this.shadowCompute?.dispose(); this.shadowCompute = null;
     const meshes = new Set<Mesh>(), mats = new Set<Material>();
     for (const l of this.layers) {
       for (const [, p] of l.patches) { p?.dispose(); }
@@ -313,8 +314,11 @@ export class ScatterService {
     }
     for (const m of meshes) { m.dispose(); }
     for (const mm of mats) { mm.dispose(); }
-    // Static far-forest layer (own meshes + materials; textures are shared with the ring impostors above).
-    for (const m of this.farMeshes) { m.material?.dispose(); m.dispose(); }
+    // Static far-forest layer: per variant ONE shared material across its (hidden template + chunk clones),
+    // so dedupe material disposal — and textures are shared with the ring impostors above (don't force-dispose).
+    const farMats = new Set<Material>();
+    for (const m of this.farMeshes) { if (m.material) { farMats.add(m.material); } m.dispose(); }
+    for (const mm of farMats) { mm.dispose(); }
     this.farMeshes = [];
     this.beechImpostors = [];
     this.layers = [];
@@ -406,6 +410,12 @@ export class ScatterService {
 
   /** Lazily-created per-kernel dispatchers (each owns its UBO → one dispatch per kernel per frame). */
   private readonly scatterComputes = new Map<string, ScatterCompute>();
+  /** Lazily-created MERGED shadow dispatcher — runs all four asset shadow kernels into one patch buffer
+   *  (one draw) instead of four separate layers. */
+  private shadowCompute: ShadowCompute | null = null;
+  /** Merged shadow patch instance capacity — holds the four kinds' blobs together (rocks 576 + drift 400
+   *  + trees 256 + palms 196 ≈ 1428; rounded up). A patch rarely carries all four at once. */
+  private static readonly SHADOW_GPU_CAPACITY = 1536;
 
   /** True when this session should place scatter on the GPU (WebGPU + not opted out). A/B escape
    *  hatch: localStorage.setItem('ignis_scatter_gpu','0') + reload forces the CPU builders. */
@@ -458,6 +468,45 @@ export class ScatterService {
       shadowMode ? false : cfg.color,   // shadow discs must not gain a 'color' kind either
     );
     this.getCompute(kind).enqueue(patch, cx, cz, variant, this.PATCH, this.densityMul, pads, shadowMode);
+    return patch;
+  }
+
+  private getShadowCompute(): ShadowCompute {
+    if (!this.shadowCompute) {
+      const scene = this.sceneService.scene;
+      this.shadowCompute = new ShadowCompute(
+        scene.getEngine() as import('@babylonjs/core').WebGPUEngine, scene,
+        () => this.terrainService.getHeightFieldGPU(),
+      );
+    }
+    return this.shadowCompute;
+  }
+
+  /** GPU MERGED shadow patch: one buffer fed by all four asset shadow kernels (rocks/drift/trees/palms),
+   *  so the whole near-ring of asset shadows is a single thin-instance draw. Mirrors buildScatterGpu's
+   *  culling-box probe, but over the UNION of the asset bands (≈0.25–150 m) so a patch with any kind keeps
+   *  its shadows; patches fully over open sea / above the band allocate nothing. */
+  private buildShadowGpu(cx: number, cz: number): GpuScatterPatch | null {
+    const half = this.PATCH / 2;
+    const cell = this.terrainService.getCellSizeM() || 24;
+    const steps = Math.max(2, Math.min(12, Math.ceil(this.PATCH / cell) + 1));
+    let yMin = Infinity, yMax = -Infinity;
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps; j++) {
+        const y = this.terrainService.getElevationFast(cx + ((i / steps) * 2 - 1) * half, cz + ((j / steps) * 2 - 1) * half);
+        yMin = Math.min(yMin, y); yMax = Math.max(yMax, y);
+      }
+    }
+    if (yMax < 0.25 - 2 || yMin > 150 + 10) { return null; }   // entirely outside every asset band → no shadows
+
+    const pads: PadBox[] = this.townPadsNear(cx, cz).slice(0, 2);
+    const engine = this.sceneService.scene.getEngine() as import('@babylonjs/core').WebGPUEngine;
+    const patch = new GpuScatterPatch(
+      engine, new Vector3(cx, 0, cz), ScatterService.SHADOW_GPU_CAPACITY, half + 1,
+      yMin - 2, yMax + 3,   // discs lie flat on the ground → small vertical headroom
+      false,                // shadow discs carry no per-instance colour
+    );
+    this.getShadowCompute().enqueue(patch, cx, cz, this.PATCH, this.densityMul, pads);
     return patch;
   }
 
@@ -597,9 +646,17 @@ export class ScatterService {
     const take = Math.min(BUDGET, seen);
     if (!take) { return; }
 
-    // Deal each kept point to a variant, compose its thin-instance matrix.
-    const mats: number[][] = Array.from({ length: V }, () => []);
+    // Spatially CHUNK the impostors so off-screen islands frustum-cull instead of the WHOLE map drawing
+    // every frame. The old layer was one mesh per variant flagged alwaysSelectAsActiveMesh (never culled),
+    // so all 600k impostors were vertex-processed regardless of where the camera pointed. Now: one mesh per
+    // (variant, chunk); only chunks inside the view frustum draw — a big GPU vertex/fill saving (esp. after
+    // the 2× density), at the cost of a few more draw calls (only the handful of on-screen chunks).
+    const chunkM = Math.max(400, Math.max(spanX, spanZ) / 8);   // ~8 chunks across the larger span (~hundreds of m each)
+    const ncx = Math.max(1, Math.ceil(spanX / chunkM));
+    const ncz = Math.max(1, Math.ceil(spanZ / chunkM));
     const scaleV = new Vector3(), posV = new Vector3(), up = Vector3.Up(), q = new Quaternion(), mat = new Matrix();
+    // groups[variant][chunkIndex] = flat column-major matrix array for that (variant, chunk) bucket.
+    const groups: number[][][] = Array.from({ length: V }, () => Array.from({ length: ncx * ncz }, () => [] as number[]));
     for (let k = 0; k < take; k++) {
       const px = res[k * 3], pz = res[k * 3 + 1], py = res[k * 3 + 2];
       const v = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));
@@ -615,28 +672,45 @@ export class ScatterService {
       posV.set(px, py - 0.4 - convexSink, pz);
       Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, q);
       Matrix.ComposeToRef(scaleV, q, posV, mat);
-      const arr = mats[v]; mat.copyToArray(arr, arr.length);
+      const cgx = Math.min(ncx - 1, Math.max(0, Math.floor(((px - b.minX) / spanX) * ncx)));
+      const cgz = Math.min(ncz - 1, Math.max(0, Math.floor(((b.maxZ - pz) / spanZ) * ncz)));
+      const arr = groups[v][cgz * ncx + cgx]; mat.copyToArray(arr, arr.length);
     }
 
+    // One SHARED material + geometry TEMPLATE per variant (built once), then a hidden-template / per-chunk
+    // clone pattern: every chunk of a variant shares the variant's material (so still only V materials), but
+    // each chunk is its own mesh with its own bounds, so the frustum culls them independently.
+    let chunkMeshes = 0;
     for (let v = 0; v < V; v++) {
-      if (!mats[v].length) { continue; }
       const info = this.beechImpostors[v];
-      const m = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
-      if (m.material) {
-        m.material.unfreeze();                       // FarFade + haze need live per-frame uniform binds
-        new FarFadePlugin(m.material);
-        new ImpostorHazePlugin(m.material);          // aerial-perspective haze → recedes WITH the terrain (not vivid/dark)
-        this.sceneService.excludeFromPrePass(m.material);
+      const template = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
+      template.isVisible = false;                    // the template never draws — it owns the shared geometry/material
+      if (template.material) {
+        template.material.unfreeze();                // FarFade + haze need live per-frame uniform binds
+        new FarFadePlugin(template.material);
+        new ImpostorHazePlugin(template.material);    // aerial-perspective haze → recedes WITH the terrain (not vivid/dark)
+        this.sceneService.excludeFromPrePass(template.material);
       }
-      this.sceneService.excludeFromGlow(m);
-      m.renderingGroupId = 2;                         // world layer (terrain/ocean/vessels)
-      m.isPickable = false;
-      m.alwaysSelectAsActiveMesh = true;             // spans the whole map → don't frustum-cull the source
-      m.isVisible = true;
-      m.thinInstanceSetBuffer('matrix', new Float32Array(mats[v]), 16, true);
-      this.farMeshes.push(m);
+      this.sceneService.excludeFromGlow(template);
+      this.farMeshes.push(template);                 // kept alive (owns geometry+material); disposed with the layer
+      for (let ci = 0; ci < ncx * ncz; ci++) {
+        const arr = groups[v][ci];
+        if (!arr.length) { continue; }
+        const cm = template.clone(`far_beech_${v}_c${ci}`);
+        cm.makeGeometryUnique();                      // independent thin-instance storage per chunk (mirrors ThinInstancePatch)
+        cm.isVisible = true;
+        cm.isPickable = false;
+        cm.renderingGroupId = 2;                      // world layer (terrain/ocean/vessels)
+        cm.thinInstanceSetBuffer('matrix', new Float32Array(arr), 16, true);
+        cm.thinInstanceRefreshBoundingInfo(true);     // REAL world bounds → Babylon frustum-culls when off-screen
+        cm.doNotSyncBoundingInfo = true;
+        cm.freezeWorldMatrix();
+        this.sceneService.excludeFromGlow(cm);
+        this.farMeshes.push(cm);
+        chunkMeshes++;
+      }
     }
-    console.log(`[scatter] far-forest: ${take} impostors across ${this.farMeshes.length} variant meshes`);
+    console.log(`[scatter] far-forest: ${take} impostors across ${V} variants × ${chunkMeshes} frustum-culled chunks (${ncx}×${ncz} grid)`);
   }
 
   /** A GLB tree sub-layer: full mesh near, crossed-quad impostor far, swapped per-patch by distance. */
@@ -693,21 +767,33 @@ export class ScatterService {
     this.sceneService.excludeFromGlow(disc);
     this._shadowDisc = disc;
 
-    // One near-ring shadow layer per asset type (all share the disc + material + manager-clone path).
-    // GPU mode: the SAME placement kernels run with shadowMode=1 (variant -1 keeps all candidates)
-    // and emit flat blob discs instead of meshes.
-    const shadows: Array<[keyof typeof ScatterService.GPU_LAYERS, (cx: number, cz: number) => PatchData]> = [
-      ['rocks', (cx, cz) => this.buildRocks(cx, cz, -1, true)],
-      ['drift', (cx, cz) => this.buildDriftwood(cx, cz, -1, true)],
-      ['trees', (cx, cz) => this.buildTrees(cx, cz, -1, true)],
-      ['palms', (cx, cz) => this.buildPalms(cx, cz, -1, true)],
+    // ONE near-ring shadow layer for ALL asset types (was four — one per kind — = four draws per patch).
+    // The four kinds' blob placements (variant -1 keeps every candidate, shadowMode emits flat discs) are
+    // merged into a single mesh per patch: on CPU by concatenating their matrix buffers; on GPU by running
+    // all four kernels into one buffer sharing an append counter (ShadowCompute). 1 draw per patch.
+    const shadowBuilds: Array<(cx: number, cz: number) => PatchData> = [
+      (cx, cz) => this.buildRocks(cx, cz, -1, true),
+      (cx, cz) => this.buildDriftwood(cx, cz, -1, true),
+      (cx, cz) => this.buildTrees(cx, cz, -1, true),
+      (cx, cz) => this.buildPalms(cx, cz, -1, true),
     ];
-    for (const [kind, build] of shadows) {
-      const layer = this.makeShadowLayer(disc, build);
-      layer.tag = 'shadow_' + kind;   // debug toggle: shadow('palms', false) etc.
-      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu(kind, cx, cz, -1, 1); }
-      this.layers.push(layer);
-    }
+    const layer = this.makeShadowLayer(disc, (cx, cz) => this.mergeShadowPatches(shadowBuilds, cx, cz));
+    layer.tag = 'shadow';   // debug toggle: shadow('all', false)
+    if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildShadowGpu(cx, cz); }
+    this.layers.push(layer);
+  }
+
+  /** Merge the four asset-type shadow-blob builds for one patch into a SINGLE matrix buffer (one draw).
+   *  Shadow discs carry no per-instance colour, so only the matrices concatenate. */
+  private mergeShadowPatches(builds: Array<(cx: number, cz: number) => PatchData>, cx: number, cz: number): PatchData {
+    const parts = builds.map((b) => b(cx, cz).matrix);
+    let total = 0;
+    for (const m of parts) { total += m.length; }
+    if (!total) { return EMPTY_PATCH; }
+    const matrix = new Float32Array(total);
+    let off = 0;
+    for (const m of parts) { matrix.set(m, off); off += m.length; }
+    return { matrix, color: null };
   }
 
   /** A shadow sub-layer: a single-LoD (no distance swap) manager over the shared disc, capped to the
@@ -967,7 +1053,7 @@ export class ScatterService {
           if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
             if (p) {
               l.manager.removePatch(p);
-              if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+              if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } this.shadowCompute?.cancel(p); }
               p.dispose();
             }
             l.patches.delete(key);
@@ -1177,7 +1263,7 @@ export class ScatterService {
       for (const [, p] of l.patches) {
         if (p) {
           l.manager.removePatch(p);
-          if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+          if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } this.shadowCompute?.cancel(p); }
           p.dispose();
         }
       }
@@ -1196,17 +1282,17 @@ export class ScatterService {
     // Register both bare + underscored names so either form works in the console.
     w['palmSink'] = palm; w['__palmSink'] = palm;
     w['treeSink'] = tree; w['__treeSink'] = tree;
-    // Per-kind shadow toggle: shadow('drift', false) hides drift shadows (kinds: palms/trees/rocks/drift/all).
-    (w as unknown as Record<string, (k: string, on?: boolean) => void>)['shadow'] = (kind: string, on = false) => {
+    // Shadow toggle: shadow(false) hides ALL asset shadows (now one merged layer; arg kept for back-compat).
+    (w as unknown as Record<string, (k?: unknown, on?: boolean) => void>)['shadow'] = (_kind?: unknown, on = false) => {
       for (const l of this.layers) {
-        if (l.tag === 'shadow_' + kind || (kind === 'all' && l.tag?.startsWith('shadow_'))) {
+        if (l.tag === 'shadow') {
           l.disabled = !on;
           for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
           l.patches.clear();
         }
       }
       this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to re-scan
-      console.info(`[probe] shadow '${kind}' ${on ? 'ON' : 'OFF'}`);
+      console.info(`[probe] shadows ${on ? 'ON' : 'OFF'}`);
     };
     console.info('[probe] tuners ready → palmSink(0.7) · treeSink(0.35) · shadow("drift",false)');
   }

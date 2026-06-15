@@ -497,3 +497,114 @@ export class ScatterCompute {
     this.params.dispose();
   }
 }
+
+/** The four asset SHADOW kernels (rocks/drift/trees/palms in shadowMode) merged into one dispatcher.
+ *  Per patch it runs all four kernels into the SAME buffers sharing ONE atomic append counter — reset
+ *  once, read back once — so every asset's near-ring shadow blobs pack contiguously into a SINGLE
+ *  thin-instance mesh (1 draw) instead of four. (WebGPU auto-synchronises between compute passes, so the
+ *  later kernels' atomicAdd continues from the running total written by the earlier ones.) The kernels are
+ *  unchanged: they already emit flat discs when params.extra.x (shadowMode) = 1. */
+export class ShadowCompute {
+  private readonly kernels: Array<{ cs: ComputeShader; res: number }> = [];
+  private readonly params: UniformBuffer;
+  private readonly queue: Array<{
+    patch: GpuScatterPatch; cx: number; cz: number; patchSize: number; densityMul: number; pads: PadBox[];
+  }> = [];
+  private observer: Observer<Scene> | null = null;
+
+  constructor(engine: WebGPUEngine, private readonly scene: Scene,
+              private readonly getHeightField: () => HeightFieldGPU | null) {
+    this.params = new UniformBuffer(engine);
+    this.params.addUniform('patchCenter', 2);
+    this.params.addUniform('patchSize', 1);
+    this.params.addUniform('densityMul', 1);
+    this.params.addUniform('variant', 1);
+    this.params.addUniform('capacity', 1);
+    this.params.addUniform('texSize', 2);
+    this.params.addUniform('wbounds', 4);
+    this.params.addUniform('pad0a', 4);
+    this.params.addUniform('pad0b', 4);
+    this.params.addUniform('pad1a', 4);
+    this.params.addUniform('pad1b', 4);
+    this.params.addUniform('extra', 4);
+
+    const SHADOW_KERNELS: Array<[string, string]> = [
+      ['rocks', ROCKS_WGSL], ['drift', DRIFT_WGSL], ['trees', TREES_WGSL], ['palms', PALMS_WGSL],
+    ];
+    for (const [kind, wgsl] of SHADOW_KERNELS) {
+      const cs = ComputeHelper.createShader(engine, `scatter_shadow_${kind}`, wgsl, 'main', {
+        mats:      { group: 0, binding: 0 },
+        cols:      { group: 0, binding: 1 },
+        counter:   { group: 0, binding: 2 },
+        heightTex: { group: 0, binding: 3 },
+        params:    { group: 0, binding: 4 },
+      });
+      cs.setUniformBuffer('params', this.params);
+      this.kernels.push({ cs, res: KERNEL_RES[kind] ?? 24 });
+    }
+
+    this.observer = scene.onBeforeRenderObservable.add(() => this.drainOne());
+  }
+
+  enqueue(patch: GpuScatterPatch, cx: number, cz: number,
+          patchSize: number, densityMul: number, pads: PadBox[]): void {
+    this.queue.push({ patch, cx, cz, patchSize, densityMul, pads });
+  }
+
+  private drainOne(): void {
+    if (!this.queue.length) { return; }
+    const hf = this.getHeightField();
+    if (!hf) { return; }   // terrain height texture not built yet — retry next frame
+
+    const { patch, cx, cz, patchSize, densityMul, pads } = this.queue[0];
+
+    // One shared param block for all four kernels (same patch; variant -1 keeps every candidate; shadowMode 1).
+    this.params.updateFloat2('patchCenter', cx, cz);
+    this.params.updateFloat('patchSize', patchSize);
+    this.params.updateFloat('densityMul', densityMul);
+    this.params.updateFloat('variant', -1);
+    this.params.updateFloat('capacity', patch.capacity);
+    this.params.updateFloat2('texSize', hf.texSize.x, hf.texSize.y);
+    this.params.updateVector4('wbounds', hf.wbounds);
+    const p0 = pads[0], p1 = pads[1];
+    this.params.updateFloat4('pad0a', p0?.cx ?? 0, p0?.cz ?? 0, p0?.hx ?? 0, p0?.hz ?? 0);
+    this.params.updateFloat4('pad0b', p0?.sin ?? 0, p0?.cos ?? 1, p0 ? 1 : 0, 0);
+    this.params.updateFloat4('pad1a', p1?.cx ?? 0, p1?.cz ?? 0, p1?.hx ?? 0, p1?.hz ?? 0);
+    this.params.updateFloat4('pad1b', p1?.sin ?? 0, p1?.cos ?? 1, p1 ? 1 : 0, 0);
+    this.params.updateFloat4('extra', 1, 0, 0, 0);   // shadowMode = 1 → emit flat discs
+    this.params.update();
+
+    // Point every kernel at the SAME patch buffers + the shared append counter.
+    for (const { cs } of this.kernels) {
+      cs.setStorageBuffer('mats', patch.mats);
+      cs.setStorageBuffer('cols', patch.cols);
+      cs.setStorageBuffer('counter', patch.counter);
+      cs.setTexture('heightTex', hf.tex, false);
+    }
+
+    // Reset the shared counter ONCE (queue-ordered → lands before the dispatches), then run all four; each
+    // kernel's atomicAdd continues from the prior total, so the discs compact into one contiguous buffer.
+    patch.counter.update(new Uint32Array([0]));
+    for (const { cs, res } of this.kernels) {
+      if (!ComputeHelper.dispatch(cs, res, res, 1)) { return; }   // a kernel still compiling — retry the whole patch next frame
+    }
+    this.queue.shift();
+
+    patch.counter.read().then((buf) => {
+      patch.setCount(new Uint32Array(buf.buffer, buf.byteOffset, 1)[0]);
+    }).catch(() => { /* engine torn down mid-read — patch is being disposed anyway */ });
+  }
+
+  /** Drop queued jobs for a disposed patch (patch culling can outrun the one-per-frame drain). */
+  cancel(patch: GpuScatterPatch): void {
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      if (this.queue[i].patch === patch) { this.queue.splice(i, 1); }
+    }
+  }
+
+  dispose(): void {
+    if (this.observer) { this.scene.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
+    this.queue.length = 0;
+    this.params.dispose();
+  }
+}

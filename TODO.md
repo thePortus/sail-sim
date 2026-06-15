@@ -6,15 +6,18 @@
 * add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping... make merchants flee if your faction is bad enough (or attack if you get close enough) (make AI strategy consider relative ship powers)
 * fix pinnace water displacement
 * better latency handling
+* add brigantine
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * add occasional bosun whistle (no more than once a day)
+* Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
+* Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * grapeshot doesn't make cannonball impacts on the water
 * lod + imposters for ships at distance
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * any way to reduce load times?
-* streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
+* streaming assets has gotten weird, trees move in and out.. can we make them fade in?
 * server is disconnected message
 * Plan to make towns or areas "different"... things to see, special marvels
 * For landscape.... distant trees scattered and then node material editor PBR
@@ -24,28 +27,13 @@
 * shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
 * shader for water on camera https://www.shadertoy.com/view/ltffzl
 * docking tie up animation
-* keypress makes songs lock up
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
-* adjust water displacement to better fit hull of pinnace
-* add dedication
-* draw distance (for other players, etc)
 * add damage from collisions and aground
-* Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * add keymap help screen
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
-* add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
-* fix tree height
-* persistent logoff locations & serverside authoritative location
 * tidal pull?
-* introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
-* add in damage morph targets
 * Bring DRACO compression in, remove any CDNs
-* Add in town geometries (just worry about piers at first)
-* Add in towns themselves
-* Add repairing
-* Add sailors on deck
-* Add ship names
 * Add /teleport playername x y and /teleportTo playername to admins
 * Add lost server connection detection
 * encrypt websocket server? wss instead of ws?

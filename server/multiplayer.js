@@ -1358,6 +1358,28 @@ function attachMultiplayer(server) {
             }
           }
 
+        } else if (text.startsWith('/crew ')) {
+          // /crew "<player>" — fully re-crew another player's ship to its complement (admin courtesy). Mirrors
+          // /repair: sets crew to maxCrew, clears any partial wound, persists, and broadcasts the new crew_state.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may re-crew players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/crew '.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              target.maxCrew = crewFor(target.ship);   // recompute from the owned vessel in case the ship changed
+              target.crew = target.maxCrew;
+              target.crewWound = 0;
+              saveCombatState(target);                  // persist the new crew count (same column as recruit)
+              broadcastCrew(targetId, target, players); // everyone's crew HUD/scaling updates
+              sysReply(target.ws, `Your crew has been brought back to full strength (${target.crew}) by the admins.`);
+              sysReply(me.ws, `Re-crewed "${name}" to ${target.crew}/${target.maxCrew}.`);
+            }
+          }
+
         } else if (text.startsWith('/givegold ')) {
           // /givegold "<player>" <amount> — gift gold to another player (admin). Amount is a positive integer.
           const me = players.get(id);

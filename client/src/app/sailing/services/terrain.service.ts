@@ -15,6 +15,7 @@ import {
   InstancedMesh,
   DirectionalLight,
   StandardMaterial,
+  Material,
   Matrix,
   VertexData,
   RawTexture,
@@ -166,6 +167,16 @@ export class TerrainService {
   // ── Terrain clipmap (camera-centric LoD, GPU displacement + Sobel normals) ───
   private clipmap: TerrainClipmap | null = null;
   private clipmapObserver: import('@babylonjs/core').Observer<Scene> | null = null;
+  // Self-heal for the rare cold-start failure where the terrain material's WebGPU shader never compiles
+  // (the failure surfaces as a swallowed promise rejection, NOT Material.onError — see the onCompiled note in
+  // buildTerrainMaterialPBR), so the terrain silently never renders (land invisible; water + scatter fine)
+  // until a manual page refresh. A watchdog rebuilds the clipmap = an automatic "refresh" if it doesn't
+  // report compiled within CLIPMAP_HEAL_MS, bounded by CLIPMAP_HEAL_MAX so a genuinely-slow machine can't loop.
+  private terrainMatCompiled = false;
+  private clipmapHealAttempts = 0;
+  private clipmapHealTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly CLIPMAP_HEAL_MS = 6000;
+  private readonly CLIPMAP_HEAL_MAX = 3;
 
   /** Build the camera-centric clipmap and render it with the terrain material in clipmap mode
    *  (vertex height displacement + fragment Sobel normals). This IS the terrain render — no static
@@ -178,7 +189,14 @@ export class TerrainService {
 
     // Dispose any prior clipmap (e.g. a quality-driven rebuild).
     if (this.clipmapObserver) { scene.onBeforeRenderObservable.remove(this.clipmapObserver); this.clipmapObserver = null; }
-    this.clipmap?.dispose();
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
+    if (this.clipmap) {
+      // Un-enroll the old rings from the ocean reflection RTT BEFORE disposing them: TerrainClipmap.dispose()
+      // frees the meshes but can't know about the RTT, and leaving disposed refs in the render list is the
+      // descriptor-heap leak pattern. Fires on every rebuild — quality change AND the self-heal retry.
+      for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
+      this.clipmap.dispose();
+    }
     this.clipmap = null;
 
     // PBRCustomMaterial terrain skin (aux-driven PBR) is now the DEFAULT; the Standard skin remains
@@ -188,6 +206,11 @@ export class TerrainService {
     const usePBR = this.isTerrainPBREnabled();
     const mat = usePBR ? this.buildTerrainMaterialPBR(scene, m) : this.buildTerrainMaterial(scene, m, true);
     mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
+    // Track the WebGPU shader compile so the watchdog below can tell a healthy build from the cold-start
+    // compile-failure that silently hides the terrain. onCompiled fires ONLY on success (a failure is a
+    // swallowed promise rejection), so its arrival is our positive "the terrain will render" signal.
+    this.terrainMatCompiled = false;
+    mat.onCompiled = () => { this.terrainMatCompiled = true; this.clipmapHealAttempts = 0; console.info('[terrain] clipmap shader compiled OK'); };
 
     // Publish the heightfield so the volumetric clouds can march it for terrain occlusion (the clipmap
     // displaces in the vertex shader, which the depth renderers can't see → clouds need the heights).
@@ -211,6 +234,31 @@ export class TerrainService {
     }
 
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('clipmap', () => this.clipmap?.update()));
+    this.scheduleClipmapHeal(mat);
+  }
+
+  /** Watchdog for the cold-start terrain-shader compile failure. If the material hasn't reported compiled (and
+   *  isn't otherwise render-ready) a few seconds after a build, the WebGPU shader almost certainly failed to
+   *  compile — a swallowed rejection that leaves the land invisible until a manual refresh. Rebuilding the
+   *  clipmap re-attempts the compile (auto-"refresh"); the generous timeout + isReady check avoid false
+   *  positives on a slow machine, and the attempt cap prevents an unbroken-compile loop. */
+  private scheduleClipmapHeal(mat: Material): void {
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); }
+    this.clipmapHealTimer = setTimeout(() => {
+      this.clipmapHealTimer = null;
+      const meshes = this.clipmap?.allMeshes() ?? [];
+      // Healthy: the shader reported compiled, or the material is render-ready for the live clipmap meshes.
+      const looksReady = meshes.length > 0 && meshes[0].material === mat && mat.isReady(meshes[0]);
+      if (this.terrainMatCompiled || looksReady) { this.clipmapHealAttempts = 0; return; }
+      if (!this.clipmap) { return; }   // torn down meanwhile
+      if (this.clipmapHealAttempts >= this.CLIPMAP_HEAL_MAX) {
+        console.error('[terrain] clipmap shader failed to compile after retries — terrain may be invisible; please reload.');
+        return;
+      }
+      this.clipmapHealAttempts++;
+      console.warn(`[terrain] clipmap shader not compiled ${this.CLIPMAP_HEAL_MS} ms after build (WebGPU cold-start race) — rebuilding (self-heal ${this.clipmapHealAttempts}/${this.CLIPMAP_HEAL_MAX}).`);
+      this.buildClipmap();   // re-creates the material → re-attempts the compile, and re-arms this watchdog
+    }, this.CLIPMAP_HEAL_MS);
   }
 
   isReady(): boolean {
@@ -241,7 +289,11 @@ export class TerrainService {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.clipmapObserver);
       this.clipmapObserver = null;
     }
-    this.clipmap?.dispose();
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
+    if (this.clipmap) {
+      for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
+      this.clipmap.dispose();
+    }
     this.clipmap = null;
     this.terrainMesh?.dispose();
     this.terrainMesh = null;
@@ -2854,11 +2906,10 @@ export class TerrainService {
       }
     });
 
-    // TEMP DIAGNOSTIC (remove once S0-S3 verified): WebGPU SPIR-V compile failures surface as
-    // unhandled promise rejections, NOT via Material.onError. onCompiled DOES fire on success, so this
-    // is our deterministic "the PBR terrain shader actually compiled" signal in the console.
-    mat.onCompiled = () => console.info('[TerrainPBR] shader compiled OK');
-
+    // NOTE: WebGPU SPIR-V compile failures for this material surface as unhandled promise rejections, NOT via
+    // Material.onError; onCompiled fires ONLY on success. buildClipmap() sets mat.onCompiled (the positive
+    // "it actually compiled" signal) and runs a watchdog that rebuilds the clipmap if it never fires — the
+    // self-heal for the cold-start race that otherwise leaves the terrain invisible until a manual refresh.
     this.terrainMaterialPBR = mat;
     return mat;
   }

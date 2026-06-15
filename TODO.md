@@ -2,16 +2,16 @@
 
 # General or Current TODO Items
 
-* ever so occasionally, the terrain never loads. Must be some kind of loading error because refresh fixes... but when it happens there are no console errors. Water is there, just all land is not visible, though scatter assets show like they are laying over invisible landscape.
 * fix pinnace water displacement
 * add brigantine
+* intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * add occasional bosun whistle (no more than once a day)
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
+* lod + imposters for ships at distance... same towns
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * grapeshot doesn't make cannonball impacts on the water
-* lod + imposters for ships at distance... same towns
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant

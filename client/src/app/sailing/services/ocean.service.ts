@@ -1900,6 +1900,9 @@ export class OceanService {
   // Baked hull beam-profile cut (texture-free → no sampler; Mac/Metal caps samplers at 16). The
   // profile is half-beam vs along-position; the ocean shader cuts sea inside it AND above waterY.
   static readonly HULL_CUT_N = 96;      // along-bins (must match the shader's array size × 4)
+  // Height-aware silhouette (the DISCARD path): NA along × NH height; the table is NA*NH = 384 floats = 96 vec4.
+  static readonly HULL_SIL_NA = 48;
+  static readonly HULL_SIL_NH = 8;
   private hullCutOn       = 0;
   private hullCutProfile  = new Array<number>(OceanService.HULL_CUT_N).fill(0);
   private hullCutAlongMin = 0;
@@ -1907,6 +1910,13 @@ export class OceanService {
   private hullCutAcrossCenter = 0;
   private hullCutAlongSign = 1;         // +1 if the boat's forward (BoatDir) is +root-Z, else -1
   private hullCutWaterY   = -1.0e9;     // world Y of the boat's floor; sea ABOVE this (in hull) is cut
+  // Discard path (height-aware occlusion): the 2-D hull silhouette + the boat's root world-Y (height ref).
+  private hullSilTable    = new Array<number>(OceanService.HULL_SIL_NA * OceanService.HULL_SIL_NH).fill(0);
+  private hullSilHMin     = 0;
+  private hullSilHMax     = 1;
+  private hullSilRootY    = -1.0e9;     // boat root world-Y; the live wave height on the hull = waveY − this
+  private hullTiltPitch   = 0;          // boat pitch (rad, +bow-up) — tilts the per-pixel hull height so a heeled/
+  private hullTiltRoll    = 0;          // boat roll  (rad, +stbd-down)  hull's waterline is read correctly (no slivers)
 
   /** Install the baked hull beam profile for the local boat's interior cut (once, on load).
    *  alongSign maps the boat's forward heading to +root-Z (flip if bow/stern read swapped). */
@@ -1927,12 +1937,35 @@ export class OceanService {
    *  sea below it is kept, so when the boat lifts on a trough you never see through the ocean. */
   setHullCutWaterY(y: number): void { this.hullCutWaterY = y; }
 
+  /** Install the HEIGHT-AWARE hull silhouette (the discard path) — half-beam vs (along, height). */
+  setHullSilhouette(table: Float32Array, hMin: number, hMax: number): void {
+    const N = OceanService.HULL_SIL_NA * OceanService.HULL_SIL_NH;
+    for (let i = 0; i < N; i++) { this.hullSilTable[i] = table[i] ?? 0; }
+    this.hullSilHMin = hMin; this.hullSilHMax = hMax;
+  }
+  /** Per-frame: the boat's ROOT world-Y — the reference the per-pixel wave height is measured against so
+   *  the discard outline rides the bob (live wave height on the hull = ocean surface Y − this). */
+  setHullCutRootY(y: number): void { this.hullSilRootY = y; }
+  /** Per-frame: the boat's pitch + roll (rad) so the discard reads the hull's waterline height correctly when
+   *  it's heeled/pitched (a tilted hull's edge sits higher/lower across the beam than a flat read would say). */
+  setHullCutTilt(pitchRad: number, rollRad: number): void { this.hullTiltPitch = pitchRad; this.hullTiltRoll = rollRad; }
+
+  /** STENCIL-mask mode: the FFT ocean is masked out of the hull by a stencil proxy (true geometry, no shader
+   *  cut) instead of the per-pixel carve/discard. OceanFFTRenderer watches this and toggles the stencil test
+   *  on its materials + the group-0 draw order. Set by VesselService when a hullCut vessel runs in this mode. */
+  private hullStencilMask = false;
+  setHullStencilMask(on: boolean): void { this.hullStencilMask = on; }
+
   /** Local boat interior-cut state, consumed by the FFT ocean material (ocean-material.ts). */
   getHullCut(): { on: number; profile: number[]; alongMin: number; alongLen: number;
-                  acrossCenter: number; alongSign: number; waterY: number } {
+                  acrossCenter: number; alongSign: number; waterY: number;
+                  sil: number[]; hMin: number; hMax: number; rootY: number; pitch: number; roll: number;
+                  stencilMask: boolean } {
     return { on: this.hullCutOn, profile: this.hullCutProfile, alongMin: this.hullCutAlongMin,
              alongLen: this.hullCutAlongLen, acrossCenter: this.hullCutAcrossCenter,
-             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY };
+             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY,
+             sil: this.hullSilTable, hMin: this.hullSilHMin, hMax: this.hullSilHMax, rootY: this.hullSilRootY,
+             pitch: this.hullTiltPitch, roll: this.hullTiltRoll, stencilMask: this.hullStencilMask };
   }
 
   /**

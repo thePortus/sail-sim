@@ -8,7 +8,7 @@ import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoade
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
-import { bakeHullCutProfile } from './ocean-fft/hull-cut-mask';
+import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
@@ -96,6 +96,8 @@ export class VesselService {
   // Water-contact shadow projected beneath the hull.
   private waterShadow: Mesh | null = null;
   private waterShadowMat: StandardMaterial | null = null;
+  /** Hull-stencil proxy (stencil mode only) — masks the FFT sea out of the open hull. Parented to root. */
+  private hullStencilCap: Mesh | null = null;
 
   // ── PBR material / texture pools ─────────────────────────────────────────
   private matPool         = new Map<string, PBRMaterial>();
@@ -398,14 +400,49 @@ export class VesselService {
    *  off otherwise). Local boat only — the ocean shader tracks a single boat transform. The per-frame
    *  floor height (waterY) is pushed from the physics loop so the cut rides the bob. */
   private applyHullCut(): void {
+    // Tear down any stencil proxy from a previous hull (vessel swap/reload re-runs this); default both cut
+    // modes off until re-enabled below.
+    this.hullStencilCap?.dispose(false, true);
+    this.hullStencilCap = null;
+    this.oceanService.setHullStencilMask(false);
     const hc = this.rig.hullCut;
     if (!hc || !this.root) { this.oceanService.setHullCutEnabled(false); return; }
     const hull = this.root.getChildMeshes()
       .find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
-    const baked = hull ? bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N) : null;
+    // Footprint = the WIDEST-beam (gunwale/deck) outline, NOT the waterline contour. The dry region the cut
+    // must cover is the whole open COCKPIT, which extends out to the gunwales; the narrower waterline slice
+    // left the outer cockpit (and bow/stern flare) un-cut → waves flooded it. The gunwale outline also robustly
+    // avoids any "where is the waterline in this hull's frame?" guess. `waterlineY` (a per-rig opt-in) still
+    // forces a true waterline slice if ever wanted, but the pinnace omits it → widest-beam.
+    const baked = hull ? bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N, hc.waterlineY) : null;
     if (!baked) { this.oceanService.setHullCutEnabled(false); return; }
     this.oceanService.setHullCutProfile(
       baked.profile, baked.alongMin, baked.alongLen, baked.acrossCenter, hc.alongSign);
+    // Also bake the HEIGHT-AWARE silhouette (along × height) for the discard path (used only when the ocean
+    // shader is built with HULL_DISCARD; the along meta is shared with the profile above via _HullCutMeta).
+    const sil = bakeHullSilhouette(hull, this.root, OceanService.HULL_SIL_NA, OceanService.HULL_SIL_NH);
+    if (sil) { this.oceanService.setHullSilhouette(sil.table, sil.hMin, sil.hMax); }
+
+    // STENCIL mask mode (localStorage.ignis_hullcut === 'stencil'): mask the sea out of the hull with a
+    // stencil proxy built from the boat's real geometry — perfect silhouette adherence, no carve, no tears.
+    // The shader cut (carve/discard) stays OFF so the two can't fight. (FFT/WebGPU only; on the procedural
+    // ocean this no-ops and the boat just shows a little interior water until the user is back on FFT.)
+    const mode = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
+    if (mode === 'stencil' && hull) {
+      // TRUE-3D proxy: clone the live hull mesh (shared geometry + skeleton) and stamp it into the stencil
+      // buffer. A boat's cross-section changes with height, so no flat sheet matches it at every angle — a
+      // gunwale-height lid floats above the sea (parallax), a waterline lid pokes its wide outline past the
+      // narrower waterline hull (a skirt). The hull's own geometry is the only silhouette that's exactly
+      // right from any camera, so we mask to that. (FFT/WebGPU only; no-ops visually on the procedural ocean.)
+      const scene = this.sceneService.scene;
+      this.hullStencilCap = buildHullStencilProxy(hull, this.root, scene);
+      if (this.hullStencilCap) {
+        this.oceanService.setHullStencilMask(true);
+        this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
+        return;
+      }
+    }
+
     this.oceanService.setHullCutEnabled(true);
   }
 
@@ -1056,6 +1093,12 @@ export class VesselService {
     // sea inside the hull above this is removed (dry), below it is kept (no see-through on a trough).
     if (this.rig.hullCut) {
       this.oceanService.setHullCutWaterY(this.root.position.y + this.rig.hullCut.floorY);
+      // Discard path: the boat's ROOT world-Y is the height reference (silhouette heights are root-local, ~0 at
+      // the waterline), so the per-pixel wave height ON the hull = ocean surface Y − this, riding the bob.
+      this.oceanService.setHullCutRootY(this.root.position.y);
+      // …plus the boat's full pitch/roll so the discard reads the heeled hull's waterline correctly (no slivers).
+      // NOTE: rotation is set later in this method — read NEXT frame's value here, a 1-frame lag that's invisible.
+      this.oceanService.setHullCutTilt(this.root.rotation.x, this.root.rotation.z);
     }
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
@@ -1071,7 +1114,7 @@ export class VesselService {
     const cap = capsizeFor(this.combatService.zones(), hullMax);
 
     this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
-    this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv;
+    this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv + (this.rig.trimPitch ?? 0);
 
     // ── Rigged vessel drive (per-vessel controller via the VesselController interface) ─────────
     if (this.controller) {

@@ -6,13 +6,14 @@
  * between it and the classic procedural ocean.
  */
 import { Injectable, inject } from '@angular/core';
-import { Observer, Scene, Material, Mesh, Vector3 } from '@babylonjs/core';
+import { Constants, Observer, Scene, Material, Mesh, SubMesh, Vector3 } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { OceanFFTEngine } from './ocean-fft-engine.service';
 import { MultiplayerService } from './multiplayer.service';
 import { OceanGeometry } from './ocean-fft/ocean-geometry';
 import { OceanFFTMaterial } from './ocean-fft/ocean-material';
+import { HULL_STENCIL_REF } from './ocean-fft/hull-cut-mask';
 import { WakeTracker } from './ocean-fft/wake-tracker';
 
 @Injectable({ providedIn: 'root' })
@@ -36,6 +37,7 @@ export class OceanFFTRenderer {
   private _mode: 'off' | 'fft' = 'off';
   private _startTime = 0;
   private _keyHandler: ((e: KeyboardEvent) => void) | null = null;
+  private _stencilMaskOn = false;
 
   get isAvailable(): boolean { return this._geometry !== null; }
   get isEnabled(): boolean { return this._enabled; }
@@ -110,6 +112,7 @@ export class OceanFFTRenderer {
       if (this._enabled) {
         this._geometry!.update();
         this._updateWakes(scene);
+        this._syncStencilMask();
       }
     }));
 
@@ -139,6 +142,40 @@ export class OceanFFTRenderer {
     this._wakeTracker.assemble(cam.x, cam.z);
   }
 
+  /**
+   * Mirror OceanService's hull-stencil-mask flag onto the live FFT surface (changes only — cheap to poll).
+   * When ON: every cascade material rejects pixels the hull-stencil proxy stamped (stencil == REF), so the
+   * sea is masked out of the hull by true geometry; and a group-0 opaque sort draws that proxy FIRST so its
+   * stencil is laid down before the water reads it (proxy + ocean share renderingGroup 0). When OFF: restore
+   * the default (stencil test off, default opaque order). Set by VesselService for a hullCut vessel in
+   * stencil mode (localStorage.ignis_hullcut === 'stencil').
+   */
+  private _syncStencilMask(): void {
+    const want = this.oceanService.getHullCut().stencilMask === true;
+    if (want === this._stencilMaskOn) { return; }
+    this._stencilMaskOn = want;
+    for (const m of this._realMaterials) {
+      m.stencil.enabled            = want;
+      m.stencil.func               = Constants.NOTEQUAL;   // draw only where the proxy did NOT stamp
+      m.stencil.funcRef            = HULL_STENCIL_REF;
+      m.stencil.funcMask           = 0xff;
+      m.stencil.mask               = 0x00;                 // the ocean never writes stencil itself
+      m.stencil.opStencilDepthPass = Constants.KEEP;
+      m.stencil.opStencilFail      = Constants.KEEP;
+      m.stencil.opDepthFail        = Constants.KEEP;
+    }
+    // Force the stencil proxy to render before the rest of group 0 (the FFT ocean lives there too, and
+    // opaque draw order is otherwise undefined → the proxy would stamp too late). Comparator hoists the
+    // proxy and leaves every other submesh's relative order intact (stable sort).
+    this.sceneService.scene.setRenderingOrder(0, want
+      ? (a: SubMesh, b: SubMesh) => {
+          const pa = a.getMesh().metadata?.stencilProxy ? 0 : 1;
+          const pb = b.getMesh().metadata?.stencilProxy ? 0 : 1;
+          return pa - pb;
+        }
+      : null);
+  }
+
   /** Switch to the FFT ocean (or back to procedural). Pre-compiles and aborts safely on failure. */
   async toggleFFT(): Promise<void> {
     if (!this._geometry || !this._material) { return; }
@@ -159,22 +196,25 @@ export class OceanFFTRenderer {
     this._enabled = true;
     this._geometry.root.setEnabled(true);
     this.oceanService.setHidden(true);
-    // Float the boat on the actual FFT surface, with the same boat-footprint calming as the
-    // material so the hull agrees with the (calmed) water around it.
-    this.oceanService.setHeightProvider((x, z) => {
-      const h = this.fft.getHeightAt(x, z);
-      if (Number.isNaN(h)) { return h; }
-      const b = this.oceanService.getBoatWake();
-      const d = Math.hypot(x - b.x, z - b.z);
-      const s = Math.max(0, Math.min(1, (d - 6) / (16 - 6)));   // smoothstep(6,16)
-      return h * (0.45 + 0.55 * (s * s * (3 - 2 * s)));
-    });
+    // Float the boat on the ACTUAL FFT surface — no calming. The radial-disc calming that used to be
+    // mirrored here (matching the material) is gone: it flattened the wave the hull sampled, so the boat
+    // barely bobbed. The buoyancy service samples this at 8 hull points, so returning the true swell makes
+    // the pinnace heave/pitch/roll again, while the exact waterline-contour depression (in the material,
+    // riding hullCutWaterY = the boat's floor) keeps the open hull dry as it bobs.
+    this.oceanService.setHeightProvider((x, z) => this.fft.getHeightAt(x, z));
   }
 
   private _disable(): void {
     if (!this._geometry) { return; }
     this._enabled = false;
     this._mode = 'off';
+    // Drop any stencil-mask state before the procedural ocean takes over (its meshes share group 0/2 and
+    // must not inherit our group-0 draw-order override or a stale stencil test).
+    if (this._stencilMaskOn) {
+      this._stencilMaskOn = false;
+      this._realMaterials.forEach((m) => { m.stencil.enabled = false; });
+      this.sceneService.scene.setRenderingOrder(0, null);
+    }
     this._geometry.root.setEnabled(false);
     this.oceanService.setHidden(false);
     this.oceanService.setHeightProvider(null);   // back to the procedural height model

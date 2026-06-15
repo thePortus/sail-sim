@@ -44,16 +44,22 @@ export interface VesselRig {
   controller: 'sloop' | 'pinnace';
   /** Extra metres to raise the hull out of the water (a shallow open boat shows the surface otherwise). */
   floatDraft: number;
+  /** Resting fore-aft trim bias (radians, + = BOW-UP / stern-down) — models a rearward centre of gravity so a
+   *  bow-heavy boat doesn't lean forward under sail and lift its rudder clear of the water. Omit → 0 (level). */
+  trimPitch?: number;
   /** Clip the sea out of the hull's INTERIOR (open, low-sitting boats only) so wave crests never show
    *  inside the floor while the sea still laps the outer planking. Uses a baked hull-silhouette mask +
    *  a height-aware cut (see OceanService.setHullCutProfile / bakeHullCutProfile). Omit → no cut.
    *   - floorY:    metres above the vessel root origin of the cockpit floor; sea inside the hull ABOVE
    *                this world height is cut (dry interior), below it is kept (no see-through on troughs).
-   *   - alongSign: +1 if the boat's forward heading is +Z in the root frame; flip to -1 if bow/stern read swapped. */
-  hullCut?: { floorY: number; alongSign: 1 | -1 };
-  /** Per-vessel buoyancy feel (omit → generic sloop response). pitchScale lower = gentler bow
-   *  pitch; heaveTau higher = slower, less "bouncy" vertical follow. See VesselBuoyancyService. */
-  buoyancy?: { pitchScale?: number; heaveTau?: number };
+   *   - alongSign: +1 if the boat's forward heading is +Z in the root frame; flip to -1 if bow/stern read swapped.
+   *   - waterlineY: root-local Y of the waterline plane the footprint is SLICED at (the rig origin is authored
+   *                 at the waterline, so 0 is right; nudge ± if the cut sits a touch high/low on the hull). */
+  hullCut?: { floorY: number; alongSign: 1 | -1; waterlineY?: number };
+  /** Per-vessel buoyancy feel (omit → generic sloop response). pitchScale = how far the wave slope tilts it;
+   *  heaveTau = vertical-follow time constant (LOWER = rides waves more, sits at an average level less);
+   *  tiltTau = pitch/roll time constant (LOWER = snaps onto the slope + drops back faster). See VesselBuoyancyService. */
+  buoyancy?: { pitchScale?: number; heaveTau?: number; tiltTau?: number };
   /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
   hullHalfLen: number;
   hullHalfBeam: number;
@@ -61,7 +67,7 @@ export interface VesselRig {
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
   sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2 },
-  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.1, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, buoyancy: { pitchScale: 0.08, heaveTau: 2.1 } },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.1, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.13, heaveTau: 0.65, tiltTau: 0.3 } },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {

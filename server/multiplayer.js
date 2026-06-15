@@ -523,6 +523,40 @@ function sendWallet(p) {
   }
 }
 
+// ── Piracy reputation (Diplomacy D2) ──────────────────────────────────────────
+// Attacking a nation's merchant shipping shifts the attacker's standing: you LOSE rep with that nation (more
+// on a sink), lose a little with its ALLIES (you struck their friend), and GAIN rep with its WAR enemies (more
+// on a sink — you're hurting their foe). Tiers scale hit→sink→capture. `factionRep` is clamped to ±REP_CLAMP.
+const REP_CLAMP = 100;
+const REP_TIERS = {
+  attack:  { victim: -2,  ally: -1, enemy: +1  },   // a connecting round/bar shot on a merchant
+  sink:    { victim: -15, ally: -6, enemy: +8  },   // sending one to the bottom
+  capture: { victim: -20, ally: -8, enemy: +12 },   // CAPTURE HOOK — no gameplay yet; a future board-and-take calls this tier
+};
+const clampRep = (v) => (v < -REP_CLAMP ? -REP_CLAMP : (v > REP_CLAMP ? REP_CLAMP : v));
+
+/** Apply one piracy event's reputation shift to `shooter` for attacking faction `victimFaction`, at the given
+ *  tier ('attack' | 'sink' | 'capture'). Updates standing in-memory, pushes a `reputation_changed` toast (with
+ *  the per-faction deltas AND the full updated map, so the client's "Standing with the Powers" stays exact),
+ *  and returns the deltas. Persistence is left to the caller (sinks persist immediately; attacks ride the 30 s
+ *  autosave). Safe no-op for NPC shooters / unknown factions. Reused by the future capture feature. */
+function awardPiracyRep(shooter, victimFaction, tier) {
+  if (!shooter || shooter.isNpc || !factions.isFaction(victimFaction)) return null;
+  const t = REP_TIERS[tier]; if (!t) return null;
+  shooter.factionRep = factions.normalizeRep(shooter.factionRep);
+  const rep = shooter.factionRep;
+  const deltas = {};
+  const bump = (fid, d) => { if (!d) return; deltas[fid] = (deltas[fid] || 0) + d; };
+  bump(victimFaction, t.victim);
+  for (const a of diplomacy.alliesOf(victimFaction)) bump(a, t.ally);
+  for (const e of diplomacy.enemiesOf(victimFaction)) bump(e, t.enemy);
+  for (const [fid, d] of Object.entries(deltas)) rep[fid] = clampRep((rep[fid] || 0) + d);
+  if (shooter.ws && shooter.ws.readyState === 1) {
+    shooter.ws.send(JSON.stringify({ type: 'reputation_changed', reason: tier, deltas, factionRep: rep }));
+  }
+  return deltas;
+}
+
 /** Record that this player has seen a town's market (specialty + last-seen prices + day) in their discovery
  *  ledger. Driven from sendMarket → fires on trade_open AND after each trade (keeps prices fresh). */
 function recordVisit(p, mk) {
@@ -739,7 +773,12 @@ function attachMultiplayer(server) {
     // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). Only a PLAYER
     // hit provokes it — collateral from another NPC's shot doesn't spark merchant-vs-merchant brawls. The
     // tactical helm + return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
-    if (victim.isNpc && shooter && !shooter.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
+    if (victim.isNpc && shooter && !shooter.isNpc) {
+      npc.markHostile(victim, shot.shooterId, Date.now());
+      // Piracy reputation (D2): a connecting shot on a nation's merchant dings your standing. The killing blow
+      // is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
+      if (!justSunk && victim.faction) awardPiracyRep(shooter, victim.faction, 'attack');
+    }
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
     const hitMsg = JSON.stringify({
@@ -775,6 +814,13 @@ function attachMultiplayer(server) {
           for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
         }
         if (shooter) sysReply(shooter.ws, `You sank the ${victim.state.vesselName || 'merchant'}! Salvage floats nearby.`);
+        // Piracy reputation (D2): sinking a nation's merchant is the big standing shift — heavy loss with that
+        // nation (+ its allies), a strong gain with its war-enemies. A sink is a milestone, so persist now
+        // rather than waiting for the 30 s autosave. (A future capture reuses awardPiracyRep with the 'capture' tier.)
+        if (shooter && !shooter.isNpc && victim.faction) {
+          awardPiracyRep(shooter, victim.faction, 'sink');
+          saveEconomyState(shooter);
+        }
         victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
       } else {
         sysReply(victim.ws, `You were sunk by ${sinker}.`);
@@ -1599,4 +1645,4 @@ function attachMultiplayer(server) {
   console.log('Sailing multiplayer WebSocket ready');
 }
 
-module.exports = { attachMultiplayer };
+module.exports = { attachMultiplayer, _test: { awardPiracyRep, REP_TIERS, REP_CLAMP } };

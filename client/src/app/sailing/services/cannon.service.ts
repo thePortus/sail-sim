@@ -14,6 +14,7 @@ import { SfxService }         from './sfx.service';
 import { BirdService }        from './bird.service';
 import { DolphinService }     from './dolphin.service';
 import { MuzzleExplosions }   from './muzzle-explosion';
+import { MuzzleSmoke }        from './muzzle-smoke';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -226,6 +227,11 @@ export class CannonService {
   private explosions: MuzzleExplosions | null = null;
   private readonly useVolExplosion =
     (typeof localStorage === 'undefined') || localStorage.getItem('ignis_muzzle') !== 'particles';
+  // Shader smoke (rising/drifting billboard puffs) replaces the dense fountain belch (lingering pall kept).
+  // Opt out with localStorage.ignis_smoke='particles' to fall back to the old smoke ParticleSystem.
+  private smoke: MuzzleSmoke | null = null;
+  private readonly useShaderSmoke =
+    (typeof localStorage === 'undefined') || localStorage.getItem('ignis_smoke') !== 'particles';
 
   // Smoke "fountain" particle systems — the directional belch right at the muzzle
   private smokePortPS!:  ParticleSystem;
@@ -317,6 +323,14 @@ export class CannonService {
     if (this.useVolExplosion) {
       this.explosions = new MuzzleExplosions(this.scene, (m) => this.sceneService.excludeFromPrePass(m));
     }
+    if (this.useShaderSmoke) {
+      this.smoke = new MuzzleSmoke(this.scene, {
+        excludeFromPrePass: (m) => this.sceneService.excludeFromPrePass(m),
+        setDepthActive:     (on) => this.sceneService.setSmokeDepthActive(on),
+        getDepthTexture:    () => this.sceneService.smokeDepthMap,
+        vFlip:              this.sceneService.isWebGPU ? 1 : 0,
+      });
+    }
     this.buildSmokeParticles();
     this.buildLingerParticles();
     this.buildImpactParticles();
@@ -355,6 +369,8 @@ export class CannonService {
 
     this.explosions?.dispose();
     this.explosions = null;
+    this.smoke?.dispose();
+    this.smoke = null;
 
     for (const list of this.decals.values()) for (const d of list) d.dispose();
     this.decals.clear();
@@ -1046,6 +1062,14 @@ export class CannonService {
 
     // ── Particle burst cutoffs ────────────────────────────────────────────────
     this.explosions?.update(dt);
+    if (this.smoke) {
+      // Drift the smoke downwind: wind blows FROM fromBearingDeg, so smoke travels toward from+180°, at a
+      // fraction of wind speed (it's near the surface and the puffs carry their own belch velocity).
+      const w = this.vesselService.getWind();
+      const toRad = ((w.fromBearingDeg + 180) % 360) * Math.PI / 180;
+      const drift = Math.min(w.speed, 14) * 0.3;
+      this.smoke.update(dt, Math.sin(toRad) * drift, Math.cos(toRad) * drift);
+    }
     if (this.flameCutoffT > 0 && this.elapsed >= this.flameCutoffT) {
       this.flamePortPS.emitRate = 0;
       this.flameStbdPS.emitRate = 0;
@@ -1201,21 +1225,28 @@ export class CannonService {
       this.flameCutoffT = this.elapsed + 0.22;
     }
 
-    // 2) Smoke fountain — dense directional belch (emitted slightly ahead of the mouth).
+    // 2) Smoke belch — shader puffs (default) rising/drifting out the barrel, else the legacy fountain PS.
     const sSpread = 0.32;
-    smokePS.direction1.set(dirX * 1.0 - sSpread, 0.12, dirZ * 1.0 - sSpread);
-    smokePS.direction2.set(dirX * 1.5 + sSpread, 0.55, dirZ * 1.5 + sSpread);
-    sEmit.set(mwx + dirX * 0.3, mwy, mwz + dirZ * 0.3);
-    smokePS.emitRate  = 850;
-    this.smokeCutoffT = this.elapsed + 0.55;
+    if (this.smoke) {
+      this.smoke.belch(mwx + dirX * 0.3, mwy, mwz + dirZ * 0.3, dirX, dirZ);
+    } else {
+      smokePS.direction1.set(dirX * 1.0 - sSpread, 0.12, dirZ * 1.0 - sSpread);
+      smokePS.direction2.set(dirX * 1.5 + sSpread, 0.55, dirZ * 1.5 + sSpread);
+      sEmit.set(mwx + dirX * 0.3, mwy, mwz + dirZ * 0.3);
+      smokePS.emitRate  = 850;
+      this.smokeCutoffT = this.elapsed + 0.55;
+    }
 
-    // 3) Lingering cloud — same wide directional spread as the fountain so the pall
-    //    that hangs covers the whole plume footprint, just slower and far longer-lived.
-    lEmit.set(mwx + dirX * 0.3, mwy + 0.2, mwz + dirZ * 0.3);
-    lingerPS.direction1.set(dirX * 1.0 - sSpread, 0.10, dirZ * 1.0 - sSpread);
-    lingerPS.direction2.set(dirX * 1.5 + sSpread, 0.65, dirZ * 1.5 + sSpread);
-    lingerPS.emitRate  = 120;
-    this.lingerCutoffT = this.elapsed + 0.55;
+    // 3) Lingering pall — shader puffs (default) that hang + drift, else the legacy linger PS.
+    if (this.smoke) {
+      this.smoke.pall(mwx + dirX * 0.3, mwy + 0.2, mwz + dirZ * 0.3, dirX, dirZ);
+    } else {
+      lEmit.set(mwx + dirX * 0.3, mwy + 0.2, mwz + dirZ * 0.3);
+      lingerPS.direction1.set(dirX * 1.0 - sSpread, 0.10, dirZ * 1.0 - sSpread);
+      lingerPS.direction2.set(dirX * 1.5 + sSpread, 0.65, dirZ * 1.5 + sSpread);
+      lingerPS.emitRate  = 120;
+      this.lingerCutoffT = this.elapsed + 0.55;
+    }
   }
 
   /**
@@ -1274,20 +1305,28 @@ export class CannonService {
       rig.flameCutoffT = this.elapsed + 0.22;
     }
 
-    // 2) Smoke fountain — dense directional belch
+    // 2) Smoke belch — shader puffs (default) or the legacy fountain PS (opt-out fallback).
     const sSpread = 0.32;
-    rig.smokePS.direction1.set(dx * 1.0 - sSpread, 0.12, dz * 1.0 - sSpread);
-    rig.smokePS.direction2.set(dx * 1.5 + sSpread, 0.55, dz * 1.5 + sSpread);
-    rig.smokeEmit.set(ox + dx * 0.3, oy, oz + dz * 0.3);
-    rig.smokePS.emitRate = 850;
-    rig.smokeCutoffT = this.elapsed + 0.55;
+    if (this.smoke) {
+      this.smoke.belch(ox + dx * 0.3, oy, oz + dz * 0.3, dx, dz);
+    } else {
+      rig.smokePS.direction1.set(dx * 1.0 - sSpread, 0.12, dz * 1.0 - sSpread);
+      rig.smokePS.direction2.set(dx * 1.5 + sSpread, 0.55, dz * 1.5 + sSpread);
+      rig.smokeEmit.set(ox + dx * 0.3, oy, oz + dz * 0.3);
+      rig.smokePS.emitRate = 850;
+      rig.smokeCutoffT = this.elapsed + 0.55;
+    }
 
-    // 3) Lingering cloud — same wide spread as the fountain (covers the plume footprint)
-    rig.lingerEmit.set(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3);
-    rig.lingerPS.direction1.set(dx * 1.0 - sSpread, 0.10, dz * 1.0 - sSpread);
-    rig.lingerPS.direction2.set(dx * 1.5 + sSpread, 0.65, dz * 1.5 + sSpread);
-    rig.lingerPS.emitRate = 120;
-    rig.lingerCutoffT = this.elapsed + 0.55;
+    // 3) Lingering pall — shader puffs (default) or the legacy linger PS (opt-out fallback).
+    if (this.smoke) {
+      this.smoke.pall(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3, dx, dz);
+    } else {
+      rig.lingerEmit.set(ox + dx * 0.3, oy + 0.2, oz + dz * 0.3);
+      rig.lingerPS.direction1.set(dx * 1.0 - sSpread, 0.10, dz * 1.0 - sSpread);
+      rig.lingerPS.direction2.set(dx * 1.5 + sSpread, 0.65, dz * 1.5 + sSpread);
+      rig.lingerPS.emitRate = 120;
+      rig.lingerCutoffT = this.elapsed + 0.55;
+    }
 
     // Recoil on the firing vessel
     this.multiplayerService.applyRemoteRecoil(ox, oz);

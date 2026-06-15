@@ -144,6 +144,44 @@ export class SceneService {
   /** Camera-space-Z depth of opaque geometry (ocean excluded). Null until built. */
   get oceanDepthMap(): RenderTargetTexture | null { return this._oceanDepthMap; }
 
+  // Soft-particle depth for cannon smoke: a SEPARATE camera-space-Z depth that INCLUDES the ship + terrain
+  // (unlike oceanDepthMap, which excludes skinned meshes for perf). Built lazily, and only RENDERED while
+  // smoke is on screen (setSmokeDepthActive) so it costs nothing the rest of the time.
+  private smokeDepthRenderer: DepthRenderer | null = null;
+  private _smokeDepthMap: RenderTargetTexture | null = null;
+  private smokeDepthActive = false;
+  get smokeDepthMap(): RenderTargetTexture | null { return this._smokeDepthMap; }
+
+  /** Turn the smoke soft-particle depth pass on/off (called by the smoke FX as puffs come and go). */
+  setSmokeDepthActive(on: boolean): void {
+    if (on === this.smokeDepthActive || !this.scene) { return; }
+    if (on && !this._smokeDepthMap) { this.buildSmokeDepthRenderer(); }
+    const dm = this._smokeDepthMap;
+    if (!dm) { return; }
+    this.smokeDepthActive = on;
+    const list = this.scene.customRenderTargets;
+    const i = list.indexOf(dm);
+    if (on && i < 0) { list.push(dm); }
+    else if (!on && i >= 0) { list.splice(i, 1); }
+  }
+
+  private buildSmokeDepthRenderer(): void {
+    const dr = new DepthRenderer(
+      this.scene, Constants.TEXTURETYPE_FLOAT, this.camera,
+      /* storeNonLinearDepth */ false, Texture.NEAREST_SAMPLINGMODE, /* storeCameraSpaceZ */ true,
+    );
+    const dm = dr.getDepthMap();
+    // Include the solid occluders smoke should soften against: hull/deck/masts/sails/rigging + terrain +
+    // buildings. Skip the ocean (smoke is above water), inland scatter foliage, and the FX billboards
+    // themselves (tagged excludeFromRefraction / stencilProxy) so they never occlude their own smoke.
+    dm.renderListPredicate = (m) =>
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_')
+      && !m.metadata?.excludeFromRefraction && !m.metadata?.stencilProxy;
+    dm.refreshRate = 1;   // every frame while active (stale depth misaligns under camera rotation)
+    this.smokeDepthRenderer = dr;
+    this._smokeDepthMap = dm;
+  }
+
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
 
@@ -1544,6 +1582,10 @@ export class SceneService {
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;
+    this.smokeDepthRenderer?.dispose();
+    this.smokeDepthRenderer = null;
+    this._smokeDepthMap = null;
+    this.smokeDepthActive = false;
     this._sInstr?.dispose(); this._sInstr = null;
     this._eInstr?.dispose(); this._eInstr = null;
     this.scene?.dispose();

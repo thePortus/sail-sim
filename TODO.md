@@ -3,7 +3,6 @@
 # General or Current TODO Items
 
 * add brigantine, make sure 4092^2 atlas resolution doesn't hurt FPS
-* shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * revisit dead render pipeline
 * make pinace buoyance more responsive
@@ -27,16 +26,13 @@
 * add ship armor + cannon upgrades
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
-* improved landscape with NME & more scatter to distant
 * any way to reduce load times?
 * streaming assets has gotten weird, trees move in and out.. can we make them fade in?
 * server is disconnected message
-* Plan to make towns or areas "different"... things to see, special marvels
-* For landscape.... distant trees scattered and then node material editor PBR
+* Plan to make towns or areas "different"... things to see, special marvels... missions?
 * sound is chunking on windows machines still
-* impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
-* make stuff look cool pass
-* docking tie up animation
+* server optimization pass
+* make stuff look cool pass (bloom lighting?)
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * add damage from collisions and aground
 * add sharks and schools of colorful fish and whales

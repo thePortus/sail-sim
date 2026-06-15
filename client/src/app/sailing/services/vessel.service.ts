@@ -976,6 +976,9 @@ export class VesselService {
     this.currentSea  = sea;
   }
 
+  /** Current wind (read-only) — used e.g. to drift cannon smoke downwind. */
+  getWind(): Wind { return this.currentWind; }
+
   // ── Physics loop ──────────────────────────────────────────────────────────
 
   private startLoop(scene: Scene): void {

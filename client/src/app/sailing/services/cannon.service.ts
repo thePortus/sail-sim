@@ -13,6 +13,7 @@ import { MultiplayerService } from './multiplayer.service';
 import { SfxService }         from './sfx.service';
 import { BirdService }        from './bird.service';
 import { DolphinService }     from './dolphin.service';
+import { MuzzleExplosions }   from './muzzle-explosion';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -220,6 +221,11 @@ export class CannonService {
   private flamePortEmit  = new Vector3(0, 0, 0);
   private flameStbdEmit  = new Vector3(0, 0, 0);
   private flameCutoffT   = -1;
+  // Volumetric muzzle fireball (raymarched billboard) — replaces the orange flame particles by default.
+  // Opt out with localStorage.ignis_muzzle='particles' to fall back to the old additive flame PS.
+  private explosions: MuzzleExplosions | null = null;
+  private readonly useVolExplosion =
+    (typeof localStorage === 'undefined') || localStorage.getItem('ignis_muzzle') !== 'particles';
 
   // Smoke "fountain" particle systems — the directional belch right at the muzzle
   private smokePortPS!:  ParticleSystem;
@@ -308,6 +314,9 @@ export class CannonService {
     this.buildBallPool();
     this.buildFlashLights();
     this.buildFlameParticles();
+    if (this.useVolExplosion) {
+      this.explosions = new MuzzleExplosions(this.scene, (m) => this.sceneService.excludeFromPrePass(m));
+    }
     this.buildSmokeParticles();
     this.buildLingerParticles();
     this.buildImpactParticles();
@@ -343,6 +352,9 @@ export class CannonService {
     this.multiplayerService.onRemoteShot = null;
     this.multiplayerService.onCombatHit = null;
     this.multiplayerService.onCombatRepair = null;
+
+    this.explosions?.dispose();
+    this.explosions = null;
 
     for (const list of this.decals.values()) for (const d of list) d.dispose();
     this.decals.clear();
@@ -1033,6 +1045,7 @@ export class CannonService {
     for (const rig of this.remoteRigs) this.decayFlash(rig.light, rig.lightEndT);
 
     // ── Particle burst cutoffs ────────────────────────────────────────────────
+    this.explosions?.update(dt);
     if (this.flameCutoffT > 0 && this.elapsed >= this.flameCutoffT) {
       this.flamePortPS.emitRate = 0;
       this.flameStbdPS.emitRate = 0;
@@ -1175,13 +1188,18 @@ export class CannonService {
     // Pass the beam direction so the hull masks the glow to the firing side (no cross-deck bleed).
     this.oceanService.addCannonFlash(mwx, mwz, dirX, dirZ);
 
-    // 1) Flame core — tight, fast jet right out the barrel.
-    const fSpread = 0.16;
-    flamePS.direction1.set(dirX - fSpread, 0.04, dirZ - fSpread);
-    flamePS.direction2.set(dirX + fSpread, 0.30, dirZ + fSpread);
-    fEmit.set(mwx, mwy, mwz);
-    flamePS.emitRate  = 1800;
-    this.flameCutoffT = this.elapsed + 0.22;
+    // 1) Muzzle fireball — a volumetric raymarched billboard at the barrel mouth (default); the legacy
+    //    additive flame jet is the opt-out fallback (localStorage.ignis_muzzle='particles').
+    if (this.explosions) {
+      this.explosions.spawn(mwx + dirX * 0.5, mwy + 0.1, mwz + dirZ * 0.5);
+    } else {
+      const fSpread = 0.16;
+      flamePS.direction1.set(dirX - fSpread, 0.04, dirZ - fSpread);
+      flamePS.direction2.set(dirX + fSpread, 0.30, dirZ + fSpread);
+      fEmit.set(mwx, mwy, mwz);
+      flamePS.emitRate  = 1800;
+      this.flameCutoffT = this.elapsed + 0.22;
+    }
 
     // 2) Smoke fountain — dense directional belch (emitted slightly ahead of the mouth).
     const sSpread = 0.32;
@@ -1244,13 +1262,17 @@ export class CannonService {
     // Warm glow on the sea below the remote muzzle too (dx,dz is the unit beam direction).
     this.oceanService.addCannonFlash(ox, oz, dx, dz);
 
-    // 1) Flame core — tight, fast jet along the shot vector
-    const fSpread = 0.16;
-    rig.flamePS.direction1.set(dx - fSpread, 0.04, dz - fSpread);
-    rig.flamePS.direction2.set(dx + fSpread, 0.30, dz + fSpread);
-    rig.flameEmit.set(ox, oy, oz);
-    rig.flamePS.emitRate = 1800;
-    rig.flameCutoffT = this.elapsed + 0.22;
+    // 1) Muzzle fireball — volumetric billboard (default) or the legacy flame jet (opt-out fallback).
+    if (this.explosions) {
+      this.explosions.spawn(ox + dx * 0.5, oy + 0.1, oz + dz * 0.5);
+    } else {
+      const fSpread = 0.16;
+      rig.flamePS.direction1.set(dx - fSpread, 0.04, dz - fSpread);
+      rig.flamePS.direction2.set(dx + fSpread, 0.30, dz + fSpread);
+      rig.flameEmit.set(ox, oy, oz);
+      rig.flamePS.emitRate = 1800;
+      rig.flameCutoffT = this.elapsed + 0.22;
+    }
 
     // 2) Smoke fountain — dense directional belch
     const sSpread = 0.32;

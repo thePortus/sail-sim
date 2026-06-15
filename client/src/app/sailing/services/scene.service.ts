@@ -14,6 +14,7 @@ import { Settings } from '../../app.settings';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
 import { ProceduralSky } from './procedural-sky';
+import { RainLens } from './rain-lens';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -40,6 +41,7 @@ export class SceneService {
   private moonMesh!:  Mesh;
   private godRays: VolumetricLightScatteringPostProcess | null = null;
   private ssao: SSAO2RenderingPipeline | null = null;
+  private rainLens: RainLens | null = null;
   private starDome: Mesh | null = null;
   private starMat:  CustomMaterial | null = null;
   private _starTime = 0;
@@ -824,6 +826,20 @@ export class SceneService {
     });
 
     this.buildGodRays();
+
+    // Raindrops-on-the-lens post-process (adapted "Heartfelt"). Created here, driven per-frame by
+    // CloudService via setRainLens(storminess); it only attaches itself while it's actually raining and
+    // fails safe on WebGPU (never blanks — see RainLens).
+    try {
+      this.rainLens = new RainLens(this.camera, this.engine);
+    } catch (e) {
+      console.warn('[Scene] Rain-lens post-process unavailable:', e);
+    }
+  }
+
+  /** Storminess (0..1) → raindrops-on-the-camera intensity. Called each frame by CloudService. */
+  setRainLens(amount: number): void {
+    this.rainLens?.setAmount(amount);
   }
 
   // ── Crepuscular rays (god rays / sun shafts) ────────────────────────────────
@@ -1523,6 +1539,8 @@ export class SceneService {
    *  a fresh Scene on them without the WebGPU-recreation degradation. */
   disposeScene(): void {
     this.engine?.stopRenderLoop();
+    this.rainLens?.dispose();
+    this.rainLens = null;
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;

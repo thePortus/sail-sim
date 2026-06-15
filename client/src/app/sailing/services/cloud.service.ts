@@ -1048,6 +1048,8 @@ export class CloudService {
 
     // Drive the ocean's surface rain-ripple normals (covers the dry case too).
     this.oceanService.setRainIntensity(this.precipIntensity);
+    // Drive the raindrops-on-the-camera lens effect (drizzle → heavy storm).
+    this.sceneService.setRainLens(this.precipIntensity);
     // Drive the continuous rain-patter ambience.
     this.updateRainAmbience(this.precipIntensity);
 

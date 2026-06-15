@@ -2,11 +2,10 @@
 
 # General or Current TODO Items
 
-* add rain on lens, if you can https://www.shadertoy.com/view/ltffzl
+* add brigantine, make sure 4092^2 atlas resolution doesn't hurt FPS
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * make pinace buoyance more responsive
 * ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
-* add brigantine, make sure 4092^2 atlas resolution doesn't hurt FPS
 * check waves go right way for wind
 * why a dark patch around player ship? is it because of transparency to see hull?
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
@@ -35,7 +34,7 @@
 * docking tie up animation
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * add damage from collisions and aground
-* add keymap help screen
+* add sharks and schools of colorful fish and whales
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
 * tidal pull?

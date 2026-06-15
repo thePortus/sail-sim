@@ -10,6 +10,7 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
+import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { SquadronService } from './squadron.service';
@@ -865,7 +866,9 @@ export class MultiplayerService {
       // instantiated with cloneMaterials=false, so every ship (local + remote) shares ONE
       // material + texture set owned by the asset container. Disposing them here would strip
       // the texture off the local ship and all other remotes — leaving a flat grey model.
-      (m as Mesh).dispose(false, false);
+      // EXCEPTION: the hull-stencil proxy owns a UNIQUE stencil material (not shared), so free it.
+      const ownsMat = !!(m.metadata && m.metadata.stencilProxy);
+      (m as Mesh).dispose(false, ownsMat);
     });
     entry.root.getChildTransformNodes(false).forEach(n => n.dispose());
   }
@@ -1425,6 +1428,22 @@ export class MultiplayerService {
         seenMats.add(mat);
         mat.fogEnabled = false;
         this.sceneService.excludeFromPrePass(mat);
+      }
+    }
+
+    // Open-hull water mask (stencil = the WebGPU default, mirrors VesselService): stamp THIS remote's real
+    // hull geometry into the stencil buffer so the FFT sea is masked out of its open deck exactly as the
+    // local vessel's is. One cheap stencil-only draw, shares the hull's geometry+skeleton. Built AFTER the
+    // snapshot above so it's never registered for reflections/shadows; its unique material is freed in
+    // clearVesselMeshes. The ocean stencil test is global, so any number of vessels can stamp the same ref.
+    // `ignis_hullcut` opt-out: 'carve'/'discard' disable it (the legacy shader carve only ever masked the
+    // LOCAL boat anyway, so remotes simply go unmasked there, as before).
+    const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
+    const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
+    if (useStencil) {
+      const hull = vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
+      if (hull && buildHullStencilProxy(hull, entry.root, scene)) {
+        this.oceanService.setHullStencilMask(true);
       }
     }
   }

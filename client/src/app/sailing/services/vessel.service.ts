@@ -405,16 +405,41 @@ export class VesselService {
     this.hullStencilCap?.dispose(false, true);
     this.hullStencilCap = null;
     this.oceanService.setHullStencilMask(false);
-    const hc = this.rig.hullCut;
-    if (!hc || !this.root) { this.oceanService.setHullCutEnabled(false); return; }
+    if (!this.root) { this.oceanService.setHullCutEnabled(false); return; }
     const hull = this.root.getChildMeshes()
       .find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
+
+    // STENCIL mask = the DEFAULT open-hull occlusion on WebGPU: mask the sea out of the hull with a stencil
+    // proxy built from the boat's REAL geometry — perfect silhouette adherence, no carve, no tears. It's
+    // INDEPENDENT of the per-rig hullCut config (only needs a hull mesh), so EVERY vessel — open pinnace or
+    // decked sloop — gets the same clean mask from one cheap stencil-only draw. It only masks the FFT ocean,
+    // so the WebGL/procedural ocean keeps the legacy shader carve below. `ignis_hullcut` is now an opt-OUT
+    // override: 'carve' or 'discard' force the legacy shader path even on WebGPU; 'stencil' forces stencil.
+    const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
+    const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
+    if (useStencil && hull) {
+      // TRUE-3D proxy: clone the live hull mesh (shared geometry + skeleton) and stamp it into the stencil
+      // buffer. A boat's cross-section changes with height, so no flat sheet matches it at every angle — a
+      // gunwale-height lid floats above the sea (parallax), a waterline lid pokes its wide outline past the
+      // narrower waterline hull (a skirt). The hull's own geometry is the only silhouette that's exactly
+      // right from any camera, so we mask to that.
+      this.hullStencilCap = buildHullStencilProxy(hull, this.root, this.sceneService.scene);
+      if (this.hullStencilCap) {
+        this.oceanService.setHullStencilMask(true);
+        this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
+        return;
+      }
+    }
+
+    // ── Legacy shader carve/discard (any non-stencil mode), driven by the per-rig hullCut config. ──
+    const hc = this.rig.hullCut;
+    if (!hc || !hull) { this.oceanService.setHullCutEnabled(false); return; }
     // Footprint = the WIDEST-beam (gunwale/deck) outline, NOT the waterline contour. The dry region the cut
     // must cover is the whole open COCKPIT, which extends out to the gunwales; the narrower waterline slice
     // left the outer cockpit (and bow/stern flare) un-cut → waves flooded it. The gunwale outline also robustly
     // avoids any "where is the waterline in this hull's frame?" guess. `waterlineY` (a per-rig opt-in) still
     // forces a true waterline slice if ever wanted, but the pinnace omits it → widest-beam.
-    const baked = hull ? bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N, hc.waterlineY) : null;
+    const baked = bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N, hc.waterlineY);
     if (!baked) { this.oceanService.setHullCutEnabled(false); return; }
     this.oceanService.setHullCutProfile(
       baked.profile, baked.alongMin, baked.alongLen, baked.acrossCenter, hc.alongSign);
@@ -422,26 +447,6 @@ export class VesselService {
     // shader is built with HULL_DISCARD; the along meta is shared with the profile above via _HullCutMeta).
     const sil = bakeHullSilhouette(hull, this.root, OceanService.HULL_SIL_NA, OceanService.HULL_SIL_NH);
     if (sil) { this.oceanService.setHullSilhouette(sil.table, sil.hMin, sil.hMax); }
-
-    // STENCIL mask mode (localStorage.ignis_hullcut === 'stencil'): mask the sea out of the hull with a
-    // stencil proxy built from the boat's real geometry — perfect silhouette adherence, no carve, no tears.
-    // The shader cut (carve/discard) stays OFF so the two can't fight. (FFT/WebGPU only; on the procedural
-    // ocean this no-ops and the boat just shows a little interior water until the user is back on FFT.)
-    const mode = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
-    if (mode === 'stencil' && hull) {
-      // TRUE-3D proxy: clone the live hull mesh (shared geometry + skeleton) and stamp it into the stencil
-      // buffer. A boat's cross-section changes with height, so no flat sheet matches it at every angle — a
-      // gunwale-height lid floats above the sea (parallax), a waterline lid pokes its wide outline past the
-      // narrower waterline hull (a skirt). The hull's own geometry is the only silhouette that's exactly
-      // right from any camera, so we mask to that. (FFT/WebGPU only; no-ops visually on the procedural ocean.)
-      const scene = this.sceneService.scene;
-      this.hullStencilCap = buildHullStencilProxy(hull, this.root, scene);
-      if (this.hullStencilCap) {
-        this.oceanService.setHullStencilMask(true);
-        this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
-        return;
-      }
-    }
 
     this.oceanService.setHullCutEnabled(true);
   }

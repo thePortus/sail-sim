@@ -104,7 +104,6 @@ export class HarborService {
     this.squareLight.intensity = 0;
 
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.sceneService.span('harbor', () => this.tick()));
-    console.log(`[Harbor] ${this.harbors.length} harbors; piers + buildings stream by range`);
     // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to
     // build up front. The 3 variant GLBs parse once into the shared cache on first use.
   }

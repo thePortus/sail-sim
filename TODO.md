@@ -2,21 +2,21 @@
 
 # General or Current TODO Items
 
-* fix pinnace water displacement
-* get rid of [scatter] and [harbor] debug messages
 * double dock distance
 * ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
 * add brigantine, make sure 4092^2 atlas resolution doesn't hurt FPS
 * come up with plan for much more realistic sailing wind physics, how the boat reacts to wind angles, etc. and the speed, momentum... effects of turning into, away from the wind... different sailing rig set ups... one that each boat reacts differently to.... plan it out, ask any questions you want... especially be accurate with stuff like the trim... if I have a trim that is slightly off but going witih wind behind me, does it make sense to be penalized so heavily I nearly stop?
+* lod + imposters for ships at distance... same towns
+* hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
-* hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
 * add occasional bosun whistle (no more than once a day)
+* more realistic bird flight paths... momentum starting and stopping... speed of flapping wings relative to flight speed
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
-* lod + imposters for ships at distance... same towns
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * grapeshot doesn't make cannonball impacts on the water
+* update to cannon aim sight to show spread of all cannon shots somehow
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant

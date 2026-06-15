@@ -710,7 +710,6 @@ export class ScatterService {
         chunkMeshes++;
       }
     }
-    console.log(`[scatter] far-forest: ${take} impostors across ${V} variants × ${chunkMeshes} frustum-culled chunks (${ncx}×${ncz} grid)`);
   }
 
   /** A GLB tree sub-layer: full mesh near, crossed-quad impostor far, swapped per-patch by distance. */
@@ -1141,7 +1140,6 @@ export class ScatterService {
     // moves the base to local y=0 so BOTH the CPU and GPU placement plant the trunk at the ground with no
     // per-scale sink (the GLB's lowest vertex is a drooping frond, which groundToBase can't use).
     if (Math.abs(cx) > 0.03 || Math.abs(cz) > 0.03 || trunkY !== 0) {
-      console.info(`[scatter] ${mesh.name}: origin→trunk (${cx.toFixed(2)}, ${trunkY.toFixed(2)}, ${cz.toFixed(2)}) m → baked to base`);
       mesh.position.set(-cx, -trunkY, -cz);
       mesh.bakeCurrentTransformIntoVertices();
     }

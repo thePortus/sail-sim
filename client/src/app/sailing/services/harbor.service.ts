@@ -74,10 +74,10 @@ export class HarborService {
   // from instantiating 3+ full towns at once.
   private readonly MAX_ACTIVE_TOWNS = 2;
   private readonly STREAM_BUILDINGS = true;
-  // Dock when the hull is within ~20 ft (≈6 m) of the pier DECK EDGE (not the shore point — the pier
+  // Dock when the hull is within ~40 ft (≈12 m) of the pier DECK EDGE (not the shore point — the pier
   // blocks the centre from ever reaching the shore). Per-variant deck size (m): len = along-seaward
   // from the shore point, halfWidth = half the across-extent (matches the server pier-obstacles dims).
-  private readonly DOCK_EDGE_M = 6;
+  private readonly DOCK_EDGE_M = 12;
   private readonly PIER_DIMS: Record<string, { len: number; halfWidth: number }> = {
     straight: { len: 14.3, halfWidth: 1.6 },
     l:        { len: 11.0, halfWidth: 6.5 },
@@ -138,6 +138,34 @@ export class HarborService {
     const cur = this.dockable();
     if (inRange) { if (!cur || cur.id !== best.id) this.dockable.set(best); }
     else if (cur) { this.dockable.set(null); }
+  }
+
+  /**
+   * Tie-up berth for harbour `h` given the boat's current pose: a point ALONGSIDE the pier deck edge, on
+   * whichever side the boat approaches from, parallel to the pier and offset clear of the deck. Fed to the
+   * vessel's auto-dock glide. Returns world XZ + heading°.
+   */
+  computeBerth(
+    h: TerrainHarbor, boatX: number, boatZ: number, boatHeadingDeg: number,
+  ): { x: number; z: number; heading: number } {
+    const hr = (h.heading * Math.PI) / 180;
+    const fx = Math.sin(hr), fz = Math.cos(hr);          // seaward unit (pier centreline direction)
+    const px = fz, pz = -fx;                             // unit perpendicular (starboard of seaward)
+    const dim = this.PIER_DIMS[h.variant] ?? this.PIER_DIMS['straight'];
+    // Project the boat onto the centreline; berth alongside the seaward half of the deck (clamped on-pier).
+    const along = Math.max(dim.len * 0.45, Math.min(dim.len * 0.95,
+      (boatX - h.x) * fx + (boatZ - h.z) * fz));
+    const cx = h.x + fx * along, cz = h.z + fz * along;  // centreline point abreast the berth
+    const side = ((boatX - cx) * px + (boatZ - cz) * pz) >= 0 ? 1 : -1;   // boat's side of the pier
+    const offset = dim.halfWidth + 3.0;                  // clear of the deck edge (~hull half-beam + fenders)
+    const bx = cx + px * side * offset, bz = cz + pz * side * offset;
+    // Heading: parallel to the pier, in whichever direction is closest to the boat's current heading
+    // (so it eases alongside rather than spinning 180°).
+    const fwd = ((h.heading % 360) + 360) % 360;
+    const aft = (fwd + 180) % 360;
+    const dF = Math.abs(((boatHeadingDeg - fwd + 540) % 360) - 180);
+    const dA = Math.abs(((boatHeadingDeg - aft + 540) % 360) - 180);
+    return { x: bx, z: bz, heading: dF <= dA ? fwd : aft };
   }
 
   /** Shortest distance from point P to segment [A,B] in the XZ plane. */

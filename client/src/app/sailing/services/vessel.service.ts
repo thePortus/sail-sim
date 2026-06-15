@@ -50,6 +50,10 @@ export class VesselService {
   grounded = signal<boolean>(false);
   /** True while the anchor is down (boat parked/tethered). */
   anchored = signal<boolean>(false);
+  /** True while auto-steering toward a berth (the docking glide; input is ignored during it). */
+  docking = signal<boolean>(false);
+  /** True while moored at a berth — helm + throttle frozen (like anchored) until castOff(). */
+  tiedUp = signal<boolean>(false);
 
   state = signal<VesselState>({
     x: 7200, z: 0, heading: 270, speed: 0,
@@ -236,6 +240,45 @@ export class VesselService {
       this.anchorZ = this.z;
     }
     this.anchored.set(this.isAnchored);
+  }
+
+  // ── Docking (auto-moor to a pier berth) ──────────────────────────────────────
+  // dockAt() eases the boat from its current pose to a tie-up point over a short glide (player input
+  // ignored during it), then PINS it there — tied up, like an anchor with zero scope — until castOff().
+  // Position-only: buoyancy still bobs the hull. No tie-rope animation (per design).
+  private dockPhase: 'free' | 'approaching' | 'tied' = 'free';
+  private dockElapsed = 0;
+  private dockDuration = 0;
+  private dockStartX = 0; private dockStartZ = 0; private dockStartHdg = 0;
+  private dockBerthX = 0; private dockBerthZ = 0; private dockBerthHdg = 0;
+
+  /** Begin auto-steering to a berth: glide to (x,z,heading°) then moor. No-op if already docking/tied. */
+  dockAt(berth: { x: number; z: number; heading: number }): void {
+    if (this.dockPhase !== 'free' || !this.root) { return; }
+    this.isAnchored = false; this.anchored.set(false);   // can't be anchored AND tied
+    this.dockStartX = this.x; this.dockStartZ = this.z; this.dockStartHdg = this.heading;
+    this.dockBerthX = berth.x; this.dockBerthZ = berth.z;
+    this.dockBerthHdg = ((berth.heading % 360) + 360) % 360;
+    const dist = Math.hypot(berth.x - this.x, berth.z - this.z);
+    this.dockDuration = Math.min(4, Math.max(1.4, dist / 6));   // ~6 m/s glide, clamped 1.4–4 s
+    this.dockElapsed = 0;
+    this.dockPhase = 'approaching';
+    this.docking.set(true);
+    this.keys.left = this.keys.right = this.keys.sheetIn = this.keys.sheetOut = false;
+    this.speed = 0;
+  }
+
+  /** Cast off the mooring so the helm/throttle answer again. */
+  castOff(): void {
+    if (this.dockPhase === 'free') { return; }
+    this.dockPhase = 'free';
+    this.docking.set(false);
+    this.tiedUp.set(false);
+  }
+
+  /** Shortest signed delta a→b in degrees, in [-180, 180] (for berth-heading interpolation). */
+  private angleDeltaDeg(a: number, b: number): number {
+    return ((b - a) % 360 + 540) % 360 - 180;
   }
 
   // ── Input ─────────────────────────────────────────────────────────────────
@@ -892,20 +935,38 @@ export class VesselService {
     const crewMul = this.combatService.crewFactor();
     const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul)) * crewMul;
     // speedModifier applied below after buoyancy is computed.
-    // While sinking, control is frozen: glide to a dead stop (no sail drive) and ignore the helm.
-    const spdTarget = this.sinking ? 0 : baseTarget;
+    // While sinking OR docked (approaching/tied), control is frozen: glide to a dead stop (no sail drive)
+    // and ignore the helm.
+    const docked = this.dockPhase !== 'free';
+    const spdTarget = (this.sinking || docked) ? 0 : baseTarget;
     const spdRate   = this.sinking ? 1.2 : this.physics.accelerationRate;
     this.speed  += (spdTarget - this.speed) * spdRate * dt;
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
 
     // Steering. With the mast totally down she still answers the helm, but only just — capped to a slow
     // pivot (she's lost her sail-driven way; this is the "can turn very slowly but that is it" rule).
-    if ((this.keys.left || this.keys.right) && !this.sinking) {
+    if ((this.keys.left || this.keys.right) && !this.sinking && !docked) {
       const dir = this.keys.left ? -1 : 1;
       let rate = this.turnRate(this.speed);
       if (mastH <= 0) rate = Math.min(rate, MAST_DOWN_TURN_MAX);
       rate *= crewMul;   // short-handed → slower on the helm too (floor 0.5)
       this.heading = ((this.heading + dir * rate * dt) + 360) % 360;
+    }
+
+    // ── Auto-dock: ease to the berth, then stay moored (frozen) until cast off ──
+    if (docked) {
+      if (this.dockPhase === 'approaching') {
+        this.dockElapsed += dt;
+        const u = this.dockDuration > 0 ? Math.min(1, this.dockElapsed / this.dockDuration) : 1;
+        const e = u * u * (3 - 2 * u);   // smoothstep ease in/out
+        this.x = this.dockStartX + (this.dockBerthX - this.dockStartX) * e;
+        this.z = this.dockStartZ + (this.dockBerthZ - this.dockStartZ) * e;
+        this.heading = ((this.dockStartHdg + this.angleDeltaDeg(this.dockStartHdg, this.dockBerthHdg) * e) % 360 + 360) % 360;
+        if (u >= 1) { this.dockPhase = 'tied'; this.docking.set(false); this.tiedUp.set(true); }
+      } else {   // 'tied' — pinned at the berth, like an anchor with zero scope
+        this.x = this.dockBerthX; this.z = this.dockBerthZ; this.heading = this.dockBerthHdg;
+      }
+      this.speed = 0;
     }
 
     // ── Position update ──────────────────────────────────────────────────────
@@ -941,8 +1002,13 @@ export class VesselService {
     // Block when the HULL (bow when moving ahead, stern when reversing) — not just
     // the centre — would touch land, so the ship halts at the shoreline instead of
     // burying its bow inside the island. dirSign follows the direction of travel.
+    // (While docked the auto-dock glide above already set the pose — skip the sailing
+    // collision/grounded test so a berth tucked near the pier never reads as "aground".)
     const dirSign = this.speed >= 0 ? 1 : -1;
-    if (this.hullHitsLand(newX, newZ, hr, dirSign) ||
+    if (docked) {
+      this.groundedTime = 0;
+      if (this.isGrounded) { this.isGrounded = false; this.grounded.set(false); }
+    } else if (this.hullHitsLand(newX, newZ, hr, dirSign) ||
         this.terrainService.isOnLand(newX, newZ)) {
       // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
@@ -1000,7 +1066,7 @@ export class VesselService {
     // confused sea gradually nudges the boat off course over ~tens of seconds,
     // requiring the occasional correction. Both scale with sea roughness, so calm
     // water barely moves the bow while rough seas need more frequent attention.
-    if (!this.keys.left && !this.keys.right) {
+    if (!this.keys.left && !this.keys.right && !docked) {
       const roughT = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4.0);
       const wander = Math.sin(t * 0.08 + 1.3) + 0.5 * Math.sin(t * 0.19 + 4.1);
       const waveYaw = wander * roughT * 0.6;   // °/s slow drift

@@ -128,9 +128,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
         <!-- Dock prompt + town menu (when near a harbor and not sunk) -->
         @if (!combatService.sunk() && harborService.dockable(); as town) {
-          @if (!dockMenuOpen()) {
-            <button class="dock-prompt" (click)="dockMenuOpen.set(true)">⚓ Dock at {{ town.name }}</button>
-          } @else {
+          @if (vesselService.tiedUp()) {
             <div class="dock-menu">
               <div class="dock-name">{{ town.name }}</div>
               @if (town.faction) {
@@ -143,8 +141,12 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <button class="dock-opt" (click)="onRepairVessel()">
                 Repair Vessel ({{ isAdmin || multiplayerService.gold() < repairFee ? 'free' : repairFee + 'g' }})
               </button>
-              <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
+              <button class="dock-cast" (click)="onCastOff()">Cast Off</button>
             </div>
+          } @else if (vesselService.docking()) {
+            <div class="dock-prompt dock-mooring">⚓ Mooring at {{ town.name }}…</div>
+          } @else {
+            <button class="dock-prompt" (click)="onDock(town)">⚓ Dock at {{ town.name }}</button>
           }
         }
 
@@ -251,6 +253,8 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                    color: #ffe9b0; font-weight: 600; font-family: ui-monospace, monospace;
                    box-shadow: 0 6px 20px rgba(0,0,0,0.5); transition: all 0.15s; }
     .dock-prompt:hover { background: rgba(40,52,68,0.92); }
+    .dock-mooring { cursor: default; opacity: 0.8; }
+    .dock-mooring:hover { background: rgba(20,28,40,0.86); }
     .dock-menu { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
                  z-index: 60; min-width: 280px; padding: 22px 26px; text-align: center;
                  border-radius: 14px; border: 1px solid rgba(232,211,160,0.4);
@@ -341,7 +345,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private oceanFftRenderer     = inject(OceanFFTRenderer);
   private terrainService     = inject(TerrainService);
   protected harborService    = inject(HarborService);   // template reads dockable()
-  private vesselService      = inject(VesselService);
+  protected vesselService    = inject(VesselService);   // template reads docking()/tiedUp()
   private vesselAssetCache   = inject(VesselAssetCacheService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
@@ -530,6 +534,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.multiplayerService.authFailed.set(false);
         this.forceReauth();
       });
+    });
+
+    // Moored at a berth → open the town menu; cast off → close it. dockMenuOpen mirrors the vessel's tied
+    // state so all the existing panel-close logic (below) keeps working unchanged.
+    effect(() => {
+      const tied = this.vesselService.tiedUp();
+      untracked(() => this.dockMenuOpen.set(tied));
     });
 
     // Sailed away from the pier → close the town menu (and trader/shipwright panels) if they were open.
@@ -875,6 +886,20 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
     this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
     this.multiplayerService.requestRespawn();
+  }
+
+  /** Dock prompt: auto-steer the boat to a tie-up berth alongside the pier, then moor (the town menu
+   *  opens once tied — see the effect in the constructor). */
+  onDock(town: TerrainHarbor): void {
+    const p = this.vesselService.getPosition();
+    const heading = this.vesselService.state().heading;
+    const berth = this.harborService.computeBerth(town, p.x, p.z, heading);
+    this.vesselService.dockAt(berth);
+  }
+
+  /** Cast off: release the mooring so the helm answers again (closes the town menu via the tiedUp effect). */
+  onCastOff(): void {
+    this.vesselService.castOff();
   }
 
   /** Dock action: open the town trader (asks the server for this town's market quote). */

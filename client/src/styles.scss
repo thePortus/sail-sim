@@ -125,11 +125,13 @@ p {
     transform: translateX(-50%);
     padding: 10px 14px;
   }
-  // Hull damage diagram, right edge, vertically centred.
+  // Hull damage diagram: right edge, anchored just ABOVE the bottom-right minimap (~248 px tall) so it
+  // clears the tall top-right sails panel it used to open over (was vertically centred at top:50%).
   &.damage-diagram {
-    top: 50%;
+    top: auto;
+    bottom: 16rem;
     right: 1.25rem;
-    transform: translateY(-50%);
+    transform: none;
     padding: 10px 12px;
   }
 }
@@ -146,8 +148,8 @@ p {
   user-select: none;
   touch-action: none;
   &:active { cursor: grabbing; }
-  // When dragged, explicit left/top (bound inline) take over from the centred default.
-  &.dd-dragged { right: auto; transform: none; }
+  // When dragged, explicit left/top (bound inline) take over from the default — clear both edge anchors.
+  &.dd-dragged { right: auto; bottom: auto; transform: none; }
   .dd-title {
     font-size: 0.7rem;
     letter-spacing: 0.12em;

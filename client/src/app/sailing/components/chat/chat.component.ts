@@ -100,7 +100,9 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
 
   // ── Position (HostBinding drives absolute placement) ─────────────────────
   @HostBinding('style.left.px') posLeft = 20;
-  @HostBinding('style.top.px')  posTop  = 200;
+  // Start BELOW the top-left wind/compass panel (~220 px tall) so the chat box doesn't open on top of it.
+  // (Only size/font are persisted, not position — so this default applies every session.)
+  @HostBinding('style.top.px')  posTop  = 300;
 
   // ── Chat state ────────────────────────────────────────────────────────────
   myCallsign    = '';

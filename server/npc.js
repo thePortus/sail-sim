@@ -73,8 +73,11 @@ function blendHeading(a, b, t) {
   return (Math.atan2(x, z) * 180 / Math.PI + 360) % 360;
 }
 
-// ── Wind sailing model — MIRRORS the player's VesselService.sailEfficiency so merchants are bound by the
-// exact same wind envelope (no more flat "insanely fast" cruise). NPCs sail full-canvas, perfectly trimmed.
+// ── Wind sailing model — MIRRORS the player's VesselService so merchants are bound by the same wind envelope.
+// NPCs sail full-canvas, perfectly trimmed (no trim model needed). Drive now comes from PER-RIG POLARS so a
+// sloop and a pinnace sail differently, exactly like players (P3/P6). NPCs read the TRUE wind angle (no
+// apparent-wind shift, no momentum/heel/reefing of the player force model) — a deliberate simplification: the
+// polar SHAPE + no-go are the visible parity, and NPC speed stays a wind-proportional target, not a force sim.
 
 /** Angle (deg) between a heading and the wind's FROM-bearing, in [0,180] — 0 = bow into the wind. */
 function angleFromWind(heading, windBearing) {
@@ -82,7 +85,30 @@ function angleFromWind(heading, windBearing) {
   return d > 180 ? 360 - d : d;
 }
 
-/** Point-of-sail efficiency curve (identical thresholds/multipliers to the player). <minTack = no-go zone. */
+// PER-RIG drive polars — MIRROR the client (vessel-controller.ts SLOOP_SAIL / PINNACE_SAIL). Keep in sync.
+// Both fore-and-aft: the sloop points higher and is stronger on a reach but weak dead-downwind; the pinnace
+// points a touch lower and holds its drive far better on the run. [apparentAngle°, coeff], interpolated.
+const SAIL_POLARS = {
+  sloop:   [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
+  pinnace: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+};
+
+/** Per-rig drive coefficient at wind angle `aw` (0 = bow into wind). Below the no-go angle the sail
+ *  luffs → backwinds (ramps to −0.30); above it, interpolate the rig's polar. Falls back to the sloop polar. */
+function npcDrive(aw, slug, minTack) {
+  if (aw < minTack) return -0.30 * (1 - aw / Math.max(1, minTack));   // luff → backwind in the no-go zone
+  const p = SAIL_POLARS[slug] || SAIL_POLARS.sloop;
+  if (aw <= p[0][0]) return p[0][1];
+  for (let i = 1; i < p.length; i++) {
+    if (aw <= p[i][0]) {
+      const t = (aw - p[i - 1][0]) / (p[i][0] - p[i - 1][0]);
+      return p[i - 1][1] + (p[i][1] - p[i - 1][1]) * t;
+    }
+  }
+  return p[p.length - 1][1];
+}
+
+/** Legacy step curve — kept for back-compat / tests; live NPC sailing now uses the per-rig npcDrive() above. */
 function sailEff(aw, minTack) {
   if (aw < minTack) return -0.30;   // in irons
   if (aw < 45)  return 0.52;        // close-hauled
@@ -247,8 +273,9 @@ function engageHeading(npc, foeState, wind, ph) {
   else                              offset = 90;     // in the slot → hold a clean broadside (orbits at range)
   const hPlus  = (B + offset + 360) % 360;
   const hMinus = (B - offset + 360) % 360;
-  const effPlus  = sailEff(angleFromWind(hPlus,  wind.windBearing), ph.minTackAngle);
-  const effMinus = sailEff(angleFromWind(hMinus, wind.windBearing), ph.minTackAngle);
+  const slug     = npc.state.vesselSlug;
+  const effPlus  = npcDrive(angleFromWind(hPlus,  wind.windBearing), slug, ph.minTackAngle);
+  const effMinus = npcDrive(angleFromWind(hMinus, wind.windBearing), slug, ph.minTackAngle);
   let side = (npc.broadsideSide === 1 || npc.broadsideSide === -1) ? npc.broadsideSide
            : (effPlus >= effMinus ? 1 : -1);
   if      (side === 1  && effMinus > effPlus  + BROADSIDE_HYST) side = -1;
@@ -273,7 +300,7 @@ function escapeHeading(npc, foeState, wind, ph) {
   let best = away, bestRate = -Infinity;
   for (let h = 0; h < 360; h += 15) {
     const opening = Math.sin(h * DEG) * awayX + Math.cos(h * DEG) * awayZ;   // -1 (toward foe) .. 1 (dead away)
-    const rate = Math.max(0, sailEff(angleFromWind(h, wind.windBearing), ph.minTackAngle)) * opening;
+    const rate = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), npc.state.vesselSlug, ph.minTackAngle)) * opening;
     if (rate > bestRate) { bestRate = rate; best = h; }
   }
   return best;
@@ -555,10 +582,10 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec * turnMul);
     npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
 
-    // Speed from wind strength × point of sail — the EXACT player envelope (full sail, perfect trim, no
-    // gust), now also scaled by mast + crew condition. Eased toward target like the player.
+    // Speed from wind strength × the per-rig POLAR (full sail, perfect trim) — sloop/pinnace now sail by their
+    // own drive curves, matching players (P6). Also scaled by mast + crew condition; eased toward target.
     const aw     = angleFromWind(npc.state.heading, wind.windBearing);
-    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * sailEff(aw, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul));
+    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul));
     npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
@@ -647,7 +674,7 @@ module.exports = {
     spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
     avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,
     setJitter(j) { TRIP_JITTER = j; }, OWN_DEST_BONUS, OWN_SRC_BONUS,
-    markHostile, isHostile, AGGRO_MS, engageTarget, engageHeading, angleFromWind, sailEff, FIRE_RANGE,
+    markHostile, isHostile, AGGRO_MS, engageTarget, engageHeading, angleFromWind, sailEff, npcDrive, FIRE_RANGE,
     firingSolution, NPC_MUZZLE_V, MAX_FIRE_RANGE, FIRE_ARC, NPC_RELOAD_MS,
     escapeHeading, hullFraction, FLEE_HEALTH, GIVE_UP_RANGE,
     shipStrength, hullPoints, repWith, findThreat, combatStance,

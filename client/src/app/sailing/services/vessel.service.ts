@@ -11,7 +11,7 @@ import { OceanService }  from './ocean.service';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
+import { VesselController, createVesselController, rigForSlug, VesselRig, SailRig } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { MastCrackService } from './mast-crack.service';
@@ -74,6 +74,41 @@ export class VesselService {
   private physics: VesselPhysics = {
     maxSpeed: 8, accelerationRate: 0.25, minTackAngle: 38, sailAreaFactor: 0.32, weight: 2800,
   };
+
+  // ── Realistic physics v2 (force-based; gated by localStorage.ignis_physics='v2') ──────────────────
+  // P1: apparent wind + drive-vs-quadratic-drag + mass momentum. Calibrated to keep ~current top speeds
+  // (hand-checked vs the legacy lag model at wind 9 m/s). Constants are global for P1; per-rig polars
+  // arrive in P3. See sailing-physics-roadmap. Trim/turn/in-irons stay on the legacy model until P2/P4.
+  // v2 force-based sailing is now the DEFAULT; opt back to the old model with localStorage.ignis_physics='legacy'.
+  private readonly physV2 = !(typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics') === 'legacy');
+  // The tuning overlay is off by default now; show it again with localStorage.ignis_physics_debug='1'.
+  private readonly physDebugOn = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics_debug') === '1');
+  private readonly SAIL_FORCE_K   = 0.26;    // drive scale: thrust = K·sailAreaFactor·driveC·V_app²
+  private readonly DRAG_K         = 1.0;     // hull drag: F = DRAG_K·v² (quadratic) — sets where drive=drag
+  private readonly FORCE_RESPONSE = 0.04;    // accel gain (sets momentum/time-constant; lower = weightier)
+  private readonly WEIGHT_REF     = 2800;    // sloop weight → massK = physics.weight / WEIGHT_REF
+  private prevSpeedMod = 0;                  // last frame's buoy.speedModifier, fed back as wave-surf accel
+  private trimQ = 1;                         // last frame's trim quality (0..1) at the drive angle — for the HUD
+  // P4 turning realism (v2): the helm commands a TARGET yaw rate that eases in (angular inertia) instead of
+  // snapping; hard turns scrub speed (broadside drag); and a stalled bow head-to-wind is gently blown off
+  // the eye so you can never be permanently stuck in irons (recoverable).
+  private yawRate = 0;                       // current heading rate (deg/s); eased toward the rudder target
+  private readonly YAW_RESPONSE   = 4;       // how fast yaw eases to target (1/s; ~0.25 s time constant)
+  private readonly TURN_SCRUB     = 0.06;    // speed lost to turning: extra drag = TURN_SCRUB·|yaw|·|speed|
+  private readonly IRONS_FALLOFF  = 6;       // deg/s the wind blows the bow off the eye when stalled in irons
+  // P5 sea-state + reefing (v2): heel comes from wind SIDE-FORCE (not speed); over-canvassed sails heel past
+  // comfort and SPILL wind → forward drive drops, so reefing pays in a blow and full sail wins in light air.
+  // Rough/head seas add drag. Heel feeds the visual lean + leeway.
+  private heelV2 = 0;                         // current wind-pressure heel (deg, magnitude) under v2
+  private heelSpill = 0;                      // 0..1 over-canvassed wind-spill (also the HUD "reef" hint)
+  private readonly HEEL_K        = 0.22;      // heel = HEEL_K·SAF·canvas·V_app²·sin(angle), capped below
+  private readonly COMFORT_HEEL  = 16;        // ° before the sail starts spilling wind
+  private readonly SPILL_RANGE   = 14;        // ° of heel over comfort that ramps spill 0→1
+  private readonly SPILL_MAX     = 0.75;      // max forward-drive fraction lost to an over-pressed (heeled) sail
+  private readonly MAX_HEEL_VIS  = 26;        // ° cap on the visual/leeway heel
+  private readonly SEA_DRAG_K    = 0.06;      // chop resistance: extra drag = SEA_DRAG_K·rough·(0.5+intoSea)·|v|
+  /** Live force-model telemetry for the tuning overlay (only set when physV2). null on the legacy model. */
+  physDebug = signal<{ appAngle: number; appWind: number; trueAngle: number; thrust: number; drag: number; speed: number; vmg: number; trim: number; heel: number; reef: boolean } | null>(null);
 
   /**
    * Seconds the vessel has been continuously blocked by land.
@@ -844,24 +879,77 @@ export class VesselService {
     }
   }
 
+  /**
+   * v2 trim quality (0..1) — sensitivity depends on POINT OF SAIL. Upwind/reaching the sail is an
+   * AIRFOIL: tight tolerance, and bad trim STALLS (over-sheet) or LUFFS (over-ease) toward 0. Dead
+   * downwind the sail is a DRAG device (a parachute): wide tolerance, a high floor, and it CANNOT stall —
+   * a slightly-off sheet with the wind behind you costs almost nothing. Fixes the legacy bug where a 30°
+   * over-sheet drove efficiency to 0 even on a run (the "I'm running downwind but nearly stopped" case).
+   */
+  private trimFactorV2(absAngle: number): number {
+    const optimal  = this.optimalSheetAngle(absAngle);
+    const mismatch = this.sheetAngleDeg - optimal;          // <0 = sheeted too tight, >0 = eased too far
+    const dw       = this.smooth01(absAngle, 100, 160);     // 0 = airfoil (up/reach) → 1 = drag device (run)
+    const forgive  = this.rig.sail?.trimForgive ?? 1;       // simple workboat rig → wider tolerance
+    const floor    = 0.70 * dw;                             // min drive even badly mis-set: 0 upwind → .70 run
+    const tightW   = (20 + 56 * dw) * forgive;              // too-tight (stall) tolerance °: 20 → 76
+    const easeW    = (32 + 58 * dw) * forgive;              // too-eased (luff)  tolerance °: 32 → 90
+    const width    = (mismatch < 0 ? tightW : easeW) || 1;
+    const x        = Math.min(1, Math.abs(mismatch) / width);
+    return floor + (1 - floor) * (1 - x * x);              // parabolic falloff, = floor at the tolerance edge
+  }
+
+  /** Smoothstep 0..1 as v sweeps a→b. */
+  private smooth01(v: number, a: number, b: number): number {
+    const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+    return t * t * (3 - 2 * t);
+  }
+
   private sailEfficiency(angleFromWind: number): number {
-    if (this.sailState === 'reefed') return 0;
+    if (this.sailState === 'reefed') { this.trimQ = 1; return 0; }
     const sailMult = this.sailState === 'topsails' ? 0.5 : 1.0;
     const a = Math.abs(angleFromWind);
     let eff: number;
 
-    if      (a < this.physics.minTackAngle) eff = -0.30;  // in irons: gentle pushback
-    else if (a < 45)  eff = 0.52;  // close-hauled
-    else if (a < 60)  eff = 0.72;  // close reach
-    else if (a < 90)  eff = 0.86;  // beam reach
-    else if (a < 115) eff = 0.95;  // broad reach approach
-    else if (a < 145) eff = 1.00;  // broad reach — peak VMG
-    else if (a < 165) eff = 0.88;  // running
-    else              eff = 0.72;  // dead downwind (blanketed jib)
+    if (this.physV2 && this.rig.sail) {
+      // v2: per-rig polar (distinct character per boat) — see VESSEL_RIGS / sailing-physics-roadmap.
+      eff = this.polarDrive(a, this.rig.sail);
+    } else {
+      // Legacy step curve (shared by both boats).
+      if      (a < this.physics.minTackAngle) eff = -0.30;  // in irons: gentle pushback
+      else if (a < 45)  eff = 0.52;  // close-hauled
+      else if (a < 60)  eff = 0.72;  // close reach
+      else if (a < 90)  eff = 0.86;  // beam reach
+      else if (a < 115) eff = 0.95;  // broad reach approach
+      else if (a < 145) eff = 1.00;  // broad reach — peak VMG
+      else if (a < 165) eff = 0.88;  // running
+      else              eff = 0.72;  // dead downwind (blanketed jib)
+    }
 
-    // Trim penalty: even a perfect point of sail underperforms with a mis-set sheet
-    const trim = (a < this.physics.minTackAngle) ? 1 : this.trimFactor(a);
+    // Trim penalty: even a perfect point of sail underperforms with a mis-set sheet. v2 makes the penalty
+    // POINT-OF-SAIL-AWARE (forgiving downwind, sharp upwind); legacy uses the old one-size curve.
+    const trim = (a < this.physics.minTackAngle) ? 1 : (this.physV2 ? this.trimFactorV2(a) : this.trimFactor(a));
+    this.trimQ = trim;   // cached for the HUD trim-quality readout (reflects the actual drive trim)
     return eff * sailMult * trim;
+  }
+
+  /**
+   * v2 per-rig drive coefficient at apparent wind angle `a` (0 = bow into wind). Below the no-go angle the
+   * sail luffs then backwinds (ramps to −0.30 dead into the wind); above it, linearly interpolate the rig's
+   * polar breakpoints. This is what makes a sloop and a pinnace sail differently.
+   */
+  private polarDrive(a: number, sail: SailRig): number {
+    const noGo = this.physics.minTackAngle;
+    if (a < noGo) return -0.30 * (1 - a / Math.max(1, noGo));   // luff → backwind in the no-go zone
+    const p = sail.polar;
+    if (a <= p[0][0]) return p[0][1];
+    for (let i = 1; i < p.length; i++) {
+      if (a <= p[i][0]) {
+        const t = (a - p[i - 1][0]) / (p[i][0] - p[i - 1][0]);
+        return p[i - 1][1] + (p[i][1] - p[i - 1][1]) * t;
+      }
+    }
+    return p[p.length - 1][1];
   }
 
   // ── Turn rate (speed-dependent) ───────────────────────────────────────────
@@ -929,28 +1017,95 @@ export class VesselService {
     const mastH   = mastHealth(this.combatService.zones(), zoneHpFor(this.vesselSlug));
     const mastMul = mastSpeedMult(mastH);
 
-    const eff    = this.sailEfficiency(angleFromWind);
+    // ── Apparent wind (v2): the wind the boat actually feels = true-wind vector − boat-velocity vector.
+    // Reaching/upwind raises it (more drive); running lowers it (you can't outrun the wind dead downwind).
+    // The legacy model read TRUE wind only; v2 drives off the apparent angle/speed. ──
+    let driveAngle = angleFromWind;
+    let appWind    = gustSpeed;
+    if (this.physV2) {
+      const hr0 = this.heading * Math.PI / 180;
+      const bvx = Math.sin(hr0) * this.speed, bvz = Math.cos(hr0) * this.speed;   // boat velocity
+      const wf  = wind.fromBearingDeg * Math.PI / 180;
+      const wvx = -Math.sin(wf) * gustSpeed, wvz = -Math.cos(wf) * gustSpeed;     // true wind velocity (blows TO = from+180°)
+      const ax  = wvx - bvx, az = wvz - bvz;                                       // apparent wind velocity
+      appWind   = Math.hypot(ax, az);
+      const cosA = (-ax * Math.sin(hr0) - az * Math.cos(hr0)) / (appWind || 1);    // cos(angle bow ↔ apparent FROM)
+      driveAngle = Math.acos(Math.max(-1, Math.min(1, cosA))) * 180 / Math.PI;     // 0 = bow into apparent wind
+    }
+
+    const eff    = this.sailEfficiency(driveAngle);
     // Crew: fewer hands work the sails (and helm) less effectively — scale top speed + turn rate by the
     // crew-efficiency factor (0.5..1). Even solo you still sail/turn, just at half pace (the 0.5 floor).
     const crewMul = this.combatService.crewFactor();
     const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul)) * crewMul;
-    // speedModifier applied below after buoyancy is computed.
-    // While sinking OR docked (approaching/tied), control is frozen: glide to a dead stop (no sail drive)
-    // and ignore the helm.
+    // speedModifier applied below after buoyancy is computed (legacy path; v2 folds it into the force model).
+    // While sinking OR docked (approaching/tied), control is frozen: glide to a dead stop (no sail drive).
     const docked = this.dockPhase !== 'free';
-    const spdTarget = (this.sinking || docked) ? 0 : baseTarget;
-    const spdRate   = this.sinking ? 1.2 : this.physics.accelerationRate;
-    this.speed  += (spdTarget - this.speed) * spdRate * dt;
+    if (this.sinking || docked) {
+      this.speed += (0 - this.speed) * (this.sinking ? 1.2 : this.physics.accelerationRate) * dt;
+    } else if (this.physV2) {
+      // ── Force model: a = (thrust − drag)·response/mass. Thrust ∝ driveC·V_app²; drag ∝ v². The steady
+      // state (drive = drag) sets the top speed; mass sets the momentum (heavy boats accelerate/coast slow). ──
+      // Heel from wind SIDE-FORCE (canvas × V_app² × how abeam the wind is). Over comfort the sail spills
+      // wind → forward drive falls off (reefing pays in a blow); spilling also sheds some of the heel.
+      const canvas   = this.sailState === 'full' ? 1 : this.sailState === 'topsails' ? 0.5 : 0;
+      const heelRaw  = this.HEEL_K * this.physics.sailAreaFactor * canvas
+                     * appWind * appWind * Math.sin(driveAngle * Math.PI / 180);
+      this.heelSpill = Math.max(0, Math.min(1, (heelRaw - this.COMFORT_HEEL) / this.SPILL_RANGE));
+      this.heelV2    = Math.min(this.MAX_HEEL_VIS, heelRaw * (1 - 0.45 * this.heelSpill));
+      const driveC = eff * mastMul * crewMul * (1 - this.SPILL_MAX * this.heelSpill);
+      const forceK = this.rig.sail?.forceK ?? this.SAIL_FORCE_K;
+      const thrust = forceK * this.physics.sailAreaFactor * driveC * appWind * appWind;
+      // Drag = hull drag (quadratic) + turn scrub (a hard turn drags the hull broadside, bleeding way — most
+      // felt mid-tack; uses last frame's yawRate, 1-frame lag is moot) + sea drag (chop resistance, worse
+      // punching into a head sea than running with it).
+      const rough    = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4);
+      const intoSea  = 1 - driveAngle / 180;                                   // 1 dead upwind → 0 downwind
+      const drag = this.DRAG_K * this.speed * Math.abs(this.speed)
+                 + this.TURN_SCRUB * Math.abs(this.yawRate) * Math.abs(this.speed)
+                 + this.SEA_DRAG_K * rough * (0.5 + intoSea) * Math.abs(this.speed);
+      const massK  = Math.max(0.2, this.physics.weight / this.WEIGHT_REF);
+      this.speed  += (thrust - drag) * this.FORCE_RESPONSE / massK * dt;
+      this.speed  += this.prevSpeedMod * this.physics.maxSpeed * 0.3 * dt;   // following/head-sea surf nudge
+      this.speed   = Math.max(-1.5, Math.min(this.physics.maxSpeed, this.speed));
+    } else {
+      this.speed += (baseTarget - this.speed) * this.physics.accelerationRate * dt;
+    }
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
+
+    if (this.physV2 && this.physDebugOn) {
+      const driveC = eff * mastMul * crewMul * (1 - this.SPILL_MAX * this.heelSpill);
+      this.physDebug.set({
+        appAngle: driveAngle, appWind, trueAngle: angleFromWind,
+        thrust: (this.rig.sail?.forceK ?? this.SAIL_FORCE_K) * this.physics.sailAreaFactor * driveC * appWind * appWind,
+        drag: this.DRAG_K * this.speed * Math.abs(this.speed),
+        speed: this.speed, vmg: this.speed * Math.cos(driveAngle * Math.PI / 180), trim: this.trimQ,
+        heel: this.heelV2, reef: this.heelSpill > 0.3,
+      });
+    }
 
     // Steering. With the mast totally down she still answers the helm, but only just — capped to a slow
     // pivot (she's lost her sail-driven way; this is the "can turn very slowly but that is it" rule).
-    if ((this.keys.left || this.keys.right) && !this.sinking && !docked) {
-      const dir = this.keys.left ? -1 : 1;
-      let rate = this.turnRate(this.speed);
-      if (mastH <= 0) rate = Math.min(rate, MAST_DOWN_TURN_MAX);
-      rate *= crewMul;   // short-handed → slower on the helm too (floor 0.5)
-      this.heading = ((this.heading + dir * rate * dt) + 360) % 360;
+    let maxYaw = this.turnRate(this.speed);                  // speed-dependent rudder authority (water flow)
+    if (mastH <= 0) maxYaw = Math.min(maxYaw, MAST_DOWN_TURN_MAX);
+    maxYaw *= crewMul;                                       // short-handed → slower on the helm too
+    const rudder = (!this.sinking && !docked) ? (this.keys.left ? -1 : this.keys.right ? 1 : 0) : 0;
+    if (this.physV2) {
+      // Angular inertia: the helm sets a TARGET yaw rate the boat eases toward (and coasts back from when
+      // centred) — no instant pivots. Turn scrub (above) bleeds speed through the turn.
+      const targetYaw = rudder * maxYaw;
+      this.yawRate += (targetYaw - this.yawRate) * Math.min(1, this.YAW_RESPONSE * dt);
+      this.heading = ((this.heading + this.yawRate * dt) + 360) % 360;
+      // In irons & losing way → the wind blows the bow off the eye so you can never be permanently stuck.
+      // Scales with how stalled she is (→ 0 once she has way on or has fallen off past the no-go zone).
+      if (rudder === 0 && !this.sinking && !docked
+          && driveAngle < this.physics.minTackAngle && Math.abs(this.speed) < 1.5) {
+        const signed = diff > 180 ? diff - 360 : diff;       // heading vs wind FROM, −180..180 (0 = eye)
+        const fall = (signed >= 0 ? 1 : -1) * this.IRONS_FALLOFF * (1 - Math.abs(this.speed) / 1.5);
+        this.heading = ((this.heading + fall * dt) + 360) % 360;
+      }
+    } else if (rudder !== 0) {
+      this.heading = ((this.heading + rudder * maxYaw * dt) + 360) % 360;   // legacy: instant rate while held
     }
 
     // ── Auto-dock: ease to the berth, then stay moored (frozen) until cast off ──
@@ -976,8 +1131,11 @@ export class VesselService {
     // Leeway: sailing boats slip sideways (leeward) under sail pressure.
     // Proportional to heel angle — more heel = more sideways drift.
     // On port tack the wind pushes to starboard (+cos/−sin in world space).
-    const heelMag     = Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
-    const leewayDeg   = heelMag * 0.28;        // max ~3.4° leeway at full speed/heel
+    // v2: heel comes from wind side-force (computed in the force model above) → more leeway when pressed,
+    // and the workboat pinnace makes more leeway than the keel-stiff sloop (per-rig leewayK).
+    const heelMag     = this.physV2 ? this.heelV2 : Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
+    const leewayK     = this.physV2 ? (this.rig.sail?.leewayK ?? 1) : 1;
+    const leewayDeg   = heelMag * 0.28 * leewayK;   // legacy ~3.4° max; v2 scales with wind-pressure heel
     const leewayRad   = leewayDeg * Math.PI / 180;
     const leewaySign  = isPortTack ? 1 : -1;   // push to starboard on port tack
     const lwyX = Math.cos(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
@@ -1055,10 +1213,15 @@ export class VesselService {
 
     // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
     // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.
-    const modTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed,
-      baseTarget * (1 + buoy.speedModifier),
-    ));
-    this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
+    // v2 folds this into the force model (via prevSpeedMod, applied next frame as a surf accel) rather than
+    // retargeting toward baseTarget, so the two speed integrators never fight.
+    if (!this.physV2) {
+      const modTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed,
+        baseTarget * (1 + buoy.speedModifier),
+      ));
+      this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
+    }
+    this.prevSpeedMod = buoy.speedModifier;
 
     // Cross-wave broaching bias + slow sea-state wander: only active when the
     // player is not steering. buoy.steeringBias is the fast wave-to-wave jostle
@@ -1236,7 +1399,7 @@ export class VesselService {
         turnRate: this.turnRateSmoothed,
         sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
         sheetAngle:  Math.round(this.sheetAngleDeg),
-        trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),
+        trimQuality: this.trimQ,   // actual drive trim (apparent-angle + point-of-sail-aware under v2)
         anchored: this.isAnchored, anchorSide: this.anchorSide,
       });
     });

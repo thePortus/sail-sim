@@ -150,6 +150,19 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           }
         }
 
+        <!-- Physics v2 tuning overlay (only when localStorage.ignis_physics='v2') -->
+        @if (vesselService.physDebug(); as pd) {
+          <div class="phys-debug">
+            <div class="phys-row"><span>app wind</span><b>{{ pd.appAngle | number:'1.0-0' }}° · {{ pd.appWind | number:'1.1-1' }}</b></div>
+            <div class="phys-row"><span>true wind</span><b>{{ pd.trueAngle | number:'1.0-0' }}°</b></div>
+            <div class="phys-row"><span>speed</span><b>{{ pd.speed | number:'1.2-2' }}</b></div>
+            <div class="phys-row"><span>VMG</span><b>{{ pd.vmg | number:'1.2-2' }}</b></div>
+            <div class="phys-row"><span>trim</span><b>{{ pd.trim * 100 | number:'1.0-0' }}%</b></div>
+            <div class="phys-row"><span>heel</span><b [class.phys-warn]="pd.reef">{{ pd.heel | number:'1.0-0' }}°{{ pd.reef ? ' ⚠ reef' : '' }}</b></div>
+            <div class="phys-row"><span>thrust / drag</span><b>{{ pd.thrust | number:'1.1-1' }} / {{ pd.drag | number:'1.1-1' }}</b></div>
+          </div>
+        }
+
         <!-- Trader panel (opened from the dock menu's Trade button) -->
         @if (tradeMenuOpen()) {
           <app-trader-menu (close)="tradeMenuOpen.set(false)" />
@@ -314,6 +327,15 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                    opacity: 0; transition: opacity 0.8s ease; }
     .game-canvas--visible { opacity: 1; }
+    /* Physics v2 tuning overlay */
+    .phys-debug { position: absolute; top: 4.5rem; left: 1rem; z-index: 55; min-width: 168px;
+                  padding: 8px 10px; border-radius: 8px; background: rgba(10,16,24,0.74);
+                  border: 1px solid rgba(120,160,200,0.35); color: #cfe3f5; pointer-events: none;
+                  font-family: ui-monospace, monospace; font-size: 0.72rem; line-height: 1.5; }
+    .phys-row { display: flex; justify-content: space-between; gap: 14px; }
+    .phys-row span { opacity: 0.66; }
+    .phys-row b { color: #ffe9b0; font-weight: 600; }
+    .phys-row b.phys-warn { color: #ff9a6b; }
     .loading-overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
                         align-items: center; justify-content: center;
                         background: radial-gradient(ellipse at center, #3a2817 0%, #15100a 70%); }

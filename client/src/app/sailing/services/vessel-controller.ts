@@ -34,6 +34,23 @@ export interface VesselController {
   dispose(): void;
 }
 
+/**
+ * Per-rig sailing character for the v2 force model (localStorage.ignis_physics='v2'). Gives each vessel a
+ * DISTINCT polar so boats feel different to sail; the legacy model ignores this. Mirror any change into the
+ * server NPC sim (server/npc.js) when P6 lands — see sailing-physics-roadmap.
+ */
+export interface SailRig {
+  /** Drive-coefficient polar: [apparentWindAngle°, coeff] breakpoints from the no-go angle out to 180°,
+   *  linearly interpolated. Below the no-go angle the model ramps to a backwinded (negative) drive. */
+  polar: ReadonlyArray<readonly [number, number]>;
+  /** Drive-scale override (else the global SAIL_FORCE_K). A smaller/less-efficient sail plan → lower. */
+  forceK?: number;
+  /** Trim-tolerance multiplier (>1 = more forgiving; a simple workboat rig is less fussy than a tuned sloop). */
+  trimForgive?: number;
+  /** Leeway (sideways slip) multiplier (>1 = slips more; a shallow keel-less hull makes more leeway). */
+  leewayK?: number;
+}
+
 /** Rig asset descriptor by vessel slug. Used by BOTH the local VesselService (which also has the full
  *  server vessel def) and MultiplayerService (which only knows a remote ship's slug). */
 export interface VesselRig {
@@ -63,11 +80,27 @@ export interface VesselRig {
   /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
   hullHalfLen: number;
   hullHalfBeam: number;
+  /** v2 sailing polar (omit → falls back to the legacy step curve). */
+  sail?: SailRig;
 }
 
+// Both vessels are FORE-AND-AFT rigged but with distinct character (see sailing-physics-roadmap):
+//  • Sloop — Bermuda rig: points high (no-go 32°), strong on a reach, peak drive ~120°, but the main
+//    blankets the jib dead downwind so the run falls off. A tuned rig → fussier trim.
+//  • Pinnace — handy sprit/lug: points a touch lower (no-go 34°), lower peak, but a simple low sail holds
+//    its drive much better dead downwind, and the workboat rig is more forgiving of sloppy trim.
+const SLOOP_SAIL: SailRig = {
+  polar: [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
+  trimForgive: 1.0, leewayK: 1.0,
+};
+const PINNACE_SAIL: SailRig = {
+  polar: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+  trimForgive: 1.25, leewayK: 1.4,
+};
+
 export const VESSEL_RIGS: Record<string, VesselRig> = {
-  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2 },
-  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.25, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.13, heaveTau: 0.65, tiltTau: 0.3 } },
+  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, sail: SLOOP_SAIL },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.25, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.13, heaveTau: 0.65, tiltTau: 0.3 }, sail: PINNACE_SAIL },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {

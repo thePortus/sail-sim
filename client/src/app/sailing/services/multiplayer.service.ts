@@ -139,6 +139,12 @@ export class MultiplayerService {
   allMerchants = signal<{ x: number; z: number }[]>([]);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
+  /** Inter-faction relations matrix { [a]: { [b]: 'war'|'peace'|'alliance' } } — drives the Diplomacy panel. */
+  factionMatrix = signal<Record<string, Record<string, string>>>({});
+  /** Last reputation change from attacking shipping (transient; surfaced as a toast). */
+  repToast = signal<{ deltas: Record<string, number>; reason: string } | null>(null);
+  /** Last inter-faction war/peace/alliance shift (transient; surfaced as a prominent banner). */
+  diplomacyBanner = signal<{ text: string; to: string } | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -451,6 +457,9 @@ export class MultiplayerService {
     this.nearestMerchant.set(null);
     this.allMerchants.set([]);
     this.factionRep.set({});
+    this.factionMatrix.set({});
+    this.repToast.set(null);
+    this.diplomacyBanner.set(null);
     this.ownedShip.set('pinnace');
     this.purchasedShip.set(null);
     this.shipError.set(null);
@@ -659,6 +668,20 @@ export class MultiplayerService {
     } else if (msg.type === 'salvage_collected') {
       // The wallet update arrives separately; surface a transient toast of what we scooped.
       this.salvageToast.set({ goods: (msg.goods && typeof msg.goods === 'object') ? msg.goods : {}, gold: +msg.gold || 0 });
+
+    } else if (msg.type === 'diplomacy_state') {
+      // Full inter-faction relations matrix (on connect + on any shift) → the Diplomacy panel.
+      this.factionMatrix.set((msg.matrix && typeof msg.matrix === 'object') ? msg.matrix as Record<string, Record<string, string>> : {});
+
+    } else if (msg.type === 'diplomacy_event') {
+      // A war/peace/alliance shift (also arrives as a system chat line) → flash a prominent banner.
+      this.diplomacyBanner.set({ text: String(msg.text ?? ''), to: String(msg.to ?? 'peace') });
+
+    } else if (msg.type === 'reputation_changed') {
+      // Attacking/sinking a nation's shipping shifted our standing. The message carries the FULL updated map
+      // (keep the readout exact) + the per-faction deltas (for the toast).
+      if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
+      this.repToast.set({ deltas: (msg.deltas && typeof msg.deltas === 'object') ? msg.deltas as Record<string, number> : {}, reason: String(msg.reason ?? '') });
 
     } else if (msg.type === 'ledger') {
       // Full discovered-towns ledger (on connect).

@@ -17,3 +17,9 @@ const byId = new Map(FACTIONS.map((f) => [f.id, f]));
 export function factionDef(id?: string | null): FactionDef | null { return id ? (byId.get(id) ?? null) : null; }
 export function factionColor(id?: string | null): string { return (id && byId.get(id)?.color) || '#9a9a9a'; }
 export function factionName(id?: string | null): string { return (id && byId.get(id)?.name) || 'Unaligned'; }
+
+// ── Inter-faction relations (Diplomacy module) — mirror of server/diplomacy.js states ──
+export type Relation = 'war' | 'peace' | 'alliance';
+export function relationLabel(r?: string | null): string { return r === 'war' ? 'War' : r === 'alliance' ? 'Alliance' : 'Peace'; }
+export function relationColor(r?: string | null): string { return r === 'war' ? '#f85149' : r === 'alliance' ? '#3fb950' : '#8a8a8a'; }
+export function relationIcon(r?: string | null): string { return r === 'war' ? '⚔' : r === 'alliance' ? '⚜' : '·'; }

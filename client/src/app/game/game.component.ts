@@ -44,6 +44,7 @@ import { SettingsMenuComponent }   from '../sailing/components/settings-menu/set
 import { TraderMenuComponent }     from './trader-menu.component';
 import { ShipwrightMenuComponent } from './shipwright-menu.component';
 import { TavernMenuComponent } from './tavern-menu.component';
+import { DiplomacyMenuComponent } from './diplomacy-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -53,7 +54,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, DiplomacyMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -157,9 +158,24 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-tavern-menu (close)="tavernOpen.set(false)" />
         }
 
+        <!-- Diplomacy panel (opened from the Ship's Hold or the K key) — faction relations + your standing -->
+        @if (diplomacyOpen()) {
+          <app-diplomacy-menu (close)="diplomacyOpen.set(false)" />
+        }
+
         <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
         @if (salvageNotice(); as note) {
           <div class="salvage-toast">📦 {{ note }}</div>
+        }
+
+        <!-- Reputation toast — flashes the per-nation standing change after attacking shipping -->
+        @if (repNotice(); as rep) {
+          <div class="rep-toast">{{ rep }}</div>
+        }
+
+        <!-- Diplomacy banner — a prominent flash when nations declare war / make peace / ally -->
+        @if (diploBanner(); as b) {
+          <div class="diplo-banner" [class.war]="b.war">{{ b.text }}</div>
         }
 
         <!-- Ship's Hold — gold + cargo, viewable anytime with I or Tab -->
@@ -190,7 +206,8 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                 </div>
               }
             </div>
-            <div class="inv-hint">Press I or Tab to close</div>
+            <button class="inv-diplo-btn" (click)="openDiplomacy()">⚔ View Faction Relations</button>
+            <div class="inv-hint">Press I or Tab to close · K for diplomacy</div>
           </div>
         }
 
@@ -278,6 +295,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .inv-rep-val { color: #cdbb95; font-variant-numeric: tabular-nums; }
     .inv-rep-val.pos { color: #9fe0a0; }
     .inv-rep-val.neg { color: #f0a8a0; }
+    .inv-diplo-btn { margin-top: 0.7rem; width: 100%; padding: 0.5rem; cursor: pointer; background: rgba(184,138,62,0.14); color: #e7d6ab; border: 1px solid rgba(184,138,62,0.4); border-radius: 6px; font-family: inherit; font-size: 0.85rem; }
+    .inv-diplo-btn:hover { background: rgba(184,138,62,0.24); }
+    .rep-toast { position: absolute; top: 8.5rem; left: 50%; transform: translateX(-50%); z-index: 85; padding: 8px 16px; border-radius: 8px; background: rgba(20,12,6,0.86); border: 1px solid rgba(184,138,62,0.4); color: #f0e3c6; font-family: 'IBM Plex Serif', Georgia, serif; font-size: 0.9rem; white-space: nowrap; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+    .diplo-banner { position: absolute; top: 30%; left: 50%; transform: translateX(-50%); z-index: 86; padding: 12px 26px; border-radius: 10px; background: rgba(20,12,6,0.92); border: 1px solid rgba(184,138,62,0.5); color: #f0e3c6; font-family: 'IBM Plex Serif', Georgia, serif; font-size: 1.05rem; font-weight: 600; text-align: center; max-width: 80vw; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+    .diplo-banner.war { border-color: rgba(248,81,73,0.7); color: #ffd9d4; }
     .inv-hint { margin-top: 0.8rem; text-align: center; color: #8a7448; font-size: 0.72rem; }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
@@ -343,8 +365,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
   tavernOpen = signal<boolean>(false);     // the tavern panel (opened from the town menu's Tavern button — recruit crew)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
+  diplomacyOpen = signal<boolean>(false);  // the Diplomacy panel (K / Ship's Hold button) — faction relations + standing
   salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
   private salvageTimer: ReturnType<typeof setTimeout> | null = null;
+  repNotice = signal<string | null>(null);       // transient reputation-change toast after attacking shipping
+  private repTimer: ReturnType<typeof setTimeout> | null = null;
+  diploBanner = signal<{ text: string; war: boolean } | null>(null);   // prominent war/peace/alliance flash
+  private diploTimer: ReturnType<typeof setTimeout> | null = null;
   protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
 
   /** Cargo as a sorted display list { id, name, qty } using the server-sent goods catalogue. */
@@ -379,9 +406,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   @HostListener('window:keydown.escape')
   onEscKey(): void {
     if (this.phase() !== 'sailing') return;
-    // Esc backs out of the hold first; then Settings; then stands down an armed gun; then pause.
+    // Esc backs out of the hold/diplomacy first; then Settings; then stands down an armed gun; then pause.
     if (this.inventoryOpen()) {
       this.inventoryOpen.set(false);
+      return;
+    }
+    if (this.diplomacyOpen()) {
+      this.diplomacyOpen.set(false);
       return;
     }
     if (this.showSettings()) {
@@ -403,6 +434,17 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     e.preventDefault();                          // Tab would otherwise move focus
     this.inventoryOpen.update(v => !v);
   }
+
+  // Toggle the Diplomacy panel (faction relations + standing) with K — viewable anytime while sailing.
+  @HostListener('window:keydown.k', ['$event'])
+  onDiplomacyKey(e: KeyboardEvent): void {
+    if (this.phase() !== 'sailing' || this.typingInField()) return;
+    e.preventDefault();
+    this.diplomacyOpen.update(v => !v);
+  }
+
+  /** Open Diplomacy from the Ship's Hold button (and close the hold so one panel shows at a time). */
+  protected openDiplomacy(): void { this.inventoryOpen.set(false); this.diplomacyOpen.set(true); }
 
   /** True when a text field (e.g. chat) is focused, so game hotkeys don't hijack typing. */
   private typingInField(): boolean {
@@ -535,6 +577,33 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.multiplayerService.salvageToast.set(null);
         if (this.salvageTimer) clearTimeout(this.salvageTimer);
         this.salvageTimer = setTimeout(() => this.salvageNotice.set(null), 3500);
+      });
+    });
+
+    // Reputation change (attacked/sank a nation's shipping) → flash the per-nation deltas as a toast.
+    effect(() => {
+      const t = this.multiplayerService.repToast();
+      if (!t) return;
+      untracked(() => {
+        const parts = Object.entries(t.deltas)
+          .filter(([, d]) => d)
+          .map(([fid, d]) => `${d > 0 ? '+' : ''}${d} ${factionName(fid)}`);
+        if (parts.length) this.repNotice.set('Reputation: ' + parts.join(' · '));
+        this.multiplayerService.repToast.set(null);
+        if (this.repTimer) clearTimeout(this.repTimer);
+        this.repTimer = setTimeout(() => this.repNotice.set(null), 3500);
+      });
+    });
+
+    // Diplomacy shift (war / peace / alliance) → a prominent banner for a few seconds (also in chat).
+    effect(() => {
+      const b = this.multiplayerService.diplomacyBanner();
+      if (!b) return;
+      untracked(() => {
+        this.diploBanner.set({ text: b.text, war: b.to === 'war' });
+        this.multiplayerService.diplomacyBanner.set(null);
+        if (this.diploTimer) clearTimeout(this.diploTimer);
+        this.diploTimer = setTimeout(() => this.diploBanner.set(null), 6000);
       });
     });
   }

@@ -5,6 +5,7 @@
 * updated home screen that describes the game, gives a fun vibe
 * fix pinnace water displacement
 * add brigantine
+* make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * add occasional bosun whistle (no more than once a day)
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...

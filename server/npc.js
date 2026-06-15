@@ -158,6 +158,69 @@ function hullFraction(combat) {
   return max > 0 ? cur / max : 1;
 }
 
+// ── D3: faction-hostility + relative-strength engagement ────────────────────────────────────────────────────
+// A merchant treats a player its NATION hates (rep ≤ HOSTILE_REP with npc.faction) as an enemy even unprovoked —
+// but whether it FIGHTS, AVOIDS, or simply watches depends on RELATIVE STRENGTH. shipStrength weighs CURRENT hull
+// HP + broadside guns + top speed, so the comparison stays meaningful as bigger, better-armed ships enter play.
+const HOSTILE_REP  = -25;    // a player at/below this standing with the merchant's nation is treated as an enemy
+const DETECT_RANGE = 650;    // world units: how far off a merchant notices a hated player (to start avoiding / closing)
+const ENGAGE_RANGE = 320;    // world units: an even/stronger merchant defends its lane once a hated player closes to here
+const AVOID_RATIO  = 1.25;   // the foe must be ≥25% stronger for the merchant to break off and run rather than fight
+const STR_HULL_W   = 1.0;    // strength per current hull point
+const STR_GUN_W    = 30.0;   // strength per broadside gun
+const STR_SPEED_W  = 8.0;    // strength per knot of top speed
+
+/** Current (and max) non-mast hull points of a combat state. */
+function hullPoints(combat) {
+  let cur = 0, max = 0;
+  if (combat) for (const z of Cc.ZONES) { if (z === 'masts') continue; cur += combat.zones[z] || 0; max += combat.maxHp[z] || 0; }
+  return { cur, max };
+}
+/** Relative fighting strength of ANY ship entry (player or merchant): CURRENT hull + broadside firepower + speed.
+ *  A shot-up ship reads weaker (current hull), more guns / a faster hull read stronger — so the assessment scales
+ *  naturally to the heavier vessels coming. Slug from state.vesselSlug (merchant/player) or the owned ship. */
+function shipStrength(entry) {
+  const slug = (entry.state && entry.state.vesselSlug) || entry.ship || 'pinnace';
+  const def = getVesselDef(slug) || {};
+  const guns = (def.cannons && def.cannons.port && def.cannons.port.length) || 1;
+  const speed = (def.physics && def.physics.maxSpeed) || 8;
+  const hull = entry.combat ? hullPoints(entry.combat).cur : 100;
+  return Math.max(1, hull * STR_HULL_W + guns * STR_GUN_W + speed * STR_SPEED_W);
+}
+/** A player's standing with `faction` (0 if absent / not yet loaded). */
+function repWith(player, faction) {
+  return (player && player.factionRep && Number.isFinite(player.factionRep[faction])) ? player.factionRep[faction] : 0;
+}
+
+/** The threat a merchant should react to this tick: its PROVOKED attacker (it was fired on — existing aggro) or,
+ *  failing that, the nearest player its nation HATES within DETECT_RANGE. Returns { foe, provoked } or null. */
+function findThreat(npc, players, nowMs) {
+  const provoked = engageTarget(npc, players, nowMs);   // existing grudge (hit → hostileToward), already stale/sunk/escape-checked
+  if (provoked) return { foe: provoked, provoked: true };
+  // Unprovoked: scan for the nearest HATED player in detection range (its nation's enemy by reputation).
+  let best = null, bestD2 = DETECT_RANGE * DETECT_RANGE;
+  for (const [, p] of players) {
+    if (p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (repWith(p, npc.faction) > HOSTILE_REP) continue;   // not hated enough → ignored
+    const dx = p.state.x - npc.state.x, dz = p.state.z - npc.state.z, d2 = dx * dx + dz * dz;
+    if (d2 < bestD2) { bestD2 = d2; best = p; }
+  }
+  return best ? { foe: best, provoked: false } : null;
+}
+
+/** Decide a merchant's stance toward a threat: 'fight' | 'flee' | 'route' (hold the trade run). Badly-hurt → always
+ *  flee. Outmatched (foe ≥ AVOID_RATIO stronger) → flee/avoid. Otherwise a PROVOKED merchant fights back; an
+ *  UNPROVOKED (merely hated) one holds its lane and only engages defensively once the player closes to ENGAGE_RANGE
+ *  — it won't chase a hated stranger across the sea, but it won't be boarded for free either. */
+function combatStance(npc, foe, provoked) {
+  if (hullFraction(npc.combat) < FLEE_HEALTH) return 'flee';
+  const ratio = shipStrength(foe) / shipStrength(npc);
+  if (ratio > AVOID_RATIO) return 'flee';                    // they're stronger → keep away / run
+  if (provoked) return 'fight';                              // attacked + can hold our own → fight back
+  const dx = foe.state.x - npc.state.x, dz = foe.state.z - npc.state.z;
+  return (dx * dx + dz * dz) <= ENGAGE_RANGE * ENGAGE_RANGE ? 'fight' : 'route';
+}
+
 /** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished, sunk, or
  *  opened past GIVE_UP_RANGE (it escaped / was lost) — at which point the merchant resumes its trade route. */
 function engageTarget(npc, players, nowMs) {
@@ -449,16 +512,23 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
 
     const ph = npc.physics;
     let desired;
-    const foe = engageTarget(npc, players, nowMs);   // hostile + live attacker → fight; else trade route
+    // D3: react to the right threat — a PROVOKED attacker (was fired on) or a nation-HATED player within range —
+    // with the stance set by RELATIVE STRENGTH: fight if it can hold its own, flee/avoid if outmatched or badly
+    // hurt, or just hold the trade lane (route) while a hated stranger lurks beyond ENGAGE_RANGE.
+    const threat = findThreat(npc, players, nowMs);
+    const stance = threat ? combatStance(npc, threat.foe, threat.provoked) : 'route';
+    const foe = (stance === 'fight' || stance === 'flee') ? threat.foe : null;
     if (foe) {
-      // ── Combat helm: drop the route to fight. Healthy → jockey for a broadside (A2); once the hull is shot
-      // below FLEE_HEALTH it commits to running (A4) — hull doesn't self-heal, so the decision never flip-flops.
-      // The route is left untouched so the merchant resumes its trade run once it disengages (escapes / lapses).
+      // Combat helm: jockey for a broadside when fighting (A2), bear off and run when fleeing (A4). BOTH stay
+      // "engaged" so the gunnery arc gate can still loose a parting broadside while running. An UNPROVOKED merchant
+      // that elects to fight commits a timed grudge so it presses the engagement instead of chattering at the range
+      // edge; the grudge lapses (GIVE_UP_RANGE / AGGRO_MS) and it returns to trade once the foe breaks off.
+      if (stance === 'fight' && !threat.provoked) markHostile(npc, threat.foe.id, nowMs);
       npc.engaged = true;
-      if (!npc.fleeing && hullFraction(npc.combat) < FLEE_HEALTH) npc.fleeing = true;
+      npc.fleeing = (stance === 'flee');
       desired = npc.fleeing ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
     } else {
-      npc.engaged = false; npc.fleeing = false;   // disengaged → clear the flee commitment
+      npc.engaged = false; npc.fleeing = false;   // no threat (or watching from afar) → sail the trade route
       if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
       const wp = npc.route[npc.routeIdx];
       const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
@@ -580,5 +650,7 @@ module.exports = {
     markHostile, isHostile, AGGRO_MS, engageTarget, engageHeading, angleFromWind, sailEff, FIRE_RANGE,
     firingSolution, NPC_MUZZLE_V, MAX_FIRE_RANGE, FIRE_ARC, NPC_RELOAD_MS,
     escapeHeading, hullFraction, FLEE_HEALTH, GIVE_UP_RANGE,
+    shipStrength, hullPoints, repWith, findThreat, combatStance,
+    HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
   },
 };

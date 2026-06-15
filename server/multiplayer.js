@@ -669,7 +669,7 @@ function attachMultiplayer(server) {
     // Inter-faction diplomacy: rare war/peace/alliance shifts on the in-game-day roll (≈1–2 game months apart),
     // rival-biased by the contested-border towns. Each shift is announced + refreshes everyone's relation matrix.
     {
-      const dChanges = diplomacy.tickToDay(economy.economyDayAt(Date.now()),
+      const dChanges = diplomacy.tickToDay(economy.currentDay(),
                                            diplomacy.rivalWeightsFromTowns(economy.townList()));
       if (dChanges.length) {
         broadcastDiplomacy();

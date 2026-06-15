@@ -41,6 +41,7 @@ import { MinimapComponent }        from '../sailing/components/minimap/minimap.c
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
+import { HelpMenuComponent }       from '../sailing/components/help-menu/help-menu.component';
 import { TraderMenuComponent }     from './trader-menu.component';
 import { ShipwrightMenuComponent } from './shipwright-menu.component';
 import { TavernMenuComponent } from './tavern-menu.component';
@@ -54,7 +55,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, DiplomacyMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, DiplomacyMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -106,11 +107,15 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
           <app-pause-menu (resume)="onResume()" (quit)="onReturnToHarbor()"
-                          (openSettings)="showSettings.set(true)" />
+                          (openSettings)="showSettings.set(true)" (openHelp)="showHelp.set(true)" />
         }
         <!-- Settings panel — opened from the pause menu -->
         @if (showSettings()) {
           <app-settings-menu (close)="showSettings.set(false)" />
+        }
+        <!-- Help / controls reference — opened from the pause menu -->
+        @if (showHelp()) {
+          <app-help-menu (close)="showHelp.set(false)" />
         }
         <div class="minimap-anchor">
           <app-minimap />
@@ -360,6 +365,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private sceneStarted = false;
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
+  showHelp     = signal<boolean>(false);   // the Help / controls reference, opened from the pause menu
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
   shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
@@ -417,6 +423,10 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     }
     if (this.showSettings()) {
       this.showSettings.set(false);
+      return;
+    }
+    if (this.showHelp()) {
+      this.showHelp.set(false);
       return;
     }
     if (this.cannonService.anyCancellable()) {
@@ -855,6 +865,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onResume(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+    this.showHelp.set(false);
   }
 
   /** Acknowledge a sinking → respawn at the nearest harbor town (teleport + full repair). The server
@@ -905,6 +916,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onExitGame(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+    this.showHelp.set(false);
     this.teardown(true);   // keep the WebGPU engine alive; only the Scene is rebuilt on re-entry
     this.selectedSlug = '';
     this.callsign     = '';
@@ -918,6 +930,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onReturnToHarbor(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+    this.showHelp.set(false);
     this.router.navigate(['/home']);
   }
 

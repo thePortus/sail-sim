@@ -2,7 +2,7 @@
 
 # General or Current TODO Items
 
-* updated home screen that describes the game, gives a fun vibe
+* ever so occasionally, the terrain never loads. Must be some kind of loading error because refresh fixes... but when it happens there are no console errors. Water is there, just all land is not visible, though scatter assets show like they are laying over invisible landscape.
 * fix pinnace water displacement
 * add brigantine
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)

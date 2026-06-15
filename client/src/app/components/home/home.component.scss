@@ -118,6 +118,41 @@ h1 {
   color: var(--bp-oak);
 }
 
+.home-desc {
+  width: 100%;
+  text-align: left;
+
+  .home-lead {
+    margin: 0 0 1rem;
+    font-size: 0.95rem;
+    line-height: 1.55;
+    color: var(--bp-ink);
+  }
+
+  .home-features {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.45rem 1.2rem;
+
+    li {
+      font-size: 0.85rem;
+      line-height: 1.4;
+      color: var(--bp-ink-muted);
+
+      b { color: var(--bp-ink); }
+    }
+
+    .hf-i { margin-right: 0.35rem; }
+  }
+}
+
+@media (max-width: 560px) {
+  .home-desc .home-features { grid-template-columns: 1fr; }
+}
+
 .controls-preview {
   width: 100%;
   margin-top: 0.5rem;

@@ -60,6 +60,7 @@ const npc = require('./npc');
 const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
+const diplomacy = require('./diplomacy');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
@@ -609,6 +610,16 @@ function attachMultiplayer(server) {
     const m = JSON.stringify({ type: 'salvage_despawn', id: cid });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
   };
+  /** Push the current inter-faction relation matrix to everyone (on change) — drives the Diplomacy panel. */
+  const broadcastDiplomacy = () => {
+    const m = JSON.stringify({ type: 'diplomacy_state', matrix: diplomacy.matrix() });
+    for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+  };
+  /** Broadcast a system chat line to everyone (diplomacy announcements, etc.). */
+  const broadcastSystem = (text) => {
+    const m = JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text });
+    for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+  };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
   const broadcastWeather = () => {
@@ -621,6 +632,21 @@ function attachMultiplayer(server) {
   setInterval(() => {
     weatherState.tick();
     economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
+    // Inter-faction diplomacy: rare war/peace/alliance shifts on the in-game-day roll (≈1–2 game months apart),
+    // rival-biased by the contested-border towns. Each shift is announced + refreshes everyone's relation matrix.
+    {
+      const dChanges = diplomacy.tickToDay(economy.economyDayAt(Date.now()),
+                                           diplomacy.rivalWeightsFromTowns(economy.townList()));
+      if (dChanges.length) {
+        broadcastDiplomacy();
+        for (const c of dChanges) {
+          const text = diplomacy.describeChange(c);
+          broadcastSystem(text);
+          const ev = JSON.stringify({ type: 'diplomacy_event', a: c.a, b: c.b, from: c.from, to: c.to, text });
+          for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(ev);
+        }
+      }
+    }
     npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
     for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
 
@@ -661,6 +687,7 @@ function attachMultiplayer(server) {
     // economy save = backstop (trades persist inline); location + hull damage persist here + on disconnect.
     for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); saveCombatState(p); }
     economy.flushState();   // town-market drift (global) — once, not per-player; no-op unless dirty
+    diplomacy.flush();      // inter-faction relations (global) — no-op unless a shift happened
   }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change
@@ -832,6 +859,8 @@ function attachMultiplayer(server) {
     // Existing floating salvage crates, so a joiner sees ones dropped before they connected.
     const crates = salvage.list().map((c) => ({ id: c.id, x: c.x, z: c.z }));
     if (crates.length) ws.send(JSON.stringify({ type: 'salvage_snapshot', crates }));
+    // Current inter-faction relations, so the joiner's Diplomacy panel + standing predictions are populated.
+    ws.send(JSON.stringify({ type: 'diplomacy_state', matrix: diplomacy.matrix() }));
 
     ws.on('message', (raw) => {
       let msg;
@@ -1409,6 +1438,46 @@ function attachMultiplayer(server) {
                 sysReply(target.ws, `The admins have granted you ${amount} gold.`);
                 sysReply(me.ws, `Gave ${amount} gold to "${parsed.target}" (now ${target.gold}).`);
               }
+            }
+          }
+
+        } else if (text === '/diplomacy' || text.startsWith('/diplomacy ')) {
+          // /diplomacy                                       → show the current relation matrix
+          // /diplomacy <nationA> <nationB> <war|peace|alliance>  → force a relation (announced to all)
+          // Nations: english / french / spanish / dutch (id or name; single words → no quoting needed).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may change diplomacy.'); }
+          else {
+            const args = text.slice('/diplomacy'.length).trim().split(/\s+/).filter(Boolean);
+            const resolveFaction = (s) => {
+              const t = String(s || '').toLowerCase();
+              for (const fid of factions.factionIds()) {
+                if (fid === t || factions.factionName(fid).toLowerCase() === t) return fid;
+              }
+              return null;
+            };
+            if (args.length === 0) {
+              sysReply(me.ws, `Diplomacy — ${diplomacy.summary()}`);
+            } else if (args.length === 3) {
+              const a = resolveFaction(args[0]), b = resolveFaction(args[1]), stt = args[2].toLowerCase();
+              if (!a || !b) { sysReply(me.ws, 'Unknown nation. Use english / french / spanish / dutch.'); }
+              else if (a === b) { sysReply(me.ws, 'A nation cannot hold relations with itself.'); }
+              else if (!diplomacy.isState(stt)) { sysReply(me.ws, 'State must be war, peace, or alliance.'); }
+              else {
+                const c = diplomacy.setRelation(a, b, stt);
+                if (!c) { sysReply(me.ws, `${factions.factionName(a)} and ${factions.factionName(b)} are already at ${stt}.`); }
+                else {
+                  const ann = diplomacy.describeChange(c) + ' (by decree of the admiralty)';
+                  broadcastSystem(ann);
+                  broadcastDiplomacy();
+                  const ev = JSON.stringify({ type: 'diplomacy_event', a: c.a, b: c.b, from: c.from, to: c.to, text: ann });
+                  for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(ev);
+                  diplomacy.flush(true);   // persist the decree immediately
+                  sysReply(me.ws, `Set ${factions.factionName(a)} ↔ ${factions.factionName(b)} to ${stt}.`);
+                }
+              }
+            } else {
+              sysReply(me.ws, 'Usage: /diplomacy   |   /diplomacy <nationA> <nationB> <war|peace|alliance>');
             }
           }
 

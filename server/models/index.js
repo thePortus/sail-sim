@@ -15,6 +15,7 @@ db.sequelize = sequelize;
 
 db.User = require('./user.model')(sequelize, Sequelize.DataTypes);
 db.EconomyState = require('./economy-state.model')(sequelize, Sequelize.DataTypes);
+db.DiplomacyState = require('./diplomacy-state.model')(sequelize, Sequelize.DataTypes);
 
 /**
  * Self-applying, NON-destructive schema top-up. This project has no sequelize.sync(), so new columns
@@ -68,6 +69,16 @@ db.ensureTables = async () => {
       towns:       { type: DT.TEXT('medium'), allowNull: false },
     });
     console.log('[db] created table economyStates');
+  } catch {
+    /* already exists (or DB unreachable) */
+  }
+  try {
+    await qi.createTable('diplomacyStates', {
+      id:           { type: DT.INTEGER, primaryKey: true, allowNull: false, defaultValue: 1 },
+      lastShiftDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
+      rel:          { type: DT.TEXT, allowNull: false },
+    });
+    console.log('[db] created table diplomacyStates');
   } catch {
     /* already exists (or DB unreachable) */
   }

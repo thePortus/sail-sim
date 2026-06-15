@@ -869,16 +869,25 @@ function attachMultiplayer(server) {
         {
           const p = players.get(id);
           const now = Date.now();
-          const dt = p.lastUpdateMs ? (now - p.lastUpdateMs) / 1000 : 0;
+          const realDt = p.lastUpdateMs ? (now - p.lastUpdateMs) / 1000 : 0;
           // Owner/Admin bypass movement validation — they have a teleport ability. Role is from the
           // verified JWT (p.auth), so a regular client can't claim it.
           const trusted = p.auth.role === 'Owner' || p.auth.role === 'Admin';
-          const { pose, corrected } = movement.validateMove(
+          // Token-bucket dt (network-JITTER tolerance): refill the budget by real elapsed wall-clock time
+          // (capped per packet at DT_MAX) up to MOVE_BURST_SEC, then validate against the WHOLE budget. So
+          // when a high-ping client's updates stall then arrive BUNCHED, each bunched packet can still spend
+          // a full send-interval of movement from the budget accrued during the stall — instead of seeing a
+          // ~0 ms inter-arrival dt, getting clamped to nearly no travel, and rubber-banding (the bug a
+          // ~300 ms-ping player hit). validateMove reports the seconds it actually consumed, debited below.
+          if (p.moveDtBudget == null) p.moveDtBudget = moveConst.MOVE_BURST_SEC;
+          p.moveDtBudget = Math.min(moveConst.MOVE_BURST_SEC, p.moveDtBudget + Math.min(realDt, moveConst.DT_MAX));
+          const { pose, corrected, budgetSpentSec } = movement.validateMove(
             p.authPose || null,
             { x: state.x, z: state.z, heading: state.heading, speed: state.speed, vesselSlug: state.vesselSlug },
-            dt,
+            p.moveDtBudget,
             trusted,
           );
+          if (!trusted) p.moveDtBudget = Math.max(0, p.moveDtBudget - (budgetSpentSec || 0));
           p.state = state;
           p.lastUpdateMs = now;   // also drives combat victim-pose lag compensation
           p.lastSeq = Number.isFinite(+msg.seq) ? +msg.seq : 0;
@@ -1104,6 +1113,7 @@ function attachMultiplayer(server) {
           me.maxCrew = crewFor(me.state?.vesselSlug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
           saveCombatState(me);  // persist the fresh hull (respawn = full repair)
           me.authPose = null;   // trust the next update — the respawn teleport
+          me.moveDtBudget = moveConst.MOVE_BURST_SEC;   // fresh jitter budget so post-respawn moves aren't starved
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
           });

@@ -4,7 +4,6 @@
 
 * add factions going to war, making peace (diplomacy module) and factional hits for attacking national shipping... make merchants flee if your faction is bad enough (or attack if you get close enough) (make AI strategy consider relative ship powers)
 * fix pinnace water displacement
-* better latency handling
 * add brigantine
 * hide all merchants on map (except for admins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * add occasional bosun whistle (no more than once a day)

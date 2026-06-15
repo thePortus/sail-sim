@@ -31,6 +31,14 @@ const TURN_CAP_DEG = 30;
 const DT_MIN = 0.02;
 const DT_MAX = 0.5;
 
+// Token-bucket burst window (s) for the movement-validation dt. The dt budget refills at real wall-clock
+// rate (capped per packet at DT_MAX) and tops out here. This absorbs network JITTER: when a high-ping
+// client's updates stall then arrive BUNCHED (several within a few ms), each can still spend a full
+// send-interval of travel from the budget accrued during the stall — instead of being false-clamped to
+// ~0 and rubber-banding (the bug a ~300 ms-ping player hit). Still bounds sustained speed-hacks: over any
+// window, total travel ≤ maxSpeed·SLACK·elapsed + this burst. ~0.6 s covers typical intercontinental jitter.
+const MOVE_BURST_SEC = 0.6;
+
 // Ship-to-ship collision capsule per vessel slug (mirrors the client COLL_DIMS_BY_SLUG). Phase 4.
 const COLL_DIMS_BY_SLUG = {
   sloop:   { halfLen: 5.0, radius: 2.2 },
@@ -57,6 +65,6 @@ function bakedMapVersion() {
 const MAP_VERSION = bakedMapVersion();
 
 module.exports = {
-  worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX,
+  worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX, MOVE_BURST_SEC,
   COLL_DIMS_BY_SLUG, collDims, COLL_RESTITUTION, COLL_MIN_SPEED, MAP_VERSION,
 };

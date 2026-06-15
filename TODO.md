@@ -12,7 +12,8 @@
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * grapeshot doesn't make cannonball impacts on the water
-* lod + imposters for ships at distance
+* lod + imposters for ships at distance... same towns
+* general materials atlas draw cycle reduction
 * Paying for powder and shot
 * improved landscape with NME & more scatter to distant
 * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.

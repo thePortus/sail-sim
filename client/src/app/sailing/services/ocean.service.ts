@@ -1642,12 +1642,13 @@ export class OceanService {
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
     this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
-    // Every 4th frame (perf). The renderList is just sky + vessels + piers, which change slowly.
-    // 4 is deliberately COPRIME with the refraction's refreshRate (5): the two heavy RTTs then only
-    // render on the same frame once every lcm(4,5)=20 frames instead of every 3 — that de-stacks the
-    // bimodal frame-time spike (the every-other-frame stutter) that dominated the felt frame rate.
-    // If the sky/vessel reflection strobes at low FPS, lower this.
-    this.reflectionRTT.refreshRate = 4;
+    // Every 3rd frame (perf). The renderList is just sky + vessels + piers, which change slowly.
+    // 3 is deliberately COPRIME with the refraction's refreshRate (2): the two heavy RTTs then only
+    // render on the same frame once every lcm(3,2)=6 frames — that de-stacks the bimodal frame-time
+    // spike (the every-other-frame stutter) that dominated the felt frame rate. NOTE: must stay ODD —
+    // an EVEN reflection rate would divide into the refraction's 2 and collide every reflection frame,
+    // re-stacking the spike. Bumped 5→3 for a fresher sky/vessel reflection. If FPS suffers, raise to 5.
+    this.reflectionRTT.refreshRate = 3;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
     // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
@@ -1693,10 +1694,10 @@ export class OceanService {
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
-    this.refractionRTT.refreshRate = 3;   // every 3rd frame — reverted from the every-frame (1) experiment, which
-                                          // was a real FPS hit (the seabed RTT is the heaviest GPU cost). 3 is
-                                          // coprime with the reflection's 4, so the two heavy RTTs only stack 1/12
-                                          // frames — keeps the de-stacking smoothness without the seabed lag.
+    this.refractionRTT.refreshRate = 2;   // every OTHER frame (experiment) — the seabed RTT is the heaviest GPU
+                                          // cost; every-frame (1) was too much, this is the middle ground above 3.
+                                          // 2 is coprime with the reflection's 5, so the two heavy RTTs only stack
+                                          // 1/10 frames — keeps the de-stacking smoothness with a fresher seabed.
     this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 

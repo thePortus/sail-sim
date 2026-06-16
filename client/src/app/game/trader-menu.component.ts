@@ -29,6 +29,8 @@ import { factionColor, factionName } from '../sailing/faction.config';
         </div>
       </div>
 
+      <img src="/images/trader.png" alt="A trader inspecting goods.">
+
       @if (mp.hint(); as h) {
         <div class="tr-rumour">🗣 They say <b>{{ h.townName }}</b> pays well for <b>{{ h.goodName }}</b> ({{ h.bid }}g) — marked on your map.</div>
       }

@@ -23,7 +23,7 @@ import { CombatService } from '../sailing/services/combat.service';
         <span class="tv-gold">⚜ {{ mp.gold() }} gold</span>
       </div>
 
-      <img src="/images/tavern.png" alt="A crowded tavern with sailors and merchants." class="home-image">
+      <img src="/images/tavern.png" alt="A crowded tavern with sailors and merchants.">
 
       <div class="tv-flavour">Hands lost to grapeshot can be replaced here — a coin in the right palm finds willing sailors.</div>
 
@@ -55,7 +55,7 @@ import { CombatService } from '../sailing/services/combat.service';
         @if (mp.rumorError(); as err)  { <div class="tv-note tv-rumour-none">{{ prettyRumor(err) }}</div> }
       </div>
 
-      <button class="tv-close" (click)="onClose()">Leave</button>
+      <button class="tv-close" (click)="onClose()">Go Back to Town</button>
     </div>
   `,
   styles: [`

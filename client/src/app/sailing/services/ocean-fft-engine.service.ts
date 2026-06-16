@@ -109,7 +109,10 @@ export class OceanFFTEngine {
     if (!this._active || !this._generator) { return; }
 
     const ms        = Math.max(0.5, wind.speed * 0.5144);          // knots → m/s (JONSWAP needs >0)
-    const dir       = wind.fromBearingDeg;
+    // Spectrum wind-axis angle (deg) from the wind's FROM-bearing. The wave field samples the FFT by world XZ
+    // directly (k.x→X, k.y→Z) and propagates along −k, so the dominant crests run DOWNWIND when the spectrum
+    // angle = 90 − bearing (e.g. wind from N (bearing 0) → waves travel S, not W). The raw bearing was 90° off.
+    const dir       = 90 - wind.fromBearingDeg;
     const chop      = Math.max(0.05, Math.min(1, sea.choppiness));
     const beaufortT = Math.max(0, Math.min(1, (wind.beaufort ?? 0) / 12));
     this._choppiness = chop;   // exposed to the material so heavy seas foam less

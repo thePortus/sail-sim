@@ -151,9 +151,6 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
               <button class="dock-opt" (click)="onTavern()">Tavern</button>
-              <button class="dock-opt" (click)="onRepairVessel()">
-                Repair Vessel ({{ isAdmin || multiplayerService.gold() < repairFee ? 'free' : repairFee + 'g' }})
-              </button>
               <button class="dock-cast" (click)="onCastOff()">Cast Off</button>
             </div>
           } @else if (vesselService.docking()) {
@@ -418,7 +415,6 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private repTimer: ReturnType<typeof setTimeout> | null = null;
   diploBanner = signal<{ text: string; war: boolean } | null>(null);   // prominent war/peace/alliance flash
   private diploTimer: ReturnType<typeof setTimeout> | null = null;
-  protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
 
   /** Cargo as a sorted display list { id, name, qty } using the server-sent goods catalogue. */
   protected inventoryList = computed(() => {
@@ -962,7 +958,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.tradeMenuOpen.set(true);
   }
 
-  /** Dock action: open the shipwright (buy/commission vessels). The panel fetches the catalogue itself. */
+  /** Dock action: open the shipwright (hull repair + buy/commission vessels). The panel fetches the catalogue itself. */
   onShipwright(): void {
     this.multiplayerService.shipError.set(null);
     this.shipwrightOpen.set(true);
@@ -983,12 +979,6 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     } catch (err) {
       console.warn('[Shipwright] refit failed:', err);
     }
-  }
-
-  /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */
-  onRepairVessel(): void {
-    this.multiplayerService.requestCombatReset();
-    // Keep the town menu open (return to the main town screen) — "Cast Off" leaves.
   }
 
   /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */

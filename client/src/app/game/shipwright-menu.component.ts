@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
+import { CombatService } from '../sailing/services/combat.service';
 import { Settings } from '../app.settings';
 
 interface ShipRow {
@@ -30,7 +31,24 @@ interface ShipRow {
         <span class="sw-gold">⚜ {{ mp.gold() }} gold</span>
       </div>
 
+      <img src="/images/shipwright.png" alt="A shipwright at work, repairing a ship.">
+
       @if (admin) { <div class="sw-admin-note">Admin — commission any vessel free of charge.</div> }
+
+      <!-- Hull repair (moved here from the dock menu — the shipwright patches your hull). -->
+      <div class="sw-repair">
+        <div class="sw-repair-info">
+          <span class="sw-repair-title">Hull repair</span>
+          @if (damaged()) {
+            <span class="sw-repair-sub">Your hull has taken damage — patch her up to full.</span>
+          } @else {
+            <span class="sw-repair-sub sw-repair-ok">Your hull is sound — no repairs needed.</span>
+          }
+        </div>
+        <button class="sw-buy sw-repair-btn" [disabled]="!damaged()" (click)="repair()">
+          {{ damaged() ? 'Repair · ' + repairLabel() : 'In good repair' }}
+        </button>
+      </div>
 
       <div class="sw-list">
         @for (s of ships(); track s.slug) {
@@ -64,7 +82,7 @@ interface ShipRow {
 
       @if (mp.shipError(); as err) { <div class="sw-err">{{ prettyError(err) }}</div> }
 
-      <button class="sw-close" (click)="onClose()">Cast Off</button>
+      <button class="sw-close" (click)="onClose()">Go Back to Town</button>
     </div>
   `,
   styles: [`
@@ -81,6 +99,13 @@ interface ShipRow {
     .sw-title { font-size: 1.25rem; font-weight: 600; color: #e8d3a0; }
     .sw-gold { color: #f0c869; font-weight: 600; }
     .sw-admin-note { margin-top: 0.5rem; font-size: 0.78rem; color: #c6a85f; font-style: italic; }
+    .sw-repair { display: flex; align-items: center; justify-content: space-between; gap: 0.7rem; margin-top: 0.7rem;
+                 padding: 0.6rem 0.7rem; border: 1px solid rgba(184,138,62,0.3); border-radius: 8px; background: rgba(255,255,255,0.03); }
+    .sw-repair-info { display: flex; flex-direction: column; gap: 0.15rem; }
+    .sw-repair-title { font-size: 1.0rem; color: #f0e3c6; font-weight: 600; }
+    .sw-repair-sub { font-size: 0.78rem; color: #cdbb95; }
+    .sw-repair-ok { color: #9fc98a; }
+    .sw-repair-btn { white-space: nowrap; }
     .sw-list { display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.7rem; }
     .sw-card { border: 1px solid rgba(184,138,62,0.3); border-radius: 8px; padding: 0.6rem 0.7rem; background: rgba(255,255,255,0.03); }
     .sw-card--owned { border-color: rgba(240,200,105,0.55); background: rgba(240,200,105,0.07); }
@@ -106,9 +131,21 @@ export class ShipwrightMenuComponent implements OnInit {
   @Input() admin = false;
   @Output() close = new EventEmitter<void>();
   protected mp = inject(MultiplayerService);
+  private combat = inject(CombatService);
   private http = inject(HttpClient);
 
   protected ships = signal<ShipRow[]>([]);
+  protected readonly repairFee = 40;   // matches server REPAIR_FEE (and the old dock-menu button)
+
+  /** True when any hull zone is below its max — i.e. there's something to repair. */
+  protected damaged = computed(() => {
+    const z = this.combat.zones();
+    if (!z) { return false; }                       // null = full health
+    const m = this.combat.maxHp();
+    return (Object.keys(m) as (keyof typeof m)[]).some((k) => (z[k] ?? m[k]) < m[k]);
+  });
+  /** Repair price label — free for admins, or if you can't even afford the fee (so you're never stuck broke + holed). */
+  protected repairLabel = computed(() => (this.admin || this.mp.gold() < this.repairFee) ? 'free' : this.repairFee + 'g');
 
   async ngOnInit(): Promise<void> {
     this.mp.shipError.set(null);
@@ -130,6 +167,9 @@ export class ShipwrightMenuComponent implements OnInit {
   canBuy(s: ShipRow): boolean { return !this.owned(s.slug) && this.fits(s) && this.mp.gold() >= this.netCost(s); }
 
   buy(slug: string): void { this.mp.buyShip(slug); }
+
+  /** Repair the hull to full in place (server-authoritative; the updated combat_state disables the button). */
+  repair(): void { this.mp.requestCombatReset(); }
 
   prettyError(reason: string): string {
     const map: Record<string, string> = {

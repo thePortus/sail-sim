@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* check waves go right way for wind
 * have way to earn back faction reputation... increased rep from attacking enemies and enemies of allies... but also paying off at "Governor's Mansion"... new menu item at town selection screen... also give admins ability to say /reputation <player> and if no other arguments are given, all negative reps are cleared (keeping good ones)
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
@@ -10,6 +9,7 @@
 * make pinace buoyance more responsive
 * make salvage crate asset
 * hide labels in photo mode
+* increase render resolution in spyglass
 * update profile page and update password page (and 404 page with a funny 404)
 * why a dark patch around player ship? is it because of transparency to see hull?
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story

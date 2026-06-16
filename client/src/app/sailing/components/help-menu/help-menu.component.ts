@@ -47,6 +47,7 @@ import { CommonModule } from '@angular/common';
             <tr><td><kbd>I</kbd> <kbd>Tab</kbd></td><td>Ship's Hold (cargo · gold · standing)</td></tr>
             <tr><td><kbd>K</kbd></td><td>Diplomacy (faction relations)</td></tr>
             <tr><td><kbd>M</kbd></td><td>Expand / close the map</td></tr>
+            <tr><td><kbd>RMB</kbd> hold</td><td>Spyglass — magnify the view (5×)</td></tr>
             <tr><td><kbd>Enter</kbd></td><td>Chat · <kbd>/</kbd> for a command</td></tr>
             <tr><td><kbd>Esc</kbd></td><td>Pause · close panels</td></tr>
           </table>

@@ -33,6 +33,11 @@ const VIEW_RADIUS = 3000;    // world units: merchant draw distance (only nearby
 const VIEW_R2 = VIEW_RADIUS * VIEW_RADIUS;
 const MAX_VISIBLE = 5;       // at most this many merchants per client (the nearest ones)
 const MERCHANT_LOAD = 8;     // units a merchant tries to buy + carry per trip
+// Merchants cruise EASY so a player can run one down. A flat throttle on the wind-derived target speed: it
+// scales the polar result, so light wind / a bad point of sail still slow them further (fully wind-dependent),
+// but their comfortable cruising speed stays well under what a trimmed player ship makes in the same wind —
+// closing the gap that made merchants near-impossible to chase. Tune up toward 1.0 to make them faster.
+const MERCHANT_CRUISE = 0.68;
 const SEED_GOLD = 1500;      // working capital a merchant spawns with (looted on a sinking — NP4)
 // Trip selection — a soft-weighted score over the most urgent shortages. Each merchant flies a nation's flag
 // and PREFERS to keep trade within it (own-faction destination + source add a bonus), but a severe enough rival
@@ -587,7 +592,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     // Speed from wind strength × the per-rig POLAR (full sail, perfect trim) — sloop/pinnace now sail by their
     // own drive curves, matching players (P6). Also scaled by mast + crew condition; eased toward target.
     const aw     = angleFromWind(npc.state.heading, wind.windBearing);
-    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul));
+    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul * MERCHANT_CRUISE));
     npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;

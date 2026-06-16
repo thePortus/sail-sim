@@ -2,19 +2,14 @@
 
 # General or Current TODO Items
 
-* magnifying glass on right click?
-* merchants aren't so hard to chase down... often seem like they are performing at max speed
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
+* reduced crew slows reload speed of cannons... NPCs will use bar shot too... 
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
-* revisit dead render pipeline
+* revisit landscape not loading (losing the landscape loading race)
 * make pinace buoyance more responsive
 * ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
-* make it easier to catch merchants
-* reduced crew slows reload speed of cannons... NPCs will use bar shot too... 
 * check waves go right way for wind
-* revisit landscape not loading (losing the landscape loading race)
 * why a dark patch around player ship? is it because of transparency to see hull?
-* hide all merchants on map (except for adamins)... then have "hints" at taverns where you can "listen to rumors" and it says "I heard about a pinnace (or whatever type) that was sailing around X (a town)" and then that merchant starts being tracked on the player map
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
@@ -28,6 +23,7 @@
 * add ship armor + cannon upgrades
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
+* warships/escorts for some merchants... also lone warships
 * any way to reduce load times?
 * streaming assets has gotten weird, trees move in and out.. can we make them fade in?
 * server is disconnected message
@@ -49,3 +45,8 @@
 * Security pass
 
 # TODO Items by Module
+Great! Committed. Now...
+
+I want to hide all merchants on map (except for admins). Currently the default is to display the nearest one.
+
+Then when the player visits a tavern, in addition to being able to recruit, they will be able to "Listen to rumors" and hear a formula like "You overheard a X (bartender, sailor, server) talking about a Y (pinnace, sloop, brig, etc) laden with treasure, sailing from Z1 to Z2 (places)." (if we don't know the origin, just give the destination)... that ship should then become marked on the player's map. The ship should be one of the closest 3 ships in distance

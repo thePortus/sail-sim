@@ -22,6 +22,7 @@ import { VesselAssetCacheService } from '../sailing/services/vessel-asset-cache.
 import { clearScatterCache } from '../sailing/services/scatter/asset-loader';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
+import { TelescopeService }   from '../sailing/services/telescope.service';
 import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
@@ -371,6 +372,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private vesselAssetCache   = inject(VesselAssetCacheService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
+  private telescopeService   = inject(TelescopeService);
   private oceanAudioService  = inject(OceanAudioService);
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
@@ -707,6 +709,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.oceanFftRenderer.init();
         // PERF DIAGNOSTIC: ?noclouds skips the volumetric clouds (raymarch) to isolate their cost.
         if (!location.search.includes('noclouds')) { this.cloudService.init(); }
+        // Hold-right-click spyglass magnifier (camera + canvas exist by now).
+        this.telescopeService.init();
         // Weather-driven ambient sea bed (filtered-noise wash + whitecap hiss).
         this.oceanAudioService.init();
       });
@@ -865,6 +869,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cannonService.dispose();
     this.musicService.dispose();
     this.cloudService.dispose();
+    this.telescopeService.dispose();
     this.oceanAudioService.dispose();
     this.dolphinService.dispose();
     this.seaweedService.dispose();

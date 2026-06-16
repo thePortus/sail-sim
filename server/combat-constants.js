@@ -31,8 +31,10 @@ const ZONES = ['bow', 'stern', 'port', 'starboard', 'masts'];
 // lightly built — far fewer HP, so it sinks much faster than the sloop. Keep these in sync with the
 // vessel defs (server/controllers/vessels.controller.js) and the client mirror (combat.constants.ts).
 const ZONE_HP_BY_SLUG = {
-  sloop:   { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
-  pinnace: { bow: 55, stern: 55, port: 80,  starboard: 80,  masts: 60  },
+  sloop:   { bow: 90,  stern: 90,  port: 130, starboard: 130, masts: 100 },
+  pinnace: { bow: 55,  stern: 55,  port: 80,  starboard: 80,  masts: 60  },
+  // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
+  brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
 };
 function zoneHpFor(slug) { return ZONE_HP_BY_SLUG[slug] || ZONE_HP_BY_SLUG.sloop; }
 // Back-compat default (sloop) for any caller without a slug.

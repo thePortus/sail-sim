@@ -39,8 +39,9 @@ export class CrewService {
   private static readonly LAYOUTS: Record<string, string> = {
     pinnace: 'crew_stations.pinnace.json',
     sloop:   'crew_stations.sloop.json',
+    brig:    'crew_stations.brig.json',
   };
-  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7 };
+  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12 };
 
   /**
    * Spawn a crew on one vessel.
@@ -143,7 +144,7 @@ interface PirateManifest {
 }
 
 // ── per-ship crew runtime ────────────────────────────────────────────────────
-type CrewState = 'station' | 'walk' | 'climb' | 'dead';
+type CrewState = 'station' | 'walk' | 'climb' | 'dead' | 'reserve';
 
 interface PathLeg { to: Vector3; kind: string; }
 
@@ -328,7 +329,7 @@ export class CrewHandle {
 
   /** Mark one (random alive) crew member as a casualty: stagger, fall, stay down. */
   killOne(): boolean {
-    const alive = this.members.filter((m) => m.state !== 'dead');
+    const alive = this.members.filter((m) => m.state !== 'dead' && m.state !== 'reserve');
     if (!alive.length) return false;
     const m = alive[Math.floor(Math.random() * alive.length)];
     if (m.state === 'climb' && m.climb) {
@@ -359,26 +360,49 @@ export class CrewHandle {
     }
   }
 
-  /** Bring ONE casualty back to work (a fresh hand at the tavern). Returns false if none are down. */
+  /** Bring ONE hand back to work (a fresh hire at the tavern, or a downed casualty). Returns false if the
+   *  whole pool is already manning stations. Prefers an UNRECRUITED reserve (walks on fresh) over raising a
+   *  fallen body, so a hire reads as a new sailor rather than a resurrection. */
   reviveOne(): boolean {
-    const dead = this.members.find((m) => m.state === 'dead');
-    if (!dead) return false;
-    dead.state = 'station';
-    const st = this.pickStation(dead);
-    if (st) this.arriveAt(dead, st, true);
+    const back = this.members.find((m) => m.state === 'reserve')
+              ?? this.members.find((m) => m.state === 'dead');
+    if (!back) return false;
+    if (back.state === 'reserve') back.holder.setEnabled(true);
+    back.state = 'station';
+    const st = this.pickStation(back);
+    if (st) this.arriveAt(back, st, true);
     return true;
   }
 
-  /** Drive the number of living crew to `target` (authoritative count from the server). Drops the difference
-   *  as casualties (Death → Dead) or revives downed hands — so grapeshot losses and tavern hires both show. */
+  /** Hide one member as UNRECRUITED reserve (invisible, off the stations) — used for the initial underfill so
+   *  an under-crewed ship shows fewer hands, NOT a deck of corpses (only combat casualties lie dead). */
+  private hideMember(m: CrewMember): void {
+    const mm = m as CrewMember & { _climb?: CrewClimb | null };
+    if (m.state === 'climb' || mm._climb) this.climbBusy = false;
+    if (this.walker === m) this.walker = null;
+    mm._climb = null;
+    this.releaseStation(m);
+    m.state = 'reserve'; m.legs = []; m.climb = null;
+    m.holder.setEnabled(false);
+  }
+
+  /** Drive the number of living crew to `target` (authoritative count from the server). The FIRST call is the
+   *  initial fill: surplus spawned hands become invisible reserve (no corpses on a fresh deck). Later calls are
+   *  live changes — grapeshot losses drop bodies (Death → Dead); tavern hires bring a hand back. */
   setAliveCount(target: number): void {
     const t = Math.max(0, Math.min(this.members.length, Math.round(target)));
+    if (this.firstFill) {
+      this.firstFill = false;
+      for (let i = t; i < this.members.length; i++) this.hideMember(this.members[i]);
+      return;
+    }
     let alive = this.aliveCount;
     while (alive > t) { if (!this.killOne()) break; alive--; }
     while (alive < t) { if (!this.reviveOne()) break; alive++; }
   }
+  private firstFill = true;
 
-  get aliveCount(): number { return this.members.filter((m) => m.state !== 'dead').length; }
+  get aliveCount(): number { return this.members.filter((m) => m.state !== 'dead' && m.state !== 'reserve').length; }
 
   dispose(): void {
     if (this.disposed) return;
@@ -448,6 +472,7 @@ export class CrewHandle {
 
   // ── per-member state machine ────────────────────────────────────────────────
   private tick(m: CrewMember, dt: number): void {
+    if (m.state === 'reserve') return;   // unrecruited reserve: hidden, no animation/logic
     this.tickFace(m, dt);
     this.tickLod(m);
     // Smooth yaw toward target everywhere except while dead.

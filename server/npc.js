@@ -88,9 +88,11 @@ function angleFromWind(heading, windBearing) {
 // PER-RIG drive polars — MIRROR the client (vessel-controller.ts SLOOP_SAIL / PINNACE_SAIL). Keep in sync.
 // Both fore-and-aft: the sloop points higher and is stronger on a reach but weak dead-downwind; the pinnace
 // points a touch lower and holds its drive far better on the run. [apparentAngle°, coeff], interpolated.
+// The brig (square fore + gaff main) points LOW but holds strong drive on a reach and dead downwind.
 const SAIL_POLARS = {
   sloop:   [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
   pinnace: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+  brig:    [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
 };
 
 /** Per-rig drive coefficient at wind angle `aw` (0 = bow into wind). Below the no-go angle the sail

@@ -13,8 +13,10 @@ export const ZONES: Zone[] = ['bow', 'port', 'starboard', 'stern', 'masts'];
 /** Starting / max hit points per zone, per vessel (must match server ZONE_HP_BY_SLUG). The pinnace
  *  is lightly built — far fewer HP, so it sinks faster. */
 export const ZONE_HP_BY_SLUG: Record<string, Record<Zone, number>> = {
-  sloop:   { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
-  pinnace: { bow: 55, stern: 55, port: 80,  starboard: 80,  masts: 60  },
+  sloop:   { bow: 90,  stern: 90,  port: 130, starboard: 130, masts: 100 },
+  pinnace: { bow: 55,  stern: 55,  port: 80,  starboard: 80,  masts: 60  },
+  // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
+  brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
 };
 
 /** Per-zone max HP for a vessel slug (defaults to the sloop). */

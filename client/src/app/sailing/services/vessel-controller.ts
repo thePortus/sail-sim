@@ -2,6 +2,7 @@ import { AbstractMesh, InstantiatedEntries, Scene, TransformNode } from '@babylo
 import { RiggedManifest, SailState } from '../models';
 import { SloopController } from './rigged-vessel.controller';
 import { PinnaceController } from './pinnace-vessel.controller';
+import { BrigController } from './brig-vessel.controller';
 
 export type GunSide = 'S' | 'P';
 
@@ -58,7 +59,7 @@ export interface VesselRig {
   manifest: string;
   importFlipY: boolean;
   rightSign: 1 | -1;
-  controller: 'sloop' | 'pinnace';
+  controller: 'sloop' | 'pinnace' | 'brig';
   /** Extra metres to raise the hull out of the water (a shallow open boat shows the surface otherwise). */
   floatDraft: number;
   /** Resting fore-aft trim bias (radians, + = BOW-UP / stern-down) — models a rearward centre of gravity so a
@@ -97,10 +98,24 @@ const PINNACE_SAIL: SailRig = {
   polar: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
   trimForgive: 1.25, leewayK: 1.4,
 };
+//  • Brig — square-rigged foremast + gaff main: points LOW (no-go 50°; square sails can't sail close), but
+//    a big spread of canvas gives strong drive on a reach and HOLDS it dead downwind (square sails love a
+//    run, peak ~120°). Heavy deep hull → little leeway; the square rig is fairly forgiving of sloppy trim.
+const BRIG_SAIL: SailRig = {
+  polar: [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+  forceK: 1.12, trimForgive: 1.1, leewayK: 0.9,
+};
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
   sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, sail: SLOOP_SAIL },
   pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.25, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.13, heaveTau: 0.65, tiltTau: 0.3 }, sail: PINNACE_SAIL },
+  // Brigantine — a big, decked two-master. Sits at normal draft (no hull cut). A heavy hull rides the swell
+  // ponderously (low pitchScale, longer time constants) rather than bobbing like the open boats.
+  // floatDraft −2.0 (was −2.3): +0.3m FREEBOARD so the low waist deck (deck-local ~3.6 → world ~1.6) clears the
+  // wave crests that were occasionally washing it. waterlineY tracks −floatDraft (=2.0) so the cut footprint
+  // sits at the real waterline. floorY −0.3 keeps the interior sink deep (root.y −2.0 + −0.3 − 0.38 ≈ −2.7, at
+  // the hull bottom) so no water reads through the gratings.
+  brig:    { glb: 'brig.glb',                  manifest: 'brig.manifest.json',                 importFlipY: false, rightSign: 1,  controller: 'brig',    floatDraft: -2.0,  hullHalfLen: 12.0, hullHalfBeam: 3.2, hullCut: { floorY: -0.3, alongSign: 1, waterlineY: 2.0 }, buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 }, sail: BRIG_SAIL },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {
@@ -111,7 +126,8 @@ export function rigForSlug(slug: string | undefined): VesselRig {
 export function createVesselController(
   slug: string | undefined, entries: InstantiatedEntries, root: TransformNode, manifest: RiggedManifest, scene: Scene,
 ): VesselController {
-  return rigForSlug(slug).controller === 'pinnace'
-    ? new PinnaceController(entries, root, manifest, scene)
-    : new SloopController(entries, root, manifest, scene);
+  const kind = rigForSlug(slug).controller;
+  if (kind === 'pinnace') return new PinnaceController(entries, root, manifest, scene);
+  if (kind === 'brig')    return new BrigController(entries, root, manifest, scene);
+  return new SloopController(entries, root, manifest, scene);
 }

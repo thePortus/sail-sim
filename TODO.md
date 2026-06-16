@@ -2,12 +2,16 @@
 
 # General or Current TODO Items
 
-* add brigantine, make sure 4092^2 atlas resolution doesn't hurt FPS
+* anchor needs rope that follows it
+* smoke always renders overe the ship
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
+* add admin right click on map brings up a teleport to option for those coordinates
+* distance to dock should be based on size of ship
+* magnifying glass on space bar?
+* brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit dead render pipeline
 * make pinace buoyance more responsive
 * ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
-* remove aground check
 * make it easier to catch merchants
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too... 
 * check waves go right way for wind
@@ -21,6 +25,7 @@
 * more realistic bird flight paths... momentum starting and stopping... speed of flapping wings relative to flight speed
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
+* placeholder ship for other players when that model hasnt loaded yet (or LOD imposter?)
 * grapeshot doesn't make cannonball impacts on the water
 * update to cannon aim sight to show spread of all cannon shots somehow
 * add ship armor + cannon upgrades

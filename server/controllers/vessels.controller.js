@@ -89,6 +89,40 @@ const VESSELS = [
     price: 60000,                 // Ships-as-economy: bought at a port shipwright
     parts: [],
   },
+  {
+    id: 3,
+    name: 'Brigantine',
+    slug: 'brig',
+    description: 'A big two-masted warship — square-rigged forward, gaff main aft. Eight guns, a deep stout hull, and a heavy spread of canvas: slow to gather way but powerful and steady. The most ship gold can buy.',
+    glb:      'brig.glb',
+    manifest: 'brig.manifest.json',
+    importFlipY: false,           // brig exports bow = +Z
+    rightSign:   1,               // starboard is +X on this hull
+    physics: {
+      maxSpeed:         9.5,      // big sail plan → strong top end on a reach
+      accelerationRate: 0.16,     // heavy → slow to gather way
+      minTackAngle:     50,       // square sails can't point close
+      sailAreaFactor:   0.48,     // lots of canvas
+      weight:           5200,     // deep, heavily-built hull
+    },
+    // Helm — at the wheel aft (B_Wheel ≈ model 0,5.74,-11.1), standing eye height, looking forward.
+    // y is vessel-local (rides the floated hull); the quarterdeck sits high on this ship.
+    firstPersonCam: { x: 0, y: 6.6, z: -9.5 },
+    // Four guns a side, taken from the actual gunport (B_Lid) bone positions — and they are NOT on one deck:
+    // a forecastle chase (z≈9), a main-deck waist gun (z≈1.5, sitting ~1 m lower), and two on the raised
+    // quarterdeck (z≈-6.5, -9). y is the WORLD muzzle height = model gunport y + floatDraft(-2.3) - barrel.
+    // Standard sides: port = −X, starboard = +X, so each gun fires out its own rail.
+    // y lowered ~0.6 m from the lid-bone height so balls leave THROUGH the gunports, not over the rail.
+    cannons: {
+      port: [{ x: -2.7, y: 2.25, z: 9.0 }, { x: -3.5, y: 1.32, z: 1.5 }, { x: -3.4, y: 2.34, z: -6.5 }, { x: -3.1, y: 2.44, z: -9.0 }],
+      stbd: [{ x:  2.7, y: 2.25, z: 9.0 }, { x:  3.5, y: 1.32, z: 1.5 }, { x:  3.4, y: 2.34, z: -6.5 }, { x:  3.1, y: 2.44, z: -9.0 }],
+    },
+    zoneHp: { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
+    crew: 12,                     // Crew resource: a big ship needs hands at every station
+    cargo: 60,                    // hold capacity in cargo slots — a roomy warship hold
+    price: 120000,                // Ships-as-economy: the top-tier shipwright purchase
+    parts: [],
+  },
 ];
 
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to

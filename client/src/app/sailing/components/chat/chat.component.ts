@@ -5,6 +5,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MultiplayerService } from '../../services/multiplayer.service';
+import { VesselService } from '../../services/vessel.service';
 import { SquadronService } from '../../services/squadron.service';
 import { AuthService } from '../../../services/auth.service';
 import { ApiService } from '../../../services/api.service';
@@ -93,6 +94,7 @@ import { ApiService } from '../../../services/api.service';
 })
 export class ChatComponent implements AfterViewInit, OnDestroy {
   private multiplayerService = inject(MultiplayerService);
+  private vesselService      = inject(VesselService);
   readonly squadronService   = inject(SquadronService);
   private authService        = inject(AuthService);
   private elRef              = inject(ElementRef);
@@ -386,6 +388,12 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         this.handleExport();
         return;
 
+      case 'stuck':
+        // Self-rescue: same effect as the old aground "refloat" button (which no longer auto-pops).
+        this.vesselService.refloat();
+        this.addSystemMessage('Refloated — your ship has been backed off to open water.');
+        return;
+
       // Server-handled commands — pass through verbatim.
       default:
         if (this.SERVER_COMMANDS.includes(cmd)) {
@@ -442,6 +450,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
       '/mute "<name>" (or /block) — hide a player\'s messages',
       '/unmute "<name>" (or /unblock) — unhide them',
       '/setpass <new password> — change your own password',
+      '/stuck — refloat your ship if you\'re pinned against land',
       '/help — show this help',
     ];
     if (this.isAdmin) {

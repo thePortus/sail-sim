@@ -1173,15 +1173,9 @@ export class VesselService {
         this.terrainService.isOnLand(newX, newZ)) {
       // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
-
-      // Accumulate contact time.  Only declare "aground" once the ship has
-      // been pinned for GROUNDED_DELAY seconds — this lets players scrape a
-      // headland or back off a beach without triggering the overlay.
-      this.groundedTime += dt;
-      if (!this.isGrounded && this.groundedTime >= this.GROUNDED_DELAY) {
-        this.isGrounded = true;
-        this.grounded.set(true);
-      }
+      // NOTE: aground DETECTION is intentionally disabled — we never raise the `grounded` overlay/message.
+      // The hull still can't enter land (speed 0 above); a player who pins themselves uses the /stuck chat
+      // command (→ refloat()) to back off. groundedTime/isGrounded are left wired but never set here.
     } else {
       this.x = newX;
       this.z = newZ;

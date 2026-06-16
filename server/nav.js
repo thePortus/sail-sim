@@ -194,6 +194,16 @@ function reachable(ax, az, bx, bz) {
   return a >= 0 && a === componentAt(bx, bz);
 }
 
+/** World-space straight-segment water test: true if (ax,az)→(bx,bz) stays entirely on navigable water (no land
+ *  crossing). Fail-open (true) when no navgrid is loaded. Used by the NPC helm to steer AROUND land in combat,
+ *  where it follows a free heading instead of the A* route. */
+function clearLine(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  if (!bits) return true;
+  const a = worldToCell(ax, az), b = worldToCell(bx, bz);
+  return lineClear(a.cx, a.cz, b.cx, b.cz);
+}
+
 // ── public ──────────────────────────────────────────────────────────────────────
 /**
  * World-space sea route from A to B. Returns [{x,z}, …] starting at A and ending at B (the real pier points),
@@ -236,7 +246,7 @@ function loadNavGrid() {
 }
 
 module.exports = {
-  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable,
+  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable, clearLine,
   // test seam — inject a synthetic grid (bitset) without a baked manifest.
   _test: {
     setGrid(resolution, bitset, worldBounds) { res = resolution; bits = bitset; wb = worldBounds; loaded = true; pathCache.clear(); computeComponents(); },

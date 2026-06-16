@@ -195,13 +195,31 @@ function hullFraction(combat) {
 // A merchant treats a player its NATION hates (rep ≤ HOSTILE_REP with npc.faction) as an enemy even unprovoked —
 // but whether it FIGHTS, AVOIDS, or simply watches depends on RELATIVE STRENGTH. shipStrength weighs CURRENT hull
 // HP + broadside guns + top speed, so the comparison stays meaningful as bigger, better-armed ships enter play.
-const HOSTILE_REP  = -25;    // a player at/below this standing with the merchant's nation is treated as an enemy
+const HOSTILE_REP  = -70;    // a player at/below this standing with the merchant's nation is treated as an enemy on
+                             // sight. Deliberately deep (was -25 ≈ ONE sink): with ~-25 rep per kill it takes
+                             // ~3 sinkings of a nation's shipping to become a notorious-enough pirate that its
+                             // OTHER ships auto-aggro you. (The ship you actually fire on still defends itself —
+                             // that's the separate PROVOKED path, unaffected by this.)
 const DETECT_RANGE = 650;    // world units: how far off a merchant notices a hated player (to start avoiding / closing)
 const ENGAGE_RANGE = 320;    // world units: an even/stronger merchant defends its lane once a hated player closes to here
 const AVOID_RATIO  = 1.25;   // the foe must be ≥25% stronger for the merchant to break off and run rather than fight
 const STR_HULL_W   = 1.0;    // strength per current hull point
 const STR_GUN_W    = 30.0;   // strength per broadside gun
 const STR_SPEED_W  = 8.0;    // strength per knot of top speed
+// NPC helm = the PLAYER'S helm. These mirror client vessel.service exactly so an NPC sloop turns like a player
+// sloop, an NPC brig like a player brig: a speed-dependent Lorentzian rudder authority (vesselTurnRate), eased
+// in through angular inertia (YAW_RESPONSE), and capped hard once the mast is down — no instant combat pivots.
+const YAW_RESPONSE      = 4;    // how fast yaw eases to the target rate (1/s) — matches the player
+const MAST_DOWN_TURN_MAX = 6;   // deg/s helm cap once the mast is down (matches client combat.constants)
+/** Speed-dependent max yaw (deg/s), IDENTICAL to vessel.service.turnRate(): peaks at ~28% of hull speed, falls
+ *  off sharply when fast and to a barely-steerable floor when nearly stopped. maxSpeed = this vessel's def. */
+function vesselTurnRate(speed, maxSpeed) {
+  const sf = Math.abs(speed) / (maxSpeed || 8);
+  if (sf < 0.03) return 4;
+  const p = 0.28;
+  const rate = 155 * sf / (1 + (sf / p) * (sf / p));
+  return Math.max(4, Math.min(30, rate));
+}
 
 /** Current (and max) non-mast hull points of a combat state. */
 function hullPoints(combat) {
@@ -373,6 +391,26 @@ function firingSolution(npc, foeState) {
   const el = theta + spreadRad(NPC_EL_SPREAD);
   const vhs = v * Math.cos(el);
   return { ox, oy: MUZZLE_Y, oz, vx: vhs * Math.sin(az), vy: v * Math.sin(el), vz: vhs * Math.cos(az) };
+}
+
+// ── Land avoidance ──────────────────────────────────────────────────────────────────────────────────────────
+// NPCs must NEVER sail through land — not even in combat, where they steer a FREE heading (engage/escape) off the
+// A* route. Probe a lookahead along the intended heading; if it would cross land, sweep outward (alternating
+// left/right) to the nearest heading whose lookahead stays on navigable water, so they round the shore instead of
+// ploughing through it. Lookahead scales with speed so a fast ship turns away in time.
+function clearAhead(x, z, headingDeg, lookM) {
+  const hr = headingDeg * DEG;
+  return nav.clearLine(x, z, x + Math.sin(hr) * lookM, z + Math.cos(hr) * lookM);
+}
+function avoidLand(npc, desired) {
+  const lookM = 90 + Math.abs(npc.state.speed) * moveConst.TRAVEL_SCALE * 6;   // ~6 s of travel to react
+  if (clearAhead(npc.state.x, npc.state.z, desired, lookM)) return desired;
+  for (let off = 15; off <= 165; off += 15) {
+    const r = (desired + off) % 360, l = (desired - off + 360) % 360;
+    if (clearAhead(npc.state.x, npc.state.z, r, lookM)) return r;
+    if (clearAhead(npc.state.x, npc.state.z, l, lookM)) return l;
+  }
+  return desired;   // boxed in (shouldn't happen on open water) — hold heading
 }
 
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
@@ -575,24 +613,36 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     }
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
+    desired = avoidLand(npc, desired);   // never steer through land — round the shore (incl. in combat)
 
-    // Combat attrition slows a merchant just like a player: a demasted hull (bar shot) bleeds sail power, and
-    // a thinned crew (grapeshot) slows BOTH sailing and the helm. mastMul mirrors the player's mast curve;
-    // crewMul is the 0.5..1 crew-efficiency factor. A fully-downed mast pivots only slowly.
+    // Combat attrition slows a merchant just like a player: a demasted hull (bar shot) bleeds sail power, a
+    // thinned crew (grapeshot) drags it, and a holed hull loses way — so a hit ship can be run down. mastMul
+    // mirrors the player's mast curve; crewMul is the 0.5..1 crew-efficiency factor; hullMul a gentle drag.
     const mastFrac = (npc.combat && npc.combat.maxHp && npc.combat.maxHp.masts)
       ? (npc.combat.zones.masts / npc.combat.maxHp.masts) : 1;
     const mastMul = Cc.mastSpeedMult(mastFrac);
     const crewMul = crewFactor(npc);
-    const turnMul = crewMul * (mastFrac <= 0 ? 0.4 : 1);
+    const hullMul = 0.7 + 0.3 * hullFraction(npc.combat);   // holed hull → loses way (full hull = 1.0)
 
+    // Helm = the PLAYER'S helm (issue: NPCs must turn EXACTLY like a same-class player, no instant pivots):
+    // speed-dependent max yaw, capped when demasted, eased in through angular inertia, never overshooting the
+    // desired heading. Crew/mast slow the turn only INDIRECTLY (they slow the ship → less rudder authority),
+    // exactly as for the player.
     const prev = npc.state.heading;
-    npc.state.heading = turnToward(prev, desired, moveConst.TURN_CAP_DEG * dtSec * turnMul);
+    let maxYaw = vesselTurnRate(npc.state.speed, ph.maxSpeed);
+    if (mastFrac <= 0) maxYaw = Math.min(maxYaw, MAST_DOWN_TURN_MAX);
+    const delta = angleDelta(prev, desired);                          // signed deg to turn
+    const rudder = Math.abs(delta) < 0.5 ? 0 : (delta > 0 ? 1 : -1);
+    npc.yawRate = (npc.yawRate || 0) + (rudder * maxYaw - (npc.yawRate || 0)) * Math.min(1, YAW_RESPONSE * dtSec);
+    let stepDeg = npc.yawRate * dtSec;
+    if (Math.abs(stepDeg) > Math.abs(delta)) { stepDeg = delta; npc.yawRate = dtSec > 0 ? delta / dtSec : 0; }  // settle, don't overshoot
+    npc.state.heading = (prev + stepDeg + 360) % 360;
     npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
 
     // Speed from wind strength × the per-rig POLAR (full sail, perfect trim) — sloop/pinnace now sail by their
-    // own drive curves, matching players (P6). Also scaled by mast + crew condition; eased toward target.
+    // own drive curves, matching players (P6). Also scaled by mast + crew + hull condition; eased toward target.
     const aw     = angleFromWind(npc.state.heading, wind.windBearing);
-    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul * MERCHANT_CRUISE));
+    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul * hullMul * MERCHANT_CRUISE));
     npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;

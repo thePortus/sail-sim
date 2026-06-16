@@ -113,6 +113,9 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 
   const { ox, oy, oz, vx, vy, vz } = shot;
   const reach2 = (C.HALF_LEN + C.BROADPHASE_PAD) * (C.HALF_LEN + C.BROADPHASE_PAD);
+  // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug.
+  const shooter = players.get(shot.shooterId);
+  const caliber = C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null);
 
   // Sub-step the ball through the freshly-elapsed window so a fast ball can't tunnel a hull.
   const tEnd = Math.min(tTo, C.SIM_MAX_T);
@@ -131,7 +134,7 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
       const zone = zoneAtLocal(lat, lon, by);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
-      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType);
+      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType) * caliber;
       return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg, tof: t };
     }
   }

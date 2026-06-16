@@ -131,7 +131,8 @@ export function capsizeFor(
 // lockstep. Onset is the HUD green→yellow boundary: above it the mast is fine; below it she leans,
 // cracks, and slows; at 0 HP the mast comes down and the ship acts as if her sails were furled.
 export const MAST_DAMAGE_ONSET  = SEV_GREEN_MIN;   // 0.60 — damage shows / penalty begins below this health
-export const MAST_SLOW_FLOOR    = 0.70;            // worst partial sail-power multiplier (just above destroyed)
+export const MAST_SLOW_FLOOR    = 0.30;            // worst partial sail-power multiplier (just above destroyed) —
+                                                   // a shot-up rig really bleeds speed (was 0.70); 0 at destroyed
 export const MAST_DOWN_TURN_MAX = 6;               // deg/s helm cap once the mast is down (pivots slowly only)
 
 /** Mast health fraction (1 = intact .. 0 = destroyed) from a hull state. Unknown hull → 1. */

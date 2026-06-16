@@ -57,6 +57,12 @@ const ZONE_NORMAL = {
 const DMG_K        = 0.5;
 const DMG_PERP_EXP = 1.3;
 
+// Per-vessel cannon CALIBER → damage multiplier. Bigger ships carry heavier guns with real stopping power, so a
+// brig's ball hurts far more than a pinnace's — ON TOP of the brig carrying more guns AND more hull HP (armour).
+// Net: a brig wrecks a pinnace fast, while a pinnace peppering a brig barely dents it. Keyed by the SHOOTER slug.
+const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7 };
+function caliberFor(slug) { return CALIBER_BY_SLUG[slug] || 1.0; }
+
 // Waterline bonus: a shot striking at/near the waterline holes the ship below the
 // floodline and hurts far more. Hull y runs 0 (waterline) .. DECK_Y (deck). A hit at or
 // below y=0 gets the full bonus; it fades to nothing by WATERLINE_BAND above the water.
@@ -77,7 +83,9 @@ const SEV_YELLOW_MIN = 0.30;
 // Sail drive falls once mast health drops below the onset, easing to MAST_SLOW_FLOOR just above destroyed and
 // 0 at fully destroyed (coasts like furled sails). Used server-side to slow NPC merchants when demasted.
 const MAST_DAMAGE_ONSET = SEV_GREEN_MIN;   // 0.60 — penalty begins below this mast-health fraction
-const MAST_SLOW_FLOOR   = 0.70;            // worst partial sail-power just above destroyed
+const MAST_SLOW_FLOOR   = 0.30;            // worst partial sail-power just above destroyed — a shot-up rig really
+                                           // bleeds speed now (was 0.70, which barely slowed a damaged mast), so a
+                                           // demasted ship can be run down. 0 at fully destroyed (coasts).
 function mastSpeedMult(h) {
   if (h <= 0) return 0;
   if (h >= MAST_DAMAGE_ONSET) return 1;
@@ -131,7 +139,7 @@ module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL,
-  DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND,
+  DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, caliberFor,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
   MAST_DAMAGE_ONSET, MAST_SLOW_FLOOR, mastSpeedMult,
   MAST_REPAIR_MS, MAST_REPAIR_FRAC,

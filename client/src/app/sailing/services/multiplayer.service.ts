@@ -11,6 +11,7 @@ import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
+import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { SquadronService } from './squadron.service';
@@ -77,6 +78,15 @@ interface OtherPlayerEntry extends OtherPlayer {
 
   // ── Collision: previous-frame hull distance to the local ship (for on-screen closing rate). ──
   collPrevDist?: number;
+
+  // ── Distant-ship LOD: an azimuthal billboard impostor swapped in for the full rigged GLB beyond ~½ km
+  // (built async; null until its atlas loads). impostorActive = the billboard is showing + the full GLB
+  // (and all its rig animation) is skipped — the big CPU/draw saving on churning NPC merchants. ──
+  impostor?:       ShipImpostor | null;
+  impostorActive?: boolean;
+  // Nameplate, DETACHED from root so the hull LOD (which disables root) doesn't hide it — kept up even while
+  // impostored so a spyglass can still read a distant ship's name + nationality. Positioned each frame.
+  label?:          Mesh | null;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -884,6 +894,16 @@ export class MultiplayerService {
   /** Tear down a remote's vessel meshes/crew/controller/label but KEEP its root TransformNode (used by both
    *  full disposal and an in-place hull swap). See the shadow-caster note below. */
   private clearVesselMeshes(entry: OtherPlayerEntry): void {
+    // Distant-ship impostor: standalone mesh + its own ShaderMaterial (the ATLAS texture is shared per type
+    // and stays cached — don't dispose it). Drop it here so a hull-swap rebuild re-creates it for the new slug.
+    entry.impostor?.mesh.dispose();
+    entry.impostor?.mat.dispose();
+    entry.impostor = null;
+    entry.impostorActive = false;
+    // Nameplate is detached from root (so the LOD can't hide it) → root disposal won't reach it; free it +
+    // its unique DynamicTexture/material here.
+    entry.label?.dispose(false, true);
+    entry.label = null;
     entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
     entry.crew = null;
     entry.controller?.dispose();
@@ -1103,6 +1123,20 @@ export class MultiplayerService {
     // rotation.z gets wave roll here; tickRecoil adds cannon recoil on top.
     entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll;
 
+    // Nameplate: driven independently of the hull LOD (it's detached from root) so it stays up over a distant
+    // impostor — a spyglass can then still read the ship's name + nationality. Floats at the masthead; visible
+    // within the view radius. (Slight loss of pitch/roll bob vs a child, but a steady plate reads better.)
+    if (entry.label) {
+      const cam = this.sceneService.camera;
+      const within = !cam || Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) <= this.VISIBILITY_RADIUS;
+      entry.label.position.set(entry.dispX, entry.root.position.y + this.LABEL_Y, entry.dispZ);
+      if (entry.label.isEnabled() !== within) entry.label.setEnabled(within);
+    }
+
+    // Distant-ship LOD: beyond ~½ km swap the full rigged GLB for a cheap azimuthal billboard impostor AND
+    // skip every bit of rig animation below (the main CPU win on churning merchants). Returns true if so.
+    if (this.applyShipLOD(entry)) { return; }
+
     // Rig animation: rudder reflects the broadcast yaw; flag/pennant flutter downwind;
     // sail furl + anchor ease toward the broadcast state so they animate like the local ship.
     if (entry.controller) {
@@ -1135,6 +1169,48 @@ export class MultiplayerService {
       // Last: ease trim/boom/furl AND re-prepare the skeleton from all posed bone nodes.
       entry.controller.tickRig(dt);
     }
+  }
+
+  // Distant ships render as a baked azimuthal billboard instead of the full rigged GLB. Hysteresis band
+  // (full < LOD_NEAR, impostor > LOD_FAR) so a ship hovering at the boundary doesn't strobe between them.
+  // LOD_NEAR sits beyond combat range (~320 m) so anyone you're fighting stays full-detail.
+  private readonly LOD_NEAR = 460;
+  private readonly LOD_FAR  = 540;
+
+  /** Show/hide this ship's impostor by camera distance; when impostored, place + aim it and report true so
+   *  the caller skips the full-GLB rig animation. Sinking ships keep the real mesh (so the capsize plays). */
+  private applyShipLOD(entry: OtherPlayerEntry): boolean {
+    const imp = entry.impostor;
+    if (!imp) return false;                                   // atlas not loaded yet → applyVisibility owns root
+    const cam = this.sceneService.camera;
+    if (!cam) return false;
+    const d = Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z);
+
+    // Decide the desired LOD. For impostor-capable ships THIS is the single owner of enable state (root +
+    // billboard), evaluated every frame — applyVisibility skips them, so set the states idempotently so a
+    // ship recovering from the far cull or a sinking can't get stuck hidden.
+    //  • beyond VISIBILITY_RADIUS → hide both (coarse cull)
+    //  • sinking → full mesh (so the capsize plays)
+    //  • else hysteresis: impostor past LOD_FAR, full mesh within LOD_NEAR
+    let want: boolean;   // show the impostor?
+    if (d > this.VISIBILITY_RADIUS) {
+      if (imp.mesh.isEnabled()) imp.mesh.setEnabled(false);
+      if (entry.root.isEnabled()) entry.root.setEnabled(false);
+      entry.impostorActive = false;
+      return true;                                            // nothing on screen → skip rig
+    } else if (entry.sinking || entry.sinkEnv > 0.001) {
+      want = false;
+    } else {
+      want = entry.impostorActive ? d > this.LOD_NEAR : d > this.LOD_FAR;
+    }
+    entry.impostorActive = want;
+    if (entry.root.isEnabled() === want) entry.root.setEnabled(!want);   // root ON when NOT impostored
+    if (imp.mesh.isEnabled() !== want) imp.mesh.setEnabled(want);
+    if (want) {
+      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z);
+      return true;
+    }
+    return false;
   }
 
   private tickRecoil(entry: OtherPlayerEntry, dt: number): void {
@@ -1376,6 +1452,9 @@ export class MultiplayerService {
   }
 
   private applyVisibility(entry: OtherPlayerEntry): void {
+    // Impostor-capable ships have their root (and billboard) enable state driven every frame by applyShipLOD,
+    // which also does this far cull — touching root here would fight it (full GLB drawn over its impostor).
+    if (entry.impostor) return;
     const dx   = entry.x - this.localState.x;
     const dz   = entry.z - this.localState.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1438,7 +1517,10 @@ export class MultiplayerService {
     // Nameplate (billboard above masthead). NPC merchants show their ship name + a faction-coloured "⚑ NATION
     // MERCHANT" tag; players show their callsign.
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
-    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, entry.npc ? (entry.faction || null) : null);
+    entry.label = this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, entry.npc ? (entry.faction || null) : null);
+    // Detach from root so the hull LOD (root.setEnabled(false) when impostored) can't hide the nameplate;
+    // tickRemoteMotion positions it at the masthead each frame instead. (Disposed in clearVesselMeshes.)
+    entry.label.parent = null;
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1480,6 +1562,18 @@ export class MultiplayerService {
         this.oceanService.setHullStencilMask(true);
       }
     }
+
+    // Distant-ship LOD impostor (azimuthal billboard) — built lazily; the full GLB is used until the shared
+    // atlas for this slug has loaded. Standalone mesh (not a child of root), so root.setEnabled() toggles the
+    // full ship without touching the billboard. Freed in clearVesselMeshes.
+    void getShipImpostorAtlas(scene, slug).then((atlas) => {
+      if (!atlas || entry.root.isDisposed()) return;
+      entry.impostor?.mesh.dispose(); entry.impostor?.mat.dispose();
+      const imp = createShipImpostor(scene, slug, atlas);
+      this.sceneService.excludeFromPrePass(imp.mat);
+      this.sceneService.excludeFromGlow(imp.mesh);
+      entry.impostor = imp;
+    });
   }
 
   // ── Floating callsign label ───────────────────────────────────────────────

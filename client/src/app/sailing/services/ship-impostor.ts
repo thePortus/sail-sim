@@ -13,7 +13,7 @@ import { Effect, Mesh, MeshBuilder, Scene, ShaderMaterial, Texture, Vector2 } fr
 import { Settings } from '../../app.settings';
 
 export interface ShipImpostorAtlas { tex: Texture; size: number; centerY: number; n: number; cols: number; }
-export interface ShipImpostor { mesh: Mesh; mat: ShaderMaterial; atlas: ShipImpostorAtlas; cell: number; }
+export interface ShipImpostor { mesh: Mesh; mat: ShaderMaterial; atlas: ShipImpostorAtlas; cell: number; calib: number; }
 
 const BASE = `${Settings.apiUrl}geometry/ship_impostors/`;
 
@@ -21,6 +21,15 @@ const BASE = `${Settings.apiUrl}geometry/ship_impostors/`;
 // (degrees / ±1) — overridable live via localStorage for quick iteration without a rebuild.
 const CALIB_DEG = +(localStorage.getItem('ignis_shipimp_calib') ?? '0');
 const CALIB_DIR = +(localStorage.getItem('ignis_shipimp_dir') ?? '1') < 0 ? -1 : 1;
+// Per-slug bow offset: the bake loads the RAW GLB (no runtime importFlipY), so a model authored bow-reversed
+// vs the others bakes a 180°-rotated atlas and reads "sailing backwards". The brig's GLB is one such — give it
+// a half-turn. Override any slug live with localStorage ignis_shipimp_calib_<slug> (degrees) if one's still off.
+const CALIB_DEG_BY_SLUG: Record<string, number> = { brig: 180 };
+function calibRadFor(slug: string): number {
+  const per = localStorage.getItem('ignis_shipimp_calib_' + slug);
+  const deg = per !== null ? +per : CALIB_DEG + (CALIB_DEG_BY_SLUG[slug] ?? 0);
+  return (deg * Math.PI) / 180;
+}
 
 let manifestPromise: Promise<Record<string, { size: number; centerY: number; n: number; cols: number }>> | null = null;
 const atlasCache = new Map<string, ShipImpostorAtlas | null>();
@@ -90,7 +99,7 @@ export function createShipImpostor(scene: Scene, slug: string, atlas: ShipImpost
   mesh.alwaysSelectAsActiveMesh = true;              // positioned each frame; skip cull churn
   mesh.metadata = { excludeFromRefraction: true };
   mesh.setEnabled(false);
-  return { mesh, mat, atlas, cell: -1 };
+  return { mesh, mat, atlas, cell: -1, calib: calibRadFor(slug) };
 }
 
 /** Per frame (while impostored): place the billboard at the ship + select the atlas cell for the view angle. */
@@ -100,7 +109,7 @@ export function updateShipImpostor(
   imp.mesh.position.set(x, y + imp.atlas.centerY, z);
   // Azimuth the camera views the ship FROM, relative to the ship's heading (atan2(x,z) = heading convention).
   const viewAz = Math.atan2(camX - x, camZ - z);
-  let rel = (viewAz - headingRad) * CALIB_DIR + CALIB_DEG * Math.PI / 180;
+  let rel = (viewAz - headingRad) * CALIB_DIR + imp.calib;
   rel /= (2 * Math.PI);
   const n = imp.atlas.n;
   let cell = Math.round(rel * n) % n;

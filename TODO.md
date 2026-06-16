@@ -2,16 +2,15 @@
 
 # General or Current TODO Items
 
-* add occasional bosun whistle (raise/lower anchor... and when first adding sail after leaving port (or first time since logging in))\
-* I want to make NPC merchant labels and player names more visible at distance... just imroving "size" won't help... since ships are often far off... we need a way to make labels (esp of players) more readable at a distance
-* I also want to make the dot indicating towns on maps more visible.. they are hard to see
-* have way to earn back faction reputation... increased rep from attacking enemies and enemies of allies... but also paying off at "Governor's Mansion"... new menu item at town selection screen
+* check waves go right way for wind
+* have way to earn back faction reputation... increased rep from attacking enemies and enemies of allies... but also paying off at "Governor's Mansion"... new menu item at town selection screen... also give admins ability to say /reputation <player> and if no other arguments are given, all negative reps are cleared (keeping good ones)
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit landscape not loading (losing the landscape loading race)
 * make pinace buoyance more responsive
 * make salvage crate asset
-* check waves go right way for wind
+* hide labels in photo mode
+* update profile page and update password page (and 404 page with a funny 404)
 * why a dark patch around player ship? is it because of transparency to see hull?
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
@@ -46,9 +45,3 @@
 * Security pass
 
 # TODO Items by Module
-
-Great, committed
-
-Now, I want to add the sound effect of a bosun's whistle at some key moments. Use the existing sound synthesize system with tone.js and plug it in alongside other sound effects. Make sure to have the characteristic change in pitch that is common, and that it starts out in about the same high pitch range that a real bosun's whistle does.
-
-In the game I want it to signify "getting under way." and also "stopping." If you want to put a variation on the whistle for "stopping" (when we lower the anchor), that would be extra cool. But I want it to happen in several key occasions... (1) the anchor is raised (2) the anchor is lowered (consider variation here) (3) the sails are raised for the first time after leaving a port (4) the sails are raised for the first time after logging in. If you want to do a different variation for both raising and lowering the anchor, that is fine... but only if you think that is realistic and can guess what it should sound like.

@@ -11,6 +11,11 @@ import { ImpostorHazePlugin } from './scatter/impostor-haze.plugin';
 import { measureBottomPad } from './scatter/asset-loader';
 import { Settings } from '../../app.settings';
 import { TerrainHarbor } from '../models';
+import { buildNameplate } from './nameplate';
+import { factionColor, factionName } from '../faction.config';
+
+// Settlement-type wording for the town-sign subtitle (the raw tier 'small' alone reads as "Spanish Small").
+const TOWN_TIER_LABEL: Record<string, string> = { capital: 'Capital', medium: 'Town', small: 'Small Town' };
 
 /**
  * Renders the harbor towns detected during terrain generation (manifest.harbors). For now a town =
@@ -96,6 +101,19 @@ export class HarborService {
 
   /** The town the player is currently close enough to dock at, or null. Read by the HUD/game UI. */
   readonly dockable = signal<TerrainHarbor | null>(null);
+
+  // Floating town signs (same ornate brass plaque as the ship nameplates — see nameplate.ts). Streamed in as
+  // the player nears a town and dropped again past LBL_DROP, so only the ~1–2 nearest carry a live billboard.
+  // Tinted by the owning nation; a "⚓ NATION CAPITAL/MEDIUM/SMALL" tag under the town name.
+  private readonly townLabels = new Map<string, { plane: Mesh; h: TerrainHarbor }>();
+  private readonly LBL_SHOW   = 2000;   // build the sign within this range (m)
+  private readonly LBL_DROP   = 2400;   // drop it past this (hysteresis vs SHOW)
+  private readonly LBL_NEAR   = 350;    // ≤ this → base size; beyond, softened-perspective growth
+  private readonly LBL_POW    = 0.6;    // perspective softening (matches the ship labels)
+  private readonly LBL_FAR    = 7;      // scale cap
+  private readonly LBL_W      = 46;     // base plane size (a town sign is a bigger landmark than a ship plate)
+  private readonly LBL_H      = 12.8;   // ≈ LBL_W / 3.6 (texture aspect)
+  private readonly LBL_LIFT   = 18;     // lower edge this far above the town's pad (clears the buildings)
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -207,7 +225,47 @@ export class HarborService {
   private tick(): void {
     this.updateNearestPier();
     if (this.impostorMeshes.length) { this.updateImpostorCamera(); }
-    if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); }
+    this.updateTownLabels();   // position/scale the few active signs (cheap; only nearby towns carry one)
+    if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); }
+  }
+
+  /** Build a town's floating sign when the player nears it; drop it again once well past (hysteresis). */
+  private streamTownLabels(): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    const p = this.vesselService.getPosition();
+    for (const h of this.harbors) {
+      const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
+      const has = this.townLabels.has(h.id);
+      if (!has && d2 <= this.LBL_SHOW * this.LBL_SHOW) {
+        const nation = h.faction ? factionName(h.faction).toUpperCase() : 'FREE';
+        const settle = (TOWN_TIER_LABEL[h.tier ?? ''] ?? 'Town').toUpperCase();   // 'small' → "SMALL TOWN", etc.
+        const plane = buildNameplate(scene, 'townlbl_' + h.id, {
+          title: h.name,
+          subtitle: `⚓ ${nation} ${settle}`,
+          baseColor: h.faction ? factionColor(h.faction) : '#4a5560',   // owned → nation tint; free → slate stone
+          width: this.LBL_W, height: this.LBL_H,
+          kind: 'town',   // swallowtail wooden banner — distinct from a ship's brass plaque
+        });
+        this.townLabels.set(h.id, { plane, h });
+      } else if (has && d2 > this.LBL_DROP * this.LBL_DROP) {
+        this.townLabels.get(h.id)!.plane.dispose(false, true);
+        this.townLabels.delete(h.id);
+      }
+    }
+  }
+
+  /** Per-frame: soften-perspective scale + bottom-anchor each live town sign above its pad (mirrors ship labels). */
+  private updateTownLabels(): void {
+    if (!this.townLabels.size) return;
+    const cam = this.sceneService.camera;
+    if (!cam) return;
+    for (const { plane, h } of this.townLabels.values()) {
+      const d = Math.hypot(h.x - cam.position.x, h.z - cam.position.z);
+      const s = Math.min(this.LBL_FAR, Math.max(1, Math.pow(d / this.LBL_NEAR, this.LBL_POW)));
+      plane.scaling.set(s, s, s);
+      plane.position.set(h.x, (h.pad?.elev ?? 0) + this.LBL_LIFT + this.LBL_H * s * 0.5, h.z);
+    }
   }
 
   /** Feed the town-impostor billboard plugin the live camera XZ + horizontal right vector (so the quads face
@@ -689,6 +747,8 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    for (const { plane } of this.townLabels.values()) plane.dispose(false, true);   // own texture+material
+    this.townLabels.clear();
     for (const m of this.impostorMeshes) { m.material?.dispose(true, true); m.dispose(); }   // own texture+material
     this.impostorMeshes = [];
     // Pier nodes die with root below (the scene teardown also disposes the shadow/reflection/glow

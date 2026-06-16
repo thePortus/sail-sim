@@ -1,8 +1,6 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
-import {
-  MeshBuilder, Color3, StandardMaterial, TransformNode,
-  Mesh, Material, Scene, DynamicTexture,
-} from '@babylonjs/core';
+import { TransformNode, Mesh, Material, Scene } from '@babylonjs/core';
+import { buildNameplate } from './nameplate';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
@@ -87,6 +85,7 @@ interface OtherPlayerEntry extends OtherPlayer {
   // Nameplate, DETACHED from root so the hull LOD (which disables root) doesn't hide it — kept up even while
   // impostored so a spyglass can still read a distant ship's name + nationality. Positioned each frame.
   label?:          Mesh | null;
+  mastTop?:        number;   // height (m) of the masthead above the hull origin — label floats above THIS (tall brig vs short pinnace)
 }
 
 @Injectable({ providedIn: 'root' })
@@ -238,9 +237,17 @@ export class MultiplayerService {
   private recoilTickFn: (() => void) | null = null;
 
   // Label plane dimensions in world units
-  private readonly LABEL_WIDTH  = 12;
-  private readonly LABEL_HEIGHT = 1.8;
-  private readonly LABEL_Y      = 9;
+  private readonly LABEL_WIDTH  = 44;    // base plane size — only the NEARBY ships carry a label now, so make it big & legible
+  private readonly LABEL_HEIGHT = 12.2;  // keep ≈ texW/texH (1152/320 = 3.6) so the plate isn't stretched
+  private readonly LABEL_GAP    = 3;     // clearance above THIS ship's masthead (label bottom = mastTop + this; see mastTop)
+  private readonly LABEL_MAX_DIST = 1800;  // beyond this the ship's label is NOT drawn at all (far ships read as plain hulls)
+  // Distance-softened label scaling. A raw billboard shrinks ∝ 1/d (true perspective) — tiny far off; holding the
+  // apparent size perfectly constant (scale ∝ d) loses all sense of range. So we take a POWER between:
+  // scale = clamp((d/NEAR)^POW, 1, FAR). POW≈0.72 keeps a closer=bigger range cue but a GENTLE falloff so a ship near
+  // the cutoff is still big and readable. ≤NEAR → base size.
+  private readonly LABEL_SCALE_NEAR = 200;   // ≤ this distance → base size (perspective makes it grow as you approach)
+  private readonly LABEL_SCALE_POW  = 0.72;  // 1 = constant apparent size; 0 = full perspective. Higher → bigger far out
+  private readonly LABEL_SCALE_FAR  = 13;    // scale cap (not reached within LABEL_MAX_DIST)
 
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
@@ -1141,8 +1148,17 @@ export class MultiplayerService {
     // within the view radius. (Slight loss of pitch/roll bob vs a child, but a steady plate reads better.)
     if (entry.label) {
       const cam = this.sceneService.camera;
-      const within = !cam || Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) <= this.VISIBILITY_RADIUS;
-      entry.label.position.set(entry.dispX, entry.root.position.y + this.LABEL_Y, entry.dispZ);
+      const d = cam ? Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) : 0;
+      const within = !cam || d <= this.LABEL_MAX_DIST;   // only NEARBY ships get a label; far ones read as plain hulls
+      if (within) {
+        // Soften the perspective shrink (closer = bigger, but distant labels fall off gently — see LABEL_SCALE_*).
+        const s = Math.min(this.LABEL_SCALE_FAR, Math.max(1, Math.pow(d / this.LABEL_SCALE_NEAR, this.LABEL_SCALE_POW)));
+        entry.label.scaling.set(s, s, s);
+        // Bottom-anchor above THIS ship's masthead (tall brig vs short pinnace). The billboard scales about its
+        // centre, so raise the centre by half the scaled height to keep the lower edge clear of the rig and sea.
+        const bottom = entry.root.position.y + (entry.mastTop ?? 18) + this.LABEL_GAP;
+        entry.label.position.set(entry.dispX, bottom + this.LABEL_HEIGHT * s * 0.5, entry.dispZ);
+      }
       if (entry.label.isEnabled() !== within) entry.label.setEnabled(within);
     }
 
@@ -1527,13 +1543,18 @@ export class MultiplayerService {
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
+    // Masthead height above the hull origin — so the label floats clear of THIS ship's rig (a tall brig needs
+    // far more lift than a pinnace). Snapshot of the built rig's bounding box; +a small margin in the per-frame
+    // placement. Fallback to a generic height if the bbox is degenerate.
+    const bb = rigged.root.getHierarchyBoundingVectors(true);
+    entry.mastTop = Math.max(10, bb.max.y - entry.root.position.y);
+
     // Nameplate (billboard above masthead). NPC merchants show their ship name + a faction-coloured "⚑ NATION
     // MERCHANT" tag; players show their callsign.
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
-    entry.label = this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, entry.npc ? (entry.faction || null) : null);
-    // Detach from root so the hull LOD (root.setEnabled(false) when impostored) can't hide the nameplate;
-    // tickRemoteMotion positions it at the masthead each frame instead. (Disposed in clearVesselMeshes.)
-    entry.label.parent = null;
+    // Unparented (the shared builder returns it free-standing) so the hull LOD (root.setEnabled(false) when
+    // impostored) can't hide the nameplate; tickRemoteMotion positions it at the masthead each frame instead.
+    entry.label = this.buildCallsignLabel(prefix + 'label', labelText, scene, entry.npc ? (entry.faction || null) : null);
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1591,70 +1612,19 @@ export class MultiplayerService {
 
   // ── Floating callsign label ───────────────────────────────────────────────
 
+  /** Build the floating nameplate for a remote ship. Merchants → nation-tinted two-line plaque (name over a
+   *  "⚑ NATION MERCHANT" tag, with the redundant "Merchant " name prefix stripped); players → a single dark-slate
+   *  callsign line. Shared ornate plaque renderer (see nameplate.ts); the caller positions/scales it per frame. */
   private buildCallsignLabel(
-    name: string, text: string, root: TransformNode, scene: Scene, faction: string | null = null,
+    name: string, text: string, scene: Scene, faction: string | null = null,
   ): Mesh {
     const merchant = !!faction;
-    const texW = 768, texH = 128;
-
-    const tex = new DynamicTexture(name + '_tex', { width: texW, height: texH }, scene, false);
-    const ctx = tex.getContext() as CanvasRenderingContext2D;
-
-    ctx.clearRect(0, 0, texW, texH);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.70)';
-    ctx.beginPath();
-    ctx.rect(10, 10, texW - 20, texH - 20);
-    ctx.fill();
-    ctx.textAlign = 'center';
-
-    if (merchant) {
-      const col = factionColor(faction);
-      // Ship name (top) in cream, then a faction-coloured "⚑ NATION MERCHANT" tag (bottom).
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = '#f3ead0';
-      ctx.font = 'bold 50px Arial, sans-serif';
-      ctx.fillText(text, texW / 2, 62);
-      ctx.fillStyle = col;
-      ctx.font = 'bold 30px Arial, sans-serif';
-      ctx.fillText(`⚑ ${factionName(faction).toUpperCase()} MERCHANT`, texW / 2, 104);
-      ctx.strokeStyle = col;
-      ctx.lineWidth = 5;
-      ctx.strokeRect(8, 8, texW - 16, texH - 16);
-    } else {
-      ctx.fillStyle = '#FFFFFF';
-      ctx.font = 'bold 56px Arial, sans-serif';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(text.toUpperCase(), texW / 2, texH / 2);
-      ctx.strokeStyle = 'rgba(130, 200, 255, 0.55)';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(10, 10, texW - 20, texH - 20);
-    }
-
-    tex.update();
-    tex.hasAlpha = true;
-
-    const mat = new StandardMaterial(name + '_mat', scene);
-    mat.diffuseTexture             = tex;
-    mat.useAlphaFromDiffuseTexture = true;
-    mat.backFaceCulling            = false;
-    mat.disableLighting            = true;
-    mat.emissiveColor              = new Color3(1, 1, 1);
-
-    const plane = MeshBuilder.CreatePlane(name + '_plane', {
-      width:  this.LABEL_WIDTH,
-      height: this.LABEL_HEIGHT,
-    }, scene);
-    plane.parent        = root;
-    plane.position.y    = this.LABEL_Y;
-    plane.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    plane.isPickable    = false;
-    plane.material      = mat;
-    // Group 2 = same layer as terrain/ocean-near/vessels (see VesselService/TerrainService).
-    // The default group 0 renders BEFORE the group-2 world, so the shared depth buffer lets
-    // foreground ocean/terrain paint over the nameplate — making it vanish. Matching the
-    // world's group restores correct depth sorting: visible above the hull, hidden by hills.
-    plane.renderingGroupId = 2;
-
-    return plane;
+    const title    = merchant ? (text.replace(/^\s*merchant\s+/i, '').trim() || text) : text.toUpperCase();
+    const subtitle = merchant ? `⚑ ${factionName(faction).toUpperCase()} MERCHANT` : undefined;
+    return buildNameplate(scene, name, {
+      title, subtitle,
+      baseColor: merchant ? factionColor(faction) : null,
+      width: this.LABEL_WIDTH, height: this.LABEL_HEIGHT,
+    });
   }
 }

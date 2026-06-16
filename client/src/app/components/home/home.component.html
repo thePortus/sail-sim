@@ -28,7 +28,13 @@
       <button (click)="logout()">Logout</button>
     </div>
 
-    <img src="/images/dedication.jpg" alt="Image of a dedication: To a well-deserving father, for my dreams and the fair winds to find them." class="home-image">
+    <span *ngIf="user?.loggedIn">
+      <img src="/images/dedication.jpg" alt="Image of a dedication: To a well-deserving father, for my dreams and the fair winds to find them." class="home-image">
+    </span>
+
+    <span *ngIf="!user?.loggedIn">
+      <img src="/images/splash1.png" alt="Splash page image of a bay of pirates, with a town in the distance, sunlight breaking in over stormy clouds." class="home-image">
+    </span>
 
     <div class="home-desc">
       <p class="home-lead">

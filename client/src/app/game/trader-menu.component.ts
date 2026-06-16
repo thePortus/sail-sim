@@ -82,7 +82,7 @@ import { factionColor, factionName } from '../sailing/faction.config';
         <div class="tr-err">{{ prettyError(err) }}</div>
       }
 
-      <button class="tr-close" (click)="onClose()">Cast Off</button>
+      <button class="tr-close" (click)="onClose()">Go Back to Town</button>
     </div>
   `,
   styles: [`

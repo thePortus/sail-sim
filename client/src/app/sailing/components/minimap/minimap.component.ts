@@ -318,20 +318,23 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
           ctx.lineWidth = 2;
           ctx.beginPath(); ctx.arc(hxp, hyp, 7 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
         }
-        // Dot coloured by the owning nation (dimmed until the player has discovered it). Contested towns get a
-        // ring in their rival's colour; discovered towns get a thin white ring.
-        ctx.globalAlpha = known ? 1 : 0.5;
-        ctx.fillStyle   = h.faction ? factionColor(h.faction) : (known ? '#9fe0a0' : '#e8d3a0');
-        ctx.beginPath();
-        ctx.arc(hxp, hyp, 3, 0, Math.PI * 2);
-        ctx.fill();
+        // Dot coloured by the owning nation (dimmed until the player has discovered it). A dark halo behind it
+        // lifts the marker off the terrain — towns sit on tan/green land where a small flat dot vanishes.
+        // Contested towns get a ring in their rival's colour; discovered towns get a bright white ring.
+        const R = 5;   // marker radius (was 3 — too small to pick out at a glance)
         ctx.globalAlpha = 1;
-        if (h.contested && h.rivalFaction) { ctx.strokeStyle = factionColor(h.rivalFaction); ctx.lineWidth = 1.8; }
-        else                               { ctx.strokeStyle = 'rgba(0,0,0,0.6)';            ctx.lineWidth = 0.8; }
-        ctx.stroke();
+        ctx.fillStyle   = 'rgba(0,0,0,0.55)';                                  // contrast halo (any background)
+        ctx.beginPath(); ctx.arc(hxp, hyp, R + 2, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = known ? 1 : 0.7;                                     // undiscovered: dimmer but still findable
+        ctx.fillStyle   = h.faction ? factionColor(h.faction) : (known ? '#9fe0a0' : '#e8d3a0');
+        ctx.beginPath(); ctx.arc(hxp, hyp, R, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+        if (h.contested && h.rivalFaction) { ctx.strokeStyle = factionColor(h.rivalFaction); ctx.lineWidth = 2.4; }
+        else                               { ctx.strokeStyle = 'rgba(0,0,0,0.75)';           ctx.lineWidth = 1.3; }
+        ctx.beginPath(); ctx.arc(hxp, hyp, R, 0, Math.PI * 2); ctx.stroke();
         if (known) {
-          ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 0.8;
-          ctx.beginPath(); ctx.arc(hxp, hyp, 4.6, 0, Math.PI * 2); ctx.stroke();
+          ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.3;
+          ctx.beginPath(); ctx.arc(hxp, hyp, R + 2.2, 0, Math.PI * 2); ctx.stroke();
         }
         if (hp) {
           const d = Math.hypot(hp.x - hxp, hp.y - hyp);
@@ -358,7 +361,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       if (hovered) {
         // Highlight the hovered marker, then draw a multi-line pill above it.
         ctx.fillStyle = '#fff4d0';
-        ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 5.5, 0, Math.PI * 2); ctx.fill();
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'alphabetic';

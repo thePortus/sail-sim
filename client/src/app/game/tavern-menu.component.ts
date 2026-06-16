@@ -23,6 +23,8 @@ import { CombatService } from '../sailing/services/combat.service';
         <span class="tv-gold">⚜ {{ mp.gold() }} gold</span>
       </div>
 
+      <img src="/images/tavern.png" alt="A crowded tavern with sailors and merchants." class="home-image">
+
       <div class="tv-flavour">Hands lost to grapeshot can be replaced here — a coin in the right palm finds willing sailors.</div>
 
       <div class="tv-crew">

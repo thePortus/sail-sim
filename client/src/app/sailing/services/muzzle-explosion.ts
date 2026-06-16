@@ -160,7 +160,7 @@ export class MuzzleExplosions {
   // visible amount in the flash (the demo swirls over many seconds; we compress that into the brief life).
   private readonly ANIM_RATE = 6.3;   // slowed ~30% for a lazier swirl
 
-  constructor(scene: Scene, excludeFromPrePass: (m: Material) => void, pool = 16) {
+  constructor(scene: Scene, excludeFromPrePass: (m: Material) => void, pool = 16, includeInGlow?: (m: Mesh) => void) {
     for (let i = 0; i < pool; i++) {
       const mat = new ShaderMaterial('muzzleExplosionMat' + i, scene,
         { vertexSource: VERT, fragmentSource: FRAG },
@@ -187,6 +187,7 @@ export class MuzzleExplosions {
       mesh.alwaysSelectAsActiveMesh = true;
       // Don't let it bleed into the ocean reflection/refraction RTTs (it's an above-water additive flash).
       mesh.metadata = { excludeFromRefraction: true };
+      includeInGlow?.(mesh);   // bloom the fireball through the glow layer (day + night)
       mesh.setEnabled(false);
       this.slots.push({ mesh, mat, life: 0, lifetime: this.LIFETIME, active: false, seed: 0, size: 1 });
     }

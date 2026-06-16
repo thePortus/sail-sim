@@ -272,7 +272,8 @@ export class CloudService {
     this.initRainLayer(scene);
     this.initLensRain();
     this.initVolumetricLayer();
-    this.lightningBolt = new LightningBolt(scene, (m) => this.sceneService.excludeFromPrePass(m));
+    this.lightningBolt = new LightningBolt(scene, (m) => this.sceneService.excludeFromPrePass(m),
+      3, (mesh) => this.sceneService.includeShaderInGlow(mesh));
 
     this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('cloud', () => {
       const dt = Math.min(scene.getEngine().getDeltaTime() / 1000, 0.05);

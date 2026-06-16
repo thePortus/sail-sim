@@ -96,7 +96,7 @@ export class LightningBolt {
   private readonly BASE_H = 560;
   private readonly ANIM_RATE = 9.0;  // shader "seconds" per real second → lively strobe in the brief life
 
-  constructor(scene: Scene, excludeFromPrePass: (m: Material) => void, pool = 3) {
+  constructor(scene: Scene, excludeFromPrePass: (m: Material) => void, pool = 3, includeInGlow?: (m: Mesh) => void) {
     for (let i = 0; i < pool; i++) {
       const mat = new ShaderMaterial('lightningBoltMat' + i, scene,
         { vertexSource: VERT, fragmentSource: FRAG },
@@ -117,6 +117,7 @@ export class LightningBolt {
       mesh.isPickable = false;
       mesh.alwaysSelectAsActiveMesh = true;        // large + far — skip frustum culling churn
       mesh.metadata = { excludeFromRefraction: true };   // keep it out of the ocean RTTs + smoke depth pass
+      includeInGlow?.(mesh);   // bloom the bolt through the glow layer (so a strike glows even at night)
       mesh.setEnabled(false);
       this.bolts.push({ mesh, mat, active: false, life: 0, lifetime: 0.52, clock: 0 });
     }

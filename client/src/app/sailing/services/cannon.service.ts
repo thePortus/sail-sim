@@ -321,7 +321,8 @@ export class CannonService {
     this.buildFlashLights();
     this.buildFlameParticles();
     if (this.useVolExplosion) {
-      this.explosions = new MuzzleExplosions(this.scene, (m) => this.sceneService.excludeFromPrePass(m));
+      this.explosions = new MuzzleExplosions(this.scene, (m) => this.sceneService.excludeFromPrePass(m),
+        16, (mesh) => this.sceneService.includeShaderInGlow(mesh));
     }
     if (this.useShaderSmoke) {
       this.smoke = new MuzzleSmoke(this.scene, {

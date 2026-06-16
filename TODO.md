@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* bloom lighting?
 * NPC ship characteristics should match player vessels in all ways... speed, turning, etc. (except that merchants may never hit top speed, since we limited that earlier)
 * thoughts on making aiming easier?
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...

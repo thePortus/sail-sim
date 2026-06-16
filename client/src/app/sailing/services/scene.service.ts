@@ -89,10 +89,24 @@ export class SceneService {
     this.glowLayer?.addExcludedMesh(mesh);
   }
 
+  /** Minimum glow-layer intensity (see tickTimeOfDay) so emissive glow-included meshes still bloom on a
+   *  dark night instead of the halo fading to ~0. */
+  private readonly GLOW_NIGHT_FLOOR = 0.55;
+
   /** Add an emissive mesh to the glow layer's include list (the layer is include-only — sun/moon by
    *  default), so its emissive blooms. Used for the pier lanterns. */
   includeInGlow(mesh: Mesh): void {
     this.glowLayer?.addIncludedOnlyMesh(mesh);
+  }
+
+  /** Glow a mesh whose brightness comes from a custom ShaderMaterial (no emissiveTexture/Color the glow
+   *  layer can read) — e.g. the additive muzzle-fireball + lightning billboards. referenceMeshToUseItsOwn-
+   *  Material makes the glow pass render the mesh with its actual shader, so the effect blooms day AND night
+   *  (independent of the time-gated pipeline bloom). Cheap: only ACTIVE pooled billboards draw into the glow RTT. */
+  includeShaderInGlow(mesh: Mesh): void {
+    if (!this.glowLayer) return;
+    this.glowLayer.addIncludedOnlyMesh(mesh);
+    this.glowLayer.referenceMeshToUseItsOwnMaterial(mesh);
   }
 
   /** Remove a mesh from the glow include list — REQUIRED before disposing a glow-included mesh
@@ -234,8 +248,8 @@ export class SceneService {
   private readonly PIPELINE_EPS = 0.02;   // raised from 0.005 — updates every ~2 s during transition
   private _cachedExposure = 1.0;
   private _cachedContrast = 1.10;
-  private _cachedBloomW   = 0.28;   // bloomWeight cache (setter fires per-call with no guard)
-  private _cachedBloomThreshold = 0.78;
+  private _cachedBloomW   = 0.40;   // bloomWeight cache (setter fires per-call with no guard)
+  private _cachedBloomThreshold = 0.62;
   private _cachedBloomEnabled = true;
   private _cachedGrainAnimated = true;
   private _cachedGrainIntensity = 12;
@@ -774,8 +788,8 @@ export class SceneService {
     // Bloom — makes emissive meshes (sun disk, torches) bleed light into the scene.
     // Weight and exposure are boosted dynamically at golden hour in tickTimeOfDay().
     this.pipeline.bloomEnabled   = true;
-    this.pipeline.bloomThreshold = 0.78;
-    this.pipeline.bloomWeight    = 0.28;
+    this.pipeline.bloomThreshold = 0.62;   // lower → more highlights bloom (tickTimeOfDay drives this live)
+    this.pipeline.bloomWeight    = 0.40;   // stronger glow (live-modulated by time of day)
     // Perf: kernel 128→48 and scale 0.5→0.33. The wide-kernel blur on a HiDPI
     // framebuffer was the entire daytime FPS hit (bloom is off at night, which is
     // why daytime ran ~14 vs ~22 at night). The glow is a touch tighter — barely
@@ -1116,7 +1130,10 @@ export class SceneService {
       const sunGlow = h > 0.02
         ? Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT)
         : 0;
-      this.glowLayer.intensity = Math.max(sunGlow, moonVis * 0.55);
+      // Floor of 0.55 so emissive glow-included meshes (pier lanterns, combat-FX billboards) keep a real
+      // bloom halo even on a dark/moonless night — without it the intensity fell to ~0 and only the bare
+      // emissive surface showed. Day is unchanged (sunGlow dominates the max).
+      this.glowLayer.intensity = Math.max(this.GLOW_NIGHT_FLOOR, sunGlow, moonVis * 0.55);
     }
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
@@ -1144,15 +1161,18 @@ export class SceneService {
       const nightBlend = isNight ? 1 : Math.max(0, Math.min(1, (-h - 0.03) / 0.20));
 
       // bloomWeight: throttle like exposure/contrast — the DefaultRenderingPipeline
-      // setter chain fires internal observers on every write.
-      const dayBloomW = Math.max(0.12, 0.26 + horizon * 0.58 - cloud * 0.30);
+      // setter chain fires internal observers on every write. Base + horizon boost raised (0.26→0.40,
+      // 0.58→0.66) for a more prominent glow on emissive/bright surfaces; cost is unchanged (same passes).
+      const dayBloomW = Math.max(0.20, 0.40 + horizon * 0.66 - cloud * 0.30);
       const newBloomW = Math.max(0, dayBloomW * (1 - nightBlend));
       if (Math.abs(newBloomW - this._cachedBloomW) > this.PIPELINE_EPS) {
         this.pipeline.bloomWeight = newBloomW;
         this._cachedBloomW = newBloomW;
       }
 
-      const newBloomThreshold = 0.78 + nightBlend * 0.35;
+      // Lower daytime threshold (0.78→0.62) so more highlights bloom, not just near-white pixels (free —
+      // changes WHAT blooms, not the blur cost). Still ramps UP at night to suppress general-scene pulsing.
+      const newBloomThreshold = 0.62 + nightBlend * 0.51;
       if (Math.abs(newBloomThreshold - this._cachedBloomThreshold) > this.PIPELINE_EPS) {
         this.pipeline.bloomThreshold = newBloomThreshold;
         this._cachedBloomThreshold = newBloomThreshold;

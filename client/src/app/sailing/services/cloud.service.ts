@@ -25,6 +25,7 @@ import { SceneService } from './scene.service';
 import { OceanService } from './ocean.service';
 import { SfxService } from './sfx.service';
 import { VolumetricCloudsPlugin } from './volumetric-clouds-plugin';
+import { LightningBolt } from './lightning-bolt';
 import { Weather } from '../models';
 
 type CloudSpriteEntry = {
@@ -215,6 +216,7 @@ export class CloudService {
   private lightningCooldown = 9;            // seconds until the next strike
   private flashStart = -100;                // this.elapsed at the current strike
   private flashActive = false;
+  private lightningBolt: LightningBolt | null = null;   // visible distant strike (paired with the light flash)
   private pendingThunder: { at: number; vol: number } | null = null;
   private sfxCtx: AudioContext | null = null;
 
@@ -270,6 +272,7 @@ export class CloudService {
     this.initRainLayer(scene);
     this.initLensRain();
     this.initVolumetricLayer();
+    this.lightningBolt = new LightningBolt(scene, (m) => this.sceneService.excludeFromPrePass(m));
 
     this.beforeRenderObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('cloud', () => {
       const dt = Math.min(scene.getEngine().getDeltaTime() / 1000, 0.05);
@@ -344,6 +347,8 @@ export class CloudService {
 
     this.sceneService.setLightningFlash(0);
     this.flashActive = false;
+    this.lightningBolt?.dispose();
+    this.lightningBolt = null;
     this.pendingThunder = null;
     // Shared context: STOP the looping rain bed (else it runs silently forever), disconnect + release our
     // master, but do NOT close the context — other SFX producers share it. Reset so a re-init rebuilds.
@@ -1161,16 +1166,20 @@ export class CloudService {
       if (this.lightningCooldown <= 0) this.strikeLightning(storm);
     }
 
-    // Drive the flash envelope.
+    // Drive the flash envelope — the SAME curve feeds the scene-light flash and the visible bolt so they
+    // strobe as one event.
+    let env = 0;
     if (this.flashActive) {
       const te = this.elapsed - this.flashStart;
       if (te > 0.7) {
         this.flashActive = false;
         this.sceneService.setLightningFlash(0);
       } else {
-        this.sceneService.setLightningFlash(this.computeFlash(te) * (0.6 + 0.4 * storm));
+        env = this.computeFlash(te);
+        this.sceneService.setLightningFlash(env * (0.6 + 0.4 * storm));
       }
     }
+    this.lightningBolt?.update(dt, env);
 
     // Fire the delayed thunder for the most recent strike.
     if (this.pendingThunder && this.elapsed >= this.pendingThunder.at) {
@@ -1201,6 +1210,14 @@ export class CloudService {
     const delay = 0.4 + dist * 5.5;                       // seconds after the flash
     const vol   = (0.35 + 0.65 * (1 - dist)) * Math.min(1, storm + 0.25);
     this.pendingThunder = { at: this.elapsed + delay, vol };
+
+    // Visible bolt: spawn a distant strike for most flashes (the rest stay pure sheet-flash, which reads as
+    // cloud-internal lightning). Random azimuth around the camera — per-client, no server sync.
+    const camera = this.sceneService.camera;
+    if (camera && this.lightningBolt && Math.random() < 0.7) {
+      const az = Math.random() * Math.PI * 2;
+      this.lightningBolt.strike(camera.position.x, camera.position.y, camera.position.z, az, dist, storm);
+    }
   }
 
   private ensureSfxCtx(): AudioContext {

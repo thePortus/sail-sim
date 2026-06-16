@@ -2,9 +2,9 @@
 
 # General or Current TODO Items
 
-* lightning? https://www.shadertoy.com/view/dsXfDn
+* magnifying glass on right click?
+* merchants aren't so hard to chase down... often seem like they are performing at max speed
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-* magnifying glass on space bar?
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit dead render pipeline
 * make pinace buoyance more responsive

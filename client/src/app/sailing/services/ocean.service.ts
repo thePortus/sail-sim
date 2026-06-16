@@ -1502,6 +1502,12 @@ export class OceanService {
 
   private reflectionRTT!: MirrorTexture;
   private refractionRTT!: RenderTargetTexture;   // seabed-only colour for true shallow-water transparency
+  // Adaptive reflection refresh: the mirror RTT renders on a cheap cadence (every 3rd frame) when the view is
+  // steady, but distant ISLANDS in it lag visibly while you SWING the camera (far content slides a lot in
+  // screen-space per degree). So we speed the RTT up purely as a function of camera ANGULAR speed — every
+  // frame on a fast swing, back to the cheap rate when still — paying the cost only while you'd notice the lag.
+  private _prevCamFwd = new Vector3(0, 0, 1);
+  private readonly REFL_BASE_RATE = 3;   // steady-view cadence (kept coprime with the refraction's 2)
   private terrainShadowMask: Texture | null = null;
   private terrainShadowCenter = new Vector2(0, 0);
   private terrainShadowSize = 1;
@@ -2014,6 +2020,17 @@ export class OceanService {
         this.oceanMeshFar.position.x = cx; this.oceanMeshFar.position.z = cz;
         this.oceanMatFar.setVector2('u_WorldOffset',    wOff);
         this.oceanMatFar.setVector3('u_cameraPosition', camV);
+
+        // Adaptive reflection refresh — driven by how fast the camera is rotating (distant islands in the
+        // mirror lag most on a swing). Crisp (every frame) on a fast swing, the cheap base rate when still.
+        if (this.reflectionRTT && this._reflectionsEnabled) {
+          const fwd = cam.getForwardRay().direction;
+          const dot = Math.max(-1, Math.min(1, fwd.x * this._prevCamFwd.x + fwd.y * this._prevCamFwd.y + fwd.z * this._prevCamFwd.z));
+          const angSpeed = Math.acos(dot) / Math.max(1e-3, dt);   // rad/s of view rotation
+          this._prevCamFwd.copyFrom(fwd);
+          const want = angSpeed > 0.9 ? 1 : (angSpeed > 0.25 ? 2 : this.REFL_BASE_RATE);
+          if (this.reflectionRTT.refreshRate !== want) this.reflectionRTT.refreshRate = want;
+        }
       }
 
       this.updateWakePath(dt);

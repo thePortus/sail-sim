@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* anchor needs rope that follows it
 * smoke always renders overe the ship
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * add admin right click on map brings up a teleport to option for those coordinates

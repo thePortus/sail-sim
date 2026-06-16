@@ -358,6 +358,19 @@ export class SceneService {
       // real CPU hit. Skip it. (Click/down still picks; cannon aim uses an explicit pickWithRay.)
       this.scene.skipPointerMovePicking = true;
 
+      // Preserve the depth buffer ACROSS rendering groups 1→3. The world is split across groups: terrain/
+      // ocean-far (0), ocean LODs (1), ocean-near + vessels (2), then all the above-water transparent FX —
+      // cannon smoke, the volumetric explosion + muzzle fireball billboards, rain, the water-shadow decal,
+      // the cloud dome — live in group 3. By default Babylon CLEARS depth+stencil at the start of every
+      // group >0, which would throw away the hull/terrain depth written in group 2 and make every group-3
+      // billboard draw ON TOP of the ship even when the hull is between it and the camera. Keeping depth
+      // means those FX correctly depth-test against the world. Ocean/vessel services also set groups 1+2,
+      // but group 3 was only being set as a side effect of the SPS rain init — which never runs on WebGPU
+      // (GPU rain path), so the shader smoke/explosion drew over the hull there. Set it unconditionally.
+      this.scene.setRenderingAutoClearDepthStencil(1, false);
+      this.scene.setRenderingAutoClearDepthStencil(2, false);
+      this.scene.setRenderingAutoClearDepthStencil(3, false);
+
       this.buildSky();             // Preetham SkyMaterial dome (kept as the WebGL fallback sky)
       this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
       this.buildLights();

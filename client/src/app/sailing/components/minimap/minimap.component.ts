@@ -410,13 +410,38 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       ctx.fill();
       ctx.stroke();
     };
-    const fleet = this.multiplayerService.allMerchants();
-    if (fleet.length) {
-      const s = this.expanded() ? 6 : 5;   // slightly smaller — there are many
-      for (const m of fleet) drawMerchant(wx(m.x), wz(m.z), s);
-    } else {
-      const nm = this.multiplayerService.nearestMerchant();
-      if (nm) drawMerchant(wx(nm.x), wz(nm.z), this.expanded() ? 7 : 6);
+    // Merchants are HIDDEN from regular players (only staff see the fleet). Everyone can still see a single
+    // ship they've heard a tavern rumour about — drawn as a gold pulsing diamond just below.
+    if (this.isAdmin) {
+      const fleet = this.multiplayerService.allMerchants();
+      if (fleet.length) {
+        const s = this.expanded() ? 6 : 5;   // slightly smaller — there are many
+        for (const m of fleet) drawMerchant(wx(m.x), wz(m.z), s);
+      } else {
+        const nm = this.multiplayerService.nearestMerchant();
+        if (nm) drawMerchant(wx(nm.x), wz(nm.z), this.expanded() ? 7 : 6);
+      }
+    }
+
+    // Tavern rumour target — a gold, pulsing diamond on the one merchant the player overheard about (looked
+    // up live in otherPlayers by id; the server keeps it streamed even past the normal interest cutoff).
+    const markId = this.multiplayerService.markedMerchantId();
+    if (markId) {
+      const tgt = others.find(p => p.id === markId);
+      if (tgt) {
+        const mxp = wx(tgt.x), mzp = wz(tgt.z);
+        const s = this.expanded() ? 7 : 6;
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
+        ctx.strokeStyle = `rgba(245,205,90,${0.4 + 0.5 * pulse})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(mxp, mzp, s + 4 + pulse * 4, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#ffd24a';
+        ctx.strokeStyle = 'rgba(60,40,0,0.85)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(mxp, mzp - s); ctx.lineTo(mxp + s, mzp); ctx.lineTo(mxp, mzp + s); ctx.lineTo(mxp - s, mzp);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
     }
 
     for (const p of others) {

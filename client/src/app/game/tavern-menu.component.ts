@@ -47,6 +47,12 @@ import { CombatService } from '../sailing/services/combat.service';
       }
       @if (mp.recruitError(); as err) { <div class="tv-err">{{ prettyError(err) }}</div> }
 
+      <div class="tv-rumour">
+        <button class="tv-listen" (click)="listen()">👂 Listen for rumours</button>
+        @if (mp.rumorText(); as line) { <div class="tv-rumour-line">“{{ line }}”</div> }
+        @if (mp.rumorError(); as err)  { <div class="tv-note tv-rumour-none">{{ prettyRumor(err) }}</div> }
+      </div>
+
       <button class="tv-close" (click)="onClose()">Leave</button>
     </div>
   `,
@@ -74,6 +80,12 @@ import { CombatService } from '../sailing/services/combat.service';
     .tv-free { background: linear-gradient(135deg, #6f8f5a, #4f6b3c); color: #f3f7e8; }
     .tv-hire:disabled { opacity: 0.32; cursor: not-allowed; }
     .tv-note { margin-top: 0.55rem; font-size: 0.76rem; color: #9fe0a0; }
+    .tv-rumour { margin-top: 0.9rem; padding-top: 0.8rem; border-top: 1px solid rgba(184,138,62,0.25); }
+    .tv-listen { width: 100%; padding: 0.5rem 0.7rem; border-radius: 8px; border: 1px solid #5a4a6e; cursor: pointer;
+                 background: linear-gradient(135deg, #4b3d63, #322a47); color: #e6dcf2; font-family: inherit; font-size: 0.92rem; }
+    .tv-listen:hover { background: linear-gradient(135deg, #574773, #3a3052); }
+    .tv-rumour-line { margin-top: 0.55rem; font-size: 0.85rem; font-style: italic; line-height: 1.4; color: #e8d9b6; }
+    .tv-rumour-none { color: #cdbb95; }
     .tv-err { margin-top: 0.6rem; padding: 0.4rem 0.6rem; border-radius: 6px; background: rgba(150,40,30,0.25); border: 1px solid rgba(190,80,60,0.5); color: #f0c0b0; font-size: 0.84rem; }
     .tv-close { margin-top: 0.9rem; width: 100%; padding: 0.55rem; border-radius: 8px; border: 1px solid #6e5326; background: #3a2817; color: #e8d3a0; font-family: inherit; font-size: 0.95rem; cursor: pointer; }
     .tv-close:hover { background: #4a3420; }
@@ -95,6 +107,7 @@ export class TavernMenuComponent {
   protected freeAvailable = computed(() => this.crew() < this.freeFloor());
 
   hire(): void { this.mp.recruitCrew(); }
+  listen(): void { this.mp.listenRumor(); }
 
   prettyError(reason: string): string {
     const map: Record<string, string> = {
@@ -105,5 +118,18 @@ export class TavernMenuComponent {
     return map[reason] ?? `Could not hire (${reason}).`;
   }
 
-  onClose(): void { this.mp.recruitError.set(null); this.close.emit(); }
+  prettyRumor(reason: string): string {
+    const map: Record<string, string> = {
+      not_docked: 'You must be docked at a port.',
+      no_rumours: 'No fresh gossip tonight — no treasure ships abroad nearby.',
+    };
+    return map[reason] ?? `No rumours (${reason}).`;
+  }
+
+  onClose(): void {
+    this.mp.recruitError.set(null);
+    this.mp.rumorError.set(null);
+    this.mp.rumorText.set(null);   // clear the flavour line; the map mark persists
+    this.close.emit();
+  }
 }

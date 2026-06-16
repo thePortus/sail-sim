@@ -138,6 +138,11 @@ export class MultiplayerService {
   nearestMerchant = signal<{ x: number; z: number } | null>(null);
   // Owners/Admins receive every merchant's position for the minimap (full-fleet view); empty for regular players.
   allMerchants = signal<{ x: number; z: number }[]>([]);
+  // Tavern "listen to rumours": the merchant id the player overheard about (marked on the map until it
+  // despawns or is replaced), the flavour line the tavern shows, and the last rejection reason.
+  markedMerchantId = signal<string | null>(null);
+  rumorText        = signal<string | null>(null);
+  rumorError       = signal<string | null>(null);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   /** Inter-faction relations matrix { [a]: { [b]: 'war'|'peace'|'alliance' } } — drives the Diplomacy panel. */
@@ -274,6 +279,13 @@ export class MultiplayerService {
   recruitCrew(): void {
     this.recruitError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'recruit_crew' }));
+  }
+
+  /** Tavern: ask after rumours. The server picks one of the three nearest merchants, names its run, and marks
+   *  it on the map (server-authoritative; must be docked). Reply arrives as rumor_result. */
+  listenRumor(): void {
+    this.rumorError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'listen_rumor' }));
   }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
@@ -625,6 +637,16 @@ export class MultiplayerService {
       // Tavern hire outcome — crew/gold already arrived via crew_state/wallet; here we just surface rejections.
       this.recruitError.set(msg.ok ? null : String(msg.reason ?? 'recruit failed'));
 
+    } else if (msg.type === 'rumor_result') {
+      // Tavern rumour: on success mark the named ship on the map + show the overheard line; else surface why.
+      if (msg.ok) {
+        this.markedMerchantId.set(String(msg.shipId));
+        this.rumorText.set(this.composeRumor(String(msg.slug ?? ''), msg.from ?? null, String(msg.to ?? '')));
+        this.rumorError.set(null);
+      } else {
+        this.rumorError.set(String(msg.reason ?? 'no_rumours'));
+      }
+
     } else if (msg.type === 'wallet') {
       // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).
       this.gold.set(+msg.gold || 0);
@@ -818,7 +840,19 @@ export class MultiplayerService {
     this.disposeEntry(entry);
     this.players.delete(id);
     this.remoteZones.delete(id);
+    // The rumour target sailed off / sank → drop its map mark (the gossip's gone cold).
+    if (this.markedMerchantId() === id) { this.markedMerchantId.set(null); this.rumorText.set(null); }
     this.publishSignal();
+  }
+
+  /** Build the overheard-rumour line from the server's structured reply (vessel + origin→destination). */
+  private composeRumor(slug: string, from: string | null, to: string): string {
+    const tellers = ['barkeep', 'grizzled sailor', 'serving girl', 'harbour drunk', 'one-eyed fisherman'];
+    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' };
+    const teller = tellers[Math.floor(Math.random() * tellers.length)];
+    const vessel = vessels[slug] ?? 'ship';
+    const route = from ? `sailing from ${from} to ${to}` : `bound for ${to}`;
+    return `You overhear a ${teller} speak of a ${vessel} laden with treasure, ${route}. She's been marked on your map.`;
   }
 
   /**

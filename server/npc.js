@@ -650,6 +650,12 @@ function broadcastInterest(players, nowMs) {
     near.sort((a, b) => a.d2 - b.d2);
     const visible = new Set();
     for (let i = 0; i < near.length && i < MAX_VISIBLE; i++) visible.add(near[i].n.id);
+    // Always render this player's tavern-rumour target (so its map marker + hull persist while they hunt it
+    // down, even past the normal nearest-N cutoff). Auto-clear the grudge once the ship has despawned/sunk.
+    if (p.rumorShipId) {
+      if (players.has(p.rumorShipId)) visible.add(p.rumorShipId);
+      else p.rumorShipId = null;
+    }
     if (!p._visNpcs) p._visNpcs = new Set();
     for (const id of visible) p.ws.send(msgFor(players.get(id)));               // RENDER updates for nearby merchants
     for (const id of p._visNpcs) if (!visible.has(id)) p.ws.send(JSON.stringify({ type: 'leave', id })); // dropped → despawn client-side

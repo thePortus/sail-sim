@@ -3,11 +3,12 @@
 # General or Current TODO Items
 
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-* reduced crew slows reload speed of cannons... NPCs will use bar shot too... 
+* Add lost server connection detection
+* reduced crew slows reload speed of cannons... NPCs will use bar shot too...
+* ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit landscape not loading (losing the landscape loading race)
 * make pinace buoyance more responsive
-* ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
 * check waves go right way for wind
 * why a dark patch around player ship? is it because of transparency to see hull?
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
@@ -39,14 +40,16 @@
 * tidal pull?
 * Bring DRACO compression in, remove any CDNs
 * Add /teleport playername x y and /teleportTo playername to admins
-* Add lost server connection detection
 * encrypt websocket server? wss instead of ws?
 * Optimization pass
 * Security pass
 
 # TODO Items by Module
-Great! Committed. Now...
 
-I want to hide all merchants on map (except for admins). Currently the default is to display the nearest one.
 
-Then when the player visits a tavern, in addition to being able to recruit, they will be able to "Listen to rumors" and hear a formula like "You overheard a X (bartender, sailor, server) talking about a Y (pinnace, sloop, brig, etc) laden with treasure, sailing from Z1 to Z2 (places)." (if we don't know the origin, just give the destination)... that ship should then become marked on the player's map. The ship should be one of the closest 3 ships in distance
+
+Now, I want to do some more optimization.... specifically, reduce draw cycles on the CPU. The remaining big drag are ships and towns.... to quote what you said
+
+Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
+
+I definitely want to do LOD imposters for both towns and ships... I have blender open with one of the town buildings, and I have shared the folders with the raw ship and town assets. Also if it is easy to do thin-instanced buildings and merged per town clutter... great too

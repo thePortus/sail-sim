@@ -1227,6 +1227,45 @@ function attachMultiplayer(server) {
           }
         }
 
+      } else if (msg.type === 'listen_rumor') {
+        // Tavern: overhear a rumour about a nearby treasure ship. Picks one of the THREE nearest merchants
+        // that has a known run, names its vessel + origin→destination towns, and MARKS it for the player so it
+        // shows on their map (merchants are otherwise hidden from non-staff). Must be docked at a port.
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, data) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'rumor_result', ok, ...(data || {}) }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, { reason: 'not_docked' }); }
+          else {
+            // Rumours only cover ships in the player's REGION (the map is 50 km across) — a tavern wouldn't
+            // know a ship on the far coast. Well beyond render range (3 km) so it still reveals an unseen ship.
+            const RUMOR_R2 = 14000 * 14000;
+            const px = me.authPose.x, pz = me.authPose.z;
+            const cand = [];
+            for (const [, p] of players) {
+              if (!p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
+              const destId = p.legTarget || (p.trip && p.trip.destTownId);   // where it's headed now
+              const destT = destId && economy.getTown(destId);
+              if (!destT) continue;                                          // need a destination to gossip about
+              const dx = p.state.x - px, dz = p.state.z - pz, d2 = dx * dx + dz * dz;
+              if (d2 > RUMOR_R2) continue;                                    // too far to be local gossip
+              cand.push({ p, destT, d2 });
+            }
+            if (!cand.length) { reply(false, { reason: 'no_rumours' }); }
+            else {
+              cand.sort((a, b) => a.d2 - b.d2);
+              const pool = cand.slice(0, 3);                                 // one of the three nearest
+              const sel = pool[Math.floor(Math.random() * pool.length)];
+              const np = sel.p;
+              // Origin is only "known" once the ship is laden (heading to its sell town); else it's a mystery.
+              const srcT = (np.phase === 'toDest' && np.trip) ? economy.getTown(np.trip.srcTownId) : null;
+              me.rumorShipId = np.id;                                        // force-included in this player's interest set
+              reply(true, { shipId: np.id, slug: np.state.vesselSlug, from: srcT ? srcT.name : null, to: sel.destT.name });
+            }
+          }
+        }
+
       } else if (msg.type === 'trade_open') {
         // Open a town's trader: send its (static) market quote + the player's wallet. Read-only.
         const me = players.get(id);

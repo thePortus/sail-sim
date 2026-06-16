@@ -192,6 +192,12 @@ export class VesselService {
   private readonly CAM_TRAUMA_DECAY = 0.6;    // SLOW decay → the shake rings for ~1 s (not a single flick)
   private readonly CAM_SHAKE_MAX    = 1.2;    // max camera position offset (m) at trauma = 1
   private readonly CAM_SHAKE_FREQ   = 12.6;   // rad/s ≈ 2 Hz → a visible back-and-forth, not a fast jitter
+  // 3rd-person amplifiers (a fixed metre offset is invisible 60 m out): distance-compensate the positional
+  // shake so it reads the same at any zoom, and add a higher-frequency ROTATIONAL view jolt — the part that
+  // makes it feel jarring rather than a gentle drift. (First-person is untouched — it sits ON the eye.)
+  private readonly SHAKE_DIST_REF   = 12;     // camDist (m) at which the positional shake is 1×
+  private readonly SHAKE_DIST_MAX   = 2;      // cap on the distance scale so a far zoom doesn't over-shake
+  private readonly CAM_SHAKE_ROT    = 0.02;   // view-jolt angle (rad, ~2.9°) at trauma = 1 — the jarring kick
 
   /** Add camera-shake trauma (0..1, clamped). Trauma decays in updateCamera. */
   addShakeTrauma(amount: number): void {
@@ -1442,17 +1448,18 @@ export class VesselService {
     // smaller, then settles. Phase resets on a fresh shake (addShakeTrauma). Computed here; ADDED to the
     // final camera position at the end of whichever branch runs below.
     this.camTrauma = Math.max(0, this.camTrauma - dt * this.CAM_TRAUMA_DECAY);
+    let shX = 0, shY = 0, shZ = 0;   // raw positional jitter (first-person magnitude)
     if (this.camTrauma > 1e-3) {
       this.shakeTime += dt;
       const st = this.shakeTime, amp = this.CAM_SHAKE_MAX * this.camTrauma;
-      this.camShakeOffset.set(
-        Math.sin(st * this.CAM_SHAKE_FREQ)              * amp,          // primary lateral swing (~2 Hz)
-        Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55,   // vertical, smaller, slightly detuned
-        Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50,   // fore-aft
-      );
-    } else {
-      this.camShakeOffset.setAll(0);
+      shX = Math.sin(st * this.CAM_SHAKE_FREQ)              * amp;          // primary lateral swing (~2 Hz)
+      shY = Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55;   // vertical, smaller, slightly detuned
+      shZ = Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50;   // fore-aft
     }
+    // First-person uses the raw offset (it sits ON the eye → already strong); the 3rd-person branch overwrites
+    // camShakeOffset with a distance-scaled version below. Always store the FINAL applied offset so next frame's
+    // strip removes exactly what was added.
+    this.camShakeOffset.set(shX, shY, shZ);
 
     // ── First-person ("on deck"): sit at the deck eye point looking forward; drag = free-look. ──
     if (this.firstPerson() && this.fpEye && this.root) {
@@ -1498,8 +1505,21 @@ export class VesselService {
       if (cam.position.y < minY) { cam.position.y = minY; }
     }
 
+    // Distance-compensate the positional shake so it reads at any zoom (a 1 m offset is invisible 60 m out).
+    const distScale = Math.min(this.SHAKE_DIST_MAX, Math.max(1, this.camDist / this.SHAKE_DIST_REF));
+    this.camShakeOffset.scaleInPlace(distScale);
     cam.position.addInPlace(this.camShakeOffset);
-    cam.setTarget(new Vector3(targetX, targetY, targetZ));
+
+    // Rotational VIEW JOLT — the jarring kick: snap the aim point by a small ANGLE (so the whole frame whips,
+    // not just slides). Offset ∝ camDist keeps the angle constant at any zoom; higher frequency than the
+    // positional swing reads as a violent rattle. Decays with trauma; no jolt once it's spent.
+    let tjx = 0, tjy = 0;
+    if (this.camTrauma > 1e-3) {
+      const ra = this.CAM_SHAKE_ROT * this.camTrauma * this.camDist, rt = this.shakeTime;
+      tjx = Math.sin(rt * this.CAM_SHAKE_FREQ * 1.8)       * ra;          // horizontal whip (fast)
+      tjy = Math.sin(rt * this.CAM_SHAKE_FREQ * 2.1 + 1.7) * ra * 0.7;    // vertical, detuned
+    }
+    cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
   }
 
   private setupCameraInput(): void {

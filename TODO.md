@@ -2,8 +2,8 @@
 
 # General or Current TODO Items
 
-* boat shakes, but not camera on cannon fire
 * occasionally forgets that user set music off (music defaults to off?)
+* bloom lighting?
 * NPC ship characteristics should match player vessels in all ways... speed, turning, etc. (except that merchants may never hit top speed, since we limited that earlier)
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind

@@ -2070,6 +2070,13 @@ export class VesselService {
     return { x: this.x, z: this.z };
   }
 
+  /** Current hull's longest half-extent (m). Used by the dock-range check: docking distance is measured
+   *  from the ship CENTRE, so a long hull (brig 12 m vs pinnace 4 m) must be allowed to dock from farther
+   *  out — its bow/stern can be alongside the pier while the centre is still well off it. */
+  getHullReach(): number {
+    return Math.max(this.rig.hullHalfLen, this.rig.hullHalfBeam);
+  }
+
   dispose(): void {
     window.removeEventListener('keydown', this.keyHandler);
     window.removeEventListener('keyup',   this.keyUpHandler);

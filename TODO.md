@@ -2,10 +2,8 @@
 
 # General or Current TODO Items
 
-* smoke always renders overe the ship
+* lightning? https://www.shadertoy.com/view/dsXfDn
 * lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-* add admin right click on map brings up a teleport to option for those coordinates
-* distance to dock should be based on size of ship
 * magnifying glass on space bar?
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit dead render pipeline

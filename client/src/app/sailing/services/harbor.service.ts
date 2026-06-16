@@ -133,7 +133,10 @@ export class HarborService {
     // (shore → seaward end), minus the deck half-width.
     const dim = this.PIER_DIMS[best.variant] ?? this.PIER_DIMS['straight'];
     const segD = this.distToSegment(p.x, p.z, best.x, best.z, best.x + fx * dim.len, best.z + fz * dim.len);
-    const inRange = Math.max(0, segD - dim.halfWidth) <= this.DOCK_EDGE_M;
+    // segD is measured from the ship CENTRE, so scale the allowance by the hull's reach: a big ship
+    // (brig half-len 12 m) docks from much farther out than a pinnace (4 m), since its hull edge is
+    // alongside the pier while its centre is still a full hull-length off it.
+    const inRange = Math.max(0, segD - dim.halfWidth) <= this.DOCK_EDGE_M + this.vesselService.getHullReach();
 
     const cur = this.dockable();
     if (inRange) { if (!cur || cur.id !== best.id) this.dockable.set(best); }

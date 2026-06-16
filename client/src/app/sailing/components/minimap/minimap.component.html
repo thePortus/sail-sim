@@ -8,8 +8,20 @@
           (mousedown)="onMouseDown($event)"
           (mousemove)="onPointerMove($event)"
           (mouseleave)="onPointerLeave()"
+          (contextmenu)="onContextMenu($event)"
     class="minimap-canvas">
   </canvas>
+
+  <!-- Admin-only right-click teleport menu (positioned at the clicked point within the wrapper) -->
+  @if (teleportMenu(); as tm) {
+    <button class="minimap-teleport-btn"
+            [style.left.px]="tm.px"
+            [style.top.px]="tm.py"
+            (click)="$event.stopPropagation(); confirmTeleport()">
+      ⚓ Teleport here
+      <span class="minimap-teleport-coords">{{ tm.x | number:'1.0-0' }}, {{ tm.z | number:'1.0-0' }}</span>
+    </button>
+  }
 
   <!-- Expand/collapse hint -->
   <div class="minimap-hint">

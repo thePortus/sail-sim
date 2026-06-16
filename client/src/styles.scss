@@ -424,6 +424,32 @@ kbd {
   pointer-events: none;
 }
 
+.minimap-teleport-btn {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  background: rgba(8, 16, 28, 0.96);
+  border: 1px solid rgba(120, 170, 210, 0.5);
+  border-radius: 5px;
+  color: #cfe0f0;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  transition: background 0.12s, border-color 0.12s;
+
+  &:hover { background: rgba(22, 40, 64, 0.98); border-color: rgba(150, 200, 240, 0.8); }
+}
+
+.minimap-teleport-coords {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 9px;
+}
+
 // ── Chat panel ────────────────────────────────────────────────────────────────
 
 app-chat {

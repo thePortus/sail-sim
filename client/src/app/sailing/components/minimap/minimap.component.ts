@@ -7,6 +7,8 @@ import { TerrainService } from '../../services/terrain.service';
 import { VesselService } from '../../services/vessel.service';
 import { MultiplayerService } from '../../services/multiplayer.service';
 import { SceneService } from '../../services/scene.service';
+import { AdminService } from '../../services/admin.service';
+import { AuthService } from '../../../services/auth.service';
 import { MinimapBakeCompute } from '../../services/terrain/minimap-bake-compute';
 import { factionColor, factionName } from '../../faction.config';
 import type { WebGPUEngine } from '@babylonjs/core';
@@ -25,9 +27,61 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private multiplayerService = inject(MultiplayerService);
   private sceneService       = inject(SceneService);
+  private adminService       = inject(AdminService);
+  private authService        = inject(AuthService);
   private zone               = inject(NgZone);
 
   expanded = signal(false);
+
+  // Admin-only right-click "Teleport here". isAdmin is read once from the cached userData (same gate the
+  // chat/admin-panel use); the server re-verifies the role on POST /admin/teleport, so this only governs UI.
+  isAdmin = false;
+  /** Open context-menu state: pixel offset within the wrapper for placement + the target world coords. */
+  teleportMenu = signal<{ px: number; py: number; x: number; z: number } | null>(null);
+
+  constructor() {
+    try {
+      const raw = this.authService.getUserDetails();
+      if (raw) {
+        const role = (JSON.parse(raw)?.role ?? '').toLowerCase();
+        this.isAdmin = role === 'admin' || role === 'owner';
+      }
+    } catch { /* malformed userData — stay non-admin */ }
+  }
+
+  /** Right-click on the map → (admins only) pop a "Teleport here" menu at the clicked world point. Always
+   *  suppresses the browser context menu over the canvas; does nothing else for non-admins. */
+  onContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+    if (!this.isAdmin) { return; }
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) { return; }
+    const r = canvas.getBoundingClientRect();
+    const cxp = (e.clientX - r.left) * (canvas.width / r.width);
+    const cyp = (e.clientY - r.top)  * (canvas.height / r.height);
+    const w = this.canvasToWorld(cxp, cyp);
+    // Place the menu relative to the wrapper (the canvas's parent), clamped to stay inside it (the wrapper
+    // clips overflow), leaving room for the ~150×34 px popup.
+    const wrap = canvas.parentElement as HTMLElement | null;
+    const wr = (wrap ?? canvas).getBoundingClientRect();
+    const px = Math.min(Math.max(0, e.clientX - wr.left), Math.max(0, wr.width  - 152));
+    const py = Math.min(Math.max(0, e.clientY - wr.top),  Math.max(0, wr.height - 36));
+    this.teleportMenu.set({ px, py, x: w.x, z: w.z });
+  }
+
+  /** Confirm the teleport: server authorises (admin role), then snap the local vessel. Mirrors the admin
+   *  panel's flow so other players see the move via the server broadcast. */
+  confirmTeleport(): void {
+    const m = this.teleportMenu();
+    if (!m) { return; }
+    this.teleportMenu.set(null);
+    this.adminService.teleport(m.x, m.z).subscribe({
+      next: () => this.vesselService.teleportTo(m.x, m.z),
+      error: (err) => console.warn('[Minimap] teleport rejected:', err?.status),
+    });
+  }
+
+  closeTeleportMenu(): void { this.teleportMenu.set(null); }
 
   // Zoom + pan for the EXPANDED map. zoom 1 = whole world (the original view); higher = zoomed in on a
   // sub-region centred on (viewCX, viewCZ) in world coords. Wheel zooms toward the cursor. Plain fields
@@ -115,6 +169,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
    *  mousedown, so checking it directly (vs a persisted flag) can't get stuck if a drag ends off-canvas. */
   onMapClick(): void {
     if (this.dragMoved) { return; }
+    if (this.teleportMenu()) { this.closeTeleportMenu(); return; }   // click-away dismisses the teleport menu
     this.toggleExpand();
   }
 

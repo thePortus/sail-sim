@@ -2,12 +2,17 @@
 
 # General or Current TODO Items
 
-* thoughts on making aiming easier? come up with a plan
-* add occasional bosun whistle (no more than once a day)
+* merchants still go into land during combat
+* don't render other ship's crews... expensive
+* add occasional bosun whistle (raise/lower anchor... and when first adding sail after leaving port (or first time since logging in))\
+* I want to make NPC merchant labels and player names more visible at distance... just imroving "size" won't help... since ships are often far off... we need a way to make labels (esp of players) more readable at a distance
+* I also want to make the dot indicating towns on maps more visible.. they are hard to see
+* have way to earn back faction reputation... increased rep from attacking enemies and enemies of allies... but also paying off at "Governor's Mansion"... new menu item at town selection screen
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit landscape not loading (losing the landscape loading race)
 * make pinace buoyance more responsive
+* make salvage crate asset
 * check waves go right way for wind
 * why a dark patch around player ship? is it because of transparency to see hull?
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story

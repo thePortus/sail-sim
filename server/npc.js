@@ -616,6 +616,13 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       npc.engaged = true;
       npc.fleeing = (stance === 'flee');
       desired = npc.fleeing ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
+      if (npc.fleeing) {
+        // Imperfect helmsman under pressure: a slowly-drifting heading error around the optimal escape line.
+        // Any deviation from the best VMG-away heading costs speed-made-good, so a well-sailed chaser on a
+        // clean line gradually closes — a CATCH-UP lever, not a stat nerf (their hull/sails are unchanged).
+        npc.fleeWander = (npc.fleeWander || 0) * 0.96 + (Math.random() - 0.5) * 7;   // smoothed ±~ several °
+        desired = (desired + npc.fleeWander + 360) % 360;
+      }
     } else {
       npc.engaged = false; npc.fleeing = false;   // no threat (or watching from afar) → sail the trade route
       if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }

@@ -357,7 +357,9 @@ export class VesselService {
   // The HUD displays physics speed (realistic knots), but world position advances
   // at TRAVEL_SCALE × that rate — a classic video-game map-compression trick.
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
-  private readonly TRAVEL_SCALE = 5.0;
+  // MUST match the server (combat-constants.js TRAVEL_SCALE, which movement-constants imports) or the server's
+  // movement validation snaps the local ship back (rubber-banding). Currently 3.
+  private readonly TRAVEL_SCALE = 3.0;
 
   // ── Hull collision ──────────────────────────────────────────────────────────
   // The aground check used to test only the boat's CENTRE point, so the long bow

@@ -139,6 +139,22 @@ export class CannonService {
   readonly gunElevDeg = signal(this.ELEV_HULL);
   readonly targetMode = signal<'hull' | 'mast'>('hull');
 
+  // ── Soft gunnery lock (aim assist) ──────────────────────────────────────────
+  // A broadside soft-locks the nearest enemy roughly abeam (within LOCK_ARC of the beam) and solves the
+  // LEADING, range-correct shot to it — but the horizontal correction is clamped to AIM_CONE, so you must
+  // still bring the broadside generally to bear (an assist, not auto-aim). gunElevDeg picks the aim HEIGHT on
+  // the target (waterline ↔ masthead), so Shift/Ctrl still choose hull vs rigging. Round/bar only (grape stays
+  // a fixed canister spread). lockTarget drives the HUD reticle. The server adjudicates the solved shot like
+  // any other (it keeps muzzle speed, so it passes validateShot).
+  private readonly LOCK_ARC_DEG   = 42;    // target must be within this of the beam to lock on
+  private readonly AIM_CONE_DEG   = 52;    // max horizontal correction off the raw beam (keeps positioning relevant)
+  private readonly LOCK_MAX_RANGE = 320;   // only lock within effective round-shot reach
+  private readonly AIM_LOW_Y      = 0.6;   // gunElevDeg = ELEV_HULL → aim at the waterline
+  private readonly AIM_HIGH_Y     = 14;    // gunElevDeg = ELEV_MAST → aim at the masthead
+  private readonly TRAVEL_SCALE   = 3;     // world velocity = speed × this (mirror combat-constants)
+  /** The enemy a broadside is currently solving onto (for the HUD reticle); null when no side has a lock. */
+  readonly lockTarget = signal<{ id: string; x: number; z: number } | null>(null);
+
   // ── Ammunition ──────────────────────────────────────────────────────────────
   // 'round' = solid shot (full range, anti-hull). 'bar' = bar shot (~45% range, anti-mast / anti-rigging).
   // 'grape' = canister (~22% range, anti-CREW — a fanned pellet spread, no hull damage).
@@ -191,8 +207,12 @@ export class CannonService {
 
   // Aiming aid: a translucent red trajectory tube per side, shown only while that side's
   // guns are run out and ready to fire (not stowed, arming, firing or reloading).
-  private aimMat: StandardMaterial | null = null;
+  private aimMat: StandardMaterial | null = null;       // free-aim arc (red)
+  private aimMatLock: StandardMaterial | null = null;   // locked solution arc (green)
   private readonly aimTube: Record<'port' | 'stbd', Mesh | null> = { port: null, stbd: null };
+  // Lock reticle: a camera-facing corner-bracket billboard parked on the soft-locked enemy (built lazily).
+  private reticle: Mesh | null = null;
+  private readonly RETICLE_Y = 3.5;   // sit it on the hull/low rig of the locked ship
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
@@ -380,6 +400,9 @@ export class CannonService {
     this.aimTube.port?.dispose();
     this.aimTube.stbd?.dispose();
     this.aimMat?.dispose();
+    this.aimMatLock?.dispose();
+    this.reticle?.dispose(false, true);   // also frees its DynamicTexture + material
+    this.reticle = null;
 
     for (const b of this.balls) b.mesh.dispose();
     this.flashPort?.dispose();
@@ -932,45 +955,121 @@ export class CannonService {
 
   // ── Aiming aid (predicted trajectory) ───────────────────────────────────────
 
-  /** Show/update a translucent red arc for each side that's run out and ready; hide otherwise. */
+  /** Show/update the predicted arc per run-out side: GREEN, ending AT the target, when a lock has a firing
+   *  solution; RED splashing into the sea on free aim. Hidden otherwise. */
   private updateAimArcs(): void {
+    let lock: { id: string; x: number; z: number } | null = null;   // for the HUD reticle (locked ship)
     for (const side of ['port', 'stbd'] as const) {
       const ready = this.gun[side].state === 'ready';
       if (!ready) { this.aimTube[side]?.setEnabled(false); continue; }
 
-      const path = this.buildArcPath(side);
+      // Solve the lock ONCE (round/bar) — reused for the arc shape, its colour, and the reticle.
+      let sol: ReturnType<CannonService['solveLock']> = null;
+      if (this.shotType() !== 'grape') {
+        const vs = this.vesselService.state();
+        const hRad = vs.heading * Math.PI / 180, sinH = Math.sin(hRad), cosH = Math.cos(hRad);
+        const beamX = side === 'port' ? -cosH : cosH, beamZ = side === 'port' ? sinH : -sinH;
+        sol = this.solveLock(side, vs, beamX, beamZ, this.muzzleV(), this.muzzles[side][0].y);
+        if (sol && !lock) lock = { id: sol.lockId, x: sol.cx, z: sol.cz };   // park the reticle ON the locked ship
+      }
+
+      const path = this.buildArcPath(side, sol);
+      const mat  = this.aimMaterial(!!sol);   // locked → green solution arc; free → red
       const prev = this.aimTube[side];
       if (prev) {
         // Reuse the geometry — same sample count, so update in place (cheap).
-        this.aimTube[side] = MeshBuilder.CreateTube('aim_' + side, { path, instance: prev }, this.scene);
-        prev.setEnabled(true);
+        const tube = MeshBuilder.CreateTube('aim_' + side, { path, instance: prev }, this.scene);
+        tube.material = mat;                  // recolour by lock state each frame
+        tube.setEnabled(true);
+        this.aimTube[side] = tube;
       } else {
         const tube = MeshBuilder.CreateTube('aim_' + side, {
           path, radius: AIM_RADIUS, tessellation: 8, cap: Mesh.NO_CAP, updatable: true,
         }, this.scene);
-        tube.material         = this.aimMaterial();
+        tube.material         = mat;
         tube.isPickable       = false;
         tube.renderingGroupId = 3;        // draw over the water like the cannon FX
         tube.alphaIndex       = 0;        // behind the smoke/flame within the group
         this.aimTube[side]    = tube;
       }
     }
+    // World-space reticle on the locked ship (camera-facing); gentle pulse so it reads as a live lock.
+    const ret = this.reticleMesh();
+    if (lock) {
+      ret.position.set(lock.x, this.RETICLE_Y, lock.z);
+      ret.scaling.setAll(1 + 0.08 * Math.sin(this.elapsed * 6));
+      if (!ret.isEnabled()) ret.setEnabled(true);
+    } else if (ret.isEnabled()) {
+      ret.setEnabled(false);
+    }
+    // Publish the lock id for any Angular HUD binding (throttled to id changes; the mesh handles per-frame motion).
+    if ((this.lockTarget()?.id ?? null) !== (lock?.id ?? null)) {
+      this.zone.run(() => this.lockTarget.set(lock));
+    }
   }
 
-  /** Sample the cannonball trajectory this side would fly right now (ship pose + elevation). */
-  private buildArcPath(side: 'port' | 'stbd'): Vector3[] {
+  /**
+   * Soft aim-assist: find the enemy roughly abeam on `side` (within LOCK_ARC of the beam, in range) and solve
+   * the LEADING low-arc shot to it — aiming at a HEIGHT on the target chosen by gunElevDeg (waterline↔mast).
+   * The azimuth correction is CLAMPED to AIM_CONE of the raw beam, so it only refines a generally-good aim
+   * (you still have to bring the broadside to bear). Returns the launch direction + h/v speed split, or null
+   * when there's no valid lock — in which case the caller fires straight out the beam at the manual elevation.
+   * ox/oz = ship centre (so every gun + the preview share one solution); muzzleY = representative gun height.
+   */
+  private solveLock(side: 'port' | 'stbd', vs: { x: number; z: number; heading: number },
+                    beamX: number, beamZ: number, mv: number, muzzleY: number):
+                    { dirX: number; dirZ: number; vh: number; vy0: number; lockId: string; px: number; pz: number; cx: number; cz: number } | null {
+    const enemies = this.multiplayerService.otherPlayers();
+    if (!enemies.length) return null;
+    const beamAng = Math.atan2(beamX, beamZ);
+    const norm = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));   // → [-π, π]
+
+    // Acquire: the enemy whose bearing is closest to the beam, within the arc + range.
+    let best: { id: string; x: number; z: number; heading: number; speed: number } | null = null;
+    let bestOff = this.LOCK_ARC_DEG * Math.PI / 180;
+    for (const e of enemies) {
+      const dx = e.x - vs.x, dz = e.z - vs.z, dist = Math.hypot(dx, dz);
+      if (dist < 2 || dist > this.LOCK_MAX_RANGE) continue;
+      const off = Math.abs(norm(Math.atan2(dx, dz) - beamAng));
+      if (off < bestOff) { bestOff = off; best = e as never; }
+    }
+    if (!best) return null;
+
+    // Aim HEIGHT on the target from the manual elevation control (Shift/Ctrl, Hull/Mast presets).
+    const tf   = Math.max(0, Math.min(1, (this.gunElevDeg() - this.ELEV_HULL) / (this.ELEV_MAST - this.ELEV_HULL)));
+    const aimY = this.AIM_LOW_Y + (this.AIM_HIGH_Y - this.AIM_LOW_Y) * tf;
+    // Target world velocity (same dead-reckoning the server adjudicator uses).
+    const tvx = Math.sin(best.heading * Math.PI / 180) * best.speed * this.TRAVEL_SCALE;
+    const tvz = Math.cos(best.heading * Math.PI / 180) * best.speed * this.TRAVEL_SCALE;
+    const v = mv, v2 = v * v, dY = aimY - muzzleY, ox = vs.x, oz = vs.z;
+    // Iterate lead → range → flight-time → re-lead, then solve the low (direct-fire) launch elevation.
+    let tof = Math.hypot(best.x - ox, best.z - oz) / (v * 0.97), theta = 0, px = best.x, pz = best.z, R = 0;
+    for (let k = 0; k < 3; k++) {
+      px = best.x + tvx * tof; pz = best.z + tvz * tof;
+      R = Math.hypot(px - ox, pz - oz);
+      const disc = v2 * v2 - G * (G * R * R + 2 * dY * v2);
+      if (disc < 0) return null;                                  // out of ballistic reach
+      theta = Math.atan2(v2 - Math.sqrt(disc), G * R);            // low arc
+      tof = R / (v * Math.cos(theta));
+    }
+    // Azimuth toward the lead point, CLAMPED to the cone around the beam (positioning still matters).
+    const cone = this.AIM_CONE_DEG * Math.PI / 180;
+    const az   = beamAng + Math.max(-cone, Math.min(cone, norm(Math.atan2(px - ox, pz - oz) - beamAng)));
+    return { dirX: Math.sin(az), dirZ: Math.cos(az), vh: v * Math.cos(theta), vy0: v * Math.sin(theta), lockId: best.id, px, pz, cx: best.x, cz: best.z };
+  }
+
+  /** Sample the predicted arc this side would fly. With a lock `sol` (round/bar) it traces the SOLVED leading
+   *  shot and STOPS at the target intercept (so the arc visually lands on the locked ship); free aim splashes
+   *  down at the waterline. `sol` is solved once by updateAimArcs and passed in (no double-solve). */
+  private buildArcPath(side: 'port' | 'stbd', sol: ReturnType<CannonService['solveLock']>): Vector3[] {
     const vs   = this.vesselService.state();
     const hRad = vs.heading * Math.PI / 180;
     const sinH = Math.sin(hRad), cosH = Math.cos(hRad);
 
-    // Mirror fireOneCannon exactly so the preview matches the real shot.
-    const dirX    = side === 'port' ? -cosH :  cosH;
-    const dirZ    = side === 'port' ?  sinH : -sinH;
+    const beamX   = side === 'port' ? -cosH :  cosH;
+    const beamZ   = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
     const mv      = this.muzzleV();
-    const vh      = mv * Math.cos(elevRad);
-    const vy0     = mv * Math.sin(elevRad);
-    const bvx     = dirX * vh, bvz = dirZ * vh;
 
     const m = this.muzzles[side];
     const muz = m[Math.floor(m.length / 2)] ?? m[0];   // centre gun, representative
@@ -978,10 +1077,20 @@ export class CannonService {
     const oy  = muz.y;
     const oz  = vs.z - muz.x * sinH + muz.z * cosH;
 
-    // Solve oy + vy0·t − ½·g·t² = waterline for the splash-down time.
-    const a = 0.5 * G, b = -vy0, c = AIM_WATER_Y - oy;
-    const disc = b * b - 4 * a * c;
-    let tEnd = disc > 0 ? (-b + Math.sqrt(disc)) / (2 * a) : 2.0;
+    const vh  = sol ? sol.vh  : mv * Math.cos(elevRad);
+    const vy0 = sol ? sol.vy0 : mv * Math.sin(elevRad);
+    const bvx = (sol ? sol.dirX : beamX) * vh, bvz = (sol ? sol.dirZ : beamZ) * vh;
+
+    let tEnd: number;
+    if (sol) {
+      // Locked: stop at the intercept — time to fly the horizontal range to the lead point (vh = horiz speed).
+      tEnd = Math.hypot(sol.px - ox, sol.pz - oz) / Math.max(1, vh);
+    } else {
+      // Free aim: solve oy + vy0·t − ½·g·t² = waterline for the splash-down time.
+      const a = 0.5 * G, b = -vy0, c = AIM_WATER_Y - oy;
+      const disc = b * b - 4 * a * c;
+      tEnd = disc > 0 ? (-b + Math.sqrt(disc)) / (2 * a) : 2.0;
+    }
     tEnd = Math.max(0.3, Math.min(tEnd, 6.0));
 
     const path: Vector3[] = [];
@@ -992,18 +1101,65 @@ export class CannonService {
     return path;
   }
 
-  /** Shared mostly-transparent red, self-lit so it reads at any time of day. */
-  private aimMaterial(): StandardMaterial {
-    if (this.aimMat) return this.aimMat;
-    const m = new StandardMaterial('aimMat', this.scene);
-    m.emissiveColor   = new Color3(0.95, 0.12, 0.10);
+  /** Self-lit translucent arc material. LOCKED = a confident GREEN solution arc (you have a firing solution);
+   *  FREE = the old RED guess. Two cached materials so each side colours independently. */
+  private aimMaterial(locked: boolean): StandardMaterial {
+    if (locked) {
+      if (!this.aimMatLock) this.aimMatLock = this.makeAimMat('aimMatLock', new Color3(0.24, 0.95, 0.40), 0.40);
+      return this.aimMatLock;
+    }
+    if (!this.aimMat) this.aimMat = this.makeAimMat('aimMatFree', new Color3(0.95, 0.30, 0.12), 0.24);
+    return this.aimMat;
+  }
+
+  private makeAimMat(name: string, color: Color3, alpha: number): StandardMaterial {
+    const m = new StandardMaterial(name, this.scene);
+    m.emissiveColor   = color;
     m.diffuseColor    = new Color3(0, 0, 0);
     m.specularColor   = new Color3(0, 0, 0);
     m.disableLighting = true;
-    m.alpha           = 0.26;
+    m.alpha           = alpha;
     m.backFaceCulling = false;
-    this.aimMat = m;
     return m;
+  }
+
+  /** Lazily build the lock-reticle billboard: four amber corner-brackets on a transparent quad, camera-facing,
+   *  drawn over the water. Parked on the soft-locked enemy by updateAimArcs; hidden when there's no lock. */
+  private reticleMesh(): Mesh {
+    if (this.reticle) return this.reticle;
+    const S = 128;
+    const tex = new DynamicTexture('lockReticleTex', { width: S, height: S }, this.scene, true);
+    const ctx = tex.getContext() as unknown as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, S, S);
+    ctx.strokeStyle = 'rgba(255, 90, 60, 0.98)';
+    ctx.lineWidth = 8;
+    ctx.lineCap = 'round';
+    const m = 16, len = 34;
+    for (const [x, y, sx, sy] of [[m, m, 1, 1], [S - m, m, -1, 1], [m, S - m, 1, -1], [S - m, S - m, -1, -1]] as const) {
+      ctx.beginPath();
+      ctx.moveTo(x, y + sy * len); ctx.lineTo(x, y); ctx.lineTo(x + sx * len, y);
+      ctx.stroke();
+    }
+    tex.update();
+    tex.hasAlpha = true;
+
+    const mat = new StandardMaterial('lockReticleMat', this.scene);
+    mat.emissiveTexture            = tex;   // brackets glow their own colour
+    mat.diffuseTexture             = tex;
+    mat.useAlphaFromDiffuseTexture = true;
+    mat.diffuseColor               = new Color3(0, 0, 0);
+    mat.specularColor              = new Color3(0, 0, 0);
+    mat.disableLighting            = true;
+    mat.backFaceCulling            = false;
+
+    const plane = MeshBuilder.CreatePlane('lockReticle', { size: 8 }, this.scene);
+    plane.material         = mat;
+    plane.billboardMode    = Mesh.BILLBOARDMODE_ALL;
+    plane.renderingGroupId = 3;        // over the water, with the cannon FX
+    plane.isPickable       = false;
+    plane.setEnabled(false);
+    this.reticle = plane;
+    return plane;
   }
 
   // ── Main tick ─────────────────────────────────────────────────────────────
@@ -1155,7 +1311,7 @@ export class CannonService {
 
     // Beam direction (perpendicular to the hull): port out −X, starboard out +X. Each vessel's def
     // places its muzzles on the matching side, so the ball always leaves out its own rail.
-    const dirX = side === 'port' ? -cosH :  cosH;
+    const dirX = side === 'port' ? -cosH :  cosH;   // raw beam (muzzle FX + grape spread fire out the rail)
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
     const mv   = this.muzzleV();
@@ -1168,21 +1324,28 @@ export class CannonService {
 
     const kind  = this.shotType();
     const myId  = this.multiplayerService.getMyId() ?? 'local';
+    // Soft aim-assist (round/bar only): a lock leads + ranges the shot onto an enemy roughly abeam. Computed
+    // from the ship centre so every gun in the broadside shares one solution (parallel converging shots).
+    const sol = kind !== 'grape' ? this.solveLock(side, vs, dirX, dirZ, mv, muz.y) : null;
     // Round/bar = one shot out the beam. Grape = a fan of GRAPE_PELLETS, each its own server-adjudicated shot
     // with scattered azimuth + elevation (a true canister spread). Magnitude stays `mv`, so each pellet sits in
     // the server's grape speed band.
     const pellets = kind === 'grape' ? GRAPE_PELLETS : 1;
     for (let k = 0; k < pellets; k++) {
-      let ddx = dirX, ddz = dirZ, el = elevRad;
+      let bvx: number, vyk: number, bvz: number;
       if (kind === 'grape') {
         const az = (Math.random() * 2 - 1) * GRAPE_SPREAD_RAD;   // rotate the beam in the horizontal plane
         const ca = Math.cos(az), sa = Math.sin(az);
-        ddx = dirX * ca - dirZ * sa;
-        ddz = dirX * sa + dirZ * ca;
-        el  = elevRad + (Math.random() * 2 - 1) * GRAPE_ELEV_RAD;
+        const ddx = dirX * ca - dirZ * sa, ddz = dirX * sa + dirZ * ca;
+        const el  = elevRad + (Math.random() * 2 - 1) * GRAPE_ELEV_RAD;
+        const vh  = mv * Math.cos(el); vyk = mv * Math.sin(el);
+        bvx = ddx * vh; bvz = ddz * vh;
+      } else if (sol) {
+        bvx = sol.dirX * sol.vh; vyk = sol.vy0; bvz = sol.dirZ * sol.vh;   // leading, range-correct solution
+      } else {
+        const vh = mv * Math.cos(elevRad); vyk = mv * Math.sin(elevRad);
+        bvx = dirX * vh; bvz = dirZ * vh;                                  // straight out the beam (no lock)
       }
-      const vh = mv * Math.cos(el), vyk = mv * Math.sin(el);
-      const bvx = ddx * vh, bvz = ddz * vh;
       const seq = ++this.shotSeq;
       this.launchBall(mwx, mwy, mwz, bvx, vyk, bvz, myId, seq, kind);
       this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vyk, bvz, seq, kind);

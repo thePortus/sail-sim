@@ -233,7 +233,7 @@ export class MultiplayerService {
   private readonly RECONCILE = 0.25;
   // Must match the server world-distance multiplier (vessel.service TRAVEL_SCALE) so
   // dead-reckoning projects forward at the same rate positions actually move.
-  private readonly TRAVEL_SCALE = 5.0;
+  private readonly TRAVEL_SCALE = 3.0;
 
   private recoilTickFn: (() => void) | null = null;
 

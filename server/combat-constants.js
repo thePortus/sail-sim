@@ -13,7 +13,7 @@
  */
 
 const G            = 9.81;   // cannonball gravity (world units/s^2) — matches client cannon
-const TRAVEL_SCALE = 5.0;    // ship world-velocity = speed * TRAVEL_SCALE along heading
+const TRAVEL_SCALE = 3.0;    // ship world-velocity = speed * TRAVEL_SCALE along heading
 
 // ── Hull zone geometry (oriented box in vessel-local space) ───────────────────
 const HALF_LEN  = 9.0;    // fore-aft half-length (|lon| <= HALF_LEN)

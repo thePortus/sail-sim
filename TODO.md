@@ -2,8 +2,8 @@
 
 # General or Current TODO Items
 
-* NPC ship characteristics should match player vessels in all ways... speed, turning, etc. (except that merchants may never hit top speed, since we limited that earlier)
-* thoughts on making aiming easier?
+* thoughts on making aiming easier? come up with a plan
+* add occasional bosun whistle (no more than once a day)
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * revisit landscape not loading (losing the landscape loading race)
@@ -13,7 +13,6 @@
 * intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
-* add occasional bosun whistle (no more than once a day)
 * more realistic bird flight paths... momentum starting and stopping... speed of flapping wings relative to flight speed
 * Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors

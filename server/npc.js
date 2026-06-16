@@ -22,7 +22,9 @@ const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
 
 const DEG = Math.PI / 180;
-const MERCHANT_SLUGS = ['sloop', 'pinnace'];
+// Weighted merchant vessel pool: sloops + pinnaces are the common traders; the occasional brigantine (a fat,
+// well-armed prize) shows up at ~1-in-5. Duplicates set the odds via the uniform pick().
+const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
   'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne'];
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
@@ -220,6 +222,21 @@ function vesselTurnRate(speed, maxSpeed) {
   const rate = 155 * sf / (1 + (sf / p) * (sf / p));
   return Math.max(4, Math.min(30, rate));
 }
+
+// ── v2 force-model constants — MIRROR client vessel.service.physicsStep EXACTLY so an NPC sails like a
+// same-class player (apparent wind + thrust-vs-quadratic-drag + mass momentum). Keep in sync if the client
+// retunes. (Sea drag + the wave surf-nudge are omitted: the server has no per-NPC sea state — a minor
+// difference only in rough/head seas.) ──
+const SAIL_FORCE_K  = 0.26;   // default drive scale (brig overrides below)
+const DRAG_K        = 1.0;    // quadratic hull drag — sets where drive=drag (top speed)
+const FORCE_RESPONSE = 0.04;  // accel gain (with mass → momentum / time constant)
+const WEIGHT_REF    = 2800;   // sloop weight → massK = weight / WEIGHT_REF
+const TURN_SCRUB    = 0.06;   // speed bled by a hard turn (broadside drag)
+const HEEL_K        = 0.22;   // heel = HEEL_K·SAF·V_app²·sin(angle) (canvas=1, NPCs full sail)
+const COMFORT_HEEL  = 16;     // ° before the sail spills wind
+const SPILL_RANGE   = 14;     // ° of heel over comfort that ramps spill 0→1
+const SPILL_MAX     = 0.75;   // max forward-drive fraction lost to an over-pressed (heeled) sail
+const FORCE_K_BY_SLUG = { sloop: SAIL_FORCE_K, pinnace: SAIL_FORCE_K, brig: 1.12 };   // mirrors VESSEL_RIGS sail.forceK
 
 /** Current (and max) non-mast hull points of a combat state. */
 function hullPoints(combat) {
@@ -615,22 +632,21 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
     desired = avoidLand(npc, desired);   // never steer through land — round the shore (incl. in combat)
 
-    // Combat attrition slows a merchant just like a player: a demasted hull (bar shot) bleeds sail power, a
-    // thinned crew (grapeshot) drags it, and a holed hull loses way — so a hit ship can be run down. mastMul
-    // mirrors the player's mast curve; crewMul is the 0.5..1 crew-efficiency factor; hullMul a gentle drag.
+    // Combat attrition slows a merchant EXACTLY like a player: a demasted hull bleeds sail power (mastMul, in
+    // the drive coefficient below) and a thinned crew works the sails + helm less effectively (crewMul). Both
+    // are the SAME terms the player feels — no NPC-only penalties (so an undamaged merchant matches a player).
     const mastFrac = (npc.combat && npc.combat.maxHp && npc.combat.maxHp.masts)
       ? (npc.combat.zones.masts / npc.combat.maxHp.masts) : 1;
     const mastMul = Cc.mastSpeedMult(mastFrac);
     const crewMul = crewFactor(npc);
-    const hullMul = 0.7 + 0.3 * hullFraction(npc.combat);   // holed hull → loses way (full hull = 1.0)
 
-    // Helm = the PLAYER'S helm (issue: NPCs must turn EXACTLY like a same-class player, no instant pivots):
-    // speed-dependent max yaw, capped when demasted, eased in through angular inertia, never overshooting the
-    // desired heading. Crew/mast slow the turn only INDIRECTLY (they slow the ship → less rudder authority),
-    // exactly as for the player.
+    // Helm = the PLAYER'S helm (turn EXACTLY like a same-class player, no instant pivots): speed-dependent max
+    // yaw, capped when demasted, scaled by crew (short-handed → slower on the helm, like the player), eased in
+    // through angular inertia, never overshooting the desired heading.
     const prev = npc.state.heading;
     let maxYaw = vesselTurnRate(npc.state.speed, ph.maxSpeed);
     if (mastFrac <= 0) maxYaw = Math.min(maxYaw, MAST_DOWN_TURN_MAX);
+    maxYaw *= crewMul;                                                // short-handed → slower helm (player parity)
     const delta = angleDelta(prev, desired);                          // signed deg to turn
     const rudder = Math.abs(delta) < 0.5 ? 0 : (delta > 0 ? 1 : -1);
     npc.yawRate = (npc.yawRate || 0) + (rudder * maxYaw - (npc.yawRate || 0)) * Math.min(1, YAW_RESPONSE * dtSec);
@@ -639,11 +655,31 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     npc.state.heading = (prev + stepDeg + 360) % 360;
     npc.state.turnRate = angleDelta(prev, npc.state.heading) / dtSec;
 
-    // Speed from wind strength × the per-rig POLAR (full sail, perfect trim) — sloop/pinnace now sail by their
-    // own drive curves, matching players (P6). Also scaled by mast + crew + hull condition; eased toward target.
-    const aw     = angleFromWind(npc.state.heading, wind.windBearing);
-    const target = Math.max(-1.5, Math.min(ph.maxSpeed, wind.windSpeed * npcDrive(aw, npc.state.vesselSlug, ph.minTackAngle) * ph.sailAreaFactor * mastMul * crewMul * hullMul * MERCHANT_CRUISE));
-    npc.state.speed += (target - npc.state.speed) * Math.min(1, ph.accelerationRate * dtSec);
+    // ── Speed: the PLAYER'S v2 FORCE MODEL (mirrors client vessel.service.physicsStep) so an NPC <type> sails
+    // exactly like a player <type>. Apparent wind (true-wind − boat-velocity) → per-rig drive coefficient →
+    // thrust ∝ forceK·SAF·driveC·V_app²; drag ∝ DRAG_K·v² + turn scrub; a = (thrust−drag)·response/mass. The
+    // ONLY merchant difference: capped at MERCHANT_CRUISE·maxSpeed so they never reach a player's full speed.
+    const hrr = npc.state.heading * DEG;
+    const vNow = npc.state.speed;
+    const bvx = Math.sin(hrr) * vNow, bvz = Math.cos(hrr) * vNow;                  // boat velocity
+    const wf  = wind.windBearing * DEG;
+    const wvx = -Math.sin(wf) * wind.windSpeed, wvz = -Math.cos(wf) * wind.windSpeed;   // true wind (blows TO = from+180°)
+    const axw = wvx - bvx, azw = wvz - bvz;                                        // apparent wind velocity
+    const appWind = Math.hypot(axw, azw);
+    const cosA = (-axw * Math.sin(hrr) - azw * Math.cos(hrr)) / (appWind || 1);
+    const appAngle = Math.acos(Math.max(-1, Math.min(1, cosA))) * 180 / Math.PI;   // 0 = bow into apparent wind
+    const eff = npcDrive(appAngle, npc.state.vesselSlug, ph.minTackAngle);         // full-sail, perfect-trim drive (trim=1)
+    // Heel spill: an over-pressed sail in a blow spills wind → forward drive falls off (matches the player).
+    const heelRaw   = HEEL_K * ph.sailAreaFactor * appWind * appWind * Math.sin(appAngle * DEG);
+    const heelSpill = Math.max(0, Math.min(1, (heelRaw - COMFORT_HEEL) / SPILL_RANGE));
+    const driveC = eff * mastMul * crewMul * (1 - SPILL_MAX * heelSpill);
+    const forceK = FORCE_K_BY_SLUG[npc.state.vesselSlug] || SAIL_FORCE_K;
+    const thrust = forceK * ph.sailAreaFactor * driveC * appWind * appWind;
+    const drag   = DRAG_K * vNow * Math.abs(vNow) + TURN_SCRUB * Math.abs(npc.yawRate || 0) * Math.abs(vNow);
+    const massK  = Math.max(0.2, (ph.weight || WEIGHT_REF) / WEIGHT_REF);
+    let sp = vNow + (thrust - drag) * FORCE_RESPONSE / massK * dtSec;
+    sp = Math.max(-1.5, Math.min(ph.maxSpeed * MERCHANT_CRUISE, sp));              // merchants never hit full speed
+    npc.state.speed = Math.abs(sp) < 0.001 ? 0 : sp;
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
     npc.state.x += Math.sin(hr) * step;

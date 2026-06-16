@@ -2,8 +2,6 @@
 
 # General or Current TODO Items
 
-* merchants still go into land during combat
-* don't render other ship's crews... expensive
 * add occasional bosun whistle (raise/lower anchor... and when first adding sail after leaving port (or first time since logging in))\
 * I want to make NPC merchant labels and player names more visible at distance... just imroving "size" won't help... since ships are often far off... we need a way to make labels (esp of players) more readable at a distance
 * I also want to make the dot indicating towns on maps more visible.. they are hard to see
@@ -48,3 +46,9 @@
 * Security pass
 
 # TODO Items by Module
+
+Great, committed
+
+Now, I want to add the sound effect of a bosun's whistle at some key moments. Use the existing sound synthesize system with tone.js and plug it in alongside other sound effects. Make sure to have the characteristic change in pitch that is common, and that it starts out in about the same high pitch range that a real bosun's whistle does.
+
+In the game I want it to signify "getting under way." and also "stopping." If you want to put a variation on the whistle for "stopping" (when we lower the anchor), that would be extra cool. But I want it to happen in several key occasions... (1) the anchor is raised (2) the anchor is lowered (consider variation here) (3) the sails are raised for the first time after leaving a port (4) the sails are raised for the first time after logging in. If you want to do a different variation for both raising and lowering the anchor, that is fine... but only if you think that is realistic and can guess what it should sound like.

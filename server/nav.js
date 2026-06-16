@@ -204,6 +204,25 @@ function clearLine(ax, az, bx, bz) {
   return lineClear(a.cx, a.cz, b.cx, b.cz);
 }
 
+/** GRADUATED version of clearLine: the world distance from A toward B that stays on navigable water, capped at
+ *  |AB| (returns the full length when the whole segment is open). Sampled at half-cell resolution. Lets the NPC
+ *  helm rank candidate headings by HOW MUCH open water lies ahead instead of an all-or-nothing pass/fail — so a
+ *  boxed-in merchant turns toward the most open water rather than holding course into the nearest rock. */
+function openDistance(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  const full = Math.hypot(bx - ax, bz - az);
+  if (!bits || full < 1e-3) return full;
+  const cellW = (wb.maxX - wb.minX) / res, cellH = (wb.maxZ - wb.minZ) / res;
+  const step = Math.max(1e-3, Math.min(cellW, cellH) * 0.5);
+  const n = Math.max(1, Math.ceil(full / step));
+  const ux = (bx - ax) / n, uz = (bz - az) / n;
+  for (let i = 1; i <= n; i++) {
+    const c = worldToCell(ax + ux * i, az + uz * i);
+    if (!isNav(c.cx, c.cz)) return ((i - 1) / n) * full;
+  }
+  return full;
+}
+
 // ── public ──────────────────────────────────────────────────────────────────────
 /**
  * World-space sea route from A to B. Returns [{x,z}, …] starting at A and ending at B (the real pier points),
@@ -246,7 +265,7 @@ function loadNavGrid() {
 }
 
 module.exports = {
-  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable, clearLine,
+  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable, clearLine, openDistance,
   // test seam — inject a synthetic grid (bitset) without a baked manifest.
   _test: {
     setGrid(resolution, bitset, worldBounds) { res = resolution; bits = bitset; wb = worldBounds; loaded = true; pathCache.clear(); computeComponents(); },

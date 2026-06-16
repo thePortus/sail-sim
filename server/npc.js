@@ -415,19 +415,44 @@ function firingSolution(npc, foeState) {
 // A* route. Probe a lookahead along the intended heading; if it would cross land, sweep outward (alternating
 // left/right) to the nearest heading whose lookahead stays on navigable water, so they round the shore instead of
 // ploughing through it. Lookahead scales with speed so a fast ship turns away in time.
-function clearAhead(x, z, headingDeg, lookM) {
+const LAND_LOOK_BASE = 130;   // base lookahead (m): a hull-length-plus reaction buffer before any open-water term
+const LAND_LOOK_SEC  = 7;     // + this many SECONDS of world travel, so a faster ship commits to the turn earlier
+const LAND_TURN_BIAS = 0.7;   // metres of open water "worth" of penalty per degree of detour — prefer the smallest
+                              // turn that still clears, so merchants hug straight lines and only swing wide near land
+const LAND_COMMIT    = 0.35;  // probe from this fraction of the lookahead AHEAD on the CURRENT heading: the ship keeps
+                              // surging forward while the helm swings, so test from where it WILL be, not where it is
+
+/** Open-water distance ahead on `headingDeg` from (x,z), capped at lookM (graduated — see nav.openDistance). */
+function openAhead(x, z, headingDeg, lookM) {
   const hr = headingDeg * DEG;
-  return nav.clearLine(x, z, x + Math.sin(hr) * lookM, z + Math.cos(hr) * lookM);
+  return nav.openDistance(x, z, x + Math.sin(hr) * lookM, z + Math.cos(hr) * lookM);
 }
+// Steer AROUND land — even in combat, where the helm follows a FREE heading (engage/escape) off the A* route.
+// Probe a speed-scaled lookahead; if the intended heading would fetch up on land, sweep outward and take the
+// heading with the MOST open water ahead, biased toward the smallest detour. Crucially it NEVER holds a blocked
+// heading: a boxed-in merchant (bay, concave headland, or a turn it can't finish in time) turns toward the most
+// open water it can find instead of ploughing straight in — the old version fell through and beached itself.
 function avoidLand(npc, desired) {
-  const lookM = 90 + Math.abs(npc.state.speed) * moveConst.TRAVEL_SCALE * 6;   // ~6 s of travel to react
-  if (clearAhead(npc.state.x, npc.state.z, desired, lookM)) return desired;
-  for (let off = 15; off <= 165; off += 15) {
-    const r = (desired + off) % 360, l = (desired - off + 360) % 360;
-    if (clearAhead(npc.state.x, npc.state.z, r, lookM)) return r;
-    if (clearAhead(npc.state.x, npc.state.z, l, lookM)) return l;
+  const speedW = Math.abs(npc.state.speed) * moveConst.TRAVEL_SCALE;   // world units/s
+  const lookM  = LAND_LOOK_BASE + speedW * LAND_LOOK_SEC;
+  // Origin a little ahead on the current heading (turn-in lag), but only if that point is still on water.
+  const hr = npc.state.heading * DEG;
+  const commit = Math.min(lookM * LAND_COMMIT, speedW * 1.5);
+  let ox = npc.state.x, oz = npc.state.z;
+  const cx = ox + Math.sin(hr) * commit, cz = oz + Math.cos(hr) * commit;
+  if (commit > 1 && nav.clearLine(ox, oz, cx, cz)) { ox = cx; oz = cz; }
+
+  if (openAhead(ox, oz, desired, lookM) >= lookM) return desired;   // intended heading stays clear → keep it
+  let best = desired, bestScore = -Infinity;
+  for (let off = 12; off <= 180; off += 12) {
+    for (const cand of [(desired + off) % 360, (desired - off + 360) % 360]) {
+      const open = openAhead(ox, oz, cand, lookM);
+      if (open >= lookM) return cand;                 // first fully-clear detour wins (smallest offset, by sweep order)
+      const score = open - off * LAND_TURN_BIAS;
+      if (score > bestScore) { bestScore = score; best = cand; }
+    }
   }
-  return desired;   // boxed in (shouldn't happen on open water) — hold heading
+  return best;   // most-open heading found — turn toward water rather than hold course into the rocks
 }
 
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */

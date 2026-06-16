@@ -1,11 +1,15 @@
 import { Injectable, inject, signal } from '@angular/core';
-import { TransformNode, Vector3, Mesh, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
+import { TransformNode, Vector3, Mesh, MeshBuilder, Matrix, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
   StandardMaterial, DynamicTexture, VertexData, Texture } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
 import { VesselService } from './vessel.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { TownImpostorPlugin } from './scatter/town-impostor.plugin';
+import { ImpostorHazePlugin } from './scatter/impostor-haze.plugin';
+import { measureBottomPad } from './scatter/asset-loader';
+import { Settings } from '../../app.settings';
 import { TerrainHarbor } from '../models';
 
 /**
@@ -59,15 +63,21 @@ export class HarborService {
   // those four registrations (see disposePier).
   private readonly pierNodes = new Map<string, TransformNode>();
   private readonly pierLoading = new Set<string>();
+  // Distant-town BUILDING IMPOSTOR layer: one camera-facing billboard mesh per building TYPE, thin-instanced
+  // across every town (~few draws total), faded in past the mesh-drop range + out by ~5 km (see
+  // TownImpostorPlugin). Built once from the baked impostor atlas; keeps distant coastlines populated cheaply.
+  private impostorMeshes: Mesh[] = [];
   private readonly PIER_BUILD_RANGE = 2400;
   private readonly PIER_DROP_RANGE = 2800;
   // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
   private squareMat: StandardMaterial | null = null;
   private roadMat: StandardMaterial | null = null;
-  // Building stream ranges: tuned for the 50-town map — a 6 m cabin at 1 km is a couple of pixels,
-  // and several towns can now be in range at once, so keep the detail bubble tight (was 1500/1900).
-  private readonly BUILD_RANGE = 950;
-  private readonly DROP_RANGE = 1150;
+  // Building stream ranges: full 3-D buildings only in the CLOSE bubble now that the impostor layer (T3)
+  // covers the mid-distance — so we pull this in hard (was 950/1150) to slash near-town building draws.
+  // The impostor fade-in band (TownImpostorPlugin.band) is set to reach full right as real meshes drop, so
+  // the town never disappears at the handoff. Tune the two together.
+  private readonly BUILD_RANGE = 600;
+  private readonly DROP_RANGE = 800;
   // Cap on simultaneous full-detail towns: only the nearest MAX_ACTIVE_TOWNS inside BUILD_RANGE may
   // START building. Eviction stays purely range-based (DROP_RANGE) — rank churn between two towns at
   // similar distances never disposes one, so there's no swap-thrash; the cap just stops a dense bay
@@ -106,6 +116,7 @@ export class HarborService {
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.sceneService.span('harbor', () => this.tick()));
     // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to
     // build up front. The 3 variant GLBs parse once into the shared cache on first use.
+    this.buildTownImpostors();   // async; distant-town billboard layer (fire-and-forget)
   }
 
   /** Each frame: park the pool light at the nearest pier and update the dockable town. */
@@ -195,7 +206,20 @@ export class HarborService {
    *  to scan per frame). */
   private tick(): void {
     this.updateNearestPier();
+    if (this.impostorMeshes.length) { this.updateImpostorCamera(); }
     if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); }
+  }
+
+  /** Feed the town-impostor billboard plugin the live camera XZ + horizontal right vector (so the quads face
+   *  the camera) once per frame. Cheap — two uniform values shared by every impostor material. */
+  private updateImpostorCamera(): void {
+    const cam = this.sceneService.camera;
+    if (!cam) return;
+    const f = cam.getForwardRay().direction;            // camera forward (world)
+    let rx = f.z, rz = -f.x;                             // horizontal right = up × forward, projected to XZ
+    const rl = Math.hypot(rx, rz) || 1; rx /= rl; rz /= rl;
+    const P = TownImpostorPlugin.cam;
+    P.x = cam.position.x; P.z = cam.position.z; P.rx = rx; P.rz = rz;
   }
 
   /** Instantiate piers within PIER_BUILD_RANGE; tear down those past PIER_DROP_RANGE (hysteresis
@@ -286,6 +310,68 @@ export class HarborService {
     }
     this.buildGround(h, root, padElev);
     return root;
+  }
+
+  /** Build the static distant-town impostor layer: for EVERY town's buildings, drop a camera-facing billboard
+   *  (baked 3/4 view) thin-instanced per building TYPE — so all towns are visible mid-distance for ~a handful
+   *  of draws. Hidden up close (real streamed buildings own that) + faded out past ~5 km via TownImpostorPlugin.
+   *  Piers have no impostor (they stream as real meshes), so they're simply skipped. */
+  private async buildTownImpostors(): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.harbors.length) return;
+    const base = `${Settings.apiUrl}geometry/harbors/impostors/`;
+    let sizes: Record<string, { size: number }>;
+    try {
+      const mani = await (await fetch(`${base}impostors_manifest.json`)).json();
+      sizes = mani?.buildings ?? {};
+    } catch { return; }
+
+    // Gather all instances grouped by building TYPE (world coords; per-instance translation matrix).
+    const byType = new Map<string, number[]>();
+    for (const h of this.harbors) {
+      if (!h.buildings) continue;
+      const y = h.pad?.elev ?? 0;
+      for (const b of h.buildings) {
+        if (!sizes[b.asset]) continue;                  // no impostor (piers) → skip
+        let arr = byType.get(b.asset);
+        if (!arr) { arr = []; byType.set(b.asset, arr); }
+        Matrix.Translation(b.x, y, b.z).copyToArray(arr, arr.length);
+      }
+    }
+    if (!byType.size || !this.root) return;
+
+    for (const [asset, arr] of byType) {
+      const size = sizes[asset].size;
+      const url = `${base}${asset}_imp.png`;
+      const pad = await measureBottomPad(url, 0.0);      // align the building's base to the instance ground
+      if (!this.root) return;                            // disposed mid-await
+      const tex = new Texture(url, scene);
+      tex.hasAlpha = true;
+
+      const mesh = MeshBuilder.CreatePlane(`town_imp_${asset}`, { width: size, height: size }, scene);
+      mesh.bakeTransformIntoVertices(Matrix.Translation(0, size / 2 - pad * size, 0));   // base → local y=0
+      const mat = new StandardMaterial(`town_imp_mat_${asset}`, scene);
+      mat.diffuseTexture = tex; mat.emissiveTexture = tex;   // pre-lit: show the baked image directly
+      mat.diffuseColor = new Color3(0, 0, 0);
+      mat.disableLighting = true;
+      mat.transparencyMode = Material.MATERIAL_ALPHATEST;
+      mat.alphaCutOff = 0.4;
+      mat.backFaceCulling = false;
+      mat.useAlphaFromDiffuseTexture = true;
+      new TownImpostorPlugin(mat);                        // camera-facing billboard + distance-band fade (vertex)
+      new ImpostorHazePlugin(mat);                        // aerial haze (fragment) — recede with the terrain
+      this.sceneService.excludeFromPrePass(mat);
+
+      mesh.material = mat;
+      mesh.parent = this.root;
+      mesh.renderingGroupId = 2;                          // world layer (terrain/ocean/vessels)
+      mesh.isPickable = false;
+      mesh.alwaysSelectAsActiveMesh = true;               // billboarded in-shader → bounds meaningless; instances are tiny + fade-gated
+      mesh.doNotSyncBoundingInfo = true;
+      this.sceneService.excludeFromGlow(mesh);
+      mesh.thinInstanceSetBuffer('matrix', new Float32Array(arr), 16, true);
+      this.impostorMeshes.push(mesh);
+    }
   }
 
   /** Lazily build the two shared procedural ground materials: cobblestone (the civic square) + dirt (roads).
@@ -603,6 +689,8 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    for (const m of this.impostorMeshes) { m.material?.dispose(true, true); m.dispose(); }   // own texture+material
+    this.impostorMeshes = [];
     // Pier nodes die with root below (the scene teardown also disposes the shadow/reflection/glow
     // lists they were registered in) — just drop the refs.
     this.pierNodes.clear();

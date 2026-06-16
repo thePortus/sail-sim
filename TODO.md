@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* lod + imposters for ships at distance... same towns, * Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
 * Add lost server connection detection
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * ocean refelction/refraction delay mostly fine.... but seems extreme for distant landscape, since that moves a lot as you rotate the camera... any way to tweak that without rendering entire phase every frame?
@@ -45,11 +44,3 @@
 * Security pass
 
 # TODO Items by Module
-
-
-
-Now, I want to do some more optimization.... specifically, reduce draw cycles on the CPU. The remaining big drag are ships and towns.... to quote what you said
-
-Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-
-I definitely want to do LOD imposters for both towns and ships... I have blender open with one of the town buildings, and I have shared the folders with the raw ship and town assets. Also if it is easy to do thin-instanced buildings and merged per town clutter... great too

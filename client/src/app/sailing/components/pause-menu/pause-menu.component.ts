@@ -17,7 +17,7 @@ import { SfxService } from '../../services/sfx.service';
       <!-- Header -->
       <div class="pause-header">
         <div class="pause-title">⚓ Anchored</div>
-        <div class="pause-subtitle">Game Paused</div>
+        <div class="pause-subtitle">(Game Menu)</div>
       </div>
 
       <!-- Now playing -->

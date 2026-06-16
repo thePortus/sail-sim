@@ -89,6 +89,18 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         </div>
       }
 
+      <!-- Lost connection to the server (server down / network drop) — OK returns to the home screen -->
+      @if (serverLostNotice()) {
+        <div class="kick-notice-backdrop">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚠️</div>
+            <div class="kick-notice-title">Connection Lost</div>
+            <div class="kick-notice-text">Lost contact with the server — it may be down or restarting. Please try again shortly.</div>
+            <button class="kick-notice-btn" (click)="onConnectionLostOk()">OK</button>
+          </div>
+        </div>
+      }
+
       <!-- Loading overlay -->
       @if (phase() === 'initializing') {
         <div class="loading-overlay">
@@ -560,6 +572,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
+    // Socket dropped unexpectedly (server down / network loss) → show the lost-connection popup (OK → home).
+    effect(() => {
+      if (!this.multiplayerService.connectionLost()) return;
+      untracked(() => this.serverLostNotice.set(true));
+    });
+
     // Moored at a berth → open the town menu; cast off → close it. dockMenuOpen mirrors the vessel's tied
     // state so all the existing panel-close logic (below) keeps working unchanged.
     effect(() => {
@@ -658,6 +676,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   dismissKicked(): void {
     this.kickedNotice.set(null);
     this.multiplayerService.kickedReason.set(null);
+  }
+
+  // Lost-connection popup (mirrors kickedNotice, but driven by the service's connectionLost signal). OK
+  // returns to the home screen (navigation destroys this component → ngOnDestroy tears multiplayer down).
+  serverLostNotice = signal(false);
+  onConnectionLostOk(): void {
+    this.serverLostNotice.set(false);
+    this.multiplayerService.connectionLost.set(false);
+    this.onReturnToHarbor();
   }
 
   ngAfterViewInit(): void {

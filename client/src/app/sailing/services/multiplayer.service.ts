@@ -117,6 +117,10 @@ export class MultiplayerService {
   // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
   // watches this to force a fresh login — the session token can no longer be trusted.
   authFailed    = signal<boolean>(false);
+  // Set when the socket drops UNEXPECTEDLY (server down / network loss) — i.e. a close that wasn't an
+  // intentional disconnect, an auth rejection (4401), or a kick. The game component shows a popup whose OK
+  // returns to the home screen.
+  connectionLost = signal<boolean>(false);
 
   // Crew resource (C1/C2): the LOCAL player's crew lives on CombatService (it drives the crewFactor used by
   // vessel + cannon). Here we only keep REMOTE ships' crew counts for rendering their on-deck sailor count.
@@ -186,6 +190,7 @@ export class MultiplayerService {
   }
 
   private ws:          WebSocket | null = null;
+  private _intentionalClose = false;   // true while disconnect() tears the socket down → suppress the lost-connection popup
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
   /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
@@ -417,6 +422,8 @@ export class MultiplayerService {
     // server verifies it and refuses (close 4401) if it's missing/invalid.
     const token = this.authService.getToken();
     const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
+    this._intentionalClose = false;   // fresh session — a drop from here is a real connection loss
+    this.connectionLost.set(false);
     this.ws = new WebSocket(url);
 
     // Let the salvage service ask the server to collect a crate the local ship sailed over.
@@ -445,7 +452,10 @@ export class MultiplayerService {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.telemetry.ping.set(-1);
       // 4401 = server rejected the JWT. The token can't be trusted → force a fresh login.
-      if (evt.code === 4401) this.zone.run(() => this.authFailed.set(true));
+      if (evt.code === 4401) { this.zone.run(() => this.authFailed.set(true)); return; }
+      // Any OTHER close we didn't initiate (server down / restart / network drop) → surface the lost-connection
+      // popup. Intentional teardown (disconnect()) sets _intentionalClose so leaving the game is silent.
+      if (!this._intentionalClose) this.zone.run(() => this.connectionLost.set(true));
     });
   }
 
@@ -460,6 +470,7 @@ export class MultiplayerService {
   }
 
   disconnect(): void {
+    this._intentionalClose = true;   // we're closing on purpose → the close handler must NOT show the popup
     if (this.updateTimer) clearInterval(this.updateTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.telemetry.ping.set(-1);
@@ -593,7 +604,9 @@ export class MultiplayerService {
       this.scatterService.reloadAssets(+msg.version || 0).catch((e) => console.warn('[MP] scatter reload failed', e));
 
     } else if (msg.type === 'kicked') {
-      // Server closed this session because the same account logged in elsewhere.
+      // Server closed this session because the same account logged in elsewhere. The kick notice owns this UX,
+      // so flag the imminent socket close as intentional → no duplicate "connection lost" popup.
+      this._intentionalClose = true;
       this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
 
     } else if (msg.type === 'chat') {

@@ -35,10 +35,14 @@ ok(dl.length > 0, 'distressList surfaces persistent shortages');
 ok(dl.some((d) => d.townId === 'F' && d.goodId === 'rum'), "the forge's rum shortage is in distress");
 ok(dl.every((d, i) => i === 0 || dl[i - 1].distressDays >= d.distressDays), 'distress list is sorted worst-first');
 
-console.log('(c) dispatch: distress-first, sourced from a producer:');
+console.log('(c) dispatch: NEED-driven, sourced from a reachable producer:');
+const needs = economy.needList();
+console.log(`    needs: ${needs.map((n) => `${n.townName}/${n.goodId}:lvl${n.level}`).join(', ') || '(none)'}`);
+ok(needs.length > 0, 'needList surfaces a town short of a consumed good');
+ok(needs.some((n) => n.townId === 'F' && n.goodId === 'rum'), "the forge's rum shortage is a need");
 const trip = npc._test.chooseTrip();
 console.log(`    chosen trip: buy ${trip && trip.goodId} at ${trip && trip.srcTownId} → deliver to ${trip && trip.destTownId}`);
-ok(trip && dl.some((d) => d.townId === trip.destTownId), 'trip destination is a distressed town (distress-driven)');
+ok(trip && needs.some((n) => n.townId === trip.destTownId && n.goodId === trip.goodId), 'trip destination is a NEEDY town (demand-driven)');
 ok(trip && trip.srcTownId !== trip.destTownId, 'sources from a DIFFERENT town');
 const seller = economy.bestSellerFor('rum', 'F');
 const buyer = economy.bestBuyerFor('rum', 'D');

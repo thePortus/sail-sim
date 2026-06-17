@@ -35,7 +35,7 @@ struct Params {
   densityMul: f32,        // quality-tier density multiplier
   variant: f32,           // variant this layer owns, or -1 = keep all (shadow blobs)
   capacity: f32,          // instance capacity of the patch buffers
-  texSizeMinus1: vec2f,   // heightfield texel count - 1
+  texSize: vec2f,         // heightfield texel count (full width/height)
   wbounds: vec4f,         // heightfield world bounds: minX, minZ, sizeX, sizeZ
   pad0a: vec4f,           // town pad 0: cx, cz, halfX, halfZ
   pad0b: vec4f,           // town pad 0: sin, cos, enabled, unused
@@ -97,10 +97,10 @@ fn step01(a: f32, b: f32, x: f32) -> f32 {
 fn groundAt(wx: f32, wz: f32) -> f32 {
   let u = (wx - params.wbounds.x) / params.wbounds.z;
   let v = (params.wbounds.y + params.wbounds.w - wz) / params.wbounds.w;
-  let fxy = vec2f(u, v) * params.texSizeMinus1 - vec2f(0.5, 0.5);
+  let fxy = vec2f(u, v) * params.texSize - vec2f(0.5, 0.5);
   let i0 = vec2i(floor(fxy));
   let f = fxy - floor(fxy);
-  let mx = vec2i(params.texSizeMinus1);
+  let mx = vec2i(params.texSize) - vec2i(1, 1);
   let h00 = textureLoad(heightTex, clamp(i0,                vec2i(0), mx), 0).r;
   let h10 = textureLoad(heightTex, clamp(i0 + vec2i(1, 0),  vec2i(0), mx), 0).r;
   let h01 = textureLoad(heightTex, clamp(i0 + vec2i(0, 1),  vec2i(0), mx), 0).r;
@@ -110,7 +110,7 @@ fn groundAt(wx: f32, wz: f32) -> f32 {
 
 // Local slope in m/m over one heightfield texel — mirrors the CPU slopeAt (which uses cellM, not E)
 fn slopeAt(px: f32, pz: f32, baseY: f32) -> f32 {
-  let d = params.wbounds.z / params.texSizeMinus1.x;
+  let d = params.wbounds.z / params.texSize.x;
   return length(vec2f(groundAt(px + d, pz) - baseY, groundAt(px, pz + d) - baseY)) / d;
 }
 
@@ -244,13 +244,19 @@ fn emitClump(px: f32, pz: f32, y: f32) -> bool {
 
   let region = fbm2(vec2f(px / 45.0 + 120.0, pz / 45.0 - 60.0));
   let bush = fbm2(vec2f(px / 5.0 + 31.0, pz / 5.0 + 17.0));
-  let regionGate = step01(0.54, 0.64, region);
-  let core = step01(0.56, 0.80, bush);
+  let core = step01(0.50, 0.78, bush);
   let coreD = core * core * core;
-  let lowland = smoothstep(1.5, 13.0, y);
   let alt = 1.0 - smoothstep(90.0, 140.0, y);
-  let envFac = lowland * alt * (1.0 - slope * 0.7) * params.densityMul;
-  let density = coreD * regionGate * envFac;
+  // FOREST: lush, near-continuous coverage on inland/higher ground (base meadow floor + denser bush hearts).
+  let forestRegion = step01(0.34, 0.50, region);
+  let forestCover = 0.55 + 0.45 * coreD;
+  let lowland = smoothstep(1.5, 13.0, y);
+  let forestDens = forestRegion * forestCover * lowland;
+  // BEACH: modest grass on the sand band (~old forest amount) — cubed bush cores only, no meadow floor.
+  let beachBand = smoothstep(0.7, 1.8, y) * (1.0 - smoothstep(4.0, 11.0, y));
+  let beachRegion = step01(0.50, 0.62, region);
+  let beachDens = beachRegion * coreD * beachBand * 0.85;
+  let density = max(forestDens, beachDens) * alt * (1.0 - slope * 0.7) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > density) { return; }
   if (dealtAway(px, pz, 3.0)) { return; }
 
@@ -414,7 +420,7 @@ export class ScatterCompute {
     this.params.addUniform('densityMul', 1);
     this.params.addUniform('variant', 1);
     this.params.addUniform('capacity', 1);
-    this.params.addUniform('texSizeMinus1', 2);
+    this.params.addUniform('texSize', 2);
     this.params.addUniform('wbounds', 4);
     this.params.addUniform('pad0a', 4);
     this.params.addUniform('pad0b', 4);
@@ -457,7 +463,7 @@ export class ScatterCompute {
     this.params.updateFloat('densityMul', densityMul);
     this.params.updateFloat('variant', variant);
     this.params.updateFloat('capacity', patch.capacity);
-    this.params.updateFloat2('texSizeMinus1', hf.texSize.x - 1, hf.texSize.y - 1);
+    this.params.updateFloat2('texSize', hf.texSize.x, hf.texSize.y);
     this.params.updateVector4('wbounds', hf.wbounds);
     const p0 = pads[0], p1 = pads[1];
     this.params.updateFloat4('pad0a', p0?.cx ?? 0, p0?.cz ?? 0, p0?.hx ?? 0, p0?.hz ?? 0);
@@ -473,6 +479,117 @@ export class ScatterCompute {
     this.queue.shift();
 
     // Async count readback (4 bytes, per-patch counter — no race with later dispatches).
+    patch.counter.read().then((buf) => {
+      patch.setCount(new Uint32Array(buf.buffer, buf.byteOffset, 1)[0]);
+    }).catch(() => { /* engine torn down mid-read — patch is being disposed anyway */ });
+  }
+
+  /** Drop queued jobs for a disposed patch (patch culling can outrun the one-per-frame drain). */
+  cancel(patch: GpuScatterPatch): void {
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      if (this.queue[i].patch === patch) { this.queue.splice(i, 1); }
+    }
+  }
+
+  dispose(): void {
+    if (this.observer) { this.scene.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
+    this.queue.length = 0;
+    this.params.dispose();
+  }
+}
+
+/** The four asset SHADOW kernels (rocks/drift/trees/palms in shadowMode) merged into one dispatcher.
+ *  Per patch it runs all four kernels into the SAME buffers sharing ONE atomic append counter — reset
+ *  once, read back once — so every asset's near-ring shadow blobs pack contiguously into a SINGLE
+ *  thin-instance mesh (1 draw) instead of four. (WebGPU auto-synchronises between compute passes, so the
+ *  later kernels' atomicAdd continues from the running total written by the earlier ones.) The kernels are
+ *  unchanged: they already emit flat discs when params.extra.x (shadowMode) = 1. */
+export class ShadowCompute {
+  private readonly kernels: Array<{ cs: ComputeShader; res: number }> = [];
+  private readonly params: UniformBuffer;
+  private readonly queue: Array<{
+    patch: GpuScatterPatch; cx: number; cz: number; patchSize: number; densityMul: number; pads: PadBox[];
+  }> = [];
+  private observer: Observer<Scene> | null = null;
+
+  constructor(engine: WebGPUEngine, private readonly scene: Scene,
+              private readonly getHeightField: () => HeightFieldGPU | null) {
+    this.params = new UniformBuffer(engine);
+    this.params.addUniform('patchCenter', 2);
+    this.params.addUniform('patchSize', 1);
+    this.params.addUniform('densityMul', 1);
+    this.params.addUniform('variant', 1);
+    this.params.addUniform('capacity', 1);
+    this.params.addUniform('texSize', 2);
+    this.params.addUniform('wbounds', 4);
+    this.params.addUniform('pad0a', 4);
+    this.params.addUniform('pad0b', 4);
+    this.params.addUniform('pad1a', 4);
+    this.params.addUniform('pad1b', 4);
+    this.params.addUniform('extra', 4);
+
+    const SHADOW_KERNELS: Array<[string, string]> = [
+      ['rocks', ROCKS_WGSL], ['drift', DRIFT_WGSL], ['trees', TREES_WGSL], ['palms', PALMS_WGSL],
+    ];
+    for (const [kind, wgsl] of SHADOW_KERNELS) {
+      const cs = ComputeHelper.createShader(engine, `scatter_shadow_${kind}`, wgsl, 'main', {
+        mats:      { group: 0, binding: 0 },
+        cols:      { group: 0, binding: 1 },
+        counter:   { group: 0, binding: 2 },
+        heightTex: { group: 0, binding: 3 },
+        params:    { group: 0, binding: 4 },
+      });
+      cs.setUniformBuffer('params', this.params);
+      this.kernels.push({ cs, res: KERNEL_RES[kind] ?? 24 });
+    }
+
+    this.observer = scene.onBeforeRenderObservable.add(() => this.drainOne());
+  }
+
+  enqueue(patch: GpuScatterPatch, cx: number, cz: number,
+          patchSize: number, densityMul: number, pads: PadBox[]): void {
+    this.queue.push({ patch, cx, cz, patchSize, densityMul, pads });
+  }
+
+  private drainOne(): void {
+    if (!this.queue.length) { return; }
+    const hf = this.getHeightField();
+    if (!hf) { return; }   // terrain height texture not built yet — retry next frame
+
+    const { patch, cx, cz, patchSize, densityMul, pads } = this.queue[0];
+
+    // One shared param block for all four kernels (same patch; variant -1 keeps every candidate; shadowMode 1).
+    this.params.updateFloat2('patchCenter', cx, cz);
+    this.params.updateFloat('patchSize', patchSize);
+    this.params.updateFloat('densityMul', densityMul);
+    this.params.updateFloat('variant', -1);
+    this.params.updateFloat('capacity', patch.capacity);
+    this.params.updateFloat2('texSize', hf.texSize.x, hf.texSize.y);
+    this.params.updateVector4('wbounds', hf.wbounds);
+    const p0 = pads[0], p1 = pads[1];
+    this.params.updateFloat4('pad0a', p0?.cx ?? 0, p0?.cz ?? 0, p0?.hx ?? 0, p0?.hz ?? 0);
+    this.params.updateFloat4('pad0b', p0?.sin ?? 0, p0?.cos ?? 1, p0 ? 1 : 0, 0);
+    this.params.updateFloat4('pad1a', p1?.cx ?? 0, p1?.cz ?? 0, p1?.hx ?? 0, p1?.hz ?? 0);
+    this.params.updateFloat4('pad1b', p1?.sin ?? 0, p1?.cos ?? 1, p1 ? 1 : 0, 0);
+    this.params.updateFloat4('extra', 1, 0, 0, 0);   // shadowMode = 1 → emit flat discs
+    this.params.update();
+
+    // Point every kernel at the SAME patch buffers + the shared append counter.
+    for (const { cs } of this.kernels) {
+      cs.setStorageBuffer('mats', patch.mats);
+      cs.setStorageBuffer('cols', patch.cols);
+      cs.setStorageBuffer('counter', patch.counter);
+      cs.setTexture('heightTex', hf.tex, false);
+    }
+
+    // Reset the shared counter ONCE (queue-ordered → lands before the dispatches), then run all four; each
+    // kernel's atomicAdd continues from the prior total, so the discs compact into one contiguous buffer.
+    patch.counter.update(new Uint32Array([0]));
+    for (const { cs, res } of this.kernels) {
+      if (!ComputeHelper.dispatch(cs, res, res, 1)) { return; }   // a kernel still compiling — retry the whole patch next frame
+    }
+    this.queue.shift();
+
     patch.counter.read().then((buf) => {
       patch.setCount(new Uint32Array(buf.buffer, buf.byteOffset, 1)[0]);
     }).catch(() => { /* engine torn down mid-read — patch is being disposed anyway */ });

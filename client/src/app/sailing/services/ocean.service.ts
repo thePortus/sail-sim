@@ -1502,6 +1502,12 @@ export class OceanService {
 
   private reflectionRTT!: MirrorTexture;
   private refractionRTT!: RenderTargetTexture;   // seabed-only colour for true shallow-water transparency
+  // Adaptive reflection refresh: the mirror RTT renders on a cheap cadence (every 3rd frame) when the view is
+  // steady, but distant ISLANDS in it lag visibly while you SWING the camera (far content slides a lot in
+  // screen-space per degree). So we speed the RTT up purely as a function of camera ANGULAR speed — every
+  // frame on a fast swing, back to the cheap rate when still — paying the cost only while you'd notice the lag.
+  private _prevCamFwd = new Vector3(0, 0, 1);
+  private readonly REFL_BASE_RATE = 3;   // steady-view cadence (kept coprime with the refraction's 2)
   private terrainShadowMask: Texture | null = null;
   private terrainShadowCenter = new Vector2(0, 0);
   private terrainShadowSize = 1;
@@ -1642,12 +1648,13 @@ export class OceanService {
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
     this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
-    // Every 4th frame (perf). The renderList is just sky + vessels + piers, which change slowly.
-    // 4 is deliberately COPRIME with the refraction's refreshRate (5): the two heavy RTTs then only
-    // render on the same frame once every lcm(4,5)=20 frames instead of every 3 — that de-stacks the
-    // bimodal frame-time spike (the every-other-frame stutter) that dominated the felt frame rate.
-    // If the sky/vessel reflection strobes at low FPS, lower this.
-    this.reflectionRTT.refreshRate = 4;
+    // Every 3rd frame (perf). The renderList is just sky + vessels + piers, which change slowly.
+    // 3 is deliberately COPRIME with the refraction's refreshRate (2): the two heavy RTTs then only
+    // render on the same frame once every lcm(3,2)=6 frames — that de-stacks the bimodal frame-time
+    // spike (the every-other-frame stutter) that dominated the felt frame rate. NOTE: must stay ODD —
+    // an EVEN reflection rate would divide into the refraction's 2 and collide every reflection frame,
+    // re-stacking the spike. Bumped 5→3 for a fresher sky/vessel reflection. If FPS suffers, raise to 5.
+    this.reflectionRTT.refreshRate = 3;
     this.reflectionRTT.mirrorPlane = new Plane(0, -1, 0, 0);
     this.reflectionRTT.renderList  = [];
     // Do NOT render particles into the mirror. The MirrorTexture sets a clip plane, and our storm
@@ -1693,10 +1700,10 @@ export class OceanService {
     // shallows reveal SAND rather than the sky or a dark void — a tan transition that blends
     // the deep→shallow boundary into the beach colour.
     this.refractionRTT.clearColor = new Color4(0.57, 0.50, 0.37, 1.0);
-    this.refractionRTT.refreshRate = 3;   // every 3rd frame — reverted from 5: at 5 the seabed visibly lagged
-                                          // behind a fast camera spin. 3 is still coprime with the reflection's 4,
-                                          // so the two heavy RTTs only stack 1/lcm(3,4)=12 frames (vs every frame
-                                          // when both were 3) — we keep the de-stacking smoothness without the lag.
+    this.refractionRTT.refreshRate = 2;   // every OTHER frame (experiment) — the seabed RTT is the heaviest GPU
+                                          // cost; every-frame (1) was too much, this is the middle ground above 3.
+                                          // 2 is coprime with the reflection's 5, so the two heavy RTTs only stack
+                                          // 1/10 frames — keeps the de-stacking smoothness with a fresher seabed.
     this.refractionRTT.renderParticles = false;  // seabed refraction: particles don't belong here (also avoids the GPU-particle RTT compile)
     scene.customRenderTargets.push(this.refractionRTT);
 
@@ -1899,6 +1906,9 @@ export class OceanService {
   // Baked hull beam-profile cut (texture-free → no sampler; Mac/Metal caps samplers at 16). The
   // profile is half-beam vs along-position; the ocean shader cuts sea inside it AND above waterY.
   static readonly HULL_CUT_N = 96;      // along-bins (must match the shader's array size × 4)
+  // Height-aware silhouette (the DISCARD path): NA along × NH height; the table is NA*NH = 384 floats = 96 vec4.
+  static readonly HULL_SIL_NA = 48;
+  static readonly HULL_SIL_NH = 8;
   private hullCutOn       = 0;
   private hullCutProfile  = new Array<number>(OceanService.HULL_CUT_N).fill(0);
   private hullCutAlongMin = 0;
@@ -1906,6 +1916,13 @@ export class OceanService {
   private hullCutAcrossCenter = 0;
   private hullCutAlongSign = 1;         // +1 if the boat's forward (BoatDir) is +root-Z, else -1
   private hullCutWaterY   = -1.0e9;     // world Y of the boat's floor; sea ABOVE this (in hull) is cut
+  // Discard path (height-aware occlusion): the 2-D hull silhouette + the boat's root world-Y (height ref).
+  private hullSilTable    = new Array<number>(OceanService.HULL_SIL_NA * OceanService.HULL_SIL_NH).fill(0);
+  private hullSilHMin     = 0;
+  private hullSilHMax     = 1;
+  private hullSilRootY    = -1.0e9;     // boat root world-Y; the live wave height on the hull = waveY − this
+  private hullTiltPitch   = 0;          // boat pitch (rad, +bow-up) — tilts the per-pixel hull height so a heeled/
+  private hullTiltRoll    = 0;          // boat roll  (rad, +stbd-down)  hull's waterline is read correctly (no slivers)
 
   /** Install the baked hull beam profile for the local boat's interior cut (once, on load).
    *  alongSign maps the boat's forward heading to +root-Z (flip if bow/stern read swapped). */
@@ -1926,12 +1943,35 @@ export class OceanService {
    *  sea below it is kept, so when the boat lifts on a trough you never see through the ocean. */
   setHullCutWaterY(y: number): void { this.hullCutWaterY = y; }
 
+  /** Install the HEIGHT-AWARE hull silhouette (the discard path) — half-beam vs (along, height). */
+  setHullSilhouette(table: Float32Array, hMin: number, hMax: number): void {
+    const N = OceanService.HULL_SIL_NA * OceanService.HULL_SIL_NH;
+    for (let i = 0; i < N; i++) { this.hullSilTable[i] = table[i] ?? 0; }
+    this.hullSilHMin = hMin; this.hullSilHMax = hMax;
+  }
+  /** Per-frame: the boat's ROOT world-Y — the reference the per-pixel wave height is measured against so
+   *  the discard outline rides the bob (live wave height on the hull = ocean surface Y − this). */
+  setHullCutRootY(y: number): void { this.hullSilRootY = y; }
+  /** Per-frame: the boat's pitch + roll (rad) so the discard reads the hull's waterline height correctly when
+   *  it's heeled/pitched (a tilted hull's edge sits higher/lower across the beam than a flat read would say). */
+  setHullCutTilt(pitchRad: number, rollRad: number): void { this.hullTiltPitch = pitchRad; this.hullTiltRoll = rollRad; }
+
+  /** STENCIL-mask mode: the FFT ocean is masked out of the hull by a stencil proxy (true geometry, no shader
+   *  cut) instead of the per-pixel carve/discard. OceanFFTRenderer watches this and toggles the stencil test
+   *  on its materials + the group-0 draw order. Set by VesselService when a hullCut vessel runs in this mode. */
+  private hullStencilMask = false;
+  setHullStencilMask(on: boolean): void { this.hullStencilMask = on; }
+
   /** Local boat interior-cut state, consumed by the FFT ocean material (ocean-material.ts). */
   getHullCut(): { on: number; profile: number[]; alongMin: number; alongLen: number;
-                  acrossCenter: number; alongSign: number; waterY: number } {
+                  acrossCenter: number; alongSign: number; waterY: number;
+                  sil: number[]; hMin: number; hMax: number; rootY: number; pitch: number; roll: number;
+                  stencilMask: boolean } {
     return { on: this.hullCutOn, profile: this.hullCutProfile, alongMin: this.hullCutAlongMin,
              alongLen: this.hullCutAlongLen, acrossCenter: this.hullCutAcrossCenter,
-             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY };
+             alongSign: this.hullCutAlongSign, waterY: this.hullCutWaterY,
+             sil: this.hullSilTable, hMin: this.hullSilHMin, hMax: this.hullSilHMax, rootY: this.hullSilRootY,
+             pitch: this.hullTiltPitch, roll: this.hullTiltRoll, stencilMask: this.hullStencilMask };
   }
 
   /**
@@ -1980,6 +2020,17 @@ export class OceanService {
         this.oceanMeshFar.position.x = cx; this.oceanMeshFar.position.z = cz;
         this.oceanMatFar.setVector2('u_WorldOffset',    wOff);
         this.oceanMatFar.setVector3('u_cameraPosition', camV);
+
+        // Adaptive reflection refresh — driven by how fast the camera is rotating (distant islands in the
+        // mirror lag most on a swing). Crisp (every frame) on a fast swing, the cheap base rate when still.
+        if (this.reflectionRTT && this._reflectionsEnabled) {
+          const fwd = cam.getForwardRay().direction;
+          const dot = Math.max(-1, Math.min(1, fwd.x * this._prevCamFwd.x + fwd.y * this._prevCamFwd.y + fwd.z * this._prevCamFwd.z));
+          const angSpeed = Math.acos(dot) / Math.max(1e-3, dt);   // rad/s of view rotation
+          this._prevCamFwd.copyFrom(fwd);
+          const want = angSpeed > 0.9 ? 1 : (angSpeed > 0.25 ? 2 : this.REFL_BASE_RATE);
+          if (this.reflectionRTT.refreshRate !== want) this.reflectionRTT.refreshRate = want;
+        }
       }
 
       this.updateWakePath(dt);

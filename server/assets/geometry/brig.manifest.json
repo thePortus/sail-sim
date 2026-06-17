@@ -1,0 +1,77 @@
+{
+  "model": "brig.glb",
+  "schema_version": 2,
+  "units": "meters",
+  "up_axis": "Y",
+  "forward_axis": "+Z (bow)",
+  "right_axis": "+X (starboard)",
+  "frame_range": [0, 30],
+  "fps_authored": 30,
+  "constants": {
+    "rudder_max_deg": 30.0,
+    "gun_run_m": 0.55,
+    "gun_recoil_m": 0.55,
+    "anchor_drop_m": 3.4,
+    "trim_max_deg": 30.0,
+    "clip_frame_end": 30
+  },
+  "skeleton": {
+    "armature_node": "Brig_Rig",
+    "joints": [
+      "B_Rudder", "B_Wheel", "B_Gaff", "B_Boom",
+      "B_Yard_Course", "B_Yard_LowerTops", "B_Yard_UpperTops", "B_Yard_TGallant", "B_Yard_Royal",
+      "B_Gun_S", "B_Gun_P", "B_Lid_S0", "B_Lid_S1", "B_Lid_S2", "B_Lid_S3", "B_Lid_P0", "B_Lid_P1", "B_Lid_P2", "B_Lid_P3",
+      "B_Anchor_S", "B_Anchor_P", "B_Mast_Fore", "B_Mast_Main",
+      "B_Flag_Ensign", "B_Flag_Burgee", "B_Flag_Pennant"
+    ]
+  },
+  "notes": [
+    "Two-masted brigantine: square-rigged FOREmast (5 yards) + fore-and-aft gaff MAINmast. Bow +Z, up +Y.",
+    "AnimationGroups carry an 'NLA_' prefix in the GLB (NLA_Rudder, NLA_Trim, ...); the BrigController strips both the NLA_ prefix and the loader's .NNN suffix.",
+    "Trim is SYMMETRIC (one scrub coordinates the 5 square yards + the gaff): 0=braced to one tack, 0.5=square/centred, 1=braced to the other tack.",
+    "Guns are PER SIDE with gunport LIDS: open the lid then run the gun out (Lid_{S|P} + Gun_{S|P}). Recoil kicks the gun term toward stowed. Clip side-naming already reads the GAME side after the glTF handedness flip.",
+    "TWO anchors (AnchorDrop_S / AnchorDrop_P); the game lowers whichever side it randomly picked, cat-tackle cable pays out via the CatTackle Drop_{S|P} morph (baked into the clip).",
+    "Sails furl by DIRECT morph drive (not the NLA_Furl_* clips): each Sail_* has a 'Furl' shape key; the modelled running rigging follows via Furl_<SailName> shape keys on Clews / RunRig_Sheets / UpperSheets (see sail_sheet_pairs). 0=set, 1=furled.",
+    "MAST DAMAGE: a SINGLE collective masts-zone HP drives BOTH masts. The foremast comes down first (while HP remains); the mainmast comes down only at 0 HP. Each topples about its own hinge bone carrying its yards/sails/standing-rigging, with a Break morph for the splintered snap.",
+    "Flags (B_Flag_Ensign on the gaff, B_Flag_Burgee fore truck, B_Flag_Pennant main truck) + B_Wheel have NO clips — driven in code: flags stream downwind & flutter (limp when the wind is dead), the wheel spins with the helm."
+  ],
+  "sail_sheet_pairs": [
+    { "sail": "ForeCourse",        "sail_morph": { "node": "Sail_ForeCourse",        "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_ForeCourse" } ] },
+    { "sail": "ForeLowerTops",     "sail_morph": { "node": "Sail_ForeLowerTops",     "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "ForeUpperTops",     "sail_morph": { "node": "Sail_ForeUpperTops",     "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "ForeTGallant",      "sail_morph": { "node": "Sail_ForeTGallant",      "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "ForeRoyal",         "sail_morph": { "node": "Sail_ForeRoyal",         "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "MainGaff",          "sail_morph": { "node": "Sail_MainGaff",          "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "GaffTopsail",       "sail_morph": { "node": "Sail_GaffTopsail",       "target": "Furl" }, "rigging_morphs": [] },
+    { "sail": "ForeStaysail",      "sail_morph": { "node": "Sail_ForeStaysail",      "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_ForeStaysail" } ] },
+    { "sail": "InnerJib",          "sail_morph": { "node": "Sail_InnerJib",          "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_InnerJib" } ] },
+    { "sail": "FlyingJib",         "sail_morph": { "node": "Sail_FlyingJib",         "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_FlyingJib" } ] },
+    { "sail": "MainStaysail",      "sail_morph": { "node": "Sail_MainStaysail",      "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_MainStaysail" } ] },
+    { "sail": "MainTopStaysail",   "sail_morph": { "node": "Sail_MainTopStaysail",   "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_MainTopStaysail" } ] },
+    { "sail": "MainTGallStaysail", "sail_morph": { "node": "Sail_MainTGallStaysail", "target": "Furl" }, "rigging_morphs": [ { "node": "RunRig_Sheets", "target": "Furl_MainTGallStaysail" } ] }
+  ],
+  "mast_damage_zones": [
+    {
+      "id": "fore",
+      "fall_clip": "MastDown_Fore",
+      "hinge_bone": "B_Mast_Fore",
+      "break_morph": { "node": "Mast_Fore_Lower", "target": "Break_Fore" },
+      "order": "first",
+      "note": "Foremast topples first — fully down while HP remains (collapse 0->1 mapped over mast-damage fraction 0.40..0.70)."
+    },
+    {
+      "id": "main",
+      "fall_clip": "MastDown_Main",
+      "hinge_bone": "B_Mast_Main",
+      "break_morph": { "node": "Mast_Main_Lower", "target": "Break_Main" },
+      "order": "last",
+      "note": "Mainmast topples last — only at 0 HP (collapse 0->1 mapped over mast-damage fraction 0.70..1.00)."
+    }
+  ],
+  "free_rotation_bones": {
+    "B_Flag_Ensign":  { "role": "ensign (parented to B_Gaff, inherits trim yaw)", "drive": "code", "suggestion": "stream downwind + flutter; limp when wind dead" },
+    "B_Flag_Burgee":  { "role": "burgee at the fore truck", "drive": "code", "suggestion": "stream downwind + flutter" },
+    "B_Flag_Pennant": { "role": "pennant at the main truck", "drive": "code", "suggestion": "stream downwind + flutter, longer lag" },
+    "B_Wheel":        { "role": "ship's wheel", "drive": "code", "suggestion": "spin with the helm" }
+  }
+}

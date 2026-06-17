@@ -9,6 +9,8 @@ import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { catchError, of } from 'rxjs';
 
+import { FACTIONS, factionColor, factionName } from '../sailing/faction.config';
+import type { TerrainHarbor }  from '../sailing/models';
 import { SceneService }       from '../sailing/services/scene.service';
 import { OceanService }       from '../sailing/services/ocean.service';
 import { OceanFFTEngine }      from '../sailing/services/ocean-fft-engine.service';
@@ -20,6 +22,7 @@ import { VesselAssetCacheService } from '../sailing/services/vessel-asset-cache.
 import { clearScatterCache } from '../sailing/services/scatter/asset-loader';
 import { WeatherService }     from '../sailing/services/weather.service';
 import { CloudService }       from '../sailing/services/cloud.service';
+import { TelescopeService }   from '../sailing/services/telescope.service';
 import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
@@ -36,11 +39,15 @@ import { AuthService }        from '../services/auth.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
-import { VesselSelectorComponent } from '../sailing/components/vessel-selector/vessel-selector.component';
 import { AdminPanelComponent }     from '../sailing/components/admin-panel/admin-panel.component';
 import { PauseMenuComponent }      from '../sailing/components/pause-menu/pause-menu.component';
 import { SettingsMenuComponent }   from '../sailing/components/settings-menu/settings-menu.component';
+import { HelpMenuComponent }       from '../sailing/components/help-menu/help-menu.component';
 import { TraderMenuComponent }     from './trader-menu.component';
+import { ShipwrightMenuComponent } from './shipwright-menu.component';
+import { TavernMenuComponent } from './tavern-menu.component';
+import { GovernorMenuComponent } from './governor-menu.component';
+import { DiplomacyMenuComponent } from './diplomacy-menu.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -50,16 +57,25 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, VesselSelectorComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, TraderMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
       <canvas #gameCanvas class="game-canvas"
               [class.game-canvas--visible]="phase() === 'sailing'"></canvas>
 
-      <!-- Vessel selection screen -->
-      @if (phase() === 'selecting') {
-        <app-vessel-selector (vesselSelected)="onVesselSelected($event)" />
+      <!-- No vessel-selection screen anymore: the game auto-boots into the player's OWNED ship (bought at a
+           port shipwright). The 'selecting' phase is now just a transient pre-boot state; if startup fails it
+           shows a retry card. -->
+      @if (phase() === 'selecting' && initError()) {
+        <div class="kick-notice-backdrop">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚓</div>
+            <div class="kick-notice-title">Becalmed</div>
+            <div class="kick-notice-text">{{ initError() }}</div>
+            <button class="kick-notice-btn" (click)="startGame()">Retry</button>
+          </div>
+        </div>
       }
 
       <!-- Kicked / banned notice (prominent, dismissable) -->
@@ -70,6 +86,18 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
             <div class="kick-notice-title">Disconnected</div>
             <div class="kick-notice-text">{{ kickedNotice() }}</div>
             <button class="kick-notice-btn" (click)="dismissKicked()">Dismiss</button>
+          </div>
+        </div>
+      }
+
+      <!-- Lost connection to the server (server down / network drop) — OK returns to the home screen -->
+      @if (serverLostNotice()) {
+        <div class="kick-notice-backdrop">
+          <div class="kick-notice" (click)="$event.stopPropagation()">
+            <div class="kick-notice-icon">⚠️</div>
+            <div class="kick-notice-title">Connection Lost</div>
+            <div class="kick-notice-text">Lost contact with the server — it may be down or restarting. Please try again shortly.</div>
+            <button class="kick-notice-btn" (click)="onConnectionLostOk()">OK</button>
           </div>
         </div>
       }
@@ -88,16 +116,20 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
       <!-- In-game HUD -->
       @if (phase() === 'sailing') {
-        <app-hud (exitGame)="onExitGame()" (photoModeChange)="photoMode.set($event)" />
+        <app-hud (exitGame)="onReturnToHarbor()" (photoModeChange)="photoMode.set($event)" />
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
-          <app-pause-menu (resume)="onResume()" (quit)="onExitGame()"
-                          (openSettings)="showSettings.set(true)" />
+          <app-pause-menu (resume)="onResume()" (quit)="onReturnToHarbor()"
+                          (openSettings)="showSettings.set(true)" (openHelp)="showHelp.set(true)" />
         }
         <!-- Settings panel — opened from the pause menu -->
         @if (showSettings()) {
           <app-settings-menu (close)="showSettings.set(false)" />
+        }
+        <!-- Help / controls reference — opened from the pause menu -->
+        @if (showHelp()) {
+          <app-help-menu (close)="showHelp.set(false)" />
         }
         <div class="minimap-anchor">
           <app-minimap />
@@ -110,19 +142,39 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 
         <!-- Dock prompt + town menu (when near a harbor and not sunk) -->
         @if (!combatService.sunk() && harborService.dockable(); as town) {
-          @if (!dockMenuOpen()) {
-            <button class="dock-prompt" (click)="dockMenuOpen.set(true)">⚓ Dock at {{ town.name }}</button>
-          } @else {
+          @if (vesselService.tiedUp()) {
             <div class="dock-menu">
               <div class="dock-name">{{ town.name }}</div>
+              @if (town.faction) {
+                <div class="dock-faction"><span class="dock-faction-dot" [style.background]="factionColor(town.faction)"></span>{{ factionLabel(town) }}</div>
+              }
               <div class="dock-desc">{{ town.description }}</div>
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
-              <button class="dock-opt" (click)="onRepairVessel()">
-                Repair Vessel ({{ multiplayerService.gold() >= repairFee ? repairFee + 'g' : 'free' }})
-              </button>
-              <button class="dock-cast" (click)="dockMenuOpen.set(false)">Cast Off</button>
+              <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
+              <button class="dock-opt" (click)="onTavern()">Tavern</button>
+              @if (town.faction) {
+                <button class="dock-opt" (click)="onGovernor()">{{ town.tier === 'capital' ? "Governor's Mansion" : "Mayor's House" }}</button>
+              }
+              <button class="dock-cast" (click)="onCastOff()">Cast Off</button>
             </div>
+          } @else if (vesselService.docking()) {
+            <div class="dock-prompt dock-mooring">⚓ Mooring at {{ town.name }}…</div>
+          } @else {
+            <button class="dock-prompt" (click)="onDock(town)">⚓ Dock at {{ town.name }}</button>
           }
+        }
+
+        <!-- Physics v2 tuning overlay (only when localStorage.ignis_physics='v2') -->
+        @if (vesselService.physDebug(); as pd) {
+          <div class="phys-debug">
+            <div class="phys-row"><span>app wind</span><b>{{ pd.appAngle | number:'1.0-0' }}° · {{ pd.appWind | number:'1.1-1' }}</b></div>
+            <div class="phys-row"><span>true wind</span><b>{{ pd.trueAngle | number:'1.0-0' }}°</b></div>
+            <div class="phys-row"><span>speed</span><b>{{ pd.speed | number:'1.2-2' }}</b></div>
+            <div class="phys-row"><span>VMG</span><b>{{ pd.vmg | number:'1.2-2' }}</b></div>
+            <div class="phys-row"><span>trim</span><b>{{ pd.trim * 100 | number:'1.0-0' }}%</b></div>
+            <div class="phys-row"><span>heel</span><b [class.phys-warn]="pd.reef">{{ pd.heel | number:'1.0-0' }}°{{ pd.reef ? ' ⚠ reef' : '' }}</b></div>
+            <div class="phys-row"><span>thrust / drag</span><b>{{ pd.thrust | number:'1.1-1' }} / {{ pd.drag | number:'1.1-1' }}</b></div>
+          </div>
         }
 
         <!-- Trader panel (opened from the dock menu's Trade button) -->
@@ -130,9 +182,39 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-trader-menu (close)="tradeMenuOpen.set(false)" />
         }
 
+        <!-- Shipwright panel (opened from the dock menu's Shipwright button) -->
+        @if (shipwrightOpen()) {
+          <app-shipwright-menu [admin]="isAdmin" (close)="shipwrightOpen.set(false)" />
+        }
+
+        <!-- Tavern panel (opened from the dock menu's Tavern button) -->
+        @if (tavernOpen()) {
+          <app-tavern-menu (close)="tavernOpen.set(false)" />
+        }
+
+        <!-- Governor's Mansion / Mayor's House (opened from the dock menu) — buy back bad standing -->
+        @if (governorOpen() && harborService.dockable(); as govTown) {
+          <app-governor-menu [town]="govTown" [admin]="isAdmin" (close)="governorOpen.set(false)" />
+        }
+
+        <!-- Diplomacy panel (opened from the Ship's Hold or the K key) — faction relations + your standing -->
+        @if (diplomacyOpen()) {
+          <app-diplomacy-menu (close)="diplomacyOpen.set(false)" />
+        }
+
         <!-- Salvage toast — flashes when you scoop a sunk merchant's crate -->
         @if (salvageNotice(); as note) {
           <div class="salvage-toast">📦 {{ note }}</div>
+        }
+
+        <!-- Reputation toast — flashes the per-nation standing change after attacking shipping -->
+        @if (repNotice(); as rep) {
+          <div class="rep-toast">{{ rep }}</div>
+        }
+
+        <!-- Diplomacy banner — a prominent flash when nations declare war / make peace / ally -->
+        @if (diploBanner(); as b) {
+          <div class="diplo-banner" [class.war]="b.war">{{ b.text }}</div>
         }
 
         <!-- Ship's Hold — gold + cargo, viewable anytime with I or Tab -->
@@ -153,7 +235,18 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
             } @else {
               <div class="inv-empty">Your hold is empty — visit a town's trader to buy goods.</div>
             }
-            <div class="inv-hint">Press I or Tab to close</div>
+            <div class="inv-rep-title">Standing with the Powers</div>
+            <div class="inv-rep">
+              @for (f of factionStandings(); track f.id) {
+                <div class="inv-rep-row">
+                  <span class="inv-rep-swatch" [style.background]="f.color"></span>
+                  <span class="inv-rep-name">{{ f.name }}</span>
+                  <span class="inv-rep-val" [class.pos]="f.value > 0" [class.neg]="f.value < 0">{{ f.label }}</span>
+                </div>
+              }
+            </div>
+            <button class="inv-diplo-btn" (click)="openDiplomacy()">⚔ View Faction Relations</button>
+            <div class="inv-hint">Press I or Tab to close · K for diplomacy</div>
           </div>
         }
 
@@ -192,11 +285,15 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                    color: #ffe9b0; font-weight: 600; font-family: ui-monospace, monospace;
                    box-shadow: 0 6px 20px rgba(0,0,0,0.5); transition: all 0.15s; }
     .dock-prompt:hover { background: rgba(40,52,68,0.92); }
+    .dock-mooring { cursor: default; opacity: 0.8; }
+    .dock-mooring:hover { background: rgba(20,28,40,0.86); }
     .dock-menu { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
                  z-index: 60; min-width: 280px; padding: 22px 26px; text-align: center;
                  border-radius: 14px; border: 1px solid rgba(232,211,160,0.4);
                  background: rgba(12,20,32,0.95); box-shadow: 0 14px 44px rgba(0,0,0,0.6); }
     .dock-name { color: #ffe9b0; font-size: 1.2rem; font-weight: 700; }
+    .dock-faction { display: flex; align-items: center; gap: 6px; margin-top: 4px; color: #dbe7f0; font-size: 0.82rem; }
+    .dock-faction-dot { width: 10px; height: 10px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.5); flex: none; }
     .dock-desc { color: #cfe3f5; opacity: 0.75; font-size: 0.85rem; margin: 6px 0 16px;
                  font-family: ui-monospace, monospace; }
     .dock-opt  { display: block; width: 100%; padding: 10px; margin-bottom: 8px; cursor: pointer;
@@ -229,11 +326,35 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
     .inv-row:nth-child(odd) { background: rgba(255,255,255,0.03); }
     .inv-qty { color: #f0c869; font-variant-numeric: tabular-nums; font-weight: 600; }
     .inv-empty { padding: 1.2rem 0; text-align: center; color: #b89a62; font-style: italic; }
+    .inv-rep-title { margin: 0.9rem 0 0.4rem; padding-top: 0.6rem; border-top: 1px solid rgba(184,138,62,0.25);
+                     color: #b89a62; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .inv-rep { display: flex; flex-direction: column; gap: 2px; }
+    .inv-rep-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.28rem 0.2rem; border-radius: 5px; }
+    .inv-rep-row:nth-child(odd) { background: rgba(255,255,255,0.03); }
+    .inv-rep-swatch { width: 11px; height: 11px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.45); flex: none; }
+    .inv-rep-name { flex: 1; color: #f0e3c6; }
+    .inv-rep-val { color: #cdbb95; font-variant-numeric: tabular-nums; }
+    .inv-rep-val.pos { color: #9fe0a0; }
+    .inv-rep-val.neg { color: #f0a8a0; }
+    .inv-diplo-btn { margin-top: 0.7rem; width: 100%; padding: 0.5rem; cursor: pointer; background: rgba(184,138,62,0.14); color: #e7d6ab; border: 1px solid rgba(184,138,62,0.4); border-radius: 6px; font-family: inherit; font-size: 0.85rem; }
+    .inv-diplo-btn:hover { background: rgba(184,138,62,0.24); }
+    .rep-toast { position: absolute; top: 8.5rem; left: 50%; transform: translateX(-50%); z-index: 85; padding: 8px 16px; border-radius: 8px; background: rgba(20,12,6,0.86); border: 1px solid rgba(184,138,62,0.4); color: #f0e3c6; font-family: 'IBM Plex Serif', Georgia, serif; font-size: 0.9rem; white-space: nowrap; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+    .diplo-banner { position: absolute; top: 30%; left: 50%; transform: translateX(-50%); z-index: 86; padding: 12px 26px; border-radius: 10px; background: rgba(20,12,6,0.92); border: 1px solid rgba(184,138,62,0.5); color: #f0e3c6; font-family: 'IBM Plex Serif', Georgia, serif; font-size: 1.05rem; font-weight: 600; text-align: center; max-width: 80vw; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+    .diplo-banner.war { border-color: rgba(248,81,73,0.7); color: #ffd9d4; }
     .inv-hint { margin-top: 0.8rem; text-align: center; color: #8a7448; font-size: 0.72rem; }
     .game-root   { position: fixed; inset: 0; background: #08111e; overflow: hidden; }
     .game-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
                    opacity: 0; transition: opacity 0.8s ease; }
     .game-canvas--visible { opacity: 1; }
+    /* Physics v2 tuning overlay */
+    .phys-debug { position: absolute; top: 4.5rem; left: 1rem; z-index: 55; min-width: 168px;
+                  padding: 8px 10px; border-radius: 8px; background: rgba(10,16,24,0.74);
+                  border: 1px solid rgba(120,160,200,0.35); color: #cfe3f5; pointer-events: none;
+                  font-family: ui-monospace, monospace; font-size: 0.72rem; line-height: 1.5; }
+    .phys-row { display: flex; justify-content: space-between; gap: 14px; }
+    .phys-row span { opacity: 0.66; }
+    .phys-row b { color: #ffe9b0; font-weight: 600; }
+    .phys-row b.phys-warn { color: #ff9a6b; }
     .loading-overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
                         align-items: center; justify-content: center;
                         background: radial-gradient(ellipse at center, #3a2817 0%, #15100a 70%); }
@@ -265,10 +386,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private oceanFftRenderer     = inject(OceanFFTRenderer);
   private terrainService     = inject(TerrainService);
   protected harborService    = inject(HarborService);   // template reads dockable()
-  private vesselService      = inject(VesselService);
+  protected vesselService    = inject(VesselService);   // template reads docking()/tiedUp()
   private vesselAssetCache   = inject(VesselAssetCacheService);
   private weatherService     = inject(WeatherService);
   private cloudService       = inject(CloudService);
+  private telescopeService   = inject(TelescopeService);
   private oceanAudioService  = inject(OceanAudioService);
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
@@ -283,17 +405,26 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   readonly musicService       = inject(MusicService);    // public: PauseMenuComponent also injects it
 
   phase      = signal<GamePhase>('selecting');
+  initError  = signal<string | null>(null);   // shown as a retry card if auto-boot fails
   /** True once the BabylonJS scene/engine has been booted this session. Gates teardown so it runs for
    *  a partially-initialised game (e.g. aborting mid-init on an auth failure), not just while sailing. */
   private sceneStarted = false;
   paused       = signal<boolean>(false);
   showSettings = signal<boolean>(false);
+  showHelp     = signal<boolean>(false);   // the Help / controls reference, opened from the pause menu
   dockMenuOpen = signal<boolean>(false);   // the town interaction menu (opened from the Dock prompt)
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
+  shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
+  tavernOpen = signal<boolean>(false);     // the tavern panel (opened from the town menu's Tavern button — recruit crew)
+  governorOpen = signal<boolean>(false);   // the Governor's Mansion / Mayor's House panel (buy back bad standing)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
+  diplomacyOpen = signal<boolean>(false);  // the Diplomacy panel (K / Ship's Hold button) — faction relations + standing
   salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
   private salvageTimer: ReturnType<typeof setTimeout> | null = null;
-  protected readonly repairFee = 40;       // dock repair cost in gold (matches server REPAIR_FEE)
+  repNotice = signal<string | null>(null);       // transient reputation-change toast after attacking shipping
+  private repTimer: ReturnType<typeof setTimeout> | null = null;
+  diploBanner = signal<{ text: string; war: boolean } | null>(null);   // prominent war/peace/alliance flash
+  private diploTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Cargo as a sorted display list { id, name, qty } using the server-sent goods catalogue. */
   protected inventoryList = computed(() => {
@@ -305,19 +436,43 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   });
   protected inventoryUsed = computed(() =>
     Object.values(this.multiplayerService.cargo()).reduce((a, b) => a + (b || 0), 0));
+
+  /** Faction colour for a town (dock menu swatch). */
+  protected factionColor(id?: string | null): string { return factionColor(id); }
+  /** Dock-menu faction label: nation (+ "contested by Rival" note). */
+  protected factionLabel(town: TerrainHarbor): string {
+    return factionName(town.faction) + (town.contested && town.rivalFaction ? ` — contested by ${factionName(town.rivalFaction)}` : '');
+  }
+
+  /** Faction standings for the Ship's Hold readout — every nation, neutral by default (scaffold; no effects). */
+  protected factionStandings = computed(() => {
+    const rep = this.multiplayerService.factionRep();
+    return FACTIONS.map((f) => {
+      const v = Math.round(rep[f.id] ?? 0);
+      return { id: f.id, name: f.name, color: f.color, value: v, label: v === 0 ? 'Neutral' : (v > 0 ? `+${v}` : String(v)) };
+    });
+  });
   photoMode    = signal<boolean>(false);   // mirrored from the HUD; hides our chrome (minimap, admin hint)
   loadingMsg = signal('Charting the archipelago…');
 
   @HostListener('window:keydown.escape')
   onEscKey(): void {
     if (this.phase() !== 'sailing') return;
-    // Esc backs out of the hold first; then Settings; then stands down an armed gun; then pause.
+    // Esc backs out of the hold/diplomacy first; then Settings; then stands down an armed gun; then pause.
     if (this.inventoryOpen()) {
       this.inventoryOpen.set(false);
       return;
     }
+    if (this.diplomacyOpen()) {
+      this.diplomacyOpen.set(false);
+      return;
+    }
     if (this.showSettings()) {
       this.showSettings.set(false);
+      return;
+    }
+    if (this.showHelp()) {
+      this.showHelp.set(false);
       return;
     }
     if (this.cannonService.anyCancellable()) {
@@ -335,6 +490,17 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     e.preventDefault();                          // Tab would otherwise move focus
     this.inventoryOpen.update(v => !v);
   }
+
+  // Toggle the Diplomacy panel (faction relations + standing) with K — viewable anytime while sailing.
+  @HostListener('window:keydown.k', ['$event'])
+  onDiplomacyKey(e: KeyboardEvent): void {
+    if (this.phase() !== 'sailing' || this.typingInField()) return;
+    e.preventDefault();
+    this.diplomacyOpen.update(v => !v);
+  }
+
+  /** Open Diplomacy from the Ship's Hold button (and close the hold so one panel shows at a time). */
+  protected openDiplomacy(): void { this.inventoryOpen.set(false); this.diplomacyOpen.set(true); }
 
   /** True when a text field (e.g. chat) is focused, so game hotkeys don't hijack typing. */
   private typingInField(): boolean {
@@ -412,21 +578,61 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
-    // Sailed away from the pier → close the town menu (and trader panel) if they were open.
+    // Socket dropped unexpectedly (server down / network loss) → show the lost-connection popup (OK → home).
+    effect(() => {
+      if (!this.multiplayerService.connectionLost()) return;
+      untracked(() => this.serverLostNotice.set(true));
+    });
+
+    // Moored at a berth → open the town menu; cast off → close it. dockMenuOpen mirrors the vessel's tied
+    // state so all the existing panel-close logic (below) keeps working unchanged.
+    effect(() => {
+      const tied = this.vesselService.tiedUp();
+      untracked(() => this.dockMenuOpen.set(tied));
+    });
+
+    // Sailed away from the pier → close the town menu (and trader/shipwright panels) if they were open.
     effect(() => {
       if (!this.harborService.dockable()) {
         untracked(() => {
           if (this.dockMenuOpen()) this.dockMenuOpen.set(false);
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+          if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
+          if (this.tavernOpen()) this.tavernOpen.set(false);
+          if (this.governorOpen()) this.governorOpen.set(false);
         });
       }
     });
 
-    // Closing the town menu (Cast Off, or any path) closes the trader panel too — the trader lives "inside" it.
+    // Photo mode hides the DOM chrome (CSS) AND the 3-D floating nameplates (ship + town) for a clean screenshot.
     effect(() => {
-      if (!this.dockMenuOpen() && untracked(() => this.tradeMenuOpen())) {
-        untracked(() => { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); });
+      const pm = this.photoMode();
+      this.multiplayerService.setLabelsHidden(pm);
+      this.harborService.setLabelsHidden(pm);
+    });
+
+    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright + tavern + governor panels too.
+    effect(() => {
+      if (!this.dockMenuOpen()) {
+        untracked(() => {
+          if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
+          if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
+          if (this.tavernOpen()) this.tavernOpen.set(false);
+          if (this.governorOpen()) this.governorOpen.set(false);
+        });
       }
+    });
+
+    // Shipwright purchase succeeded → refit the in-world vessel into the new hull (fetch its full def, then
+    // hot-swap in place), close the panel, and clear the signal. Server already updated gold + ownedShip.
+    effect(() => {
+      const slug = this.multiplayerService.purchasedShip();
+      if (!slug) return;
+      untracked(() => {
+        this.multiplayerService.purchasedShip.set(null);
+        this.shipwrightOpen.set(false);
+        void this.refitVessel(slug);
+      });
     });
 
     // Arrived at the rumoured town → the rumour is fulfilled, clear its map beacon.
@@ -451,6 +657,33 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.salvageTimer = setTimeout(() => this.salvageNotice.set(null), 3500);
       });
     });
+
+    // Reputation change (attacked/sank a nation's shipping) → flash the per-nation deltas as a toast.
+    effect(() => {
+      const t = this.multiplayerService.repToast();
+      if (!t) return;
+      untracked(() => {
+        const parts = Object.entries(t.deltas)
+          .filter(([, d]) => d)
+          .map(([fid, d]) => `${d > 0 ? '+' : ''}${d} ${factionName(fid)}`);
+        if (parts.length) this.repNotice.set('Reputation: ' + parts.join(' · '));
+        this.multiplayerService.repToast.set(null);
+        if (this.repTimer) clearTimeout(this.repTimer);
+        this.repTimer = setTimeout(() => this.repNotice.set(null), 3500);
+      });
+    });
+
+    // Diplomacy shift (war / peace / alliance) → a prominent banner for a few seconds (also in chat).
+    effect(() => {
+      const b = this.multiplayerService.diplomacyBanner();
+      if (!b) return;
+      untracked(() => {
+        this.diploBanner.set({ text: b.text, war: b.to === 'war' });
+        this.multiplayerService.diplomacyBanner.set(null);
+        if (this.diploTimer) clearTimeout(this.diploTimer);
+        this.diploTimer = setTimeout(() => this.diploBanner.set(null), 6000);
+      });
+    });
   }
 
   // Prominent "you were disconnected" banner (kick/ban/duplicate-login).
@@ -460,12 +693,24 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.multiplayerService.kickedReason.set(null);
   }
 
-  ngAfterViewInit(): void {
-    // Scene initialises only after vessel selection (canvas not yet visible)
+  // Lost-connection popup (mirrors kickedNotice, but driven by the service's connectionLost signal). OK
+  // returns to the home screen (navigation destroys this component → ngOnDestroy tears multiplayer down).
+  serverLostNotice = signal(false);
+  onConnectionLostOk(): void {
+    this.serverLostNotice.set(false);
+    this.multiplayerService.connectionLost.set(false);
+    this.onReturnToHarbor();
   }
 
-  async onVesselSelected(event: { slug: string }): Promise<void> {
-    this.selectedSlug = event.slug;
+  ngAfterViewInit(): void {
+    // No vessel-selection step anymore — boot straight into the player's owned ship once the canvas exists.
+    void this.startGame();
+  }
+
+  /** Boot straight into the game with the player's OWNED ship (no vessel-selection screen — ships are now
+   *  bought at a port shipwright). Re-runnable: a Retry on the error card calls it again. */
+  async startGame(): Promise<void> {
+    this.initError.set(null);
     // Read the permanent callsign from stored credentials
     try {
       const raw = this.authService.getUserDetails();
@@ -478,6 +723,15 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     try {
       await this.runInitStep('verify-auth', 'Verifying credentials…', async () => {
         await firstValueFrom(this.http.get(`${Settings.apiUrl}user/me`));
+      });
+
+      // Owned vessel (map-independent) — build whatever hull the player owns. Defaults to the pinnace for
+      // a brand-new player. Fetched here, before the vessel build below reads this.selectedSlug.
+      this.selectedSlug = await this.runInitStep('fetch-ship', 'Mustering your crew…', async () => {
+        try {
+          const r = await firstValueFrom(this.http.get<{ ship: string }>(`${Settings.apiUrl}player-ship`));
+          return (r?.ship) || 'pinnace';
+        } catch { return 'pinnace'; }
       });
 
       // 1. Boot BabylonJS scene (WebGPU/WebGL)
@@ -497,6 +751,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         this.oceanFftRenderer.init();
         // PERF DIAGNOSTIC: ?noclouds skips the volumetric clouds (raymarch) to isolate their cost.
         if (!location.search.includes('noclouds')) { this.cloudService.init(); }
+        // Hold-right-click spyglass magnifier (camera + canvas exist by now).
+        this.telescopeService.init();
         // Weather-driven ambient sea bed (filtered-noise wash + whitecap hiss).
         this.oceanAudioService.init();
       });
@@ -614,6 +870,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('[GameInit] Fatal startup error:', err);
       this.loadingMsg.set('Startup failed. Check browser console for [GameInit] logs.');
+      this.initError.set('Could not set sail. Check your connection and try again.');
       this.phase.set('selecting');
       return;
     }
@@ -654,6 +911,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.cannonService.dispose();
     this.musicService.dispose();
     this.cloudService.dispose();
+    this.telescopeService.dispose();
     this.oceanAudioService.dispose();
     this.dolphinService.dispose();
     this.seaweedService.dispose();
@@ -687,6 +945,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   onResume(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+    this.showHelp.set(false);
   }
 
   /** Acknowledge a sinking → respawn at the nearest harbor town (teleport + full repair). The server
@@ -698,27 +957,75 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.multiplayerService.requestRespawn();
   }
 
+  /** Dock prompt: auto-steer the boat to a tie-up berth alongside the pier, then moor (the town menu
+   *  opens once tied — see the effect in the constructor). */
+  onDock(town: TerrainHarbor): void {
+    const p = this.vesselService.getPosition();
+    const heading = this.vesselService.state().heading;
+    const berth = this.harborService.computeBerth(town, p.x, p.z, heading);
+    this.vesselService.dockAt(berth);
+  }
+
+  /** Cast off: release the mooring so the helm answers again (closes the town menu via the tiedUp effect). */
+  onCastOff(): void {
+    this.vesselService.castOff();
+  }
+
   /** Dock action: open the town trader (asks the server for this town's market quote). */
   onTrade(townId: string): void {
     this.multiplayerService.openTrade(townId);
     this.tradeMenuOpen.set(true);
   }
 
-  /** Dock action: repair the hull to full IN PLACE (no teleport), then stay on the town menu. */
-  onRepairVessel(): void {
-    this.multiplayerService.requestCombatReset();
-    // Keep the town menu open (return to the main town screen) — "Cast Off" leaves.
+  /** Dock action: open the shipwright (hull repair + buy/commission vessels). The panel fetches the catalogue itself. */
+  onShipwright(): void {
+    this.multiplayerService.shipError.set(null);
+    this.shipwrightOpen.set(true);
+  }
+
+  /** Dock action: open the tavern (recruit crew lost to grapeshot). The panel reads the live crew count. */
+  /** Dock action: open the Governor's Mansion / Mayor's House (buy back bad standing with the town's nation). */
+  onGovernor(): void {
+    this.multiplayerService.pardonError.set(null);
+    this.governorOpen.set(true);
+  }
+
+  onTavern(): void {
+    this.multiplayerService.recruitError.set(null);
+    this.tavernOpen.set(true);
+  }
+
+  /** Refit the local vessel into a freshly-bought hull: fetch its full def, then hot-swap in place. */
+  private async refitVessel(slug: string): Promise<void> {
+    try {
+      const vessel = await firstValueFrom(this.http.get<Vessel>(`${Settings.apiUrl}vessels/${slug}`));
+      await this.vesselService.swapVessel(vessel);
+      this.selectedSlug = slug;
+    } catch (err) {
+      console.warn('[Shipwright] refit failed:', err);
+    }
   }
 
   /** Called by the HUD exit button or pause menu — tears down the scene and returns to vessel selection. */
   onExitGame(): void {
     this.paused.set(false);
     this.showSettings.set(false);
+    this.showHelp.set(false);
     this.teardown(true);   // keep the WebGPU engine alive; only the Scene is rebuilt on re-entry
     this.selectedSlug = '';
     this.callsign     = '';
     this.loadingMsg.set('Charting the archipelago…');
     this.phase.set('selecting');
+  }
+
+  /** "Return to Harbour" → leave the game session entirely and go to the home screen.
+   *  Navigation destroys this component, so ngOnDestroy → teardown() disconnects multiplayer and
+   *  disposes the scene/engine (teardown is idempotent, so the explicit path stays clean). */
+  onReturnToHarbor(): void {
+    this.paused.set(false);
+    this.showSettings.set(false);
+    this.showHelp.set(false);
+    this.router.navigate(['/home']);
   }
 
   ngOnDestroy(): void {

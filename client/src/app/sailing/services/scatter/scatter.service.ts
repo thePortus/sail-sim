@@ -10,7 +10,7 @@ import { ThinInstancePatch } from './instancing/thin-instance-patch';
 import { IPatch } from './instancing/i-patch';
 import { GpuScatterPatch } from './instancing/gpu-scatter-patch';
 import {
-  ScatterCompute, PadBox, GRASS_WGSL, ROCKS_WGSL, DRIFT_WGSL, TREES_WGSL, PALMS_WGSL,
+  ScatterCompute, ShadowCompute, PadBox, GRASS_WGSL, ROCKS_WGSL, DRIFT_WGSL, TREES_WGSL, PALMS_WGSL,
 } from './scatter-compute';
 import { PatchManager } from './instancing/patch-manager';
 import { createGrassBlade } from './grass/grass-blade';
@@ -19,6 +19,8 @@ import { createDriftwood } from './props/driftwood';
 import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
+import { FarFadePlugin } from './far-fade.plugin';
+import { ImpostorHazePlugin } from './impostor-haze.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
@@ -96,6 +98,10 @@ interface Layer {
   /** Optional smaller patch ring (in cells) — used by the fake-shadow layers so blobs only build/keep
    *  within a near radius around the camera (cheap). Undefined → the full scatter RADIUS. */
   maxRing?: number;
+  /** Identifier for debug toggles (e.g. 'shadow'). */
+  tag?: string;
+  /** When true, ensurePatches skips this layer entirely (debug). */
+  disabled?: boolean;
 }
 
 /** A patch's instance data: the N×16 matrix buffer, and an optional N×4 per-instance colour buffer. */
@@ -125,6 +131,9 @@ export class ScatterService {
   // Fake-shadow blobs (shared flat disc + dark decal material, thin-instanced under each land asset).
   private _shadowDisc: Mesh | null = null;
   private _shadowMat: StandardMaterial | null = null;
+  // Static far-forest impostor layer: the beech impostor textures (captured on load) + the built meshes.
+  private beechImpostors: { tex: Texture; w: number; h: number; pad: number }[] = [];
+  private farMeshes: Mesh[] = [];
   private shadowRing = 3;                            // near ring (cells) the blobs build within
   private _sunAcc = 1;                               // throttle the sun-drive recompute (the sun crawls)
   private static readonly SHADOWS_ENABLED = true;
@@ -161,6 +170,14 @@ export class ScatterService {
   })();
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
   private densityMul = 1;               // grass acceptance multiplier (set from quality)
+  // The palm GLB's trunk base is authored this high above its origin (its lowest vertex is a drooping frond,
+  // not the base). recenterTrunkXZ bakes this down so the base sits at local y=0 — then placement just plants
+  // the origin at the ground (no per-scale sink), correctly on BOTH the CPU and GPU paths.
+  private static readonly PALM_TRUNK_Y = 2.4;
+  // Small constant "planted" depth below the (correct) sampled ground — same idea as the trees. Live-tunable
+  // via palmSink()/treeSink() while dialling it in.
+  private palmSink = 0.35;
+  private treeSink = 0.35;
   private enabled = true;               // false → no grass built at all (Potato)
   // ensurePatches throttle: skip the grid scan/cull while the camera stays in its 40 m cell with all
   // patches built. _patchPending = still filling in this cell (build cap not yet drained).
@@ -192,7 +209,10 @@ export class ScatterService {
 
     this.observer = scene.onBeforeRenderObservable.add(() => {
       const c = this.sceneService.camera;
-      if (c) { GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z; }
+      if (c) {
+        GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z;
+        FarFadePlugin.camera.x   = c.position.x; FarFadePlugin.camera.z   = c.position.z;   // far-forest fade
+      }
       // Drive the palm wind from the weather wind (the same source the sails use): unit direction +
       // a gust amplitude that grows with wind speed, plus a steadily-advancing clock.
       const wd = this.weatherService.weather()?.wind;
@@ -255,8 +275,8 @@ export class ScatterService {
     // Land grass — authored CLUMP GLBs (3 tussock variants, scattered at clump density, NOT per-blade).
     // Retires the old custom grass ShaderMaterial (which failed to compile on WebGPU). (Names start with
     // `scatter_` so the ocean refraction RTT's exclusion predicate skips foliage.)
-    // DISABLED for now (GRASS_ENABLED=false): the current clump models are too expensive — awaiting
-    // better authored grass. Flip the flag back to true to restore it.
+    // Re-enabled: the updated clump models are fuller (60–90 blades, wider footprint) so far fewer
+    // instances fill a field, and the scatter bottleneck that forced this off has since been resolved.
     if (ScatterService.GRASS_ENABLED) { await this.registerGrass(scene); }
 
     // Authored-GLB groups (streamed from the server, cached): beach rocks (5 shapes, size pebble→
@@ -266,6 +286,7 @@ export class ScatterService {
     await this.registerDriftwood(scene);
     await this.registerBeeches(scene);
     await this.registerPalms(scene);
+    this.setupSinkDebug();   // console tuner: __palmSink()/__treeSink()
 
     // Cheap fake shadows: a flat dark blob under each static land asset, near-ring only. Skipped on
     // Potato (no scatter) and via ?noshadows. Must come AFTER the asset layers so the asset placement
@@ -282,6 +303,7 @@ export class ScatterService {
     // register pass recreates them — and a /reloadassets rebuild may land on a different engine).
     for (const sc of this.scatterComputes.values()) { sc.dispose(); }
     this.scatterComputes.clear();
+    this.shadowCompute?.dispose(); this.shadowCompute = null;
     const meshes = new Set<Mesh>(), mats = new Set<Material>();
     for (const l of this.layers) {
       for (const [, p] of l.patches) { p?.dispose(); }
@@ -292,6 +314,13 @@ export class ScatterService {
     }
     for (const m of meshes) { m.dispose(); }
     for (const mm of mats) { mm.dispose(); }
+    // Static far-forest layer: per variant ONE shared material across its (hidden template + chunk clones),
+    // so dedupe material disposal — and textures are shared with the ring impostors above (don't force-dispose).
+    const farMats = new Set<Material>();
+    for (const m of this.farMeshes) { if (m.material) { farMats.add(m.material); } m.dispose(); }
+    for (const mm of farMats) { mm.dispose(); }
+    this.farMeshes = [];
+    this.beechImpostors = [];
     this.layers = [];
     this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
     this.townPads = null;                              // re-fetch town pads after a region/manifest change
@@ -333,9 +362,15 @@ export class ScatterService {
    *  material, with a real *_lod.glb far-LOD per clump, and register one scatter sub-layer per variant.
    *  Wind: draw-radius dissolve (GrassFadePlugin) + clump-scale sway/flutter (TreeWindPlugin). On any
    *  load failure → no grass (the old ShaderMaterial blade system is retired). */
-  /** Master on/off for the grass layer. Off while the current clump GLBs are too costly to render —
-   *  set true again once the replacement grass models land. */
-  private static readonly GRASS_ENABLED = false;
+  /** Master on/off for the grass layer. ON: the replacement fuller-clump GLBs landed (cheaper per field)
+   *  and the scatter bottleneck is resolved. */
+  private static readonly GRASS_ENABLED = true;
+  /** Grass leans HARD on the cheap LOD impostor for perf: full-detail clumps only in the patch RIGHT
+   *  next to the ship (`GRASS_NEAR` m), the cheap baked impostor for everything past that, and grass is
+   *  not built at all beyond `GRASS_RING` patch rings (distant terrain — too small to read). The fade
+   *  band (applyQualityParams) is sized to dissolve grass before this ring's hard cull, so no pop. */
+  private static readonly GRASS_NEAR = 30;    // metres: full clump LoD only within this of the patch centre
+  private static readonly GRASS_RING = 4;     // patch rings (×40 m ≈ 180 m) — no grass past this
 
   private async registerGrass(scene: Scene): Promise<void> {
     const mat = buildGrassMaterial(scene, 'scatter_grass_mat', 'grass_albedo.png');
@@ -356,7 +391,8 @@ export class ScatterService {
       if (!full || !lod) { console.warn(`[scatter] grass clump ${v} (${cfg.file}) failed — skipping grass`); return; }
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromGlow(lod);
-      const layer = this.makeGlbLayer(full, lod, 45, (cx, cz) => this.buildGrass(cx, cz, v));
+      const layer = this.makeGlbLayer(full, lod, ScatterService.GRASS_NEAR, (cx, cz) => this.buildGrass(cx, cz, v));
+      layer.maxRing = ScatterService.GRASS_RING;   // cull distant grass — too small to read, costs FPS
       if (gpu) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('grass', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -365,7 +401,7 @@ export class ScatterService {
   /** Per-layer GPU patch config: kernel kind, instance capacity, the pre-gate altitude band, the
    *  vertical headroom for the culling box, and whether the material reads instance colors. */
   private static readonly GPU_LAYERS = {
-    grass: { wgsl: GRASS_WGSL, capacity: 1800, yLo: 0.6,  yHi: 140, headroom: 4,  color: true },
+    grass: { wgsl: GRASS_WGSL, capacity: 3072, yLo: 0.6,  yHi: 140, headroom: 4,  color: true },
     rocks: { wgsl: ROCKS_WGSL, capacity: 576,  yLo: 0.25, yHi: 150, headroom: 5,  color: true },
     drift: { wgsl: DRIFT_WGSL, capacity: 400,  yLo: 0.25, yHi: 7,   headroom: 3,  color: true },
     trees: { wgsl: TREES_WGSL, capacity: 256,  yLo: 0.6,  yHi: 80,  headroom: 16, color: false },
@@ -374,6 +410,12 @@ export class ScatterService {
 
   /** Lazily-created per-kernel dispatchers (each owns its UBO → one dispatch per kernel per frame). */
   private readonly scatterComputes = new Map<string, ScatterCompute>();
+  /** Lazily-created MERGED shadow dispatcher — runs all four asset shadow kernels into one patch buffer
+   *  (one draw) instead of four separate layers. */
+  private shadowCompute: ShadowCompute | null = null;
+  /** Merged shadow patch instance capacity — holds the four kinds' blobs together (rocks 576 + drift 400
+   *  + trees 256 + palms 196 ≈ 1428; rounded up). A patch rarely carries all four at once. */
+  private static readonly SHADOW_GPU_CAPACITY = 1536;
 
   /** True when this session should place scatter on the GPU (WebGPU + not opted out). A/B escape
    *  hatch: localStorage.setItem('ignis_scatter_gpu','0') + reload forces the CPU builders. */
@@ -402,14 +444,20 @@ export class ScatterService {
                           cx: number, cz: number, variant: number, shadowMode = 0): GpuScatterPatch | null {
     const cfg = ScatterService.GPU_LAYERS[kind];
     const half = this.PATCH / 2;
+    // Probe the patch's terrain min/max for the (GPU-resident, CPU-unreadable) culling box. The old 3×3 grid
+    // undersampled a 40 m patch — a hill BETWEEN probe points left the box too short, so correctly-placed
+    // instances poked out of it and got frustum-culled except at extreme foreground. Sample densely enough to
+    // hit every heightfield texel in the patch so the box truly bounds the terrain.
+    const cell = this.terrainService.getCellSizeM() || 24;
+    const steps = Math.max(2, Math.min(12, Math.ceil(this.PATCH / cell) + 1));
     let yMin = Infinity, yMax = -Infinity;
-    for (let i = -1; i <= 1; i++) {
-      for (let j = -1; j <= 1; j++) {
-        const y = this.terrainService.getElevationFast(cx + i * half, cz + j * half);
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps; j++) {
+        const y = this.terrainService.getElevationFast(cx + ((i / steps) * 2 - 1) * half, cz + ((j / steps) * 2 - 1) * half);
         yMin = Math.min(yMin, y); yMax = Math.max(yMax, y);
       }
     }
-    // The 3×3 probe undersamples a 40 m patch — pad the band so a coastal texel can't false-reject.
+    // Pad the band so a coastal texel can't false-reject the whole patch.
     if (yMax < cfg.yLo - 2 || yMin > cfg.yHi + 10) { return null; }
 
     const pads: PadBox[] = this.townPadsNear(cx, cz).slice(0, 2);
@@ -420,6 +468,45 @@ export class ScatterService {
       shadowMode ? false : cfg.color,   // shadow discs must not gain a 'color' kind either
     );
     this.getCompute(kind).enqueue(patch, cx, cz, variant, this.PATCH, this.densityMul, pads, shadowMode);
+    return patch;
+  }
+
+  private getShadowCompute(): ShadowCompute {
+    if (!this.shadowCompute) {
+      const scene = this.sceneService.scene;
+      this.shadowCompute = new ShadowCompute(
+        scene.getEngine() as import('@babylonjs/core').WebGPUEngine, scene,
+        () => this.terrainService.getHeightFieldGPU(),
+      );
+    }
+    return this.shadowCompute;
+  }
+
+  /** GPU MERGED shadow patch: one buffer fed by all four asset shadow kernels (rocks/drift/trees/palms),
+   *  so the whole near-ring of asset shadows is a single thin-instance draw. Mirrors buildScatterGpu's
+   *  culling-box probe, but over the UNION of the asset bands (≈0.25–150 m) so a patch with any kind keeps
+   *  its shadows; patches fully over open sea / above the band allocate nothing. */
+  private buildShadowGpu(cx: number, cz: number): GpuScatterPatch | null {
+    const half = this.PATCH / 2;
+    const cell = this.terrainService.getCellSizeM() || 24;
+    const steps = Math.max(2, Math.min(12, Math.ceil(this.PATCH / cell) + 1));
+    let yMin = Infinity, yMax = -Infinity;
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps; j++) {
+        const y = this.terrainService.getElevationFast(cx + ((i / steps) * 2 - 1) * half, cz + ((j / steps) * 2 - 1) * half);
+        yMin = Math.min(yMin, y); yMax = Math.max(yMax, y);
+      }
+    }
+    if (yMax < 0.25 - 2 || yMin > 150 + 10) { return null; }   // entirely outside every asset band → no shadows
+
+    const pads: PadBox[] = this.townPadsNear(cx, cz).slice(0, 2);
+    const engine = this.sceneService.scene.getEngine() as import('@babylonjs/core').WebGPUEngine;
+    const patch = new GpuScatterPatch(
+      engine, new Vector3(cx, 0, cz), ScatterService.SHADOW_GPU_CAPACITY, half + 1,
+      yMin - 2, yMax + 3,   // discs lie flat on the ground → small vertical headroom
+      false,                // shadow discs carry no per-instance colour
+    );
+    this.getShadowCompute().enqueue(patch, cx, cz, this.PATCH, this.densityMul, pads);
     return patch;
   }
 
@@ -443,6 +530,7 @@ export class ScatterService {
         return;
       }
       this.groundToBase(full);
+      this.recenterTrunkXZ(full, ScatterService.PALM_TRUNK_Y);   // bake the off-centre + raised trunk base to the origin (both paths)
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -483,6 +571,7 @@ export class ScatterService {
         return;
       }
       this.groundToBase(full);
+      this.recenterTrunkXZ(full);   // (also) put the beech trunk over the origin if its GLB origin is off-axis
       new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -494,11 +583,132 @@ export class ScatterService {
       const imp = createCrossImpostor(scene, `scatter_beech_${v}_imp`, tex, cfg.w, cfg.h, pad);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
+      this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
       // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
       const layer = this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v));
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
+    }
+    this.buildFarForest(scene);   // static whole-island impostor layer for the distant hillsides
+  }
+
+  /**
+   * Static FAR-FOREST impostor layer: tree billboards blanketing the WHOLE island's forested slopes, faded
+   * IN at distance (FarFadePlugin) so the camera-following scatter ring owns near trees and these give the
+   * distant hillsides real tree texture over the §8d shader canopy. Built once (not camera-following): walk
+   * the heightfield, gate with the same forest recipe as buildTrees, keep a capped budget, thin-instance the
+   * (reused) beech impostors per variant. Cheap — a few instanced draws of unlit alpha-tested billboards.
+   */
+  private buildFarForest(scene: Scene): void {
+    const V = this.beechImpostors.length;
+    if (V < 1) { return; }
+    const tg = this.terrainService;
+    const b = tg.getWorldBounds();
+    const cell = tg.getCellSizeM() || 24;
+    const nx = Math.max(2, Math.round((b.maxX - b.minX) / cell) + 1);
+    const nz = Math.max(2, Math.round((b.maxZ - b.minZ) / cell) + 1);
+    const stride = Math.max(1, Math.ceil(Math.sqrt((nx * nz) / 8_000_000)));   // cap cells visited at ~8M (fine sampling → stride 1 on most maps)
+    const spanX = b.maxX - b.minX, spanZ = b.maxZ - b.minZ;
+    // Match the §8d shader canopy's elevation band (treeline) so impostors cover the SAME green hills, not
+    // just the lower slopes the near scatter ring caps at (80 m). _forestF uses [0.035 .. 0.74] × peak.
+    const man = tg.getManifest();
+    const peak = man?.maxElevation ?? man?.targetPeakElevation ?? 920;
+    const yLo = Math.max(0.6, 0.04 * peak), yHi = 0.74 * peak;
+
+    const BUDGET = 600000;   // far billboards are cheap (instanced into ~3 variant meshes → few draws); doubled for denser distant canopy on faraway islands
+    // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
+    // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
+    const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]
+    let seen = 0;
+    for (let iz = 0; iz < nz; iz += stride) {
+      for (let ix = 0; ix < nx; ix += stride) {
+        const jx = hash2(ix * 12.9 + iz, iz * 78.2 + ix), jz = hash2(ix * 39.3 + 7.1, iz * 11.7 - 3.3);
+        const px = b.minX + ((ix + jx) / (nx - 1)) * spanX;
+        const pz = b.maxZ - ((iz + jz) / (nz - 1)) * spanZ;
+        const y = tg.getElevationFast(px, pz);
+        if (y < yLo || y > yHi) { continue; }                      // forested elevation band (matches canopy)
+        const slope = this.slopeAt(px, pz, y, 3.0);
+        if (slope > 0.6) { continue; }                             // gentle-ish ground
+        const stand = fbm2(px / 45, pz / 45), clearing = fbm2(px / 13 + 9, pz / 13 - 4);
+        // Dense canopy: high BASE acceptance in forested stands (so slopes read as continuous forest, not dotted),
+        // with the clearing fbm only THINNING toward natural gaps/edges. Softer slope penalty keeps the hills full.
+        const standC = smoothstep(0.28, 0.62, stand), clearC = smoothstep(0.18, 0.52, clearing);
+        const dens = (0.45 + 0.55 * standC) * clearC * (1 - slope * 0.35);
+        if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
+        if (this.nearShoreline(px, pz, 6)) { continue; }
+        let slot = seen;
+        if (seen >= BUDGET) { slot = (Math.random() * (seen + 1)) | 0; }
+        if (slot < BUDGET) { res[slot * 3] = px; res[slot * 3 + 1] = pz; res[slot * 3 + 2] = y; }
+        seen++;
+      }
+    }
+    const take = Math.min(BUDGET, seen);
+    if (!take) { return; }
+
+    // Spatially CHUNK the impostors so off-screen islands frustum-cull instead of the WHOLE map drawing
+    // every frame. The old layer was one mesh per variant flagged alwaysSelectAsActiveMesh (never culled),
+    // so all 600k impostors were vertex-processed regardless of where the camera pointed. Now: one mesh per
+    // (variant, chunk); only chunks inside the view frustum draw — a big GPU vertex/fill saving (esp. after
+    // the 2× density), at the cost of a few more draw calls (only the handful of on-screen chunks).
+    const chunkM = Math.max(400, Math.max(spanX, spanZ) / 8);   // ~8 chunks across the larger span (~hundreds of m each)
+    const ncx = Math.max(1, Math.ceil(spanX / chunkM));
+    const ncz = Math.max(1, Math.ceil(spanZ / chunkM));
+    const scaleV = new Vector3(), posV = new Vector3(), up = Vector3.Up(), q = new Quaternion(), mat = new Matrix();
+    // groups[variant][chunkIndex] = flat column-major matrix array for that (variant, chunk) bucket.
+    const groups: number[][][] = Array.from({ length: V }, () => Array.from({ length: ncx * ncz }, () => [] as number[]));
+    for (let k = 0; k < take; k++) {
+      const px = res[k * 3], pz = res[k * 3 + 1], py = res[k * 3 + 2];
+      const v = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));
+      const s = 0.85 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.30;
+      scaleV.set(s, s, s);
+      // Distant hills are drawn at COARSE clipmap LOD whose chord cuts UNDER convex hilltops, so an impostor at
+      // the true height floats above the visible hill. Sink it by the local convexity (height above a ~far-LOD-
+      // cell-radius average) so hilltop impostors settle onto the drawn hill; flats/valleys are untouched.
+      const d = 24;
+      const avg = (tg.getElevationFast(px + d, pz) + tg.getElevationFast(px - d, pz)
+                 + tg.getElevationFast(px, pz + d) + tg.getElevationFast(px, pz - d)) * 0.25;
+      const convexSink = Math.min(10, Math.max(0, py - avg) * 1.15);   // sharper peaks undershoot more → sink more
+      posV.set(px, py - 0.4 - convexSink, pz);
+      Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, q);
+      Matrix.ComposeToRef(scaleV, q, posV, mat);
+      const cgx = Math.min(ncx - 1, Math.max(0, Math.floor(((px - b.minX) / spanX) * ncx)));
+      const cgz = Math.min(ncz - 1, Math.max(0, Math.floor(((b.maxZ - pz) / spanZ) * ncz)));
+      const arr = groups[v][cgz * ncx + cgx]; mat.copyToArray(arr, arr.length);
+    }
+
+    // One SHARED material + geometry TEMPLATE per variant (built once), then a hidden-template / per-chunk
+    // clone pattern: every chunk of a variant shares the variant's material (so still only V materials), but
+    // each chunk is its own mesh with its own bounds, so the frustum culls them independently.
+    let chunkMeshes = 0;
+    for (let v = 0; v < V; v++) {
+      const info = this.beechImpostors[v];
+      const template = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
+      template.isVisible = false;                    // the template never draws — it owns the shared geometry/material
+      if (template.material) {
+        template.material.unfreeze();                // FarFade + haze need live per-frame uniform binds
+        new FarFadePlugin(template.material);
+        new ImpostorHazePlugin(template.material);    // aerial-perspective haze → recedes WITH the terrain (not vivid/dark)
+        this.sceneService.excludeFromPrePass(template.material);
+      }
+      this.sceneService.excludeFromGlow(template);
+      this.farMeshes.push(template);                 // kept alive (owns geometry+material); disposed with the layer
+      for (let ci = 0; ci < ncx * ncz; ci++) {
+        const arr = groups[v][ci];
+        if (!arr.length) { continue; }
+        const cm = template.clone(`far_beech_${v}_c${ci}`);
+        cm.makeGeometryUnique();                      // independent thin-instance storage per chunk (mirrors ThinInstancePatch)
+        cm.isVisible = true;
+        cm.isPickable = false;
+        cm.renderingGroupId = 2;                      // world layer (terrain/ocean/vessels)
+        cm.thinInstanceSetBuffer('matrix', new Float32Array(arr), 16, true);
+        cm.thinInstanceRefreshBoundingInfo(true);     // REAL world bounds → Babylon frustum-culls when off-screen
+        cm.doNotSyncBoundingInfo = true;
+        cm.freezeWorldMatrix();
+        this.sceneService.excludeFromGlow(cm);
+        this.farMeshes.push(cm);
+        chunkMeshes++;
+      }
     }
   }
 
@@ -556,20 +766,33 @@ export class ScatterService {
     this.sceneService.excludeFromGlow(disc);
     this._shadowDisc = disc;
 
-    // One near-ring shadow layer per asset type (all share the disc + material + manager-clone path).
-    // GPU mode: the SAME placement kernels run with shadowMode=1 (variant -1 keeps all candidates)
-    // and emit flat blob discs instead of meshes.
-    const shadows: Array<[keyof typeof ScatterService.GPU_LAYERS, (cx: number, cz: number) => PatchData]> = [
-      ['rocks', (cx, cz) => this.buildRocks(cx, cz, -1, true)],
-      ['drift', (cx, cz) => this.buildDriftwood(cx, cz, -1, true)],
-      ['trees', (cx, cz) => this.buildTrees(cx, cz, -1, true)],
-      ['palms', (cx, cz) => this.buildPalms(cx, cz, -1, true)],
+    // ONE near-ring shadow layer for ALL asset types (was four — one per kind — = four draws per patch).
+    // The four kinds' blob placements (variant -1 keeps every candidate, shadowMode emits flat discs) are
+    // merged into a single mesh per patch: on CPU by concatenating their matrix buffers; on GPU by running
+    // all four kernels into one buffer sharing an append counter (ShadowCompute). 1 draw per patch.
+    const shadowBuilds: Array<(cx: number, cz: number) => PatchData> = [
+      (cx, cz) => this.buildRocks(cx, cz, -1, true),
+      (cx, cz) => this.buildDriftwood(cx, cz, -1, true),
+      (cx, cz) => this.buildTrees(cx, cz, -1, true),
+      (cx, cz) => this.buildPalms(cx, cz, -1, true),
     ];
-    for (const [kind, build] of shadows) {
-      const layer = this.makeShadowLayer(disc, build);
-      if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu(kind, cx, cz, -1, 1); }
-      this.layers.push(layer);
-    }
+    const layer = this.makeShadowLayer(disc, (cx, cz) => this.mergeShadowPatches(shadowBuilds, cx, cz));
+    layer.tag = 'shadow';   // debug toggle: shadow('all', false)
+    if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildShadowGpu(cx, cz); }
+    this.layers.push(layer);
+  }
+
+  /** Merge the four asset-type shadow-blob builds for one patch into a SINGLE matrix buffer (one draw).
+   *  Shadow discs carry no per-instance colour, so only the matrices concatenate. */
+  private mergeShadowPatches(builds: Array<(cx: number, cz: number) => PatchData>, cx: number, cz: number): PatchData {
+    const parts = builds.map((b) => b(cx, cz).matrix);
+    let total = 0;
+    for (const m of parts) { total += m.length; }
+    if (!total) { return EMPTY_PATCH; }
+    const matrix = new Float32Array(total);
+    let off = 0;
+    for (const m of parts) { matrix.set(m, off); off += m.length; }
+    return { matrix, color: null };
   }
 
   /** A shadow sub-layer: a single-LoD (no distance swap) manager over the shared disc, capped to the
@@ -793,6 +1016,7 @@ export class ScatterService {
       const ix = cx + off.dx, iz = cz + off.dz;
       const key = ix + ',' + iz;
       for (const l of this.layers) {
+        if (l.disabled) { continue; }   // debug: layer toggled off
         if (l.patches.has(key)) { continue; }
         // Shadow (and any capped) layers only build within their near ring around the camera cell.
         if (l.maxRing !== undefined && (Math.abs(off.dx) > l.maxRing || Math.abs(off.dz) > l.maxRing)) { continue; }
@@ -828,7 +1052,7 @@ export class ScatterService {
           if (Math.abs(+c[0] - cx) > cull || Math.abs(+c[1] - cz) > cull) {
             if (p) {
               l.manager.removePatch(p);
-              if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+              if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } this.shadowCompute?.cancel(p); }
               p.dispose();
             }
             l.patches.delete(key);
@@ -898,6 +1122,29 @@ export class ScatterService {
     }
   }
 
+  /**
+   * Re-centre a tree/palm so its TRUNK AXIS sits at object-space X/Z = 0. Some authored GLBs put the origin
+   * under an off-centre vertex (e.g. a drooping palm frond tip that also defeats groundToBase by sitting at
+   * y=0), so the trunk lands laterally offset from the placement origin — and since each instance is yaw-
+   * rotated, that offset swings to a different direction per tree (shadows scattered, trunk never over its
+   * shadow). The frond canopy is roughly symmetric about the trunk, so the vertex CENTROID ≈ the trunk axis;
+   * baking −centroid into the geometry plants the trunk under the origin (and thus under its shadow).
+   */
+  private recenterTrunkXZ(mesh: Mesh, trunkY = 0): void {
+    const pos = mesh.getVerticesData('position');
+    if (!pos || !pos.length) { return; }
+    let sx = 0, sz = 0; const n = pos.length / 3;
+    for (let i = 0; i < pos.length; i += 3) { sx += pos[i]; sz += pos[i + 2]; }
+    const cx = sx / n, cz = sz / n;
+    // `trunkY` (>0 for palms) is the authored height of the trunk BASE above the GLB origin — baking it down
+    // moves the base to local y=0 so BOTH the CPU and GPU placement plant the trunk at the ground with no
+    // per-scale sink (the GLB's lowest vertex is a drooping frond, which groundToBase can't use).
+    if (Math.abs(cx) > 0.03 || Math.abs(cz) > 0.03 || trunkY !== 0) {
+      mesh.position.set(-cx, -trunkY, -cz);
+      mesh.bakeCurrentTransformIntoVertices();
+    }
+  }
+
   /** Build one patch's grass CLUMPS for a single variant. Each authored clump is now a FULL 60–90
    *  blade tuft with a wide base footprint (updated asset — see GRASS_ASSET.md), so a few overlapping
    *  clumps already read as continuous grass. Clustering is TWO-SCALE: a low-freq `region` field makes
@@ -953,16 +1200,21 @@ export class ScatterService {
         // lush spots. No base floor → between bushes (even inside a lush region) there is zero grass.
         const region = fbm2(px / 45 + 120, pz / 45 - 60);             // where bushes are ALLOWED at all
         const bush   = fbm2(px / 5 + 31, pz / 5 + 17);                // small scale → small, tight bushes
-        const regionGate = step01(0.54, 0.64, region);                // ~0 almost everywhere → 1 in rare lush spots
-        const core = step01(0.56, 0.80, bush);                        // 0 between bushes → 1 at a bush heart
+        const core = step01(0.50, 0.78, bush);                        // 0 between bushes → 1 at a bush heart
         const coreD = core * core * core;                             // cubed: concentrates hard into the heart
-        const lowland = smoothstep(1.5, 13, y);                       // shore → lowland
         const alt = 1 - smoothstep(90, 140, y);                       // fade out toward the rocky uplands
-        const envFac = lowland * alt * (1 - slope * 0.7) * this.densityMul;
 
-        // No meadow base: density is purely region × bush-core, so barren gaps are genuinely empty and the
-        // only grass is the bush hearts (which then get heavily over-packed below).
-        const density = coreD * regionGate * envFac;
+        // FOREST: lush, near-continuous coverage on inland/higher ground. Permissive region gate + a base
+        // meadow floor (0.55) so most of the forest carries grass, denser still toward bush hearts.
+        const forestRegion = step01(0.34, 0.50, region);
+        const forestCover = 0.55 + 0.45 * coreD;
+        const lowland = smoothstep(1.5, 13, y);                       // favors higher ground (forest)
+        const forestDens = forestRegion * forestCover * lowland;
+        // BEACH: modest grass on the sand band (~old forest amount) — cubed bush cores only, no meadow floor.
+        const beachBand = smoothstep(0.7, 1.8, y) * (1 - smoothstep(4, 11, y));
+        const beachRegion = step01(0.50, 0.62, region);
+        const beachDens = beachRegion * coreD * beachBand * 0.85;
+        const density = Math.max(forestDens, beachDens) * alt * (1 - slope * 0.7) * this.densityMul;
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > density) { continue; }
 
         // Deal each accepted cell to one clump variant.
@@ -1000,12 +1252,16 @@ export class ScatterService {
     this._quality = q;
     localStorage.setItem('ignis_scatter_quality', String(q));
     this.applyQualityParams(q);
-    // Rebuild: drop every live patch so ensurePatches regenerates them at the new radius/density.
+    this.rebuildPatches();
+  }
+
+  /** Drop every live patch so ensurePatches regenerates them (after a quality/density/placement change). */
+  private rebuildPatches(): void {
     for (const l of this.layers) {
       for (const [, p] of l.patches) {
         if (p) {
           l.manager.removePatch(p);
-          if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } }
+          if (p instanceof GpuScatterPatch) { for (const sc of this.scatterComputes.values()) { sc.cancel(p); } this.shadowCompute?.cancel(p); }
           p.dispose();
         }
       }
@@ -1015,6 +1271,30 @@ export class ScatterService {
     if (this.enabled) { this.ensurePatches(); }
   }
 
+  /** DEBUG: live-tune the per-asset planting sink from the console — __palmSink(0.9) / __treeSink(0.5), then
+   *  the value that looks right gets baked as the default. Rebuilds patches on each call. */
+  private setupSinkDebug(): void {
+    const w = window as unknown as Record<string, (v: number) => void>;
+    const palm = (v: number) => { this.palmSink = v; this.rebuildPatches(); console.info(`[probe] palmSink = ${v}`); };
+    const tree = (v: number) => { this.treeSink = v; this.rebuildPatches(); console.info(`[probe] treeSink = ${v}`); };
+    // Register both bare + underscored names so either form works in the console.
+    w['palmSink'] = palm; w['__palmSink'] = palm;
+    w['treeSink'] = tree; w['__treeSink'] = tree;
+    // Shadow toggle: shadow(false) hides ALL asset shadows (now one merged layer; arg kept for back-compat).
+    (w as unknown as Record<string, (k?: unknown, on?: boolean) => void>)['shadow'] = (_kind?: unknown, on = false) => {
+      for (const l of this.layers) {
+        if (l.tag === 'shadow') {
+          l.disabled = !on;
+          for (const [, p] of l.patches) { if (p) { l.manager.removePatch(p); p.dispose(); } }
+          l.patches.clear();
+        }
+      }
+      this._lastCx = NaN; this._patchPending = true;   // force ensurePatches to re-scan
+      console.info(`[probe] shadows ${on ? 'ON' : 'OFF'}`);
+    };
+    console.info('[probe] tuners ready → palmSink(0.7) · treeSink(0.35) · shadow("drift",false)');
+  }
+
   /** Apply a quality tier's radius/density/enabled flags + the matching fade band (no rebuild). */
   private applyQualityParams(q: number): void {
     const t = ScatterService.QUALITY[Math.max(0, Math.min(4, q))];
@@ -1022,8 +1302,12 @@ export class ScatterService {
     this.densityMul = t.density;
     this.RADIUS = Math.max(1, t.radius);
     this.shadowRing = Math.min(this.RADIUS, 3);   // blobs only near the camera (~120 m)
-    GrassFadePlugin.fade.end   = (this.RADIUS - 0.4) * this.PATCH;
-    GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 110);
+    // Grass dissolves at its OWN (smaller) ring cap, not the global draw radius — so the cheap-LoD grass
+    // shrinks to nothing just before GRASS_RING's hard patch cull (no pop), and never reaches out to the
+    // distant terrain where it isn't worth the FPS. Fade plugin is grass-only in the active asset path.
+    const grassRing = Math.min(ScatterService.GRASS_RING, this.RADIUS);
+    GrassFadePlugin.fade.end   = (grassRing + 0.5) * this.PATCH;
+    GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 60);
   }
 
   /** Build one patch's beach rocks: scattered on the sand/low-dune band, mostly small with some
@@ -1256,7 +1540,7 @@ export class ScatterService {
         const s = 0.9 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.22;   // ~±11 % (GLB beeches are real metres)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 4.2); kept++; continue; }
-        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
+        posV.set(px, y - this.treeSink * s, pz);   // sink = authored base height × instance scale → plants at any size
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);
@@ -1304,7 +1588,7 @@ export class ScatterService {
         const s = 0.92 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.16;   // ~±8 % (world-correct height)
         scaleV.set(s, s, s);
         if (shadow) { this.composeShadow(tmp, kept, px, y, pz, s * 2.6); kept++; continue; }
-        posV.set(px, y - 0.35, pz);   // root the trunk slightly into the ground (planted, never floating)
+        posV.set(px, y - this.palmSink, pz);   // trunk base is baked to the origin → just plant it at the ground
         Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, this._q);
         Matrix.ComposeToRef(scaleV, this._q, posV, this._mat);
         this._mat.copyToArray(tmp, kept * 16);

@@ -14,6 +14,7 @@ import { Settings } from '../../app.settings';
 import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
 import { ProceduralSky } from './procedural-sky';
+import { RainLens } from './rain-lens';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -40,6 +41,7 @@ export class SceneService {
   private moonMesh!:  Mesh;
   private godRays: VolumetricLightScatteringPostProcess | null = null;
   private ssao: SSAO2RenderingPipeline | null = null;
+  private rainLens: RainLens | null = null;
   private starDome: Mesh | null = null;
   private starMat:  CustomMaterial | null = null;
   private _starTime = 0;
@@ -87,10 +89,24 @@ export class SceneService {
     this.glowLayer?.addExcludedMesh(mesh);
   }
 
+  /** Minimum glow-layer intensity (see tickTimeOfDay) so emissive glow-included meshes still bloom on a
+   *  dark night instead of the halo fading to ~0. */
+  private readonly GLOW_NIGHT_FLOOR = 0.55;
+
   /** Add an emissive mesh to the glow layer's include list (the layer is include-only — sun/moon by
    *  default), so its emissive blooms. Used for the pier lanterns. */
   includeInGlow(mesh: Mesh): void {
     this.glowLayer?.addIncludedOnlyMesh(mesh);
+  }
+
+  /** Glow a mesh whose brightness comes from a custom ShaderMaterial (no emissiveTexture/Color the glow
+   *  layer can read) — e.g. the additive muzzle-fireball + lightning billboards. referenceMeshToUseItsOwn-
+   *  Material makes the glow pass render the mesh with its actual shader, so the effect blooms day AND night
+   *  (independent of the time-gated pipeline bloom). Cheap: only ACTIVE pooled billboards draw into the glow RTT. */
+  includeShaderInGlow(mesh: Mesh): void {
+    if (!this.glowLayer) return;
+    this.glowLayer.addIncludedOnlyMesh(mesh);
+    this.glowLayer.referenceMeshToUseItsOwnMaterial(mesh);
   }
 
   /** Remove a mesh from the glow include list — REQUIRED before disposing a glow-included mesh
@@ -141,6 +157,44 @@ export class SceneService {
   private _oceanDepthMap: RenderTargetTexture | null = null;
   /** Camera-space-Z depth of opaque geometry (ocean excluded). Null until built. */
   get oceanDepthMap(): RenderTargetTexture | null { return this._oceanDepthMap; }
+
+  // Soft-particle depth for cannon smoke: a SEPARATE camera-space-Z depth that INCLUDES the ship + terrain
+  // (unlike oceanDepthMap, which excludes skinned meshes for perf). Built lazily, and only RENDERED while
+  // smoke is on screen (setSmokeDepthActive) so it costs nothing the rest of the time.
+  private smokeDepthRenderer: DepthRenderer | null = null;
+  private _smokeDepthMap: RenderTargetTexture | null = null;
+  private smokeDepthActive = false;
+  get smokeDepthMap(): RenderTargetTexture | null { return this._smokeDepthMap; }
+
+  /** Turn the smoke soft-particle depth pass on/off (called by the smoke FX as puffs come and go). */
+  setSmokeDepthActive(on: boolean): void {
+    if (on === this.smokeDepthActive || !this.scene) { return; }
+    if (on && !this._smokeDepthMap) { this.buildSmokeDepthRenderer(); }
+    const dm = this._smokeDepthMap;
+    if (!dm) { return; }
+    this.smokeDepthActive = on;
+    const list = this.scene.customRenderTargets;
+    const i = list.indexOf(dm);
+    if (on && i < 0) { list.push(dm); }
+    else if (!on && i >= 0) { list.splice(i, 1); }
+  }
+
+  private buildSmokeDepthRenderer(): void {
+    const dr = new DepthRenderer(
+      this.scene, Constants.TEXTURETYPE_FLOAT, this.camera,
+      /* storeNonLinearDepth */ false, Texture.NEAREST_SAMPLINGMODE, /* storeCameraSpaceZ */ true,
+    );
+    const dm = dr.getDepthMap();
+    // Include the solid occluders smoke should soften against: hull/deck/masts/sails/rigging + terrain +
+    // buildings. Skip the ocean (smoke is above water), inland scatter foliage, and the FX billboards
+    // themselves (tagged excludeFromRefraction / stencilProxy) so they never occlude their own smoke.
+    dm.renderListPredicate = (m) =>
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_')
+      && !m.metadata?.excludeFromRefraction && !m.metadata?.stencilProxy;
+    dm.refreshRate = 1;   // every frame while active (stale depth misaligns under camera rotation)
+    this.smokeDepthRenderer = dr;
+    this._smokeDepthMap = dm;
+  }
 
   // Public signal so the HUD can display the current game time.
   gameTime = signal(10.5);  // 0–24 hours
@@ -194,8 +248,8 @@ export class SceneService {
   private readonly PIPELINE_EPS = 0.02;   // raised from 0.005 — updates every ~2 s during transition
   private _cachedExposure = 1.0;
   private _cachedContrast = 1.10;
-  private _cachedBloomW   = 0.28;   // bloomWeight cache (setter fires per-call with no guard)
-  private _cachedBloomThreshold = 0.78;
+  private _cachedBloomW   = 0.40;   // bloomWeight cache (setter fires per-call with no guard)
+  private _cachedBloomThreshold = 0.62;
   private _cachedBloomEnabled = true;
   private _cachedGrainAnimated = true;
   private _cachedGrainIntensity = 12;
@@ -318,6 +372,19 @@ export class SceneService {
       // real CPU hit. Skip it. (Click/down still picks; cannon aim uses an explicit pickWithRay.)
       this.scene.skipPointerMovePicking = true;
 
+      // Preserve the depth buffer ACROSS rendering groups 1→3. The world is split across groups: terrain/
+      // ocean-far (0), ocean LODs (1), ocean-near + vessels (2), then all the above-water transparent FX —
+      // cannon smoke, the volumetric explosion + muzzle fireball billboards, rain, the water-shadow decal,
+      // the cloud dome — live in group 3. By default Babylon CLEARS depth+stencil at the start of every
+      // group >0, which would throw away the hull/terrain depth written in group 2 and make every group-3
+      // billboard draw ON TOP of the ship even when the hull is between it and the camera. Keeping depth
+      // means those FX correctly depth-test against the world. Ocean/vessel services also set groups 1+2,
+      // but group 3 was only being set as a side effect of the SPS rain init — which never runs on WebGPU
+      // (GPU rain path), so the shader smoke/explosion drew over the hull there. Set it unconditionally.
+      this.scene.setRenderingAutoClearDepthStencil(1, false);
+      this.scene.setRenderingAutoClearDepthStencil(2, false);
+      this.scene.setRenderingAutoClearDepthStencil(3, false);
+
       this.buildSky();             // Preetham SkyMaterial dome (kept as the WebGL fallback sky)
       this.buildProceduralSky();   // WebGPU-only homegrown sky; retires the Preetham dome when active
       this.buildLights();
@@ -430,8 +497,15 @@ export class SceneService {
     sunMat.disableLighting = true;
     sunMat.emissiveColor = new Color3(1.0, 0.95, 0.68);
     sunMat.specularColor = Color3.Black();
+    // Round, soft-edged disc: a radial-gradient texture drives both the emissive colour and the opacity, so
+    // the billboard reads as a circular sun (bright core → feathered limb) instead of a flat square quad. The
+    // glow layer blooms the emissive halo on top. Without this mask the plane is a literal square.
+    const sunTex = this.buildSunTexture();
+    sunMat.emissiveTexture = sunTex;
+    sunMat.opacityTexture  = sunTex;   // alpha channel = the circular falloff
+    sunMat.useAlphaFromDiffuseTexture = false;
 
-    this.sunMesh = MeshBuilder.CreatePlane('sunDisk', { size: 2200 }, this.scene);
+    this.sunMesh = MeshBuilder.CreatePlane('sunDisk', { size: 2600 }, this.scene);
     this.sunMesh.material = sunMat;
     this.sunMesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
     this.sunMesh.isPickable = false;
@@ -631,6 +705,30 @@ export class SceneService {
     return tex;
   }
 
+  /**
+   * Round sun disc: a radial gradient (warm-white core → feathered transparent limb) in both colour and
+   * alpha, so the billboard plane reads as a circular sun rather than a square quad. Premultiplied-feel:
+   * the alpha falls to 0 before the texture edge so there's no hard square boundary. Built once.
+   */
+  private buildSunTexture(): DynamicTexture {
+    const S = 256;
+    const tex = new DynamicTexture('sunTex', { width: S, height: S }, this.scene, true);
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, S, S);
+    const c = S / 2;
+    const g = ctx.createRadialGradient(c, c, 0, c, c, c);
+    g.addColorStop(0.00, 'rgba(255,252,242,1)');   // hot near-white core
+    g.addColorStop(0.42, 'rgba(255,244,212,1)');   // solid warm disc
+    g.addColorStop(0.62, 'rgba(255,226,168,0.75)'); // limb
+    g.addColorStop(0.82, 'rgba(255,210,150,0.22)'); // soft halo
+    g.addColorStop(1.00, 'rgba(255,205,145,0)');    // fully transparent before the square edge
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(c, c, c, 0, Math.PI * 2); ctx.fill();
+    tex.hasAlpha = true;
+    tex.update();
+    return tex;
+  }
+
   // ── Camera ───────────────────────────────────────────────────────────────────
 
   private buildCamera(canvas: HTMLCanvasElement): void {
@@ -690,8 +788,8 @@ export class SceneService {
     // Bloom — makes emissive meshes (sun disk, torches) bleed light into the scene.
     // Weight and exposure are boosted dynamically at golden hour in tickTimeOfDay().
     this.pipeline.bloomEnabled   = true;
-    this.pipeline.bloomThreshold = 0.78;
-    this.pipeline.bloomWeight    = 0.28;
+    this.pipeline.bloomThreshold = 0.62;   // lower → more highlights bloom (tickTimeOfDay drives this live)
+    this.pipeline.bloomWeight    = 0.40;   // stronger glow (live-modulated by time of day)
     // Perf: kernel 128→48 and scale 0.5→0.33. The wide-kernel blur on a HiDPI
     // framebuffer was the entire daytime FPS hit (bloom is off at night, which is
     // why daytime ran ~14 vs ~22 at night). The glow is a touch tighter — barely
@@ -793,6 +891,20 @@ export class SceneService {
     });
 
     this.buildGodRays();
+
+    // Raindrops-on-the-lens post-process (adapted "Heartfelt"). Created here, driven per-frame by
+    // CloudService via setRainLens(storminess); it only attaches itself while it's actually raining and
+    // fails safe on WebGPU (never blanks — see RainLens).
+    try {
+      this.rainLens = new RainLens(this.camera, this.engine);
+    } catch (e) {
+      console.warn('[Scene] Rain-lens post-process unavailable:', e);
+    }
+  }
+
+  /** Storminess (0..1) → raindrops-on-the-camera intensity. Called each frame by CloudService. */
+  setRainLens(amount: number): void {
+    this.rainLens?.setAmount(amount);
   }
 
   // ── Crepuscular rays (god rays / sun shafts) ────────────────────────────────
@@ -1018,7 +1130,10 @@ export class SceneService {
       const sunGlow = h > 0.02
         ? Math.min(1.4, (0.25 + horizon * 1.8 + above * 0.3) * occT)
         : 0;
-      this.glowLayer.intensity = Math.max(sunGlow, moonVis * 0.55);
+      // Floor of 0.55 so emissive glow-included meshes (pier lanterns, combat-FX billboards) keep a real
+      // bloom halo even on a dark/moonless night — without it the intensity fell to ~0 and only the bare
+      // emissive surface showed. Day is unchanged (sunGlow dominates the max).
+      this.glowLayer.intensity = Math.max(this.GLOW_NIGHT_FLOOR, sunGlow, moonVis * 0.55);
     }
 
     // ── Post-processing: bloom and exposure surge at golden hour ──────────────
@@ -1046,15 +1161,18 @@ export class SceneService {
       const nightBlend = isNight ? 1 : Math.max(0, Math.min(1, (-h - 0.03) / 0.20));
 
       // bloomWeight: throttle like exposure/contrast — the DefaultRenderingPipeline
-      // setter chain fires internal observers on every write.
-      const dayBloomW = Math.max(0.12, 0.26 + horizon * 0.58 - cloud * 0.30);
+      // setter chain fires internal observers on every write. Base + horizon boost raised (0.26→0.40,
+      // 0.58→0.66) for a more prominent glow on emissive/bright surfaces; cost is unchanged (same passes).
+      const dayBloomW = Math.max(0.20, 0.40 + horizon * 0.66 - cloud * 0.30);
       const newBloomW = Math.max(0, dayBloomW * (1 - nightBlend));
       if (Math.abs(newBloomW - this._cachedBloomW) > this.PIPELINE_EPS) {
         this.pipeline.bloomWeight = newBloomW;
         this._cachedBloomW = newBloomW;
       }
 
-      const newBloomThreshold = 0.78 + nightBlend * 0.35;
+      // Lower daytime threshold (0.78→0.62) so more highlights bloom, not just near-white pixels (free —
+      // changes WHAT blooms, not the blur cost). Still ramps UP at night to suppress general-scene pulsing.
+      const newBloomThreshold = 0.62 + nightBlend * 0.51;
       if (Math.abs(newBloomThreshold - this._cachedBloomThreshold) > this.PIPELINE_EPS) {
         this.pipeline.bloomThreshold = newBloomThreshold;
         this._cachedBloomThreshold = newBloomThreshold;
@@ -1492,9 +1610,15 @@ export class SceneService {
    *  a fresh Scene on them without the WebGPU-recreation degradation. */
   disposeScene(): void {
     this.engine?.stopRenderLoop();
+    this.rainLens?.dispose();
+    this.rainLens = null;
     this.oceanDepthRenderer?.dispose();
     this.oceanDepthRenderer = null;
     this._oceanDepthMap = null;
+    this.smokeDepthRenderer?.dispose();
+    this.smokeDepthRenderer = null;
+    this._smokeDepthMap = null;
+    this.smokeDepthActive = false;
     this._sInstr?.dispose(); this._sInstr = null;
     this._eInstr?.dispose(); this._eInstr = null;
     this.scene?.dispose();

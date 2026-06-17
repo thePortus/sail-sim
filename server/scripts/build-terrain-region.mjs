@@ -295,8 +295,19 @@ async function run() {
   const navInfo = writeNavGrid(field, harborShore, OUT, cellM, outputDir);
   console.log(`  nav grid: ${navInfo.resolution}² navigable mask → navgrid.bin (${navInfo.navigablePct}% open water)`);
 
+  // Auto-bumped map version: each bake increments the prior manifest's value. The server reads this (via
+  // movement-constants) and gates persistence on it — so generating ANY new map automatically resets saved
+  // player positions + economy, with no manual constant to remember. Monotonic, so even back-to-back rebakes
+  // in the same second still differ. Starts at 9 (one past the last hand-set MAP_VERSION of 8).
+  let mapVersion = 9;
+  try {
+    const prev = JSON.parse(readFileSync(join(outputDir, 'manifest.json'), 'utf8'));
+    if (Number.isFinite(prev.mapVersion)) mapVersion = (prev.mapVersion | 0) + 1;
+  } catch { /* no prior manifest (fresh output dir) → start at 9 */ }
+
   const manifest = {
     version: 2,
+    mapVersion,
     source: region.id,
     sourceName: region.name,
     archetype: region.archetype,
@@ -335,7 +346,7 @@ async function run() {
   ao.data.fill(255);
   writeFileSync(join(outputDir, 'ao_map.png'), PNG.sync.write(ao));
 
-  console.log(`  ${chunkCountX}×${chunkCountZ} chunks + manifest + neutral ao_map written → ${outputDir}`);
+  console.log(`  ${chunkCountX}×${chunkCountZ} chunks + manifest (mapVersion ${mapVersion}) + neutral ao_map written → ${outputDir}`);
   const tierCount = harbors.reduce((m, t) => (m[t.tier] = (m[t.tier] || 0) + 1, m), {});
   const totalBuildings = harbors.reduce((n, t) => n + (t.buildings?.length || 0), 0);
   console.log(`  ${spawns.length} spawn point(s); ${harbors.length} harbor town(s) ` +

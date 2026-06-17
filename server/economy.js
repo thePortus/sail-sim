@@ -22,6 +22,7 @@ const path = require('path');
 const terrainConfig = require('./config/terrain.config');
 const moveConst = require('./movement-constants');
 const goods = require('./trade-goods');
+const nav = require('./nav');
 const { getVesselDef } = require('./controllers/vessels.controller');
 
 const DOCK_RADIUS_M = 70;         // generous: anti-cheat backstop, never tighter than the client dock test
@@ -31,6 +32,18 @@ const MAX_CATCHUP_DAYS = 30;      // cap downtime simulation so a long outage do
 const MIN_STOCK = 1;              // a town never sells its last unit (also avoids div-by-zero in pricing)
 const SCARCE_FRAC = 0.25;        // a consumed good is "in distress" below this fraction of its priceRef
 const DISTRESS_TRIGGER = 3;      // days a shortage must persist before merchants are dispatched to relieve it
+const NEED_FRAC = 0.85;          // a consumed good is "needed" (a dispatch trigger) below this fraction of priceRef
+// Faction-standing trade perk: your reputation with a town's NATION nudges its prices for YOU only — a trusted
+// trader buys cheaper + sells dearer, a hated one pays through the nose. Capped small (±REP_PRICE_MAX) so it's a
+// perk, not a money printer, and the WORLD economy (NPC trades, stock, treasury) is untouched — only the player's
+// own transaction is scaled. ±100 standing → ±7% on each side.
+const REP_PRICE_MAX = 0.07;
+/** Per-player price multipliers from `standing` (−100..100) with the town's nation: buy ask down + sell bid up when
+ *  liked, the reverse when hated. Neutral (0 / free port) → {1,1}. */
+function repPriceMul(standing) {
+  const t = Math.max(-1, Math.min(1, (standing || 0) / 100));
+  return { ask: 1 - REP_PRICE_MAX * t, bid: 1 + REP_PRICE_MAX * t };
+}
 
 let loaded = false;
 let towns = new Map();            // townId → { id, name, tier, specialty, x, z }
@@ -48,7 +61,10 @@ function load() {
     if (!fs.existsSync(manifestPath)) { console.warn('[economy] manifest not found — trading disabled'); return; }
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     for (const h of (m.harbors || [])) {
-      towns.set(h.id, { id: h.id, name: h.name, tier: h.tier || 'medium', specialty: h.specialty || 'port', x: h.x, z: h.z });
+      towns.set(h.id, {
+        id: h.id, name: h.name, tier: h.tier || 'medium', specialty: h.specialty || 'port', x: h.x, z: h.z,
+        faction: h.faction || null, contested: !!h.contested, rivalFaction: h.rivalFaction || null,
+      });
     }
     const present = new Set([...towns.values()].map((t) => t.specialty));
     const missing = goods.specialtyKeys().filter((s) => !present.has(s));
@@ -154,19 +170,34 @@ function marketFor(townId) {
     const stock = mk ? (mk.stock[g.id] ?? 0) : pr.seedStock;
     const q = goods.quote(g.base, pr.priceRef, stock, t.tier);
     const level = +Math.max(0, Math.min(3, stock / pr.priceRef)).toFixed(2);
-    return { goodId: g.id, name: g.name, ask: q.ask, bid: q.bid, level, role: pr.role };
+    // `stock` = units physically on hand; `buyable` = how many the player may buy now (a town never sells its
+    // last MIN_STOCK). Both let the trader UI show real scarcity, not just a badge.
+    return {
+      goodId: g.id, name: g.name, ask: q.ask, bid: q.bid, level, role: pr.role,
+      stock: Math.round(stock), buyable: Math.max(0, Math.floor(stock) - MIN_STOCK), cap: Math.round(pr.stockCap),
+    };
   });
-  return { townId: t.id, name: t.name, specialty: t.specialty, goods: list };
+  return { townId: t.id, name: t.name, specialty: t.specialty, faction: t.faction || null, contested: !!t.contested, rivalFaction: t.rivalFaction || null, goods: list };
 }
 
 // ── demand hints (Phase 3) ────────────────────────────────────────────────────
+/** True if `cand` is sea-reachable from the anchor town (same connected water body). When `anchorId` is null
+ *  (no anchor), nothing is filtered. Fail-open when no navgrid is loaded. */
+function reachableFrom(anchorId, cand) {
+  if (!anchorId) return true;
+  const a = getTown(anchorId);
+  return a ? nav.reachable(a.x, a.z, cand.x, cand.z) : true;
+}
+
 /** The town currently paying the highest BID for `goodId` (a scarce consumer) — the best place to SELL it.
- *  Excludes `excludeTownId` (the town giving the hint). Returns { townId, townName, bid } or null. */
+ *  Excludes `excludeTownId` (the anchor town giving the hint) AND any port not sea-reachable from it, so a
+ *  rumour never names a harbour walled off by land. Returns { townId, townName, bid } or null. */
 function bestBuyerFor(goodId, excludeTownId) {
   ensureSeeded();
   let best = null;
   for (const t of towns.values()) {
     if (t.id === excludeTownId) continue;
+    if (!reachableFrom(excludeTownId, t)) continue;
     const mk = marketFor(t.id);
     const row = mk && mk.goods.find((g) => g.goodId === goodId);
     if (row && (!best || row.bid > best.bid)) best = { townId: t.id, townName: t.name, bid: row.bid };
@@ -227,11 +258,12 @@ function intQty(qty) { const n = Math.floor(Number(qty)); return Number.isFinite
  * Buy walks the ask UP as stock drops (limited by stock + actor gold/space); sell walks the bid DOWN as stock
  * rises (limited by town treasury + actor holdings). Returns { ok, cost|proceeds, unit } or { ok:false, reason }.
  */
-function tradeCore(actor, town, goodId, qty, side) {
+function tradeCore(actor, town, goodId, qty, side, priceMul) {
   ensureSeeded();
   const mk = markets.get(town.id);
   const pr = profileFor(town)[goodId];
   if (!mk || !pr) return { ok: false, reason: 'no_town' };
+  const mul = priceMul || { ask: 1, bid: 1 };   // standing-based, player-only (NPCs pass none → neutral)
   const base = goods.basePrice(goodId);
   if (side === 'buy') {
     const stock0 = mk.stock[goodId] ?? 0;
@@ -239,6 +271,7 @@ function tradeCore(actor, town, goodId, qty, side) {
     if (usedSlots(actor.cargo) + goods.goodVolume(goodId) * qty > actor.capacityVol) return { ok: false, reason: 'no_space' };
     let s = stock0, cost = 0;
     for (let i = 0; i < qty; i++) { cost += goods.quote(base, pr.priceRef, s, town.tier).ask; s -= 1; }
+    cost = Math.max(qty, Math.round(cost * mul.ask));   // standing tweak (≥1/unit floor); treasury tracks what's paid
     if (actor.gold < cost) return { ok: false, reason: 'no_gold' };
     actor.gold -= cost; mk.stock[goodId] = s; mk.treasury += cost;
     actor.cargo[goodId] = (actor.cargo[goodId] || 0) + qty;
@@ -250,11 +283,29 @@ function tradeCore(actor, town, goodId, qty, side) {
   if (held < qty) return { ok: false, reason: 'no_goods' };
   let s = mk.stock[goodId] ?? 0, proceeds = 0;
   for (let i = 0; i < qty; i++) { proceeds += goods.quote(base, pr.priceRef, s, town.tier).bid; s += 1; }
+  proceeds = Math.max(0, Math.round(proceeds * mul.bid));   // standing tweak; the town pays the player this from treasury
   if (mk.treasury < proceeds) return { ok: false, reason: 'town_broke' };
   actor.gold += proceeds; mk.stock[goodId] = s; mk.treasury -= proceeds;
   const left = held - qty; if (left > 0) actor.cargo[goodId] = left; else delete actor.cargo[goodId];
   dirty = true;
   return { ok: true, proceeds, unit: Math.round(proceeds / qty) };
+}
+
+/** A player's standing with the town's owning nation (0 if the town is a free port or the player has no rep map). */
+function standingAt(player, town) {
+  const fid = town && town.faction;
+  return (fid && player && player.factionRep && Number.isFinite(player.factionRep[fid])) ? player.factionRep[fid] : 0;
+}
+
+/** marketFor(townId) with ask/bid nudged by THIS player's standing with the town's nation — the SAME multiplier
+ *  tradeCore applies on execution, so the quote the player sees matches what they pay/receive. `mk` may be passed
+ *  in to avoid recomputing. Neutral standing / free port → returns the market unchanged. */
+function playerMarket(player, townId, mk) {
+  mk = mk || marketFor(townId);
+  if (!mk) return mk;
+  const mul = repPriceMul(standingAt(player, getTown(townId)));
+  if (mul.ask === 1 && mul.bid === 1) return mk;
+  return { ...mk, goods: mk.goods.map((g) => ({ ...g, ask: Math.max(1, Math.round(g.ask * mul.ask)), bid: Math.max(0, Math.round(g.bid * mul.bid)) })) };
 }
 
 /** Player buys `qty` of `goodId` at the docked town (validates docked + good/qty, then tradeCore). Atomic. */
@@ -265,7 +316,7 @@ function applyBuy(player, authPose, townId, goodId, qty) {
   const n = intQty(qty);
   if (!n) return { ok: false, reason: 'bad_qty' };
   const actor = { gold: player.gold, cargo: player.cargo, capacityVol: capacityFor(player.state && player.state.vesselSlug) };
-  const r = tradeCore(actor, town, goodId, n, 'buy');
+  const r = tradeCore(actor, town, goodId, n, 'buy', repPriceMul(standingAt(player, town)));
   if (r.ok) { player.gold = actor.gold; pushLedger(player, { t: Date.now(), side: 'buy', townId, goodId, qty: n, unit: r.unit }); }
   return r;
 }
@@ -278,7 +329,7 @@ function applySell(player, authPose, townId, goodId, qty) {
   const n = intQty(qty);
   if (!n) return { ok: false, reason: 'bad_qty' };
   const actor = { gold: player.gold, cargo: player.cargo, capacityVol: capacityFor(player.state && player.state.vesselSlug) };
-  const r = tradeCore(actor, town, goodId, n, 'sell');
+  const r = tradeCore(actor, town, goodId, n, 'sell', repPriceMul(standingAt(player, town)));
   if (r.ok) { player.gold = actor.gold; pushLedger(player, { t: Date.now(), side: 'sell', townId, goodId, qty: n, unit: r.unit }); }
   return r;
 }
@@ -299,6 +350,34 @@ function npcSell(npc, townId, goodId, qty) {
   const r = tradeCore(actor, town, goodId, n, 'sell'); if (r.ok) npc.gold = actor.gold; return r;
 }
 
+/** Every active SHORTAGE that should pull a merchant: a town holding less than NEED_FRAC×priceRef of a good it
+ *  CONSUMES. This is the primary dispatch driver — merchant transit is triggered by real need, not generic
+ *  arbitrage. Sorted most-urgent first: long-unmet distress outranks, then the deepest shortage by stock level.
+ *  Each entry: { townId, townName, goodId, goodName, level (stock/priceRef), distressDays }. */
+function needList() {
+  ensureSeeded();
+  const out = [];
+  for (const t of towns.values()) {
+    const prof = profileFor(t);
+    const mk = markets.get(t.id);
+    if (!mk) continue;
+    for (const g of goods.GOODS) {
+      const pr = prof[g.id];
+      if (pr.role !== 'consumed') continue;
+      const stock = mk.stock[g.id] ?? 0;
+      const level = stock / pr.priceRef;
+      if (level < NEED_FRAC) {
+        out.push({
+          townId: t.id, townName: t.name, goodId: g.id, goodName: g.name,
+          level: +level.toFixed(3), distressDays: (mk.distress && mk.distress[g.id]) || 0,
+        });
+      }
+    }
+  }
+  out.sort((a, b) => (b.distressDays - a.distressDays) || (a.level - b.level));
+  return out;
+}
+
 /** Towns whose need for a good has stayed unmet ≥ DISTRESS_TRIGGER days, worst-first — merchant delivery targets. */
 function distressList() {
   ensureSeeded();
@@ -313,12 +392,14 @@ function distressList() {
   return out;
 }
 
-/** The town selling `goodId` cheapest right now (a stocked producer) — where a merchant SOURCES it. */
+/** The town selling `goodId` cheapest right now (a stocked producer) — where a merchant SOURCES it. Skips ports
+ *  not sea-reachable from `excludeTownId` (the needy town being supplied), so the route actually exists. */
 function bestSellerFor(goodId, excludeTownId) {
   ensureSeeded();
   let best = null;
   for (const t of towns.values()) {
     if (t.id === excludeTownId) continue;
+    if (!reachableFrom(excludeTownId, t)) continue;
     const mk = markets.get(t.id);
     if (!mk || (mk.stock[goodId] ?? 0) < MIN_STOCK + 4) continue;   // must have some to sell
     const m = marketFor(t.id);
@@ -343,8 +424,10 @@ function bestArbitrage() {
   return best;
 }
 
-/** Dock repair — charge the flat fee if affordable, otherwise a MERCY free repair. Always succeeds. */
-function applyRepair(player) {
+/** Dock repair — charge the flat fee if affordable, otherwise a MERCY free repair. Always succeeds.
+ *  Staff (Owner/Admin) repair gratis: pass free=true to skip the fee entirely (not a "mercy"). */
+function applyRepair(player, free = false) {
+  if (free) return { ok: true, charged: 0, mercy: false, free: true };
   const fee = goods.REPAIR_FEE;
   if (player.gold >= fee) { player.gold -= fee; return { ok: true, charged: fee, mercy: false }; }
   return { ok: true, charged: 0, mercy: true };
@@ -412,19 +495,20 @@ async function flushState(force) {
 }
 
 module.exports = {
-  load, ensureLoaded, townAt, getTown, townList, marketFor,
+  load, ensureLoaded, townAt, getTown, townList, marketFor, playerMarket,
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
   bestBuyerFor, hintFor, currentDay: economyDay,
-  npcBuy, npcSell, distressList, bestSellerFor, bestArbitrage,
+  npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
   tick, tickToToday, loadState, flushState, seedMarkets,
-  REPAIR_FEE: goods.REPAIR_FEE, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
+  REPAIR_FEE: goods.REPAIR_FEE, RECRUIT_COST: goods.RECRUIT_COST, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,
   // test seam (headless harness — no manifest/DB): inject towns + drive state directly.
   _test: {
     setTowns(arr) { towns = new Map(arr.map((t) => [t.id, t])); profiles = new Map(); markets = new Map(); loaded = true; },
     seedMarkets, tick, marketFor, bestBuyerFor, hintFor, serializeTowns, hydrateTowns, economyDayAt,
-    npcBuy, npcSell, distressList, bestSellerFor, bestArbitrage,
+    npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
     setLastTickDay(d) { lastTickDay = d; }, getLastTickDay() { return lastTickDay; },
     getMarket(id) { return markets.get(id); }, profileFor: (t) => profileFor(t),
+    repPriceMul, standingAt, playerMarket, applyBuy, applySell, REP_PRICE_MAX: () => REP_PRICE_MAX,
   },
 };

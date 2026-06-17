@@ -6,6 +6,7 @@ import { RiggedManifest, SailState } from '../models';
 import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
+import { mastDownAmount, mastBreakAmount } from './combat.constants';
 
 /**
  * Per-vessel animation driver for a single rigged GLB (e.g. bermuda_sloop_rigged.glb).
@@ -70,6 +71,18 @@ export class SloopController implements VesselController {
   private readonly GUN_RECOIL_DECAY = 5.0;   // recoil kick decay per sec
 
   private readonly frameEnd: number;
+
+  // Mast damage / dismasting: scrub the `MastDown` clip + ramp the splinter `Break` morph off the
+  // masts-zone health. Eased in tickRig so the rig falls (and rises on repair) over ~1-2 s rather than
+  // snapping. Resolved from manifest.mast_damage; stays a no-op on GLBs without that rig.
+  private readonly mastFallClip:  string | null;
+  private readonly mastBreakNode: string | null;
+  private readonly mastBreakIndex: number;
+  private mastDownCur   = 0;
+  private mastDownTarget = 0;
+  private mastBreakCur   = 0;
+  private mastBreakTarget = 0;
+  private readonly MAST_FALL_RATE = 0.4;   // scrub units/sec (~1.25 s for the final topple, ~2.3 s to rise)
 
   // Sail-state → per-sail furl table (0 = set, 1 = furled). Semantic per-sail mapping;
   // tunable per future ship. Keep keys aligned with manifest sail names.
@@ -150,6 +163,12 @@ export class SloopController implements VesselController {
     // Build the sail → sheet-pair lookup.
     for (const p of manifest.sail_sheet_pairs ?? []) this.pairBySail.set(p.sail, p);
 
+    // Resolve the dismasting rig (clip + break morph) if this GLB ships one.
+    const md = manifest.mast_damage;
+    this.mastFallClip   = md && this.clips.has(md.fall_clip) ? md.fall_clip : null;
+    this.mastBreakNode  = md?.break_morph?.node ?? null;
+    this.mastBreakIndex = md?.break_morph?.index ?? 0;
+
     // Capture rest rotation for the code-driven bones so swings compose onto rest pose.
     for (const name of ['B_Boom', 'B_Gaff', 'B_Flag', 'B_Pennant', 'B_Wheel', 'B_Rudder']) {
       const n = this.nodes.get(name);
@@ -210,6 +229,17 @@ export class SloopController implements VesselController {
     return g;
   }
 
+  /** Scrub a clip to a NORMALIZED 0..1 over its ACTUAL [from, to]. The glTF loader resamples animation
+   *  times onto its own frame range, so g.to is generally NOT frameEnd — the mast collapse must reach its
+   *  FULL authored pose, so it scrubs the real range here. (The legacy clips keep the frameEnd scrub above
+   *  to preserve their existing tuned look.) */
+  private poseNorm(clipName: string, t01: number): void {
+    const g = this.clips.get(clipName);
+    if (!g) return;
+    if (!g.animatables.length) { g.start(false, 1.0, g.from, g.to); g.pause(); }
+    g.goToFrame(g.from + Math.max(0, Math.min(1, t01)) * (g.to - g.from));
+  }
+
   // ── public control surface ─────────────────────────────────────────────────
 
   /** -1 hard port .. 0 center .. +1 hard starboard. Drives the rudder bone directly (the
@@ -249,6 +279,14 @@ export class SloopController implements VesselController {
   /** Gunport lids per side: 0 = closed (default), 1 = open. */
   setGunports(side: 'S' | 'P', open: number): void {
     this.pose(`Lid_${side}`, Math.max(0, Math.min(1, open)) * this.frameEnd);
+  }
+
+  /** Mast damage from the masts-zone health (1 intact .. 0 destroyed). Sets the collapse + splinter
+   *  TARGETS; tickRig eases them so the rig falls (and rises on repair) instead of snapping. */
+  setMastDamage(health: number): void {
+    if (!this.mastFallClip) return;
+    this.mastDownTarget  = mastDownAmount(health);
+    this.mastBreakTarget = mastBreakAmount(health);
   }
 
   // ── Gunnery: run-out / stow / recoil (eased + applied in tickRig) ──────────
@@ -373,6 +411,22 @@ export class SloopController implements VesselController {
       if (this.gunDeployCur[side] !== 0 || tgt !== 0 || this.gunRecoil[side] > 0) {
         this.applyGunPose(side);
       }
+    }
+
+    // Mast damage — ease the collapse scrub + splinter morph toward their targets, then pose the
+    // MastDown clip (B_Mast hinge) and drive the Break morph. Posed BEFORE the skeleton recompute so
+    // the skinned mast + standing rigging fall with the bone this frame.
+    if (this.mastFallClip) {
+      if (this.mastDownCur !== this.mastDownTarget) {
+        const d = this.mastDownTarget - this.mastDownCur;
+        this.mastDownCur += Math.sign(d) * Math.min(Math.abs(d), this.MAST_FALL_RATE * dt);
+      }
+      this.poseNorm(this.mastFallClip, this.mastDownCur);
+      if (this.mastBreakCur !== this.mastBreakTarget) {
+        const d = this.mastBreakTarget - this.mastBreakCur;
+        this.mastBreakCur += Math.sign(d) * Math.min(Math.abs(d), this.MAST_FALL_RATE * dt);
+      }
+      if (this.mastBreakNode) this.setMorph(this.mastBreakNode, this.mastBreakIndex, this.mastBreakCur);
     }
 
     // Recompute the skeleton from the bone nodes we just posed. The yard/boom meshes are

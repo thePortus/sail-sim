@@ -1,12 +1,21 @@
 import { Injectable, inject, signal } from '@angular/core';
-import { TransformNode, Vector3, Mesh, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
+import { TransformNode, Vector3, Mesh, MeshBuilder, Matrix, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
   StandardMaterial, DynamicTexture, VertexData, Texture } from '@babylonjs/core';
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
 import { VesselService } from './vessel.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { TownImpostorPlugin } from './scatter/town-impostor.plugin';
+import { ImpostorHazePlugin } from './scatter/impostor-haze.plugin';
+import { measureBottomPad } from './scatter/asset-loader';
+import { Settings } from '../../app.settings';
 import { TerrainHarbor } from '../models';
+import { buildNameplate } from './nameplate';
+import { factionColor, factionName } from '../faction.config';
+
+// Settlement-type wording for the town-sign subtitle (the raw tier 'small' alone reads as "Spanish Small").
+const TOWN_TIER_LABEL: Record<string, string> = { capital: 'Capital', medium: 'Town', small: 'Small Town' };
 
 /**
  * Renders the harbor towns detected during terrain generation (manifest.harbors). For now a town =
@@ -59,25 +68,31 @@ export class HarborService {
   // those four registrations (see disposePier).
   private readonly pierNodes = new Map<string, TransformNode>();
   private readonly pierLoading = new Set<string>();
+  // Distant-town BUILDING IMPOSTOR layer: one camera-facing billboard mesh per building TYPE, thin-instanced
+  // across every town (~few draws total), faded in past the mesh-drop range + out by ~5 km (see
+  // TownImpostorPlugin). Built once from the baked impostor atlas; keeps distant coastlines populated cheaply.
+  private impostorMeshes: Mesh[] = [];
   private readonly PIER_BUILD_RANGE = 2400;
   private readonly PIER_DROP_RANGE = 2800;
   // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
   private squareMat: StandardMaterial | null = null;
   private roadMat: StandardMaterial | null = null;
-  // Building stream ranges: tuned for the 50-town map — a 6 m cabin at 1 km is a couple of pixels,
-  // and several towns can now be in range at once, so keep the detail bubble tight (was 1500/1900).
-  private readonly BUILD_RANGE = 950;
-  private readonly DROP_RANGE = 1150;
+  // Building stream ranges: full 3-D buildings only in the CLOSE bubble now that the impostor layer (T3)
+  // covers the mid-distance — so we pull this in hard (was 950/1150) to slash near-town building draws.
+  // The impostor fade-in band (TownImpostorPlugin.band) is set to reach full right as real meshes drop, so
+  // the town never disappears at the handoff. Tune the two together.
+  private readonly BUILD_RANGE = 600;
+  private readonly DROP_RANGE = 800;
   // Cap on simultaneous full-detail towns: only the nearest MAX_ACTIVE_TOWNS inside BUILD_RANGE may
   // START building. Eviction stays purely range-based (DROP_RANGE) — rank churn between two towns at
   // similar distances never disposes one, so there's no swap-thrash; the cap just stops a dense bay
   // from instantiating 3+ full towns at once.
   private readonly MAX_ACTIVE_TOWNS = 2;
   private readonly STREAM_BUILDINGS = true;
-  // Dock when the hull is within ~20 ft (≈6 m) of the pier DECK EDGE (not the shore point — the pier
+  // Dock when the hull is within ~40 ft (≈12 m) of the pier DECK EDGE (not the shore point — the pier
   // blocks the centre from ever reaching the shore). Per-variant deck size (m): len = along-seaward
   // from the shore point, halfWidth = half the across-extent (matches the server pier-obstacles dims).
-  private readonly DOCK_EDGE_M = 6;
+  private readonly DOCK_EDGE_M = 12;
   private readonly PIER_DIMS: Record<string, { len: number; halfWidth: number }> = {
     straight: { len: 14.3, halfWidth: 1.6 },
     l:        { len: 11.0, halfWidth: 6.5 },
@@ -86,6 +101,26 @@ export class HarborService {
 
   /** The town the player is currently close enough to dock at, or null. Read by the HUD/game UI. */
   readonly dockable = signal<TerrainHarbor | null>(null);
+
+  private _hideLabels = false;   // photo mode hides the floating town signs for a clean screenshot
+  /** Photo mode: hide/show the floating town signs (called from the game component's photoMode effect). */
+  setLabelsHidden(hidden: boolean): void {
+    this._hideLabels = hidden;
+    if (hidden) { for (const { plane } of this.townLabels.values()) plane.setEnabled(false); }   // instant hide; the loop restores
+  }
+
+  // Floating town signs (same ornate brass plaque as the ship nameplates — see nameplate.ts). Streamed in as
+  // the player nears a town and dropped again past LBL_DROP, so only the ~1–2 nearest carry a live billboard.
+  // Tinted by the owning nation; a "⚓ NATION CAPITAL/MEDIUM/SMALL" tag under the town name.
+  private readonly townLabels = new Map<string, { plane: Mesh; h: TerrainHarbor }>();
+  private readonly LBL_SHOW   = 2000;   // build the sign within this range (m)
+  private readonly LBL_DROP   = 2400;   // drop it past this (hysteresis vs SHOW)
+  private readonly LBL_NEAR   = 350;    // ≤ this → base size; beyond, softened-perspective growth
+  private readonly LBL_POW    = 0.6;    // perspective softening (matches the ship labels)
+  private readonly LBL_FAR    = 7;      // scale cap
+  private readonly LBL_W      = 46;     // base plane size (a town sign is a bigger landmark than a ship plate)
+  private readonly LBL_H      = 12.8;   // ≈ LBL_W / 3.6 (texture aspect)
+  private readonly LBL_LIFT   = 18;     // lower edge this far above the town's pad (clears the buildings)
 
   async init(): Promise<void> {
     const scene = this.sceneService.scene;
@@ -104,9 +139,9 @@ export class HarborService {
     this.squareLight.intensity = 0;
 
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.sceneService.span('harbor', () => this.tick()));
-    console.log(`[Harbor] ${this.harbors.length} harbors; piers + buildings stream by range`);
     // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to
     // build up front. The 3 variant GLBs parse once into the shared cache on first use.
+    this.buildTownImpostors();   // async; distant-town billboard layer (fire-and-forget)
   }
 
   /** Each frame: park the pool light at the nearest pier and update the dockable town. */
@@ -134,11 +169,42 @@ export class HarborService {
     // (shore → seaward end), minus the deck half-width.
     const dim = this.PIER_DIMS[best.variant] ?? this.PIER_DIMS['straight'];
     const segD = this.distToSegment(p.x, p.z, best.x, best.z, best.x + fx * dim.len, best.z + fz * dim.len);
-    const inRange = Math.max(0, segD - dim.halfWidth) <= this.DOCK_EDGE_M;
+    // segD is measured from the ship CENTRE, so scale the allowance by the hull's reach: a big ship
+    // (brig half-len 12 m) docks from much farther out than a pinnace (4 m), since its hull edge is
+    // alongside the pier while its centre is still a full hull-length off it.
+    const inRange = Math.max(0, segD - dim.halfWidth) <= this.DOCK_EDGE_M + this.vesselService.getHullReach();
 
     const cur = this.dockable();
     if (inRange) { if (!cur || cur.id !== best.id) this.dockable.set(best); }
     else if (cur) { this.dockable.set(null); }
+  }
+
+  /**
+   * Tie-up berth for harbour `h` given the boat's current pose: a point ALONGSIDE the pier deck edge, on
+   * whichever side the boat approaches from, parallel to the pier and offset clear of the deck. Fed to the
+   * vessel's auto-dock glide. Returns world XZ + heading°.
+   */
+  computeBerth(
+    h: TerrainHarbor, boatX: number, boatZ: number, boatHeadingDeg: number,
+  ): { x: number; z: number; heading: number } {
+    const hr = (h.heading * Math.PI) / 180;
+    const fx = Math.sin(hr), fz = Math.cos(hr);          // seaward unit (pier centreline direction)
+    const px = fz, pz = -fx;                             // unit perpendicular (starboard of seaward)
+    const dim = this.PIER_DIMS[h.variant] ?? this.PIER_DIMS['straight'];
+    // Project the boat onto the centreline; berth alongside the seaward half of the deck (clamped on-pier).
+    const along = Math.max(dim.len * 0.45, Math.min(dim.len * 0.95,
+      (boatX - h.x) * fx + (boatZ - h.z) * fz));
+    const cx = h.x + fx * along, cz = h.z + fz * along;  // centreline point abreast the berth
+    const side = ((boatX - cx) * px + (boatZ - cz) * pz) >= 0 ? 1 : -1;   // boat's side of the pier
+    const offset = dim.halfWidth + 3.0;                  // clear of the deck edge (~hull half-beam + fenders)
+    const bx = cx + px * side * offset, bz = cz + pz * side * offset;
+    // Heading: parallel to the pier, in whichever direction is closest to the boat's current heading
+    // (so it eases alongside rather than spinning 180°).
+    const fwd = ((h.heading % 360) + 360) % 360;
+    const aft = (fwd + 180) % 360;
+    const dF = Math.abs(((boatHeadingDeg - fwd + 540) % 360) - 180);
+    const dA = Math.abs(((boatHeadingDeg - aft + 540) % 360) - 180);
+    return { x: bx, z: bz, heading: dF <= dA ? fwd : aft };
   }
 
   /** Shortest distance from point P to segment [A,B] in the XZ plane. */
@@ -165,7 +231,64 @@ export class HarborService {
    *  to scan per frame). */
   private tick(): void {
     this.updateNearestPier();
-    if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); }
+    if (this.impostorMeshes.length) { this.updateImpostorCamera(); }
+    const f = this.frame++;
+    // Towns are STATIC, so their signs' scale/position drift slowly with the camera — refresh at ~15 Hz, not 60.
+    if ((f & 3) === 0) { this.updateTownLabels(); }
+    if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); }
+  }
+
+  /** Build a town's floating sign when the player nears it; drop it again once well past (hysteresis). */
+  private streamTownLabels(): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    const p = this.vesselService.getPosition();
+    for (const h of this.harbors) {
+      const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
+      const has = this.townLabels.has(h.id);
+      if (!has && d2 <= this.LBL_SHOW * this.LBL_SHOW) {
+        const nation = h.faction ? factionName(h.faction).toUpperCase() : 'FREE';
+        const settle = (TOWN_TIER_LABEL[h.tier ?? ''] ?? 'Town').toUpperCase();   // 'small' → "SMALL TOWN", etc.
+        const plane = buildNameplate(scene, 'townlbl_' + h.id, {
+          title: h.name,
+          subtitle: `⚓ ${nation} ${settle}`,
+          baseColor: h.faction ? factionColor(h.faction) : '#4a5560',   // owned → nation tint; free → slate stone
+          width: this.LBL_W, height: this.LBL_H,
+          kind: 'town',   // swallowtail wooden banner — distinct from a ship's brass plaque
+        });
+        this.townLabels.set(h.id, { plane, h });
+      } else if (has && d2 > this.LBL_DROP * this.LBL_DROP) {
+        this.townLabels.get(h.id)!.plane.dispose(false, true);
+        this.townLabels.delete(h.id);
+      }
+    }
+  }
+
+  /** Per-frame: soften-perspective scale + bottom-anchor each live town sign above its pad (mirrors ship labels). */
+  private updateTownLabels(): void {
+    if (!this.townLabels.size) return;
+    const cam = this.sceneService.camera;
+    if (!cam) return;
+    for (const { plane, h } of this.townLabels.values()) {
+      if (this._hideLabels) { if (plane.isEnabled()) plane.setEnabled(false); continue; }   // photo mode
+      if (!plane.isEnabled()) plane.setEnabled(true);
+      const d = Math.hypot(h.x - cam.position.x, h.z - cam.position.z);
+      const s = Math.min(this.LBL_FAR, Math.max(1, Math.pow(d / this.LBL_NEAR, this.LBL_POW)));
+      plane.scaling.set(s, s, s);
+      plane.position.set(h.x, (h.pad?.elev ?? 0) + this.LBL_LIFT + this.LBL_H * s * 0.5, h.z);
+    }
+  }
+
+  /** Feed the town-impostor billboard plugin the live camera XZ + horizontal right vector (so the quads face
+   *  the camera) once per frame. Cheap — two uniform values shared by every impostor material. */
+  private updateImpostorCamera(): void {
+    const cam = this.sceneService.camera;
+    if (!cam) return;
+    const f = cam.getForwardRay().direction;            // camera forward (world)
+    let rx = f.z, rz = -f.x;                             // horizontal right = up × forward, projected to XZ
+    const rl = Math.hypot(rx, rz) || 1; rx /= rl; rz /= rl;
+    const P = TownImpostorPlugin.cam;
+    P.x = cam.position.x; P.z = cam.position.z; P.rx = rx; P.rz = rz;
   }
 
   /** Instantiate piers within PIER_BUILD_RANGE; tear down those past PIER_DROP_RANGE (hysteresis
@@ -256,6 +379,68 @@ export class HarborService {
     }
     this.buildGround(h, root, padElev);
     return root;
+  }
+
+  /** Build the static distant-town impostor layer: for EVERY town's buildings, drop a camera-facing billboard
+   *  (baked 3/4 view) thin-instanced per building TYPE — so all towns are visible mid-distance for ~a handful
+   *  of draws. Hidden up close (real streamed buildings own that) + faded out past ~5 km via TownImpostorPlugin.
+   *  Piers have no impostor (they stream as real meshes), so they're simply skipped. */
+  private async buildTownImpostors(): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.harbors.length) return;
+    const base = `${Settings.apiUrl}geometry/harbors/impostors/`;
+    let sizes: Record<string, { size: number }>;
+    try {
+      const mani = await (await fetch(`${base}impostors_manifest.json`)).json();
+      sizes = mani?.buildings ?? {};
+    } catch { return; }
+
+    // Gather all instances grouped by building TYPE (world coords; per-instance translation matrix).
+    const byType = new Map<string, number[]>();
+    for (const h of this.harbors) {
+      if (!h.buildings) continue;
+      const y = h.pad?.elev ?? 0;
+      for (const b of h.buildings) {
+        if (!sizes[b.asset]) continue;                  // no impostor (piers) → skip
+        let arr = byType.get(b.asset);
+        if (!arr) { arr = []; byType.set(b.asset, arr); }
+        Matrix.Translation(b.x, y, b.z).copyToArray(arr, arr.length);
+      }
+    }
+    if (!byType.size || !this.root) return;
+
+    for (const [asset, arr] of byType) {
+      const size = sizes[asset].size;
+      const url = `${base}${asset}_imp.png`;
+      const pad = await measureBottomPad(url, 0.0);      // align the building's base to the instance ground
+      if (!this.root) return;                            // disposed mid-await
+      const tex = new Texture(url, scene);
+      tex.hasAlpha = true;
+
+      const mesh = MeshBuilder.CreatePlane(`town_imp_${asset}`, { width: size, height: size }, scene);
+      mesh.bakeTransformIntoVertices(Matrix.Translation(0, size / 2 - pad * size, 0));   // base → local y=0
+      const mat = new StandardMaterial(`town_imp_mat_${asset}`, scene);
+      mat.diffuseTexture = tex; mat.emissiveTexture = tex;   // pre-lit: show the baked image directly
+      mat.diffuseColor = new Color3(0, 0, 0);
+      mat.disableLighting = true;
+      mat.transparencyMode = Material.MATERIAL_ALPHATEST;
+      mat.alphaCutOff = 0.4;
+      mat.backFaceCulling = false;
+      mat.useAlphaFromDiffuseTexture = true;
+      new TownImpostorPlugin(mat);                        // camera-facing billboard + distance-band fade (vertex)
+      new ImpostorHazePlugin(mat);                        // aerial haze (fragment) — recede with the terrain
+      this.sceneService.excludeFromPrePass(mat);
+
+      mesh.material = mat;
+      mesh.parent = this.root;
+      mesh.renderingGroupId = 2;                          // world layer (terrain/ocean/vessels)
+      mesh.isPickable = false;
+      mesh.alwaysSelectAsActiveMesh = true;               // billboarded in-shader → bounds meaningless; instances are tiny + fade-gated
+      mesh.doNotSyncBoundingInfo = true;
+      this.sceneService.excludeFromGlow(mesh);
+      mesh.thinInstanceSetBuffer('matrix', new Float32Array(arr), 16, true);
+      this.impostorMeshes.push(mesh);
+    }
   }
 
   /** Lazily build the two shared procedural ground materials: cobblestone (the civic square) + dirt (roads).
@@ -573,6 +758,10 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    for (const { plane } of this.townLabels.values()) plane.dispose(false, true);   // own texture+material
+    this.townLabels.clear();
+    for (const m of this.impostorMeshes) { m.material?.dispose(true, true); m.dispose(); }   // own texture+material
+    this.impostorMeshes = [];
     // Pier nodes die with root below (the scene teardown also disposes the shadow/reflection/glow
     // lists they were registered in) — just drop the refs.
     this.pierNodes.clear();

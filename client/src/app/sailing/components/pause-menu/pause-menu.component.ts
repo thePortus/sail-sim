@@ -17,7 +17,7 @@ import { SfxService } from '../../services/sfx.service';
       <!-- Header -->
       <div class="pause-header">
         <div class="pause-title">⚓ Anchored</div>
-        <div class="pause-subtitle">Game Paused</div>
+        <div class="pause-subtitle">(Game Menu)</div>
       </div>
 
       <!-- Now playing -->
@@ -56,6 +56,9 @@ import { SfxService } from '../../services/sfx.service';
         </button>
         <button class="pause-btn pause-btn--settings" (click)="onSettings()">
           ⚙ Settings
+        </button>
+        <button class="pause-btn pause-btn--settings" (click)="onHelp()">
+          ❓ Help &amp; Controls
         </button>
         <button class="pause-btn pause-btn--danger" (click)="onQuit()">
           ← Return to Harbour
@@ -174,6 +177,7 @@ export class PauseMenuComponent {
   @Output() resume       = new EventEmitter<void>();
   @Output() quit         = new EventEmitter<void>();
   @Output() openSettings = new EventEmitter<void>();
+  @Output() openHelp     = new EventEmitter<void>();
 
   readonly music = inject(MusicService);
   readonly sfx   = inject(SfxService);
@@ -181,6 +185,7 @@ export class PauseMenuComponent {
   onResume():   void { this.resume.emit(); }
   onQuit():     void { this.quit.emit(); }
   onSettings(): void { this.openSettings.emit(); }
+  onHelp():     void { this.openHelp.emit(); }
 
   // Audio controls (mirror the settings menu; both bind the same MusicService/SfxService signals).
   volumePct(): number { return Math.round(this.music.volume() * 100); }

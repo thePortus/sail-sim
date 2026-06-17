@@ -7,7 +7,10 @@
  * combat. Keep the capsule dims in sync with the client COLL_DIMS_BY_SLUG (multiplayer.service.ts).
  */
 
-const { worldBounds }  = require('./config/terrain.config');
+const fs = require('fs');
+const path = require('path');
+const terrainConfig = require('./config/terrain.config');
+const { worldBounds }  = terrainConfig;
 const { TRAVEL_SCALE } = require('./combat-constants');
 
 // Slack multiplier applied to every kinematic limit. Absorbs gusts, leeway, wave-surf nudges,
@@ -28,6 +31,14 @@ const TURN_CAP_DEG = 30;
 const DT_MIN = 0.02;
 const DT_MAX = 0.5;
 
+// Token-bucket burst window (s) for the movement-validation dt. The dt budget refills at real wall-clock
+// rate (capped per packet at DT_MAX) and tops out here. This absorbs network JITTER: when a high-ping
+// client's updates stall then arrive BUNCHED (several within a few ms), each can still spend a full
+// send-interval of travel from the budget accrued during the stall — instead of being false-clamped to
+// ~0 and rubber-banding (the bug a ~300 ms-ping player hit). Still bounds sustained speed-hacks: over any
+// window, total travel ≤ maxSpeed·SLACK·elapsed + this burst. ~0.6 s covers typical intercontinental jitter.
+const MOVE_BURST_SEC = 0.6;
+
 // Ship-to-ship collision capsule per vessel slug (mirrors the client COLL_DIMS_BY_SLUG). Phase 4.
 const COLL_DIMS_BY_SLUG = {
   sloop:   { halfLen: 5.0, radius: 2.2 },
@@ -41,9 +52,19 @@ const COLL_RESTITUTION = 0.15;
 const COLL_MIN_SPEED   = 0.4;
 
 // Bump whenever the terrain is re-baked so stale saved positions are discarded on spawn. Phase 5.
-const MAP_VERSION = 7;   // 7: re-bake — + navgrid.bin (navigable-water mask) for NPC sea-routing
+// Map version: now AUTO-STAMPED into the manifest by the terrain build (build-terrain-region.mjs increments
+// it every bake). Read it once at boot; any new map → a new version → saved player positions + economy reset.
+// Falls back to 8 for legacy manifests baked before mapVersion was stamped (matches the last hand-set value).
+function bakedMapVersion() {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(terrainConfig.outputDir, 'manifest.json'), 'utf8'));
+    if (Number.isFinite(m.mapVersion)) return m.mapVersion | 0;
+  } catch { /* no manifest / parse error → legacy fallback */ }
+  return 8;
+}
+const MAP_VERSION = bakedMapVersion();
 
 module.exports = {
-  worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX,
+  worldBounds, TRAVEL_SCALE, SLACK, REVERSE_MAX, TURN_CAP_DEG, DT_MIN, DT_MAX, MOVE_BURST_SEC,
   COLL_DIMS_BY_SLUG, collDims, COLL_RESTITUTION, COLL_MIN_SPEED, MAP_VERSION,
 };

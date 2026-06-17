@@ -2,53 +2,37 @@
 
 # General or Current TODO Items
 
-* make trade hints not show you ports you can't get to
-* make all merchants visible to admins on the map, admins repair free, can /repair others, and /teleport and /teleportto
-* add occasional bosun whistle (no more than once a day)
-* all players start in pinnace.... sloop is like 60k, unless admin, then can choose vessel in pause menu... sloop has bigger hold, players keep money, ship, and inventory even if map changes
-* lod + imposters for ships at distance
-* improved landscape with NME & more scatter to distant
-* ship status in db... start all players in pinnace, allow switch via menu... ship inventory.. persistent ship damage... leave slots for ship upgrade
-* town economies... goods they produce, consume... all produce one or two goods for export, will need the rest, prices based on amount in town... step 1
-* AI ships... step 2
-* Cool towns = thin-instanced buildings + merged per-town clutter + impostor LODs for distance — all keep draw count flat.
-* streaming assets has gotten weird, trees move in and out.. and all scattered assets don't sit well on elevation
-* better latency handling
-* server is disconnected message
-* Plan to make towns or areas "different"... things to see, special marvels
-* For landscape.... distant trees scattered and then node material editor PBR
+* brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
+* make pinace buoyance more responsive
+* make salvage crate asset
+* increase render resolution in spyglass
+* update profile page and update password page (and 404 page with a funny 404)
+* why a dark patch around player ship? is it because of transparency to see hull?
+* make trading and ship buying server-side secure
+* intro text for newest players saying how they overthrew their captain and struck out for a life of siezing what you can come up with story
+* crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
+* more realistic bird flight paths... momentum starting and stopping... speed of flapping wings relative to flight speed
+* Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
+* placeholder ship for other players when that model hasnt loaded yet (or LOD imposter?)
+* grapeshot doesn't make cannonball impacts on the water
+* update to cannon aim sight to show spread of all cannon shots somehow
+* add ship armor + cannon upgrades
+* general materials atlas draw cycle reduction
+* Paying for powder and shot
+* any way to reduce load times?
+* add forts to town that will fire when super hostile
+* streaming assets has gotten weird, trees move in and out.. can we make them fade in?
+* Plan to make towns or areas "different"... things to see, special marvels... missions?
 * sound is chunking on windows machines still
-* get rid of flickering on landscape that is riiiiight at water height and thus flighting above/below constantly. Not bc of waves.. but because of look of two geometry objects in same space
-* impoved sailing physics... boat rocked by visible shader waves? boat can get knocked off course? Have it generate a plan to improve physics
-* make stuff look cool pass)
-* RAINFOREST SHADER TO COVER ALL NON CLOSE TERRAIN https://www.shadertoy.com/view/4ttSWf and for desert https://www.shadertoy.com/view/Xs33Df or for both dry rocky gorge https://www.shadertoy.com/view/lslfRN or general purpose terrain shader https://github.com/MichaelEGA/Procedural-Stochastic-Terrain-Shader or this https://www.shadertoy.com/view/MdBGzG
-* shader for volumetric explosions https://www.shadertoy.com/view/lsySzd
-* shader for water on camera https://www.shadertoy.com/view/ltffzl
-* docking tie up animation
-* keypress makes songs lock up
+* server optimization pass
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
-* adjust water displacement to better fit hull of pinnace
-* add dedication
-* draw distance (for other players, etc)
 * add damage from collisions and aground
-* Change "callsign" to "Pirate Name" in front end UI (leave backend unchanged)...
-* add keymap help screen
+* add sharks and schools of colorful fish and whales
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * check landscape hit detection... make sure balls don't go through land
-* add sharks... make their appearance procedural... so everyone has same experience, yet make them rare.. make the summonable by admin for testing
-* fix tree height
-* persistent logoff locations & serverside authoritative location
 * tidal pull?
-* introduce map iteration (a game id # basically) number so if player is connecting to a new map, they can get starting location
-* add in damage morph targets
 * Bring DRACO compression in, remove any CDNs
-* Add in town geometries (just worry about piers at first)
-* Add in towns themselves
-* Add repairing
-* Add sailors on deck
-* Add ship names
 * Add /teleport playername x y and /teleportTo playername to admins
-* Add lost server connection detection
 * encrypt websocket server? wss instead of ws?
 * Optimization pass
 * Security pass

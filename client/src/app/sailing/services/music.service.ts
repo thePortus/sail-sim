@@ -94,11 +94,13 @@ export class MusicService {
       this.fetchAndCache(track.filename).catch(() => {});
     }
 
-    // ── Start playback if the user preference says so ──────────────────────
+    // ── Make actual playback reflect the saved settings on entry ───────────
+    // Always drive the output bus from the stored preference: the saved volume when music is on, fully silent
+    // when it's off. This guarantees a player who turned music off hears nothing (no stray full-volume bus),
+    // and that the saved volume is honoured on every entry — not just the first.
+    this.applyOutputVolume();
     if (this.isEnabled()) {
       await Tone.start();   // ensure AudioContext is running after user gesture
-      // Restore saved volume now that the AudioContext exists.
-      this.setVolume(this.volume());
       await this.startCurrentTrack();
     }
   }
@@ -108,8 +110,16 @@ export class MusicService {
     const clamped = Math.max(0, Math.min(1, v));
     this.volume.set(clamped);
     localStorage.setItem(LS_VOL_KEY, String(clamped));
+    this.applyOutputVolume();   // reflect on the bus now (stays silent while music is toggled OFF)
+  }
+
+  /** Drive the actual output bus from the CURRENT settings: the saved volume when music is enabled, fully
+   *  SILENT when it's off — so playback always matches the user's preference (no stray full-volume audio),
+   *  without clobbering the stored volume. Called on entry, on every volume change, and on toggle. */
+  private applyOutputVolume(): void {
+    const v = this.isEnabled() ? this.volume() : 0;
     // Tone.gainToDb(0) would be -Infinity; clamp to −60 dB for silence.
-    Tone.Destination.volume.value = clamped < 0.001 ? -60 : 20 * Math.log10(clamped);
+    Tone.Destination.volume.value = v < 0.001 ? -60 : 20 * Math.log10(v);
   }
 
   /** Toggle music on/off; persists preference to localStorage. */
@@ -117,6 +127,7 @@ export class MusicService {
     const next = !this.isEnabled();
     this.isEnabled.set(next);
     localStorage.setItem(LS_KEY, String(next));
+    this.applyOutputVolume();   // unmute to the saved volume / mute, matching the new state
 
     if (next) {
       await Tone.start();
@@ -155,10 +166,10 @@ export class MusicService {
   }
 
   private readStoredVolume(): number {
-    // Default to 30% on a NEW device (no stored value) so music never blasts on first load. A previously
-    // set volume — including 0 (muted) — is stored as a string, so `?? '0.3'` only applies when the key is
+    // Default to 10% on a NEW device (no stored value) so music is gentle on first load. A previously set
+    // volume — including 0 (muted) — is stored as a string, so this default only applies when the key is
     // genuinely absent, leaving any prior preference untouched.
-    const DEFAULT_VOL = 0.3;
+    const DEFAULT_VOL = 0.1;
     try {
       const raw = localStorage.getItem(LS_VOL_KEY);
       if (raw === null) { return DEFAULT_VOL; }

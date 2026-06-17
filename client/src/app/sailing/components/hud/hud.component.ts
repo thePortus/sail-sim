@@ -4,6 +4,9 @@ import { VesselService } from '../../services/vessel.service';
 import { WeatherService } from '../../services/weather.service';
 import { SceneService } from '../../services/scene.service';
 import { CannonService } from '../../services/cannon.service';
+import { CombatService } from '../../services/combat.service';
+import { MultiplayerService } from '../../services/multiplayer.service';
+import { SquadronService } from '../../services/squadron.service';
 import { SailState } from '../../models';
 import { ChatComponent } from '../chat/chat.component';
 import { DamageDiagramComponent } from './damage-diagram.component';
@@ -19,6 +22,9 @@ export class HudComponent implements OnInit, OnDestroy {
   weatherService = inject(WeatherService);
   sceneService   = inject(SceneService);
   cannonService  = inject(CannonService);
+  combatService  = inject(CombatService);
+  multiplayerService = inject(MultiplayerService);
+  squadronService    = inject(SquadronService);
   private zone   = inject(NgZone);
 
   @ViewChild(ChatComponent) private chat?: ChatComponent;
@@ -138,6 +144,16 @@ export class HudComponent implements OnInit, OnDestroy {
     return '🌙';
   });
 
+  /** Crew readout colour: green when well-crewed, amber/red as casualties mount. */
+  crewColor = computed(() => {
+    const max = this.combatService.maxCrew();
+    if (max <= 0) return 'text-white';
+    const f = this.combatService.crew() / max;
+    if (f > 0.66) return 'text-green-400';
+    if (f > 0.33) return 'text-yellow-400';
+    return 'text-red-400';
+  });
+
   grounded  = this.vesselService.grounded;
   anchored  = this.vesselService.anchored;
   exitGame  = output<void>();
@@ -241,6 +257,11 @@ export class HudComponent implements OnInit, OnDestroy {
   refloat(): void {
     this.vesselService.refloat();
   }
+
+  // ── Squadrons (Phase B) ─────────────────────────────────────────────────────
+  acceptSquadron(): void  { this.multiplayerService.squadronAccept(); }
+  declineSquadron(): void { this.multiplayerService.squadronDecline(); }
+  leaveSquadron(): void   { this.multiplayerService.squadronLeave(); }
 
   exit(): void {
     this.exitGame.emit();

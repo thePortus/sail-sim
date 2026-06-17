@@ -165,6 +165,64 @@ function stringPull(cells) {
   return out;
 }
 
+/** Component id of the nearest navigable cell to (x,z) — searching outward, NOT forced to the main sea (unlike
+ *  snapToNav). This is the LOCAL water body a point touches. -1 if no navigable cell within SNAP_MAX_RINGS. */
+function componentAt(x, z) {
+  if (!loaded) loadNavGrid();
+  if (!bits || !comp) return -1;
+  const { cx, cz } = worldToCell(x, z);
+  if (isNav(cx, cz)) return comp[cz * res + cx];
+  for (let r = 1; r <= SNAP_MAX_RINGS; r++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+        const nx = cx + dx, nz = cz + dz;
+        if (inGrid(nx, nz) && isNav(nx, nz)) return comp[nz * res + nx];
+      }
+    }
+  }
+  return -1;
+}
+
+/** True if a sea route plausibly connects A and B — i.e. their local water bodies are the SAME connected
+ *  component (no land barrier between them). Fail-open (true) when no navgrid is loaded, so trading still
+ *  works on maps built before the grid existed. Used to keep demand hints / NPC sourcing to reachable ports. */
+function reachable(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  if (!bits || !comp) return true;   // no grid → don't filter
+  const a = componentAt(ax, az);
+  return a >= 0 && a === componentAt(bx, bz);
+}
+
+/** World-space straight-segment water test: true if (ax,az)→(bx,bz) stays entirely on navigable water (no land
+ *  crossing). Fail-open (true) when no navgrid is loaded. Used by the NPC helm to steer AROUND land in combat,
+ *  where it follows a free heading instead of the A* route. */
+function clearLine(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  if (!bits) return true;
+  const a = worldToCell(ax, az), b = worldToCell(bx, bz);
+  return lineClear(a.cx, a.cz, b.cx, b.cz);
+}
+
+/** GRADUATED version of clearLine: the world distance from A toward B that stays on navigable water, capped at
+ *  |AB| (returns the full length when the whole segment is open). Sampled at half-cell resolution. Lets the NPC
+ *  helm rank candidate headings by HOW MUCH open water lies ahead instead of an all-or-nothing pass/fail — so a
+ *  boxed-in merchant turns toward the most open water rather than holding course into the nearest rock. */
+function openDistance(ax, az, bx, bz) {
+  if (!loaded) loadNavGrid();
+  const full = Math.hypot(bx - ax, bz - az);
+  if (!bits || full < 1e-3) return full;
+  const cellW = (wb.maxX - wb.minX) / res, cellH = (wb.maxZ - wb.minZ) / res;
+  const step = Math.max(1e-3, Math.min(cellW, cellH) * 0.5);
+  const n = Math.max(1, Math.ceil(full / step));
+  const ux = (bx - ax) / n, uz = (bz - az) / n;
+  for (let i = 1; i <= n; i++) {
+    const c = worldToCell(ax + ux * i, az + uz * i);
+    if (!isNav(c.cx, c.cz)) return ((i - 1) / n) * full;
+  }
+  return full;
+}
+
 // ── public ──────────────────────────────────────────────────────────────────────
 /**
  * World-space sea route from A to B. Returns [{x,z}, …] starting at A and ending at B (the real pier points),
@@ -207,7 +265,7 @@ function loadNavGrid() {
 }
 
 module.exports = {
-  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav,
+  findPath, loadNavGrid, worldToCell, cellToWorld, isNav, snapToNav, componentAt, reachable, clearLine, openDistance,
   // test seam — inject a synthetic grid (bitset) without a baked manifest.
   _test: {
     setGrid(resolution, bitset, worldBounds) { res = resolution; bits = bitset; wb = worldBounds; loaded = true; pathCache.clear(); computeComponents(); },

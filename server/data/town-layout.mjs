@@ -11,6 +11,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mulberry32 } from './augment.mjs';
+import factionsPkg from '../factions.js';   // CJS faction config (default import in ESM)
+
+const { factionIds } = factionsPkg;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -220,16 +223,17 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
  * `elevAt(x,z)` samples the baked field for pad elevation; `footprints` = assets_manifest footprint_m.
  */
 export function assignTowns(sites, seed, elevAt, footprints) {
-  const bank = JSON.parse(readFileSync(join(__dirname, 'town-names.json'), 'utf8')).towns;
   const rng = mulberry32((seed ?? 1) ^ 0x70c4b0a7);            // distinct stream from terrain/reefs
-  const names = seededShuffle(bank, rng);
-  const n = Math.min(sites.length, names.length);
 
+  // Bare towns first — faction (which depends on POSITION) is assigned before the name, so each town can draw
+  // its identity from its owning nation's pool.
   const towns = [];
-  for (let k = 0; k < n; k++) {
-    const s = sites[k], id = names[k];
-    towns.push({ id: `town_${k}`, name: id.name, description: id.description, x: s.x, z: s.z, heading: s.heading, _site: s });
+  for (let k = 0; k < sites.length; k++) {
+    const s = sites[k];
+    towns.push({ id: `town_${k}`, x: s.x, z: s.z, heading: s.heading, _site: s });
   }
+  assignFactions(towns, seed);       // spatial spheres of interest (+ contested borders)
+  assignFactionNames(towns, seed);   // name + description from each town's faction pool
 
   // Capitals = the most spacious inland sites (need real flat depth + width to host the big layout).
   const CAPITALS = Math.min(12, towns.length);
@@ -305,5 +309,116 @@ export function assignSpecialties(towns, seed) {
       fi++;
     }
   }
+  return towns;
+}
+
+// ── factions (spheres of interest) ──────────────────────────────────────────────
+const CONTESTED_RATIO = 1.30;   // a town whose 2nd-nearest nation is within 30% of its nearest sits on a border
+const CONTESTED_PROB  = 0.5;    // ...and a seeded coin-flip decides it's actually contested (flagged for events)
+
+/** FNV-1a string hash → a stable per-faction RNG seed offset. */
+function hashStr(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; } return h >>> 0; }
+/** Small roman numeral for cycled name suffixes (only used if a nation ever has more towns than pool names). */
+function roman(n) { return ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII'][n] || String(n); }
+
+const LLOYD_ITERS = 8;   // k-means relaxation passes — pull anchors to the centre of their territory for balance
+
+/**
+ * Assign each town a `faction` (and flag `contested` border towns) via SPHERES OF INTEREST: farthest-point
+ * sampling seeds one well-spread anchor per nation, then a few k-means (Lloyd) passes relax each anchor to the
+ * CENTRE of its territory — so spheres follow town density and come out reasonably balanced + contiguous (not
+ * one nation swallowing a whole island). Every town joins its nearest anchor; a guarantee pass ensures each
+ * nation keeps ≥1 town. A town whose 2nd-nearest nation is within CONTESTED_RATIO may be flagged `contested`
+ * + given a `rivalFaction` for the future events module (it still has a primary owner for colour/name/home).
+ * DEDICATED rng stream → geometry + specialty assignment stay byte-identical.
+ */
+export function assignFactions(towns, seed) {
+  const ids = factionIds();
+  const K = Math.min(ids.length, towns.length);
+  if (K === 0) return towns;
+  const fr = mulberry32((((seed ?? 1) ^ 0x46414354) >>> 0));   // 'FACT'
+  const d2 = (a, b) => { const dx = a.x - b.x, dz = a.z - b.z; return dx * dx + dz * dz; };
+
+  // Farthest-point sampling → K spread seed anchors; anchor index a flies nation ids[a]'s flag throughout.
+  const anchorIdx = [Math.floor(fr() * towns.length)];
+  while (anchorIdx.length < K) {
+    let bestI = -1, bestD = -1;
+    for (let i = 0; i < towns.length; i++) {
+      if (anchorIdx.includes(i)) continue;
+      let nearest = Infinity;
+      for (const ai of anchorIdx) nearest = Math.min(nearest, d2(towns[i], towns[ai]));
+      if (nearest > bestD) { bestD = nearest; bestI = i; }
+    }
+    if (bestI < 0) break;
+    anchorIdx.push(bestI);
+  }
+  let cen = anchorIdx.map((i) => ({ x: towns[i].x, z: towns[i].z }));
+
+  // Lloyd relaxation: reassign to nearest centroid, then recompute centroids. Settles spheres onto density.
+  const nearestC = (t) => { let bi = 0, bd = Infinity; for (let a = 0; a < K; a++) { const d = d2(t, cen[a]); if (d < bd) { bd = d; bi = a; } } return bi; };
+  for (let iter = 0; iter < LLOYD_ITERS; iter++) {
+    const sx = new Array(K).fill(0), sz = new Array(K).fill(0), cnt = new Array(K).fill(0);
+    for (const t of towns) { const a = nearestC(t); sx[a] += t.x; sz[a] += t.z; cnt[a]++; }
+    let moved = false;
+    for (let a = 0; a < K; a++) {
+      if (!cnt[a]) continue;                 // keep an emptied anchor where it is (guarantee pass fixes ≥1)
+      const nx = sx[a] / cnt[a], nz = sz[a] / cnt[a];
+      if (nx !== cen[a].x || nz !== cen[a].z) moved = true;
+      cen[a] = { x: nx, z: nz };
+    }
+    if (!moved) break;
+  }
+  const anchors = cen.map((p, a) => ({ x: p.x, z: p.z, faction: ids[a] }));
+
+  // Final assignment: nearest anchor = owner; 2nd-nearest within CONTESTED_RATIO + a coin-flip = contested.
+  for (const t of towns) {
+    let n1 = Infinity, n2 = Infinity, a1 = 0, a2 = -1;
+    for (let a = 0; a < K; a++) {
+      const d = d2(t, anchors[a]);
+      if (d < n1) { n2 = n1; a2 = a1; n1 = d; a1 = a; }
+      else if (d < n2) { n2 = d; a2 = a; }
+    }
+    t.faction = anchors[a1].faction;
+    t._fa = a1;   // scratch: anchor index, used by the guarantee pass
+    delete t.contested; delete t.rivalFaction;
+    const ratio = n1 > 0 ? Math.sqrt(n2 / n1) : Infinity;   // sqrt → a true linear distance ratio
+    if (a2 >= 0 && ratio < CONTESTED_RATIO && fr() < CONTESTED_PROB) { t.contested = true; t.rivalFaction = anchors[a2].faction; }
+  }
+
+  // Guarantee ≥1 town per nation: hand each empty nation the town closest to its anchor, taken from the
+  // currently-largest nation (never stranding that donor at zero).
+  const counts = () => { const c = new Array(K).fill(0); for (const t of towns) c[t._fa]++; return c; };
+  for (let a = 0; a < K; a++) {
+    let c = counts();
+    if (c[a] > 0) continue;
+    let donor = -1; for (let b = 0; b < K; b++) if (c[b] > 1 && (donor < 0 || c[b] > c[donor])) donor = b;
+    if (donor < 0) continue;
+    let pick = null, pd = Infinity;
+    for (const t of towns) { if (t._fa !== donor) continue; const d = d2(t, anchors[a]); if (d < pd) { pd = d; pick = t; } }
+    if (pick) { pick._fa = a; pick.faction = anchors[a].faction; delete pick.contested; delete pick.rivalFaction; }
+  }
+  for (const t of towns) delete t._fa;
+  return towns;
+}
+
+/**
+ * Give each town a `name` + `description` drawn from its OWNING nation's pool (town-names.json factions.<id>),
+ * so identities fit the flag (Port Royal=English, Petit-Goâve=French, …). Per-faction seeded shuffle; cycles
+ * with a roman-numeral suffix if a nation ever holds more towns than its pool. Call AFTER assignFactions.
+ */
+export function assignFactionNames(towns, seed) {
+  const pools = JSON.parse(readFileSync(join(__dirname, 'town-names.json'), 'utf8')).factions || {};
+  for (const fid of factionIds()) {
+    const pool = pools[fid] || [];
+    const shuffled = pool.length ? seededShuffle(pool, mulberry32((((seed ?? 1) ^ hashStr(fid)) >>> 0))) : [];
+    const mine = towns.filter((t) => t.faction === fid);
+    for (let k = 0; k < mine.length; k++) {
+      const base = shuffled.length ? shuffled[k % shuffled.length] : { name: `Harbour ${k + 1}`, description: 'A nameless anchorage.' };
+      const cycle = Math.floor(k / Math.max(1, shuffled.length));
+      mine[k].name = cycle === 0 ? base.name : `${base.name} ${roman(cycle + 1)}`;
+      mine[k].description = base.description;
+    }
+  }
+  for (const t of towns) if (!t.name) { t.name = 'Free Harbour'; t.description = 'An unaligned anchorage.'; }
   return towns;
 }

@@ -11,6 +11,10 @@ const { fn, col, where } = db.Sequelize;
 // avoid spamming a crowded harbour.
 const JOIN_LEAVE_MAX_PLAYERS = 30;
 
+// When a PLAYER is sunk, this fraction of their CARGO (not gold) spills into a floating crate at the wreck —
+// a real but RECOVERABLE penalty: anyone can scoop it, including the owner once they respawn and sail back.
+const PLAYER_WRECK_LOOT = 0.5;
+
 /**
  * Sailing multiplayer WebSocket server.
  *
@@ -53,7 +57,11 @@ const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const squadron = require('./squadron');
 const salvage = require('./salvage');
+const factions = require('./factions');
+const diplomacy = require('./diplomacy');
+const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -117,6 +125,24 @@ function sysReply(ws, text) {
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text }));
   }
+}
+
+/** True if a player entry's VERIFIED token role (from the signed JWT — unspoofable) is staff. */
+function isStaff(p) { return !!(p && p.auth && (p.auth.role === 'Owner' || p.auth.role === 'Admin')); }
+
+/** Find an open-water spot near (x,z): ring-search outward (skipping the player's own cell) for the first
+ *  cell that isn't land. Returns {x,z} or null if nothing within range. Used by /teleporto to drop the
+ *  admin beside a target without grounding them. (terrain-mask fails open → returns the first ring if the
+ *  heightfield is unavailable, which is fine — open sea.) */
+function findWaterNear(x, z, startR = 70, maxR = 1200) {
+  for (let r = startR; r <= maxR; r += 40) {
+    for (let a = 0; a < 12; a++) {
+      const ang = (a / 12) * Math.PI * 2;
+      const wx = x + Math.cos(ang) * r, wz = z + Math.sin(ang) * r;
+      if (!terrainMask.isOnLand(wx, wz)) return { x: wx, z: wz };
+    }
+  }
+  return null;
 }
 
 /**
@@ -390,6 +416,8 @@ async function saveEconomyState(p) {
       {
         gold: p.gold | 0, cargo: JSON.stringify(p.cargo || {}), tradeLedger: JSON.stringify(p.tradeLedger || []),
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
+        factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
+        ship: p.ship || 'pinnace',
       },
       { where: { id: p.auth.userId } },
     );
@@ -409,10 +437,9 @@ function parseCombat(text) {
 async function saveCombatState(p) {
   if (!p || !p.auth || p.auth.userId == null || !p.combat) return;
   try {
-    await User.update(
-      { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) },
-      { where: { id: p.auth.userId } },
-    );
+    const upd = { combatState: JSON.stringify({ zones: p.combat.zones, slug: p.combat.slug, mapVersion: moveConst.MAP_VERSION }) };
+    if (typeof p.crew === 'number') upd.crew = p.crew | 0;   // Crew resource persists alongside hull damage
+    await User.update(upd, { where: { id: p.auth.userId } });
   } catch (err) {
     console.warn('[WS] saveCombatState failed:', err.message);
   }
@@ -424,11 +451,26 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
+    // Owned vessel — map-independent. The 'update' handler forces the broadcast slug to this, so a client
+    // can't sail a hull it doesn't own. capacity/physics derive from it too.
+    p.ship = (u.ship && getVesselDef(u.ship)) ? u.ship : 'pinnace';
+    if (p.state) p.state.vesselSlug = p.ship;
+
+    // Crew resource — clamp the saved count to the owned vessel's complement (NULL → full). crewWound is the
+    // in-memory fractional-casualty accumulator (grapeshot), never persisted (a partial wound heals on relog).
+    p.maxCrew = crewFor(p.ship);
+    p.crew = (u.crew == null) ? p.maxCrew : Math.max(0, Math.min(p.maxCrew, u.crew | 0));
+    p.crewWound = 0;
+
+    // Faction reputation — persists across maps (it's the player's standing, not the world's). Normalized so a
+    // newly-added nation always appears at neutral.
+    let rep = null; try { rep = JSON.parse(u.factionRep || 'null'); } catch { /* corrupt → neutral */ }
+    p.factionRep = factions.normalizeRep(rep);
 
     // Discovery ledger — restore only if it belongs to the current map (else a new map starts undiscovered).
     const ml = parseMarketLedger(u.marketLedger);
@@ -445,9 +487,27 @@ async function loadAndSendWallet(id, p, players) {
     // Broadcast the current hull (restored damage or fresh) so the player's HUD and everyone's listing match.
     const stateMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(stateMsg);
+    broadcastCrew(id, p, players);   // everyone renders this ship's sailor count; the owner's HUD shows N/max
   } catch (err) {
     console.warn('[WS] loadAndSendWallet failed:', err.message);
   }
+}
+
+/** Crew resource (C1): the JSON every client needs to render N-of-max sailors on this ship + (for the owner)
+ *  drive sail/turn/reload scaling. Broadcast to ALL on change (like combat_state) — crew changes are rare. */
+function crewStateMsg(pid, p) {
+  return JSON.stringify({ type: 'crew_state', playerId: pid, crew: p.crew | 0, maxCrew: p.maxCrew | 0 });
+}
+/** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew, 1.0 fully manned). Mirrors the client's formula;
+ *  scales mast-repair speed here (and sail/turn/reload client-side). NPCs (no maxCrew) → 1 (unaffected). */
+function crewFactor(p) {
+  const max = p && p.maxCrew | 0;
+  if (!max || max <= 0) return 1;
+  return 0.5 + 0.5 * Math.max(0, Math.min(1, (p.crew | 0) / max));
+}
+function broadcastCrew(pid, p, players) {
+  const m = crewStateMsg(pid, p);
+  for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
 }
 
 /** Send the player their authoritative purse + hold + current cargo capacity (from their vessel). */
@@ -455,10 +515,81 @@ function sendWallet(p) {
   if (p && p.ws.readyState === 1) {
     p.ws.send(JSON.stringify({
       type: 'wallet', gold: p.gold | 0, cargo: p.cargo || {},
-      capacity: economy.capacityFor(p.state && p.state.vesselSlug),
+      capacity: economy.capacityFor(p.ship || (p.state && p.state.vesselSlug)),
       catalog: economy.goodsCatalog(),
+      factionRep: p.factionRep || factions.defaultRep(),
+      ship: p.ship || 'pinnace',
     }));
   }
+}
+
+// ── Piracy reputation (Diplomacy D2) ──────────────────────────────────────────
+// Attacking a nation's merchant shipping shifts the attacker's standing: you LOSE rep with that nation (more
+// on a sink), lose a little with its ALLIES (you struck their friend), and GAIN rep with its WAR enemies (more
+// on a sink — you're hurting their foe). Tiers scale hit→sink→capture. `factionRep` is clamped to ±REP_CLAMP.
+const REP_CLAMP = 100;
+// Attacking faction V's shipping: V (victim) + V's allies turn cold; V's WAR enemies — and now THEIR allies
+// (enemyAlly) — warm to you. The enemy/enemyAlly gains are the deliberate "earn back your standing" lever:
+// privateering against a nation's foes is a real path to rehabilitate a bad reputation with that nation.
+const REP_TIERS = {
+  attack:  { victim: -2,  ally: -1, enemy: +2,  enemyAlly: +1 },   // a connecting round/bar shot on a merchant
+  sink:    { victim: -15, ally: -6, enemy: +12, enemyAlly: +5 },   // sending one to the bottom
+  capture: { victim: -20, ally: -8, enemy: +16, enemyAlly: +7 },   // CAPTURE HOOK — a future board-and-take calls this tier
+};
+const clampRep = (v) => (v < -REP_CLAMP ? -REP_CLAMP : (v > REP_CLAMP ? REP_CLAMP : v));
+
+/** Apply one piracy event's reputation shift to `shooter` for attacking faction `victimFaction`, at the given
+ *  tier ('attack' | 'sink' | 'capture'). Updates standing in-memory, pushes a `reputation_changed` toast (with
+ *  the per-faction deltas AND the full updated map, so the client's "Standing with the Powers" stays exact),
+ *  and returns the deltas. Persistence is left to the caller (sinks persist immediately; attacks ride the 30 s
+ *  autosave). Safe no-op for NPC shooters / unknown factions. Reused by the future capture feature. */
+function awardPiracyRep(shooter, victimFaction, tier) {
+  if (!shooter || shooter.isNpc || !factions.isFaction(victimFaction)) return null;
+  const t = REP_TIERS[tier]; if (!t) return null;
+  shooter.factionRep = factions.normalizeRep(shooter.factionRep);
+  const rep = shooter.factionRep;
+  const deltas = {};
+  const bump = (fid, d) => { if (!d) return; deltas[fid] = (deltas[fid] || 0) + d; };
+  bump(victimFaction, t.victim);
+  const victimAllies = new Set(diplomacy.alliesOf(victimFaction));
+  for (const a of victimAllies) bump(a, t.ally);
+  const enemies = diplomacy.enemiesOf(victimFaction);
+  for (const e of enemies) bump(e, t.enemy);
+  // The allies of V's enemies also warm to you — you struck a common foe (smaller bump). Skip V itself and V's
+  // own allies so the goodwill never contradicts the cold shoulder above.
+  if (t.enemyAlly) {
+    const enemySet = new Set(enemies);
+    for (const e of enemies) {
+      for (const a of diplomacy.alliesOf(e)) {
+        if (a === victimFaction || victimAllies.has(a) || enemySet.has(a)) continue;
+        bump(a, t.enemyAlly);
+      }
+    }
+  }
+  for (const [fid, d] of Object.entries(deltas)) rep[fid] = clampRep((rep[fid] || 0) + d);
+  if (shooter.ws && shooter.ws.readyState === 1) {
+    shooter.ws.send(JSON.stringify({ type: 'reputation_changed', reason: tier, deltas, factionRep: rep }));
+  }
+  return deltas;
+}
+
+// ── Trade reputation: relieving a town's shortage earns goodwill with its nation ──────────────────────────────
+const REP_TRADE_K   = 0.7;   // goodwill per unit sold, at full scarcity (level→0)
+const REP_TRADE_MAX = 8;     // cap per transaction (a fat sale can't vault your standing in one go)
+// Buying a pardon at the Governor's Mansion / Mayor's House: restore NEGATIVE standing toward neutral (never
+// above 0 — goodwill must be earned). Deliberately costly so it's a last resort, not a substitute for good conduct.
+const PARDON_STEP          = 20;    // max points restored per petition
+const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt petition ≈ 2 800g)
+
+/** Award `gain` standing with `factionId` to `player` and push the live readout. Returns the delta map (or null). */
+function awardFactionRep(player, factionId, gain, reason) {
+  if (!player || player.isNpc || !factions.isFaction(factionId) || gain <= 0) return null;
+  player.factionRep = factions.normalizeRep(player.factionRep);
+  player.factionRep[factionId] = clampRep((player.factionRep[factionId] || 0) + gain);
+  if (player.ws && player.ws.readyState === 1) {
+    player.ws.send(JSON.stringify({ type: 'reputation_changed', reason, deltas: { [factionId]: gain }, factionRep: player.factionRep }));
+  }
+  return { [factionId]: gain };
 }
 
 /** Record that this player has seen a town's market (specialty + last-seen prices + day) in their discovery
@@ -479,10 +610,12 @@ function sendMarket(p, townId) {
   if (!p || p.ws.readyState !== 1) return;
   const mk = economy.marketFor(townId);
   if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
-  recordVisit(p, mk);
+  recordVisit(p, mk);   // ledger keeps the town's BASE prices (comparable across players + the demand hint)
   const hint = economy.hintFor(townId);
+  // Display the quote nudged by THIS player's standing with the town's nation — matches what tradeCore charges.
+  const shown = economy.playerMarket(p, townId, mk);
   p.ws.send(JSON.stringify({
-    type: 'market_state', ...mk, hint, gold: p.gold | 0, cargo: p.cargo || {},
+    type: 'market_state', ...shown, hint, gold: p.gold | 0, cargo: p.cargo || {},
     capacity: economy.capacityFor(p.state && p.state.vesselSlug),
   }));
   p.ws.send(JSON.stringify({ type: 'ledger_entry', townId, ...p.ledger[townId] }));
@@ -491,6 +624,7 @@ function sendMarket(p, townId) {
 function attachMultiplayer(server) {
   const wss = new WebSocketServer({ server });
   const players = new Map();
+  const squadrons = new Map();   // Squadrons (Phase B): session-only fireteams, id → { id, leaderId, members:[] }
   let nextId = 1;
 
   // ── Movement helpers (authoritative pose application + correction/broadcast) ───────────────────
@@ -529,6 +663,14 @@ function attachMultiplayer(server) {
       if (qid !== pid && q.ws.readyState === 1) q.ws.send(m);
     }
   };
+  /** Teleport a player to a pose: set the server authority, snap their own client (correction), and broadcast
+   *  the jump to everyone else. Used by the /teleport and /teleporto admin commands. Speed is zeroed on arrival;
+   *  a regular target can't escape because their next update is clamped back toward this new authPose. */
+  const teleportTo = (pid, p, x, z, heading) => {
+    applyPose(p, { x: +x, z: +z, heading: ((+heading % 360) + 360) % 360, speed: 0 });
+    sendCorrection(p);
+    broadcastPose(pid, p);
+  };
   /** Broadcast that an entity (player or NPC) has left so clients drop its vessel. */
   const broadcastLeave = (lid) => {
     const m = JSON.stringify({ type: 'leave', id: lid });
@@ -538,6 +680,30 @@ function attachMultiplayer(server) {
   const broadcastSalvageDespawn = (cid) => {
     const m = JSON.stringify({ type: 'salvage_despawn', id: cid });
     for (const [, q] of players) if (q.ws.readyState === 1) q.ws.send(m);
+  };
+  /** Push the current inter-faction relation matrix to everyone (on change) — drives the Diplomacy panel. */
+  const broadcastDiplomacy = () => {
+    const m = JSON.stringify({ type: 'diplomacy_state', matrix: diplomacy.matrix() });
+    for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+  };
+  /** Broadcast a system chat line to everyone (diplomacy announcements, etc.). */
+  const broadcastSystem = (text) => {
+    const m = JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text });
+    for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+  };
+  /** Telegraph an NPC convoy's combat posture to players within ~1.6 km of (x,z) — readability for NPC tactics (E4). */
+  const announceConvoy = (x, z, faction, kind) => {
+    const nation = factions.factionName(faction) || 'A';
+    const text = kind === 'pincer'  ? `⚑ A ${nation} convoy moves to flank you!`
+               : kind === 'engage'  ? `⚑ A ${nation} convoy forms up and runs out its guns!`
+               :                       `⚑ A ${nation} convoy breaks off and runs!`;
+    const m = JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text });
+    const R2 = 1600 * 1600;
+    for (const [, q] of players) {
+      if (q.isNpc || !q.ws || q.ws.readyState !== 1 || !q.state) continue;
+      const dx = q.state.x - x, dz = q.state.z - z;
+      if (dx * dx + dz * dz <= R2) q.ws.send(m);
+    }
   };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
@@ -551,8 +717,40 @@ function attachMultiplayer(server) {
   setInterval(() => {
     weatherState.tick();
     economy.tickToToday();   // once-per-in-game-day economy drift (no-op until a day rolls over); catch-up safe
+    // Inter-faction diplomacy: rare war/peace/alliance shifts on the in-game-day roll (≈1–2 game months apart),
+    // rival-biased by the contested-border towns. Each shift is announced + refreshes everyone's relation matrix.
+    {
+      const dChanges = diplomacy.tickToDay(economy.currentDay(),
+                                           diplomacy.rivalWeightsFromTowns(economy.townList()));
+      if (dChanges.length) {
+        broadcastDiplomacy();
+        for (const c of dChanges) {
+          const text = diplomacy.describeChange(c);
+          broadcastSystem(text);
+          const ev = JSON.stringify({ type: 'diplomacy_event', a: c.a, b: c.b, from: c.from, to: c.to, text });
+          for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(ev);
+        }
+      }
+    }
     npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
     for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
+
+    // Mast self-repair: jury-rig a shot-away mast back to 50 % after 45 s. tickMastRepair arms the timer
+    // when masts hit 0 and restores them on elapse; broadcast the new hull so every client updates HUD,
+    // mast-raise visual, and (for the owner) the sailing penalty.
+    const nowMast = Date.now();
+    for (const [id, p] of players) {
+      const r = combat.tickMastRepair(p.combat, nowMast, crewFactor(p));
+      if (r === 'repaired') {
+        const m = JSON.stringify({ type: 'combat_state', playerId: id, zones: p.combat.zones, maxHp: p.combat.maxHp });
+        for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
+      } else if (r === 'armed' && p.ws && p.ws.readyState === 1) {
+        // Tell the OWNER how long the jury-rig will take (ms) so their HUD can show a repair progress bar.
+        // Server-driven duration → when crew later makes it variable, the bar follows with no client change.
+        p.ws.send(JSON.stringify({ type: 'mast_repair', ms: Math.max(0, p.combat.mastRepairUntil - nowMast) }));
+      }
+    }
+
     if (++broadcastCooldown >= 5) {
       broadcastCooldown = 0;
       broadcastWeather();
@@ -563,7 +761,7 @@ function attachMultiplayer(server) {
   const NPC_DT = 0.2;
   setInterval(() => {
     const now = Date.now();
-    npc.tickNpcs(players, NPC_DT, broadcastLeave, now);   // integrate + despawn sunk
+    npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot, announceConvoy);   // integrate, despawn sunk, return fire, telegraph
     npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
   }, NPC_DT * 1000);
 
@@ -574,6 +772,7 @@ function attachMultiplayer(server) {
     // economy save = backstop (trades persist inline); location + hull damage persist here + on disconnect.
     for (const [, p] of players) { savePlayerLocation(p); saveEconomyState(p); saveCombatState(p); }
     economy.flushState();   // town-market drift (global) — once, not per-player; no-op unless dirty
+    diplomacy.flush();      // inter-faction relations (global) — no-op unless a shift happened
   }, 30000);
 
   // Push an immediate snapshot to everyone whenever an admin override / time change
@@ -586,13 +785,51 @@ function attachMultiplayer(server) {
   // the ball's multi-second flight actually dodges it (unlike fire-time prediction).
   const activeShots = [];   // { shooterId, seq, ox,oy,oz, vx,vy,vz, fireTime, lastT }
 
+  /** An NPC merchant fires (A3): relay the flight visual to every client and register the shot for the SAME
+   *  wait-and-see adjudication a player's shot gets — so the merchant's ball is dodgeable exactly like a
+   *  player's, and can damage/sink whatever its leading solution actually hits. */
+  const fireNpcShot = (npcShip, shotData, shotType) => {
+    const now = Date.now();
+    const seq = (npcShip.shotSeq = (npcShip.shotSeq || 0) + 1);
+    const msg = JSON.stringify({ type: 'cannon_shot', id: npcShip.id, seq, ...shotData, shotType });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);   // NPCs don't receive
+    activeShots.push({ shooterId: npcShip.id, seq, ...shotData, shotType, fireTime: now, lastT: 0 });
+  };
+
   /** Apply a resolved hit: damage the victim and broadcast the cosmetics / hull state. */
   const resolveHit = (shot, hit) => {
     const shooter = players.get(shot.shooterId);
     const victim  = players.get(hit.victimId);
     if (!victim || !victim.combat) return;
+    if (victim.godmode) return;   // /godmode: invulnerable admin — the ball passes harmlessly, no damage or cosmetics
+    if (squadron.sameSquadron(shooter, victim)) return;   // Squadrons (B2): mates' shots pass harmlessly through each other
+
+    // ── Grapeshot (C3): anti-crew, NO hull/mast damage. Each pellet that connects attrites the victim's crew
+    // (players only — NPCs carry none). Still aggros an NPC you fire grape at. Cosmetic combat_hit (grape flag)
+    // shows the pellet strike; NO combat_state since the hull is untouched.
+    if (shot.shotType === 'grape') {
+      if (victim.isNpc && shooter && !shooter.isNpc) npc.markHostile(victim, shot.shooterId, Date.now());
+      const killed = combat.applyGrapeCrew(victim);
+      if (killed > 0) broadcastCrew(hit.victimId, victim, players);
+      const grapeMsg = JSON.stringify({
+        type: 'combat_hit', shooterId: shot.shooterId, victimId: hit.victimId, seq: shot.seq,
+        zone: hit.zone, hx: hit.hx, hy: hit.hy, hz: hit.hz, side: hit.side, tof: hit.tof, grape: true,
+      });
+      for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(grapeMsg);
+      return;
+    }
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
+
+    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). Only a PLAYER
+    // hit provokes it — collateral from another NPC's shot doesn't spark merchant-vs-merchant brawls. The
+    // tactical helm + return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
+    if (victim.isNpc && shooter && !shooter.isNpc) {
+      npc.markHostile(victim, shot.shooterId, Date.now());
+      // Piracy reputation (D2): a connecting shot on a nation's merchant dings your standing. The killing blow
+      // is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
+      if (!justSunk && victim.faction) awardPiracyRep(shooter, victim.faction, 'attack');
+    }
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
     const hitMsg = JSON.stringify({
@@ -609,7 +846,7 @@ function attachMultiplayer(server) {
     for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
 
     if (justSunk) {
-      const sinker = shooter?.state?.callsign || 'an unknown ship';
+      const sinker = shooter?.state?.callsign || shooter?.state?.vesselName || 'an unknown ship';
       const sunkMsg = JSON.stringify({
         type: 'combat_sunk', victimId: hit.victimId, shooterId: shot.shooterId, shooterName: sinker,
       });
@@ -628,10 +865,33 @@ function attachMultiplayer(server) {
           for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
         }
         if (shooter) sysReply(shooter.ws, `You sank the ${victim.state.vesselName || 'merchant'}! Salvage floats nearby.`);
+        // Piracy reputation (D2): sinking a nation's merchant is the big standing shift — heavy loss with that
+        // nation (+ its allies), a strong gain with its war-enemies. A sink is a milestone, so persist now
+        // rather than waiting for the 30 s autosave. (A future capture reuses awardPiracyRep with the 'capture' tier.)
+        if (shooter && !shooter.isNpc && victim.faction) {
+          awardPiracyRep(shooter, victim.faction, 'sink');
+          saveEconomyState(shooter);
+        }
         victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
       } else {
         sysReply(victim.ws, `You were sunk by ${sinker}.`);
         if (shooter) sysReply(shooter.ws, `You sank ${victim.state?.callsign || 'a ship'}!`);
+        // A sunk player spills a fraction of their CARGO (gold stays safe) into a floating crate at the wreck.
+        // The goods leave their hold immediately (persisted), so being sunk has a real cost — but anyone can
+        // scoop the crate, INCLUDING the owner once they respawn and sail back (player recovery).
+        const contents = {};
+        for (const [g, q] of Object.entries(victim.cargo || {})) { const k = Math.floor((q || 0) * PLAYER_WRECK_LOOT); if (k > 0) contents[g] = k; }
+        if (Object.keys(contents).length) {
+          for (const [g, k] of Object.entries(contents)) {
+            victim.cargo[g] = (victim.cargo[g] || 0) - k;
+            if (victim.cargo[g] <= 0) delete victim.cargo[g];
+          }
+          const crate = salvage.spawnCrate(victim.state.x, victim.state.z, contents, 0, Date.now());
+          const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+          saveEconomyState(victim).then(() => sendWallet(victim));   // persist the lighter hold + refresh the owner's UI
+          sysReply(victim.ws, 'Some of your cargo floats free at the wreck — sail back to recover it before others do.');
+        }
       }
     }
   };
@@ -669,6 +929,10 @@ function attachMultiplayer(server) {
     players.set(id, {
       ws, state: null, friends: [], combat: combat.newCombatState(), auth,
       gold: economy.STARTING_GOLD, cargo: {}, tradeLedger: [], ledger: {},   // Town Economy — overwritten by the DB load below
+      factionRep: factions.defaultRep(),                                      // Factions reputation — overwritten by the DB load below
+      ship: 'pinnace',                                                        // Ships-as-economy: owned hull — overwritten by the DB load below
+      squadron: null, pendingInvite: null,                                    // Squadrons (Phase B): session-only, never persisted
+      crew: 0, maxCrew: 0, crewWound: 0,                                      // Crew resource — set from the DB + vessel def in loadAndSendWallet
     });
 
     ws.send(JSON.stringify({ type: 'welcome', id }));
@@ -685,9 +949,15 @@ function attachMultiplayer(server) {
     if (existing.length > 0) {
       ws.send(JSON.stringify({ type: 'snapshot', players: existing }));
     }
+    // Crew counts for everyone already aboard, so the joiner renders the right sailor count on each remote ship.
+    for (const [pid, p] of players) {
+      if (pid !== id && !p.isNpc && p.state && typeof p.crew === 'number') ws.send(crewStateMsg(pid, p));
+    }
     // Existing floating salvage crates, so a joiner sees ones dropped before they connected.
     const crates = salvage.list().map((c) => ({ id: c.id, x: c.x, z: c.z }));
     if (crates.length) ws.send(JSON.stringify({ type: 'salvage_snapshot', crates }));
+    // Current inter-faction relations, so the joiner's Diplomacy panel + standing predictions are populated.
+    ws.send(JSON.stringify({ type: 'diplomacy_state', matrix: diplomacy.matrix() }));
 
     ws.on('message', (raw) => {
       let msg;
@@ -710,7 +980,10 @@ function attachMultiplayer(server) {
           anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
           vesselName: String(msg.vesselName ?? '').slice(0, 64),
-          vesselSlug: String(msg.vesselSlug ?? 'sloop').slice(0, 64),
+          // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
+          // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
+          // bought. capacity + movement physics then derive from the real hull.
+          vesselSlug: (players.get(id).ship) || 'pinnace',
           // Authoritative identity from the verified JWT — a forged `msg.callsign` is ignored, so a
           // client can't impersonate another player or hijack their single-session slot.
           callsign:   players.get(id).auth.callsign,
@@ -722,16 +995,25 @@ function attachMultiplayer(server) {
         {
           const p = players.get(id);
           const now = Date.now();
-          const dt = p.lastUpdateMs ? (now - p.lastUpdateMs) / 1000 : 0;
+          const realDt = p.lastUpdateMs ? (now - p.lastUpdateMs) / 1000 : 0;
           // Owner/Admin bypass movement validation — they have a teleport ability. Role is from the
           // verified JWT (p.auth), so a regular client can't claim it.
           const trusted = p.auth.role === 'Owner' || p.auth.role === 'Admin';
-          const { pose, corrected } = movement.validateMove(
+          // Token-bucket dt (network-JITTER tolerance): refill the budget by real elapsed wall-clock time
+          // (capped per packet at DT_MAX) up to MOVE_BURST_SEC, then validate against the WHOLE budget. So
+          // when a high-ping client's updates stall then arrive BUNCHED, each bunched packet can still spend
+          // a full send-interval of movement from the budget accrued during the stall — instead of seeing a
+          // ~0 ms inter-arrival dt, getting clamped to nearly no travel, and rubber-banding (the bug a
+          // ~300 ms-ping player hit). validateMove reports the seconds it actually consumed, debited below.
+          if (p.moveDtBudget == null) p.moveDtBudget = moveConst.MOVE_BURST_SEC;
+          p.moveDtBudget = Math.min(moveConst.MOVE_BURST_SEC, p.moveDtBudget + Math.min(realDt, moveConst.DT_MAX));
+          const { pose, corrected, budgetSpentSec } = movement.validateMove(
             p.authPose || null,
             { x: state.x, z: state.z, heading: state.heading, speed: state.speed, vesselSlug: state.vesselSlug },
-            dt,
+            p.moveDtBudget,
             trusted,
           );
+          if (!trusted) p.moveDtBudget = Math.max(0, p.moveDtBudget - (budgetSpentSec || 0));
           p.state = state;
           p.lastUpdateMs = now;   // also drives combat victim-pose lag compensation
           p.lastSeq = Number.isFinite(+msg.seq) ? +msg.seq : 0;
@@ -882,6 +1164,15 @@ function attachMultiplayer(server) {
           }
         })();
 
+      } else if (msg.type === 'squadron_invite') {
+        squadron.invite(players, squadrons, id, String(msg.callsign ?? ''), Date.now());
+      } else if (msg.type === 'squadron_accept') {
+        squadron.accept(players, squadrons, id, Date.now());
+      } else if (msg.type === 'squadron_decline') {
+        squadron.decline(players, id);
+      } else if (msg.type === 'squadron_leave') {
+        squadron.leave(players, squadrons, id);
+
       } else if (msg.type === 'cannon_shot') {
         const me = players.get(id);
         const shotData = {
@@ -889,15 +1180,16 @@ function attachMultiplayer(server) {
           vx: +msg.vx || 0, vy: +msg.vy || 0, vz: +msg.vz || 0,
         };
         const seq = +msg.seq || 0;
+        const shotType = (msg.shotType === 'bar' || msg.shotType === 'grape') ? msg.shotType : 'round';   // ammo type (default round)
         const now = Date.now();
 
         // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
-        if (!combat.validateShot(shotData, me?.state) || !combat.allowShot(me?.combat, now)) {
+        if (!combat.validateShot(shotData, me?.state, shotType) || !combat.allowShot(me?.combat, now, shotType)) {
           return;
         }
 
-        // Relay the flight visual to everyone else (carries the shot seq).
-        const shot = JSON.stringify({ type: 'cannon_shot', id, seq, ...shotData });
+        // Relay the flight visual to everyone else (carries the shot seq + ammo type).
+        const shot = JSON.stringify({ type: 'cannon_shot', id, seq, ...shotData, shotType });
         for (const [pid, p] of players) {
           if (pid !== id && p.ws.readyState === 1) p.ws.send(shot);
         }
@@ -906,7 +1198,7 @@ function attachMultiplayer(server) {
         // The step loop flies it over real time and tests it against each victim's ACTUAL
         // evolving pose, so manoeuvring during the flight genuinely dodges it. fireTime is
         // `now` (when the muzzle data is valid); lastT tracks how far it's been tested.
-        activeShots.push({ shooterId: id, seq, ...shotData, fireTime: now, lastT: 0 });
+        activeShots.push({ shooterId: id, seq, ...shotData, shotType, fireTime: now, lastT: 0 });
 
       } else if (msg.type === 'combat_reset') {
         // Dock "Repair Vessel" → restore the hull to full, for a gold fee (the first gold sink). The sunk→
@@ -914,10 +1206,10 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat) {
           // Mercy repair: charge the fee if affordable, otherwise free — the harbourmaster never turns away
-          // a broke captain. Always proceeds to a full hull.
-          const rep = economy.applyRepair(me);
+          // a broke captain. Always proceeds to a full hull. Staff (Owner/Admin) always repair gratis.
+          const rep = economy.applyRepair(me, isStaff(me));
           saveEconomyState(me);   // persist the (possibly zero) gold deduction
-          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy }));
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy, free: !!rep.free }));
           sendWallet(me);
           me.combat = combat.newCombatState(me.state?.vesselSlug);
           saveCombatState(me);   // persist the repaired (full) hull
@@ -942,15 +1234,86 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me && me.combat && me.combat.sunk) {
           me.combat = combat.newCombatState(me.state?.vesselSlug);
+          // Crew carries over a respawn too (no free refill — recruit at a tavern to replace losses). Hull is
+          // restored, but lost hands stay lost.
+          me.maxCrew = crewFor(me.state?.vesselSlug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
           saveCombatState(me);  // persist the fresh hull (respawn = full repair)
           me.authPose = null;   // trust the next update — the respawn teleport
+          me.moveDtBudget = moveConst.MOVE_BURST_SEC;   // fresh jitter budget so post-respawn moves aren't starved
           const stateMsg = JSON.stringify({
             type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp,
           });
           for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(stateMsg);
+          broadcastCrew(id, me, players);
           const repaired = JSON.stringify({ type: 'combat_repair', playerId: id });
           for (const [pid, p] of players) {
             if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
+          }
+        }
+
+      } else if (msg.type === 'recruit_crew') {
+        // Tavern (Crew C4): hire ONE sailor. Must be docked. Charges RECRUIT_COST; if you can't afford it you
+        // can still take on hands free "on commission" up to ceil(60% of complement) — so a broke captain can
+        // always limp back to a fighting crew, but filling the top ~40% costs gold (keeps it a real sink).
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, reason, charged = 0) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({
+              type: 'recruit_result', ok, reason: reason || null, charged,
+              crew: me.crew | 0, maxCrew: me.maxCrew | 0, gold: me.gold | 0,
+            }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, 'not_docked'); }
+          else if ((me.crew | 0) >= (me.maxCrew | 0)) { reply(false, 'full'); }
+          else {
+            const cost = economy.RECRUIT_COST;
+            const freeFloor = Math.ceil(0.6 * (me.maxCrew | 0));   // ≥60% complement is hireable free when broke
+            let charged = 0;
+            if ((me.gold | 0) >= cost) { me.gold -= cost; charged = cost; }
+            else if ((me.crew | 0) < freeFloor) { charged = 0; }   // free commission hire
+            else { reply(false, 'no_gold'); return; }
+            me.crew = Math.min(me.maxCrew | 0, (me.crew | 0) + 1);
+            saveCombatState(me);   // persist the new crew count
+            saveEconomyState(me).then(() => { sendWallet(me); broadcastCrew(id, me, players); reply(true, charged === 0 ? 'free' : null, charged); });
+          }
+        }
+
+      } else if (msg.type === 'listen_rumor') {
+        // Tavern: overhear a rumour about a nearby treasure ship. Picks one of the THREE nearest merchants
+        // that has a known run, names its vessel + origin→destination towns, and MARKS it for the player so it
+        // shows on their map (merchants are otherwise hidden from non-staff). Must be docked at a port.
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, data) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'rumor_result', ok, ...(data || {}) }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, { reason: 'not_docked' }); }
+          else {
+            // Rumours only cover ships in the player's REGION (the map is 50 km across) — a tavern wouldn't
+            // know a ship on the far coast. Well beyond render range (3 km) so it still reveals an unseen ship.
+            const RUMOR_R2 = 14000 * 14000;
+            const px = me.authPose.x, pz = me.authPose.z;
+            const cand = [];
+            for (const [, p] of players) {
+              if (!p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
+              const destId = p.legTarget || (p.trip && p.trip.destTownId);   // where it's headed now
+              const destT = destId && economy.getTown(destId);
+              if (!destT) continue;                                          // need a destination to gossip about
+              const dx = p.state.x - px, dz = p.state.z - pz, d2 = dx * dx + dz * dz;
+              if (d2 > RUMOR_R2) continue;                                    // too far to be local gossip
+              cand.push({ p, destT, d2 });
+            }
+            if (!cand.length) { reply(false, { reason: 'no_rumours' }); }
+            else {
+              cand.sort((a, b) => a.d2 - b.d2);
+              const pool = cand.slice(0, 3);                                 // one of the three nearest
+              const sel = pool[Math.floor(Math.random() * pool.length)];
+              const np = sel.p;
+              // Origin is only "known" once the ship is laden (heading to its sell town); else it's a mystery.
+              const srcT = (np.phase === 'toDest' && np.trip) ? economy.getTown(np.trip.srcTownId) : null;
+              me.rumorShipId = np.id;                                        // force-included in this player's interest set
+              reply(true, { shipId: np.id, slug: np.state.vesselSlug, from: srcT ? srcT.name : null, to: sel.destT.name });
+            }
           }
         }
 
@@ -965,13 +1328,108 @@ function attachMultiplayer(server) {
         // so the client never sees gold the server didn't durably record (money safety).
         const me = players.get(id);
         if (me) {
+          const townId = String(msg.townId ?? ''), goodId = String(msg.goodId ?? '');
+          // PRE-sale snapshot: selling a town one of its NEEDS (a consumed good it's short of) earns goodwill with
+          // its nation. Captured before the sale (which itself relieves the shortage), scaled by how scarce it was.
+          let repFid = null, scarcity = 0;
+          if (msg.type === 'trade_sell') {
+            const town = economy.getTown(townId);
+            if (town && town.faction && factions.isFaction(town.faction)) {
+              const g = (economy.marketFor(townId)?.goods || []).find((x) => x.goodId === goodId);
+              if (g && g.role === 'consumed') { repFid = town.faction; scarcity = Math.max(0, 1 - (g.level ?? 1)); }
+            }
+          }
           const apply = msg.type === 'trade_buy' ? economy.applyBuy : economy.applySell;
-          const r = apply(me, me.authPose, String(msg.townId ?? ''), String(msg.goodId ?? ''), msg.qty);
+          const r = apply(me, me.authPose, townId, goodId, msg.qty);
           if (r.ok) {
-            saveEconomyState(me).then(() => { sendMarket(me, String(msg.townId ?? '')); sendWallet(me); });
+            if (repFid && scarcity > 0) {
+              const qtySold = Math.max(0, Math.floor(Number(r.qty ?? msg.qty)) || 0);   // atomic fill → full qty on ok
+              const gain = Math.min(REP_TRADE_MAX, Math.round(qtySold * scarcity * REP_TRADE_K));
+              awardFactionRep(me, repFid, gain, 'trade');
+            }
+            saveEconomyState(me).then(() => { sendMarket(me, townId); sendWallet(me); });
           } else {
             sendWallet(me);   // authoritative correction
             if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'trade_error', reason: r.reason }));
+          }
+        }
+
+      } else if (msg.type === 'petition_pardon') {
+        // Buy back NEGATIVE standing with the docked town's nation at its Governor's Mansion / Mayor's House.
+        // Server-authoritative: must be docked at one of that nation's towns, standing must be below neutral,
+        // and you must afford the (costly) fee. Restores toward 0 only — positive standing is earned, not bought.
+        const me = players.get(id);
+        if (me) {
+          const townId = String(msg.townId ?? '');
+          const town = economy.getTown(townId);
+          const fid = town && town.faction;
+          const err = (reason) => { if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'pardon_error', reason })); };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { err('not_docked'); }
+          else if (!fid || !factions.isFaction(fid)) { err('no_faction'); }
+          else {
+            me.factionRep = factions.normalizeRep(me.factionRep);
+            const cur = me.factionRep[fid] || 0;
+            if (cur >= 0) { err('not_needed'); }   // standing already neutral-or-better — nothing to pardon
+            else {
+              const restore = Math.min(PARDON_STEP, -cur);                 // never above neutral
+              const cost = isStaff(me) ? 0 : restore * PARDON_GOLD_PER_POINT;
+              if (!isStaff(me) && (me.gold | 0) < cost) { err('no_gold'); }
+              else {
+                if (!isStaff(me)) me.gold = (me.gold | 0) - cost;
+                me.factionRep[fid] = clampRep(cur + restore);
+                saveEconomyState(me).then(() => sendWallet(me));            // persist gold + rep (money safety)
+                if (me.ws.readyState === 1) {
+                  me.ws.send(JSON.stringify({ type: 'reputation_changed', reason: 'pardon', deltas: { [fid]: restore }, factionRep: me.factionRep }));
+                  me.ws.send(JSON.stringify({ type: 'pardon_ok', townId, faction: fid, restored: restore, cost }));
+                }
+              }
+            }
+          }
+        }
+
+      } else if (msg.type === 'ship_buy') {
+        // Shipwright purchase at a port. Server-authoritative: must be docked at a town; owned ship + gold are
+        // the source of truth. Buying REPLACES the current hull with a 50% trade-in credit toward the new one
+        // (cost clamped ≥0 — no cash-back on a downgrade). Blocks if current cargo wouldn't fit the new hold.
+        // Owners/Admins commission ANY vessel for free. Persists BEFORE replying (money safety).
+        const me = players.get(id);
+        if (me) {
+          const slug = String(msg.slug ?? '');
+          const def = getVesselDef(slug);
+          const shipErr = (reason) => { if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_error', reason })); };
+          if (!def || def.slug !== slug) {
+            shipErr('bad_ship');
+          } else if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) {
+            shipErr('not_docked');
+          } else if (me.ship === slug) {
+            shipErr('already_owned');
+          } else if (economy.usedSlots(me.cargo) > (def.cargo | 0)) {
+            shipErr('hold_too_small');   // decision: BLOCK — sell cargo down before refitting
+          } else {
+            const admin = isStaff(me);
+            const owned = getVesselDef(me.ship);
+            const tradeIn = Math.floor((owned.price | 0) * 0.5);   // 50% of the old hull's value
+            const cost = admin ? 0 : Math.max(0, (def.price | 0) - tradeIn);
+            if (!admin && me.gold < cost) {
+              shipErr('no_gold');
+            } else {
+              if (!admin) me.gold -= cost;
+              me.ship = slug;
+              if (me.state) me.state.vesselSlug = slug;   // the 'update' handler keeps forcing this to me.ship
+              // A newly-acquired hull arrives whole AND with the new vessel's zone HP (pinnace ≠ sloop).
+              me.combat = combat.newCombatState(slug);
+              // Crew CARRIES OVER to the new hull (clamped to its complement) — buying a bigger ship doesn't
+              // refill the crew; you must recruit at a tavern to man the extra stations.
+              me.maxCrew = crewFor(slug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
+              saveCombatState(me);
+              const hullMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hullMsg);
+              broadcastCrew(id, me, players);
+              saveEconomyState(me).then(() => {
+                sendWallet(me);   // authoritative new gold + ship + capacity
+                if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_bought', slug, cost }));
+              });
+            }
           }
         }
 
@@ -1045,8 +1503,262 @@ function attachMultiplayer(server) {
           const parsed = parseTargetAndRest(arg);
           handleModCommand(id, senderCallsign, action, parsed?.target, players);
 
+        } else if (text === '/godmode' || text.startsWith('/godmode ')) {
+          // Toggle invulnerability for the calling admin (session-only; cleared on disconnect).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may use /godmode.'); }
+          else {
+            me.godmode = !me.godmode;
+            sysReply(me.ws, me.godmode
+              ? 'Godmode ON — your hull is invulnerable to cannon fire.'
+              : 'Godmode OFF — you can take damage again.');
+          }
+
+        } else if (text.startsWith('/teleporto ')) {
+          // /teleporto "<player>" — teleport the calling admin to open water beside another player.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may teleport.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/teleporto '.length).trim());
+            const name = parsed?.target;
+            let target = null;
+            for (const [, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              const spot = findWaterNear(target.state.x, target.state.z);
+              if (!spot) { sysReply(me.ws, `Couldn't find open water near "${name}".`); }
+              else {
+                const heading = (Math.atan2(target.state.x - spot.x, target.state.z - spot.z) * 180 / Math.PI + 360) % 360;
+                teleportTo(id, me, spot.x, spot.z, heading);
+                sysReply(me.ws, `Teleported beside "${name}".`);
+              }
+            }
+          }
+
+        } else if (text.startsWith('/teleport ')) {
+          // /teleport "<player>" <X> <Y> — teleport another player to world coords (X = east/west, Y = north/south).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may teleport players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/teleport '.length).trim());
+            const coords = (parsed?.rest || '').trim().split(/\s+/).filter(Boolean);
+            const tx = Number(coords[0]), ty = Number(coords[1]);
+            if (!parsed?.target || coords.length < 2 || !Number.isFinite(tx) || !Number.isFinite(ty)) {
+              sysReply(me.ws, 'Usage: /teleport "<player>" <X> <Y>   (X = east/west, Y = north/south)');
+            } else {
+              let target = null, targetId = null;
+              for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === parsed.target) { target = p; targetId = pid; break; } }
+              if (!target) { sysReply(me.ws, `No online player named "${parsed.target}".`); }
+              else if (terrainMask.isOnLand(tx, ty)) { sysReply(me.ws, `(${tx.toFixed(0)}, ${ty.toFixed(0)}) is on land — pick a spot of open water.`); }
+              else {
+                teleportTo(targetId, target, tx, ty, target.state.heading || 0);
+                sysReply(me.ws, `Teleported "${parsed.target}" to (${tx.toFixed(0)}, ${ty.toFixed(0)}).`);
+                sysReply(target.ws, `You were teleported to (${tx.toFixed(0)}, ${ty.toFixed(0)}) by ${senderCallsign}.`);
+              }
+            }
+          }
+
+        } else if (text.startsWith('/repair ')) {
+          // /repair "<player>" — fully restore another player's hull (admin courtesy). Resets their combat
+          // state to a fresh hull of their owned ship, refloats them if sinking, and notifies them.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may repair players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/repair '.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              target.combat = combat.newCombatState((target.ship) || (target.state && target.state.vesselSlug));
+              saveCombatState(target);
+              // Full hull → everyone's HUD/listing resets; combat_repair clears scorch decals AND (for the
+              // target's own client) refloats a sinking/sunk hull. Sent to ALL incl. the target.
+              const hull = JSON.stringify({ type: 'combat_state', playerId: targetId, zones: target.combat.zones, maxHp: target.combat.maxHp });
+              const repaired = JSON.stringify({ type: 'combat_repair', playerId: targetId });
+              for (const [, p] of players) if (p.ws.readyState === 1) { p.ws.send(hull); p.ws.send(repaired); }
+              sysReply(target.ws, 'Your ship has been fully repaired by the admins.');
+              sysReply(me.ws, `Repaired "${name}".`);
+            }
+          }
+
+        } else if (text.startsWith('/crew ')) {
+          // /crew "<player>" — fully re-crew another player's ship to its complement (admin courtesy). Mirrors
+          // /repair: sets crew to maxCrew, clears any partial wound, persists, and broadcasts the new crew_state.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may re-crew players.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/crew '.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
+            else {
+              target.maxCrew = crewFor(target.ship);   // recompute from the owned vessel in case the ship changed
+              target.crew = target.maxCrew;
+              target.crewWound = 0;
+              saveCombatState(target);                  // persist the new crew count (same column as recruit)
+              broadcastCrew(targetId, target, players); // everyone's crew HUD/scaling updates
+              sysReply(target.ws, `Your crew has been brought back to full strength (${target.crew}) by the admins.`);
+              sysReply(me.ws, `Re-crewed "${name}" to ${target.crew}/${target.maxCrew}.`);
+            }
+          }
+
+        } else if (text.startsWith('/reputation')) {
+          // /reputation "<player>"                  → clear all NEGATIVE standings to neutral (keep the good ones)
+          // /reputation "<player>" <faction> <value> → set that nation's standing outright (admin override)
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may adjust reputation.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/reputation'.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}". Usage: /reputation "<player>" [<faction> <value>]`); }
+            else {
+              target.factionRep = factions.normalizeRep(target.factionRep);
+              const rest = (parsed.rest || '').trim();
+              let note = null;
+              if (!rest) {
+                let cleared = 0;
+                for (const fid of factions.factionIds()) { if (target.factionRep[fid] < 0) { target.factionRep[fid] = 0; cleared++; } }
+                note = `Cleared ${cleared} negative standing(s) for "${name}".`;
+              } else {
+                const [fArg, vArg] = rest.split(/\s+/);
+                const fid = String(fArg || '').toLowerCase();
+                const val = Math.round(Number(vArg));
+                if (!factions.isFaction(fid) || !Number.isFinite(val)) {
+                  sysReply(me.ws, `Usage: /reputation "<player>" [<faction> <value>]  (factions: ${factions.factionIds().join(', ')})`);
+                } else {
+                  target.factionRep[fid] = clampRep(val);
+                  note = `Set ${name}'s ${factions.factionName(fid)} standing to ${target.factionRep[fid]}.`;
+                }
+              }
+              if (note) {
+                saveEconomyState(target);   // persist the new rep map
+                if (target.ws.readyState === 1) {
+                  target.ws.send(JSON.stringify({ type: 'reputation_changed', reason: 'admin', deltas: {}, factionRep: target.factionRep }));
+                }
+                sysReply(me.ws, note);
+              }
+            }
+          }
+
+        } else if (text.startsWith('/givegold ')) {
+          // /givegold "<player>" <amount> — gift gold to another player (admin). Amount is a positive integer.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may give gold.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/givegold '.length).trim());
+            const amount = Math.floor(Number((parsed?.rest || '').trim()));
+            if (!parsed?.target || !Number.isFinite(amount) || amount <= 0) {
+              sysReply(me.ws, 'Usage: /givegold "<player>" <amount>   (amount must be a positive number)');
+            } else {
+              let target = null;
+              for (const [, p] of players) { if (!p.isNpc && p.state && p.state.callsign === parsed.target) { target = p; break; } }
+              if (!target) { sysReply(me.ws, `No online player named "${parsed.target}".`); }
+              else {
+                target.gold = (target.gold | 0) + amount;
+                saveEconomyState(target).then(() => sendWallet(target));   // persist BEFORE the client sees it
+                sysReply(target.ws, `The admins have granted you ${amount} gold.`);
+                sysReply(me.ws, `Gave ${amount} gold to "${parsed.target}" (now ${target.gold}).`);
+              }
+            }
+          }
+
+        } else if (text === '/diplomacy' || text.startsWith('/diplomacy ')) {
+          // /diplomacy                                       → show the current relation matrix
+          // /diplomacy <nationA> <nationB> <war|peace|alliance>  → force a relation (announced to all)
+          // Nations: english / french / spanish / dutch (id or name; single words → no quoting needed).
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may change diplomacy.'); }
+          else {
+            const args = text.slice('/diplomacy'.length).trim().split(/\s+/).filter(Boolean);
+            const resolveFaction = (s) => {
+              const t = String(s || '').toLowerCase();
+              for (const fid of factions.factionIds()) {
+                if (fid === t || factions.factionName(fid).toLowerCase() === t) return fid;
+              }
+              return null;
+            };
+            if (args.length === 0) {
+              sysReply(me.ws, `Diplomacy — ${diplomacy.summary()}`);
+            } else if (args.length === 3) {
+              const a = resolveFaction(args[0]), b = resolveFaction(args[1]), stt = args[2].toLowerCase();
+              if (!a || !b) { sysReply(me.ws, 'Unknown nation. Use english / french / spanish / dutch.'); }
+              else if (a === b) { sysReply(me.ws, 'A nation cannot hold relations with itself.'); }
+              else if (!diplomacy.isState(stt)) { sysReply(me.ws, 'State must be war, peace, or alliance.'); }
+              else {
+                const c = diplomacy.setRelation(a, b, stt);
+                if (!c) { sysReply(me.ws, `${factions.factionName(a)} and ${factions.factionName(b)} are already at ${stt}.`); }
+                else {
+                  const ann = diplomacy.describeChange(c) + ' (by decree of the admiralty)';
+                  broadcastSystem(ann);
+                  broadcastDiplomacy();
+                  const ev = JSON.stringify({ type: 'diplomacy_event', a: c.a, b: c.b, from: c.from, to: c.to, text: ann });
+                  for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(ev);
+                  diplomacy.flush(true);   // persist the decree immediately
+                  sysReply(me.ws, `Set ${factions.factionName(a)} ↔ ${factions.factionName(b)} to ${stt}.`);
+                }
+              }
+            } else {
+              sysReply(me.ws, 'Usage: /diplomacy   |   /diplomacy <nationA> <nationB> <war|peace|alliance>');
+            }
+          }
+
+        } else if (text === '/mast' || text.startsWith('/mast ')) {
+          // /mast [hp] — set YOUR OWN masts-zone HP, for testing the dismasting arc solo (admin). No arg
+          // shoots it clean away (0 → leans/slows below 60%, collapses + "furled" at 0, then the 45 s
+          // jury-rig restores it to 50%). A number sets it directly (e.g. /mast 50, /mast 60). Broadcasts
+          // your hull so every other client sees your mast drop/rise too.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may use /mast.'); }
+          else if (!me.combat) { sysReply(me.ws, 'No combat state yet — try again in a moment.'); }
+          else {
+            const arg = text.slice('/mast'.length).trim();
+            const maxM = me.combat.maxHp.masts;
+            const hp   = arg === '' ? 0 : Number(arg);
+            if (!Number.isFinite(hp)) {
+              sysReply(me.ws, 'Usage: /mast [hp]   (omit hp to dismast; e.g. /mast 0, /mast 50)');
+            } else {
+              const clamped = Math.max(0, Math.min(maxM, Math.round(hp)));
+              me.combat.zones.masts  = clamped;
+              me.combat.mastRepairUntil = 0;   // clear any pending jury-rig; the 1 Hz tick re-arms it if 0
+              const hull = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hull);
+              sysReply(me.ws, clamped === 0
+                ? `Mast shot away (0/${maxM}) — she'll jury-rig back to ${Math.round(maxM * 0.5)} in 45 s.`
+                : `Mast HP set to ${clamped}/${maxM}.`);
+            }
+          }
+
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
+
+        } else if (text === '/squad' || text.startsWith('/squad ')) {
+          // /squad invite "<callsign>" · /squad accept · /squad decline · /squad leave — squadron lifecycle (Phase B).
+          const arg  = text.slice('/squad'.length).trim();
+          const m    = arg.match(/^(\S+)\s*([\s\S]*)$/);
+          const sub  = (m?.[1] || '').toLowerCase();
+          const rest = m?.[2] || '';
+          if (sub === 'invite') {
+            const tgt = parseTargetAndRest(rest)?.target || rest.trim();
+            squadron.invite(players, squadrons, id, tgt, Date.now());
+          } else if (sub === 'accept') {
+            squadron.accept(players, squadrons, id, Date.now());
+          } else if (sub === 'decline') {
+            squadron.decline(players, id);
+          } else if (sub === 'leave' || sub === 'disband') {
+            squadron.leave(players, squadrons, id);
+          } else {
+            sysReply(players.get(id)?.ws, 'Usage: /squad invite "<callsign>" · /squad accept · /squad decline · /squad leave');
+          }
+
+        } else if (text === '/s' || text.startsWith('/s ')) {
+          // /s <message> — talk privately to your squadron (Phase B).
+          const body = text.slice(2).trim();
+          if (body) squadron.chat(players, squadrons, id, body);
+          else sysReply(players.get(id)?.ws, 'Usage: /s <message>   (squadron chat)');
 
         } else if (text.startsWith('/')) {
           // Strict command parsing: anything starting with '/' that wasn't matched
@@ -1068,6 +1780,7 @@ function attachMultiplayer(server) {
       savePlayerLocation(closing);   // persist final authoritative pose before dropping the player
       saveEconomyState(closing);     // backstop persist of purse + hold (trades already persist inline)
       saveCombatState(closing);      // persist hull damage so it survives logout/restart
+      squadron.handleDisconnect(players, squadrons, id);   // Squadrons (B): drop from any squadron (disband if <2), void invites
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a
@@ -1111,4 +1824,4 @@ function attachMultiplayer(server) {
   console.log('Sailing multiplayer WebSocket ready');
 }
 
-module.exports = { attachMultiplayer };
+module.exports = { attachMultiplayer, _test: { awardPiracyRep, REP_TIERS, REP_CLAMP } };

@@ -47,5 +47,18 @@ module.exports = (sequelize, DataTypes) => {
     // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } } of
     // the towns whose trader this player has opened (specialty + last-seen prices). MAP_VERSION-gated on load.
     marketLedger: { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
+
+    // Factions reputation: JSON { [factionId]: standing } (neutral 0 start). Persists across maps. Scaffold
+    // only for now — surfaced in the Ship's Hold readout; the events module will move these values later.
+    factionRep:   { type: DataTypes.TEXT,   allowNull: true,  defaultValue: null },
+
+    // Ships-as-economy: the player's OWNED vessel slug, persisted across maps (the player's, not the world's).
+    // New players start in the 'pinnace'; bigger hulls are bought at a port shipwright for gold.
+    ship:         { type: DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' },
+
+    // Crew resource: remaining sailors aboard (grapeshot attrites it; a port tavern re-hires). NULL = never
+    // recorded → treated as the current vessel's FULL complement on load. Clamped to the vessel's max. A
+    // ship change / sunk→respawn resets it to full. Drives sail/turn/reload/mast-repair speed (with a floor).
+    crew:         { type: DataTypes.INTEGER, allowNull: true, defaultValue: null },
   });
 };

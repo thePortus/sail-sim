@@ -57,7 +57,7 @@ function deadReckon(state, t) {
  * Damage from a hit: heavier when fast + head-on (closing), lighter when slow + glancing,
  * and amplified for a strike at/near the waterline (`hy` = hull-local impact height).
  */
-function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
+function computeDamage(bvx, bvy, bvz, pose, zone, hy, shotType) {
   const relSpeed = Math.hypot(bvx - pose.vvx, bvy, bvz - pose.vvz);
   let perp;
   if (zone === 'masts') {
@@ -77,7 +77,10 @@ function computeDamage(bvx, bvy, bvz, pose, zone, hy) {
     const prox = Math.max(0, Math.min(1, (C.WATERLINE_BAND - hy) / C.WATERLINE_BAND));
     waterline = 1 + C.WATERLINE_BONUS_MAX * prox;
   }
-  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP) * waterline;
+  // Ammunition multiplier: round shot barely scratches rigging (×0.33 mast); bar shot is the
+  // dismaster (×1.6 mast, ×0.6 hull). `hull` covers every non-mast zone.
+  const ammo = C.shotDef(shotType).dmg[zone === 'masts' ? 'masts' : 'hull'];
+  return C.DMG_K * relSpeed * Math.pow(perp, C.DMG_PERP_EXP) * waterline * ammo;
 }
 
 /**
@@ -110,6 +113,9 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 
   const { ox, oy, oz, vx, vy, vz } = shot;
   const reach2 = (C.HALF_LEN + C.BROADPHASE_PAD) * (C.HALF_LEN + C.BROADPHASE_PAD);
+  // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug.
+  const shooter = players.get(shot.shooterId);
+  const caliber = C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null);
 
   // Sub-step the ball through the freshly-elapsed window so a fast ball can't tunnel a hull.
   const tEnd = Math.min(tTo, C.SIM_MAX_T);
@@ -128,7 +134,7 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
       const zone = zoneAtLocal(lat, lon, by);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
-      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by);
+      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType) * caliber;
       return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg, tof: t };
     }
   }
@@ -136,23 +142,46 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 }
 
 /** Plausibility check on a claimed shot (origin near shooter, speed in band). */
-function validateShot(shot, shooterState) {
+function validateShot(shot, shooterState, shotType) {
   if (!shooterState) return false;
   const speed = Math.hypot(shot.vx, shot.vy, shot.vz);
-  if (speed < C.VALID_V_MIN || speed > C.VALID_V_MAX) return false;
+  const band = C.shotDef(shotType);   // bar shot has a lower plausible-velocity band than round
+  if (speed < band.vMin || speed > band.vMax) return false;
   const dx = shot.ox - shooterState.x, dz = shot.oz - shooterState.z;
   return dx * dx + dz * dz <= C.VALID_ORIGIN_RADIUS * C.VALID_ORIGIN_RADIUS;
 }
 
-/** Fire-rate gate (sliding window + min spacing). Mutates combat.shotTimes. */
-function allowShot(combat, nowMs) {
+/** Fire-rate gate (sliding window + min spacing). Mutates combat.shotTimes. Grapeshot fires a many-pellet
+ *  burst, so it uses a SEPARATE, generous budget with no min-gap (the pellets leave together) — kept apart
+ *  from the round/bar counter so a grape burst can't lock out solid shot or vice-versa. */
+function allowShot(combat, nowMs, shotType = 'round') {
   if (!combat) return false;
+  if (shotType === 'grape') {
+    const gt = combat.grapeTimes || (combat.grapeTimes = []);
+    while (gt.length && nowMs - gt[0] > C.RATE_WINDOW_MS) gt.shift();
+    if (gt.length >= C.GRAPE_RATE_MAX) return false;
+    gt.push(nowMs);
+    return true;
+  }
   const times = combat.shotTimes;
   while (times.length && nowMs - times[0] > C.RATE_WINDOW_MS) times.shift();
   if (times.length >= C.RATE_MAX_SHOTS) return false;
   if (times.length && nowMs - times[times.length - 1] < C.RATE_MIN_GAP_MS) return false;
   times.push(nowMs);
   return true;
+}
+
+/**
+ * Apply one grapeshot pellet's crew attrition to a victim player entry. Adds the per-pellet `crew` fraction to
+ * a running wound accumulator; each whole point removes one sailor. Returns the number killed by THIS pellet
+ * (0 or 1 — per-pellet damage is < 1). No effect on a crewless entry (NPCs) or an already-empty crew.
+ */
+function applyGrapeCrew(victim) {
+  if (!victim || (victim.maxCrew | 0) <= 0 || (victim.crew | 0) <= 0) return 0;
+  victim.crewWound = (victim.crewWound || 0) + C.shotDef('grape').crew;
+  let killed = 0;
+  while (victim.crewWound >= 1 && victim.crew > 0) { victim.crew -= 1; victim.crewWound -= 1; killed++; }
+  return killed;
 }
 
 /** Apply damage to a zone; returns { sunk } where sunk=true the instant a non-mast zone hits 0. */
@@ -164,6 +193,31 @@ function applyDamage(combat, zone, dmg) {
     justSunk = true;
   }
   return { justSunk };
+}
+
+/**
+ * Mast self-repair tick (call ~1 Hz per player). The first time the masts zone is at 0 (and the ship
+ * isn't sunk) this arms a jury-rig timer; once it elapses the mast is restored to MAST_REPAIR_FRAC of
+ * max (a partial fix — full repair still needs a port). Returns true the instant it repairs, so the
+ * caller broadcasts the new combat_state. The timer rides on `combat.mastRepairUntil`, so it clears
+ * itself on any newCombatState (respawn / port repair / vessel change) and is never persisted.
+ */
+function tickMastRepair(combat, nowMs, crewFactor = 1) {
+  if (!combat || combat.sunk) return null;    // sinking ships respawn (which resets the mast) — don't repair
+  if (combat.mastRepairUntil) {
+    if (nowMs >= combat.mastRepairUntil) {
+      combat.zones.masts = Math.round(combat.maxHp.masts * C.MAST_REPAIR_FRAC);
+      combat.mastRepairUntil = 0;
+      return 'repaired';
+    }
+  } else if (combat.zones.masts <= 0) {
+    // Arm the jury-rig. Fewer hands → slower work: the base MAST_REPAIR_MS is divided by the crew-efficiency
+    // factor (0.5..1), so a skeleton crew takes up to ~2× as long. The client is TOLD this duration and just
+    // follows it, so the HUD bar stays accurate — this is the single source of truth for the timing.
+    combat.mastRepairUntil = nowMs + Math.round(C.MAST_REPAIR_MS / Math.max(0.1, crewFactor));
+    return 'armed';
+  }
+  return null;
 }
 
 /**
@@ -187,5 +241,5 @@ function restoreCombatState(slug, savedZones) {
 
 module.exports = {
   newCombatState, restoreCombatState, zoneAtLocal, deadReckon, computeDamage,
-  stepShot, validateShot, allowShot, applyDamage,
+  stepShot, validateShot, allowShot, applyDamage, applyGrapeCrew, tickMastRepair,
 };

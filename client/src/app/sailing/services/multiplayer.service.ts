@@ -1,8 +1,6 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
-import {
-  MeshBuilder, Color3, StandardMaterial, TransformNode,
-  Mesh, Material, Scene, DynamicTexture,
-} from '@babylonjs/core';
+import { TransformNode, Mesh, Material, Scene } from '@babylonjs/core';
+import { buildNameplate } from './nameplate';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
@@ -10,13 +8,18 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
 import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
+import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
+import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
+import { SquadronService } from './squadron.service';
 import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
+import { MastCrackService } from './mast-crack.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS } from './combat.constants';
+import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
+import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
 
@@ -35,6 +38,9 @@ interface OtherPlayerEntry extends OtherPlayer {
   root:            TransformNode;
   controller:      VesselController | null;  // drives this remote's trim/sail/rudder/flag
   crew:            CrewHandle | null;        // animated deck crew (seeded from playerId)
+  builtSlug?:      string;                   // slug the current mesh was built with — a change triggers a rebuild
+  rebuilding?:     boolean;                  // a hull-swap rebuild is in flight (guards re-entry)
+  prevMastH?:      number;                   // last mast-health fraction, for the demasting-crack 0-crossing
   recoilRoll:      number;
   recoilRollVel:   number;
   recoilSway:      number;
@@ -70,6 +76,17 @@ interface OtherPlayerEntry extends OtherPlayer {
 
   // ── Collision: previous-frame hull distance to the local ship (for on-screen closing rate). ──
   collPrevDist?: number;
+
+  // ── Distant-ship LOD: an azimuthal billboard impostor swapped in for the full rigged GLB beyond ~½ km
+  // (built async; null until its atlas loads). impostorActive = the billboard is showing + the full GLB
+  // (and all its rig animation) is skipped — the big CPU/draw saving on churning NPC merchants. ──
+  impostor?:       ShipImpostor | null;
+  impostorActive?: boolean;
+  // Nameplate, DETACHED from root so the hull LOD (which disables root) doesn't hide it — kept up even while
+  // impostored so a spyglass can still read a distant ship's name + nationality. Positioned each frame.
+  label?:          Mesh | null;
+  mastTop?:        number;   // height (m) of the masthead above the hull origin — label floats above THIS (tall brig vs short pinnace)
+  labelScale?:     number;   // cached label scale; recomputed ~15 Hz (distance changes slowly), reused for the per-frame position
 }
 
 @Injectable({ providedIn: 'root' })
@@ -82,6 +99,8 @@ export class MultiplayerService {
   private vesselService  = inject(VesselService);
   private scatterService = inject(ScatterService);
   private combatService  = inject(CombatService);
+  readonly squadronService = inject(SquadronService);
+  private mastCrackService = inject(MastCrackService);
   private sfx            = inject(SfxService);
   private telemetry      = inject(TelemetryService);
   private zone           = inject(NgZone);
@@ -98,6 +117,14 @@ export class MultiplayerService {
   // Set when the websocket is refused/closed with code 4401 (invalid/expired JWT). The game component
   // watches this to force a fresh login — the session token can no longer be trusted.
   authFailed    = signal<boolean>(false);
+  // Set when the socket drops UNEXPECTEDLY (server down / network loss) — i.e. a close that wasn't an
+  // intentional disconnect, an auth rejection (4401), or a kick. The game component shows a popup whose OK
+  // returns to the home screen.
+  connectionLost = signal<boolean>(false);
+
+  // Crew resource (C1/C2): the LOCAL player's crew lives on CombatService (it drives the crewFactor used by
+  // vessel + cannon). Here we only keep REMOTE ships' crew counts for rendering their on-deck sailor count.
+  readonly remoteCrew = new Map<string, { crew: number; maxCrew: number }>();
 
   // ── Town Economy ────────────────────────────────────────────────────────────
   // Authoritative purse + hold (server-pushed via 'wallet'/'market_state'), and the currently open town's
@@ -107,14 +134,39 @@ export class MultiplayerService {
   capacity = signal<number>(0);            // current vessel's cargo hold capacity (slots)
   market   = signal<MarketState | null>(null);
   goodsCatalog = signal<Record<string, string>>({});   // goodId → display name (for the inventory panel anywhere)
+  // Factions reputation — the player's standing per nation (neutral 0). Scaffold only; shown in the Ship's Hold.
+  factionRep   = signal<Record<string, number>>({});
+  // Ships-as-economy — the player's OWNED vessel slug (server-authoritative; drives the shipwright UI).
+  ownedShip    = signal<string>('pinnace');
+  // Set to the new slug when a shipwright purchase succeeds → the game swaps the in-world vessel, then clears it.
+  purchasedShip = signal<string | null>(null);
+  // Last shipwright rejection reason (transient; the shipwright panel surfaces it).
+  shipError    = signal<string | null>(null);
+  /** Last Governor's-Mansion pardon rejection reason (transient; the governor panel surfaces it). null = ok/cleared. */
+  pardonError  = signal<string | null>(null);
+  /** Last tavern-recruit rejection reason (transient; the tavern panel surfaces it). null = ok/cleared. */
+  recruitError = signal<string | null>(null);
   // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
   ledger       = signal<Record<string, LedgerEntry>>({});
   hint         = signal<MarketHint | null>(null);
   hintedHarbor = signal<string | null>(null);
   // Position of the single nearest NPC merchant (any distance) — for the minimap marker only.
   nearestMerchant = signal<{ x: number; z: number } | null>(null);
+  // Owners/Admins receive every merchant's position for the minimap (full-fleet view); empty for regular players.
+  allMerchants = signal<{ x: number; z: number }[]>([]);
+  // Tavern "listen to rumours": the merchant id the player overheard about (marked on the map until it
+  // despawns or is replaced), the flavour line the tavern shows, and the last rejection reason.
+  markedMerchantId = signal<string | null>(null);
+  rumorText        = signal<string | null>(null);
+  rumorError       = signal<string | null>(null);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
+  /** Inter-faction relations matrix { [a]: { [b]: 'war'|'peace'|'alliance' } } — drives the Diplomacy panel. */
+  factionMatrix = signal<Record<string, Record<string, string>>>({});
+  /** Last reputation change from attacking shipping (transient; surfaced as a toast). */
+  repToast = signal<{ deltas: Record<string, number>; reason: string } | null>(null);
+  /** Last inter-faction war/peace/alliance shift (transient; surfaced as a prominent banner). */
+  diplomacyBanner = signal<{ text: string; to: string } | null>(null);
   /** Last trade rejection reason (transient; the panel may surface it as a toast). */
   tradeError = signal<string | null>(null);
   /** True when the most recent dock repair was a mercy (free) repair — the UI can flash a note. */
@@ -140,6 +192,7 @@ export class MultiplayerService {
   }
 
   private ws:          WebSocket | null = null;
+  private _intentionalClose = false;   // true while disconnect() tears the socket down → suppress the lost-connection popup
   private myId:        string   | null = null;
   private players      = new Map<string, OtherPlayerEntry>();
   /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
@@ -182,28 +235,44 @@ export class MultiplayerService {
   private readonly RECONCILE = 0.25;
   // Must match the server world-distance multiplier (vessel.service TRAVEL_SCALE) so
   // dead-reckoning projects forward at the same rate positions actually move.
-  private readonly TRAVEL_SCALE = 5.0;
+  private readonly TRAVEL_SCALE = 3.0;
 
   private recoilTickFn: (() => void) | null = null;
 
   // Label plane dimensions in world units
-  private readonly LABEL_WIDTH  = 12;
-  private readonly LABEL_HEIGHT = 1.8;
-  private readonly LABEL_Y      = 9;
+  private readonly LABEL_WIDTH  = 44;    // base plane size — only the NEARBY ships carry a label now, so make it big & legible
+  private readonly LABEL_HEIGHT = 12.2;  // keep ≈ texW/texH (1152/320 = 3.6) so the plate isn't stretched
+  private readonly LABEL_GAP    = 3;     // clearance above THIS ship's masthead (label bottom = mastTop + this; see mastTop)
+  private readonly LABEL_MAX_DIST = 1080;  // beyond this the ship's label is NOT drawn at all (far ships read as plain hulls)
+  // Distance-softened label scaling. A raw billboard shrinks ∝ 1/d (true perspective) — tiny far off; holding the
+  // apparent size perfectly constant (scale ∝ d) loses all sense of range. So we take a POWER between:
+  // scale = clamp((d/NEAR)^POW, 1, FAR). POW≈0.72 keeps a closer=bigger range cue but a GENTLE falloff so a ship near
+  // the cutoff is still big and readable. ≤NEAR → base size.
+  private readonly LABEL_SCALE_NEAR = 200;   // ≤ this distance → base size (perspective makes it grow as you approach)
+  private readonly LABEL_SCALE_POW  = 0.72;  // 1 = constant apparent size; 0 = full perspective. Higher → bigger far out
+  private readonly LABEL_SCALE_FAR  = 13;    // scale cap (not reached within LABEL_MAX_DIST)
+  private _lblFrame = 0;                      // per-frame counter; label distance/scale recomputes every 4th frame
+  private _hideLabels = false;                // photo mode hides the floating nameplates for a clean screenshot
+  /** Photo mode: hide/show the floating ship nameplates (called from the game component's photoMode effect). */
+  setLabelsHidden(hidden: boolean): void {
+    this._hideLabels = hidden;
+    if (hidden) { for (const e of this.players.values()) e.label?.setEnabled(false); }   // instant hide; the loop restores
+  }
 
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
                   vx: number, vy: number, vz: number,
-                  shooterId: string, seq: number) => void) | null = null;
+                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape') => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
   /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
   onCombatRepair: ((playerId: string) => void) | null = null;
 
   broadcastShot(ox: number, oy: number, oz: number,
-                vx: number, vy: number, vz: number, seq: number): void {
+                vx: number, vy: number, vz: number, seq: number,
+                shotType: 'round' | 'bar' | 'grape' = 'round'): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType }));
   }
 
   /** Ask the server to restore our hull to full IN PLACE (dock "Repair Vessel"; no teleport). */
@@ -229,6 +298,33 @@ export class MultiplayerService {
   }
   /** Close the trader panel locally (clears the open market quote). */
   closeTrade(): void { this.market.set(null); }
+
+  /** Shipwright: ask the server to buy/commission a vessel (validated server-side: docked, gold/admin,
+   *  cargo fits). On success the server sends a fresh wallet + a `ship_bought` that drives the in-world swap. */
+  /** Petition the docked town's nation to restore (buy back) negative standing. Server-authoritative + costly. */
+  petitionPardon(townId: string): void {
+    this.pardonError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'petition_pardon', townId }));
+  }
+
+  buyShip(slug: string): void {
+    this.shipError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ship_buy', slug }));
+  }
+
+  /** Tavern (Crew C4): hire one sailor at the docked port. Server-authoritative (docked + gold/free-floor);
+   *  the new count arrives via crew_state and the purse via wallet. recruit_result carries any rejection. */
+  recruitCrew(): void {
+    this.recruitError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'recruit_crew' }));
+  }
+
+  /** Tavern: ask after rumours. The server picks one of the three nearest merchants, names its run, and marks
+   *  it on the map (server-authoritative; must be docked). Reply arrives as rumor_result. */
+  listenRumor(): void {
+    this.rumorError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'listen_rumor' }));
+  }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
    *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
@@ -295,6 +391,26 @@ export class MultiplayerService {
     this.ws.send(JSON.stringify({ type: 'friend_toggle', callsign }));
   }
 
+  // ── Squadrons (Phase B) — typed lifecycle messages (the server also accepts the /squad chat commands). ──
+  squadronInvite(callsign: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_invite', callsign }));
+  }
+  squadronAccept(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_accept' }));
+    this.squadronService.clearInvite();
+  }
+  squadronDecline(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_decline' }));
+    this.squadronService.clearInvite();
+  }
+  squadronLeave(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'squadron_leave' }));
+  }
+
   // Current local state — kept updated by updateLocalState()
   private localState: Omit<OtherPlayer, 'id'> = {
     x: 0, z: 0, heading: 0, speed: 0, turnRate: 0, sheetAngle: 30, isPortTack: false,
@@ -314,6 +430,7 @@ export class MultiplayerService {
       this.recoilTickFn = () => this.sceneService.span('mp', () => {
         const dt = Math.min(scene.getEngine().getDeltaTime() * 0.001, 0.05);
         const renderAt = performance.now() - this.INTERP_DELAY_MS;
+        this._lblFrame++;   // drives the ~15 Hz label distance/scale throttle (position still updates every frame)
         for (const entry of this.players.values()) {
           this.tickRemoteMotion(entry, renderAt, dt);
           this.tickRecoil(entry, dt);
@@ -329,6 +446,8 @@ export class MultiplayerService {
     // server verifies it and refuses (close 4401) if it's missing/invalid.
     const token = this.authService.getToken();
     const url = token ? `${Settings.wsUrl}?token=${encodeURIComponent(token)}` : Settings.wsUrl;
+    this._intentionalClose = false;   // fresh session — a drop from here is a real connection loss
+    this.connectionLost.set(false);
     this.ws = new WebSocket(url);
 
     // Let the salvage service ask the server to collect a crate the local ship sailed over.
@@ -357,7 +476,10 @@ export class MultiplayerService {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.telemetry.ping.set(-1);
       // 4401 = server rejected the JWT. The token can't be trusted → force a fresh login.
-      if (evt.code === 4401) this.zone.run(() => this.authFailed.set(true));
+      if (evt.code === 4401) { this.zone.run(() => this.authFailed.set(true)); return; }
+      // Any OTHER close we didn't initiate (server down / restart / network drop) → surface the lost-connection
+      // popup. Intentional teardown (disconnect()) sets _intentionalClose so leaving the game is silent.
+      if (!this._intentionalClose) this.zone.run(() => this.connectionLost.set(true));
     });
   }
 
@@ -372,6 +494,7 @@ export class MultiplayerService {
   }
 
   disconnect(): void {
+    this._intentionalClose = true;   // we're closing on purpose → the close handler must NOT show the popup
     if (this.updateTimer) clearInterval(this.updateTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.telemetry.ping.set(-1);
@@ -390,6 +513,15 @@ export class MultiplayerService {
     this.hint.set(null);
     this.hintedHarbor.set(null);
     this.nearestMerchant.set(null);
+    this.allMerchants.set([]);
+    this.factionRep.set({});
+    this.factionMatrix.set({});
+    this.repToast.set(null);
+    this.diplomacyBanner.set(null);
+    this.ownedShip.set('pinnace');
+    this.purchasedShip.set(null);
+    this.shipError.set(null);
+    this.pardonError.set(null);
     this.salvageToast.set(null);
     this.salvageService.clear();
   }
@@ -430,7 +562,8 @@ export class MultiplayerService {
     } else if (msg.type === 'cannon_shot') {
       if (msg.id === this.myId) return;
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
-                          String(msg.id), +msg.seq || 0);
+                          String(msg.id), +msg.seq || 0,
+                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
 
     } else if (msg.type === 'combat_hit') {
       // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)
@@ -447,6 +580,10 @@ export class MultiplayerService {
       if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState, maxHp);
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
+    } else if (msg.type === 'mast_repair') {
+      // Server armed our mast jury-rig (sent only to us) → run the HUD repair bar over its duration.
+      this.combatService.startMastRepair(+msg.ms || 0);
+
     } else if (msg.type === 'combat_sunk') {
       if (msg.victimId === this.myId) {
         // Start the capsize NOW, but delay the "you were sunk" card until the wreck animation has played.
@@ -460,10 +597,18 @@ export class MultiplayerService {
       }
 
     } else if (msg.type === 'combat_repair') {
-      // A remote ship was restored to full → clear its persistent battle damage AND refloat it.
-      const e = this.players.get(String(msg.playerId));
-      if (e) { e.sinking = false; }
-      this.onCombatRepair?.(String(msg.playerId));
+      // A ship was restored to full → clear its persistent battle damage AND refloat it. If it's US (an admin
+      // /repair'd our hull), also clear the sinking/sunk state locally — the dock-repair path does this
+      // client-side, but an admin repair only reaches us over the wire.
+      const pid = String(msg.playerId);
+      if (pid === this.myId) {
+        this.combatService.clearSunk();
+        this.vesselService.stopSinking();
+      } else {
+        const e = this.players.get(pid);
+        if (e) { e.sinking = false; }
+      }
+      this.onCombatRepair?.(pid);
 
     } else if (msg.type === 'gun_state') {
       if (msg.id === this.myId) return;
@@ -484,7 +629,9 @@ export class MultiplayerService {
       this.scatterService.reloadAssets(+msg.version || 0).catch((e) => console.warn('[MP] scatter reload failed', e));
 
     } else if (msg.type === 'kicked') {
-      // Server closed this session because the same account logged in elsewhere.
+      // Server closed this session because the same account logged in elsewhere. The kick notice owns this UX,
+      // so flag the imminent socket close as intentional → no duplicate "connection lost" popup.
+      this._intentionalClose = true;
       this.kickedReason.set(String(msg.reason ?? 'This account was opened in another window.'));
 
     } else if (msg.type === 'chat') {
@@ -496,9 +643,57 @@ export class MultiplayerService {
         to:        msg.to ? String(msg.to) : undefined,
         text:      String(msg.text ?? ''),
         timestamp: new Date(),
-        chatType:  msg.chatType === 'dm' ? 'dm' : 'global',
+        chatType:  msg.chatType === 'dm' ? 'dm' : (msg.chatType === 'squadron' ? 'squadron' : 'global'),
       };
       this.chatMessages.update(msgs => [...msgs.slice(-199), chatMsg]);
+
+    } else if (msg.type === 'squadron_invited') {
+      // A captain invited us → surface the accept/decline prompt (Phase B).
+      this.squadronService.setInvite({
+        squadronId:   String(msg.squadronId ?? ''),
+        fromId:       String(msg.fromId ?? ''),
+        fromCallsign: String(msg.fromCallsign ?? ''),
+      });
+
+    } else if (msg.type === 'squadron_state') {
+      // Authoritative roster (squadronId:null = we left / it disbanded → clear the UI).
+      if (msg.squadronId == null) {
+        this.squadronService.setRoster(null);
+      } else {
+        this.squadronService.setRoster({
+          squadronId: String(msg.squadronId),
+          leaderId:   String(msg.leaderId ?? ''),
+          members:    Array.isArray(msg.members)
+            ? msg.members.map((m: any) => ({ id: String(m.id), callsign: String(m.callsign) }))
+            : [],
+        });
+      }
+      this.squadronService.clearInvite();   // any pending invite is now resolved
+
+    } else if (msg.type === 'crew_state') {
+      // Crew resource (C1): authoritative sailor count for a ship. Self → HUD signals; remotes → stored for
+      // rendering their visible crew (C5 wires the on-deck casualties).
+      const pid = String(msg.playerId ?? '');
+      const crew = Math.max(0, +msg.crew || 0), maxCrew = Math.max(0, +msg.maxCrew || 0);
+      if (pid === this.myId) { this.combatService.setCrew(crew, maxCrew); }
+      else {
+        this.remoteCrew.set(pid, { crew, maxCrew });
+        this.players.get(pid)?.crew?.setAliveCount(crew);   // drop/raise sailors on the remote deck
+      }
+
+    } else if (msg.type === 'recruit_result') {
+      // Tavern hire outcome — crew/gold already arrived via crew_state/wallet; here we just surface rejections.
+      this.recruitError.set(msg.ok ? null : String(msg.reason ?? 'recruit failed'));
+
+    } else if (msg.type === 'rumor_result') {
+      // Tavern rumour: on success mark the named ship on the map + show the overheard line; else surface why.
+      if (msg.ok) {
+        this.markedMerchantId.set(String(msg.shipId));
+        this.rumorText.set(this.composeRumor(String(msg.slug ?? ''), msg.from ?? null, String(msg.to ?? '')));
+        this.rumorError.set(null);
+      } else {
+        this.rumorError.set(String(msg.reason ?? 'no_rumours'));
+      }
 
     } else if (msg.type === 'wallet') {
       // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).
@@ -510,10 +705,16 @@ export class MultiplayerService {
         for (const g of msg.catalog) cat[String(g.id)] = String(g.name);
         this.goodsCatalog.set(cat);
       }
+      if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
+      if (typeof msg.ship === 'string' && msg.ship) { this.ownedShip.set(msg.ship); this.localState.vesselSlug = msg.ship; }
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
-      this.market.set({ townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty), goods: msg.goods || [], hint: msg.hint ?? null });
+      this.market.set({
+        townId: String(msg.townId), name: String(msg.name), specialty: String(msg.specialty),
+        goods: msg.goods || [], hint: msg.hint ?? null,
+        faction: msg.faction ?? null, contested: !!msg.contested, rivalFaction: msg.rivalFaction ?? null,
+      });
       this.hint.set(msg.hint ?? null);
       this.hintedHarbor.set(msg.hint?.townId ?? null);
       if (msg.gold != null) this.gold.set(+msg.gold || 0);
@@ -522,6 +723,9 @@ export class MultiplayerService {
 
     } else if (msg.type === 'nearest_merchant') {
       this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
+
+    } else if (msg.type === 'all_merchants') {
+      this.allMerchants.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({ x: +s.x, z: +s.z })) : []);
 
     } else if (msg.type === 'salvage_spawn') {
       this.salvageService.spawn(String(msg.id), +msg.x, +msg.z);
@@ -535,6 +739,26 @@ export class MultiplayerService {
     } else if (msg.type === 'salvage_collected') {
       // The wallet update arrives separately; surface a transient toast of what we scooped.
       this.salvageToast.set({ goods: (msg.goods && typeof msg.goods === 'object') ? msg.goods : {}, gold: +msg.gold || 0 });
+
+    } else if (msg.type === 'diplomacy_state') {
+      // Full inter-faction relations matrix (on connect + on any shift) → the Diplomacy panel.
+      this.factionMatrix.set((msg.matrix && typeof msg.matrix === 'object') ? msg.matrix as Record<string, Record<string, string>> : {});
+
+    } else if (msg.type === 'diplomacy_event') {
+      // A war/peace/alliance shift (also arrives as a system chat line) → flash a prominent banner.
+      this.diplomacyBanner.set({ text: String(msg.text ?? ''), to: String(msg.to ?? 'peace') });
+
+    } else if (msg.type === 'reputation_changed') {
+      // Attacking/sinking a nation's shipping shifted our standing. The message carries the FULL updated map
+      // (keep the readout exact) + the per-faction deltas (for the toast).
+      if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
+      this.repToast.set({ deltas: (msg.deltas && typeof msg.deltas === 'object') ? msg.deltas as Record<string, number> : {}, reason: String(msg.reason ?? '') });
+
+    } else if (msg.type === 'pardon_ok') {
+      this.pardonError.set(null);   // standing already updated by the reputation_changed above
+
+    } else if (msg.type === 'pardon_error') {
+      this.pardonError.set(String(msg.reason ?? 'failed'));
 
     } else if (msg.type === 'ledger') {
       // Full discovered-towns ledger (on connect).
@@ -551,6 +775,14 @@ export class MultiplayerService {
 
     } else if (msg.type === 'trade_error') {
       this.tradeError.set(String(msg.reason ?? 'trade failed'));
+
+    } else if (msg.type === 'ship_bought') {
+      // The wallet message arriving alongside already updated gold/ownedShip; trigger the in-world swap.
+      this.shipError.set(null);
+      this.purchasedShip.set(String(msg.slug ?? ''));
+
+    } else if (msg.type === 'ship_error') {
+      this.shipError.set(String(msg.reason ?? 'purchase failed'));
     }
   }
 
@@ -588,6 +820,7 @@ export class MultiplayerService {
         vesselName: 'Sloop', vesselSlug: 'sloop',
         callsign:   String(data.callsign ?? ''),
         npc:        !!data.npc,
+        faction:    data.faction ?? null,
         buffer:      [],
         dispX:       sx,
         dispZ:       sz,
@@ -608,6 +841,7 @@ export class MultiplayerService {
 
       const callsign = String(data.callsign ?? '').slice(0, 32);
       const slug     = String(data.vesselSlug ?? 'sloop').slice(0, 64);
+      entry.builtSlug = slug;   // track what the mesh is built as, so a later slug change rebuilds it
       this.buildPlayerVessel(data.id, slug, callsign, entry, scene)
         .catch(err => console.warn('Multiplayer mesh build failed:', err));
     }
@@ -623,6 +857,12 @@ export class MultiplayerService {
     entry.vesselName = String(data.vesselName ?? 'Sloop').slice(0, 64);
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
     entry.npc        = !!data.npc;
+    if (data.faction !== undefined) entry.faction = data.faction ?? null;
+    // Hull swapped under us (a remote player bought a new ship at a shipwright) → rebuild their mesh so
+    // everyone sees the new vessel, not the old one. Guarded against re-entry; keeps the same root + pose.
+    if (!isNew && entry.controller && entry.builtSlug && entry.builtSlug !== entry.vesselSlug && !entry.rebuilding) {
+      this.rebuildRemoteVessel(data.id, entry, scene);
+    }
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
     entry.anchored   = !!data.anchored;
@@ -654,7 +894,19 @@ export class MultiplayerService {
     this.disposeEntry(entry);
     this.players.delete(id);
     this.remoteZones.delete(id);
+    // The rumour target sailed off / sank → drop its map mark (the gossip's gone cold).
+    if (this.markedMerchantId() === id) { this.markedMerchantId.set(null); this.rumorText.set(null); }
     this.publishSignal();
+  }
+
+  /** Build the overheard-rumour line from the server's structured reply (vessel + origin→destination). */
+  private composeRumor(slug: string, from: string | null, to: string): string {
+    const tellers = ['barkeep', 'grizzled sailor', 'serving girl', 'harbour drunk', 'one-eyed fisherman'];
+    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' };
+    const teller = tellers[Math.floor(Math.random() * tellers.length)];
+    const vessel = vessels[slug] ?? 'ship';
+    const route = from ? `sailing from ${from} to ${to}` : `bound for ${to}`;
+    return `You overhear a ${teller} speak of a ${vessel} laden with treasure, ${route}. She's been marked on your map.`;
   }
 
   /**
@@ -683,7 +935,19 @@ export class MultiplayerService {
     this.publishSignal();
   }
 
-  private disposeEntry(entry: OtherPlayerEntry): void {
+  /** Tear down a remote's vessel meshes/crew/controller/label but KEEP its root TransformNode (used by both
+   *  full disposal and an in-place hull swap). See the shadow-caster note below. */
+  private clearVesselMeshes(entry: OtherPlayerEntry): void {
+    // Distant-ship impostor: standalone mesh + its own ShaderMaterial (the ATLAS texture is shared per type
+    // and stays cached — don't dispose it). Drop it here so a hull-swap rebuild re-creates it for the new slug.
+    entry.impostor?.mesh.dispose();
+    entry.impostor?.mat.dispose();
+    entry.impostor = null;
+    entry.impostorActive = false;
+    // Nameplate is detached from root (so the LOD can't hide it) → root disposal won't reach it; free it +
+    // its unique DynamicTexture/material here.
+    entry.label?.dispose(false, true);
+    entry.label = null;
     entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
     entry.crew = null;
     entry.controller?.dispose();
@@ -700,10 +964,30 @@ export class MultiplayerService {
       // instantiated with cloneMaterials=false, so every ship (local + remote) shares ONE
       // material + texture set owned by the asset container. Disposing them here would strip
       // the texture off the local ship and all other remotes — leaving a flat grey model.
-      (m as Mesh).dispose(false, false);
+      // EXCEPTION: the hull-stencil proxy owns a UNIQUE stencil material (not shared), so free it.
+      const ownsMat = !!(m.metadata && m.metadata.stencilProxy);
+      (m as Mesh).dispose(false, ownsMat);
     });
     entry.root.getChildTransformNodes(false).forEach(n => n.dispose());
+  }
+
+  private disposeEntry(entry: OtherPlayerEntry): void {
+    this.clearVesselMeshes(entry);
     entry.root.dispose();
+  }
+
+  /** A remote player swapped hulls at a shipwright: rebuild their mesh in place (same root + pose) with the
+   *  new vessel slug. Clears the old meshes/crew/label first, then re-instantiates via buildPlayerVessel. */
+  private rebuildRemoteVessel(playerId: string, entry: OtherPlayerEntry, scene: Scene): void {
+    entry.rebuilding = true;
+    const slug = entry.vesselSlug;
+    this.clearVesselMeshes(entry);
+    void this.buildPlayerVessel(playerId, slug, entry.callsign, entry, scene)
+      .catch(err => console.warn('[Multiplayer] hull-swap rebuild failed for', playerId, err))
+      .finally(() => {
+        // Only the freshest entry for this id may clear the flag (it may have left + rejoined mid-rebuild).
+        if (this.players.get(playerId) === entry) { entry.builtSlug = slug; entry.rebuilding = false; }
+      });
   }
 
   private publishSignal(): void {
@@ -883,6 +1167,37 @@ export class MultiplayerService {
     // rotation.z gets wave roll here; tickRecoil adds cannon recoil on top.
     entry.root.rotation.z = entry.rollWaveRad + entry.recoilRoll;
 
+    // Nameplate: driven independently of the hull LOD (it's detached from root) so it stays up over a distant
+    // impostor — a spyglass can then still read the ship's name + nationality. Floats at the masthead; visible
+    // within the view radius. (Slight loss of pitch/roll bob vs a child, but a steady plate reads better.)
+    if (entry.label) {
+      // Distance, scale and visibility change slowly → recompute only every 4th frame (the trig + pow is the
+      // per-ship cost). The POSITION still updates every frame below so the plate stays glued to the moving hull.
+      if ((this._lblFrame & 3) === 0) {
+        const cam = this.sceneService.camera;
+        const d = cam ? Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) : 0;
+        const within = !this._hideLabels && (!cam || d <= this.LABEL_MAX_DIST);   // nearby ships only; hidden in photo mode
+        if (within) {
+          // Soften the perspective shrink (closer = bigger, but distant labels fall off gently — see LABEL_SCALE_*).
+          const s = Math.min(this.LABEL_SCALE_FAR, Math.max(1, Math.pow(d / this.LABEL_SCALE_NEAR, this.LABEL_SCALE_POW)));
+          entry.labelScale = s;
+          entry.label.scaling.set(s, s, s);
+        }
+        if (entry.label.isEnabled() !== within) entry.label.setEnabled(within);
+      }
+      if (entry.label.isEnabled()) {
+        // Bottom-anchor above THIS ship's masthead (tall brig vs short pinnace). The billboard scales about its
+        // centre, so raise the centre by half the scaled height to keep the lower edge clear of the rig and sea.
+        const s = entry.labelScale ?? 1;
+        const bottom = entry.root.position.y + (entry.mastTop ?? 18) + this.LABEL_GAP;
+        entry.label.position.set(entry.dispX, bottom + this.LABEL_HEIGHT * s * 0.5, entry.dispZ);
+      }
+    }
+
+    // Distant-ship LOD: beyond ~½ km swap the full rigged GLB for a cheap azimuthal billboard impostor AND
+    // skip every bit of rig animation below (the main CPU win on churning merchants). Returns true if so.
+    if (this.applyShipLOD(entry)) { return; }
+
     // Rig animation: rudder reflects the broadcast yaw; flag/pennant flutter downwind;
     // sail furl + anchor ease toward the broadcast state so they animate like the local ship.
     if (entry.controller) {
@@ -901,9 +1216,62 @@ export class MultiplayerService {
       entry.controller.dropAnchor('S', side === 'S' ? entry.anchorDeploy : 0);
       entry.controller.dropAnchor('P', side === 'P' ? entry.anchorDeploy : 0);
 
+      // Mast collapse/repair: drive off this remote's authoritative masts-zone HP (same source as its
+      // damage-listing tilt), so every client sees her mast come down and rise again in lockstep. On the
+      // 0-crossing, play the demasting crack at her position (distance-attenuated). prevMastH is undefined
+      // until the first observation, so a ship that comes into view already-dismasted doesn't crack.
+      const mastH = mastHealth(this.remoteZones.get(entry.id), zoneHpFor(entry.vesselSlug));
+      if (entry.prevMastH !== undefined && entry.prevMastH > 0.001 && mastH <= 0.001) {
+        this.mastCrackService.crackAt(entry.x, entry.z);
+      }
+      entry.prevMastH = mastH;
+      entry.controller.setMastDamage(mastH);
+
       // Last: ease trim/boom/furl AND re-prepare the skeleton from all posed bone nodes.
       entry.controller.tickRig(dt);
     }
+  }
+
+  // Distant ships render as a baked azimuthal billboard instead of the full rigged GLB. Hysteresis band
+  // (full < LOD_NEAR, impostor > LOD_FAR) so a ship hovering at the boundary doesn't strobe between them.
+  // LOD_NEAR sits beyond combat range (~320 m) so anyone you're fighting stays full-detail.
+  private readonly LOD_NEAR = 460;
+  private readonly LOD_FAR  = 540;
+
+  /** Show/hide this ship's impostor by camera distance; when impostored, place + aim it and report true so
+   *  the caller skips the full-GLB rig animation. Sinking ships keep the real mesh (so the capsize plays). */
+  private applyShipLOD(entry: OtherPlayerEntry): boolean {
+    const imp = entry.impostor;
+    if (!imp) return false;                                   // atlas not loaded yet → applyVisibility owns root
+    const cam = this.sceneService.camera;
+    if (!cam) return false;
+    const d = Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z);
+
+    // Decide the desired LOD. For impostor-capable ships THIS is the single owner of enable state (root +
+    // billboard), evaluated every frame — applyVisibility skips them, so set the states idempotently so a
+    // ship recovering from the far cull or a sinking can't get stuck hidden.
+    //  • beyond VISIBILITY_RADIUS → hide both (coarse cull)
+    //  • sinking → full mesh (so the capsize plays)
+    //  • else hysteresis: impostor past LOD_FAR, full mesh within LOD_NEAR
+    let want: boolean;   // show the impostor?
+    if (d > this.VISIBILITY_RADIUS) {
+      if (imp.mesh.isEnabled()) imp.mesh.setEnabled(false);
+      if (entry.root.isEnabled()) entry.root.setEnabled(false);
+      entry.impostorActive = false;
+      return true;                                            // nothing on screen → skip rig
+    } else if (entry.sinking || entry.sinkEnv > 0.001) {
+      want = false;
+    } else {
+      want = entry.impostorActive ? d > this.LOD_NEAR : d > this.LOD_FAR;
+    }
+    entry.impostorActive = want;
+    if (entry.root.isEnabled() === want) entry.root.setEnabled(!want);   // root ON when NOT impostored
+    if (imp.mesh.isEnabled() !== want) imp.mesh.setEnabled(want);
+    if (want) {
+      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z);
+      return true;
+    }
+    return false;
   }
 
   private tickRecoil(entry: OtherPlayerEntry, dt: number): void {
@@ -1145,6 +1513,9 @@ export class MultiplayerService {
   }
 
   private applyVisibility(entry: OtherPlayerEntry): void {
+    // Impostor-capable ships have their root (and billboard) enable state driven every frame by applyShipLOD,
+    // which also does this far cull — touching root here would fight it (full GLB drawn over its impostor).
+    if (entry.impostor) return;
     const dx   = entry.x - this.localState.x;
     const dz   = entry.z - this.localState.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1192,8 +1563,11 @@ export class MultiplayerService {
         .attach(slug, rigged.root, scene, crewSeedFrom(playerId))
         .then((h) => {
           if (!h) return;
-          if (this.players.get(playerId) === entry) entry.crew = h;
-          else h.dispose();   // player left while the crew GLB was loading
+          if (this.players.get(playerId) === entry) {
+            entry.crew = h;
+            const rc = this.remoteCrew.get(playerId);   // reflect casualties that arrived before the crew built
+            if (rc) h.setAliveCount(rc.crew);
+          } else h.dispose();   // player left while the crew GLB was loading
         });
     }
 
@@ -1201,9 +1575,18 @@ export class MultiplayerService {
     // ocean registration — we don't want the billboard label in either).
     const vesselMeshes = entry.root.getChildMeshes(false);
 
-    // Nameplate (billboard above masthead) — NPC merchants show their ship name + a merchant tint.
+    // Masthead height above the hull origin — so the label floats clear of THIS ship's rig (a tall brig needs
+    // far more lift than a pinnace). Snapshot of the built rig's bounding box; +a small margin in the per-frame
+    // placement. Fallback to a generic height if the bbox is degenerate.
+    const bb = rigged.root.getHierarchyBoundingVectors(true);
+    entry.mastTop = Math.max(10, bb.max.y - entry.root.position.y);
+
+    // Nameplate (billboard above masthead). NPC merchants show their ship name + a faction-coloured "⚑ NATION
+    // MERCHANT" tag; players show their callsign.
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
-    this.buildCallsignLabel(prefix + 'label', labelText, entry.root, scene, !!entry.npc);
+    // Unparented (the shared builder returns it free-standing) so the hull LOD (root.setEnabled(false) when
+    // impostored) can't hide the nameplate; tickRemoteMotion positions it at the masthead each frame instead.
+    entry.label = this.buildCallsignLabel(prefix + 'label', labelText, scene, entry.npc ? (entry.faction || null) : null);
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1229,59 +1612,51 @@ export class MultiplayerService {
         this.sceneService.excludeFromPrePass(mat);
       }
     }
+
+    // Open-hull water mask (stencil = the WebGPU default, mirrors VesselService): stamp THIS remote's real
+    // hull geometry into the stencil buffer so the FFT sea is masked out of its open deck exactly as the
+    // local vessel's is. One cheap stencil-only draw, shares the hull's geometry+skeleton. Built AFTER the
+    // snapshot above so it's never registered for reflections/shadows; its unique material is freed in
+    // clearVesselMeshes. The ocean stencil test is global, so any number of vessels can stamp the same ref.
+    // `ignis_hullcut` opt-out: 'carve'/'discard' disable it (the legacy shader carve only ever masked the
+    // LOCAL boat anyway, so remotes simply go unmasked there, as before).
+    const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
+    const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
+    if (useStencil) {
+      const hull = vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
+      if (hull && buildHullStencilProxy(hull, entry.root, scene)) {
+        this.oceanService.setHullStencilMask(true);
+      }
+    }
+
+    // Distant-ship LOD impostor (azimuthal billboard) — built lazily; the full GLB is used until the shared
+    // atlas for this slug has loaded. Standalone mesh (not a child of root), so root.setEnabled() toggles the
+    // full ship without touching the billboard. Freed in clearVesselMeshes.
+    void getShipImpostorAtlas(scene, slug).then((atlas) => {
+      if (!atlas || entry.root.isDisposed()) return;
+      entry.impostor?.mesh.dispose(); entry.impostor?.mat.dispose();
+      const imp = createShipImpostor(scene, slug, atlas);
+      this.sceneService.excludeFromPrePass(imp.mat);
+      this.sceneService.excludeFromGlow(imp.mesh);
+      entry.impostor = imp;
+    });
   }
 
   // ── Floating callsign label ───────────────────────────────────────────────
 
+  /** Build the floating nameplate for a remote ship. Merchants → nation-tinted two-line plaque (name over a
+   *  "⚑ NATION MERCHANT" tag, with the redundant "Merchant " name prefix stripped); players → a single dark-slate
+   *  callsign line. Shared ornate plaque renderer (see nameplate.ts); the caller positions/scales it per frame. */
   private buildCallsignLabel(
-    name: string, callsign: string, root: TransformNode, scene: Scene, merchant = false,
+    name: string, text: string, scene: Scene, faction: string | null = null,
   ): Mesh {
-    const texW = 768, texH = 128;
-
-    const tex = new DynamicTexture(name + '_tex', { width: texW, height: texH }, scene, false);
-    const ctx = tex.getContext() as CanvasRenderingContext2D;
-
-    ctx.clearRect(0, 0, texW, texH);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.70)';
-    ctx.beginPath();
-    ctx.rect(10, 10, texW - 20, texH - 20);
-    ctx.fill();
-
-    ctx.fillStyle = merchant ? '#f0d99a' : '#FFFFFF';
-    ctx.font      = 'bold 56px Arial, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(callsign.toUpperCase(), texW / 2, texH / 2);
-
-    ctx.strokeStyle = merchant ? 'rgba(232, 200, 120, 0.6)' : 'rgba(130, 200, 255, 0.55)';
-    ctx.lineWidth   = 3;
-    ctx.strokeRect(10, 10, texW - 20, texH - 20);
-
-    tex.update();
-    tex.hasAlpha = true;
-
-    const mat = new StandardMaterial(name + '_mat', scene);
-    mat.diffuseTexture             = tex;
-    mat.useAlphaFromDiffuseTexture = true;
-    mat.backFaceCulling            = false;
-    mat.disableLighting            = true;
-    mat.emissiveColor              = new Color3(1, 1, 1);
-
-    const plane = MeshBuilder.CreatePlane(name + '_plane', {
-      width:  this.LABEL_WIDTH,
-      height: this.LABEL_HEIGHT,
-    }, scene);
-    plane.parent        = root;
-    plane.position.y    = this.LABEL_Y;
-    plane.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    plane.isPickable    = false;
-    plane.material      = mat;
-    // Group 2 = same layer as terrain/ocean-near/vessels (see VesselService/TerrainService).
-    // The default group 0 renders BEFORE the group-2 world, so the shared depth buffer lets
-    // foreground ocean/terrain paint over the nameplate — making it vanish. Matching the
-    // world's group restores correct depth sorting: visible above the hull, hidden by hills.
-    plane.renderingGroupId = 2;
-
-    return plane;
+    const merchant = !!faction;
+    const title    = merchant ? (text.replace(/^\s*merchant\s+/i, '').trim() || text) : text.toUpperCase();
+    const subtitle = merchant ? `⚑ ${factionName(faction).toUpperCase()} MERCHANT` : undefined;
+    return buildNameplate(scene, name, {
+      title, subtitle,
+      baseColor: merchant ? factionColor(faction) : null,
+      width: this.LABEL_WIDTH, height: this.LABEL_HEIGHT,
+    });
   }
 }

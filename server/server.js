@@ -3,6 +3,7 @@ const http = require('http');
 const app  = require('./app.js');
 const db   = require('./models');
 const economy = require('./economy');
+const diplomacy = require('./diplomacy');
 const nav = require('./nav');
 const { attachMultiplayer } = require('./multiplayer.js');
 
@@ -18,6 +19,9 @@ async function boot() {
     await db.ensureColumns();
     await db.ensureTables();
     await economy.loadState();
+    // Restore (or rivalry-seed) the inter-faction political map AFTER the economy so the contested-border
+    // town data is available to bias initial wars toward genuine territorial rivals.
+    await diplomacy.load(diplomacy.rivalWeightsFromTowns(economy.townList()));
     nav.loadNavGrid();   // navigable-water grid for NPC sea-routing (lazy-loads anyway; warm it at boot)
   } catch (err) {
     console.warn('[boot] schema/economy init issue (continuing):', err.message);

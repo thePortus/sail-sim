@@ -1,0 +1,36 @@
+{
+  "schema": "harbor-impostors/1.0",
+  "res": 512,
+  "buildings": {
+    "cabin_dwelling": {
+      "size": 7.384
+    },
+    "cabin_shack": {
+      "size": 7.963
+    },
+    "cabin_tavern": {
+      "size": 9.922
+    },
+    "shipwright_shack": {
+      "size": 8.939
+    },
+    "townhall_governor": {
+      "size": 14.703
+    },
+    "townhall_magistrate": {
+      "size": 13.523
+    },
+    "fountain_simple": {
+      "size": 3.339
+    },
+    "fountain_spout": {
+      "size": 4.295
+    },
+    "fountain_statue": {
+      "size": 4.36
+    },
+    "fountain_tiered": {
+      "size": 4.476
+    }
+  }
+}

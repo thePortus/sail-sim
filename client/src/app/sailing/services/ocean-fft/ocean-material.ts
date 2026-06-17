@@ -44,6 +44,7 @@ export interface OceanMaterialDeps {
   getHullCut?: (() => {
     on: number; profile: number[]; alongMin: number; alongLen: number;
     acrossCenter: number; alongSign: number; waterY: number;
+    sil: number[]; hMin: number; hMax: number; rootY: number; pitch: number; roll: number;
   }) | null;
   /** Per-vessel wake paths (local + remotes): flat `paths` (vec4 ×WAKE_MAX_BOATS·WAKE_POINTS),
    *  `meta` (vec4 ×WAKE_MAX_BOATS: x,z,count,speed), and active boat count. Curved wakes for all. */
@@ -167,6 +168,12 @@ export class OceanFFTMaterial {
       mat.AddUniform('_HullCutProfile[24]', 'vec4', '');                   // 96 half-beam stations along the hull (NO sampler)
       mat.AddUniform('_HullCutMeta',    'vec4', new Vector4(0, 1, 0, 1));  // alongMin, alongLen, acrossCentre, alongSign
       mat.AddUniform('_HullCutWaterY',  'float', -1.0e9);                  // floor world-Y; sea above this (in hull) is cut
+      // Height-aware silhouette for the DISCARD path (behind #define HULL_DISCARD): half-beam vs (along, height),
+      // 48 along × 8 height = 384 floats = 96 vec4. _HullSilB = (hMin, hMax, NA, NH); _HullSilRootY = boat root world-Y.
+      mat.AddUniform('_HullSil[96]',    'vec4', '');
+      mat.AddUniform('_HullSilB',       'vec4', new Vector4(0, 1, 48, 8));
+      mat.AddUniform('_HullSilRootY',   'float', -1.0e9);
+      mat.AddUniform('_BoatTilt',       'vec2', new Vector2(0, 0));   // boat pitch (x, +bow-up) + roll (y, +stbd-down)
       mat.AddUniform(`_WakePaths[${WAKE_MAX_BOATS * WAKE_POINTS}]`, 'vec4', '');   // x,z,age,_ per point
       mat.AddUniform(`_WakeMeta[${WAKE_MAX_BOATS}]`, 'vec4', '');                  // x,z,count,speed per boat
       mat.AddUniform('_WakeBoatCount', 'float', '');
@@ -220,6 +227,11 @@ export class OceanFFTMaterial {
     const shadowDef = hasShadows ? '#define HAS_SHADOWS' : '';
     const boatShadowDef = hasBoatShadows ? '#define HAS_BOATSHADOWS' : '';
     const rainDef = hasRain ? '#define HAS_RAIN' : '';
+    // Height-aware interior DISCARD (SoT-style occlusion) instead of the surface carve. Opt-in + reversible:
+    // localStorage.ignis_hullcut === 'discard' → use it; anything else keeps the carve. Only meaningful for a
+    // boat that has the cut on (hasWake gates the boat uniforms). When set, the vertex carve is #ifndef'd out.
+    const hullDiscardDef = (hasWake && typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut') === 'discard')
+      ? '#define HULL_DISCARD' : '';
     // Raindrop ripples: one jittered drop per cell — a sharp central plip + an expanding ring
     // — whose gradient dimples the surface normal so the rain reads as impacts on the water.
     const rainFn = hasRain ? `
@@ -490,9 +502,64 @@ export class OceanFFTMaterial {
       }
     `;
 
-    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${flashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}`;
+    // Height-aware interior DISCARD (SoT-style occlusion). Per pixel near the boat: recover the live ocean
+    // surface (carried in vViewVector), take its height ON the hull relative to the boat's bob (surf.y −
+    // _HullSilRootY), look up the hull's half-beam AT THAT HEIGHT from the 2-D silhouette (bilinear), and
+    // discard the sea where it's inside the hull — so the exclusion outline rides up/down the flare with the
+    // waves (a crest meets the hull wider, a trough narrower). Above the gunwale (u≥1) the hull has no width
+    // → no discard → a tall wave genuinely washes over the rail. The OPEN SEA is never touched (no carve).
+    const hullDiscardFn = hullDiscardDef ? `
+      float _silAt(int a, int h) {
+        int idx = a * int(_HullSilB.w) + h;
+        vec4 v = _HullSil[idx / 4];
+        int c = idx - (idx / 4) * 4;
+        return c == 0 ? v.x : (c == 1 ? v.y : (c == 2 ? v.z : v.w));
+      }
+      void _hullDiscard() {
+        if (_HullCutOn < 0.5) return;
+        vec3 surf = _WorldSpaceCameraPos - vViewVector;          // displaced ocean surface (world)
+        // Footprint test uses the BASE (undisplaced) mesh XZ, not the displaced surf.xz: on a big swell the FFT's
+        // horizontal choppy displacement folds the surrounding crest's water INTO the hull footprint, so using the
+        // displaced position cut that crest — and with the boat sitting below it, the hole showed the tan
+        // background (the "tear around the boat"). The base XZ asks the stable question "is this sea UNDER the
+        // boat's footprint", while surf.y (below) still gives the true wave height for the dry/wet decision.
+        vec2 rel = vWorldUV - _BoatPos;
+        if (dot(rel, rel) > 900.0) return;                       // >30 m from the boat — nothing to mask
+        vec2 hf = normalize(_BoatDir + vec2(1e-5, 0.0));
+        vec2 hr = vec2(hf.y, -hf.x);
+        float along   = dot(rel, hf) * _HullCutMeta.w;           // signed along (root +Z, bow)
+        float acrossS = dot(rel, hr) - _HullCutMeta.z;           // signed across (root +X, +stbd)
+        float across  = abs(acrossS);
+        float tt = (along - _HullCutMeta.x) / _HullCutMeta.y;
+        if (tt <= 0.0 || tt >= 1.0) return;
+        // The water's height ON THE HULL at this point, corrected for the boat's TILT: a bow-up pitch raises the
+        // hull at +along, a stbd-down roll lowers it at +across — so a HEELED hull's waterline is read where it
+        // actually is, not at a flat level. That mismatch was leaving slivers along the low side as it bobbed/heeled.
+        float localH = (surf.y - _HullSilRootY) - _BoatTilt.x * along + _BoatTilt.y * acrossS;
+        float floorLocalY = _HullCutWaterY - _HullSilRootY;
+        if (localH < floorLocalY) return;                        // below the cockpit floor → hull/floor occludes it (don't cut a hole to the background)
+        // Keep masking the cockpit WELL above the gunwale so it stays dry even when a swell tops the low side
+        // walls (the boat dropping into a trough as a wave rises over it) — the width is capped at the wall, so
+        // this can't re-slice a wave OUTSIDE the hull. Only a wave ~1.5 m over the hull top (full submersion /
+        // sinking) stops the cut, so you then see the boat genuinely awash rather than a dry hole in the sea.
+        if (localH > _HullSilB.y + 1.5) return;
+        // Width follows the inner hull at the water's height, capped a little above the floor: at the floor-meets-
+        // hull edge that closes the "ribbon", while the cap (below the gunwale FLARE) stops a tall wave NEXT TO the
+        // boat from being sliced (the far-side gap). The 0.30 cap is the dial.
+        float u = clamp((min(localH, floorLocalY + 0.30) - _HullSilB.x) / (_HullSilB.y - _HullSilB.x), 0.0, 0.999);
+        float NA = _HullSilB.z, NH = _HullSilB.w;
+        float fa = tt * NA - 0.5, fh = u * NH - 0.5;
+        int a0 = int(clamp(floor(fa), 0.0, NA - 1.0)), a1 = int(min(float(a0) + 1.0, NA - 1.0));
+        int h0 = int(clamp(floor(fh), 0.0, NH - 1.0)), h1 = int(min(float(h0) + 1.0, NH - 1.0));
+        float wa = clamp(fa - floor(fa), 0.0, 1.0), wh = clamp(fh - floor(fh), 0.0, 1.0);
+        float w = mix(mix(_silAt(a0, h0), _silAt(a1, h0), wa), mix(_silAt(a0, h1), _silAt(a1, h1), wa), wh);
+        if (across < w) discard;
+      }
+    ` : '';
+
+    const allDefs = `${defines.join('\n')}\n${depthDef}\n${reflDef}\n${shoreDef}\n${refrDef}\n${wakeDef}\n${splashDef}\n${flashDef}\n${shadowDef}\n${boatShadowDef}\n${rainDef}\n${hullDiscardDef}`;
     mat.Vertex_Definitions(`${allDefs}\n${varyings}\n${shoreFn}\n${wakeFn}\n${splashFn}`);
-    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${seabedFn}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}`);
+    mat.Fragment_Definitions(`${allDefs}\n${varyings}\n${seabedFn}\n${shoreFn}\n${fishFn}\n${wakeFn}\n${splashFn}\n${flashFn}\n${shadowFn}\n${rainFn}\n${hullDiscardFn}`);
 
     mat.Vertex_After_WorldPosComputed(`
       vWorldUV = worldPos.xz;
@@ -530,16 +597,21 @@ export class OceanFFTMaterial {
       #endif
 
       #ifdef HAS_WAKE
-        // Boat-footprint calming: damp the swell right around the hull so wave crests can't
-        // rise up through the deck. Matched on the CPU (height provider) so buoyancy agrees.
-        displacement *= (0.45 + 0.55 * smoothstep(6.0, 16.0, length(vWorldUV - _BoatPos)));
-
+       #ifndef HULL_DISCARD
+        // ── SURFACE-CARVE path (default). HULL_DISCARD (the height-aware fragment occlusion) replaces all of
+        // this when enabled; there the open sea is left completely untouched and the interior is masked per-pixel.
         // Hull water displacement: instead of cutting a hole in the sea, DEPRESS the surface under
         // the hull to just below the floor and flatten its chop, so the boat sits in its own hollow.
         // The sea still renders everywhere (no see-through), can never rise into the cockpit (it's
         // forced below the floor regardless of wave height), and laps the hull normally outside — the
         // hull's planking hides the lip of the depression. The footprint is the baked beam profile
         // (inset toward the waterline) oriented to the boat; sinkY rides the bob via _HullCutWaterY.
+        // Hull interior cut: compute the footprint (fp) + the thin edge feather HERE, but APPLY the vertical
+        // cut LAST — after the wake + splash below — otherwise the bow-wave crest / cannon splash get added on
+        // top of the cut and lift the interior water back above the floor (the in-cockpit flooding). fp/sinkY
+        // are hoisted to main scope so the final clamp (after HAS_SPLASH) can reach them.
+        float fp = 0.0;
+        float sinkY = -1.0e9;
         if (_HullCutOn > 0.5) {
           vec2  hf = normalize(_BoatDir + vec2(1e-5, 0.0));
           vec2  hr = vec2(hf.y, -hf.x);
@@ -547,20 +619,27 @@ export class OceanFFTMaterial {
           float along  = dot(rel, hf) * _HullCutMeta.w;     // root-local +Z
           float across = dot(rel, hr) - _HullCutMeta.z;     // root-local +X off the centreline
           float t = (along - _HullCutMeta.x) / _HullCutMeta.y;
-          float fp = 0.0;
+          float edgeCalm = 1.0;
           if (t > 0.0 && t < 1.0) {
             int bi = int(clamp(floor(t * 96.0), 0.0, 95.0));
             vec4 pv = _HullCutProfile[bi / 4];
             int pc = bi - (bi / 4) * 4;
             float halfBeam = (pc == 0 ? pv.x : (pc == 1 ? pv.y : (pc == 2 ? pv.z : pv.w))) * 1.0;
-            fp = (1.0 - smoothstep(halfBeam + 0.10, halfBeam + 0.42, abs(across)))
-               * smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.96, 1.0, t));
+            float ends = smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.96, 1.0, t));
+            fp = (1.0 - smoothstep(halfBeam + 0.10, halfBeam + 0.42, abs(across))) * ends;
+            // Thin HULL-CONFORMING feather: ease the swell down in a narrow band just OUTSIDE the contour so a
+            // crest can't tower over the low rail and slop aboard — only ~1.2 m wide and hull-shaped, never the
+            // old wide radial trough. Full waves beyond the band.
+            float dOut = abs(across) - halfBeam;                          // >0 = outside the hull outline
+            float band = 1.0 - smoothstep(0.0, 1.2, max(dOut, 0.0));      // 1 at the planking → 0 by 1.2 m out
+            edgeCalm = 1.0 - 0.45 * band * ends;                          // down to 0.55× wave height at the hull
           }
-          float sinkY = _HullCutWaterY - 0.38;              // target surface under the hull (below the floor)
-          displacement.y = mix(displacement.y, sinkY - worldPos.y, fp);
-          displacement.x *= (1.0 - fp);
+          displacement *= edgeCalm;
+          sinkY = _HullCutWaterY - 0.38;                    // hold the interior just below the floor (dry)
+          displacement.x *= (1.0 - fp);                     // flatten interior chop (the y-cut runs last)
           displacement.z *= (1.0 - fp);
         }
+       #endif
 
         // Wake riding on the swell: flatten the FFT chop in the churned core (the boat
         // smooths the water), carve a trough there, and raise the diverging bow-wave crests.
@@ -574,7 +653,25 @@ export class OceanFFTMaterial {
         displacement.y += _splashDisp(vWorldUV);
       #endif
 
+      #ifdef HAS_WAKE
+       #ifndef HULL_DISCARD
+        // FINAL hull interior cut (carve path only) — applied AFTER the wake bow-wave crest AND the cannon splash,
+        // so neither can raise the cut water back above the floor and flood the cockpit. CAP-don't-PIN: force the
+        // interior down to sinkY (below the floor → dry) but never ABOVE the real swell, so it neither floods nor
+        // juts up as a shelf when the surrounding sea falls into a trough. (fp is 0 outside the hull → sea untouched.)
+        if (fp > 0.0) {
+          displacement.y = mix(displacement.y, min(worldPos.y + displacement.y, sinkY) - worldPos.y, fp);
+        }
+       #endif
+      #endif
+
       worldPos.xyz += displacement;
+
+      #ifdef HULL_DISCARD
+        // Carry the DISPLACED surface position to the fragment (no spare varying budget for a new one): the
+        // height-aware discard recovers the live wave height there via surfPos = _WorldSpaceCameraPos - vViewVector.
+        vViewVector = _WorldSpaceCameraPos - worldPos.xyz;
+      #endif
 
       vLodScales = vec4(lod_c0, lod_c1, lod_c2, max(displacement.y - largeWavesBias * 0.8 - _SSSBase, 0.) / _SSSScale);
     `);
@@ -584,6 +681,9 @@ export class OceanFFTMaterial {
     `);
 
     mat.Fragment_Before_Lights(`
+      #ifdef HULL_DISCARD
+        _hullDiscard();   // height-aware interior occlusion — mask the sea inside the hull at the live waterline
+      #endif
       vec2 uv0 = vWorldUV / LengthScale0;
       vec2 uv1 = vWorldUV / LengthScale1;
       vec2 uv2 = vWorldUV / LengthScale2;
@@ -842,6 +942,11 @@ export class OceanFFTMaterial {
         eff.setFloat('_HullCutWaterY', hc.waterY);
         eff.setArray4('_HullCutProfile', hc.profile);
         eff.setFloat4('_HullCutMeta', hc.alongMin, hc.alongLen, hc.acrossCenter, hc.alongSign);
+        // Height-aware silhouette + bob reference (used only when the shader is built with HULL_DISCARD).
+        eff.setArray4('_HullSil', hc.sil);
+        eff.setFloat4('_HullSilB', hc.hMin, hc.hMax, 48, 8);
+        eff.setFloat('_HullSilRootY', hc.rootY);
+        eff.setFloat2('_BoatTilt', hc.pitch, hc.roll);
       }
       const wp = this._deps.getWakePaths?.();
       if (wp) {

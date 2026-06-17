@@ -89,13 +89,15 @@ export class VesselBuoyancyService {
    */
   update(
     wx: number, wz: number, headingRad: number, t: number, dt: number,
-    opts?: { pitchScale?: number; heaveTau?: number },
+    opts?: { pitchScale?: number; heaveTau?: number; tiltTau?: number },
   ): BuoyancyState {
-    // Per-vessel buoyancy feel (defaults = the generic sloop). A smaller, calmer boat
-    // (the pinnace) passes a lower pitchScale + longer heaveTau so its short hull doesn't
-    // pitch like a 10 m sloop or snap up onto every crest.
+    // Per-vessel buoyancy feel (defaults = the generic sloop). heaveTau = how tightly the hull rises/falls
+    // with the swell (LOWER = more responsive, rides waves instead of sitting at an average level); tiltTau =
+    // the same for pitch/roll; pitchScale = how much the wave slope tilts it. A small open boat (the pinnace)
+    // wants SHORT taus so its low freeboard stays on top of a wave instead of being swamped by lag.
     const pitchScale = opts?.pitchScale ?? PITCH_SCALE;
     const heaveTau   = opts?.heaveTau   ?? HEAVE_TAU;
+    const tiltTau    = opts?.tiltTau;
 
     const sinH = Math.sin(headingRad);
     const cosH = Math.cos(headingRad);
@@ -136,8 +138,9 @@ export class VesselBuoyancyService {
     this.heaveFiltered += (meanH - this.heaveFiltered) * alpha;
 
     // ── Smooth pitch and roll ──────────────────────────────────────────────
-    // Faster tracking than heave so the tilt matches the wave geometry.
-    const pAlpha = Math.min(1, PITCH_SMOOTH + dt * 2.5);
+    // A per-vessel time constant (tiltTau) when given — a short one snaps the bow/stern onto the wave slope and
+    // lets gravity drop them back the instant the crest passes; otherwise the framerate-scaled default.
+    const pAlpha = tiltTau != null ? (1 - Math.exp(-dt / tiltTau)) : Math.min(1, PITCH_SMOOTH + dt * 2.5);
     this.pitchFiltered += (pitchRaw - this.pitchFiltered) * pAlpha;
     this.rollFiltered  += (rollRaw  - this.rollFiltered)  * pAlpha;
     // Hard ceiling so even a heavy FFT swell can't tilt the deck into the water.

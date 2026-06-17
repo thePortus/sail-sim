@@ -15,6 +15,7 @@ db.sequelize = sequelize;
 
 db.User = require('./user.model')(sequelize, Sequelize.DataTypes);
 db.EconomyState = require('./economy-state.model')(sequelize, Sequelize.DataTypes);
+db.DiplomacyState = require('./diplomacy-state.model')(sequelize, Sequelize.DataTypes);
 
 /**
  * Self-applying, NON-destructive schema top-up. This project has no sequelize.sync(), so new columns
@@ -32,6 +33,16 @@ db.ensureColumns = async () => {
     ['combatState', { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
     // Phase 3 discovery ledger: JSON { mapVersion, towns:{ [townId]:{specialty,day,goods:[{id,ask,bid}]} } }.
     ['marketLedger', { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
+    // Factions: JSON { [factionId]: standing } reputation (neutral 0 start). Persists across maps (it's the
+    // player's, not the world's). Scaffold only — no gameplay effects yet (the events module wires those in).
+    ['factionRep',   { type: Sequelize.DataTypes.TEXT,   allowNull: true,  defaultValue: null }],
+    // Ships-as-economy: the player's OWNED vessel slug. Persists across maps (it's the player's, NOT the
+    // world's — unlike lastVesselSlug which rides the map-gated position save). Everyone (incl. existing
+    // players, via the backfill) starts in the 'pinnace' — ships are now bought at a shipwright for gold.
+    ['ship',         { type: Sequelize.DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' }],
+    // Crew resource: remaining sailors (NULL backfills as "full complement" on next load). Persists across
+    // maps (the player's, not the world's). Grapeshot lowers it; a port tavern raises it back.
+    ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {
@@ -58,6 +69,16 @@ db.ensureTables = async () => {
       towns:       { type: DT.TEXT('medium'), allowNull: false },
     });
     console.log('[db] created table economyStates');
+  } catch {
+    /* already exists (or DB unreachable) */
+  }
+  try {
+    await qi.createTable('diplomacyStates', {
+      id:           { type: DT.INTEGER, primaryKey: true, allowNull: false, defaultValue: 1 },
+      lastShiftDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
+      rel:          { type: DT.TEXT, allowNull: false },
+    });
+    console.log('[db] created table diplomacyStates');
   } catch {
     /* already exists (or DB unreachable) */
   }

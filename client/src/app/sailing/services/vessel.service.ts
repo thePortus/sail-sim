@@ -1,4 +1,4 @@
-import { Injectable, NgZone, inject, signal } from '@angular/core';
+import { Injectable, NgZone, effect, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
   AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
@@ -8,13 +8,15 @@ import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoade
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
-import { bakeHullCutProfile } from './ocean-fft/hull-cut-mask';
+import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { VesselController, createVesselController, rigForSlug, VesselRig } from './vessel-controller';
+import { VesselController, createVesselController, rigForSlug, VesselRig, SailRig } from './vessel-controller';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
-import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH } from './combat.constants';
+import { MastCrackService } from './mast-crack.service';
+import { listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH,
+         mastHealth, mastSpeedMult, MAST_DOWN_TURN_MAX } from './combat.constants';
 import { Vessel, VesselPart, VesselCannon, SailState, Wind, SeaConditions, VesselState, VesselPhysics } from '../models';
 
 // The rigged GLB + manifest are now resolved per-vessel (see this.rig in init / vessel-controller.ts).
@@ -28,15 +30,30 @@ export class VesselService {
   private assetCache       = inject(VesselAssetCacheService);
   private crewService      = inject(CrewService);
   private combatService    = inject(CombatService);
+  private mastCrackService = inject(MastCrackService);
   private zone             = inject(NgZone);
+
+  /** Previous mast-health fraction, for one-shotting the demasting crack on the 0-crossing (−1 = unset). */
+  private prevMastH = -1;
 
   /** Animated deck crew on the local vessel (null until the GLB + crew assets load). */
   private crewHandle: CrewHandle | null = null;
+
+  /** Reflect the authoritative crew count onto the deck as it changes — grapeshot casualties drop, tavern
+   *  hires return. Runs in the injection context (field initializer); the handle may be null early (guarded). */
+  private readonly _crewCasualtySync = effect(() => {
+    const n = this.combatService.crew();
+    this.crewHandle?.setAliveCount(n);
+  });
 
   // ── Public reactive state ─────────────────────────────────────────────────
   grounded = signal<boolean>(false);
   /** True while the anchor is down (boat parked/tethered). */
   anchored = signal<boolean>(false);
+  /** True while auto-steering toward a berth (the docking glide; input is ignored during it). */
+  docking = signal<boolean>(false);
+  /** True while moored at a berth — helm + throttle frozen (like anchored) until castOff(). */
+  tiedUp = signal<boolean>(false);
 
   state = signal<VesselState>({
     x: 7200, z: 0, heading: 270, speed: 0,
@@ -57,6 +74,41 @@ export class VesselService {
   private physics: VesselPhysics = {
     maxSpeed: 8, accelerationRate: 0.25, minTackAngle: 38, sailAreaFactor: 0.32, weight: 2800,
   };
+
+  // ── Realistic physics v2 (force-based; gated by localStorage.ignis_physics='v2') ──────────────────
+  // P1: apparent wind + drive-vs-quadratic-drag + mass momentum. Calibrated to keep ~current top speeds
+  // (hand-checked vs the legacy lag model at wind 9 m/s). Constants are global for P1; per-rig polars
+  // arrive in P3. See sailing-physics-roadmap. Trim/turn/in-irons stay on the legacy model until P2/P4.
+  // v2 force-based sailing is now the DEFAULT; opt back to the old model with localStorage.ignis_physics='legacy'.
+  private readonly physV2 = !(typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics') === 'legacy');
+  // The tuning overlay is off by default now; show it again with localStorage.ignis_physics_debug='1'.
+  private readonly physDebugOn = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics_debug') === '1');
+  private readonly SAIL_FORCE_K   = 0.26;    // drive scale: thrust = K·sailAreaFactor·driveC·V_app²
+  private readonly DRAG_K         = 1.0;     // hull drag: F = DRAG_K·v² (quadratic) — sets where drive=drag
+  private readonly FORCE_RESPONSE = 0.04;    // accel gain (sets momentum/time-constant; lower = weightier)
+  private readonly WEIGHT_REF     = 2800;    // sloop weight → massK = physics.weight / WEIGHT_REF
+  private prevSpeedMod = 0;                  // last frame's buoy.speedModifier, fed back as wave-surf accel
+  private trimQ = 1;                         // last frame's trim quality (0..1) at the drive angle — for the HUD
+  // P4 turning realism (v2): the helm commands a TARGET yaw rate that eases in (angular inertia) instead of
+  // snapping; hard turns scrub speed (broadside drag); and a stalled bow head-to-wind is gently blown off
+  // the eye so you can never be permanently stuck in irons (recoverable).
+  private yawRate = 0;                       // current heading rate (deg/s); eased toward the rudder target
+  private readonly YAW_RESPONSE   = 4;       // how fast yaw eases to target (1/s; ~0.25 s time constant)
+  private readonly TURN_SCRUB     = 0.06;    // speed lost to turning: extra drag = TURN_SCRUB·|yaw|·|speed|
+  private readonly IRONS_FALLOFF  = 6;       // deg/s the wind blows the bow off the eye when stalled in irons
+  // P5 sea-state + reefing (v2): heel comes from wind SIDE-FORCE (not speed); over-canvassed sails heel past
+  // comfort and SPILL wind → forward drive drops, so reefing pays in a blow and full sail wins in light air.
+  // Rough/head seas add drag. Heel feeds the visual lean + leeway.
+  private heelV2 = 0;                         // current wind-pressure heel (deg, magnitude) under v2
+  private heelSpill = 0;                      // 0..1 over-canvassed wind-spill (also the HUD "reef" hint)
+  private readonly HEEL_K        = 0.22;      // heel = HEEL_K·SAF·canvas·V_app²·sin(angle), capped below
+  private readonly COMFORT_HEEL  = 16;        // ° before the sail starts spilling wind
+  private readonly SPILL_RANGE   = 14;        // ° of heel over comfort that ramps spill 0→1
+  private readonly SPILL_MAX     = 0.75;      // max forward-drive fraction lost to an over-pressed (heeled) sail
+  private readonly MAX_HEEL_VIS  = 26;        // ° cap on the visual/leeway heel
+  private readonly SEA_DRAG_K    = 0.06;      // chop resistance: extra drag = SEA_DRAG_K·rough·(0.5+intoSea)·|v|
+  /** Live force-model telemetry for the tuning overlay (only set when physV2). null on the legacy model. */
+  physDebug = signal<{ appAngle: number; appWind: number; trueAngle: number; thrust: number; drag: number; speed: number; vmg: number; trim: number; heel: number; reef: boolean } | null>(null);
 
   /**
    * Seconds the vessel has been continuously blocked by land.
@@ -83,6 +135,8 @@ export class VesselService {
   // Water-contact shadow projected beneath the hull.
   private waterShadow: Mesh | null = null;
   private waterShadowMat: StandardMaterial | null = null;
+  /** Hull-stencil proxy (stencil mode only) — masks the FFT sea out of the open hull. Parented to root. */
+  private hullStencilCap: Mesh | null = null;
 
   // ── PBR material / texture pools ─────────────────────────────────────────
   private matPool         = new Map<string, PBRMaterial>();
@@ -138,6 +192,12 @@ export class VesselService {
   private readonly CAM_TRAUMA_DECAY = 0.6;    // SLOW decay → the shake rings for ~1 s (not a single flick)
   private readonly CAM_SHAKE_MAX    = 1.2;    // max camera position offset (m) at trauma = 1
   private readonly CAM_SHAKE_FREQ   = 12.6;   // rad/s ≈ 2 Hz → a visible back-and-forth, not a fast jitter
+  // 3rd-person amplifiers (a fixed metre offset is invisible 60 m out): distance-compensate the positional
+  // shake so it reads the same at any zoom, and add a higher-frequency ROTATIONAL view jolt — the part that
+  // makes it feel jarring rather than a gentle drift. (First-person is untouched — it sits ON the eye.)
+  private readonly SHAKE_DIST_REF   = 12;     // camDist (m) at which the positional shake is 1×
+  private readonly SHAKE_DIST_MAX   = 2;      // cap on the distance scale so a far zoom doesn't over-shake
+  private readonly CAM_SHAKE_ROT    = 0.02;   // view-jolt angle (rad, ~2.9°) at trauma = 1 — the jarring kick
 
   /** Add camera-shake trauma (0..1, clamped). Trauma decays in updateCamera. */
   addShakeTrauma(amount: number): void {
@@ -184,8 +244,10 @@ export class VesselService {
   isGunSettled(side: 'port' | 'stbd'): boolean {
     return this.controller?.gunSettled(this.gunSide(side)) ?? true;
   }
-  /** Per-ship reload window (seconds). */
-  getReloadWindow(): number { return this.physics.reloadWindow ?? 6; }
+  /** Per-ship reload window (seconds), stretched when short-handed: fewer gun crew → slower reload (up to ~2×
+   *  with no crew, via the 0.5 crew-efficiency floor). The cannon service reads this for both the progress bar
+   *  and the reload-complete check, so the whole gun cycle slows with crew losses. */
+  getReloadWindow(): number { return (this.physics.reloadWindow ?? 6) / this.combatService.crewFactor(); }
 
   /** Returns the vessel root TransformNode. Used by CannonService to parent cannon pivots. */
   getRoot(): TransformNode { return this.root; }
@@ -219,6 +281,45 @@ export class VesselService {
       this.anchorZ = this.z;
     }
     this.anchored.set(this.isAnchored);
+  }
+
+  // ── Docking (auto-moor to a pier berth) ──────────────────────────────────────
+  // dockAt() eases the boat from its current pose to a tie-up point over a short glide (player input
+  // ignored during it), then PINS it there — tied up, like an anchor with zero scope — until castOff().
+  // Position-only: buoyancy still bobs the hull. No tie-rope animation (per design).
+  private dockPhase: 'free' | 'approaching' | 'tied' = 'free';
+  private dockElapsed = 0;
+  private dockDuration = 0;
+  private dockStartX = 0; private dockStartZ = 0; private dockStartHdg = 0;
+  private dockBerthX = 0; private dockBerthZ = 0; private dockBerthHdg = 0;
+
+  /** Begin auto-steering to a berth: glide to (x,z,heading°) then moor. No-op if already docking/tied. */
+  dockAt(berth: { x: number; z: number; heading: number }): void {
+    if (this.dockPhase !== 'free' || !this.root) { return; }
+    this.isAnchored = false; this.anchored.set(false);   // can't be anchored AND tied
+    this.dockStartX = this.x; this.dockStartZ = this.z; this.dockStartHdg = this.heading;
+    this.dockBerthX = berth.x; this.dockBerthZ = berth.z;
+    this.dockBerthHdg = ((berth.heading % 360) + 360) % 360;
+    const dist = Math.hypot(berth.x - this.x, berth.z - this.z);
+    this.dockDuration = Math.min(4, Math.max(1.4, dist / 6));   // ~6 m/s glide, clamped 1.4–4 s
+    this.dockElapsed = 0;
+    this.dockPhase = 'approaching';
+    this.docking.set(true);
+    this.keys.left = this.keys.right = this.keys.sheetIn = this.keys.sheetOut = false;
+    this.speed = 0;
+  }
+
+  /** Cast off the mooring so the helm/throttle answer again. */
+  castOff(): void {
+    if (this.dockPhase === 'free') { return; }
+    this.dockPhase = 'free';
+    this.docking.set(false);
+    this.tiedUp.set(false);
+  }
+
+  /** Shortest signed delta a→b in degrees, in [-180, 180] (for berth-heading interpolation). */
+  private angleDeltaDeg(a: number, b: number): number {
+    return ((b - a) % 360 + 540) % 360 - 180;
   }
 
   // ── Input ─────────────────────────────────────────────────────────────────
@@ -256,7 +357,9 @@ export class VesselService {
   // The HUD displays physics speed (realistic knots), but world position advances
   // at TRAVEL_SCALE × that rate — a classic video-game map-compression trick.
   // Raise this to make island-to-island sailing feel snappier; lower it for realism.
-  private readonly TRAVEL_SCALE = 5.0;
+  // MUST match the server (combat-constants.js TRAVEL_SCALE, which movement-constants imports) or the server's
+  // movement validation snaps the local ship back (rubber-banding). Currently 3.
+  private readonly TRAVEL_SCALE = 3.0;
 
   // ── Hull collision ──────────────────────────────────────────────────────────
   // The aground check used to test only the boat's CENTRE point, so the long bow
@@ -383,14 +486,54 @@ export class VesselService {
    *  off otherwise). Local boat only — the ocean shader tracks a single boat transform. The per-frame
    *  floor height (waterY) is pushed from the physics loop so the cut rides the bob. */
   private applyHullCut(): void {
-    const hc = this.rig.hullCut;
-    if (!hc || !this.root) { this.oceanService.setHullCutEnabled(false); return; }
+    // Tear down any stencil proxy from a previous hull (vessel swap/reload re-runs this); default both cut
+    // modes off until re-enabled below.
+    this.hullStencilCap?.dispose(false, true);
+    this.hullStencilCap = null;
+    this.oceanService.setHullStencilMask(false);
+    if (!this.root) { this.oceanService.setHullCutEnabled(false); return; }
     const hull = this.root.getChildMeshes()
       .find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
-    const baked = hull ? bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N) : null;
+
+    // STENCIL mask = the DEFAULT open-hull occlusion on WebGPU: mask the sea out of the hull with a stencil
+    // proxy built from the boat's REAL geometry — perfect silhouette adherence, no carve, no tears. It's
+    // INDEPENDENT of the per-rig hullCut config (only needs a hull mesh), so EVERY vessel — open pinnace or
+    // decked sloop — gets the same clean mask from one cheap stencil-only draw. It only masks the FFT ocean,
+    // so the WebGL/procedural ocean keeps the legacy shader carve below. `ignis_hullcut` is now an opt-OUT
+    // override: 'carve' or 'discard' force the legacy shader path even on WebGPU; 'stencil' forces stencil.
+    const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
+    const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
+    if (useStencil && hull) {
+      // TRUE-3D proxy: clone the live hull mesh (shared geometry + skeleton) and stamp it into the stencil
+      // buffer. A boat's cross-section changes with height, so no flat sheet matches it at every angle — a
+      // gunwale-height lid floats above the sea (parallax), a waterline lid pokes its wide outline past the
+      // narrower waterline hull (a skirt). The hull's own geometry is the only silhouette that's exactly
+      // right from any camera, so we mask to that.
+      this.hullStencilCap = buildHullStencilProxy(hull, this.root, this.sceneService.scene);
+      if (this.hullStencilCap) {
+        this.oceanService.setHullStencilMask(true);
+        this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
+        return;
+      }
+    }
+
+    // ── Legacy shader carve/discard (any non-stencil mode), driven by the per-rig hullCut config. ──
+    const hc = this.rig.hullCut;
+    if (!hc || !hull) { this.oceanService.setHullCutEnabled(false); return; }
+    // Footprint = the WIDEST-beam (gunwale/deck) outline, NOT the waterline contour. The dry region the cut
+    // must cover is the whole open COCKPIT, which extends out to the gunwales; the narrower waterline slice
+    // left the outer cockpit (and bow/stern flare) un-cut → waves flooded it. The gunwale outline also robustly
+    // avoids any "where is the waterline in this hull's frame?" guess. `waterlineY` (a per-rig opt-in) still
+    // forces a true waterline slice if ever wanted, but the pinnace omits it → widest-beam.
+    const baked = bakeHullCutProfile(hull, this.root, OceanService.HULL_CUT_N, hc.waterlineY);
     if (!baked) { this.oceanService.setHullCutEnabled(false); return; }
     this.oceanService.setHullCutProfile(
       baked.profile, baked.alongMin, baked.alongLen, baked.acrossCenter, hc.alongSign);
+    // Also bake the HEIGHT-AWARE silhouette (along × height) for the discard path (used only when the ocean
+    // shader is built with HULL_DISCARD; the along meta is shared with the profile above via _HullCutMeta).
+    const sil = bakeHullSilhouette(hull, this.root, OceanService.HULL_SIL_NA, OceanService.HULL_SIL_NH);
+    if (sil) { this.oceanService.setHullSilhouette(sil.table, sil.hMin, sil.hMax); }
+
     this.oceanService.setHullCutEnabled(true);
   }
 
@@ -429,15 +572,63 @@ export class VesselService {
   async reloadModel(): Promise<void> {
     const scene = this.sceneService.scene;
     if (!scene || !this.root) return;
+    const sg = this.sceneService.shadowGenerator;
     const oldRoot = this.controller?.root ?? null;
     if (oldRoot) {
-      for (const m of oldRoot.getChildMeshes(false)) this.oceanService.removeFromRenderList(m);
+      // Unregister from BOTH the ocean reflection list AND the shadow generator before disposing. Babylon
+      // does NOT auto-prune a disposed mesh from a ShadowGenerator's manual render list, so skipping this
+      // leaks dead refs every reload/refit — wasted shadow-pass work and, eventually, a descriptor-heap crash.
+      for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); }
     }
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();   // disposes the old instanced meshes (shared materials are kept)
 
     await this.buildGLBMeshes(scene);   // re-instantiate fresh + build a new controller
+    if (this.controller) {
+      this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
+      this.applyHullCut();
+    }
+  }
+
+  /** Refit into a DIFFERENT vessel in place (shipwright purchase): adopt the new def's rig/physics/guns and
+   *  rebuild the model at the CURRENT pose, keeping input, camera, the sim loop, and the wake particles.
+   *  The cannon battery resyncs from the new layout on the next broadside (CannonService.syncGuns). */
+  async swapVessel(vessel: Vessel): Promise<void> {
+    const scene = this.sceneService.scene;
+    if (!scene || !this.root) return;
+
+    // Adopt the new vessel def — mirrors init()'s setup, minus pose/input/loop.
+    if (vessel.physics) Object.assign(this.physics, vessel.physics);
+    this.vesselSlug = vessel.slug;
+    const base = rigForSlug(vessel.slug);
+    this.rig = {
+      glb:         vessel.glb         ?? base.glb,
+      manifest:    vessel.manifest    ?? base.manifest,
+      importFlipY: vessel.importFlipY ?? base.importFlipY,
+      rightSign:   vessel.rightSign   ?? base.rightSign,
+      controller:  base.controller,
+      floatDraft:  base.floatDraft,
+      hullCut:     base.hullCut,
+      buoyancy:    base.buoyancy,
+      hullHalfLen:  base.hullHalfLen,
+      hullHalfBeam: base.hullHalfBeam,
+    };
+    this.rightSign = this.rig.rightSign;
+    this.vesselCannons = vessel.cannons ?? null;
+    const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
+    this.fpEye = new Vector3(fp.x, fp.y, fp.z);
+
+    // Dispose the old model + controller and rebuild from the new rig (same as reloadModel). Unregister from
+    // BOTH the ocean list AND the shadow generator (Babylon won't auto-prune disposed meshes from the
+    // shadow render list — leaking them every refit wastes shadow-pass work and risks a descriptor-heap crash).
+    const sg = this.sceneService.shadowGenerator;
+    const oldRoot = this.controller?.root ?? null;
+    if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); } }
+    this.controller?.dispose();
+    this.controller = null;
+    oldRoot?.dispose();
+    await this.buildGLBMeshes(scene);
     if (this.controller) {
       this.registerMeshesForRendering(this.controller.root.getChildMeshes(false));
       this.applyHullCut();
@@ -471,7 +662,7 @@ export class VesselService {
     this.crewHandle = null;
     void this.crewService
       .attach(this.vesselSlug, rigged.root, scene, crewSeedFrom('local_' + this.vesselSlug))
-      .then((h) => { this.crewHandle = h; });
+      .then((h) => { this.crewHandle = h; h?.setAliveCount(this.combatService.crew()); });   // reflect current casualties
   }
 
   /** Animated deck crew handle (casualties via killOne()/reviveAll()); null until loaded. */
@@ -696,24 +887,77 @@ export class VesselService {
     }
   }
 
+  /**
+   * v2 trim quality (0..1) — sensitivity depends on POINT OF SAIL. Upwind/reaching the sail is an
+   * AIRFOIL: tight tolerance, and bad trim STALLS (over-sheet) or LUFFS (over-ease) toward 0. Dead
+   * downwind the sail is a DRAG device (a parachute): wide tolerance, a high floor, and it CANNOT stall —
+   * a slightly-off sheet with the wind behind you costs almost nothing. Fixes the legacy bug where a 30°
+   * over-sheet drove efficiency to 0 even on a run (the "I'm running downwind but nearly stopped" case).
+   */
+  private trimFactorV2(absAngle: number): number {
+    const optimal  = this.optimalSheetAngle(absAngle);
+    const mismatch = this.sheetAngleDeg - optimal;          // <0 = sheeted too tight, >0 = eased too far
+    const dw       = this.smooth01(absAngle, 100, 160);     // 0 = airfoil (up/reach) → 1 = drag device (run)
+    const forgive  = this.rig.sail?.trimForgive ?? 1;       // simple workboat rig → wider tolerance
+    const floor    = 0.70 * dw;                             // min drive even badly mis-set: 0 upwind → .70 run
+    const tightW   = (20 + 56 * dw) * forgive;              // too-tight (stall) tolerance °: 20 → 76
+    const easeW    = (32 + 58 * dw) * forgive;              // too-eased (luff)  tolerance °: 32 → 90
+    const width    = (mismatch < 0 ? tightW : easeW) || 1;
+    const x        = Math.min(1, Math.abs(mismatch) / width);
+    return floor + (1 - floor) * (1 - x * x);              // parabolic falloff, = floor at the tolerance edge
+  }
+
+  /** Smoothstep 0..1 as v sweeps a→b. */
+  private smooth01(v: number, a: number, b: number): number {
+    const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+    return t * t * (3 - 2 * t);
+  }
+
   private sailEfficiency(angleFromWind: number): number {
-    if (this.sailState === 'reefed') return 0;
+    if (this.sailState === 'reefed') { this.trimQ = 1; return 0; }
     const sailMult = this.sailState === 'topsails' ? 0.5 : 1.0;
     const a = Math.abs(angleFromWind);
     let eff: number;
 
-    if      (a < this.physics.minTackAngle) eff = -0.30;  // in irons: gentle pushback
-    else if (a < 45)  eff = 0.52;  // close-hauled
-    else if (a < 60)  eff = 0.72;  // close reach
-    else if (a < 90)  eff = 0.86;  // beam reach
-    else if (a < 115) eff = 0.95;  // broad reach approach
-    else if (a < 145) eff = 1.00;  // broad reach — peak VMG
-    else if (a < 165) eff = 0.88;  // running
-    else              eff = 0.72;  // dead downwind (blanketed jib)
+    if (this.physV2 && this.rig.sail) {
+      // v2: per-rig polar (distinct character per boat) — see VESSEL_RIGS / sailing-physics-roadmap.
+      eff = this.polarDrive(a, this.rig.sail);
+    } else {
+      // Legacy step curve (shared by both boats).
+      if      (a < this.physics.minTackAngle) eff = -0.30;  // in irons: gentle pushback
+      else if (a < 45)  eff = 0.52;  // close-hauled
+      else if (a < 60)  eff = 0.72;  // close reach
+      else if (a < 90)  eff = 0.86;  // beam reach
+      else if (a < 115) eff = 0.95;  // broad reach approach
+      else if (a < 145) eff = 1.00;  // broad reach — peak VMG
+      else if (a < 165) eff = 0.88;  // running
+      else              eff = 0.72;  // dead downwind (blanketed jib)
+    }
 
-    // Trim penalty: even a perfect point of sail underperforms with a mis-set sheet
-    const trim = (a < this.physics.minTackAngle) ? 1 : this.trimFactor(a);
+    // Trim penalty: even a perfect point of sail underperforms with a mis-set sheet. v2 makes the penalty
+    // POINT-OF-SAIL-AWARE (forgiving downwind, sharp upwind); legacy uses the old one-size curve.
+    const trim = (a < this.physics.minTackAngle) ? 1 : (this.physV2 ? this.trimFactorV2(a) : this.trimFactor(a));
+    this.trimQ = trim;   // cached for the HUD trim-quality readout (reflects the actual drive trim)
     return eff * sailMult * trim;
+  }
+
+  /**
+   * v2 per-rig drive coefficient at apparent wind angle `a` (0 = bow into wind). Below the no-go angle the
+   * sail luffs then backwinds (ramps to −0.30 dead into the wind); above it, linearly interpolate the rig's
+   * polar breakpoints. This is what makes a sloop and a pinnace sail differently.
+   */
+  private polarDrive(a: number, sail: SailRig): number {
+    const noGo = this.physics.minTackAngle;
+    if (a < noGo) return -0.30 * (1 - a / Math.max(1, noGo));   // luff → backwind in the no-go zone
+    const p = sail.polar;
+    if (a <= p[0][0]) return p[0][1];
+    for (let i = 1; i < p.length; i++) {
+      if (a <= p[i][0]) {
+        const t = (a - p[i - 1][0]) / (p[i][0] - p[i - 1][0]);
+        return p[i - 1][1] + (p[i][1] - p[i - 1][1]) * t;
+      }
+    }
+    return p[p.length - 1][1];
   }
 
   // ── Turn rate (speed-dependent) ───────────────────────────────────────────
@@ -739,6 +983,9 @@ export class VesselService {
     this.currentWind = wind;
     this.currentSea  = sea;
   }
+
+  /** Current wind (read-only) — used e.g. to drift cannon smoke downwind. */
+  getWind(): Wind { return this.currentWind; }
 
   // ── Physics loop ──────────────────────────────────────────────────────────
 
@@ -776,19 +1023,116 @@ export class VesselService {
     const angleFromWind = diff > 180 ? 360 - diff : diff;
     const isPortTack    = diff <= 180;
 
-    const eff    = this.sailEfficiency(angleFromWind);
-    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor));
-    // speedModifier applied below after buoyancy is computed.
-    // While sinking, control is frozen: glide to a dead stop (no sail drive) and ignore the helm.
-    const spdTarget = this.sinking ? 0 : baseTarget;
-    const spdRate   = this.sinking ? 1.2 : this.physics.accelerationRate;
-    this.speed  += (spdTarget - this.speed) * spdRate * dt;
+    // Mast damage: a wounded mast (< 60 % HP) bleeds sail power; a fully destroyed mast gives NO drive at
+    // all (she coasts to a stop as if furled — see the helm cap below). Read from our authoritative hull.
+    const mastH   = mastHealth(this.combatService.zones(), zoneHpFor(this.vesselSlug));
+    const mastMul = mastSpeedMult(mastH);
+
+    // ── Apparent wind (v2): the wind the boat actually feels = true-wind vector − boat-velocity vector.
+    // Reaching/upwind raises it (more drive); running lowers it (you can't outrun the wind dead downwind).
+    // The legacy model read TRUE wind only; v2 drives off the apparent angle/speed. ──
+    let driveAngle = angleFromWind;
+    let appWind    = gustSpeed;
+    if (this.physV2) {
+      const hr0 = this.heading * Math.PI / 180;
+      const bvx = Math.sin(hr0) * this.speed, bvz = Math.cos(hr0) * this.speed;   // boat velocity
+      const wf  = wind.fromBearingDeg * Math.PI / 180;
+      const wvx = -Math.sin(wf) * gustSpeed, wvz = -Math.cos(wf) * gustSpeed;     // true wind velocity (blows TO = from+180°)
+      const ax  = wvx - bvx, az = wvz - bvz;                                       // apparent wind velocity
+      appWind   = Math.hypot(ax, az);
+      const cosA = (-ax * Math.sin(hr0) - az * Math.cos(hr0)) / (appWind || 1);    // cos(angle bow ↔ apparent FROM)
+      driveAngle = Math.acos(Math.max(-1, Math.min(1, cosA))) * 180 / Math.PI;     // 0 = bow into apparent wind
+    }
+
+    const eff    = this.sailEfficiency(driveAngle);
+    // Crew: fewer hands work the sails (and helm) less effectively — scale top speed + turn rate by the
+    // crew-efficiency factor (0.5..1). Even solo you still sail/turn, just at half pace (the 0.5 floor).
+    const crewMul = this.combatService.crewFactor();
+    const baseTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed, gustSpeed * eff * this.physics.sailAreaFactor * mastMul)) * crewMul;
+    // speedModifier applied below after buoyancy is computed (legacy path; v2 folds it into the force model).
+    // While sinking OR docked (approaching/tied), control is frozen: glide to a dead stop (no sail drive).
+    const docked = this.dockPhase !== 'free';
+    if (this.sinking || docked) {
+      this.speed += (0 - this.speed) * (this.sinking ? 1.2 : this.physics.accelerationRate) * dt;
+    } else if (this.physV2) {
+      // ── Force model: a = (thrust − drag)·response/mass. Thrust ∝ driveC·V_app²; drag ∝ v². The steady
+      // state (drive = drag) sets the top speed; mass sets the momentum (heavy boats accelerate/coast slow). ──
+      // Heel from wind SIDE-FORCE (canvas × V_app² × how abeam the wind is). Over comfort the sail spills
+      // wind → forward drive falls off (reefing pays in a blow); spilling also sheds some of the heel.
+      const canvas   = this.sailState === 'full' ? 1 : this.sailState === 'topsails' ? 0.5 : 0;
+      const heelRaw  = this.HEEL_K * this.physics.sailAreaFactor * canvas
+                     * appWind * appWind * Math.sin(driveAngle * Math.PI / 180);
+      this.heelSpill = Math.max(0, Math.min(1, (heelRaw - this.COMFORT_HEEL) / this.SPILL_RANGE));
+      this.heelV2    = Math.min(this.MAX_HEEL_VIS, heelRaw * (1 - 0.45 * this.heelSpill));
+      const driveC = eff * mastMul * crewMul * (1 - this.SPILL_MAX * this.heelSpill);
+      const forceK = this.rig.sail?.forceK ?? this.SAIL_FORCE_K;
+      const thrust = forceK * this.physics.sailAreaFactor * driveC * appWind * appWind;
+      // Drag = hull drag (quadratic) + turn scrub (a hard turn drags the hull broadside, bleeding way — most
+      // felt mid-tack; uses last frame's yawRate, 1-frame lag is moot) + sea drag (chop resistance, worse
+      // punching into a head sea than running with it).
+      const rough    = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4);
+      const intoSea  = 1 - driveAngle / 180;                                   // 1 dead upwind → 0 downwind
+      const drag = this.DRAG_K * this.speed * Math.abs(this.speed)
+                 + this.TURN_SCRUB * Math.abs(this.yawRate) * Math.abs(this.speed)
+                 + this.SEA_DRAG_K * rough * (0.5 + intoSea) * Math.abs(this.speed);
+      const massK  = Math.max(0.2, this.physics.weight / this.WEIGHT_REF);
+      this.speed  += (thrust - drag) * this.FORCE_RESPONSE / massK * dt;
+      this.speed  += this.prevSpeedMod * this.physics.maxSpeed * 0.3 * dt;   // following/head-sea surf nudge
+      this.speed   = Math.max(-1.5, Math.min(this.physics.maxSpeed, this.speed));
+    } else {
+      this.speed += (baseTarget - this.speed) * this.physics.accelerationRate * dt;
+    }
     if (Math.abs(this.speed) < 0.001) this.speed = 0;  // snap to zero only on true standstill
 
-    // Steering
-    if ((this.keys.left || this.keys.right) && !this.sinking) {
-      const dir = this.keys.left ? -1 : 1;
-      this.heading = ((this.heading + dir * this.turnRate(this.speed) * dt) + 360) % 360;
+    if (this.physV2 && this.physDebugOn) {
+      const driveC = eff * mastMul * crewMul * (1 - this.SPILL_MAX * this.heelSpill);
+      this.physDebug.set({
+        appAngle: driveAngle, appWind, trueAngle: angleFromWind,
+        thrust: (this.rig.sail?.forceK ?? this.SAIL_FORCE_K) * this.physics.sailAreaFactor * driveC * appWind * appWind,
+        drag: this.DRAG_K * this.speed * Math.abs(this.speed),
+        speed: this.speed, vmg: this.speed * Math.cos(driveAngle * Math.PI / 180), trim: this.trimQ,
+        heel: this.heelV2, reef: this.heelSpill > 0.3,
+      });
+    }
+
+    // Steering. With the mast totally down she still answers the helm, but only just — capped to a slow
+    // pivot (she's lost her sail-driven way; this is the "can turn very slowly but that is it" rule).
+    let maxYaw = this.turnRate(this.speed);                  // speed-dependent rudder authority (water flow)
+    if (mastH <= 0) maxYaw = Math.min(maxYaw, MAST_DOWN_TURN_MAX);
+    maxYaw *= crewMul;                                       // short-handed → slower on the helm too
+    const rudder = (!this.sinking && !docked) ? (this.keys.left ? -1 : this.keys.right ? 1 : 0) : 0;
+    if (this.physV2) {
+      // Angular inertia: the helm sets a TARGET yaw rate the boat eases toward (and coasts back from when
+      // centred) — no instant pivots. Turn scrub (above) bleeds speed through the turn.
+      const targetYaw = rudder * maxYaw;
+      this.yawRate += (targetYaw - this.yawRate) * Math.min(1, this.YAW_RESPONSE * dt);
+      this.heading = ((this.heading + this.yawRate * dt) + 360) % 360;
+      // In irons & losing way → the wind blows the bow off the eye so you can never be permanently stuck.
+      // Scales with how stalled she is (→ 0 once she has way on or has fallen off past the no-go zone).
+      if (rudder === 0 && !this.sinking && !docked
+          && driveAngle < this.physics.minTackAngle && Math.abs(this.speed) < 1.5) {
+        const signed = diff > 180 ? diff - 360 : diff;       // heading vs wind FROM, −180..180 (0 = eye)
+        const fall = (signed >= 0 ? 1 : -1) * this.IRONS_FALLOFF * (1 - Math.abs(this.speed) / 1.5);
+        this.heading = ((this.heading + fall * dt) + 360) % 360;
+      }
+    } else if (rudder !== 0) {
+      this.heading = ((this.heading + rudder * maxYaw * dt) + 360) % 360;   // legacy: instant rate while held
+    }
+
+    // ── Auto-dock: ease to the berth, then stay moored (frozen) until cast off ──
+    if (docked) {
+      if (this.dockPhase === 'approaching') {
+        this.dockElapsed += dt;
+        const u = this.dockDuration > 0 ? Math.min(1, this.dockElapsed / this.dockDuration) : 1;
+        const e = u * u * (3 - 2 * u);   // smoothstep ease in/out
+        this.x = this.dockStartX + (this.dockBerthX - this.dockStartX) * e;
+        this.z = this.dockStartZ + (this.dockBerthZ - this.dockStartZ) * e;
+        this.heading = ((this.dockStartHdg + this.angleDeltaDeg(this.dockStartHdg, this.dockBerthHdg) * e) % 360 + 360) % 360;
+        if (u >= 1) { this.dockPhase = 'tied'; this.docking.set(false); this.tiedUp.set(true); }
+      } else {   // 'tied' — pinned at the berth, like an anchor with zero scope
+        this.x = this.dockBerthX; this.z = this.dockBerthZ; this.heading = this.dockBerthHdg;
+      }
+      this.speed = 0;
     }
 
     // ── Position update ──────────────────────────────────────────────────────
@@ -798,8 +1142,11 @@ export class VesselService {
     // Leeway: sailing boats slip sideways (leeward) under sail pressure.
     // Proportional to heel angle — more heel = more sideways drift.
     // On port tack the wind pushes to starboard (+cos/−sin in world space).
-    const heelMag     = Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
-    const leewayDeg   = heelMag * 0.28;        // max ~3.4° leeway at full speed/heel
+    // v2: heel comes from wind side-force (computed in the force model above) → more leeway when pressed,
+    // and the workboat pinnace makes more leeway than the keel-stiff sloop (per-rig leewayK).
+    const heelMag     = this.physV2 ? this.heelV2 : Math.abs(eff) * Math.abs(this.speed / this.physics.maxSpeed) * 12;
+    const leewayK     = this.physV2 ? (this.rig.sail?.leewayK ?? 1) : 1;
+    const leewayDeg   = heelMag * 0.28 * leewayK;   // legacy ~3.4° max; v2 scales with wind-pressure heel
     const leewayRad   = leewayDeg * Math.PI / 180;
     const leewaySign  = isPortTack ? 1 : -1;   // push to starboard on port tack
     const lwyX = Math.cos(hr) * leewaySign * Math.abs(this.speed) * leewayRad * dt * this.TRAVEL_SCALE;
@@ -824,20 +1171,19 @@ export class VesselService {
     // Block when the HULL (bow when moving ahead, stern when reversing) — not just
     // the centre — would touch land, so the ship halts at the shoreline instead of
     // burying its bow inside the island. dirSign follows the direction of travel.
+    // (While docked the auto-dock glide above already set the pose — skip the sailing
+    // collision/grounded test so a berth tucked near the pier never reads as "aground".)
     const dirSign = this.speed >= 0 ? 1 : -1;
-    if (this.hullHitsLand(newX, newZ, hr, dirSign) ||
+    if (docked) {
+      this.groundedTime = 0;
+      if (this.isGrounded) { this.isGrounded = false; this.grounded.set(false); }
+    } else if (this.hullHitsLand(newX, newZ, hr, dirSign) ||
         this.terrainService.isOnLand(newX, newZ)) {
       // ── Movement is blocked — ship cannot enter land ─────────────────────
       this.speed = 0;
-
-      // Accumulate contact time.  Only declare "aground" once the ship has
-      // been pinned for GROUNDED_DELAY seconds — this lets players scrape a
-      // headland or back off a beach without triggering the overlay.
-      this.groundedTime += dt;
-      if (!this.isGrounded && this.groundedTime >= this.GROUNDED_DELAY) {
-        this.isGrounded = true;
-        this.grounded.set(true);
-      }
+      // NOTE: aground DETECTION is intentionally disabled — we never raise the `grounded` overlay/message.
+      // The hull still can't enter land (speed 0 above); a player who pins themselves uses the /stuck chat
+      // command (→ refloat()) to back off. groundedTime/isGrounded are left wired but never set here.
     } else {
       this.x = newX;
       this.z = newZ;
@@ -872,10 +1218,15 @@ export class VesselService {
 
     // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
     // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.
-    const modTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed,
-      baseTarget * (1 + buoy.speedModifier),
-    ));
-    this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
+    // v2 folds this into the force model (via prevSpeedMod, applied next frame as a surf accel) rather than
+    // retargeting toward baseTarget, so the two speed integrators never fight.
+    if (!this.physV2) {
+      const modTarget = Math.max(-1.5, Math.min(this.physics.maxSpeed,
+        baseTarget * (1 + buoy.speedModifier),
+      ));
+      this.speed += (modTarget - this.speed) * this.physics.accelerationRate * dt * 0.3;
+    }
+    this.prevSpeedMod = buoy.speedModifier;
 
     // Cross-wave broaching bias + slow sea-state wander: only active when the
     // player is not steering. buoy.steeringBias is the fast wave-to-wave jostle
@@ -883,7 +1234,7 @@ export class VesselService {
     // confused sea gradually nudges the boat off course over ~tens of seconds,
     // requiring the occasional correction. Both scale with sea roughness, so calm
     // water barely moves the bow while rough seas need more frequent attention.
-    if (!this.keys.left && !this.keys.right) {
+    if (!this.keys.left && !this.keys.right && !docked) {
       const roughT = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4.0);
       const wander = Math.sin(t * 0.08 + 1.3) + 0.5 * Math.sin(t * 0.19 + 4.1);
       const waveYaw = wander * roughT * 0.6;   // °/s slow drift
@@ -981,6 +1332,12 @@ export class VesselService {
     // sea inside the hull above this is removed (dry), below it is kept (no see-through on a trough).
     if (this.rig.hullCut) {
       this.oceanService.setHullCutWaterY(this.root.position.y + this.rig.hullCut.floorY);
+      // Discard path: the boat's ROOT world-Y is the height reference (silhouette heights are root-local, ~0 at
+      // the waterline), so the per-pixel wave height ON the hull = ocean surface Y − this, riding the bob.
+      this.oceanService.setHullCutRootY(this.root.position.y);
+      // …plus the boat's full pitch/roll so the discard reads the heeled hull's waterline correctly (no slivers).
+      // NOTE: rotation is set later in this method — read NEXT frame's value here, a 1-frame lag that's invisible.
+      this.oceanService.setHullCutTilt(this.root.rotation.x, this.root.rotation.z);
     }
 
     // Combine sailing heel (wind-induced lean) with wave-induced roll.
@@ -996,7 +1353,7 @@ export class VesselService {
     const cap = capsizeFor(this.combatService.zones(), hullMax);
 
     this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
-    this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv;
+    this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv + (this.rig.trimPitch ?? 0);
 
     // ── Rigged vessel drive (per-vessel controller via the VesselController interface) ─────────
     if (this.controller) {
@@ -1020,6 +1377,13 @@ export class VesselService {
       this.controller.dropAnchor('S', this.anchorSide === 'S' ? this.anchorDeploy : 0);
       this.controller.dropAnchor('P', this.anchorSide === 'P' ? this.anchorDeploy : 0);
 
+      // Mast collapse/repair visual — driven off the same masts-zone health as the speed/helm penalty.
+      // The instant the mast crosses to destroyed, play the drawn-out demasting crack (full volume — it's
+      // your own ship). prevMastH starts at -1 so a ship that spawns already-dismasted doesn't crack.
+      if (this.prevMastH > 0.001 && mastH <= 0.001) { this.mastCrackService.crack(1.0); }
+      this.prevMastH = mastH;
+      this.controller.setMastDamage(mastH);
+
       // Ease trim / boom-swing / furl toward their targets (no teleporting on tack/auto-trim).
       this.controller.tickRig(dt);
     }
@@ -1040,7 +1404,7 @@ export class VesselService {
         turnRate: this.turnRateSmoothed,
         sailState: this.sailState, windAngle: angleFromWind, isPortTack, heelAngle,
         sheetAngle:  Math.round(this.sheetAngleDeg),
-        trimQuality: this.sailState === 'reefed' ? 1 : this.trimFactor(Math.abs(angleFromWind)),
+        trimQuality: this.trimQ,   // actual drive trim (apparent-angle + point-of-sail-aware under v2)
         anchored: this.isAnchored, anchorSide: this.anchorSide,
       });
     });
@@ -1086,17 +1450,18 @@ export class VesselService {
     // smaller, then settles. Phase resets on a fresh shake (addShakeTrauma). Computed here; ADDED to the
     // final camera position at the end of whichever branch runs below.
     this.camTrauma = Math.max(0, this.camTrauma - dt * this.CAM_TRAUMA_DECAY);
+    let shX = 0, shY = 0, shZ = 0;   // raw positional jitter (first-person magnitude)
     if (this.camTrauma > 1e-3) {
       this.shakeTime += dt;
       const st = this.shakeTime, amp = this.CAM_SHAKE_MAX * this.camTrauma;
-      this.camShakeOffset.set(
-        Math.sin(st * this.CAM_SHAKE_FREQ)              * amp,          // primary lateral swing (~2 Hz)
-        Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55,   // vertical, smaller, slightly detuned
-        Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50,   // fore-aft
-      );
-    } else {
-      this.camShakeOffset.setAll(0);
+      shX = Math.sin(st * this.CAM_SHAKE_FREQ)              * amp;          // primary lateral swing (~2 Hz)
+      shY = Math.sin(st * this.CAM_SHAKE_FREQ * 1.11 + 1.2) * amp * 0.55;   // vertical, smaller, slightly detuned
+      shZ = Math.sin(st * this.CAM_SHAKE_FREQ * 0.87 + 2.4) * amp * 0.50;   // fore-aft
     }
+    // First-person uses the raw offset (it sits ON the eye → already strong); the 3rd-person branch overwrites
+    // camShakeOffset with a distance-scaled version below. Always store the FINAL applied offset so next frame's
+    // strip removes exactly what was added.
+    this.camShakeOffset.set(shX, shY, shZ);
 
     // ── First-person ("on deck"): sit at the deck eye point looking forward; drag = free-look. ──
     if (this.firstPerson() && this.fpEye && this.root) {
@@ -1142,8 +1507,21 @@ export class VesselService {
       if (cam.position.y < minY) { cam.position.y = minY; }
     }
 
+    // Distance-compensate the positional shake so it reads at any zoom (a 1 m offset is invisible 60 m out).
+    const distScale = Math.min(this.SHAKE_DIST_MAX, Math.max(1, this.camDist / this.SHAKE_DIST_REF));
+    this.camShakeOffset.scaleInPlace(distScale);
     cam.position.addInPlace(this.camShakeOffset);
-    cam.setTarget(new Vector3(targetX, targetY, targetZ));
+
+    // Rotational VIEW JOLT — the jarring kick: snap the aim point by a small ANGLE (so the whole frame whips,
+    // not just slides). Offset ∝ camDist keeps the angle constant at any zoom; higher frequency than the
+    // positional swing reads as a violent rattle. Decays with trauma; no jolt once it's spent.
+    let tjx = 0, tjy = 0;
+    if (this.camTrauma > 1e-3) {
+      const ra = this.CAM_SHAKE_ROT * this.camTrauma * this.camDist, rt = this.shakeTime;
+      tjx = Math.sin(rt * this.CAM_SHAKE_FREQ * 1.8)       * ra;          // horizontal whip (fast)
+      tjy = Math.sin(rt * this.CAM_SHAKE_FREQ * 2.1 + 1.7) * ra * 0.7;    // vertical, detuned
+    }
+    cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
   }
 
   private setupCameraInput(): void {
@@ -1712,6 +2090,13 @@ export class VesselService {
 
   getPosition(): { x: number; z: number } {
     return { x: this.x, z: this.z };
+  }
+
+  /** Current hull's longest half-extent (m). Used by the dock-range check: docking distance is measured
+   *  from the ship CENTRE, so a long hull (brig 12 m vs pinnace 4 m) must be allowed to dock from farther
+   *  out — its bow/stern can be alongside the pier while the centre is still well off it. */
+  getHullReach(): number {
+    return Math.max(this.rig.hullHalfLen, this.rig.hullHalfBeam);
   }
 
   dispose(): void {

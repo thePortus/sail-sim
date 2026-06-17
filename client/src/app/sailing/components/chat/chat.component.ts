@@ -5,6 +5,8 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MultiplayerService } from '../../services/multiplayer.service';
+import { VesselService } from '../../services/vessel.service';
+import { SquadronService } from '../../services/squadron.service';
 import { AuthService } from '../../../services/auth.service';
 import { ApiService } from '../../../services/api.service';
 
@@ -34,6 +36,12 @@ import { ApiService } from '../../../services/api.service';
                 (click)="switchTab('global')">
           Main
         </button>
+        @if (squadronService.inSquadron()) {
+          <button class="chat-tab" [class.chat-tab--active]="activeTab() === 'squadron'"
+                  (click)="switchTab('squadron')" title="Squadron-only chat">
+            ⚔ Squad
+          </button>
+        }
         @for (tab of dmTabs(); track tab) {
           <button class="chat-tab" [class.chat-tab--active]="activeTab() === tab"
                   (click)="switchTab(tab)">
@@ -67,7 +75,7 @@ import { ApiService } from '../../../services/api.service';
           type="text"
           class="chat-input"
           [(ngModel)]="inputValue"
-          (keydown.enter)="sendMessage()"
+          (keydown.enter)="sendMessage(); chatInput.blur()"
           (keydown.escape)="chatInput.blur()"
           (keydown)="$event.stopImmediatePropagation()"
           [placeholder]="inputPlaceholder()"
@@ -86,13 +94,17 @@ import { ApiService } from '../../../services/api.service';
 })
 export class ChatComponent implements AfterViewInit, OnDestroy {
   private multiplayerService = inject(MultiplayerService);
+  private vesselService      = inject(VesselService);
+  readonly squadronService   = inject(SquadronService);
   private authService        = inject(AuthService);
   private elRef              = inject(ElementRef);
   private api                = inject(ApiService);
 
   // ── Position (HostBinding drives absolute placement) ─────────────────────
   @HostBinding('style.left.px') posLeft = 20;
-  @HostBinding('style.top.px')  posTop  = 200;
+  // Start BELOW the top-left wind/compass panel (~220 px tall) so the chat box doesn't open on top of it.
+  // (Only size/font are persisted, not position — so this default applies every session.)
+  @HostBinding('style.top.px')  posTop  = 300;
 
   // ── Chat state ────────────────────────────────────────────────────────────
   myCallsign    = '';
@@ -162,6 +174,14 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         const el = this.messagesContainer?.nativeElement;
         if (el) el.scrollTop = el.scrollHeight;
       }, 0);
+    });
+
+    // If the squadron disbands (or we leave) while its tab is active, fall back to Main so we're
+    // never stuck on a tab whose button has vanished.
+    effect(() => {
+      if (!this.squadronService.inSquadron() && untracked(() => this.activeTab()) === 'squadron') {
+        this.activeTab.set('global');
+      }
     });
   }
 
@@ -270,16 +290,20 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
     const all    = tab === 'global'
       ? [...server.filter(m => m.chatType === 'global'), ...local]
           .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
-      : server.filter(m =>
-          m.chatType === 'dm' &&
-          (m.from === tab || (m.from === this.myCallsign && m.to === tab))
-        );
+      : tab === 'squadron'
+        ? server.filter(m => m.chatType === 'squadron')
+        : server.filter(m =>
+            m.chatType === 'dm' &&
+            (m.from === tab || (m.from === this.myCallsign && m.to === tab))
+          );
     return all;
   });
 
   inputPlaceholder = computed(() => {
     const tab = this.activeTab();
-    return tab === 'global' ? 'Message all…  (/help for commands)' : `Message ${tab}…`;
+    if (tab === 'global')   return 'Message all…  (/help for commands)';
+    if (tab === 'squadron') return 'Message your squadron…';
+    return `Message ${tab}…`;
   });
 
   switchTab(tab: string): void { this.activeTab.set(tab); }
@@ -293,6 +317,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   // Commands handled entirely on the server (passed through verbatim).
   private readonly SERVER_COMMANDS = [
     't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban', 'reloadassets',
+    'godmode', 'teleport', 'teleporto', 'repair', 'crew', 'givegold', 'diplomacy', 'mast', 'squad', 's',
   ];
 
   sendMessage(): void {
@@ -313,7 +338,10 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
 
     // ── Plain chat ─────────────────────────────────────────────────────────
     const tab = this.activeTab();
-    if (tab !== 'global') {
+    if (tab === 'squadron') {
+      // On the squadron tab, plain text goes to squadron-only chat.
+      this.multiplayerService.sendChat(`/s ${text}`);
+    } else if (tab !== 'global') {
       // In a DM tab, plain text whispers to that tab's player (quote spaced names).
       this.multiplayerService.sendChat(`/t ${this.quoteName(tab)} ${text}`);
     } else {
@@ -358,6 +386,12 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
 
       case 'export':
         this.handleExport();
+        return;
+
+      case 'stuck':
+        // Self-rescue: same effect as the old aground "refloat" button (which no longer auto-pops).
+        this.vesselService.refloat();
+        this.addSystemMessage('Refloated — your ship has been backed off to open water.');
         return;
 
       // Server-handled commands — pass through verbatim.
@@ -409,9 +443,14 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
       '/t "<name>" <msg> — direct-message a player',
       '/friend "<name>" — toggle a friend',
       '/friends — list online friends',
+      '/squad invite "<name>" — invite a player to your squadron (max 4)',
+      '/squad accept · /squad decline — respond to an invite',
+      '/squad leave — leave your squadron',
+      '/s <msg> — message your squadron only',
       '/mute "<name>" (or /block) — hide a player\'s messages',
       '/unmute "<name>" (or /unblock) — unhide them',
       '/setpass <new password> — change your own password',
+      '/stuck — refloat your ship if you\'re pinned against land',
       '/help — show this help',
     ];
     if (this.isAdmin) {
@@ -424,6 +463,14 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         '/unban "<name>" — lift a ban',
         '/setpass "<name>" <new password> — reset a regular user\'s password',
         '/reloadassets — re-fetch updated vessel models for all players',
+        '/godmode — toggle invulnerability for yourself',
+        '/teleport "<name>" <X> <Y> — move a player to map coords (X=E/W, Y=N/S)',
+        '/teleporto "<name>" — jump yourself to open water beside a player',
+        '/repair "<name>" — fully repair a player\'s ship',
+        '/crew "<name>" — fully re-crew a player\'s ship',
+        '/givegold "<name>" <amount> — gift gold to a player',
+        '/diplomacy [<nationA> <nationB> war|peace|alliance] — view or set faction relations',
+        '/mast [hp] — set your own mast HP for testing (no arg = dismast; auto jury-rigs to 50% in 45s)',
       );
     }
     if (this.isOwner) {

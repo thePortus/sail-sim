@@ -107,16 +107,28 @@ export interface TerrainHarbor {
   streets?: TownStreet[];
   // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
   specialty?: string;
+  // Factions — the owning nation (e.g. 'english'); contested border towns also carry a rivalFaction.
+  faction?: string;
+  contested?: boolean;
+  rivalFaction?: string;
 }
 
 // ── Town Economy (Phase 1) ──────────────────────────────────────────────────
 /** One good's quoted prices at a town: ask = player buys, bid = player sells. Phase 2 adds a scarcity hint:
  *  `level` = stock/priceRef (1≈normal, <1 scarce/dear, >1 abundant/cheap); `role` = produced|consumed|neutral. */
-export interface MarketRow { goodId: string; name: string; ask: number; bid: number; level?: number; role?: string; }
+export interface MarketRow {
+  goodId: string; name: string; ask: number; bid: number; level?: number; role?: string;
+  stock?: number;    // units physically on hand at this town
+  buyable?: number;  // how many the player may buy right now (a town never sells its last unit)
+  cap?: number;      // the town's stock cap for this good
+}
 /** A trade rumour: the best place to SELL one of this town's exports right now. */
 export interface MarketHint { goodId: string; goodName: string; townId: string; townName: string; bid: number; }
 /** A town's market quote, pushed by the server when the trader is opened or a trade resolves. */
-export interface MarketState { townId: string; name: string; specialty: string; goods: MarketRow[]; hint?: MarketHint | null; }
+export interface MarketState {
+  townId: string; name: string; specialty: string; goods: MarketRow[]; hint?: MarketHint | null;
+  faction?: string | null; contested?: boolean; rivalFaction?: string | null;
+}
 /** A discovered town in the player's ledger: its specialty + last-seen prices + the in-game day seen. */
 export interface LedgerEntry { specialty: string; day: number; goods: { id: string; ask: number; bid: number }[]; }
 
@@ -175,6 +187,18 @@ export interface RiggedClip {
   [extra: string]: unknown;
 }
 
+/** Optional dismasting descriptor — the `MastDown` scrub clip + the splinter `Break` morph that the
+ *  game drives off the `masts` damage zone. Absent on older GLBs (controllers no-op gracefully). */
+export interface RiggedMastDamage {
+  fall_clip:    string;          // scrub clip that topples the rig (0 upright .. 1 collapsed)
+  hinge_bone?:  string;
+  mast_node?:   string;
+  break_morph:  RiggedMorphRef;  // splinter/buckle morph on the mast mesh
+  fall_side?:   string;
+  range_label?: string;
+  note?:        string;
+}
+
 export interface RiggedManifest {
   model:        string;
   frame_range:  [number, number];
@@ -185,6 +209,7 @@ export interface RiggedManifest {
   morph_targets: Record<string, Record<string, number>>;
   sail_sheet_pairs: RiggedSailSheetPair[];
   free_rotation_bones: Record<string, { role: string; drive: string; suggestion: string }>;
+  mast_damage?: RiggedMastDamage;
 }
 
 export interface VesselPhysics {
@@ -285,6 +310,7 @@ export interface OtherPlayer {
   vesselSlug:  string;
   callsign:    string;
   npc?:        boolean;    // an NPC merchant trader (server-controlled), not a real player
+  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players
 }
 
 export interface ChatMessage {
@@ -293,5 +319,22 @@ export interface ChatMessage {
   to?:      string;
   text:     string;
   timestamp: Date;
-  chatType: 'global' | 'dm';
+  chatType: 'global' | 'dm' | 'squadron';
+}
+
+/** A squadron member as sent in the server's `squadron_state` roster. */
+export interface SquadronMember { id: string; callsign: string; }
+
+/** The player's current squadron (null = not in one), mirrored from `squadron_state`. */
+export interface SquadronState {
+  squadronId: string;
+  leaderId:   string;
+  members:    SquadronMember[];
+}
+
+/** A pending squadron invite awaiting accept/decline, from `squadron_invited`. */
+export interface SquadronInvite {
+  squadronId:   string;
+  fromId:       string;
+  fromCallsign: string;
 }

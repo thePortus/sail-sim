@@ -37,7 +37,7 @@ function validateMove(prev, claim, dtSec, trusted = false) {
 
   // Trusted roles bypass all kinematic checks (admin teleport, and later teleporting other players).
   if (trusted) {
-    return { pose: { x: claim.x, z: claim.z, heading: heading0, speed: claim.speed }, corrected: false };
+    return { pose: { x: claim.x, z: claim.z, heading: heading0, speed: claim.speed }, corrected: false, budgetSpentSec: 0 };
   }
 
   const vessel = getVesselDef(claim.vesselSlug);
@@ -52,7 +52,7 @@ function validateMove(prev, claim, dtSec, trusted = false) {
   let corrected = x !== claim.x || z !== claim.z || speed !== claim.speed;
 
   // First update: nothing to diff a delta against — accept the (bounds/speed-clamped) pose.
-  if (!prev) return { pose: { x, z, heading, speed }, corrected };
+  if (!prev) return { pose: { x, z, heading, speed }, corrected, budgetSpentSec: 0 };
 
   const dt = clamp(dtSec, M.DT_MIN, M.DT_MAX);
 
@@ -97,7 +97,17 @@ function validateMove(prev, claim, dtSec, trusted = false) {
     corrected = true;
   }
 
-  return { pose: { x, z, heading, speed }, corrected };
+  // Report how much of the kinematic budget this accepted step actually consumed, in SECONDS, so the
+  // caller's token bucket can debit exactly what was used (not the whole accumulated budget). Both the
+  // travel and turn allowances scale linearly with dt, so the binding one (whichever used more of its
+  // per-second rate) sets the consumed time — a ship can translate AND rotate within the same interval.
+  const usedDist = Math.hypot(x - prev.x, z - prev.z);
+  const usedTurn = Math.abs(angleDelta(prev.heading, heading));
+  const distTime = usedDist / Math.max(1e-6, maxSpeed * M.TRAVEL_SCALE * M.SLACK);
+  const turnTime = usedTurn / Math.max(1e-6, M.TURN_CAP_DEG * M.SLACK);
+  const budgetSpentSec = Math.max(distTime, turnTime);
+
+  return { pose: { x, z, heading, speed }, corrected, budgetSpentSec };
 }
 
 // ── Ship-to-ship collision ────────────────────────────────────────────────────

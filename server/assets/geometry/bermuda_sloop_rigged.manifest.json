@@ -33,6 +33,7 @@
       "B_Gaff",
       "B_Flag",
       "B_Pennant",
+      "B_Mast",
       "B_Anchor_S",
       "B_Anchor_P",
       "B_Gun_S",
@@ -54,7 +55,8 @@
     "Lids: 0=CLOSED (flush to hull; each lid has its own baked toe-in to follow the hull curve), 1=OPEN. Closed is the default; init lid clips at frame 0 on load.",
     "Sail furl + its paired sheet morph must be driven to the same value (see sail_sheet_pairs).",
     "Morph weights can be driven directly (0..1) instead of via Furl_* clips.",
-    "B_Flag, B_Pennant, B_Wheel have no clip - rotate in code."
+    "B_Flag, B_Pennant, B_Wheel have no clip - rotate in code.",
+    "MAST DAMAGE (see mast_damage): scrub 'MastDown' 0->1 by mast-zone damage (0=intact, 0.5=cracked/leaning, 1=collapsed over the PORT rail, snapping low at the deck). Ramp the 'Break' morph on Sloop_Mast near full for the splintered snap. The whole rig topples as a unit (yard/boom/gaff/flag/pennant bones are children of the new B_Mast hinge); standing rigging + the two headsails are skinned to B_Mast with a foot->hull gradient so they drag down with the mast but their feet stay attached to the hull. Costs +1 draw (Sloop_Mast = one Atlas_C primitive); no new materials."
   ],
   "clips": {
     "AnchorDrop_P": {
@@ -212,6 +214,22 @@
       "range_label": "0=square 1=fully_braced",
       "max": 40.0
     },
+    "MastDown": {
+      "frames": [
+        0,
+        30
+      ],
+      "targets": [
+        {
+          "node": "B_Mast",
+          "path": "rotation"
+        }
+      ],
+      "kind": "scrub",
+      "range_label": "0=intact 0.5=cracked/leaning 1=collapsed(over port rail)",
+      "center_frame": 15,
+      "note": "Topples the whole rig to PORT over the side, snapping low at the deck. Pair with the 'Break' morph (see mast_damage)."
+    },
     "Furl_Mainsail": {
       "frames": [
         0,
@@ -364,7 +382,23 @@
     "Headsail_Sheets": {
       "Furl": 0,
       "Furl_FS": 1
+    },
+    "Sloop_Mast": {
+      "Break": 0
     }
+  },
+  "mast_damage": {
+    "fall_clip": "MastDown",
+    "hinge_bone": "B_Mast",
+    "mast_node": "Sloop_Mast",
+    "break_morph": {
+      "node": "Sloop_Mast",
+      "target": "Break",
+      "index": 0
+    },
+    "fall_side": "port",
+    "range_label": "scrub MastDown 0->1 with mast damage; ramp Break 0->1 over the last ~third",
+    "note": "Single driver from the mast HP zone: mastFrac = 1 - (masts_hp / masts_maxHp). scrub('MastDown', mastFrac) tops out leaning at 0.5 and fully collapsed at 1; setMorph('Sloop_Mast','Break', smoothstep(0.6,1.0,mastFrac)) adds the splintered snap near the end. The rig falls as one unit (yard/boom/gaff/flag/pennant bones parented under B_Mast); standing rigging + headsails (Sail_Jib, Sail_ForeStaysail) are skinned to B_Mast with a foot->hull gradient so they drag down but stay tied to the hull. +1 draw (Sloop_Mast, one Atlas_C primitive); no new materials. Ease the scrub over ~1.5-2.5s in code so it falls rather than snapping instantly."
   },
   "sail_sheet_pairs": [
     {

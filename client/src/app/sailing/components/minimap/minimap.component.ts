@@ -7,7 +7,10 @@ import { TerrainService } from '../../services/terrain.service';
 import { VesselService } from '../../services/vessel.service';
 import { MultiplayerService } from '../../services/multiplayer.service';
 import { SceneService } from '../../services/scene.service';
+import { AdminService } from '../../services/admin.service';
+import { AuthService } from '../../../services/auth.service';
 import { MinimapBakeCompute } from '../../services/terrain/minimap-bake-compute';
+import { factionColor, factionName } from '../../faction.config';
 import type { WebGPUEngine } from '@babylonjs/core';
 
 @Component({
@@ -24,9 +27,61 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
   private vesselService      = inject(VesselService);
   private multiplayerService = inject(MultiplayerService);
   private sceneService       = inject(SceneService);
+  private adminService       = inject(AdminService);
+  private authService        = inject(AuthService);
   private zone               = inject(NgZone);
 
   expanded = signal(false);
+
+  // Admin-only right-click "Teleport here". isAdmin is read once from the cached userData (same gate the
+  // chat/admin-panel use); the server re-verifies the role on POST /admin/teleport, so this only governs UI.
+  isAdmin = false;
+  /** Open context-menu state: pixel offset within the wrapper for placement + the target world coords. */
+  teleportMenu = signal<{ px: number; py: number; x: number; z: number } | null>(null);
+
+  constructor() {
+    try {
+      const raw = this.authService.getUserDetails();
+      if (raw) {
+        const role = (JSON.parse(raw)?.role ?? '').toLowerCase();
+        this.isAdmin = role === 'admin' || role === 'owner';
+      }
+    } catch { /* malformed userData — stay non-admin */ }
+  }
+
+  /** Right-click on the map → (admins only) pop a "Teleport here" menu at the clicked world point. Always
+   *  suppresses the browser context menu over the canvas; does nothing else for non-admins. */
+  onContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+    if (!this.isAdmin) { return; }
+    const canvas = this.canvasRef?.nativeElement;
+    if (!canvas) { return; }
+    const r = canvas.getBoundingClientRect();
+    const cxp = (e.clientX - r.left) * (canvas.width / r.width);
+    const cyp = (e.clientY - r.top)  * (canvas.height / r.height);
+    const w = this.canvasToWorld(cxp, cyp);
+    // Place the menu relative to the wrapper (the canvas's parent), clamped to stay inside it (the wrapper
+    // clips overflow), leaving room for the ~150×34 px popup.
+    const wrap = canvas.parentElement as HTMLElement | null;
+    const wr = (wrap ?? canvas).getBoundingClientRect();
+    const px = Math.min(Math.max(0, e.clientX - wr.left), Math.max(0, wr.width  - 152));
+    const py = Math.min(Math.max(0, e.clientY - wr.top),  Math.max(0, wr.height - 36));
+    this.teleportMenu.set({ px, py, x: w.x, z: w.z });
+  }
+
+  /** Confirm the teleport: server authorises (admin role), then snap the local vessel. Mirrors the admin
+   *  panel's flow so other players see the move via the server broadcast. */
+  confirmTeleport(): void {
+    const m = this.teleportMenu();
+    if (!m) { return; }
+    this.teleportMenu.set(null);
+    this.adminService.teleport(m.x, m.z).subscribe({
+      next: () => this.vesselService.teleportTo(m.x, m.z),
+      error: (err) => console.warn('[Minimap] teleport rejected:', err?.status),
+    });
+  }
+
+  closeTeleportMenu(): void { this.teleportMenu.set(null); }
 
   // Zoom + pan for the EXPANDED map. zoom 1 = whole world (the original view); higher = zoomed in on a
   // sub-region centred on (viewCX, viewCZ) in world coords. Wheel zooms toward the cursor. Plain fields
@@ -114,6 +169,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
    *  mousedown, so checking it directly (vs a persisted flag) can't get stuck if a drag ends off-canvas. */
   onMapClick(): void {
     if (this.dragMoved) { return; }
+    if (this.teleportMenu()) { this.closeTeleportMenu(); return; }   // click-away dismisses the teleport menu
     this.toggleExpand();
   }
 
@@ -262,18 +318,32 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
           ctx.lineWidth = 2;
           ctx.beginPath(); ctx.arc(hxp, hyp, 7 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
         }
-        ctx.fillStyle   = known ? '#9fe0a0' : '#e8d3a0';   // green = discovered, tan = unexplored
-        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-        ctx.lineWidth   = 0.8;
-        ctx.beginPath();
-        ctx.arc(hxp, hyp, 3, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
+        // Dot coloured by the owning nation (dimmed until the player has discovered it). A dark halo behind it
+        // lifts the marker off the terrain — towns sit on tan/green land where a small flat dot vanishes.
+        // Contested towns get a ring in their rival's colour; discovered towns get a bright white ring.
+        const R = 5;   // marker radius (was 3 — too small to pick out at a glance)
+        ctx.globalAlpha = 1;
+        ctx.fillStyle   = 'rgba(0,0,0,0.55)';                                  // contrast halo (any background)
+        ctx.beginPath(); ctx.arc(hxp, hyp, R + 2, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = known ? 1 : 0.7;                                     // undiscovered: dimmer but still findable
+        ctx.fillStyle   = h.faction ? factionColor(h.faction) : (known ? '#9fe0a0' : '#e8d3a0');
+        ctx.beginPath(); ctx.arc(hxp, hyp, R, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+        if (h.contested && h.rivalFaction) { ctx.strokeStyle = factionColor(h.rivalFaction); ctx.lineWidth = 2.4; }
+        else                               { ctx.strokeStyle = 'rgba(0,0,0,0.75)';           ctx.lineWidth = 1.3; }
+        ctx.beginPath(); ctx.arc(hxp, hyp, R, 0, Math.PI * 2); ctx.stroke();
+        if (known) {
+          ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.3;
+          ctx.beginPath(); ctx.arc(hxp, hyp, R + 2.2, 0, Math.PI * 2); ctx.stroke();
+        }
         if (hp) {
           const d = Math.hypot(hp.x - hxp, hp.y - hyp);
           if (d < bestD) {
             bestD = d;
-            const lines = [h.name, h.description];
+            const facLine = h.faction
+              ? `${factionName(h.faction)}${h.contested && h.rivalFaction ? ` (contested by ${factionName(h.rivalFaction)})` : ''}`
+              : null;
+            const lines = facLine ? [h.name, facLine, h.description] : [h.name, h.description];
             const led = ledger[h.id];
             if (led) {
               lines.push(`Trade: ${cap(led.specialty)}`);
@@ -291,7 +361,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       if (hovered) {
         // Highlight the hovered marker, then draw a multi-line pill above it.
         ctx.fillStyle = '#fff4d0';
-        ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(hovered.x, hovered.y, 5.5, 0, Math.PI * 2); ctx.fill();
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'alphabetic';
@@ -328,11 +398,9 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
     const mutuals = this.multiplayerService.mutualFriends();
     const others = this.multiplayerService.otherPlayers();
 
-    // Nearest merchant beacon — the server reports the single closest merchant's position at ANY distance
-    // (no ship is built for a far one), so the map always points to the nearest trader.
-    const nm = this.multiplayerService.nearestMerchant();
-    if (nm) {
-      const mx = wx(nm.x), mz = wz(nm.z), s = this.expanded() ? 7 : 6;
+    // Merchant markers (cyan diamonds). Owners/Admins get the WHOLE fleet's positions (any distance); regular
+    // players get a single beacon to the nearest merchant. Either way no ship is built for a far one — map only.
+    const drawMerchant = (mx: number, mz: number, s: number) => {
       ctx.fillStyle   = '#22e3d0';
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth   = 1.4;
@@ -344,6 +412,39 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+    };
+    // Merchants are HIDDEN from regular players (only staff see the fleet). Everyone can still see a single
+    // ship they've heard a tavern rumour about — drawn as a gold pulsing diamond just below.
+    if (this.isAdmin) {
+      const fleet = this.multiplayerService.allMerchants();
+      if (fleet.length) {
+        const s = this.expanded() ? 6 : 5;   // slightly smaller — there are many
+        for (const m of fleet) drawMerchant(wx(m.x), wz(m.z), s);
+      } else {
+        const nm = this.multiplayerService.nearestMerchant();
+        if (nm) drawMerchant(wx(nm.x), wz(nm.z), this.expanded() ? 7 : 6);
+      }
+    }
+
+    // Tavern rumour target — a gold, pulsing diamond on the one merchant the player overheard about (looked
+    // up live in otherPlayers by id; the server keeps it streamed even past the normal interest cutoff).
+    const markId = this.multiplayerService.markedMerchantId();
+    if (markId) {
+      const tgt = others.find(p => p.id === markId);
+      if (tgt) {
+        const mxp = wx(tgt.x), mzp = wz(tgt.z);
+        const s = this.expanded() ? 7 : 6;
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
+        ctx.strokeStyle = `rgba(245,205,90,${0.4 + 0.5 * pulse})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(mxp, mzp, s + 4 + pulse * 4, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#ffd24a';
+        ctx.strokeStyle = 'rgba(60,40,0,0.85)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(mxp, mzp - s); ctx.lineTo(mxp + s, mzp); ctx.lineTo(mxp, mzp + s); ctx.lineTo(mxp - s, mzp);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
     }
 
     for (const p of others) {

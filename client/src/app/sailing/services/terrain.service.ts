@@ -15,6 +15,7 @@ import {
   InstancedMesh,
   DirectionalLight,
   StandardMaterial,
+  Material,
   Matrix,
   VertexData,
   RawTexture,
@@ -159,12 +160,23 @@ export class TerrainService {
     }
 
     this.buildTerrainMesh();
+    this.setupGroundDebug();
 
   }
 
   // ── Terrain clipmap (camera-centric LoD, GPU displacement + Sobel normals) ───
   private clipmap: TerrainClipmap | null = null;
   private clipmapObserver: import('@babylonjs/core').Observer<Scene> | null = null;
+  // Self-heal for the rare cold-start failure where the terrain material's WebGPU shader never compiles
+  // (the failure surfaces as a swallowed promise rejection, NOT Material.onError — see the onCompiled note in
+  // buildTerrainMaterialPBR), so the terrain silently never renders (land invisible; water + scatter fine)
+  // until a manual page refresh. A watchdog rebuilds the clipmap = an automatic "refresh" if it doesn't
+  // report compiled within CLIPMAP_HEAL_MS, bounded by CLIPMAP_HEAL_MAX so a genuinely-slow machine can't loop.
+  private terrainMatCompiled = false;
+  private clipmapHealAttempts = 0;
+  private clipmapHealTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly CLIPMAP_HEAL_MS = 6000;
+  private readonly CLIPMAP_HEAL_MAX = 3;
 
   /** Build the camera-centric clipmap and render it with the terrain material in clipmap mode
    *  (vertex height displacement + fragment Sobel normals). This IS the terrain render — no static
@@ -177,7 +189,14 @@ export class TerrainService {
 
     // Dispose any prior clipmap (e.g. a quality-driven rebuild).
     if (this.clipmapObserver) { scene.onBeforeRenderObservable.remove(this.clipmapObserver); this.clipmapObserver = null; }
-    this.clipmap?.dispose();
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
+    if (this.clipmap) {
+      // Un-enroll the old rings from the ocean reflection RTT BEFORE disposing them: TerrainClipmap.dispose()
+      // frees the meshes but can't know about the RTT, and leaving disposed refs in the render list is the
+      // descriptor-heap leak pattern. Fires on every rebuild — quality change AND the self-heal retry.
+      for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
+      this.clipmap.dispose();
+    }
     this.clipmap = null;
 
     // PBRCustomMaterial terrain skin (aux-driven PBR) is now the DEFAULT; the Standard skin remains
@@ -187,6 +206,11 @@ export class TerrainService {
     const usePBR = this.isTerrainPBREnabled();
     const mat = usePBR ? this.buildTerrainMaterialPBR(scene, m) : this.buildTerrainMaterial(scene, m, true);
     mat.zOffset = 4;                                          // nudge behind the ocean surface at the waterline
+    // Track the WebGPU shader compile so the watchdog below can tell a healthy build from the cold-start
+    // compile-failure that silently hides the terrain. onCompiled fires ONLY on success (a failure is a
+    // swallowed promise rejection), so its arrival is our positive "the terrain will render" signal.
+    this.terrainMatCompiled = false;
+    mat.onCompiled = () => { this.terrainMatCompiled = true; this.clipmapHealAttempts = 0; console.info('[terrain] clipmap shader compiled OK'); };
 
     // Publish the heightfield so the volumetric clouds can march it for terrain occlusion (the clipmap
     // displaces in the vertex shader, which the depth renderers can't see → clouds need the heights).
@@ -210,6 +234,31 @@ export class TerrainService {
     }
 
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('clipmap', () => this.clipmap?.update()));
+    this.scheduleClipmapHeal(mat);
+  }
+
+  /** Watchdog for the cold-start terrain-shader compile failure. If the material hasn't reported compiled (and
+   *  isn't otherwise render-ready) a few seconds after a build, the WebGPU shader almost certainly failed to
+   *  compile — a swallowed rejection that leaves the land invisible until a manual refresh. Rebuilding the
+   *  clipmap re-attempts the compile (auto-"refresh"); the generous timeout + isReady check avoid false
+   *  positives on a slow machine, and the attempt cap prevents an unbroken-compile loop. */
+  private scheduleClipmapHeal(mat: Material): void {
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); }
+    this.clipmapHealTimer = setTimeout(() => {
+      this.clipmapHealTimer = null;
+      const meshes = this.clipmap?.allMeshes() ?? [];
+      // Healthy: the shader reported compiled, or the material is render-ready for the live clipmap meshes.
+      const looksReady = meshes.length > 0 && meshes[0].material === mat && mat.isReady(meshes[0]);
+      if (this.terrainMatCompiled || looksReady) { this.clipmapHealAttempts = 0; return; }
+      if (!this.clipmap) { return; }   // torn down meanwhile
+      if (this.clipmapHealAttempts >= this.CLIPMAP_HEAL_MAX) {
+        console.error('[terrain] clipmap shader failed to compile after retries — terrain may be invisible; please reload.');
+        return;
+      }
+      this.clipmapHealAttempts++;
+      console.warn(`[terrain] clipmap shader not compiled ${this.CLIPMAP_HEAL_MS} ms after build (WebGPU cold-start race) — rebuilding (self-heal ${this.clipmapHealAttempts}/${this.CLIPMAP_HEAL_MAX}).`);
+      this.buildClipmap();   // re-creates the material → re-attempts the compile, and re-arms this watchdog
+    }, this.CLIPMAP_HEAL_MS);
   }
 
   isReady(): boolean {
@@ -240,7 +289,14 @@ export class TerrainService {
       this.sceneService.scene.onBeforeRenderObservable.remove(this.clipmapObserver);
       this.clipmapObserver = null;
     }
-    this.clipmap?.dispose();
+    if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
+    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
+    this.clipHeightReuploadTimers = [];
+    this.clipHeightData = null;
+    if (this.clipmap) {
+      for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
+      this.clipmap.dispose();
+    }
     this.clipmap = null;
     this.terrainMesh?.dispose();
     this.terrainMesh = null;
@@ -325,6 +381,37 @@ export class TerrainService {
       return (hq / quantizationLevels) * (maxElevation - minElevation) + minElevation;
     }
     return (hq / quantizationLevels) * targetPeakElevation;
+  }
+
+  // ── DEBUG: ground-truth probe for asset placement ───────────────────────────
+  // Call __markGround() in the browser console: drops magenta posts whose BOTTOM sits at exactly
+  // getElevation(x,z) on a grid around the camera target. If the post bottoms rest on the visible sand,
+  // getElevation matches the rendered terrain (so any asset float is the ASSET's base, not the height); if the
+  // posts themselves float, getElevation reads higher than the drawn surface (a terrain-sampling bug).
+  private _groundMarks: Mesh[] = [];
+  private setupGroundDebug(): void {
+    const w = window as unknown as { __markGround?: (span?: number, step?: number) => void; __clearGround?: () => void };
+    if (w.__markGround) { return; }
+    w.__clearGround = () => { for (const m of this._groundMarks) { m.dispose(); } this._groundMarks = []; };
+    w.__markGround = (span = 50, step = 5) => {
+      const scene = this.sceneService.scene, cam = this.sceneService.camera;
+      if (!scene || !cam) { return; }
+      w.__clearGround!();
+      const tgt = (cam as unknown as { getTarget?: () => Vector3 }).getTarget?.() ?? cam.position;
+      const mat = new StandardMaterial('gmark', scene);
+      mat.emissiveColor = new Color3(1, 0, 1); mat.disableLighting = true;
+      for (let dx = -span; dx <= span; dx += step) {
+        for (let dz = -span; dz <= span; dz += step) {
+          const x = tgt.x + dx, z = tgt.z + dz, y = this.getElevation(x, z);
+          const post = MeshBuilder.CreateBox('gm', { width: 0.25, depth: 0.25, height: 2 }, scene);
+          post.position.set(x, y + 1, z);   // 2 m post, centre +1 → BOTTOM exactly at getElevation
+          post.material = mat; post.isPickable = false;
+          this._groundMarks.push(post);
+        }
+      }
+      console.info(`[probe] placed ${this._groundMarks.length} magenta posts — each post BOTTOM = getElevation. __clearGround() to remove.`);
+    };
+    console.info('[probe] ground debug ready → run __markGround() in the console');
   }
 
   /** NEAREST-texel elevation — one heightfield read + decode, NO bilinear interpolation (~3–4× cheaper
@@ -1776,12 +1863,18 @@ export class TerrainService {
       `);
       material.Fragment_Definitions(`
         float _clipHF(vec2 wxz) {
+          // BILINEAR tap (was nearest texelFetch → flat ~24 m shading facets); see PBR path note.
           vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
-          ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
-          return texelFetch(heightTex, t, 0).r;
+          vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+          ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+          float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+          float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+          float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+          float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+          return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
         }
         vec3 _clipNormal(vec2 wxz) {
-          float e = wbounds.z / texSize.x;   // 1 texel in world metres
+          float e = 1.5 * wbounds.z / texSize.x;   // ~1.5 texels in world metres (slightly wider = softer)
           float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
           float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
           return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
@@ -2461,12 +2554,19 @@ export class TerrainService {
 
     mat.Fragment_Definitions(`
       float _clipHF(vec2 wxz) {
+        // BILINEAR heightfield tap (was nearest texelFetch → constant normal per ~24 m texel = flat facets).
+        // Smooth sampling makes the Sobel normal vary continuously, de-faceting the shading.
         vec2 uv = vec2((wxz.x - wbounds.x) / wbounds.z, (wbounds.y + wbounds.w - wxz.y) / wbounds.w);
-        ivec2 t = clamp(ivec2(uv * texSize), ivec2(0), ivec2(texSize) - 1);
-        return texelFetch(heightTex, t, 0).r;
+        vec2 tc = uv * texSize - 0.5; vec2 f = fract(tc);
+        ivec2 i0 = ivec2(floor(tc)); ivec2 mx = ivec2(texSize) - 1;
+        float h00 = texelFetch(heightTex, clamp(i0,            ivec2(0), mx), 0).r;
+        float h10 = texelFetch(heightTex, clamp(i0+ivec2(1,0), ivec2(0), mx), 0).r;
+        float h01 = texelFetch(heightTex, clamp(i0+ivec2(0,1), ivec2(0), mx), 0).r;
+        float h11 = texelFetch(heightTex, clamp(i0+ivec2(1,1), ivec2(0), mx), 0).r;
+        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
       }
       vec3 _clipNormal(vec2 wxz) {
-        float e = wbounds.z / texSize.x;
+        float e = 1.5 * wbounds.z / texSize.x;   // ~1.5-texel Sobel span: a touch wider softens the slope
         float hl = _clipHF(wxz - vec2(e, 0.0)); float hr = _clipHF(wxz + vec2(e, 0.0));
         float hd = _clipHF(wxz - vec2(0.0, e)); float hu = _clipHF(wxz + vec2(0.0, e));
         return normalize(vec3(hl - hr, 2.0 * e, hd - hu));
@@ -2544,6 +2644,27 @@ export class TerrainService {
         vec2 uv = vec2((wp.x - wbounds.x)/wbounds.z, (wbounds.y + wbounds.w - wp.z)/wbounds.w);
         return texture2D(uAux, uv);
       }
+      // Forest moisture field (low-frequency, matches the Standard path) + canopy COVERAGE [0,1] (mid-
+      // elevation + gentle-slope + moist, broken into clumps). Shared by the albedo (paint green) AND the
+      // roughness (matte vegetation) so they agree. Gates relaxed vs §8d so the canopy climbs steeper slopes
+      // -> less bare-rock black between beach and forest.
+      float _forestMoist(vec3 wp) {
+        return 0.5
+          + 0.34 * sin(wp.x * 0.00080 + 1.3)
+          + 0.24 * sin(wp.z * 0.00095 - 0.7)
+          + 0.18 * sin((wp.x - wp.z) * 0.00060 + 2.1)
+          + 0.12 * sin((wp.x * 0.7 + wp.z * 1.1) * 0.0022 - 1.1);
+      }
+      float _forestF(vec3 wp, float slope) {
+        float h = clamp(wp.y / uPeakH, 0.0, 1.0);
+        float fElev  = smoothstep(0.035, 0.10, h) * (1.0 - smoothstep(0.62, 0.74, h));
+        float fSlope = clamp(1.0 - slope * 1.02, 0.0, 1.0);   // was 1.45 -> canopy reaches steeper faces
+        float fMoist = smoothstep(0.24, 0.56, _forestMoist(wp));
+        float fpw = sin(wp.x * 0.0021 + wp.z * 0.0013)
+                  + sin(wp.z * 0.0026 - wp.x * 0.0009 + 2.0)
+                  + sin((wp.x + wp.z) * 0.0015 - 1.0);
+        return clamp(fElev * fSlope * fMoist * smoothstep(-0.4, 1.1, fpw), 0.0, 1.0);
+      }
     `);
 
     // Roughness (metallic stays 0). Procedural for now - wet, low, flat ground near the waterline reads
@@ -2563,10 +2684,12 @@ export class TerrainService {
                 + texture(uOrmArr, vec3(vPositionW.xz*0.05, 4.0)).r*mrSn;
       float wet = (1.0 - smoothstep(0.0, 2.2, vPositionW.y)) * (1.0 - smoothstep(0.35, 0.70, 1.0 - clamp(nWr.y, 0.0, 1.0)));
       metallicRoughness.r = 0.0;                                    /* terrain is never metallic */
-      metallicRoughness.g = clamp(mix(rgh, rgh * 0.78, wet), 0.62, 1.0);   /* matte floor 0.62: low-roughness sky sheen was reading as wet/transparent water */
+      metallicRoughness.g = clamp(mix(rgh, rgh * 0.82, wet), 0.82, 1.0);   /* matte floor 0.82: smooth (bilinear) normals + low roughness read as plasticy sky sheen; keep land matte, wet channels below still glossy */
       vec4 auxR = _aux(vPositionW);                                 /* S4: water-polished drainage channels */
       float chanR = smoothstep(0.45, 0.82, auxR.a) * smoothstep(-0.2, 1.5, vPositionW.y);
       metallicRoughness.g = clamp(mix(metallicRoughness.g, metallicRoughness.g * 0.70, chanR), 0.50, 1.0);
+      float ffR = _forestF(vPositionW, 1.0 - clamp(nWr.y, 0.0, 1.0));   /* matte the canopy: foliage isn't glossy */
+      metallicRoughness.g = clamp(mix(metallicRoughness.g, 0.98, ffR * 0.9), 0.50, 1.0);
     `);
 
     // Albedo + normal (before the PBR light loop).
@@ -2678,6 +2801,17 @@ export class TerrainService {
                   + textureLod(uOrmArr, vec3(vPositionW.xz*0.05,4.0), alod).g*wSnow;
         aoT = mix(1.0, ao5, aoFade);
       }
+      // ── Forest canopy: paint deep green on the wooded hillsides. The PBR splat has no forest biome, so
+      // these otherwise read as dark rock / wet-darkened grass (the "black forest"). _forestF (shared with
+      // the roughness block) gates it; greener when wet, clump-mottled.
+      float forestF = _forestF(vPositionW, slope);
+      if (forestF > 0.003) {
+        float fWet = smoothstep(0.25, 0.78, clamp(_forestMoist(vPositionW), 0.0, 1.0));
+        float mott = sin(vPositionW.x * 0.045) * sin(vPositionW.z * 0.045) * 0.5 + 0.5;
+        vec3 canopyDark = mix(vec3(0.07, 0.15, 0.06), vec3(0.10, 0.20, 0.07), fWet);
+        vec3 canopyLit  = mix(vec3(0.14, 0.27, 0.11), vec3(0.20, 0.34, 0.14), fWet);
+        splatC = mix(splatC, mix(canopyDark, canopyLit, mott), forestF * 0.94);
+      }
       surfaceAlbedo = pow(clamp(splatC, 0.0, 1.0), vec3(2.2)) * (0.45 + 0.55*aoT);   // sRGB->linear, AO darkens crevices
 
       // Normal: Sobel geometry + P5 procedural detail (world-space gradient), near-faded, slope/biome-weighted.
@@ -2685,9 +2819,17 @@ export class TerrainService {
       float pe = 0.7;
       float pHL=_detailH(vPositionW.xz-vec2(pe,0.0)), pHR=_detailH(vPositionW.xz+vec2(pe,0.0));
       float pHD=_detailH(vPositionW.xz-vec2(0.0,pe)), pHU=_detailH(vPositionW.xz+vec2(0.0,pe));
-      float pStr=(0.55+slope*2.4)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);
+      float pStr=(0.85+slope*2.1)*(0.45+0.55*wRock+0.40*wGravel+0.20*wGrass);  // raised flat-ground floor (0.55->0.85): break the mirror-smooth bilinear normal so flats aren't plasticy
       float pLand=smoothstep(0.4,4.0,vPositionW.y);
       normalW = normalize(nW + vec3(-(pHR-pHL), 0.0, -(pHU-pHD)) * (1.5*pdFade*pLand*pStr));
+      // Lumpy canopy normal (§8d): treetops catch the sun, valleys self-shade — dimensional forest relief.
+      if (forestF > 0.003) {
+        vec2  cq  = vPositionW.xz * 0.085;
+        float c0  = sin(cq.x) * sin(cq.y);
+        float cgx = (sin(cq.x + 0.15) * sin(cq.y) - c0) / 0.15;
+        float cgz = (sin(cq.x) * sin(cq.y + 0.15) - c0) / 0.15;
+        normalW = normalize(normalW + vec3(-cgx, 0.0, -cgz) * (forestF * 0.32));   // softer: cut canopy sheen
+      }
     `);
 
     // Cloud shadows + aerial haze on the lit colour (matches the Standard path + the ocean).
@@ -2767,11 +2909,10 @@ export class TerrainService {
       }
     });
 
-    // TEMP DIAGNOSTIC (remove once S0-S3 verified): WebGPU SPIR-V compile failures surface as
-    // unhandled promise rejections, NOT via Material.onError. onCompiled DOES fire on success, so this
-    // is our deterministic "the PBR terrain shader actually compiled" signal in the console.
-    mat.onCompiled = () => console.info('[TerrainPBR] shader compiled OK');
-
+    // NOTE: WebGPU SPIR-V compile failures for this material surface as unhandled promise rejections, NOT via
+    // Material.onError; onCompiled fires ONLY on success. buildClipmap() sets mat.onCompiled (the positive
+    // "it actually compiled" signal) and runs a watchdog that rebuilds the clipmap if it never fires — the
+    // self-heal for the cold-start race that otherwise leaves the terrain invisible until a manual refresh.
     this.terrainMaterialPBR = mat;
     return mat;
   }
@@ -2788,6 +2929,14 @@ export class TerrainService {
       ? { tex: this.clipHeightTex, wbounds: this.clipWBounds, texSize: this.clipTexSize }
       : null;
   }
+
+  // The decoded height data is kept so we can RE-UPLOAD it to the GPU a few times after creation: on a WebGPU
+  // cold start the initial R32F upload occasionally lands empty (silent — no error), which leaves the terrain
+  // displacing to sea level (invisible) AND the ocean reading zero depth (uniformly shallow, seabed showing) while
+  // scatter — fed by the CPU heightfield — stays correct. Re-uploading once the device is warm self-heals it in
+  // ~1 s with no page refresh, and is harmless when the first upload already succeeded. Freed after the last pass.
+  private clipHeightData: Float32Array | null = null;
+  private clipHeightReuploadTimers: ReturnType<typeof setTimeout>[] = [];
 
   private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
     if (this.clipHeightTex || !this.heightfield) { return; }
@@ -2806,6 +2955,16 @@ export class TerrainService {
     this.clipWBounds = new Vector4(m.worldBounds.minX, m.worldBounds.minZ,
       m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
     this.clipTexSize = new Vector2(m.width, m.height);
+
+    // Defensive re-uploads against the cold-start upload race (see field note). Once warm these are no-ops.
+    this.clipHeightData = data;
+    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
+    this.clipHeightReuploadTimers = [600, 2000, 5000].map((ms, i, arr) => setTimeout(() => {
+      if (this.clipHeightTex && this.clipHeightData) {
+        try { this.clipHeightTex.update(this.clipHeightData); } catch { /* device busy → next pass retries */ }
+      }
+      if (i === arr.length - 1) { this.clipHeightData = null; }   // free after the final pass
+    }, ms));
   }
 
   // ── Coastal grading ───────────────────────────────────────────────────────

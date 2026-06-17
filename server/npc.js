@@ -80,6 +80,12 @@ const CONVOY_SQUAD_RANGE = 2500;   // a player's squadron-mate only reinforces t
 // convoy occasionally fields TWO escorts (a heavily-guarded run) that flank the foe in a crossfire (pincer).
 const SCREEN_DIST          = 65;   // world units a trader holds on the far side of its escort from the threat
 const CONVOY_DOUBLE_ESCORT = 0.3;  // chance a 3-ship convoy carries 2 escorts (1 trader) instead of 1 escort (2 traders)
+// Telegraphing (E4 polish): a short system-chat line to NEARBY players when a convoy commits to a fight or breaks
+// off — so the player FEELS the strategy. Transition-only + per-convoy cooldown so it never spams. Flip off here.
+const CONVOY_TELEGRAPH       = true;
+const ANNOUNCE_COOLDOWN_MS   = 25000;
+const convoyTele = new Map();      // convoyId → { prevStance, lastAnnounce } (telegraph transition state)
+const NPC_DEBUG = process.env.NPC_DEBUG === '1';   // NPC_DEBUG=1 → log convoy tactical decisions for tuning/verification
 
 /** Fleet-slot count: each solo merchant is one slot, each distinct convoy is ONE slot (regardless of 2–3 ships). */
 function npcCount(players) {
@@ -238,6 +244,11 @@ const HOSTILE_REP  = -70;    // a player at/below this standing with the merchan
 const DETECT_RANGE = 650;    // world units: how far off a merchant notices a hated player (to start avoiding / closing)
 const ENGAGE_RANGE = 320;    // world units: an even/stronger merchant defends its lane once a hated player closes to here
 const AVOID_RATIO  = 1.25;   // the foe must be ≥25% stronger for the merchant to break off and run rather than fight
+// Morale & commitment (E4): PRESS a crippled foe (close to finish it even if nominally outmatched); a convoy that
+// just lost a consort loses heart for a while (more flee-prone, recovering its composure over MORALE_SHAKE_MS).
+const PRESS_HULL          = 0.3;     // foe hull fraction at/below which a healthy NPC commits to the kill
+const MORALE_SHAKE_MS     = 18000;   // a convoy stays rattled this long after a member is sunk
+const MORALE_SHAKE_FACTOR = 0.55;    // its effective nerve while rattled (skill × this → flees far sooner)
 const STR_HULL_W   = 1.0;    // strength per current hull point
 const STR_GUN_W    = 30.0;   // strength per broadside gun
 const STR_SPEED_W  = 8.0;    // strength per knot of top speed
@@ -333,7 +344,9 @@ function findThreat(npc, players, nowMs) {
  *  — it won't chase a hated stranger across the sea, but it won't be boarded for free either. */
 function combatStance(npc, foe, provoked) {
   const skill = npcSkill(npc);
-  if (hullFraction(npc.combat) < fleeHealthFor(skill)) return 'flee';
+  if (hullFraction(npc.combat) < fleeHealthFor(skill)) return 'flee';   // I'm dying → run, whatever the foe
+  // Commitment: a healthy ship PRESSES a crippled foe to finish it, even if the foe is nominally stronger.
+  if (hullFraction(foe.combat) < PRESS_HULL) return 'fight';
   const ratio = shipStrength(foe) / shipStrength(npc);
   if (ratio > avoidRatioFor(skill)) return 'flee';           // they're stronger → keep away / run
   if (provoked) return 'fight';                              // attacked + can hold our own → fight back
@@ -372,15 +385,20 @@ function convoyMembers(npc, players) {
  *  COMBINED strength against the foe (+ its nearby squadron). Badly-hurt convoy (mean hull < FLEE_HEALTH) or an
  *  outmatched one runs; a provoked convoy that can hold its own fights; an unprovoked one engages only once the
  *  foe closes on any member. */
-function convoyStance(members, foe, provoked, players) {
-  let cx = 0, cz = 0, ourStr = 0, hullSum = 0, skill = 0;
+function convoyStance(members, foe, provoked, players, nowMs) {
+  let cx = 0, cz = 0, ourStr = 0, hullSum = 0, skill = 0, shaken = false;
   for (const m of members) {
     cx += m.state.x; cz += m.state.z; ourStr += shipStrength(m); hullSum += hullFraction(m.combat);
     skill = Math.max(skill, npcSkill(m));   // the escort emboldens the whole convoy → use the bravest member's nerve
+    if (m.moraleShakeUntil && nowMs != null && m.moraleShakeUntil > nowMs) shaken = true;
   }
   cx /= members.length; cz /= members.length;
-  if (hullSum / members.length < fleeHealthFor(skill)) return 'flee';
-  if (threatStrength(foe, players, cx, cz) / Math.max(1, ourStr) > avoidRatioFor(skill)) return 'flee';
+  // Morale: a convoy that just lost a consort fights with much less nerve (recovers as the shake decays).
+  const nerve = shaken ? skill * MORALE_SHAKE_FACTOR : skill;
+  if (hullSum / members.length < fleeHealthFor(nerve)) return 'flee';
+  // Commitment: press a crippled foe to finish it, even when nominally outmatched (unless we're rattled / dying).
+  if (!shaken && hullFraction(foe.combat) < PRESS_HULL) return 'fight';
+  if (threatStrength(foe, players, cx, cz) / Math.max(1, ourStr) > avoidRatioFor(nerve)) return 'flee';
   if (provoked) return 'fight';
   const R2 = ENGAGE_RANGE * ENGAGE_RANGE;
   const near = members.some((m) => {
@@ -489,9 +507,10 @@ function engageHeading(npc, foe, wind, ph) {
   npc.raking = raking;
 
   // Range band by relative strength: stronger → close in; weaker → keep the range open and pepper with round shot.
-  // A rake overrides toward a punchy close range to land it before the foe can turn its broadside back to us.
+  // A rake — or PRESSING a crippled foe — overrides toward a punchy close range to finish it before it recovers.
   const strRatio = shipStrength(npc) / Math.max(1, shipStrength(foe));
-  const desiredRange = raking ? FIRE_RANGE * 0.7
+  const pressing = hullFraction(foe.combat) < PRESS_HULL;
+  const desiredRange = (raking || pressing) ? FIRE_RANGE * 0.68
                      : strRatio > 1.2 ? FIRE_RANGE * 0.8
                      : strRatio < 0.85 ? Math.min(MAX_FIRE_RANGE * 0.9, FIRE_RANGE * 1.7)
                      : FIRE_RANGE;
@@ -881,7 +900,7 @@ function onArrive(npc, towns) {
 
 /** Advance every NPC one step (dtSec), steering toward its route + away from other merchants. Pose is sent
  *  separately by broadcastInterest (interest-managed), NOT here. */
-function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
+function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
   const towns = economy.townList();
   if (towns.length < 2) return;
   const fleet = [];
@@ -900,17 +919,38 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
   for (const [cid, members] of convoyGroups) {
     members.forEach((m) => { m.pincerSide = null; });   // cleared unless re-assigned for a 2-escort crossfire below
     const threat = convoyFocusTarget(members, players, nowMs);   // ONE shared focus target (weakest reachable enemy)
-    const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players) : 'route';
+    const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players, nowMs) : 'route';
     const escorts = members.filter((m) => m.combatRole === 'escort' && !(m.combat && m.combat.sunk));
     // Pincer: 2+ escorts fighting → lock alternating flanks so they catch the foe in a crossfire.
     if (stance === 'fight' && escorts.length >= 2) escorts.forEach((e, i) => { e.pincerSide = i % 2 === 0 ? 1 : -1; });
     convoyPlan.set(cid, { foe: threat && threat.foe, provoked: !!(threat && threat.provoked), stance, escorts });
+
+    // Telegraph + debug-log convoy combat-state TRANSITIONS (commit to fight / break off), per-convoy rate-limited.
+    const tele = convoyTele.get(cid) || { prevStance: 'route', lastAnnounce: 0 };
+    let kind = null;
+    if (stance === 'fight' && tele.prevStance !== 'fight') kind = escorts.length >= 2 ? 'pincer' : 'engage';
+    else if (stance === 'flee' && tele.prevStance === 'fight') kind = 'breakoff';
+    if (kind) {
+      if (NPC_DEBUG) console.log(`[npc] convoy ${cid} ${tele.prevStance}→${stance} (${kind}); escorts=${escorts.length} foe=${threat && threat.foe.state && threat.foe.state.callsign}`);
+      if (CONVOY_TELEGRAPH && announce && nowMs - tele.lastAnnounce > ANNOUNCE_COOLDOWN_MS) {
+        let cx = 0, cz = 0; for (const m of members) { cx += m.state.x; cz += m.state.z; }
+        announce(cx / members.length, cz / members.length, members[0].faction, kind);
+        tele.lastAnnounce = nowMs;
+      }
+    }
+    tele.prevStance = stance;
+    convoyTele.set(cid, tele);
   }
+  for (const cid of convoyTele.keys()) { if (!convoyGroups.has(cid)) convoyTele.delete(cid); }   // prune vanished convoys
 
   for (const npc of fleet) {
     // A sunk merchant (salvage already dropped by resolveHit) lingers briefly so its capsize plays, then despawns.
     if (npc.combat && npc.combat.sunk) {
-      if (!npc.sinkAt) npc.sinkAt = nowMs;
+      if (!npc.sinkAt) {
+        npc.sinkAt = nowMs;
+        // Morale shock: losing a consort rattles the rest of the convoy (E4) → far more flee-prone for a while.
+        if (npc.convoyId) { for (const m of convoyMembers(npc, players)) { if (m !== npc) m.moraleShakeUntil = nowMs + MORALE_SHAKE_MS; } }
+      }
       if (nowMs - npc.sinkAt >= SINK_LINGER_MS) { players.delete(npc.id); broadcastLeave(npc.id); }
       continue;
     }
@@ -1138,5 +1178,6 @@ module.exports = {
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,
     chooseNpcShot, foeMastFrac, RAKE_CONE, RAKE_SKILL,
     convoyFocusTarget, convoyScreenHeading, SCREEN_DIST, CONVOY_DOUBLE_ESCORT,
+    PRESS_HULL, MORALE_SHAKE_MS, MORALE_SHAKE_FACTOR,
   },
 };

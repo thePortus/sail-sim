@@ -689,6 +689,20 @@ function attachMultiplayer(server) {
     const m = JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text });
     for (const [, q] of players) if (q.ws && q.ws.readyState === 1) q.ws.send(m);
   };
+  /** Telegraph an NPC convoy's combat posture to players within ~1.6 km of (x,z) — readability for NPC tactics (E4). */
+  const announceConvoy = (x, z, faction, kind) => {
+    const nation = factions.factionName(faction) || 'A';
+    const text = kind === 'pincer'  ? `⚑ A ${nation} convoy moves to flank you!`
+               : kind === 'engage'  ? `⚑ A ${nation} convoy forms up and runs out its guns!`
+               :                       `⚑ A ${nation} convoy breaks off and runs!`;
+    const m = JSON.stringify({ type: 'chat', chatType: 'system', from: '⚓ System', text });
+    const R2 = 1600 * 1600;
+    for (const [, q] of players) {
+      if (q.isNpc || !q.ws || q.ws.readyState !== 1 || !q.state) continue;
+      const dx = q.state.x - x, dz = q.state.z - z;
+      if (dx * dx + dz * dz <= R2) q.ws.send(m);
+    }
+  };
 
   // ── Weather: tick the shared authority at 1 Hz, broadcast every 5 s ────────────
   const broadcastWeather = () => {
@@ -745,7 +759,7 @@ function attachMultiplayer(server) {
   const NPC_DT = 0.2;
   setInterval(() => {
     const now = Date.now();
-    npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot);   // integrate, despawn sunk, return fire
+    npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot, announceConvoy);   // integrate, despawn sunk, return fire, telegraph
     npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
   }, NPC_DT * 1000);
 

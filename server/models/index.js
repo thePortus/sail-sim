@@ -66,26 +66,25 @@ db.ensureColumns = async () => {
 db.ensureTables = async () => {
   const qi = sequelize.getQueryInterface();
   const DT = Sequelize.DataTypes;
-  try {
-    await qi.createTable('economyStates', {
-      mapVersion:  { type: DT.INTEGER, primaryKey: true, allowNull: false },
-      lastTickDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
-      towns:       { type: DT.TEXT('medium'), allowNull: false },
-    });
-    console.log('[db] created table economyStates');
-  } catch {
-    /* already exists (or DB unreachable) */
-  }
-  try {
-    await qi.createTable('diplomacyStates', {
-      id:           { type: DT.INTEGER, primaryKey: true, allowNull: false, defaultValue: 1 },
-      lastShiftDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
-      rel:          { type: DT.TEXT, allowNull: false },
-    });
-    console.log('[db] created table diplomacyStates');
-  } catch {
-    /* already exists (or DB unreachable) */
-  }
+  const mk = async (name, spec) => {
+    try { await qi.createTable(name, spec); console.log(`[db] created table ${name}`); }
+    catch (err) {
+      // "already exists" is the normal idempotent case (swallow). Anything else (no CREATE grant, bad dialect)
+      // would otherwise hide as a "Table doesn't exist" at query time — so LOG it.
+      const m = String(err && err.message || '');
+      if (!/exist/i.test(m)) { console.warn(`[db] ensureTables: could not create ${name}: ${m}`); }
+    }
+  };
+  await mk('economyStates', {
+    mapVersion:  { type: DT.INTEGER, primaryKey: true, allowNull: false },
+    lastTickDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
+    towns:       { type: DT.TEXT('medium'), allowNull: false },
+  });
+  await mk('diplomacyStates', {
+    id:           { type: DT.INTEGER, primaryKey: true, allowNull: false, defaultValue: 1 },
+    lastShiftDay: { type: DT.INTEGER, allowNull: false, defaultValue: 0 },
+    rel:          { type: DT.TEXT, allowNull: false },
+  });
 };
 
 module.exports = db;

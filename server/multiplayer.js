@@ -1400,6 +1400,14 @@ function attachMultiplayer(server) {
           if (!def || def.slug !== slug) {
             shipErr('bad_ship');
           } else if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) {
+            // DIAGNOSTIC (live-only "not docked"): log what the SERVER actually sees so we can tell whether the
+            // authoritative pose is stale/null, the town list never loaded, or the nearest town is out of range.
+            try {
+              const ap = me.authPose, ts = economy.townList();
+              let nd = Infinity, nid = null;
+              for (const t of ts) { if (!ap) break; const d = Math.hypot(ap.x - t.x, ap.z - t.z); if (d < nd) { nd = d; nid = t.id; } }
+              console.warn(`[shipwright] not_docked ${me.state && me.state.callsign}: authPose=${ap ? `(${ap.x | 0},${ap.z | 0})` : 'null'} towns=${ts.length} nearest=${nid}@${Number.isFinite(nd) ? nd.toFixed(0) : 'n/a'}m (DOCK_RADIUS=${economy.DOCK_RADIUS_M})`);
+            } catch (e) { console.warn('[shipwright] not_docked diag failed:', e.message); }
             shipErr('not_docked');
           } else if (me.ship === slug) {
             shipErr('already_owned');

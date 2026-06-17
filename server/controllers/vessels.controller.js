@@ -86,7 +86,7 @@ const VESSELS = [
     zoneHp: { bow: 90, stern: 90, port: 130, starboard: 130, masts: 100 },
     crew: 7,                      // Crew resource: full complement (grapeshot attrites it; tavern re-hires)
     cargo: 40,                    // hold capacity in cargo slots (Town Economy) — stout merchantman
-    price: 30000,                 // Ships-as-economy: bought at a port shipwright
+    price: 10000,                 // Ships-as-economy: bought at a port shipwright
     parts: [],
   },
   {
@@ -120,7 +120,7 @@ const VESSELS = [
     zoneHp: { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
     crew: 12,                     // Crew resource: a big ship needs hands at every station
     cargo: 60,                    // hold capacity in cargo slots — a roomy warship hold
-    price: 100000,                // Ships-as-economy: the top-tier shipwright purchase
+    price: 800000,                // Ships-as-economy: the top-tier shipwright purchase
     parts: [],
   },
 ];

@@ -108,7 +108,7 @@ const BRIG_SAIL: SailRig = {
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
   sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, sail: SLOOP_SAIL },
-  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.25, hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.13, heaveTau: 0.65, tiltTau: 0.3 }, sail: PINNACE_SAIL },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -2,  hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.16, heaveTau: 0.45, tiltTau: 0.22 }, sail: PINNACE_SAIL },
   // Brigantine — a big, decked two-master. Sits at normal draft (no hull cut). A heavy hull rides the swell
   // ponderously (low pitchScale, longer time constants) rather than bobbing like the open boats.
   // floatDraft −2.0 (was −2.3): +0.3m FREEBOARD so the low waist deck (deck-local ~3.6 → world ~1.6) clears the

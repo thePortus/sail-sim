@@ -16,6 +16,10 @@ const server = http.createServer(app);
 // DB is unreachable the economy still seeds in memory from the manifest and trades work (flush retries).
 async function boot() {
   try {
+    // Create the users table from the model on a FRESH db (CREATE TABLE IF NOT EXISTS — no-op + never alters an
+    // existing table), so the runtime backstop fully bootstraps even if the sequelize migrations weren't run.
+    // ensureColumns() then tops up an OLDER table that predates the economy/ship/crew columns.
+    await db.User.sync();
     await db.ensureColumns();
     await db.ensureTables();
     await economy.loadState();

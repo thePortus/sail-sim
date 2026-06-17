@@ -198,7 +198,11 @@ function crewFactor(npc) {
 // (target ±90°) it commits to whichever sails better in the current wind, so a merchant pinned on a bad point
 // of sail manoeuvres realistically rather than magically holding the slot.
 const FIRE_RANGE = 150;       // world units: ideal broadside standoff (well within round-shot reach) — tunable
-const BROADSIDE_HYST = 0.12;  // point-of-sail-efficiency margin the other tack must beat to flip the broadside side
+const BROADSIDE_HYST = 0.12;  // the other tack must score this much higher (fractional) to flip the broadside side
+// Weather gage (E1): a skilled NPC works to hold the WINDWARD position of its foe — from up-wind it can close or
+// hold at will. When not yet to windward it favours the broadside tack that claws it up-wind (weighted by skill).
+const GAGE_WEIGHT = 0.8;      // how hard a veteran prefers the windward tack (× skill × up-wind component of the heading)
+const GAGE_MARGIN = 45;       // world units up-wind of the foe past which it stops clawing and just holds the broadside
 const GIVE_UP_RANGE = 700;    // world units: a foe that opens past this is "lost" → drop the grudge, resume trade
 const FLEE_HEALTH = 0.35;     // hull fraction at/below which a merchant breaks off and runs (fighting → fleeing)
 
@@ -422,24 +426,43 @@ function engageTarget(npc, players, nowMs) {
   return foe;
 }
 
-/** Desired heading to present a broadside to `foeState`, biased to close/open toward FIRE_RANGE and to take the
- *  more sailable of the two beam options in the current wind (with hysteresis so it doesn't chatter tacks). */
-function engageHeading(npc, foeState, wind, ph) {
-  const B = headingTo(npc.state.x, npc.state.z, foeState.x, foeState.z);
-  const dist = Math.hypot(foeState.x - npc.state.x, foeState.z - npc.state.z);
+/** Desired heading to present a broadside to the foe ENTRY `foe`. RANGE BAND scales with relative strength —
+ *  stronger → close for a decisive exchange, weaker → stand off and pepper at round-shot range. SIDE choice takes
+ *  the more sailable tack AND, for a skilled captain not yet up-wind of the foe, the one that claws toward the
+ *  WEATHER GAGE (the windward position lets it dictate range). Hysteresis stops tack-chatter. */
+function engageHeading(npc, foe, wind, ph) {
+  const fs = foe.state;
+  const B = headingTo(npc.state.x, npc.state.z, fs.x, fs.z);
+  const dist = Math.hypot(fs.x - npc.state.x, fs.z - npc.state.z);
+  const skill = npcSkill(npc);
+
+  // Range band by relative strength: stronger → close in; weaker → keep the range open and pepper with round shot.
+  const strRatio = shipStrength(npc) / Math.max(1, shipStrength(foe));
+  const desiredRange = strRatio > 1.2 ? FIRE_RANGE * 0.8
+                     : strRatio < 0.85 ? Math.min(MAX_FIRE_RANGE * 0.9, FIRE_RANGE * 1.7)
+                     : FIRE_RANGE;
   let offset;
-  if (dist > FIRE_RANGE * 1.3)      offset = 55;    // well out → angle in to close (not a bow-on charge)
-  else if (dist < FIRE_RANGE * 0.7) offset = 120;   // too near → open out, avoid fouling / ramming
-  else                              offset = 90;     // in the slot → hold a clean broadside (orbits at range)
+  if (dist > desiredRange * 1.3)      offset = 55;    // well out → angle in to close (not a bow-on charge)
+  else if (dist < desiredRange * 0.7) offset = 120;   // too near → open out, avoid fouling / ramming
+  else                                offset = 90;    // in the slot → hold a clean broadside (orbits at range)
   const hPlus  = (B + offset + 360) % 360;
   const hMinus = (B - offset + 360) % 360;
-  const slug     = npc.state.vesselSlug;
-  const effPlus  = npcDrive(angleFromWind(hPlus,  wind.windBearing), slug, ph.minTackAngle);
-  const effMinus = npcDrive(angleFromWind(hMinus, wind.windBearing), slug, ph.minTackAngle);
-  let side = (npc.broadsideSide === 1 || npc.broadsideSide === -1) ? npc.broadsideSide
-           : (effPlus >= effMinus ? 1 : -1);
-  if      (side === 1  && effMinus > effPlus  + BROADSIDE_HYST) side = -1;
-  else if (side === -1 && effPlus  > effMinus + BROADSIDE_HYST) side = 1;
+
+  // Weather-gage seek: claw up-wind until we're GAGE_MARGIN to windward of the foe (then just hold the broadside).
+  const wb = wind.windBearing * DEG, Ux = Math.sin(wb), Uz = Math.cos(wb);   // unit vector toward the wind's SOURCE (up-wind)
+  const windwardNow = (npc.state.x - fs.x) * Ux + (npc.state.z - fs.z) * Uz;  // >0 already to windward of the foe
+  const seekGage = windwardNow < GAGE_MARGIN;
+  const slug = npc.state.vesselSlug;
+  const score = (h) => {
+    const eff = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), slug, ph.minTackAngle));
+    if (!seekGage) return eff;
+    const upwind = Math.sin(h * DEG) * Ux + Math.cos(h * DEG) * Uz;   // how much this heading carries us up-wind
+    return eff * (1 + GAGE_WEIGHT * skill * Math.max(0, upwind));
+  };
+  const sPlus = score(hPlus), sMinus = score(hMinus);
+  let side = (npc.broadsideSide === 1 || npc.broadsideSide === -1) ? npc.broadsideSide : (sPlus >= sMinus ? 1 : -1);
+  if      (side === 1  && sMinus > sPlus  * (1 + BROADSIDE_HYST)) side = -1;
+  else if (side === -1 && sPlus  > sMinus * (1 + BROADSIDE_HYST)) side = 1;
   npc.broadsideSide = side;
   return side === 1 ? hPlus : hMinus;
 }
@@ -450,17 +473,24 @@ function engageHeading(npc, foeState, wind, ph) {
  * off downwind onto a fast broad reach that still carries it clear. (It keeps firing opportunistically: the
  * gunnery's arc gate lets a stern-chasing foe eat a parting broadside whenever it swings abeam — no extra code.)
  */
-function escapeHeading(npc, foeState, wind, ph) {
-  const away = (headingTo(npc.state.x, npc.state.z, foeState.x, foeState.z) + 180) % 360;   // straight away from foe
+function escapeHeading(npc, foe, wind, ph) {
+  const fs = foe.state;
+  const away = (headingTo(npc.state.x, npc.state.z, fs.x, fs.z) + 180) % 360;   // straight away from foe
   const awayX = Math.sin(away * DEG), awayZ = Math.cos(away * DEG);
-  // Maximise the OUTBOUND velocity component = boat speed × (heading · away). Sweeping all headings finds the
-  // fastest way to actually pull clear: if dead-away is upwind (slow), it bears off onto a reach that opens
-  // distance faster despite the angle; if away is downwind, it just runs. In-irons efficiency is clamped to 0
-  // (a stalled heading makes no progress, however "away" it points).
+  const skill = npcSkill(npc);
+  // Wind-craft escape: pick the heading that opens distance fastest RELATIVE to the pursuer's own polar. A weatherly
+  // ship out-points a square-rigger, so it claws up-wind to shake it; a downwind-fast ship just runs off. The foe's
+  // speed on the same point of sail (it chases roughly parallel) is subtracted, weighted by skill — so a clumsy
+  // trader just runs fastest-away (own speed only) while a veteran out-thinks the chaser's rig.
+  const foeSlug = (fs && fs.vesselSlug) || foe.ship || 'pinnace';
+  const foeTack = (getVesselDef(foeSlug)?.physics?.minTackAngle) || 36;
   let best = away, bestRate = -Infinity;
   for (let h = 0; h < 360; h += 15) {
     const opening = Math.sin(h * DEG) * awayX + Math.cos(h * DEG) * awayZ;   // -1 (toward foe) .. 1 (dead away)
-    const rate = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), npc.state.vesselSlug, ph.minTackAngle)) * opening;
+    if (opening <= 0) continue;                                              // only headings that actually open range
+    const mine   = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), npc.state.vesselSlug, ph.minTackAngle));
+    const theirs = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), foeSlug, foeTack));
+    const rate = (mine - theirs * skill) * opening;   // skill 0 → fastest-away; skill 1 → maximise the gap vs the chaser
     if (rate > bestRate) { bestRate = rate; best = h; }
   }
   return best;
@@ -848,7 +878,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       // group stance. (E0 keeps the EVADE simple — flat-out away; E3 adds true interposition / screening.)
       const evade = stance === 'flee' || (npc.convoyId && npc.combatRole === 'trader' && stance === 'fight');
       npc.fleeing = evade;
-      desired = evade ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
+      desired = evade ? escapeHeading(npc, foe, wind, ph) : engageHeading(npc, foe, wind, ph);
       if (npc.fleeing) {
         // Imperfect helmsman under pressure: a slowly-drifting heading error around the optimal escape line, scaled
         // by skill — a panicky trader wanders badly (easy to run down), a veteran flees on a clean line. CATCH-UP

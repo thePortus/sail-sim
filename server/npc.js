@@ -76,6 +76,10 @@ const CONVOY_MIN         = 2;      // smallest convoy
 const CONVOY_MAX         = 3;      // largest convoy
 const CONVOY_SPACING     = 24;     // world units between formation slots
 const CONVOY_SQUAD_RANGE = 2500;   // a player's squadron-mate only reinforces the threat if within this of the convoy
+// E3 coordination: a screened TRADER tucks this far behind its escort (keeping the escort interposed); a 3-ship
+// convoy occasionally fields TWO escorts (a heavily-guarded run) that flank the foe in a crossfire (pincer).
+const SCREEN_DIST          = 65;   // world units a trader holds on the far side of its escort from the threat
+const CONVOY_DOUBLE_ESCORT = 0.3;  // chance a 3-ship convoy carries 2 escorts (1 trader) instead of 1 escort (2 traders)
 
 /** Fleet-slot count: each solo merchant is one slot, each distinct convoy is ONE slot (regardless of 2–3 ships). */
 function npcCount(players) {
@@ -416,6 +420,43 @@ function convoyFollowHeading(npc, players) {
   return headingTo(npc.state.x, npc.state.z, tx, tz);
 }
 
+/** ONE shared FOCUS target for the whole convoy (E3) → its escort guns concentrate. Prefers ACTIVE attackers (any
+ *  member's live grudge, give-up handled by engageTarget); if none, the nearest-hated players in detection range.
+ *  Within the chosen pool it picks the WEAKEST (lowest current hull) so the convoy ganges up to sink one fast. */
+function convoyFocusTarget(members, players, nowMs) {
+  let pool = [];
+  for (const m of members) { const f = engageTarget(m, players, nowMs); if (f && !pool.includes(f)) pool.push(f); }
+  const provoked = pool.length > 0;
+  if (!provoked) {
+    const faction = members[0].faction, R2 = DETECT_RANGE * DETECT_RANGE;
+    for (const [, p] of players) {
+      if (p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
+      if (repWith(p, faction) > HOSTILE_REP) continue;
+      if (members.some((m) => { const dx = p.state.x - m.state.x, dz = p.state.z - m.state.z; return dx * dx + dz * dz <= R2; })) pool.push(p);
+    }
+  }
+  if (!pool.length) return null;
+  let best = pool[0], bestHull = Infinity;
+  for (const p of pool) { const h = p.combat ? hullPoints(p.combat).cur : 100; if (h < bestHull) { bestHull = h; best = p; } }
+  return { foe: best, provoked };
+}
+
+/** A screened convoy TRADER evades by keeping its nearest ESCORT between itself and the threat — steering to a point
+ *  on the FAR side of the escort from the foe, so the escort's hull shields it. Falls back to a plain escape if the
+ *  escort's been sunk. */
+function convoyScreenHeading(npc, foe, escorts, wind, ph) {
+  let esc = null, bestD2 = Infinity;
+  for (const e of escorts) {
+    if (e === npc || (e.combat && e.combat.sunk)) continue;
+    const dx = e.state.x - npc.state.x, dz = e.state.z - npc.state.z, d2 = dx * dx + dz * dz;
+    if (d2 < bestD2) { bestD2 = d2; esc = e; }
+  }
+  if (!esc) return escapeHeading(npc, foe, wind, ph);
+  let ax = esc.state.x - foe.state.x, az = esc.state.z - foe.state.z;   // foe → escort = the sheltered direction
+  const al = Math.hypot(ax, az) || 1; ax /= al; az /= al;
+  return headingTo(npc.state.x, npc.state.z, esc.state.x + ax * SCREEN_DIST, esc.state.z + az * SCREEN_DIST);
+}
+
 /** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished, sunk, or
  *  opened past GIVE_UP_RANGE (it escaped / was lost) — at which point the merchant resumes its trade route. */
 function engageTarget(npc, players, nowMs) {
@@ -475,7 +516,11 @@ function engageHeading(npc, foe, wind, ph) {
     const upwind = Math.sin(h * DEG) * Ux + Math.cos(h * DEG) * Uz;   // how much this heading carries us up-wind
     return eff * (1 + GAGE_WEIGHT * skill * Math.max(0, upwind));
   };
-  const sPlus = score(hPlus), sMinus = score(hMinus);
+  let sPlus = score(hPlus), sMinus = score(hMinus);
+  // Pincer (E3): a convoy with ≥2 escorts locks them to opposite flanks for a crossfire. Strong preference (×3),
+  // not a hard lock — if the assigned tack is near-unsailable the safety valve still flips it.
+  if      (npc.pincerSide === 1)  sPlus  *= 3;
+  else if (npc.pincerSide === -1) sMinus *= 3;
   let side = (npc.broadsideSide === 1 || npc.broadsideSide === -1) ? npc.broadsideSide : (sPlus >= sMinus ? 1 : -1);
   if      (side === 1  && sMinus > sPlus  * (1 + BROADSIDE_HYST)) side = -1;
   else if (side === -1 && sPlus  > sMinus * (1 + BROADSIDE_HYST)) side = 1;
@@ -717,12 +762,14 @@ function spawnConvoy(players, towns) {
   const { faction, town } = pickHome(towns);
   const size = CONVOY_MIN + Math.floor(Math.random() * (CONVOY_MAX - CONVOY_MIN + 1));
   const convoyId = 'cvy_' + (++seq);
-  const ESCORT_SLOT = 1;   // one follower is an ARMED escort: a veteran brig that fights to protect the traders
+  // Slot 0 is the trade leader; the next slot(s) are ARMED escorts (veteran brigs). A 3-ship convoy occasionally
+  // fields TWO escorts (a heavily-guarded run) that pincer the foe; otherwise one escort screens the cargo.
+  const escortCount = (size >= 3 && Math.random() < CONVOY_DOUBLE_ESCORT) ? 2 : 1;
   let leader = null;
   for (let i = 0; i < size; i++) {
     // Stagger the spawn positions so the ships don't stack at the pier.
     const ox = (i - (size - 1) / 2) * CONVOY_SPACING, oz = (i % 2 ? 1 : -1) * CONVOY_SPACING * 0.5;
-    const isEscort = i === ESCORT_SLOT;
+    const isEscort = i >= 1 && i <= escortCount;   // slots 1..escortCount are escorts; slot 0 + the rest are traders
     const slug = isEscort ? 'brig' : pick(MERCHANT_SLUGS);
     const m = makeMerchant(players, town, faction, slug,
       { id: convoyId, role: i === 0 ? 'leader' : 'follower', slot: i, ox, oz },
@@ -851,11 +898,13 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     if (npc.convoyId) { (convoyGroups.get(npc.convoyId) || convoyGroups.set(npc.convoyId, []).get(npc.convoyId)).push(npc); }
   }
   for (const [cid, members] of convoyGroups) {
-    let threat = null;
-    for (const m of members) { const f = engageTarget(m, players, nowMs); if (f) { threat = { foe: f, provoked: true }; break; } }
-    if (!threat) { for (const m of members) { const t = findThreat(m, players, nowMs); if (t) { threat = t; break; } } }
+    members.forEach((m) => { m.pincerSide = null; });   // cleared unless re-assigned for a 2-escort crossfire below
+    const threat = convoyFocusTarget(members, players, nowMs);   // ONE shared focus target (weakest reachable enemy)
     const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players) : 'route';
-    convoyPlan.set(cid, { foe: threat && threat.foe, provoked: !!(threat && threat.provoked), stance });
+    const escorts = members.filter((m) => m.combatRole === 'escort' && !(m.combat && m.combat.sunk));
+    // Pincer: 2+ escorts fighting → lock alternating flanks so they catch the foe in a crossfire.
+    if (stance === 'fight' && escorts.length >= 2) escorts.forEach((e, i) => { e.pincerSide = i % 2 === 0 ? 1 : -1; });
+    convoyPlan.set(cid, { foe: threat && threat.foe, provoked: !!(threat && threat.provoked), stance, escorts });
   }
 
   for (const npc of fleet) {
@@ -873,11 +922,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     // with the stance set by RELATIVE STRENGTH: fight if it can hold its own, flee/avoid if outmatched or badly
     // hurt, or just hold the trade lane (route) while a hated stranger lurks beyond ENGAGE_RANGE.
     // Convoy members take the SHARED plan (same foe + stance → unison); solo merchants assess for themselves.
-    let threat, stance;
+    let threat, stance, convoyEscorts = null;
     if (npc.convoyId && convoyPlan.has(npc.convoyId)) {
       const plan = convoyPlan.get(npc.convoyId);
       threat = plan.foe ? { foe: plan.foe, provoked: plan.provoked } : null;
       stance = plan.stance;
+      convoyEscorts = plan.escorts;
       // Every member commits the grudge to the shared foe so its OWN gunnery bears + it gives chase / flees as one.
       if (threat && (stance === 'fight' || stance === 'flee')) markHostile(npc, plan.foe.id, nowMs);
     } else {
@@ -892,18 +942,22 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       // edge; the grudge lapses (GIVE_UP_RANGE / AGGRO_MS) and it returns to trade once the foe breaks off.
       if (stance === 'fight' && !threat.provoked) markHostile(npc, threat.foe.id, nowMs);
       npc.engaged = true;
-      // Convoy roles: when the convoy FIGHTS, the armed ESCORT engages while the cargo TRADERS evade (the escort
-      // covers them — a real convoy screen); when it FLEES, everyone runs. A lone trader / escort just does the
-      // group stance. (E0 keeps the EVADE simple — flat-out away; E3 adds true interposition / screening.)
-      const evade = stance === 'flee' || (npc.convoyId && npc.combatRole === 'trader' && stance === 'fight');
+      // Convoy roles: when the convoy FIGHTS, the armed ESCORT engages while the cargo TRADERS evade. E3 SCREENS —
+      // a trader tucks behind its escort (escort interposed) rather than just running flat-out; when the convoy
+      // FLEES, everyone runs together (escort covering with parting shots).
+      const screening = npc.convoyId && npc.combatRole === 'trader' && stance === 'fight';
+      const evade = stance === 'flee' || screening;
       npc.fleeing = evade;
-      desired = evade ? escapeHeading(npc, foe, wind, ph) : engageHeading(npc, foe, wind, ph);
-      if (npc.fleeing) {
-        // Imperfect helmsman under pressure: a slowly-drifting heading error around the optimal escape line, scaled
-        // by skill — a panicky trader wanders badly (easy to run down), a veteran flees on a clean line. CATCH-UP
-        // lever, not a stat nerf (hull/sails unchanged).
+      if (screening) {
+        desired = convoyScreenHeading(npc, foe, convoyEscorts || [], wind, ph);
+      } else if (evade) {
+        // Imperfect helmsman under pressure: a skill-scaled wobble around the optimal escape line — a panicky trader
+        // wanders badly (easy to run down), a veteran flees clean. CATCH-UP lever, not a stat nerf.
+        desired = escapeHeading(npc, foe, wind, ph);
         npc.fleeWander = (npc.fleeWander || 0) * 0.96 + (Math.random() - 0.5) * fleeWanderAmp(npcSkill(npc));
         desired = (desired + npc.fleeWander + 360) % 360;
+      } else {
+        desired = engageHeading(npc, foe, wind, ph);
       }
     } else {
       npc.engaged = false; npc.fleeing = false;   // no threat (or watching from afar) → sail the trade route
@@ -1083,5 +1137,6 @@ module.exports = {
     npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,
     chooseNpcShot, foeMastFrac, RAKE_CONE, RAKE_SKILL,
+    convoyFocusTarget, convoyScreenHeading, SCREEN_DIST, CONVOY_DOUBLE_ESCORT,
   },
 };

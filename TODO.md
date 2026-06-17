@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* Now, I'd you to plan a way to expand the realism of the NPC combat behavior (either individually or at the convoy level)... both the combat stance... but also perhaps fleshing out different tactics that might be used... ways of using the wind, etc... that might add to the feeling of realism and an opponent with strategy. How can we enrich this? Ask me any questions you want.
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make pinace buoyance more responsive

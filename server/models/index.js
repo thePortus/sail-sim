@@ -48,8 +48,12 @@ db.ensureColumns = async () => {
     try {
       await qi.addColumn('users', name, spec);
       console.log(`[db] added column users.${name}`);
-    } catch {
-      /* already exists (or DB unreachable) — a genuinely missing column surfaces at query time */
+    } catch (err) {
+      // "already exists" is the normal idempotent case (swallow). Anything else (no ALTER grant, table missing,
+      // type clash) would otherwise hide as an "Unknown column" at query time — so LOG it. Best-effort detection
+      // across dialects via the message.
+      const m = String(err && err.message || '');
+      if (!/exist|duplicate/i.test(m)) { console.warn(`[db] ensureColumns: could not add users.${name}: ${m}`); }
     }
   }
 };

@@ -290,6 +290,9 @@ export class TerrainService {
       this.clipmapObserver = null;
     }
     if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
+    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
+    this.clipHeightReuploadTimers = [];
+    this.clipHeightData = null;
     if (this.clipmap) {
       for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
       this.clipmap.dispose();
@@ -2927,6 +2930,14 @@ export class TerrainService {
       : null;
   }
 
+  // The decoded height data is kept so we can RE-UPLOAD it to the GPU a few times after creation: on a WebGPU
+  // cold start the initial R32F upload occasionally lands empty (silent — no error), which leaves the terrain
+  // displacing to sea level (invisible) AND the ocean reading zero depth (uniformly shallow, seabed showing) while
+  // scatter — fed by the CPU heightfield — stays correct. Re-uploading once the device is warm self-heals it in
+  // ~1 s with no page refresh, and is harmless when the first upload already succeeded. Freed after the last pass.
+  private clipHeightData: Float32Array | null = null;
+  private clipHeightReuploadTimers: ReturnType<typeof setTimeout>[] = [];
+
   private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
     if (this.clipHeightTex || !this.heightfield) { return; }
     const minE = m.minElevation ?? 0, maxE = m.maxElevation ?? m.targetPeakElevation;
@@ -2944,6 +2955,16 @@ export class TerrainService {
     this.clipWBounds = new Vector4(m.worldBounds.minX, m.worldBounds.minZ,
       m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
     this.clipTexSize = new Vector2(m.width, m.height);
+
+    // Defensive re-uploads against the cold-start upload race (see field note). Once warm these are no-ops.
+    this.clipHeightData = data;
+    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
+    this.clipHeightReuploadTimers = [600, 2000, 5000].map((ms, i, arr) => setTimeout(() => {
+      if (this.clipHeightTex && this.clipHeightData) {
+        try { this.clipHeightTex.update(this.clipHeightData); } catch { /* device busy → next pass retries */ }
+      }
+      if (i === arr.length - 1) { this.clipHeightData = null; }   // free after the final pass
+    }, ms));
   }
 
   // ── Coastal grading ───────────────────────────────────────────────────────

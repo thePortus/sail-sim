@@ -4,7 +4,6 @@
 
 * reduced crew slows reload speed of cannons... NPCs will use bar shot too...
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
-* revisit landscape not loading (losing the landscape loading race)
 * make pinace buoyance more responsive
 * make salvage crate asset
 * hide labels in photo mode

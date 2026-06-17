@@ -142,6 +142,8 @@ export class MultiplayerService {
   purchasedShip = signal<string | null>(null);
   // Last shipwright rejection reason (transient; the shipwright panel surfaces it).
   shipError    = signal<string | null>(null);
+  /** Last Governor's-Mansion pardon rejection reason (transient; the governor panel surfaces it). null = ok/cleared. */
+  pardonError  = signal<string | null>(null);
   /** Last tavern-recruit rejection reason (transient; the tavern panel surfaces it). null = ok/cleared. */
   recruitError = signal<string | null>(null);
   // Phase 3 — discovery: visited-town ledger, current trade rumour, and the town to beacon on the minimap.
@@ -293,6 +295,12 @@ export class MultiplayerService {
 
   /** Shipwright: ask the server to buy/commission a vessel (validated server-side: docked, gold/admin,
    *  cargo fits). On success the server sends a fresh wallet + a `ship_bought` that drives the in-world swap. */
+  /** Petition the docked town's nation to restore (buy back) negative standing. Server-authoritative + costly. */
+  petitionPardon(townId: string): void {
+    this.pardonError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'petition_pardon', townId }));
+  }
+
   buyShip(slug: string): void {
     this.shipError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ship_buy', slug }));
@@ -507,6 +515,7 @@ export class MultiplayerService {
     this.ownedShip.set('pinnace');
     this.purchasedShip.set(null);
     this.shipError.set(null);
+    this.pardonError.set(null);
     this.salvageToast.set(null);
     this.salvageService.clear();
   }
@@ -738,6 +747,12 @@ export class MultiplayerService {
       // (keep the readout exact) + the per-faction deltas (for the toast).
       if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
       this.repToast.set({ deltas: (msg.deltas && typeof msg.deltas === 'object') ? msg.deltas as Record<string, number> : {}, reason: String(msg.reason ?? '') });
+
+    } else if (msg.type === 'pardon_ok') {
+      this.pardonError.set(null);   // standing already updated by the reputation_changed above
+
+    } else if (msg.type === 'pardon_error') {
+      this.pardonError.set(String(msg.reason ?? 'failed'));
 
     } else if (msg.type === 'ledger') {
       // Full discovered-towns ledger (on connect).

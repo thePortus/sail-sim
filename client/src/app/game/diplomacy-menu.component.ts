@@ -1,7 +1,7 @@
 import { Component, EventEmitter, Output, computed, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { MultiplayerService } from '../sailing/services/multiplayer.service';
-import { FACTIONS } from '../sailing/faction.config';
+import { FACTIONS, reputationTier } from '../sailing/faction.config';
 
 /**
  * Diplomacy panel (Diplomacy module D4): the full inter-faction political map — each nation's WARS and ALLIANCES
@@ -28,7 +28,8 @@ import { FACTIONS } from '../sailing/faction.config';
             <div class="dp-nrow">
               <span class="dp-swatch" [style.background]="n.color"></span>
               <span class="dp-name">{{ n.name }}</span>
-              <span class="dp-standing" [class.pos]="n.standing > 0" [class.neg]="n.standing < 0">{{ n.standingLabel }}</span>
+              <span class="dp-standing" [class.pos]="n.tone === 'pos'" [class.neg]="n.tone === 'neg'"
+                    [title]="n.standingTitle">{{ n.standingLabel }}</span>
             </div>
             <div class="dp-rels">
               @if (n.enemies.length) {
@@ -95,7 +96,13 @@ export class DiplomacyMenuComponent {
       const enemies = FACTIONS.filter((o) => o.id !== f.id && row[o.id] === 'war').map((o) => ({ id: o.id, name: o.name, color: o.color }));
       const allies  = FACTIONS.filter((o) => o.id !== f.id && row[o.id] === 'alliance').map((o) => ({ id: o.id, name: o.name, color: o.color }));
       const v = Math.round(rep[f.id] ?? 0);
-      return { id: f.id, name: f.name, color: f.color, standing: v, standingLabel: v === 0 ? 'Neutral' : (v > 0 ? `+${v}` : String(v)), enemies, allies };
+      const tier = reputationTier(v);
+      return {
+        id: f.id, name: f.name, color: f.color, standing: v,
+        standingLabel: tier.label, tone: tier.tone,
+        standingTitle: `Standing ${v > 0 ? '+' : ''}${v}`,   // exact number on hover
+        enemies, allies,
+      };
     });
   });
 }

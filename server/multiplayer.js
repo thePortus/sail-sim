@@ -528,10 +528,13 @@ function sendWallet(p) {
 // on a sink), lose a little with its ALLIES (you struck their friend), and GAIN rep with its WAR enemies (more
 // on a sink — you're hurting their foe). Tiers scale hit→sink→capture. `factionRep` is clamped to ±REP_CLAMP.
 const REP_CLAMP = 100;
+// Attacking faction V's shipping: V (victim) + V's allies turn cold; V's WAR enemies — and now THEIR allies
+// (enemyAlly) — warm to you. The enemy/enemyAlly gains are the deliberate "earn back your standing" lever:
+// privateering against a nation's foes is a real path to rehabilitate a bad reputation with that nation.
 const REP_TIERS = {
-  attack:  { victim: -2,  ally: -1, enemy: +1  },   // a connecting round/bar shot on a merchant
-  sink:    { victim: -15, ally: -6, enemy: +8  },   // sending one to the bottom
-  capture: { victim: -20, ally: -8, enemy: +12 },   // CAPTURE HOOK — no gameplay yet; a future board-and-take calls this tier
+  attack:  { victim: -2,  ally: -1, enemy: +2,  enemyAlly: +1 },   // a connecting round/bar shot on a merchant
+  sink:    { victim: -15, ally: -6, enemy: +12, enemyAlly: +5 },   // sending one to the bottom
+  capture: { victim: -20, ally: -8, enemy: +16, enemyAlly: +7 },   // CAPTURE HOOK — a future board-and-take calls this tier
 };
 const clampRep = (v) => (v < -REP_CLAMP ? -REP_CLAMP : (v > REP_CLAMP ? REP_CLAMP : v));
 
@@ -548,13 +551,45 @@ function awardPiracyRep(shooter, victimFaction, tier) {
   const deltas = {};
   const bump = (fid, d) => { if (!d) return; deltas[fid] = (deltas[fid] || 0) + d; };
   bump(victimFaction, t.victim);
-  for (const a of diplomacy.alliesOf(victimFaction)) bump(a, t.ally);
-  for (const e of diplomacy.enemiesOf(victimFaction)) bump(e, t.enemy);
+  const victimAllies = new Set(diplomacy.alliesOf(victimFaction));
+  for (const a of victimAllies) bump(a, t.ally);
+  const enemies = diplomacy.enemiesOf(victimFaction);
+  for (const e of enemies) bump(e, t.enemy);
+  // The allies of V's enemies also warm to you — you struck a common foe (smaller bump). Skip V itself and V's
+  // own allies so the goodwill never contradicts the cold shoulder above.
+  if (t.enemyAlly) {
+    const enemySet = new Set(enemies);
+    for (const e of enemies) {
+      for (const a of diplomacy.alliesOf(e)) {
+        if (a === victimFaction || victimAllies.has(a) || enemySet.has(a)) continue;
+        bump(a, t.enemyAlly);
+      }
+    }
+  }
   for (const [fid, d] of Object.entries(deltas)) rep[fid] = clampRep((rep[fid] || 0) + d);
   if (shooter.ws && shooter.ws.readyState === 1) {
     shooter.ws.send(JSON.stringify({ type: 'reputation_changed', reason: tier, deltas, factionRep: rep }));
   }
   return deltas;
+}
+
+// ── Trade reputation: relieving a town's shortage earns goodwill with its nation ──────────────────────────────
+const REP_TRADE_K   = 0.7;   // goodwill per unit sold, at full scarcity (level→0)
+const REP_TRADE_MAX = 8;     // cap per transaction (a fat sale can't vault your standing in one go)
+// Buying a pardon at the Governor's Mansion / Mayor's House: restore NEGATIVE standing toward neutral (never
+// above 0 — goodwill must be earned). Deliberately costly so it's a last resort, not a substitute for good conduct.
+const PARDON_STEP          = 20;    // max points restored per petition
+const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt petition ≈ 2 800g)
+
+/** Award `gain` standing with `factionId` to `player` and push the live readout. Returns the delta map (or null). */
+function awardFactionRep(player, factionId, gain, reason) {
+  if (!player || player.isNpc || !factions.isFaction(factionId) || gain <= 0) return null;
+  player.factionRep = factions.normalizeRep(player.factionRep);
+  player.factionRep[factionId] = clampRep((player.factionRep[factionId] || 0) + gain);
+  if (player.ws && player.ws.readyState === 1) {
+    player.ws.send(JSON.stringify({ type: 'reputation_changed', reason, deltas: { [factionId]: gain }, factionRep: player.factionRep }));
+  }
+  return { [factionId]: gain };
 }
 
 /** Record that this player has seen a town's market (specialty + last-seen prices + day) in their discovery
@@ -1277,13 +1312,62 @@ function attachMultiplayer(server) {
         // so the client never sees gold the server didn't durably record (money safety).
         const me = players.get(id);
         if (me) {
+          const townId = String(msg.townId ?? ''), goodId = String(msg.goodId ?? '');
+          // PRE-sale snapshot: selling a town one of its NEEDS (a consumed good it's short of) earns goodwill with
+          // its nation. Captured before the sale (which itself relieves the shortage), scaled by how scarce it was.
+          let repFid = null, scarcity = 0;
+          if (msg.type === 'trade_sell') {
+            const town = economy.getTown(townId);
+            if (town && town.faction && factions.isFaction(town.faction)) {
+              const g = (economy.marketFor(townId)?.goods || []).find((x) => x.goodId === goodId);
+              if (g && g.role === 'consumed') { repFid = town.faction; scarcity = Math.max(0, 1 - (g.level ?? 1)); }
+            }
+          }
           const apply = msg.type === 'trade_buy' ? economy.applyBuy : economy.applySell;
-          const r = apply(me, me.authPose, String(msg.townId ?? ''), String(msg.goodId ?? ''), msg.qty);
+          const r = apply(me, me.authPose, townId, goodId, msg.qty);
           if (r.ok) {
-            saveEconomyState(me).then(() => { sendMarket(me, String(msg.townId ?? '')); sendWallet(me); });
+            if (repFid && scarcity > 0) {
+              const qtySold = Math.max(0, Math.floor(Number(r.qty ?? msg.qty)) || 0);   // atomic fill → full qty on ok
+              const gain = Math.min(REP_TRADE_MAX, Math.round(qtySold * scarcity * REP_TRADE_K));
+              awardFactionRep(me, repFid, gain, 'trade');
+            }
+            saveEconomyState(me).then(() => { sendMarket(me, townId); sendWallet(me); });
           } else {
             sendWallet(me);   // authoritative correction
             if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'trade_error', reason: r.reason }));
+          }
+        }
+
+      } else if (msg.type === 'petition_pardon') {
+        // Buy back NEGATIVE standing with the docked town's nation at its Governor's Mansion / Mayor's House.
+        // Server-authoritative: must be docked at one of that nation's towns, standing must be below neutral,
+        // and you must afford the (costly) fee. Restores toward 0 only — positive standing is earned, not bought.
+        const me = players.get(id);
+        if (me) {
+          const townId = String(msg.townId ?? '');
+          const town = economy.getTown(townId);
+          const fid = town && town.faction;
+          const err = (reason) => { if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'pardon_error', reason })); };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { err('not_docked'); }
+          else if (!fid || !factions.isFaction(fid)) { err('no_faction'); }
+          else {
+            me.factionRep = factions.normalizeRep(me.factionRep);
+            const cur = me.factionRep[fid] || 0;
+            if (cur >= 0) { err('not_needed'); }   // standing already neutral-or-better — nothing to pardon
+            else {
+              const restore = Math.min(PARDON_STEP, -cur);                 // never above neutral
+              const cost = isStaff(me) ? 0 : restore * PARDON_GOLD_PER_POINT;
+              if (!isStaff(me) && (me.gold | 0) < cost) { err('no_gold'); }
+              else {
+                if (!isStaff(me)) me.gold = (me.gold | 0) - cost;
+                me.factionRep[fid] = clampRep(cur + restore);
+                saveEconomyState(me).then(() => sendWallet(me));            // persist gold + rep (money safety)
+                if (me.ws.readyState === 1) {
+                  me.ws.send(JSON.stringify({ type: 'reputation_changed', reason: 'pardon', deltas: { [fid]: restore }, factionRep: me.factionRep }));
+                  me.ws.send(JSON.stringify({ type: 'pardon_ok', townId, faction: fid, restored: restore, cost }));
+                }
+              }
+            }
           }
         }
 
@@ -1501,6 +1585,46 @@ function attachMultiplayer(server) {
               broadcastCrew(targetId, target, players); // everyone's crew HUD/scaling updates
               sysReply(target.ws, `Your crew has been brought back to full strength (${target.crew}) by the admins.`);
               sysReply(me.ws, `Re-crewed "${name}" to ${target.crew}/${target.maxCrew}.`);
+            }
+          }
+
+        } else if (text.startsWith('/reputation')) {
+          // /reputation "<player>"                  → clear all NEGATIVE standings to neutral (keep the good ones)
+          // /reputation "<player>" <faction> <value> → set that nation's standing outright (admin override)
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may adjust reputation.'); }
+          else {
+            const parsed = parseTargetAndRest(text.slice('/reputation'.length).trim());
+            const name = parsed?.target;
+            let target = null, targetId = null;
+            for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
+            if (!name || !target) { sysReply(me.ws, `No online player named "${name}". Usage: /reputation "<player>" [<faction> <value>]`); }
+            else {
+              target.factionRep = factions.normalizeRep(target.factionRep);
+              const rest = (parsed.rest || '').trim();
+              let note = null;
+              if (!rest) {
+                let cleared = 0;
+                for (const fid of factions.factionIds()) { if (target.factionRep[fid] < 0) { target.factionRep[fid] = 0; cleared++; } }
+                note = `Cleared ${cleared} negative standing(s) for "${name}".`;
+              } else {
+                const [fArg, vArg] = rest.split(/\s+/);
+                const fid = String(fArg || '').toLowerCase();
+                const val = Math.round(Number(vArg));
+                if (!factions.isFaction(fid) || !Number.isFinite(val)) {
+                  sysReply(me.ws, `Usage: /reputation "<player>" [<faction> <value>]  (factions: ${factions.factionIds().join(', ')})`);
+                } else {
+                  target.factionRep[fid] = clampRep(val);
+                  note = `Set ${name}'s ${factions.factionName(fid)} standing to ${target.factionRep[fid]}.`;
+                }
+              }
+              if (note) {
+                saveEconomyState(target);   // persist the new rep map
+                if (target.ws.readyState === 1) {
+                  target.ws.send(JSON.stringify({ type: 'reputation_changed', reason: 'admin', deltas: {}, factionRep: target.factionRep }));
+                }
+                sysReply(me.ws, note);
+              }
             }
           }
 

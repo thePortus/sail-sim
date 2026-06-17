@@ -46,6 +46,7 @@ import { HelpMenuComponent }       from '../sailing/components/help-menu/help-me
 import { TraderMenuComponent }     from './trader-menu.component';
 import { ShipwrightMenuComponent } from './shipwright-menu.component';
 import { TavernMenuComponent } from './tavern-menu.component';
+import { GovernorMenuComponent } from './governor-menu.component';
 import { DiplomacyMenuComponent } from './diplomacy-menu.component';
 
 import { Vessel } from '../sailing/models';
@@ -56,7 +57,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, DiplomacyMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -151,6 +152,9 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
               <button class="dock-opt" (click)="onTavern()">Tavern</button>
+              @if (town.faction) {
+                <button class="dock-opt" (click)="onGovernor()">{{ town.tier === 'capital' ? "Governor's Mansion" : "Mayor's House" }}</button>
+              }
               <button class="dock-cast" (click)="onCastOff()">Cast Off</button>
             </div>
           } @else if (vesselService.docking()) {
@@ -186,6 +190,11 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
         <!-- Tavern panel (opened from the dock menu's Tavern button) -->
         @if (tavernOpen()) {
           <app-tavern-menu (close)="tavernOpen.set(false)" />
+        }
+
+        <!-- Governor's Mansion / Mayor's House (opened from the dock menu) — buy back bad standing -->
+        @if (governorOpen() && harborService.dockable(); as govTown) {
+          <app-governor-menu [town]="govTown" [admin]="isAdmin" (close)="governorOpen.set(false)" />
         }
 
         <!-- Diplomacy panel (opened from the Ship's Hold or the K key) — faction relations + your standing -->
@@ -407,6 +416,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   tradeMenuOpen = signal<boolean>(false);  // the trader panel (opened from the town menu's Trade button)
   shipwrightOpen = signal<boolean>(false); // the shipwright panel (opened from the town menu's Shipwright button)
   tavernOpen = signal<boolean>(false);     // the tavern panel (opened from the town menu's Tavern button — recruit crew)
+  governorOpen = signal<boolean>(false);   // the Governor's Mansion / Mayor's House panel (buy back bad standing)
   inventoryOpen = signal<boolean>(false);  // the Ship's Hold panel (I / Tab) — viewable anytime
   diplomacyOpen = signal<boolean>(false);  // the Diplomacy panel (K / Ship's Hold button) — faction relations + standing
   salvageNotice = signal<string | null>(null);   // transient "Salvaged: …" toast after collecting a crate
@@ -589,17 +599,19 @@ export class GameComponent implements AfterViewInit, OnDestroy {
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
           if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
           if (this.tavernOpen()) this.tavernOpen.set(false);
+          if (this.governorOpen()) this.governorOpen.set(false);
         });
       }
     });
 
-    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright + tavern panels too — they live "inside" it.
+    // Closing the town menu (Cast Off, or any path) closes the trader + shipwright + tavern + governor panels too.
     effect(() => {
       if (!this.dockMenuOpen()) {
         untracked(() => {
           if (this.tradeMenuOpen()) { this.tradeMenuOpen.set(false); this.multiplayerService.closeTrade(); }
           if (this.shipwrightOpen()) this.shipwrightOpen.set(false);
           if (this.tavernOpen()) this.tavernOpen.set(false);
+          if (this.governorOpen()) this.governorOpen.set(false);
         });
       }
     });
@@ -965,6 +977,12 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   }
 
   /** Dock action: open the tavern (recruit crew lost to grapeshot). The panel reads the live crew count. */
+  /** Dock action: open the Governor's Mansion / Mayor's House (buy back bad standing with the town's nation). */
+  onGovernor(): void {
+    this.multiplayerService.pardonError.set(null);
+    this.governorOpen.set(true);
+  }
+
   onTavern(): void {
     this.multiplayerService.recruitError.set(null);
     this.tavernOpen.set(true);

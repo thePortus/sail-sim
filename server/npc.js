@@ -65,7 +65,27 @@ const pick = (a) => a[Math.floor(Math.random() * a.length)];
 // Fleet size scales with the number of towns. Bumped (8–15 → 11–20, 0.25 → 0.33/town) to offset the
 // wind-bound merchants now sailing ~40% slower + tacking upwind, so overall trade throughput holds up.
 function targetFleet(townCount) { return Math.max(11, Math.min(20, Math.round(townCount * 0.5))); }
-function npcCount(players) { let n = 0; for (const [, p] of players) if (p.isNpc) n++; return n; }
+
+// ── Convoys ───────────────────────────────────────────────────────────────────────────────────────────────
+// Some "fleet slots" spawn as a CONVOY of 2–3 merchants that travel together (escorts trail the leader in
+// formation), share threats (one attacked → all hostile), flee or fight in UNISON, and weigh their COMBINED
+// strength when sizing up a foe. A convoy counts as ONE slot toward the fleet target (npcCount), so convoys
+// don't inflate the world's ship count.
+const CONVOY_CHANCE      = 0.22;   // fraction of new fleet slots that spawn as a convoy rather than a lone trader
+const CONVOY_MIN         = 2;      // smallest convoy
+const CONVOY_MAX         = 3;      // largest convoy
+const CONVOY_SPACING     = 24;     // world units between formation slots
+const CONVOY_SQUAD_RANGE = 2500;   // a player's squadron-mate only reinforces the threat if within this of the convoy
+
+/** Fleet-slot count: each solo merchant is one slot, each distinct convoy is ONE slot (regardless of 2–3 ships). */
+function npcCount(players) {
+  let solo = 0; const convoys = new Set();
+  for (const [, p] of players) {
+    if (!p.isNpc) continue;
+    if (p.convoyId) convoys.add(p.convoyId); else solo++;
+  }
+  return solo + convoys.size;
+}
 
 /** Heading (deg, atan2(x,z) convention) from a→b. */
 function headingTo(ax, az, bx, bz) { return (Math.atan2(bx - ax, bz - az) * 180 / Math.PI + 360) % 360; }
@@ -289,6 +309,82 @@ function combatStance(npc, foe, provoked) {
   return (dx * dx + dz * dz) <= ENGAGE_RANGE * ENGAGE_RANGE ? 'fight' : 'route';
 }
 
+// ── Convoy tactics ───────────────────────────────────────────────────────────────────────────────────────────
+/** Effective strength of a threat: the foe PLUS any squadron-mates within CONVOY_SQUAD_RANGE of the convoy (a
+ *  far-off squad-mate isn't part of THIS fight). (refX,refZ) = the convoy's centre. Solo foe → just its strength. */
+function threatStrength(foe, players, refX, refZ) {
+  let s = shipStrength(foe);
+  if (foe.squadron) {
+    const R2 = CONVOY_SQUAD_RANGE * CONVOY_SQUAD_RANGE;
+    for (const [, p] of players) {
+      if (p === foe || p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
+      if (p.squadron !== foe.squadron) continue;
+      const dx = p.state.x - refX, dz = p.state.z - refZ;
+      if (dx * dx + dz * dz <= R2) s += shipStrength(p);   // only nearby squad-mates reinforce the threat
+    }
+  }
+  return s;
+}
+
+/** All live members of `npc`'s convoy (including itself), or just [npc] if it sails alone. */
+function convoyMembers(npc, players) {
+  if (!npc.convoyId) return [npc];
+  const out = [];
+  for (const [, p] of players) {
+    if (p.isNpc && p.convoyId === npc.convoyId && !(p.combat && p.combat.sunk)) out.push(p);
+  }
+  return out.length ? out : [npc];
+}
+
+/** ONE stance for a whole convoy, applied to every member so they fight or flee in UNISON, weighing their
+ *  COMBINED strength against the foe (+ its nearby squadron). Badly-hurt convoy (mean hull < FLEE_HEALTH) or an
+ *  outmatched one runs; a provoked convoy that can hold its own fights; an unprovoked one engages only once the
+ *  foe closes on any member. */
+function convoyStance(members, foe, provoked, players) {
+  let cx = 0, cz = 0, ourStr = 0, hullSum = 0;
+  for (const m of members) { cx += m.state.x; cz += m.state.z; ourStr += shipStrength(m); hullSum += hullFraction(m.combat); }
+  cx /= members.length; cz /= members.length;
+  if (hullSum / members.length < FLEE_HEALTH) return 'flee';
+  if (threatStrength(foe, players, cx, cz) / Math.max(1, ourStr) > AVOID_RATIO) return 'flee';
+  if (provoked) return 'fight';
+  const R2 = ENGAGE_RANGE * ENGAGE_RANGE;
+  const near = members.some((m) => {
+    const dx = foe.state.x - m.state.x, dz = foe.state.z - m.state.z; return dx * dx + dz * dz <= R2;
+  });
+  return near ? 'fight' : 'route';
+}
+
+/** The convoy's live leader (routes + trades for the group), or null if it's been sunk/despawned. */
+function convoyLeader(convoyId, players) {
+  for (const [, p] of players) {
+    if (p.isNpc && p.convoyId === convoyId && p.convoyRole === 'leader' && !(p.combat && p.combat.sunk)) return p;
+  }
+  return null;
+}
+
+/** Heading for an ESCORT to hold its formation slot astern-and-abeam of the convoy leader. Returns null (→ route
+ *  normally) when there's no leader — the escort PROMOTES itself to leader so a beheaded convoy keeps trading. */
+function convoyFollowHeading(npc, players) {
+  const leader = convoyLeader(npc.convoyId, players);
+  if (!leader) {
+    // Leader lost. The lowest-slot survivor takes command (deterministic → exactly one new leader); the rest route
+    // for a tick, then fall in behind it next tick.
+    const members = convoyMembers(npc, players);
+    let lead = members[0]; for (const m of members) { if ((m.convoySlot | 0) < (lead.convoySlot | 0)) lead = m; }
+    if (lead === npc) { npc.convoyRole = 'leader'; npc.route = null; }
+    return null;
+  }
+  const hr = leader.state.heading * DEG;
+  const fx = Math.sin(hr), fz = Math.cos(hr);      // leader forward
+  const rx = Math.cos(hr), rz = -Math.sin(hr);     // leader starboard
+  const slot = npc.convoySlot || 1;
+  const side = (slot % 2 === 1) ? 1 : -1;          // alternate sides
+  const lane = Math.ceil(slot / 2);                // how far astern
+  const tx = leader.state.x - fx * CONVOY_SPACING * lane + rx * side * CONVOY_SPACING * 0.7;
+  const tz = leader.state.z - fz * CONVOY_SPACING * lane + rz * side * CONVOY_SPACING * 0.7;
+  return headingTo(npc.state.x, npc.state.z, tx, tz);
+}
+
 /** The live foe this merchant is engaging, or null. Clears the grudge if the target has vanished, sunk, or
  *  opened past GIVE_UP_RANGE (it escaped / was lost) — at which point the merchant resumes its trade route. */
 function engageTarget(npc, players, nowMs) {
@@ -498,21 +594,19 @@ function pickFaction(towns) {
   return ids[ids.length - 1];
 }
 
-function spawnNpc(players, towns) {
-  const faction = pickFaction(towns);
-  // Prefer to spawn at one of its own nation's towns (falls back to anywhere if it holds none yet).
-  const home = towns.filter((t) => t.faction === faction);
-  const town = pick(home.length ? home : towns);
-  const slug = pick(MERCHANT_SLUGS);
+/** Build + register one merchant at `town` (optionally as part of a convoy; `convoy` = {id, role, slot, ox, oz}). */
+function makeMerchant(players, town, faction, slug, convoy) {
   const id = 'npc_' + (++seq);
+  const ox = convoy ? convoy.ox : 0, oz = convoy ? convoy.oz : 0;
+  const sx = town.x + ox, sz = town.z + oz;
   const npc = {
     id, isNpc: true, ws: { readyState: 3 }, faction,
     state: {
-      x: town.x, z: town.z, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
+      x: sx, z: sz, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
       vesselName: 'Merchant ' + pick(MERCHANT_NAMES), vesselSlug: slug, callsign: '',
     },
-    authPose: { x: town.x, z: town.z, heading: 0, speed: 0 },
+    authPose: { x: sx, z: sz, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),
     lastUpdateMs: Date.now(),
     physics: getVesselDef(slug)?.physics || { maxSpeed: 8, accelerationRate: 0.28, minTackAngle: 36, sailAreaFactor: 0.34 },
@@ -523,9 +617,41 @@ function spawnNpc(players, towns) {
     hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
     // Crew: merchants carry a full complement too, so grapeshot attrites it (and slows them) like a player ship.
     maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
+    // Convoy: null = sails alone. Members share convoyId; the 'leader' routes/trades, 'escort's follow in formation.
+    convoyId: convoy ? convoy.id : null, convoyRole: convoy ? convoy.role : null, convoySlot: convoy ? convoy.slot : 0,
   };
   players.set(id, npc);
   return npc;
+}
+
+/** Pick a faction + one of its home towns (or anywhere if it holds none yet). */
+function pickHome(towns) {
+  const faction = pickFaction(towns);
+  const home = towns.filter((t) => t.faction === faction);
+  return { faction, town: pick(home.length ? home : towns) };
+}
+
+/** Spawn ONE fleet slot: usually a lone trader, occasionally (CONVOY_CHANCE) a 2–3 ship convoy. Returns the
+ *  (lead) merchant. The convoy counts as a single slot toward the fleet target (see npcCount). */
+function spawnNpc(players, towns) {
+  if (Math.random() < CONVOY_CHANCE) return spawnConvoy(players, towns);
+  const { faction, town } = pickHome(towns);
+  return makeMerchant(players, town, faction, pick(MERCHANT_SLUGS), null);
+}
+
+function spawnConvoy(players, towns) {
+  const { faction, town } = pickHome(towns);
+  const size = CONVOY_MIN + Math.floor(Math.random() * (CONVOY_MAX - CONVOY_MIN + 1));
+  const convoyId = 'cvy_' + (++seq);
+  let leader = null;
+  for (let i = 0; i < size; i++) {
+    // Stagger the spawn positions so the ships don't stack at the pier.
+    const ox = (i - (size - 1) / 2) * CONVOY_SPACING, oz = (i % 2 ? 1 : -1) * CONVOY_SPACING * 0.5;
+    const m = makeMerchant(players, town, faction, pick(MERCHANT_SLUGS),
+      { id: convoyId, role: i === 0 ? 'leader' : 'escort', slot: i, ox, oz });
+    if (i === 0) leader = m;
+  }
+  return leader;
 }
 
 /** Route the NPC from its current position to `town`. Returns true if a route was found. */
@@ -636,6 +762,23 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
   for (const [, p] of players) if (p.isNpc) fleet.push(p);
   const wind = weatherState.snapshot();   // { windSpeed (m/s), windBearing (deg FROM) } — same wind the player feels
 
+  // CONVOY pre-pass: decide each convoy's SHARED threat + a SINGLE stance, so members react in unison and pool
+  // their strength. Shared threat = the attacker ANY member is fighting (provoked → the whole convoy defends it),
+  // else the nearest nation-hated player any member detects. convoyId → { foe, provoked, stance }.
+  const convoyPlan = new Map();
+  const convoyGroups = new Map();
+  for (const npc of fleet) {
+    if (npc.combat && npc.combat.sunk) continue;
+    if (npc.convoyId) { (convoyGroups.get(npc.convoyId) || convoyGroups.set(npc.convoyId, []).get(npc.convoyId)).push(npc); }
+  }
+  for (const [cid, members] of convoyGroups) {
+    let threat = null;
+    for (const m of members) { const f = engageTarget(m, players, nowMs); if (f) { threat = { foe: f, provoked: true }; break; } }
+    if (!threat) { for (const m of members) { const t = findThreat(m, players, nowMs); if (t) { threat = t; break; } } }
+    const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players) : 'route';
+    convoyPlan.set(cid, { foe: threat && threat.foe, provoked: !!(threat && threat.provoked), stance });
+  }
+
   for (const npc of fleet) {
     // A sunk merchant (salvage already dropped by resolveHit) lingers briefly so its capsize plays, then despawns.
     if (npc.combat && npc.combat.sunk) {
@@ -649,8 +792,18 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     // D3: react to the right threat — a PROVOKED attacker (was fired on) or a nation-HATED player within range —
     // with the stance set by RELATIVE STRENGTH: fight if it can hold its own, flee/avoid if outmatched or badly
     // hurt, or just hold the trade lane (route) while a hated stranger lurks beyond ENGAGE_RANGE.
-    const threat = findThreat(npc, players, nowMs);
-    const stance = threat ? combatStance(npc, threat.foe, threat.provoked) : 'route';
+    // Convoy members take the SHARED plan (same foe + stance → unison); solo merchants assess for themselves.
+    let threat, stance;
+    if (npc.convoyId && convoyPlan.has(npc.convoyId)) {
+      const plan = convoyPlan.get(npc.convoyId);
+      threat = plan.foe ? { foe: plan.foe, provoked: plan.provoked } : null;
+      stance = plan.stance;
+      // Every member commits the grudge to the shared foe so its OWN gunnery bears + it gives chase / flees as one.
+      if (threat && (stance === 'fight' || stance === 'flee')) markHostile(npc, plan.foe.id, nowMs);
+    } else {
+      threat = findThreat(npc, players, nowMs);
+      stance = threat ? combatStance(npc, threat.foe, threat.provoked) : 'route';
+    }
     const foe = (stance === 'fight' || stance === 'flee') ? threat.foe : null;
     if (foe) {
       // Combat helm: jockey for a broadside when fighting (A2), bear off and run when fleeing (A4). BOTH stay
@@ -670,15 +823,23 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       }
     } else {
       npc.engaged = false; npc.fleeing = false;   // no threat (or watching from afar) → sail the trade route
-      if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
-      const wp = npc.route[npc.routeIdx];
-      const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
-      if (dist < ARRIVE_M) {
-        if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
-        continue;
+      // A convoy ESCORT just holds formation on the leader (which routes + trades for the group); a leader/solo
+      // sails its own trade route. A beheaded escort promotes itself (convoyFollowHeading → null) and falls through.
+      let follow = null;
+      if (npc.convoyId && npc.convoyRole === 'escort') { follow = convoyFollowHeading(npc, players); }
+      if (follow != null) {
+        desired = tackedHeading(follow, wind.windBearing, ph.minTackAngle, npc);
+      } else {
+        if (!npc.route) { planTrip(npc, towns); if (!npc.route) continue; }
+        const wp = npc.route[npc.routeIdx];
+        const dx = wp.x - npc.state.x, dz = wp.z - npc.state.z, dist = Math.hypot(dx, dz);
+        if (dist < ARRIVE_M) {
+          if (++npc.routeIdx >= npc.route.length) { onArrive(npc, towns); continue; }   // leg done → trade + next leg
+          continue;
+        }
+        desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
+        desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
       }
-      desired = headingTo(npc.state.x, npc.state.z, wp.x, wp.z);
-      desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
     }
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
@@ -833,5 +994,7 @@ module.exports = {
     escapeHeading, hullFraction, FLEE_HEALTH, GIVE_UP_RANGE,
     shipStrength, hullPoints, repWith, findThreat, combatStance,
     HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
+    spawnConvoy, npcCount, convoyMembers, convoyStance, threatStrength, convoyLeader, convoyFollowHeading,
+    CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
   },
 };

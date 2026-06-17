@@ -2,8 +2,7 @@
 
 # General or Current TODO Items
 
-* have some merchants go in a convoy of 2-3, and will protect each other if one is attacked... or will flee in unison. but will consider their combined strength (and will consider that against combined strength of whole player's squad if that is at play)
-* come up with plan to expand the realism of NPC combat behavior... different strategies... how might we enrich it?
+* Now, I'd you to plan a way to expand the realism of the NPC combat behavior (either individually or at the convoy level)... both the combat stance... but also perhaps fleshing out different tactics that might be used... ways of using the wind, etc... that might add to the feeling of realism and an opponent with strategy. How can we enrich this? Ask me any questions you want.
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make pinace buoyance more responsive

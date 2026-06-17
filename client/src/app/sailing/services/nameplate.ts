@@ -29,12 +29,16 @@ function shadeColor(hex: string, f: number): string {
 }
 
 export function buildNameplate(scene: Scene, name: string, o: NameplateOpts): Mesh {
-  const texW = 1152, texH = 320;
+  const texW = 1152, texH = 320;   // LOGICAL drawing space — all constants below are in these units
   const tinted = !!o.baseColor;
 
+  // Rasterise that logical layout to a SMALLER backing texture (SS<1) to cut VRAM + fill — the plane keeps its
+  // big world size, the text just comes from fewer texels. ctx.scale keeps every drawing constant unchanged.
   // Mipmaps on → the plate stays clean (no shimmer) when the billboard is scaled down at distance.
-  const tex = new DynamicTexture(name + '_tex', { width: texW, height: texH }, scene, true);
+  const SS = 0.667;
+  const tex = new DynamicTexture(name + '_tex', { width: Math.round(texW * SS), height: Math.round(texH * SS) }, scene, true);
   const ctx = tex.getContext() as CanvasRenderingContext2D;
+  ctx.scale(SS, SS);
   ctx.clearRect(0, 0, texW, texH);
 
   const town = o.kind === 'town';

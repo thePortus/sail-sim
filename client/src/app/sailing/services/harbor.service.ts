@@ -225,8 +225,10 @@ export class HarborService {
   private tick(): void {
     this.updateNearestPier();
     if (this.impostorMeshes.length) { this.updateImpostorCamera(); }
-    this.updateTownLabels();   // position/scale the few active signs (cheap; only nearby towns carry one)
-    if ((this.frame++ % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); }
+    const f = this.frame++;
+    // Towns are STATIC, so their signs' scale/position drift slowly with the camera — refresh at ~15 Hz, not 60.
+    if ((f & 3) === 0) { this.updateTownLabels(); }
+    if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); }
   }
 
   /** Build a town's floating sign when the player nears it; drop it again once well past (hysteresis). */

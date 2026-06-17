@@ -86,6 +86,7 @@ interface OtherPlayerEntry extends OtherPlayer {
   // impostored so a spyglass can still read a distant ship's name + nationality. Positioned each frame.
   label?:          Mesh | null;
   mastTop?:        number;   // height (m) of the masthead above the hull origin — label floats above THIS (tall brig vs short pinnace)
+  labelScale?:     number;   // cached label scale; recomputed ~15 Hz (distance changes slowly), reused for the per-frame position
 }
 
 @Injectable({ providedIn: 'root' })
@@ -240,7 +241,7 @@ export class MultiplayerService {
   private readonly LABEL_WIDTH  = 44;    // base plane size — only the NEARBY ships carry a label now, so make it big & legible
   private readonly LABEL_HEIGHT = 12.2;  // keep ≈ texW/texH (1152/320 = 3.6) so the plate isn't stretched
   private readonly LABEL_GAP    = 3;     // clearance above THIS ship's masthead (label bottom = mastTop + this; see mastTop)
-  private readonly LABEL_MAX_DIST = 1800;  // beyond this the ship's label is NOT drawn at all (far ships read as plain hulls)
+  private readonly LABEL_MAX_DIST = 1080;  // beyond this the ship's label is NOT drawn at all (far ships read as plain hulls)
   // Distance-softened label scaling. A raw billboard shrinks ∝ 1/d (true perspective) — tiny far off; holding the
   // apparent size perfectly constant (scale ∝ d) loses all sense of range. So we take a POWER between:
   // scale = clamp((d/NEAR)^POW, 1, FAR). POW≈0.72 keeps a closer=bigger range cue but a GENTLE falloff so a ship near
@@ -248,6 +249,7 @@ export class MultiplayerService {
   private readonly LABEL_SCALE_NEAR = 200;   // ≤ this distance → base size (perspective makes it grow as you approach)
   private readonly LABEL_SCALE_POW  = 0.72;  // 1 = constant apparent size; 0 = full perspective. Higher → bigger far out
   private readonly LABEL_SCALE_FAR  = 13;    // scale cap (not reached within LABEL_MAX_DIST)
+  private _lblFrame = 0;                      // per-frame counter; label distance/scale recomputes every 4th frame
 
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
@@ -414,6 +416,7 @@ export class MultiplayerService {
       this.recoilTickFn = () => this.sceneService.span('mp', () => {
         const dt = Math.min(scene.getEngine().getDeltaTime() * 0.001, 0.05);
         const renderAt = performance.now() - this.INTERP_DELAY_MS;
+        this._lblFrame++;   // drives the ~15 Hz label distance/scale throttle (position still updates every frame)
         for (const entry of this.players.values()) {
           this.tickRemoteMotion(entry, renderAt, dt);
           this.tickRecoil(entry, dt);
@@ -1147,19 +1150,27 @@ export class MultiplayerService {
     // impostor — a spyglass can then still read the ship's name + nationality. Floats at the masthead; visible
     // within the view radius. (Slight loss of pitch/roll bob vs a child, but a steady plate reads better.)
     if (entry.label) {
-      const cam = this.sceneService.camera;
-      const d = cam ? Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) : 0;
-      const within = !cam || d <= this.LABEL_MAX_DIST;   // only NEARBY ships get a label; far ones read as plain hulls
-      if (within) {
-        // Soften the perspective shrink (closer = bigger, but distant labels fall off gently — see LABEL_SCALE_*).
-        const s = Math.min(this.LABEL_SCALE_FAR, Math.max(1, Math.pow(d / this.LABEL_SCALE_NEAR, this.LABEL_SCALE_POW)));
-        entry.label.scaling.set(s, s, s);
+      // Distance, scale and visibility change slowly → recompute only every 4th frame (the trig + pow is the
+      // per-ship cost). The POSITION still updates every frame below so the plate stays glued to the moving hull.
+      if ((this._lblFrame & 3) === 0) {
+        const cam = this.sceneService.camera;
+        const d = cam ? Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) : 0;
+        const within = !cam || d <= this.LABEL_MAX_DIST;   // only NEARBY ships get a label; far ones read as plain hulls
+        if (within) {
+          // Soften the perspective shrink (closer = bigger, but distant labels fall off gently — see LABEL_SCALE_*).
+          const s = Math.min(this.LABEL_SCALE_FAR, Math.max(1, Math.pow(d / this.LABEL_SCALE_NEAR, this.LABEL_SCALE_POW)));
+          entry.labelScale = s;
+          entry.label.scaling.set(s, s, s);
+        }
+        if (entry.label.isEnabled() !== within) entry.label.setEnabled(within);
+      }
+      if (entry.label.isEnabled()) {
         // Bottom-anchor above THIS ship's masthead (tall brig vs short pinnace). The billboard scales about its
         // centre, so raise the centre by half the scaled height to keep the lower edge clear of the rig and sea.
+        const s = entry.labelScale ?? 1;
         const bottom = entry.root.position.y + (entry.mastTop ?? 18) + this.LABEL_GAP;
         entry.label.position.set(entry.dispX, bottom + this.LABEL_HEIGHT * s * 0.5, entry.dispZ);
       }
-      if (entry.label.isEnabled() !== within) entry.label.setEnabled(within);
     }
 
     // Distant-ship LOD: beyond ~½ km swap the full rigged GLB for a cheap azimuthal billboard impostor AND

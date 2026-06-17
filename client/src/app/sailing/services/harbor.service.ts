@@ -102,6 +102,13 @@ export class HarborService {
   /** The town the player is currently close enough to dock at, or null. Read by the HUD/game UI. */
   readonly dockable = signal<TerrainHarbor | null>(null);
 
+  private _hideLabels = false;   // photo mode hides the floating town signs for a clean screenshot
+  /** Photo mode: hide/show the floating town signs (called from the game component's photoMode effect). */
+  setLabelsHidden(hidden: boolean): void {
+    this._hideLabels = hidden;
+    if (hidden) { for (const { plane } of this.townLabels.values()) plane.setEnabled(false); }   // instant hide; the loop restores
+  }
+
   // Floating town signs (same ornate brass plaque as the ship nameplates — see nameplate.ts). Streamed in as
   // the player nears a town and dropped again past LBL_DROP, so only the ~1–2 nearest carry a live billboard.
   // Tinted by the owning nation; a "⚓ NATION CAPITAL/MEDIUM/SMALL" tag under the town name.
@@ -263,6 +270,8 @@ export class HarborService {
     const cam = this.sceneService.camera;
     if (!cam) return;
     for (const { plane, h } of this.townLabels.values()) {
+      if (this._hideLabels) { if (plane.isEnabled()) plane.setEnabled(false); continue; }   // photo mode
+      if (!plane.isEnabled()) plane.setEnabled(true);
       const d = Math.hypot(h.x - cam.position.x, h.z - cam.position.z);
       const s = Math.min(this.LBL_FAR, Math.max(1, Math.pow(d / this.LBL_NEAR, this.LBL_POW)));
       plane.scaling.set(s, s, s);

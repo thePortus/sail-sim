@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* hide labels in photo mode
 * have some merchants go in a convoy of 2-3, and will protect each other if one is attacked... or will flee in unison. but will consider their combined strength (and will consider that against combined strength of whole player's squad if that is at play)
 * come up with plan to expand the realism of NPC combat behavior... different strategies... how might we enrich it?
 * make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)

@@ -252,6 +252,12 @@ export class MultiplayerService {
   private readonly LABEL_SCALE_POW  = 0.72;  // 1 = constant apparent size; 0 = full perspective. Higher → bigger far out
   private readonly LABEL_SCALE_FAR  = 13;    // scale cap (not reached within LABEL_MAX_DIST)
   private _lblFrame = 0;                      // per-frame counter; label distance/scale recomputes every 4th frame
+  private _hideLabels = false;                // photo mode hides the floating nameplates for a clean screenshot
+  /** Photo mode: hide/show the floating ship nameplates (called from the game component's photoMode effect). */
+  setLabelsHidden(hidden: boolean): void {
+    this._hideLabels = hidden;
+    if (hidden) { for (const e of this.players.values()) e.label?.setEnabled(false); }   // instant hide; the loop restores
+  }
 
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
@@ -1170,7 +1176,7 @@ export class MultiplayerService {
       if ((this._lblFrame & 3) === 0) {
         const cam = this.sceneService.camera;
         const d = cam ? Math.hypot(entry.dispX - cam.position.x, entry.dispZ - cam.position.z) : 0;
-        const within = !cam || d <= this.LABEL_MAX_DIST;   // only NEARBY ships get a label; far ones read as plain hulls
+        const within = !this._hideLabels && (!cam || d <= this.LABEL_MAX_DIST);   // nearby ships only; hidden in photo mode
         if (within) {
           // Soften the perspective shrink (closer = bigger, but distant labels fall off gently — see LABEL_SCALE_*).
           const s = Math.min(this.LABEL_SCALE_FAR, Math.max(1, Math.pow(d / this.LABEL_SCALE_NEAR, this.LABEL_SCALE_POW)));

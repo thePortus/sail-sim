@@ -604,6 +604,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       }
     });
 
+    // Photo mode hides the DOM chrome (CSS) AND the 3-D floating nameplates (ship + town) for a clean screenshot.
+    effect(() => {
+      const pm = this.photoMode();
+      this.multiplayerService.setLabelsHidden(pm);
+      this.harborService.setLabelsHidden(pm);
+    });
+
     // Closing the town menu (Cast Off, or any path) closes the trader + shipwright + tavern + governor panels too.
     effect(() => {
       if (!this.dockMenuOpen()) {

@@ -96,7 +96,7 @@ function mastSpeedMult(h) {
 // When the masts zone is shot to 0, a jury-rig repair starts automatically and, after this long,
 // brings the mast back to a fraction of full (a partial fix — full repair still needs a port). The
 // base duration; crew/morale modifiers will scale it later.
-const MAST_REPAIR_MS   = 45000;   // 45 s base time to jury-rig the mast back up
+const MAST_REPAIR_MS   = 60000;   // 60 s base time to jury-rig the mast back up (a demasting should really cost you)
 const MAST_REPAIR_FRAC = 0.5;     // restore to 50 % of max masts HP
 
 // ── Ballistic simulation ──────────────────────────────────────────────────────

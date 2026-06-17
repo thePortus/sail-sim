@@ -353,7 +353,7 @@ function escapeHeading(npc, foeState, wind, ph) {
 // fixed muzzle speed, scatters it for moderate accuracy, and hands the shot to the server's shared adjudicator
 // (same activeShots the player feeds — so the merchant's ball can be dodged exactly like a player's). Everything
 // is in COMBAT world units (HALF_BEAM/G/TRAVEL_SCALE), NOT the GLB-scale cannon offsets in the vessel def.
-const NPC_MUZZLE_V    = Cc.SHOT_TYPES.round.v;  // 55 u/s — NPCs fire solid round shot (anti-hull)
+const NPC_MUZZLE_V    = Cc.SHOT_TYPES.round.v;  // 55 u/s — default round shot (anti-hull); NPCs also mix in bar (anti-rig)
 const FIRE_ARC        = 50;        // deg off pure-beam the target may be for a gun to bear
 const MAX_FIRE_RANGE  = 260;       // world units: don't open fire beyond this (well inside round-shot max reach)
 const NPC_RELOAD_MS   = 4200;      // min ms between a merchant's shots (one aimed ball per reload — deliberately unhurried)
@@ -361,6 +361,26 @@ const NPC_AZ_SPREAD   = 7.5;       // deg: half-width of random bearing scatter 
 const NPC_EL_SPREAD   = 3.5;       // deg: half-width of random elevation scatter (more over/undershoot)
 const MUZZLE_Y        = 2.6;       // gun height above the waterline (world units, ~deck)
 const AIM_Y           = 1.4;       // aim point on the target hull (mid-freeboard)
+// Bar/dismantling shot (anti-rig) — NPCs now mix it in when a real captain would: to bring a foe's MASTS down so
+// it can't flee or give chase. Bar flies slower (≈37 u/s → ~140 u reach), so only choose it within BAR_RANGE.
+const BAR_RANGE       = 130;       // world units: bar's effective reach (well under round's) — don't pick it beyond
+const BAR_CHANCE      = 0.6;       // probability of choosing bar when the tactical case for crippling the rig fits
+
+/** Foe's mast-health fraction (1 if unknown) — bar shot is only worth firing while the target still has a rig. */
+function foeMastFrac(foe) {
+  const c = foe && foe.combat;
+  return (c && c.maxHp && c.maxHp.masts) ? (c.zones.masts / c.maxHp.masts) : 1;
+}
+
+/** Pick the NPC's shot type. Default solid round (anti-hull). Choose BAR (anti-rig) when the case fits: within bar's
+ *  short reach, the foe still has masts worth shooting, AND the merchant either runs for its life (rake the pursuer
+ *  so it can't follow) or simply can't out-sail the foe (slow it down). Probabilistic so plenty of round shot flies. */
+function chooseNpcShot(npc, foe, dist) {
+  if (dist > BAR_RANGE || foeMastFrac(foe) <= 0.15) return 'round';
+  const foeFaster = foe.state && Math.abs(foe.state.speed) > (npc.state.speed || 0) + 0.3;
+  if ((npc.fleeing || foeFaster) && Math.random() < BAR_CHANCE) return 'bar';
+  return 'round';
+}
 
 /** Uniform scatter in [-half, half] degrees, returned in radians. */
 function spreadRad(halfDeg) { return (Math.random() * 2 - 1) * halfDeg * DEG; }
@@ -372,7 +392,7 @@ function spreadRad(halfDeg) { return (Math.random() * 2 - 1) * halfDeg * DEG; }
  * scatter. Speed of the returned velocity stays exactly NPC_MUZZLE_V, so it sits in the round-shot band.
  * Returns world-space { ox, oy, oz, vx, vy, vz }.
  */
-function firingSolution(npc, foeState) {
+function firingSolution(npc, foeState, muzzleV) {
   const hr = npc.state.heading * DEG;
   const sx = Math.cos(hr), sz = -Math.sin(hr);   // starboard (right) unit vector in world XZ
   const dx = foeState.x - npc.state.x, dz = foeState.z - npc.state.z;
@@ -390,7 +410,7 @@ function firingSolution(npc, foeState) {
   // Target world velocity (same dead-reckoning the adjudicator uses).
   const vW = (foeState.speed || 0) * Cc.TRAVEL_SCALE;
   const tvx = Math.sin(foeState.heading * DEG) * vW, tvz = Math.cos(foeState.heading * DEG) * vW;
-  const v = NPC_MUZZLE_V, v2 = v * v, dY = AIM_Y - MUZZLE_Y;
+  const v = muzzleV || NPC_MUZZLE_V, v2 = v * v, dY = AIM_Y - MUZZLE_Y;
 
   // Iterate: lead → range → flight-time → re-lead.
   let tof = dist / (v * 0.97), vh = v, theta = 0, px = foeState.x, pz = foeState.z, R = dist;
@@ -722,10 +742,13 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
     npc.lastUpdateMs = nowMs;
 
     // ── Return fire (A3): when engaged, a gun bears, and the reload is up, hand a leading solution to the
-    // server's shared shot adjudicator. Fires at most one aimed ball per NPC_RELOAD_MS.
-    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= NPC_RELOAD_MS) {
-      const sol = firingSolution(npc, foe.state);
-      if (sol) { fireShot(npc, sol, 'round'); npc.lastShotAt = nowMs; }
+    // server's shared shot adjudicator. The reload SCALES WITH CREW (a thinned crew works the guns slower — the
+    // same crewMul the player feels via getReloadWindow), and the merchant picks round vs bar shot tactically.
+    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= NPC_RELOAD_MS / crewMul) {
+      const dist = Math.hypot(foe.state.x - npc.state.x, foe.state.z - npc.state.z);
+      const shot = chooseNpcShot(npc, foe, dist);
+      const sol = firingSolution(npc, foe.state, Cc.SHOT_TYPES[shot].v);
+      if (sol) { fireShot(npc, sol, shot); npc.lastShotAt = nowMs; }
     }
   }
 }

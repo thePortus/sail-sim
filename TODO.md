@@ -22,6 +22,7 @@
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
 * any way to reduce load times?
+* add forts to town that will fire when super hostile
 * streaming assets has gotten weird, trees move in and out.. can we make them fade in?
 * Plan to make towns or areas "different"... things to see, special marvels... missions?
 * sound is chunking on windows machines still

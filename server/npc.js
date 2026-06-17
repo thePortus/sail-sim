@@ -280,6 +280,24 @@ function repWith(player, faction) {
   return (player && player.factionRep && Number.isFinite(player.factionRep[faction])) ? player.factionRep[faction] : 0;
 }
 
+// ── Role-scaled skill (NPC combat realism E0) ────────────────────────────────────────────────────────────────
+// One `skill` scalar (0 = timid/clumsy lone trader … 1 = veteran convoy escort) modulates the EXISTING combat
+// knobs so a panicky merchant feels nothing like a sharp escort, WITHOUT (yet) any new maneuvers. Set at spawn by
+// role (see makeMerchant). Kept on the fair side — even a veteran scatters its shot and breaks off when truly
+// outmatched, so the player can always out-sail it.
+const SKILL_TRADER_SOLO   = 0.28;   // lone merchant — clumsy, panics early
+const SKILL_TRADER_CONVOY = 0.45;   // a trader emboldened by sailing with an escort
+const SKILL_ESCORT        = 0.9;    // veteran warship escort
+function npcSkill(npc) { return typeof npc.skill === 'number' ? npc.skill : SKILL_TRADER_SOLO; }
+/** Hull fraction at/below which it runs: timid bolts at 50%, a veteran fights down to ~22%. */
+function fleeHealthFor(skill) { return 0.5 - 0.28 * skill; }
+/** How much stronger the foe must be before it breaks off: timid flees at parity, a veteran holds till foe ~60% up. */
+function avoidRatioFor(skill) { return 1.0 + 0.6 * skill; }
+/** Gunnery scatter multiplier: timid sprays (1.5×), a veteran is tight (0.6×) — never zero, so it's still beatable. */
+function aimSpreadMul(skill) { return 1.5 - 0.9 * skill; }
+/** Escape-line wobble amplitude (deg): timid wanders badly (~12°, easy to run down), a veteran flees clean (~3°). */
+function fleeWanderAmp(skill) { return 12 - 9 * skill; }
+
 /** The threat a merchant should react to this tick: its PROVOKED attacker (it was fired on — existing aggro) or,
  *  failing that, the nearest player its nation HATES within DETECT_RANGE. Returns { foe, provoked } or null. */
 function findThreat(npc, players, nowMs) {
@@ -301,9 +319,10 @@ function findThreat(npc, players, nowMs) {
  *  UNPROVOKED (merely hated) one holds its lane and only engages defensively once the player closes to ENGAGE_RANGE
  *  — it won't chase a hated stranger across the sea, but it won't be boarded for free either. */
 function combatStance(npc, foe, provoked) {
-  if (hullFraction(npc.combat) < FLEE_HEALTH) return 'flee';
+  const skill = npcSkill(npc);
+  if (hullFraction(npc.combat) < fleeHealthFor(skill)) return 'flee';
   const ratio = shipStrength(foe) / shipStrength(npc);
-  if (ratio > AVOID_RATIO) return 'flee';                    // they're stronger → keep away / run
+  if (ratio > avoidRatioFor(skill)) return 'flee';           // they're stronger → keep away / run
   if (provoked) return 'fight';                              // attacked + can hold our own → fight back
   const dx = foe.state.x - npc.state.x, dz = foe.state.z - npc.state.z;
   return (dx * dx + dz * dz) <= ENGAGE_RANGE * ENGAGE_RANGE ? 'fight' : 'route';
@@ -341,11 +360,14 @@ function convoyMembers(npc, players) {
  *  outmatched one runs; a provoked convoy that can hold its own fights; an unprovoked one engages only once the
  *  foe closes on any member. */
 function convoyStance(members, foe, provoked, players) {
-  let cx = 0, cz = 0, ourStr = 0, hullSum = 0;
-  for (const m of members) { cx += m.state.x; cz += m.state.z; ourStr += shipStrength(m); hullSum += hullFraction(m.combat); }
+  let cx = 0, cz = 0, ourStr = 0, hullSum = 0, skill = 0;
+  for (const m of members) {
+    cx += m.state.x; cz += m.state.z; ourStr += shipStrength(m); hullSum += hullFraction(m.combat);
+    skill = Math.max(skill, npcSkill(m));   // the escort emboldens the whole convoy → use the bravest member's nerve
+  }
   cx /= members.length; cz /= members.length;
-  if (hullSum / members.length < FLEE_HEALTH) return 'flee';
-  if (threatStrength(foe, players, cx, cz) / Math.max(1, ourStr) > AVOID_RATIO) return 'flee';
+  if (hullSum / members.length < fleeHealthFor(skill)) return 'flee';
+  if (threatStrength(foe, players, cx, cz) / Math.max(1, ourStr) > avoidRatioFor(skill)) return 'flee';
   if (provoked) return 'fight';
   const R2 = ENGAGE_RANGE * ENGAGE_RANGE;
   const near = members.some((m) => {
@@ -520,8 +542,9 @@ function firingSolution(npc, foeState, muzzleV) {
     tof = R / vh;
   }
   // Aim azimuth at the lead point, then scatter both axes (speed magnitude preserved → stays in band).
-  const az = Math.atan2(px - ox, pz - oz) + spreadRad(NPC_AZ_SPREAD);
-  const el = theta + spreadRad(NPC_EL_SPREAD);
+  const sm = aimSpreadMul(npcSkill(npc));   // veteran tight, timid sprays (role-scaled accuracy)
+  const az = Math.atan2(px - ox, pz - oz) + spreadRad(NPC_AZ_SPREAD * sm);
+  const el = theta + spreadRad(NPC_EL_SPREAD * sm);
   const vhs = v * Math.cos(el);
   return { ox, oy: MUZZLE_Y, oz, vx: vhs * Math.sin(az), vy: v * Math.sin(el), vz: vhs * Math.cos(az) };
 }
@@ -594,8 +617,9 @@ function pickFaction(towns) {
   return ids[ids.length - 1];
 }
 
-/** Build + register one merchant at `town` (optionally as part of a convoy; `convoy` = {id, role, slot, ox, oz}). */
-function makeMerchant(players, town, faction, slug, convoy) {
+/** Build + register one merchant at `town`. `convoy` = {id, role:'leader'|'follower', slot, ox, oz} or null.
+ *  `skill` (0..1) + `combatRole` ('trader'|'escort') drive the role-scaled combat behaviour (E0). */
+function makeMerchant(players, town, faction, slug, convoy, skill, combatRole) {
   const id = 'npc_' + (++seq);
   const ox = convoy ? convoy.ox : 0, oz = convoy ? convoy.oz : 0;
   const sx = town.x + ox, sz = town.z + oz;
@@ -617,8 +641,10 @@ function makeMerchant(players, town, faction, slug, convoy) {
     hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
     // Crew: merchants carry a full complement too, so grapeshot attrites it (and slows them) like a player ship.
     maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
-    // Convoy: null = sails alone. Members share convoyId; the 'leader' routes/trades, 'escort's follow in formation.
+    // Convoy: null = sails alone. Members share convoyId; the 'leader' routes/trades, 'follower's hold formation.
     convoyId: convoy ? convoy.id : null, convoyRole: convoy ? convoy.role : null, convoySlot: convoy ? convoy.slot : 0,
+    // E0 combat realism: skill scales the existing knobs; combatRole splits convoy behaviour (escort fights, trader evades).
+    skill: typeof skill === 'number' ? skill : SKILL_TRADER_SOLO, combatRole: combatRole || 'trader',
   };
   players.set(id, npc);
   return npc;
@@ -636,19 +662,24 @@ function pickHome(towns) {
 function spawnNpc(players, towns) {
   if (Math.random() < CONVOY_CHANCE) return spawnConvoy(players, towns);
   const { faction, town } = pickHome(towns);
-  return makeMerchant(players, town, faction, pick(MERCHANT_SLUGS), null);
+  return makeMerchant(players, town, faction, pick(MERCHANT_SLUGS), null, SKILL_TRADER_SOLO, 'trader');
 }
 
 function spawnConvoy(players, towns) {
   const { faction, town } = pickHome(towns);
   const size = CONVOY_MIN + Math.floor(Math.random() * (CONVOY_MAX - CONVOY_MIN + 1));
   const convoyId = 'cvy_' + (++seq);
+  const ESCORT_SLOT = 1;   // one follower is an ARMED escort: a veteran brig that fights to protect the traders
   let leader = null;
   for (let i = 0; i < size; i++) {
     // Stagger the spawn positions so the ships don't stack at the pier.
     const ox = (i - (size - 1) / 2) * CONVOY_SPACING, oz = (i % 2 ? 1 : -1) * CONVOY_SPACING * 0.5;
-    const m = makeMerchant(players, town, faction, pick(MERCHANT_SLUGS),
-      { id: convoyId, role: i === 0 ? 'leader' : 'escort', slot: i, ox, oz });
+    const isEscort = i === ESCORT_SLOT;
+    const slug = isEscort ? 'brig' : pick(MERCHANT_SLUGS);
+    const m = makeMerchant(players, town, faction, slug,
+      { id: convoyId, role: i === 0 ? 'leader' : 'follower', slot: i, ox, oz },
+      isEscort ? SKILL_ESCORT : SKILL_TRADER_CONVOY,
+      isEscort ? 'escort' : 'trader');
     if (i === 0) leader = m;
   }
   return leader;
@@ -812,13 +843,17 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       // edge; the grudge lapses (GIVE_UP_RANGE / AGGRO_MS) and it returns to trade once the foe breaks off.
       if (stance === 'fight' && !threat.provoked) markHostile(npc, threat.foe.id, nowMs);
       npc.engaged = true;
-      npc.fleeing = (stance === 'flee');
-      desired = npc.fleeing ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
+      // Convoy roles: when the convoy FIGHTS, the armed ESCORT engages while the cargo TRADERS evade (the escort
+      // covers them — a real convoy screen); when it FLEES, everyone runs. A lone trader / escort just does the
+      // group stance. (E0 keeps the EVADE simple — flat-out away; E3 adds true interposition / screening.)
+      const evade = stance === 'flee' || (npc.convoyId && npc.combatRole === 'trader' && stance === 'fight');
+      npc.fleeing = evade;
+      desired = evade ? escapeHeading(npc, foe.state, wind, ph) : engageHeading(npc, foe.state, wind, ph);
       if (npc.fleeing) {
-        // Imperfect helmsman under pressure: a slowly-drifting heading error around the optimal escape line.
-        // Any deviation from the best VMG-away heading costs speed-made-good, so a well-sailed chaser on a
-        // clean line gradually closes — a CATCH-UP lever, not a stat nerf (their hull/sails are unchanged).
-        npc.fleeWander = (npc.fleeWander || 0) * 0.96 + (Math.random() - 0.5) * 7;   // smoothed ±~ several °
+        // Imperfect helmsman under pressure: a slowly-drifting heading error around the optimal escape line, scaled
+        // by skill — a panicky trader wanders badly (easy to run down), a veteran flees on a clean line. CATCH-UP
+        // lever, not a stat nerf (hull/sails unchanged).
+        npc.fleeWander = (npc.fleeWander || 0) * 0.96 + (Math.random() - 0.5) * fleeWanderAmp(npcSkill(npc));
         desired = (desired + npc.fleeWander + 360) % 360;
       }
     } else {
@@ -826,7 +861,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
       // A convoy ESCORT just holds formation on the leader (which routes + trades for the group); a leader/solo
       // sails its own trade route. A beheaded escort promotes itself (convoyFollowHeading → null) and falls through.
       let follow = null;
-      if (npc.convoyId && npc.convoyRole === 'escort') { follow = convoyFollowHeading(npc, players); }
+      if (npc.convoyId && npc.convoyRole === 'follower') { follow = convoyFollowHeading(npc, players); }
       if (follow != null) {
         desired = tackedHeading(follow, wind.windBearing, ph.minTackAngle, npc);
       } else {
@@ -996,5 +1031,7 @@ module.exports = {
     HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
     spawnConvoy, npcCount, convoyMembers, convoyStance, threatStrength, convoyLeader, convoyFollowHeading,
     CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
+    npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
+    SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,
   },
 };

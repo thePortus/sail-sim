@@ -2,9 +2,10 @@
 
 # General or Current TODO Items
 
+* Expand list of NPC merchant vessel names
 * Switch to Georgia font
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
-* make pinace buoyance more responsive
+* spawn "pirate" npcs, who will attack player and also NPCs.... never the largest class of ship. And if they sink a ship (no loot crate drops unless it was a player)... a pirate hunter will spawn at a nearby capital and start making their way to engage the pirate. While pirate ships should sail around and attack the player if they get too close, their aggro range should be limited enough that if a player notices a pirate by their label, they can stay outside the aggro range (so aggro range should be a fair bit less than label visibility)
 * make salvage crate asset
 * increase render resolution in spyglass
 * update profile page and update password page (and 404 page with a funny 404)

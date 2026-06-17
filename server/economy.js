@@ -33,6 +33,17 @@ const MIN_STOCK = 1;              // a town never sells its last unit (also avoi
 const SCARCE_FRAC = 0.25;        // a consumed good is "in distress" below this fraction of its priceRef
 const DISTRESS_TRIGGER = 3;      // days a shortage must persist before merchants are dispatched to relieve it
 const NEED_FRAC = 0.85;          // a consumed good is "needed" (a dispatch trigger) below this fraction of priceRef
+// Faction-standing trade perk: your reputation with a town's NATION nudges its prices for YOU only — a trusted
+// trader buys cheaper + sells dearer, a hated one pays through the nose. Capped small (±REP_PRICE_MAX) so it's a
+// perk, not a money printer, and the WORLD economy (NPC trades, stock, treasury) is untouched — only the player's
+// own transaction is scaled. ±100 standing → ±7% on each side.
+const REP_PRICE_MAX = 0.07;
+/** Per-player price multipliers from `standing` (−100..100) with the town's nation: buy ask down + sell bid up when
+ *  liked, the reverse when hated. Neutral (0 / free port) → {1,1}. */
+function repPriceMul(standing) {
+  const t = Math.max(-1, Math.min(1, (standing || 0) / 100));
+  return { ask: 1 - REP_PRICE_MAX * t, bid: 1 + REP_PRICE_MAX * t };
+}
 
 let loaded = false;
 let towns = new Map();            // townId → { id, name, tier, specialty, x, z }
@@ -247,11 +258,12 @@ function intQty(qty) { const n = Math.floor(Number(qty)); return Number.isFinite
  * Buy walks the ask UP as stock drops (limited by stock + actor gold/space); sell walks the bid DOWN as stock
  * rises (limited by town treasury + actor holdings). Returns { ok, cost|proceeds, unit } or { ok:false, reason }.
  */
-function tradeCore(actor, town, goodId, qty, side) {
+function tradeCore(actor, town, goodId, qty, side, priceMul) {
   ensureSeeded();
   const mk = markets.get(town.id);
   const pr = profileFor(town)[goodId];
   if (!mk || !pr) return { ok: false, reason: 'no_town' };
+  const mul = priceMul || { ask: 1, bid: 1 };   // standing-based, player-only (NPCs pass none → neutral)
   const base = goods.basePrice(goodId);
   if (side === 'buy') {
     const stock0 = mk.stock[goodId] ?? 0;
@@ -259,6 +271,7 @@ function tradeCore(actor, town, goodId, qty, side) {
     if (usedSlots(actor.cargo) + goods.goodVolume(goodId) * qty > actor.capacityVol) return { ok: false, reason: 'no_space' };
     let s = stock0, cost = 0;
     for (let i = 0; i < qty; i++) { cost += goods.quote(base, pr.priceRef, s, town.tier).ask; s -= 1; }
+    cost = Math.max(qty, Math.round(cost * mul.ask));   // standing tweak (≥1/unit floor); treasury tracks what's paid
     if (actor.gold < cost) return { ok: false, reason: 'no_gold' };
     actor.gold -= cost; mk.stock[goodId] = s; mk.treasury += cost;
     actor.cargo[goodId] = (actor.cargo[goodId] || 0) + qty;
@@ -270,11 +283,29 @@ function tradeCore(actor, town, goodId, qty, side) {
   if (held < qty) return { ok: false, reason: 'no_goods' };
   let s = mk.stock[goodId] ?? 0, proceeds = 0;
   for (let i = 0; i < qty; i++) { proceeds += goods.quote(base, pr.priceRef, s, town.tier).bid; s += 1; }
+  proceeds = Math.max(0, Math.round(proceeds * mul.bid));   // standing tweak; the town pays the player this from treasury
   if (mk.treasury < proceeds) return { ok: false, reason: 'town_broke' };
   actor.gold += proceeds; mk.stock[goodId] = s; mk.treasury -= proceeds;
   const left = held - qty; if (left > 0) actor.cargo[goodId] = left; else delete actor.cargo[goodId];
   dirty = true;
   return { ok: true, proceeds, unit: Math.round(proceeds / qty) };
+}
+
+/** A player's standing with the town's owning nation (0 if the town is a free port or the player has no rep map). */
+function standingAt(player, town) {
+  const fid = town && town.faction;
+  return (fid && player && player.factionRep && Number.isFinite(player.factionRep[fid])) ? player.factionRep[fid] : 0;
+}
+
+/** marketFor(townId) with ask/bid nudged by THIS player's standing with the town's nation — the SAME multiplier
+ *  tradeCore applies on execution, so the quote the player sees matches what they pay/receive. `mk` may be passed
+ *  in to avoid recomputing. Neutral standing / free port → returns the market unchanged. */
+function playerMarket(player, townId, mk) {
+  mk = mk || marketFor(townId);
+  if (!mk) return mk;
+  const mul = repPriceMul(standingAt(player, getTown(townId)));
+  if (mul.ask === 1 && mul.bid === 1) return mk;
+  return { ...mk, goods: mk.goods.map((g) => ({ ...g, ask: Math.max(1, Math.round(g.ask * mul.ask)), bid: Math.max(0, Math.round(g.bid * mul.bid)) })) };
 }
 
 /** Player buys `qty` of `goodId` at the docked town (validates docked + good/qty, then tradeCore). Atomic. */
@@ -285,7 +316,7 @@ function applyBuy(player, authPose, townId, goodId, qty) {
   const n = intQty(qty);
   if (!n) return { ok: false, reason: 'bad_qty' };
   const actor = { gold: player.gold, cargo: player.cargo, capacityVol: capacityFor(player.state && player.state.vesselSlug) };
-  const r = tradeCore(actor, town, goodId, n, 'buy');
+  const r = tradeCore(actor, town, goodId, n, 'buy', repPriceMul(standingAt(player, town)));
   if (r.ok) { player.gold = actor.gold; pushLedger(player, { t: Date.now(), side: 'buy', townId, goodId, qty: n, unit: r.unit }); }
   return r;
 }
@@ -298,7 +329,7 @@ function applySell(player, authPose, townId, goodId, qty) {
   const n = intQty(qty);
   if (!n) return { ok: false, reason: 'bad_qty' };
   const actor = { gold: player.gold, cargo: player.cargo, capacityVol: capacityFor(player.state && player.state.vesselSlug) };
-  const r = tradeCore(actor, town, goodId, n, 'sell');
+  const r = tradeCore(actor, town, goodId, n, 'sell', repPriceMul(standingAt(player, town)));
   if (r.ok) { player.gold = actor.gold; pushLedger(player, { t: Date.now(), side: 'sell', townId, goodId, qty: n, unit: r.unit }); }
   return r;
 }
@@ -464,7 +495,7 @@ async function flushState(force) {
 }
 
 module.exports = {
-  load, ensureLoaded, townAt, getTown, townList, marketFor,
+  load, ensureLoaded, townAt, getTown, townList, marketFor, playerMarket,
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
   bestBuyerFor, hintFor, currentDay: economyDay,
@@ -478,5 +509,6 @@ module.exports = {
     npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
     setLastTickDay(d) { lastTickDay = d; }, getLastTickDay() { return lastTickDay; },
     getMarket(id) { return markets.get(id); }, profileFor: (t) => profileFor(t),
+    repPriceMul, standingAt, playerMarket, applyBuy, applySell, REP_PRICE_MAX: () => REP_PRICE_MAX,
   },
 };

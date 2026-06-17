@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* make faction standing affect trade prices (to a point, don't break economy or make it super easy to make profit on everything)
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make pinace buoyance more responsive
 * make salvage crate asset

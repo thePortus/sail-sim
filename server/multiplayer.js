@@ -610,10 +610,12 @@ function sendMarket(p, townId) {
   if (!p || p.ws.readyState !== 1) return;
   const mk = economy.marketFor(townId);
   if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
-  recordVisit(p, mk);
+  recordVisit(p, mk);   // ledger keeps the town's BASE prices (comparable across players + the demand hint)
   const hint = economy.hintFor(townId);
+  // Display the quote nudged by THIS player's standing with the town's nation — matches what tradeCore charges.
+  const shown = economy.playerMarket(p, townId, mk);
   p.ws.send(JSON.stringify({
-    type: 'market_state', ...mk, hint, gold: p.gold | 0, cargo: p.cargo || {},
+    type: 'market_state', ...shown, hint, gold: p.gold | 0, cargo: p.cargo || {},
     capacity: economy.capacityFor(p.state && p.state.vesselSlug),
   }));
   p.ws.send(JSON.stringify({ type: 'ledger_entry', townId, ...p.ledger[townId] }));

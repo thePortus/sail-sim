@@ -45,7 +45,9 @@ function repPriceMul(standing) {
   return { ask: 1 - REP_PRICE_MAX * t, bid: 1 + REP_PRICE_MAX * t };
 }
 
-let loaded = false;
+let loaded = false;               // true ONLY after a SUCCESSFUL manifest load — a failed load is NOT cached, so the
+let lastLoadTry = 0;              // server self-heals (throttled retry) if the manifest appears after boot
+const LOAD_RETRY_MS = 15000;
 let towns = new Map();            // townId → { id, name, tier, specialty, x, z }
 let markets = new Map();          // townId → { stock: { goodId: qty }, treasury, distress: { goodId: days } }
 let profiles = new Map();         // townId → { goodId: {role,ratePerDay,priceRef,stockCap,seedStock} }  (derived)
@@ -54,11 +56,11 @@ let dirty = false;
 
 // ── manifest towns ────────────────────────────────────────────────────────────
 function load() {
-  loaded = true;
   towns = new Map();
   try {
     const manifestPath = path.join(terrainConfig.outputDir, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) { console.warn('[economy] manifest not found — trading disabled'); return; }
+    // NOT found → leave loaded=false so ensureLoaded() retries (self-heals if the terrain is deployed after boot).
+    if (!fs.existsSync(manifestPath)) { console.warn(`[economy] manifest not found at ${manifestPath} — trading disabled (will retry)`); return; }
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     for (const h of (m.harbors || [])) {
       towns.set(h.id, {
@@ -66,6 +68,7 @@ function load() {
         faction: h.faction || null, contested: !!h.contested, rivalFaction: h.rivalFaction || null,
       });
     }
+    if (towns.size > 0) { loaded = true; }   // cache ONLY a successful (non-empty) load
     const present = new Set([...towns.values()].map((t) => t.specialty));
     const missing = goods.specialtyKeys().filter((s) => !present.has(s));
     console.log(`[economy] ${towns.size} town market(s) loaded; specialties: ${[...present].sort().join(', ')}`
@@ -75,7 +78,13 @@ function load() {
     console.warn('[economy] manifest load failed — trading disabled:', err.message);
   }
 }
-function ensureLoaded() { if (!loaded) load(); }
+function ensureLoaded() {
+  if (loaded) { return; }
+  const now = Date.now();
+  if (now - lastLoadTry < LOAD_RETRY_MS) { return; }   // throttle retries when the manifest is genuinely absent
+  lastLoadTry = now;
+  load();
+}
 function ensureSeeded() { ensureLoaded(); if (markets.size === 0 && towns.size > 0) seedMarkets(); }
 
 // ── per-town derived profile + seeding ─────────────────────────────────────────

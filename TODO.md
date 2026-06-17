@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* Switch to Georgia font
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make pinace buoyance more responsive
 * make salvage crate asset

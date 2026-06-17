@@ -203,6 +203,11 @@ const BROADSIDE_HYST = 0.12;  // the other tack must score this much higher (fra
 // hold at will. When not yet to windward it favours the broadside tack that claws it up-wind (weighted by skill).
 const GAGE_WEIGHT = 0.8;      // how hard a veteran prefers the windward tack (× skill × up-wind component of the heading)
 const GAGE_MARGIN = 45;       // world units up-wind of the foe past which it stops clawing and just holds the broadside
+// Raking (E2): if the foe shows its BOW or STERN to us (we sit near its fore-aft axis), a veteran seizes the rake —
+// closes and pours its broadside DOWN the foe's length (the damage model already rewards square-on bow/stern hits +
+// those zones have less HP). So showing a veteran escort your stern (e.g. to flee) is genuinely punishing.
+const RAKE_CONE  = 42;        // deg: foe end within this of pointing at us = a rake opportunity
+const RAKE_SKILL = 0.6;       // only captains this skilled bother to rake / anti-rake
 const GIVE_UP_RANGE = 700;    // world units: a foe that opens past this is "lost" → drop the grudge, resume trade
 const FLEE_HEALTH = 0.35;     // hull fraction at/below which a merchant breaks off and runs (fighting → fleeing)
 
@@ -436,22 +441,33 @@ function engageHeading(npc, foe, wind, ph) {
   const dist = Math.hypot(fs.x - npc.state.x, fs.z - npc.state.z);
   const skill = npcSkill(npc);
 
+  // Rake opportunity: is the foe showing us its bow or stern? (we sit near its fore-aft axis.) A skilled captain
+  // then CLOSES to drive a raking broadside down the exposed end (and flags it so the gunnery loads round, not bar).
+  const aspect = Math.abs(angleDelta(fs.heading, (B + 180) % 360));   // 0 = off foe's bow, 180 = off its stern, 90 = abeam
+  const raking = skill >= RAKE_SKILL && (aspect < RAKE_CONE || aspect > 180 - RAKE_CONE);
+  npc.raking = raking;
+
   // Range band by relative strength: stronger → close in; weaker → keep the range open and pepper with round shot.
+  // A rake overrides toward a punchy close range to land it before the foe can turn its broadside back to us.
   const strRatio = shipStrength(npc) / Math.max(1, shipStrength(foe));
-  const desiredRange = strRatio > 1.2 ? FIRE_RANGE * 0.8
+  const desiredRange = raking ? FIRE_RANGE * 0.7
+                     : strRatio > 1.2 ? FIRE_RANGE * 0.8
                      : strRatio < 0.85 ? Math.min(MAX_FIRE_RANGE * 0.9, FIRE_RANGE * 1.7)
                      : FIRE_RANGE;
+  // Close offset: a skilled captain angles in more BEAM-on (anti-rake — don't expose our own bow on the approach).
+  const closeOffset = 55 + 18 * skill;
   let offset;
-  if (dist > desiredRange * 1.3)      offset = 55;    // well out → angle in to close (not a bow-on charge)
-  else if (dist < desiredRange * 0.7) offset = 120;   // too near → open out, avoid fouling / ramming
-  else                                offset = 90;    // in the slot → hold a clean broadside (orbits at range)
+  if (dist > desiredRange * 1.3)      offset = closeOffset;   // well out → angle in to close (skill = more beam-on)
+  else if (dist < desiredRange * 0.7) offset = 120;           // too near → open out, avoid fouling / ramming
+  else                                offset = 90;            // in the slot → hold a clean broadside (orbits at range)
   const hPlus  = (B + offset + 360) % 360;
   const hMinus = (B - offset + 360) % 360;
 
-  // Weather-gage seek: claw up-wind until we're GAGE_MARGIN to windward of the foe (then just hold the broadside).
+  // Weather-gage seek: claw up-wind until we're GAGE_MARGIN to windward of the foe (then just hold). Skip it while
+  // raking — the exposed end is the prize NOW, no time to work the wind.
   const wb = wind.windBearing * DEG, Ux = Math.sin(wb), Uz = Math.cos(wb);   // unit vector toward the wind's SOURCE (up-wind)
   const windwardNow = (npc.state.x - fs.x) * Ux + (npc.state.z - fs.z) * Uz;  // >0 already to windward of the foe
-  const seekGage = windwardNow < GAGE_MARGIN;
+  const seekGage = !raking && windwardNow < GAGE_MARGIN;
   const slug = npc.state.vesselSlug;
   const score = (h) => {
     const eff = Math.max(0, npcDrive(angleFromWind(h, wind.windBearing), slug, ph.minTackAngle));
@@ -520,10 +536,12 @@ function foeMastFrac(foe) {
   return (c && c.maxHp && c.maxHp.masts) ? (c.zones.masts / c.maxHp.masts) : 1;
 }
 
-/** Pick the NPC's shot type. Default solid round (anti-hull). Choose BAR (anti-rig) when the case fits: within bar's
- *  short reach, the foe still has masts worth shooting, AND the merchant either runs for its life (rake the pursuer
- *  so it can't follow) or simply can't out-sail the foe (slow it down). Probabilistic so plenty of round shot flies. */
+/** Pick the NPC's shot type — ROUND (anti-hull) or BAR (anti-rig). NPCs never fire grape at players (anti-crew —
+ *  kept out so the player isn't forever re-crewing). RAKING → round, to pour solid shot down the exposed length.
+ *  Otherwise BAR when the case fits: within bar's short reach, the foe still has masts worth shooting, AND we're
+ *  running for our life (rake the pursuer's rig) or can't out-sail the foe (slow it). Probabilistic; round dominates. */
 function chooseNpcShot(npc, foe, dist) {
+  if (npc.raking) return 'round';                                       // raking the hull → solid shot
   if (dist > BAR_RANGE || foeMastFrac(foe) <= 0.15) return 'round';
   const foeFaster = foe.state && Math.abs(foe.state.speed) > (npc.state.speed || 0) + 0.3;
   if ((npc.fleeing || foeFaster) && Math.random() < BAR_CHANCE) return 'bar';
@@ -850,6 +868,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot) {
 
     const ph = npc.physics;
     let desired;
+    npc.raking = false;   // re-armed by engageHeading each tick it actually has a rake; cleared otherwise
     // D3: react to the right threat — a PROVOKED attacker (was fired on) or a nation-HATED player within range —
     // with the stance set by RELATIVE STRENGTH: fight if it can hold its own, flee/avoid if outmatched or badly
     // hurt, or just hold the trade lane (route) while a hated stranger lurks beyond ENGAGE_RANGE.
@@ -1063,5 +1082,6 @@ module.exports = {
     CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
     npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,
+    chooseNpcShot, foeMastFrac, RAKE_CONE, RAKE_SKILL,
   },
 };

@@ -4,6 +4,7 @@
     <div class="home-title">
       <div class="home-icon">⛵</div>
       <h1>Bay of Pirates</h1>
+      <p class="subtitle">By David J. Thomas</p>
       <p class="subtitle">A living archipelago of trade, war &amp; piracy — multiplayer, open early access</p>
     </div>
 
@@ -29,7 +30,10 @@
     </div>
 
     <span *ngIf="user?.loggedIn">
-      <img src="/images/dedication.jpg" alt="Image of a dedication: To a well-deserving father, for my dreams and the fair winds to find them." class="home-image">
+      <figure>
+        <img src="/images/dedication.jpg" alt="Image of a dedication: To a well-deserving father, for my dreams and the fair winds to find them." class="home-image">
+        <figcaption><em>For Daniel</em></figcaption>
+      </figure>
     </span>
 
     <span *ngIf="!user?.loggedIn">

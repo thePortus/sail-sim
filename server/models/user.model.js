@@ -60,5 +60,10 @@ module.exports = (sequelize, DataTypes) => {
     // recorded → treated as the current vessel's FULL complement on load. Clamped to the vessel's max. A
     // ship change / sunk→respawn resets it to full. Drives sail/turn/reload/mast-repair speed (with a floor).
     crew:         { type: DataTypes.INTEGER, allowNull: true, defaultValue: null },
+
+    // Quest progress: JSON { [questId]: { stage, done:[objectiveId], status:'active'|'done' } }. NULL = brand-new
+    // player → the server auto-starts the intro tutorial on login. Persists across maps (the player's, not the
+    // world's). The intro's map-specific anchors (start port, spawn) are DERIVED from the live map, not stored here.
+    questState:   { type: DataTypes.TEXT, allowNull: true, defaultValue: null },
   });
 };

@@ -154,7 +154,7 @@ exports.exportUsers = (req, res) => {
   const cols = [
     'username', 'callsign', 'password', 'role', 'banned', 'friends',
     'lastX', 'lastZ', 'lastHeading', 'lastVesselSlug', 'lastCallsign', 'locationSavedAt', 'lastMapVersion',
-    'gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew',
+    'gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew', 'questState',
   ];
   User.findAll({ attributes: cols, order: [['id', 'ASC']], raw: true })
     .then(users => {

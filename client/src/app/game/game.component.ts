@@ -48,6 +48,10 @@ import { ShipwrightMenuComponent } from './shipwright-menu.component';
 import { TavernMenuComponent } from './tavern-menu.component';
 import { GovernorMenuComponent } from './governor-menu.component';
 import { DiplomacyMenuComponent } from './diplomacy-menu.component';
+import { QuestModalComponent } from './quest-modal.component';
+import { QuestTrackerComponent } from './quest-tracker.component';
+import { QuestGuidanceComponent } from './quest-guidance.component';
+import { QuestToastComponent } from './quest-toast.component';
 
 import { Vessel } from '../sailing/models';
 import { Settings } from '../app.settings';
@@ -57,7 +61,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent, QuestModalComponent, QuestTrackerComponent, QuestGuidanceComponent, QuestToastComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -118,6 +122,15 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
       @if (phase() === 'sailing') {
         <app-hud (exitGame)="onReturnToHarbor()" (photoModeChange)="photoMode.set($event)" />
 
+        <!-- Quests: the objective tracker HUD + the story modal (intro tutorial + future storyline). Hidden in
+             photo mode so it doesn't clutter a screenshot. -->
+        @if (!photoMode()) {
+          <app-quest-tracker />
+          <app-quest-guidance />
+          <app-quest-modal />
+          <app-quest-toast />
+        }
+
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {
           <app-pause-menu (resume)="onResume()" (quit)="onReturnToHarbor()"
@@ -149,9 +162,9 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
                 <div class="dock-faction"><span class="dock-faction-dot" [style.background]="factionColor(town.faction)"></span>{{ factionLabel(town) }}</div>
               }
               <div class="dock-desc">{{ town.description }}</div>
-              <button class="dock-opt" (click)="onTrade(town.id)">Trade Goods</button>
+              <button class="dock-opt" data-guide="trade" (click)="onTrade(town.id)">Trade Goods</button>
               <button class="dock-opt" (click)="onShipwright()">Shipwright</button>
-              <button class="dock-opt" (click)="onTavern()">Tavern</button>
+              <button class="dock-opt" data-guide="tavern" (click)="onTavern()">Tavern</button>
               @if (town.faction) {
                 <button class="dock-opt" (click)="onGovernor()">{{ town.tier === 'capital' ? "Governor's Mansion" : "Mayor's House" }}</button>
               }
@@ -160,7 +173,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           } @else if (vesselService.docking()) {
             <div class="dock-prompt dock-mooring">⚓ Mooring at {{ town.name }}…</div>
           } @else {
-            <button class="dock-prompt" (click)="onDock(town)">⚓ Dock at {{ town.name }}</button>
+            <button class="dock-prompt" data-guide="dock" (click)="onDock(town)">⚓ Dock at {{ town.name }}</button>
           }
         }
 

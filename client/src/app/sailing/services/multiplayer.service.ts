@@ -18,7 +18,7 @@ import { SfxService } from './sfx.service';
 import { MastCrackService } from './mast-crack.service';
 import { TelemetryService } from './telemetry.service';
 import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
-import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry } from '../models';
+import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry, QuestUpdate, QuestNarrative } from '../models';
 import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
 import { AuthService } from '../../services/auth.service';
@@ -161,6 +161,13 @@ export class MultiplayerService {
   rumorError       = signal<string | null>(null);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
+  // ── Quests (intro tutorial + future storyline) ──────────────────────────────
+  // The active quest's current stage + objectives (server-authoritative). null = no active quest.
+  quest          = signal<QuestUpdate | null>(null);
+  // A transient story beat (a stage's onComplete + any gold awarded); the story modal shows it, then dismisses.
+  questNarrative = signal<QuestNarrative | null>(null);
+  // A transient gold reward with no story beat (e.g. the steer sub-stage) → a brief floating toast.
+  questReward    = signal<number | null>(null);
   /** Inter-faction relations matrix { [a]: { [b]: 'war'|'peace'|'alliance' } } — drives the Diplomacy panel. */
   factionMatrix = signal<Record<string, Record<string, string>>>({});
   /** Last reputation change from attacking shipping (transient; surfaced as a toast). */
@@ -325,6 +332,20 @@ export class MultiplayerService {
     this.rumorError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'listen_rumor' }));
   }
+
+  /** Quest: confirm a client-verified tutorial step (rotate camera, trim sails, listen for a rumour, …). The
+   *  server advances the objective and pushes a fresh quest_update. */
+  questAck(objectiveId: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'quest_ack', objectiveId }));
+  }
+
+  /** Quest: skip the intro tutorial tasks (story stays seen; no rewards). */
+  questSkip(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'quest_skip' }));
+  }
+
+  /** Dismiss the current story beat (after the player clicks through it). */
+  dismissQuestNarrative(): void { this.questNarrative.set(null); }
 
   /** Respawn after a sinking: the caller has already teleported the vessel to a harbor; this tells the
    *  server to reset our hull AND clear our authoritative pose (so the teleport isn't clamped). */
@@ -694,6 +715,19 @@ export class MultiplayerService {
       } else {
         this.rumorError.set(String(msg.reason ?? 'no_rumours'));
       }
+
+    } else if (msg.type === 'quest_update') {
+      // The active quest's current stage + objectives (server-authoritative). null clears the tracker.
+      this.quest.set((msg.questId ? msg : null) as QuestUpdate | null);
+
+    } else if (msg.type === 'quest_narrative') {
+      // A story beat (a stage's onComplete + any gold awarded) — the story modal shows it, then dismisses.
+      this.questNarrative.set({ panels: Array.isArray(msg.panels) ? msg.panels : [], rewardGold: +msg.rewardGold || 0 });
+
+    } else if (msg.type === 'quest_reward') {
+      // A silent stage reward (no story beat) — a brief floating toast acknowledges the gold.
+      this.questReward.set(+msg.gold || 0);
+      setTimeout(() => this.questReward.set(null), 2800);
 
     } else if (msg.type === 'wallet') {
       // Authoritative purse + hold + capacity (on connect, and as a correction after a denied/failed trade).

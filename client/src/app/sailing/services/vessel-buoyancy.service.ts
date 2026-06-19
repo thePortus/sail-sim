@@ -33,6 +33,14 @@ export interface BuoyancyState {
 //   dramatic and clearly visible.
 //   Short chop (<30 m) produces rapid, small-amplitude pitching (choppy sea feel).
 
+// This TEMPLATE is authored against the generic sloop (half-length ≈ 7 m, half-beam ≈ 2.2 m). update() scales it
+// to each vessel's real footprint via (hullHalfLen/REF_HALF_LEN, hullHalfBeam/REF_HALF_BEAM) so a small open boat
+// (pinnace) samples its OWN ~4 m hull instead of these sloop-sized arms — sampling far outside the real hull made
+// it straddle separate crests in steep/shallow chop and let the anti-sink floor (long lever arms) launch it.
+// Passing the sloop's own dimensions reproduces these exact numbers, so the sloop's tuned feel is unchanged.
+const REF_HALF_LEN  = 7.0;
+const REF_HALF_BEAM = 2.2;
+
 const HULL_POINTS: { fwd: number; rgt: number }[] = [
   { fwd:  5.5, rgt:  0.0 },   // 0  bow centre
   { fwd:  3.5, rgt: -2.0 },   // 1  fore-port
@@ -90,7 +98,11 @@ export class VesselBuoyancyService {
   update(
     wx: number, wz: number, headingRad: number, t: number, dt: number,
     opts?: { pitchScale?: number; heaveTau?: number; tiltTau?: number },
+    hullHalfLen?: number, hullHalfBeam?: number,
   ): BuoyancyState {
+    // Scale the sloop-authored HULL_POINTS template to this vessel's real footprint (1.0 for the sloop).
+    const sl = (hullHalfLen  ?? REF_HALF_LEN)  / REF_HALF_LEN;
+    const sb = (hullHalfBeam ?? REF_HALF_BEAM) / REF_HALF_BEAM;
     // Per-vessel buoyancy feel (defaults = the generic sloop). heaveTau = how tightly the hull rises/falls
     // with the swell (LOWER = more responsive, rides waves instead of sitting at an average level); tiltTau =
     // the same for pitch/roll; pitchScale = how much the wave slope tilts it. A small open boat (the pinnace)
@@ -113,18 +125,19 @@ export class VesselBuoyancyService {
     const waveH = new Array<number>(HULL_POINTS.length);
 
     for (let i = 0; i < HULL_POINTS.length; i++) {
-      const pt  = HULL_POINTS[i];
+      const fwd = HULL_POINTS[i].fwd * sl;
+      const rgt = HULL_POINTS[i].rgt * sb;
       // Transform local hull point to world XZ
-      const pwx = wx + pt.fwd * sinH + pt.rgt * cosH;
-      const pwz = wz + pt.fwd * cosH - pt.rgt * sinH;
+      const pwx = wx + fwd * sinH + rgt * cosH;
+      const pwz = wz + fwd * cosH - rgt * sinH;
 
       const h   = this.oceanService.getVisualHeightAt(pwx, pwz, t);
       waveH[i]   = h;
       sumH      += h;
-      pitchTorq += h * pt.fwd;
-      rollTorq  += h * pt.rgt;
-      armFwd2   += pt.fwd * pt.fwd;
-      armRgt2   += pt.rgt * pt.rgt;
+      pitchTorq += h * fwd;
+      rollTorq  += h * rgt;
+      armFwd2   += fwd * fwd;
+      armRgt2   += rgt * rgt;
     }
 
     const N = HULL_POINTS.length;
@@ -169,10 +182,9 @@ export class VesselBuoyancyService {
     const ANTI_SINK_TOLERANCE = 0.55;   // metres of submersion before floor activates
     let heaveFloor = -Infinity;
     for (let i = 0; i < HULL_POINTS.length; i++) {
-      const pt    = HULL_POINTS[i];
       const floor = waveH[i] - ANTI_SINK_TOLERANCE
-        - pt.fwd * this.pitchFiltered
-        - pt.rgt * this.rollFiltered;
+        - HULL_POINTS[i].fwd * sl * this.pitchFiltered
+        - HULL_POINTS[i].rgt * sb * this.rollFiltered;
       if (floor > heaveFloor) heaveFloor = floor;
     }
 

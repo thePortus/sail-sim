@@ -290,8 +290,7 @@ export class TerrainService {
       this.clipmapObserver = null;
     }
     if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
-    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
-    this.clipHeightReuploadTimers = [];
+    if (this.clipHeightHealObs) { this.sceneService.scene.onAfterRenderObservable.remove(this.clipHeightHealObs); this.clipHeightHealObs = null; }
     this.clipHeightData = null;
     if (this.clipmap) {
       for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
@@ -2936,7 +2935,7 @@ export class TerrainService {
   // scatter — fed by the CPU heightfield — stays correct. Re-uploading once the device is warm self-heals it in
   // ~1 s with no page refresh, and is harmless when the first upload already succeeded. Freed after the last pass.
   private clipHeightData: Float32Array | null = null;
-  private clipHeightReuploadTimers: ReturnType<typeof setTimeout>[] = [];
+  private clipHeightHealObs: import('@babylonjs/core').Observer<Scene> | null = null;
 
   private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
     if (this.clipHeightTex || !this.heightfield) { return; }
@@ -2955,16 +2954,81 @@ export class TerrainService {
     this.clipWBounds = new Vector4(m.worldBounds.minX, m.worldBounds.minZ,
       m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
     this.clipTexSize = new Vector2(m.width, m.height);
-
-    // Defensive re-uploads against the cold-start upload race (see field note). Once warm these are no-ops.
     this.clipHeightData = data;
-    for (const t of this.clipHeightReuploadTimers) { clearTimeout(t); }
-    this.clipHeightReuploadTimers = [600, 2000, 5000].map((ms, i, arr) => setTimeout(() => {
-      if (this.clipHeightTex && this.clipHeightData) {
-        try { this.clipHeightTex.update(this.clipHeightData); } catch { /* device busy → next pass retries */ }
-      }
-      if (i === arr.length - 1) { this.clipHeightData = null; }   // free after the final pass
-    }, ms));
+
+    this.scheduleClipHeightHeal(scene, m.width);
+  }
+
+  /**
+   * Heals the cold-start WebGPU upload race on the shared height texture (clipHeightTex).
+   *
+   * WHY THIS EXISTS: on WebGPU `RawTexture.isReady` is set true SYNCHRONOUSLY at construction, but the actual
+   * pixel upload is only ENQUEUED on the upload encoder and lands at the next queue submit. If that submission
+   * is lost during a cold start, the texture reports ready while holding EMPTY data — so the terrain clipmap
+   * displaces to y=0 (land invisible under the ocean), the ocean reads 0 depth everywhere (uniformly shallow /
+   * seabed showing), and the minimap-bake compute that samples it stalls. Scatter is fed by the separate CPU
+   * heightfield, so it stays correct — the tell-tale signature. (The earlier blind 3-shot setTimeout heal could
+   * fire all its re-uploads before the device was warm, then free the data → stayed broken until a manual reload.)
+   *
+   * THIS version is CONTENT-VERIFIED and frame-driven: it reads back one known-non-zero "landmark" texel (the
+   * highest peak) and only declares success once the GPU actually returns that value; until then it re-uploads
+   * on real rendered frames (device is provably warm — frames are submitting) across a generous budget. WebGL
+   * uploads synchronously (no race), so the heal is WebGPU-only; elsewhere the data is freed immediately.
+   */
+  private scheduleClipHeightHeal(scene: Scene, width: number): void {
+    if (this.clipHeightHealObs) { scene.onAfterRenderObservable.remove(this.clipHeightHealObs); this.clipHeightHealObs = null; }
+    const data = this.clipHeightData;
+    if (!this.sceneService.isWebGPU || !data) { this.clipHeightData = null; return; }
+
+    // Landmark = the single highest texel (clearly > 0, so an empty texture reads back as a gross mismatch).
+    let iMax = 0, vMax = data[0];
+    for (let i = 1; i < data.length; i++) { if (data[i] > vMax) { vMax = data[i]; iMax = i; } }
+    if (!(vMax > 1e-3)) { this.clipHeightData = null; return; }   // degenerate flat map — nothing to verify
+    const height = (data.length / width) | 0;
+    const lx = iMax % width, ly = (iMax / width) | 0;
+    const lyFlip = height - 1 - ly;   // readPixels Y-convention may differ from the upload — accept either row
+    const tol = Math.max(1, Math.abs(vMax) * 0.02);
+    const hit = (buf: ArrayBufferView | null): boolean => {
+      if (!buf) { return false; }
+      const v = new Float32Array(buf.buffer, buf.byteOffset, 1)[0];
+      return Number.isFinite(v) && Math.abs(v - vMax) <= tol;
+    };
+
+    // Check on rendered frames 6, then every 12 up to ~16 attempts (~190 frames of ACTUAL rendering).
+    let frame = 0, attempts = 0, busy = false, hadMiss = false;
+    const MAX_ATTEMPTS = 16;
+    this.clipHeightHealObs = scene.onAfterRenderObservable.add(() => {
+      const tex = this.clipHeightTex;
+      if (!tex || !this.clipHeightData) { this.stopClipHeightHeal(scene); return; }
+      frame++;
+      if (busy || frame < 6 || (frame - 6) % 12 !== 0) { return; }
+      busy = true;
+      attempts++;
+      const giveUp = attempts >= MAX_ATTEMPTS;
+      const read = (y: number) => Promise.resolve(
+        tex.readPixels(0, 0, null, true, true, lx, y, 1, 1) as ArrayBufferView | Promise<ArrayBufferView> | null);
+      Promise.all([read(ly), read(lyFlip)])
+        .then(([a, b]) => {
+          if (hit(a) || hit(b)) {
+            if (hadMiss) { console.log(`[terrain] height texture populated after ${attempts} re-upload(s) — self-healed`); }
+            this.stopClipHeightHeal(scene);
+          } else {
+            hadMiss = true;
+            try { this.clipHeightData && tex.update(this.clipHeightData); } catch { /* device busy → next attempt retries */ }
+            if (giveUp) {
+              console.error('[terrain] height texture never populated after re-uploads (WebGPU cold-start race) — land/bathymetry may be flat; please reload');
+              this.stopClipHeightHeal(scene);
+            }
+          }
+        })
+        .catch(() => { /* readback hiccup → keep trying */ })
+        .finally(() => { busy = false; });
+    });
+  }
+
+  private stopClipHeightHeal(scene: Scene): void {
+    if (this.clipHeightHealObs) { scene.onAfterRenderObservable.remove(this.clipHeightHealObs); this.clipHeightHealObs = null; }
+    this.clipHeightData = null;
   }
 
   // ── Coastal grading ───────────────────────────────────────────────────────

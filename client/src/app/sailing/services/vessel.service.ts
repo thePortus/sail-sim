@@ -1214,7 +1214,8 @@ export class VesselService {
     // port of the GPU vertex shader's waveHeight() — so the physics height
     // matches the rendered surface exactly.
     const t    = this.simTime;
-    const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt, this.rig.buoyancy);
+    const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt, this.rig.buoyancy,
+      this.rig.hullHalfLen, this.rig.hullHalfBeam);
 
     // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
     // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.

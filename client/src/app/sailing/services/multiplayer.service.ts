@@ -956,10 +956,9 @@ export class MultiplayerService {
     // don't pile up across many join/leaves. (Babylon does NOT auto-remove a disposed mesh from a
     // ShadowGenerator's manual render list — left unpruned, churning NPC merchants accumulate dead refs
     // until the shadow/depth pass dereferences one (black screen) and the GPU descriptor heap exhausts.)
-    const sg = this.sceneService.shadowGenerator;
     entry.root.getChildMeshes(false).forEach(m => {
       this.oceanService.removeFromRenderList(m);
-      sg?.removeShadowCaster(m, true);
+      this.sceneService.removeGatedShadowCaster(m);
       // dispose(doNotRecurse=false, disposeMaterialAndTextures=FALSE): vessels are
       // instantiated with cloneMaterials=false, so every ship (local + remote) shares ONE
       // material + texture set owned by the asset container. Disposing them here would strip
@@ -1592,7 +1591,7 @@ export class MultiplayerService {
     // so remote vessels appear mirrored in the surface and their submerged hull shows
     // through the water (matches VesselService).
     for (const m of vesselMeshes) {
-      this.oceanService.addToRenderList(m);
+      this.oceanService.addToRenderList(m, true);   // gated: distant remote ships drop out of the mirror
     }
 
     // Shadows + WebGPU varying budget (mirrors VesselService): the rigged GLB's PBR
@@ -1600,10 +1599,9 @@ export class MultiplayerService {
     // prePass + shadow receipt + fog + ocean reflection clip-plane they exceed WebGPU's
     // 16 inter-stage limit and invalidate every pipeline (black screen). Cast shadows
     // but don't receive them, drop fog, and exclude the materials from the prePass.
-    const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
     for (const m of vesselMeshes) {
-      if (!entry.npc) sg?.addShadowCaster(m, true);   // merchants don't cast shadows (churn perf + leak surface)
+      if (!entry.npc) this.sceneService.addGatedShadowCaster(m);   // gated: distant remote ships drop from the shadow pass (NPCs never cast)
       m.receiveShadows = false;
       const mat = m.material;
       if (mat && !seenMats.has(mat)) {

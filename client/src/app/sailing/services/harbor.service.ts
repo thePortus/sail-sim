@@ -316,10 +316,9 @@ export class HarborService {
   /** Unwind everything buildPier registered: ocean mirror render list, shadow casters, lantern glow.
    *  Then dispose meshes only — materials/textures are shared via the asset-cache container. */
   private disposePier(node: TransformNode): void {
-    const sg = this.sceneService.shadowGenerator;
     for (const m of node.getChildMeshes(false)) {
       this.oceanService.removeFromRenderList(m);
-      sg?.removeShadowCaster(m as Mesh);
+      this.sceneService.removeGatedShadowCaster(m);
       if (/glass/i.test(m.name)) this.sceneService.removeFromGlow(m as Mesh);
     }
     node.dispose(false, false);
@@ -684,10 +683,9 @@ export class HarborService {
     // prePass — receiving shadows + the prePass G-buffer variant blow the budget and invalidate the
     // prePass + ocean-reflection render pipelines. Reflection (clip-plane variant) still fits once those
     // are shed.
-    const sg = this.sceneService.shadowGenerator;
     for (const m of pier.getChildMeshes(false)) {
-      this.oceanService.addToRenderList(m);
-      sg?.addShadowCaster(m as Mesh, true);
+      this.oceanService.addToRenderList(m, true);   // gated: distant piers drop out of the mirror
+      this.sceneService.addGatedShadowCaster(m);    // gated: distant piers drop out of the shadow pass
       m.receiveShadows = false;
       m.computeWorldMatrix(true);
       m.freezeWorldMatrix();

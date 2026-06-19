@@ -2,7 +2,7 @@ import { Injectable, NgZone, inject, signal } from '@angular/core';
 import {
   Engine, WebGPUEngine, Scene, Color3, Color4, Vector3,
   HemisphericLight, DirectionalLight,
-  FreeCamera, MeshBuilder, StandardMaterial, Mesh, Material, GlowLayer,
+  FreeCamera, MeshBuilder, StandardMaterial, Mesh, AbstractMesh, Material, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
@@ -132,6 +132,11 @@ export class SceneService {
   // VesselService, TerrainService, CannonService, and MultiplayerService can
   // register their meshes as casters / receivers.
   shadowGenerator!: ShadowGenerator;
+  // Distance-gated shadow casters (remote ships, piers): dropped from the shadow pass when far from the camera
+  // to bound the shadow-map draw/bind-group count in crowded live scenes. The landscape + local ship are not gated.
+  private _shadowGated = new Set<AbstractMesh>();
+  private _shadowActive = new Set<AbstractMesh>();   // gated casters currently IN the shadow render list
+  private static readonly SHADOW_GATE_DIST2 = 150 * 150;
   private pipeline!: DefaultRenderingPipeline;
   private _aaQuality = 1; // 0=Off 1=FXAA 2=MSAA2x 3=MSAA4x
   // FPS overlay element — created once and reused across sessions (the engine is reused, so the
@@ -350,6 +355,7 @@ export class SceneService {
           this.engine   = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
           this._isWebGPU = false;
         }
+        this.wireContextLossRecovery();   // auto-heal the post-restore black frame (once per engine)
       }
 
       // Render at the display's native pixel density. Without this the backing
@@ -395,6 +401,69 @@ export class SceneService {
       this.buildOceanDepthRenderer();
       this.startRenderLoop();
     });
+  }
+
+  /**
+   * Auto-recover from a GPU context loss (registered ONCE per engine). The live deploys hit occasional
+   * `CreateDescriptorHeap E_OUTOFMEMORY` device-loss events under peak GPU pressure: the screen goes black and
+   * — crucially — stays black until the user MOVES THE CAMERA. Babylon's `_restoreEngineAfterContextLost`
+   * already resets its pipeline/bind-group caches and clears per-submesh draw wrappers, but the custom RTT
+   * passes (the ocean depth map in the crash stack, plus the reflection/refraction RTTs) keep stale draw state
+   * until something forces a re-evaluation — which is exactly what the camera move was doing by hand. Reproduce
+   * that nudge automatically on restore: a full material-dirty rebuilds every effect + bind group, and forcing
+   * the view matrix re-derives the RTT render lists next frame. (This doesn't PREVENT the OOM — that's a
+   * separate descriptor-budget reduction task — it just makes the recovery automatic instead of manual.)
+   */
+  private wireContextLossRecovery(): void {
+    if (!this.engine) { return; }
+    this.engine.onContextLostObservable.add(() => {
+      console.warn('[Scene] GPU context lost — awaiting automatic restore');
+    });
+    this.engine.onContextRestoredObservable.add(() => {
+      console.warn('[Scene] GPU context restored — forcing a rebuild to clear the post-restore black frame');
+      try {
+        this.scene?.markAllMaterialsAsDirty(Constants.MATERIAL_AllDirtyFlag);
+        this.camera?.getViewMatrix(true);   // re-derive the view so RTT render lists re-evaluate next frame
+      } catch (e) {
+        console.warn('[Scene] context-restore recovery hiccup', e);
+      }
+    });
+  }
+
+  /** Add a shadow caster that should DROP OUT of the shadow pass when far from the camera (remote ships, piers) —
+   *  their distant shadows are imperceptible but each mesh is still a shadow-map draw + bind group. Landscape and
+   *  the local ship use shadowGenerator.addShadowCaster directly (always cast). */
+  addGatedShadowCaster(mesh: AbstractMesh): void {
+    if (!this.shadowGenerator) { return; }
+    this.shadowGenerator.addShadowCaster(mesh, true);
+    this._shadowGated.add(mesh);
+    this._shadowActive.add(mesh);   // starts enrolled; the cull drops it next shadow frame if far
+  }
+
+  /** Undo addGatedShadowCaster (on remote-ship leave / pier dispose). */
+  removeGatedShadowCaster(mesh: AbstractMesh): void {
+    this._shadowGated.delete(mesh);
+    this._shadowActive.delete(mesh);
+    this.shadowGenerator?.removeShadowCaster(mesh, true);
+  }
+
+  /** Drop distant gated casters from the shadow render list, re-add as they near. Runs from the shadow map's
+   *  onBeforeRenderObservable; steady-state cost is a distance compare per gated mesh, splice only on a transition. */
+  private cullGatedShadowCasters(): void {
+    const list = this.shadowGenerator?.getShadowMap()?.renderList;
+    if (!list || this._shadowGated.size === 0 || !this.camera) { return; }
+    const cx = this.camera.position.x, cz = this.camera.position.z;
+    for (const m of this._shadowGated) {
+      const p = m.absolutePosition;
+      const near = (p.x - cx) ** 2 + (p.z - cz) ** 2 <= SceneService.SHADOW_GATE_DIST2;
+      const active = this._shadowActive.has(m);
+      if (near && !active) { list.push(m); this._shadowActive.add(m); }
+      else if (!near && active) {
+        const i = list.indexOf(m);
+        if (i >= 0) { list.splice(i, 1); }
+        this._shadowActive.delete(m);
+      }
+    }
   }
 
   // ── Sky ──────────────────────────────────────────────────────────────────────
@@ -478,6 +547,12 @@ export class SceneService {
     const shadowMap = csg.getShadowMap();
     if (shadowMap) shadowMap.refreshRate = 1;
     this.shadowGenerator   = csg;
+    // Distance-cull the gated casters (remote ships, piers) from the shadow pass right before it renders. The
+    // cascade already discards shadows past shadowMaxZ (200 u), but a crowded LIVE scene puts many remote-ship
+    // meshes (~40–73 each) inside that range — each one a shadow-map draw + bind group (the descriptor pressure
+    // behind the device-loss OOM). Their shadows at 150 u+ are imperceptible, so drop them sooner. Terrain,
+    // scatter and the LOCAL ship are never gated.
+    shadowMap?.onBeforeRenderObservable.add(() => this.cullGatedShadowCasters());
 
     // Cool blue-white directional light simulating moonlight.
     // Direction is updated each frame (opposite the sun). Intensity peaks at midnight.

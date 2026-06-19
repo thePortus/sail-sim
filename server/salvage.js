@@ -9,7 +9,7 @@
  * + messaging lives in multiplayer.js (which has the economy capacity helpers).
  */
 
-const CRATE_LIFETIME_MS = 120000;   // 2 minutes to grab it
+const CRATE_LIFETIME_MS = 240000;   // 4 minutes to grab it
 const COLLECT_RADIUS_M = 60;        // how close a hull must be to scoop a crate
 
 let seq = 0;

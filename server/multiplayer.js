@@ -61,6 +61,7 @@ const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
 const diplomacy = require('./diplomacy');
+const quest = require('./quest');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
@@ -418,6 +419,7 @@ async function saveEconomyState(p) {
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
         ship: p.ship || 'pinnace',
+        ...(p.questState ? { questState: quest.serializeState(p.questState) } : {}),   // quest progress (if loaded)
       },
       { where: { id: p.auth.userId } },
     );
@@ -451,7 +453,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew', 'questState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -481,6 +483,12 @@ async function loadAndSendWallet(id, p, players) {
       const restored = combat.restoreCombatState(saved.slug || 'sloop', saved.zones);
       if (!restored.sunk) p.combat = restored;   // keep battle damage; never restore a sunk hull
     }
+
+    // Quest progress: a brand-new player (empty questState) auto-starts the intro tutorial. Persist if it just
+    // started (so a disconnect mid-panel doesn't restart the story), then push the active quest to the client.
+    p.questState = quest.parseState(u.questState);
+    if (quest.startIfNew(p.questState)) { saveEconomyState(p); }
+    sendQuest(p);
 
     sendWallet(p);
     p.ws.send(JSON.stringify({ type: 'ledger', towns: p.ledger }));   // the player's discovered-towns ledger
@@ -521,6 +529,60 @@ function sendWallet(p) {
       ship: p.ship || 'pinnace',
     }));
   }
+}
+
+// ── Quests ─────────────────────────────────────────────────────────────────────
+const townName = (tid) => { const t = economy.getTown(tid); return t ? t.name : null; };
+
+/** Push the player's current active-quest state (stage narrative + objectives), or nothing if none active. */
+function sendQuest(p) {
+  if (!p || !p.ws || p.ws.readyState !== 1 || !p.questState) return;
+  const payload = quest.renderActive(p.questState, townName);
+  // When nothing is active (the intro is fully done, or was skipped), push an explicit CLEAR (questId: null) so
+  // the client retires the tracker. Without it the HUD keeps showing the last stage with its final objective
+  // still unticked — e.g. after sinking the tutorial target, 'sink_prey' never reads as done.
+  p.ws.send(JSON.stringify(payload || { type: 'quest_update', questId: null }));
+}
+
+/** Feed a verified game event (ack/sail/dock/trade/sink) into the player's quest. On any change: grant the reward
+ *  gold, persist (gold + questState together via saveEconomyState), and re-push the wallet + quest + any story
+ *  beats. Idempotent — a no-op when nothing advances, so it's cheap to call from hot paths. */
+function applyQuestEvent(p, eventType, data, players) {
+  if (!p || !p.questState || !quest.activeQuestId(p.questState)) return;
+  const r = quest.onEvent(p.questState, eventType, data);
+  if (!r.changed) { ensureTutorialTarget(p, players); return; }   // even a no-advance pass keeps the target alive
+  if (r.rewardGold > 0) { p.gold = (p.gold | 0) + r.rewardGold; }
+  saveEconomyState(p);
+  sendWallet(p);
+  // The closing story beat goes FIRST, then the new stage state — so the client shows the payoff before the next
+  // stage's intro narrative.
+  if (r.narratives.length && p.ws.readyState === 1) {
+    p.ws.send(JSON.stringify({ type: 'quest_narrative', panels: r.narratives, rewardGold: r.rewardGold | 0 }));
+  } else if (r.rewardGold > 0 && p.ws.readyState === 1) {
+    // A reward with NO story beat (e.g. the steer sub-stage) would otherwise land silently → a small toast.
+    p.ws.send(JSON.stringify({ type: 'quest_reward', gold: r.rewardGold | 0 }));
+  }
+  sendQuest(p);
+  ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
+}
+
+/** Spawn (or respawn) the intro_combat tutorial target while that quest is active and no live one exists. The
+ *  tavern rumour marks it; sinking it (the owner) completes the quest. */
+function ensureTutorialTarget(p, players) {
+  if (!p || !p.questState || !players || !p.authPose) return;
+  if (quest.activeQuestId(p.questState) !== 'intro_combat') return;
+  const cur = p.tutorialNpcId ? players.get(p.tutorialNpcId) : null;
+  if (cur && !(cur.combat && cur.combat.sunk)) return;   // a live target already exists
+  const t = npc.makeTutorialTarget(players, p);
+  if (t) p.tutorialNpcId = t.id;
+}
+
+/** Remove a player's tutorial target (on disconnect / skip). A sunk one is left to linger-despawn naturally. */
+function removeTutorialTarget(p, players, broadcastLeave) {
+  if (!p || !p.tutorialNpcId || !players) return;
+  const t = players.get(p.tutorialNpcId);
+  if (t && !(t.combat && t.combat.sunk)) { players.delete(p.tutorialNpcId); if (broadcastLeave) broadcastLeave(p.tutorialNpcId); }
+  p.tutorialNpcId = null;
 }
 
 // ── Piracy reputation (Diplomacy D2) ──────────────────────────────────────────
@@ -828,7 +890,7 @@ function attachMultiplayer(server) {
       npc.markHostile(victim, shot.shooterId, Date.now());
       // Piracy reputation (D2): a connecting shot on a nation's merchant dings your standing. The killing blow
       // is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
-      if (!justSunk && victim.faction) awardPiracyRep(shooter, victim.faction, 'attack');
+      if (!justSunk && victim.faction && !victim.questTag) awardPiracyRep(shooter, victim.faction, 'attack');
     }
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
@@ -852,6 +914,14 @@ function attachMultiplayer(server) {
       });
       for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
 
+      // Quest: the OWNER sinking their intro-tutorial target completes the combat quest. The sunk hull lingers
+      // for the capsize animation then despawns via the NPC tick; just clear the ref so it isn't respawned.
+      if (shooter && !shooter.isNpc && victim.questTag === 'tutorial'
+          && victim.questOwnerId != null && victim.questOwnerId === (shooter.auth && shooter.auth.userId)) {
+        applyQuestEvent(shooter, 'sink', { tag: victim.questTag, victimId: hit.victimId }, players);
+        shooter.tutorialNpcId = null;
+      }
+
       if (victim.isNpc) {
         // A merchant sank → drop floating salvage (a fraction of its cargo + gold) at the wreck; the ship is
         // despawned after a short capsize-linger by the NPC tick. Anyone can sail over and collect.
@@ -868,7 +938,7 @@ function attachMultiplayer(server) {
         // Piracy reputation (D2): sinking a nation's merchant is the big standing shift — heavy loss with that
         // nation (+ its allies), a strong gain with its war-enemies. A sink is a milestone, so persist now
         // rather than waiting for the 30 s autosave. (A future capture reuses awardPiracyRep with the 'capture' tier.)
-        if (shooter && !shooter.isNpc && victim.faction) {
+        if (shooter && !shooter.isNpc && victim.faction && !victim.questTag) {
           awardPiracyRep(shooter, victim.faction, 'sink');
           saveEconomyState(shooter);
         }
@@ -1019,6 +1089,17 @@ function attachMultiplayer(server) {
           p.lastSeq = Number.isFinite(+msg.seq) ? +msg.seq : 0;
           applyPose(p, pose);     // overwrite the cosmetic state with the authoritative pose
           let needCorrection = corrected;
+
+          // Quest tutorial: server-verify seamanship (speed→point_of_sail) + dock objectives off the
+          // AUTHORITATIVE pose. Gated to players with an active quest; dock fires once per arrival.
+          if (p.questState && quest.activeQuestId(p.questState)) {
+            // point_of_sail thresholds are authored in KNOTS (matching the HUD gauge); the pose speed is m/s
+            // (1 m/s ≈ 1.94 kn — same factor the client HUD uses), so convert before the verifier compares it.
+            applyQuestEvent(p, 'sail', { speed: (p.authPose.speed || 0) * 1.94 }, players);
+            const dtown = economy.townAt(p.authPose.x, p.authPose.z);
+            const dtid = dtown ? dtown.id : null;
+            if (dtid !== p._questDockTown) { p._questDockTown = dtid; if (dtid) applyQuestEvent(p, 'dock', { townId: dtid }, players); }
+          }
 
           // ── Ship-to-ship collision (authoritative) ──────────────────────────
           // Resolve this mover against every other live hull. resolvePair is symmetric, so on contact
@@ -1287,7 +1368,16 @@ function attachMultiplayer(server) {
           const reply = (ok, data) => {
             if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'rumor_result', ok, ...(data || {}) }));
           };
+          const tutId = (me.questState && quest.activeQuestId(me.questState) === 'intro_combat') ? me.tutorialNpcId : null;
+          const tut = tutId ? players.get(tutId) : null;
           if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, { reason: 'not_docked' }); }
+          else if (tut && tut.state && !(tut.combat && tut.combat.sunk)) {
+            // Intro tutorial: the rumour names the player's weak target (overrides the normal treasure-ship pick),
+            // and the act of listening completes the rumour objective → advances to the hunt.
+            me.rumorShipId = tut.id;
+            applyQuestEvent(me, 'ack', { objectiveId: 'listen_rumour' }, players);
+            reply(true, { shipId: tut.id, slug: tut.state.vesselSlug, from: null, to: 'uncharted waters' });
+          }
           else {
             // Rumours only cover ships in the player's REGION (the map is 50 km across) — a tavern wouldn't
             // know a ship on the far coast. Well beyond render range (3 km) so it still reveals an unseen ship.
@@ -1348,6 +1438,8 @@ function attachMultiplayer(server) {
               awardFactionRep(me, repFid, gain, 'trade');
             }
             saveEconomyState(me).then(() => { sendMarket(me, townId); sendWallet(me); });
+            // Quest: tutorial trade leg (buy a cargo / sell it on at the hinted port).
+            applyQuestEvent(me, 'trade', { action: msg.type === 'trade_buy' ? 'buy' : 'sell', goodId, qty: Number(r.qty ?? msg.qty) || 0, townId }, players);
           } else {
             sendWallet(me);   // authoritative correction
             if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'trade_error', reason: r.reason }));
@@ -1460,6 +1552,16 @@ function attachMultiplayer(server) {
             if (res.empty) { salvage.remove(crate.id); broadcastSalvageDespawn(crate.id); }
           }
         }
+
+      } else if (msg.type === 'quest_ack') {
+        // Client confirms a trivial tutorial UI step (rotate camera, trim sails, listen for a rumour, …).
+        const me = players.get(id);
+        if (me) applyQuestEvent(me, 'ack', { objectiveId: String(msg.objectiveId ?? '') }, players);
+
+      } else if (msg.type === 'quest_skip') {
+        // Skip the intro tutorial (story stays seen; tasks marked done, no rewards).
+        const me = players.get(id);
+        if (me && me.questState && quest.skipIntro(me.questState)) { saveEconomyState(me); sendQuest(me); removeTutorialTarget(me, players, broadcastLeave); }
 
       } else if (msg.type === 'gun_state') {
         // Relay a ship's gun run-out/stow so others see its ports + barrels animate.
@@ -1789,6 +1891,7 @@ function attachMultiplayer(server) {
       saveEconomyState(closing);     // backstop persist of purse + hold (trades already persist inline)
       saveCombatState(closing);      // persist hull damage so it survives logout/restart
       squadron.handleDisconnect(players, squadrons, id);   // Squadrons (B): drop from any squadron (disband if <2), void invites
+      removeTutorialTarget(closing, players, broadcastLeave);   // don't orphan the intro tutorial's pinnace
       players.delete(id);
 
       // If this player was the admin holding an active weather override, clear it so a

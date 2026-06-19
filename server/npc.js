@@ -762,6 +762,33 @@ function makeMerchant(players, town, faction, slug, convoy, skill, combatRole) {
   return npc;
 }
 
+/** A weak intro-tutorial target (intro_combat): a feeble lone pinnace tied to `owner`, spawned on water a short
+ *  sail away, slowed + low-HP so the player can run it down and sink it in a couple of broadsides, and low-skill
+ *  so it only LIGHTLY fights back (a pinnace's small guns + poor aim). Tagged so the quest sink-hook + tavern
+ *  rumour override recognise it; faction null → sinking it costs NO reputation. Reuses the merchant scaffolding. */
+function makeTutorialTarget(players, owner) {
+  const towns = economy.townList();
+  if (!towns || !towns.length) return null;
+  const op = owner.authPose || owner.state || { x: 0, z: 0 };
+  let town = towns[0], bd = Infinity;
+  for (const t of towns) { const d = (t.x - op.x) ** 2 + (t.z - op.z) ** 2; if (d < bd) { bd = d; town = t; } }
+  // Give it the local faction so the normal merchant routing/tick works; the rep HIT on sinking it is suppressed
+  // by the questTag guard in multiplayer.js (a tutorial kill costs nothing).
+  const m = makeMerchant(players, town, town.faction || null, 'pinnace', null, 0.12, 'trader');
+  // Own by the verified DB user id (player objects have no stable `.id` of their own — that's just the map key).
+  m.questTag = 'tutorial'; m.questOwnerId = (owner.auth && owner.auth.userId) ?? null;
+  m.state.vesselName = 'a lone pinnace';
+  m.physics = { ...(m.physics || {}), maxSpeed: (((m.physics && m.physics.maxSpeed) || 6) * 0.6) };   // catchable
+  // Reposition ~700 m off the owner on navigable water.
+  const ang = Math.random() * Math.PI * 2;
+  let sx = op.x + Math.cos(ang) * 700, sz = op.z + Math.sin(ang) * 700;
+  const pc = nav.worldToCell(sx, sz), sn = nav.snapToNav(pc.cx, pc.cz);
+  if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+  m.state.x = sx; m.state.z = sz; m.authPose.x = sx; m.authPose.z = sz;
+  for (const z in m.combat.zones) { m.combat.zones[z] = Math.max(1, Math.round(m.combat.zones[z] * 0.4)); m.combat.maxHp[z] = m.combat.zones[z]; }
+  return m;
+}
+
 /** Pick a faction + one of its home towns (or anywhere if it holds none yet). */
 function pickHome(towns) {
   const faction = pickFaction(towns);
@@ -1162,7 +1189,7 @@ function spawnerTick(players) {
 }
 
 module.exports = {
-  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount, markHostile, isHostile,
+  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount, markHostile, isHostile, makeTutorialTarget,
   _test: {
     spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
     avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,

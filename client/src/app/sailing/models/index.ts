@@ -132,6 +132,19 @@ export interface MarketState {
 /** A discovered town in the player's ledger: its specialty + last-seen prices + the in-game day seen. */
 export interface LedgerEntry { specialty: string; day: number; goods: { id: string; ask: number; bid: number }[]; }
 
+// ── Quests (intro tutorial + future storyline) — server-pushed, rendered by the quest UI ──
+/** A story panel: an image slot (resolved to /images/quests/<image>.png, text-only if missing) + atmospheric text. */
+export interface QuestPanel { image: string | null; text: string; }
+/** One objective in the current stage. client_ack types are confirmed by the player; the rest verify server-side. */
+export interface QuestObjective { id: string; type: string; image: string | null; label: string; hint: string; done: boolean; }
+/** The active quest's current stage (server-authoritative): narrative to show on entry + the live objective list. */
+export interface QuestUpdate {
+  questId: string; title: string; stageIndex: number; stageCount: number;
+  narrative: QuestPanel[]; objectives: QuestObjective[]; reward: { gold: number }; status: string;
+}
+/** A transient story beat (a stage's onComplete), with any gold just awarded — shown in the story modal, then dismissed. */
+export interface QuestNarrative { panels: QuestPanel[]; rewardGold: number; }
+
 export interface TerrainManifest {
   version: number;
   source: string;

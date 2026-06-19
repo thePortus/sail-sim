@@ -52,9 +52,16 @@ export class BirdFlapPlugin extends MaterialPluginBase {
 
   // birdFlap = (flapAmp, bobAmp, speed, time). Wing flap weight from |z| (span); body bob from the spine.
   // Wingtips rise/fall along +Y and sweep slightly inward along ±Z on the upstroke; the body counter-bobs.
-  // Phase per bird = instance world position so a flock desyncs.
+  // Phase per bird = instance world position so a flock desyncs. PER-BIRD EFFORT (B4): the instance colour's
+  // ALPHA carries a 0..1 flap "energy" written each frame from the bird's vertical speed — a climbing gull
+  // flaps hard, a gliding one holds its wings nearly still — scaling amplitude continuously (the opaque material
+  // discards the fragment alpha, so reusing it here is free). No INSTANCESCOLOR → energy defaults to 1.
   private static readonly GLSL = `
     #ifdef BIRD_FLAP
+      float bEnergy = 1.0;
+      #ifdef INSTANCESCOLOR
+        bEnergy = clamp(instanceColor.a, 0.0, 1.0);                  // per-bird flap effort
+      #endif
       float bWf  = smoothstep(0.10, 0.70, abs(positionUpdated.z));   // 0 body → 1 wingtip
       float bBob = 1.0 - smoothstep(0.05, 0.25, abs(positionUpdated.z));
       float bPh  = 0.0;
@@ -63,14 +70,19 @@ export class BirdFlapPlugin extends MaterialPluginBase {
       #endif
       float bT = birdFlap.z * birdFlap.w + bPh;
       float bF = sin(bT);
-      positionUpdated.y += bF * bWf * birdFlap.x;                    // wings rise/fall
-      positionUpdated.z -= sign(positionUpdated.z) * max(bF, 0.0) * bWf * birdFlap.x * 0.18;  // inward sweep
-      positionUpdated.y -= bF * bBob * birdFlap.y;                   // body counter-bob
+      float bAmp = birdFlap.x * bEnergy;
+      positionUpdated.y += bF * bWf * bAmp;                          // wings rise/fall
+      positionUpdated.z -= sign(positionUpdated.z) * max(bF, 0.0) * bWf * bAmp * 0.18;  // inward sweep
+      positionUpdated.y -= bF * bBob * birdFlap.y * (0.3 + 0.7 * bEnergy);   // body counter-bob (keeps a little life when gliding)
     #endif
   `;
 
   private static readonly WGSL = `
     #ifdef BIRD_FLAP
+      var bEnergy = 1.0;
+      #ifdef INSTANCESCOLOR
+        bEnergy = clamp(vertexInputs.instanceColor.a, 0.0, 1.0);
+      #endif
       let bWf  = smoothstep(0.10, 0.70, abs(positionUpdated.z));
       let bBob = 1.0 - smoothstep(0.05, 0.25, abs(positionUpdated.z));
       var bPh = 0.0;
@@ -79,9 +91,10 @@ export class BirdFlapPlugin extends MaterialPluginBase {
       #endif
       let bT = uniforms.birdFlap.z * uniforms.birdFlap.w + bPh;
       let bF = sin(bT);
-      positionUpdated.y += bF * bWf * uniforms.birdFlap.x;
-      positionUpdated.z -= sign(positionUpdated.z) * max(bF, 0.0) * bWf * uniforms.birdFlap.x * 0.18;
-      positionUpdated.y -= bF * bBob * uniforms.birdFlap.y;
+      let bAmp = uniforms.birdFlap.x * bEnergy;
+      positionUpdated.y += bF * bWf * bAmp;
+      positionUpdated.z -= sign(positionUpdated.z) * max(bF, 0.0) * bWf * bAmp * 0.18;
+      positionUpdated.y -= bF * bBob * uniforms.birdFlap.y * (0.3 + 0.7 * bEnergy);
     #endif
   `;
 }

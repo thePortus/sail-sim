@@ -43,6 +43,8 @@ db.ensureColumns = async () => {
     // Crew resource: remaining sailors (NULL backfills as "full complement" on next load). Persists across
     // maps (the player's, not the world's). Grapeshot lowers it; a port tavern raises it back.
     ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
+    // Quest progress (intro tutorial + future storyline). NULL = new player → intro auto-starts on login.
+    ['questState',   { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
   ];
   for (const [name, spec] of adds) {
     try {

@@ -15,8 +15,13 @@ import { TerrainHarbor } from '../sailing/models';
   standalone: true,
   imports: [CommonModule],
   template: `
+    @if (town.tier == 'capital') {
+      <img src="/images/governor.png" alt="A governor's mansion.">
+    }
+    @else {
+      <img src="/images/mayor.png" alt="A mayor's house.">
+    }
     <div class="gv-backdrop" (click)="onClose()"></div>
-
     <div class="gv-panel" (click)="$event.stopPropagation()">
       <div class="gv-header">
         <div class="gv-title">{{ title() }}</div>

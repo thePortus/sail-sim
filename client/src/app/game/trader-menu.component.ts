@@ -32,7 +32,7 @@ import { factionColor, factionName } from '../sailing/faction.config';
       <img src="/images/trader.png" alt="A trader inspecting goods.">
 
       @if (mp.hint(); as h) {
-        <div class="tr-rumour">🗣 They say <b>{{ h.townName }}</b> pays well for <b>{{ h.goodName }}</b> ({{ h.bid }}g) — marked on your map.</div>
+        <div class="tr-rumour" data-guide="market-hint">🗣 They say <b>{{ h.townName }}</b> pays well for <b>{{ h.goodName }}</b> ({{ h.bid }}g) — marked on your map.</div>
       }
 
       <div class="tr-purse">
@@ -43,7 +43,7 @@ import { factionColor, factionName } from '../sailing/faction.config';
         </span>
       </div>
 
-      <div class="tr-qty">
+      <div class="tr-qty" data-guide="market">
         <span>Quantity</span>
         <button class="tr-step" (click)="bump(-1)">−</button>
         <span class="tr-qval">{{ qty() }}</span>

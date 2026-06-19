@@ -1,6 +1,7 @@
 import { Injectable, inject, signal } from '@angular/core';
-import { TransformNode, Vector3, Mesh, MeshBuilder, Matrix, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
+import { TransformNode, Vector3, Quaternion, Mesh, MeshBuilder, Matrix, Material, Scene, PBRMaterial, Color3, PointLight, Observer,
   StandardMaterial, DynamicTexture, VertexData, Texture } from '@babylonjs/core';
+import { ShadowBlobPlugin } from './scatter/props/shadow-blob.plugin';
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
@@ -61,6 +62,18 @@ export class HarborService {
   // async builds against the per-frame scan re-triggering.
   private readonly townNodes = new Map<string, TransformNode>();
   private readonly townLoading = new Set<string>();
+  // Cheap fake building shadows (scatter-style soft blob discs, thin-instanced under each building) — ONLY for the
+  // nearest STREAMED town (real meshes, not the LOD impostor). Reuses the scatter ShadowBlobPlugin (sun-stretch
+  // from the shared global) + a dark soft decal. No real shadow-map casting (that stays the local ship + piers).
+  private _townShadowDisc: Mesh | null = null;
+  private _townShadowMat: StandardMaterial | null = null;
+  private _blobTownId: string | null = null;        // which streamed town currently owns the blobs
+  private _blobSunAcc = 1;                            // throttles the night-fade alpha recompute
+  private readonly _blobQ = Quaternion.Identity();   // identity — the plugin orients the disc in local space
+  private readonly _blobPos = new Vector3();
+  private readonly _blobScale = new Vector3();
+  private static readonly TOWN_BLOBS = true;          // master toggle
+  private static readonly BLOB_LIFT = 0.08;           // raise the decal off the pad (z-fight guard)
   // PIER streaming (50-town map): piers used to be built once for ALL towns and stay resident —
   // every pier mesh then lives in the main pass, the ocean mirror RTT (addToRenderList), the
   // shadow cascades (addShadowCaster) AND the glow include list (lantern), all frame, every frame.
@@ -235,7 +248,104 @@ export class HarborService {
     const f = this.frame++;
     // Towns are STATIC, so their signs' scale/position drift slowly with the camera — refresh at ~15 Hz, not 60.
     if ((f & 3) === 0) { this.updateTownLabels(); }
-    if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); }
+    if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); this.updateTownBlobs(); }
+    this.driveTownBlobSun();   // night-fade the building blobs (throttled internally)
+  }
+
+  // ── Cheap fake building shadows (nearest streamed town only) ─────────────────────────────────────
+
+  /** Pick the nearest STREAMED town and (re)build its building blob shadows when that changes. Only towns whose
+   *  real meshes are resident (townNodes) are candidates — so blobs never show under the distant LOD impostors. */
+  private updateTownBlobs(): void {
+    const scene = this.sceneService.scene;
+    if (!scene || !HarborService.TOWN_BLOBS) return;
+    const p = this.vesselService.getPosition();
+    let nearestId: string | null = null, best = Infinity;
+    for (const h of this.harbors) {
+      if (!this.townNodes.has(h.id)) continue;
+      const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
+      if (d2 < best) { best = d2; nearestId = h.id; }
+    }
+    // No change AND already built → nothing to do.
+    if (nearestId === this._blobTownId && (nearestId === null || this._townShadowDisc?.isVisible)) return;
+    this._blobTownId = nearestId;
+    if (nearestId) { this.ensureTownShadowAssets(scene); this.buildTownBlobsFor(nearestId); }
+    else { this.clearTownBlobs(); }
+  }
+
+  /** Thin-instance one soft blob under each building of the given (streamed) town, sized to its measured footprint. */
+  private buildTownBlobsFor(townId: string): void {
+    const node = this.townNodes.get(townId), disc = this._townShadowDisc;
+    if (!node || !disc) { this.clearTownBlobs(); return; }
+    const builds = node.getChildTransformNodes(true).filter((n) => n.name.startsWith('b_'));
+    const data = new Float32Array(builds.length * 16);
+    let n = 0;
+    for (const b of builds) {
+      const bb = b.getHierarchyBoundingVectors(true);
+      const r = Math.max(bb.max.x - bb.min.x, bb.max.z - bb.min.z) * 0.5 * 1.25;   // a touch wider than the base
+      if (!(r > 0.5)) continue;
+      this._blobPos.set((bb.min.x + bb.max.x) * 0.5, bb.min.y + HarborService.BLOB_LIFT, (bb.min.z + bb.max.z) * 0.5);
+      this._blobScale.set(r * 2, 1, r * 2);
+      Matrix.Compose(this._blobScale, this._blobQ, this._blobPos).copyToArray(data, n * 16);
+      n++;
+    }
+    if (n === 0) { this.clearTownBlobs(); return; }
+    disc.thinInstanceSetBuffer('matrix', n === builds.length ? data : data.subarray(0, n * 16), 16, false);
+    disc.isVisible = true;
+  }
+
+  private clearTownBlobs(): void {
+    if (this._townShadowDisc) { this._townShadowDisc.thinInstanceCount = 0; this._townShadowDisc.isVisible = false; }
+  }
+
+  /** Fade the blobs out at night + soften them as the sun lowers (matches the scatter blobs). Throttled — the sun crawls. */
+  private driveTownBlobSun(): void {
+    const mat = this._townShadowMat, scene = this.sceneService.scene;
+    if (!mat || !scene || !this._townShadowDisc?.isVisible) return;
+    this._blobSunAcc += scene.getEngine().getDeltaTime() / 1000;
+    if (this._blobSunAcc < 0.5) return;
+    this._blobSunAcc = 0;
+    const sunY = this.sceneService.getSunDirection().y;
+    const t = Math.max(0, Math.min(1, sunY / 0.16));
+    const ss = t * t * (3 - 2 * t);                       // smoothstep night fade
+    const stretch = ShadowBlobPlugin.SHADOW.stretch;      // shared sun-stretch (driven by ScatterService)
+    mat.alpha = 0.30 * ss * (1 - 0.12 * (stretch - 1));
+  }
+
+  /** Lazily build the shared blob disc + dark soft-decal material (mirrors ScatterService.registerShadows). */
+  private ensureTownShadowAssets(scene: Scene): void {
+    if (this._townShadowDisc) { return; }
+    const grad = new DynamicTexture('town_shadow_grad', 128, scene, false);
+    const ctx = grad.getContext() as CanvasRenderingContext2D;
+    const g = ctx.createRadialGradient(64, 64, 1, 64, 64, 63);
+    g.addColorStop(0.00, 'rgba(255,255,255,1.0)');
+    g.addColorStop(0.32, 'rgba(255,255,255,0.80)');
+    g.addColorStop(0.62, 'rgba(255,255,255,0.42)');
+    g.addColorStop(0.84, 'rgba(255,255,255,0.15)');
+    g.addColorStop(1.00, 'rgba(255,255,255,0.0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128); grad.update(); grad.hasAlpha = true;
+
+    const mat = new StandardMaterial('town_shadow_mat', scene);
+    mat.diffuseColor = new Color3(0, 0, 0);
+    mat.specularColor = new Color3(0, 0, 0);
+    mat.emissiveColor = new Color3(0.02, 0.03, 0.05);   // dark cool decal (picks up sky ambient), not dead black
+    mat.disableLighting = true;
+    mat.opacityTexture = grad;
+    mat.alpha = 0.30;
+    mat.backFaceCulling = false;
+    mat.disableDepthWrite = true;                        // a decal: blend over the pad, don't fight other blobs
+    new ShadowBlobPlugin(mat);                           // stretch away from the sun (shared global static)
+    this.sceneService.excludeFromPrePass(mat);
+    this._townShadowMat = mat;
+
+    const disc = MeshBuilder.CreateGround('town_shadow_disc', { width: 1, height: 1 }, scene);
+    disc.material = mat;
+    disc.isPickable = false;
+    disc.isVisible = false;
+    disc.alwaysSelectAsActiveMesh = true;                // thin-instance AABB isn't tracked → never frustum-cull the template
+    disc.metadata = { excludeFromRefraction: true };     // never seen through the seabed water
+    this.sceneService.excludeFromGlow(disc);
+    this._townShadowDisc = disc;
   }
 
   /** Build a town's floating sign when the player nears it; drop it again once well past (hysteresis). */
@@ -316,10 +426,9 @@ export class HarborService {
   /** Unwind everything buildPier registered: ocean mirror render list, shadow casters, lantern glow.
    *  Then dispose meshes only — materials/textures are shared via the asset-cache container. */
   private disposePier(node: TransformNode): void {
-    const sg = this.sceneService.shadowGenerator;
     for (const m of node.getChildMeshes(false)) {
       this.oceanService.removeFromRenderList(m);
-      sg?.removeShadowCaster(m as Mesh);
+      this.sceneService.removeGatedShadowCaster(m);
       if (/glass/i.test(m.name)) this.sceneService.removeFromGlow(m as Mesh);
     }
     node.dispose(false, false);
@@ -684,10 +793,9 @@ export class HarborService {
     // prePass — receiving shadows + the prePass G-buffer variant blow the budget and invalidate the
     // prePass + ocean-reflection render pipelines. Reflection (clip-plane variant) still fits once those
     // are shed.
-    const sg = this.sceneService.shadowGenerator;
     for (const m of pier.getChildMeshes(false)) {
-      this.oceanService.addToRenderList(m);
-      sg?.addShadowCaster(m as Mesh, true);
+      this.oceanService.addToRenderList(m, true);   // gated: distant piers drop out of the mirror
+      this.sceneService.addGatedShadowCaster(m);    // gated: distant piers drop out of the shadow pass
       m.receiveShadows = false;
       m.computeWorldMatrix(true);
       m.freezeWorldMatrix();
@@ -758,6 +866,9 @@ export class HarborService {
     for (const node of this.townNodes.values()) node.dispose(false, false);   // keep shared container materials
     this.townNodes.clear();
     this.townLoading.clear();
+    this._townShadowDisc?.dispose();   this._townShadowDisc = null;   // own disc + thin-instance buffer
+    this._townShadowMat?.dispose(false, true); this._townShadowMat = null;   // own material + gradient texture
+    this._blobTownId = null;
     for (const { plane } of this.townLabels.values()) plane.dispose(false, true);   // own texture+material
     this.townLabels.clear();
     for (const m of this.impostorMeshes) { m.material?.dispose(true, true); m.dispose(); }   // own texture+material

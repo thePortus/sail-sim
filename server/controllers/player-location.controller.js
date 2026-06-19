@@ -14,6 +14,7 @@
 const db   = require('../models');
 const User = db.User;
 const { MAP_VERSION } = require('../movement-constants');
+const anchors = require('../quest-anchors');
 
 exports.getLocation = async (req, res) => {
   try {
@@ -22,6 +23,13 @@ exports.getLocation = async (req, res) => {
     });
 
     if (!user || user.lastX === null) {
+      // Brand-new player → spawn at the intro tutorial anchor (the Saltmeadow, just off the start port), DERIVED
+      // from the current map so it never goes stale. The intro itself is gated by questState in the ws login.
+      // Anchors not ready (map still loading) → 404 so the client coastal-spawns on its own.
+      const a = anchors.getAnchors();
+      if (a && a.spawn) {
+        return res.json({ x: a.spawn.x, z: a.spawn.z, heading: a.spawn.heading, vesselSlug: 'pinnace', callsign: null, savedAt: null });
+      }
       return res.status(404).json({ message: 'No saved location' });
     }
 

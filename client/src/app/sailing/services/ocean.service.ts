@@ -1647,7 +1647,10 @@ export class OceanService {
     // main render-scale. Water reflections are distorted/blurry anyway, so neither
     // the resolution drop nor the 30 Hz update rate is noticeable — but it roughly
     // 1/8ths the reflection's cost.
-    this.reflectionRTT = new MirrorTexture('oceanReflection', 512, scene, true);
+    // 256 px (was 512): water reflections are wave-distorted and blurred, so the drop is imperceptible but
+    // quarters the mirror's pixel/VRAM cost. The bigger lever for the live descriptor-heap OOM is the
+    // distance-cull below (cullReflectionList), which keeps DISTANT piers/ships out of the render list.
+    this.reflectionRTT = new MirrorTexture('oceanReflection', 256, scene, true);
     // Every 3rd frame (perf). The renderList is just sky + vessels + piers, which change slowly.
     // 3 is deliberately COPRIME with the refraction's refreshRate (2): the two heavy RTTs then only
     // render on the same frame once every lcm(3,2)=6 frames — that de-stacks the bimodal frame-time
@@ -1677,6 +1680,12 @@ export class OceanService {
     // blank texture — BabylonJS only auto-renders RTTs that are wired through
     // StandardMaterial / PBRMaterial reflection slots, not ShaderMaterial.
     scene.customRenderTargets.push(this.reflectionRTT);
+
+    // Distance-cull the gated (piers + remote ships) meshes from the mirror right before it renders (only every
+    // 3rd frame, when the RTT actually runs). The landscape (terrain/islands/sky) is NEVER gated, so the
+    // shoreline keeps reflecting at any range — only distant man-made structures/ships drop out. This bounds the
+    // reflection render-list size = the bind-group/descriptor count that drives the live E_OUTOFMEMORY device loss.
+    this.reflectionRTT.onBeforeRenderObservable.add(() => this.cullReflectionList());
 
     // ── Refraction RTT: the seabed (terrain only) rendered from the main camera,
     // at half resolution, so the ocean shader can show the REAL terrain colour
@@ -2436,11 +2445,20 @@ export class OceanService {
   // explicit addToRenderList() calls; vegetation instances arrive only via the
   // direct call.  The Set avoids O(n) Array.includes() on a potentially large list.
   private renderListSet = new Set<AbstractMesh>();
+  // Distance-gated subset of the reflection list: man-made structures + remote ships that should DROP OUT of the
+  // mirror when far from the viewer (they reflect as invisible specks but each still costs a draw + bind groups —
+  // the descriptor pressure behind the live device-loss OOM). The landscape (terrain/islands/sky) is NOT gated.
+  private reflGated  = new Set<AbstractMesh>();   // enrolled-but-distance-managed meshes
+  private reflActive = new Set<AbstractMesh>();   // the subset of reflGated currently IN the mirror render list
+  private static readonly REFLECT_DIST2 = 700 * 700;   // metres² — beyond this a gated mesh leaves the mirror
 
-  addToRenderList(mesh: AbstractMesh): void {
+  /** Enrol a mesh in the ocean reflection. `gated` = distance-cull it (piers, remote ships) so distant ones drop
+   *  out of the mirror; leave false for the landscape + the local ship (always reflected). */
+  addToRenderList(mesh: AbstractMesh, gated = false): void {
     if (this.reflectionRTT?.renderList && !this.renderListSet.has(mesh)) {
       this.renderListSet.add(mesh);
       this.reflectionRTT.renderList.push(mesh);
+      if (gated) { this.reflGated.add(mesh); this.reflActive.add(mesh); }   // starts in; cull drops it if far
     }
   }
 
@@ -2449,10 +2467,32 @@ export class OceanService {
   removeFromRenderList(mesh: AbstractMesh): void {
     if (!this.renderListSet.has(mesh)) return;
     this.renderListSet.delete(mesh);
+    this.reflGated.delete(mesh);
+    this.reflActive.delete(mesh);
     const list = this.reflectionRTT?.renderList;
     if (list) {
       const i = list.indexOf(mesh);
       if (i >= 0) list.splice(i, 1);
+    }
+  }
+
+  /** Drop distant gated meshes (piers/remote ships) from the mirror, re-add them as they come near. Runs from
+   *  reflectionRTT.onBeforeRenderObservable — i.e. only on the frames the mirror actually renders. Steady-state
+   *  cost is a couple of distance compares per gated mesh; the list splice happens only on a near↔far transition. */
+  private cullReflectionList(): void {
+    const list = this.reflectionRTT?.renderList;
+    if (!list || this.reflGated.size === 0) return;
+    const bx = this.boatX, bz = this.boatZ;
+    for (const m of this.reflGated) {
+      const p = m.absolutePosition;
+      const near = (p.x - bx) ** 2 + (p.z - bz) ** 2 <= OceanService.REFLECT_DIST2;
+      const active = this.reflActive.has(m);
+      if (near && !active) { list.push(m); this.reflActive.add(m); }
+      else if (!near && active) {
+        const i = list.indexOf(m);
+        if (i >= 0) list.splice(i, 1);
+        this.reflActive.delete(m);
+      }
     }
   }
 

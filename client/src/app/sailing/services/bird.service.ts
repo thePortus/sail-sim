@@ -46,32 +46,39 @@ type FlockState = 'RESTING' | 'TAKEOFF' | 'FLYING' | 'LANDING';
 interface Member {
   ox: number; oz: number; oy: number; flyVariant: number; scale: number; tint: Color3; yaw: number;
   restWingsOut: boolean; restTimer: number;
+  // B1 per-bird flight kinematics (used while airborne) — each gull integrates its OWN momentum-limited path
+  // toward the flock goal instead of being a rigid offset from an analytic orbit centre.
+  airborne: boolean;
+  px: number; py: number; pz: number;            // world position
+  hdg: number;                                   // travel heading (rad): velocity = (sin hdg, cos hdg)
+  spd: number; vy: number;                       // airspeed (m/s) + vertical speed (m/s)
+  bank: number;                                  // roll angle (rad), eased toward the turn
+  radBias: number; altBias: number;              // personal wheel-radius / altitude bias for variety
+  // B4 effort-driven wings: flapE 0..1 = how hard it's beating (from vertical speed), written to the instance
+  // colour alpha; gliding = committed soar pose (dihedral mesh, wings near-still) with hysteresis vs flicker.
+  flapE: number; gliding: boolean; glideTimer: number;
+  // B5 landing: onFinal = within flare altitude on a landing approach (gear-down mesh); flare 0..1 = nose-up flare.
+  onFinal: boolean; flare: number;
+  // B7 surface dip: 0 none · 1 descend to the water · 2 skim · 3 climb back out. dipTimer/Cooldown pace it.
+  dipState: number; dipTimer: number; dipCooldown: number;
 }
 
 interface Flock {
   state: FlockState;
   stateTimer: number;                            // seconds spent in the current state
   dwell: number;                                 // how long to hold RESTING / FLYING before transitioning
-  lift: number;                                  // 0 on the water … 1 at cruise altitude
-  cx: number; cz: number; cy: number;            // flock centre (world)
-  heading: number;                               // travel / orbit-tangent heading (rad)
-  anchorX: number; anchorZ: number;              // the takeoff/resting spot the orbit swings around
+  cx: number; cz: number; cy: number;            // flock centroid proxy (despawn / startle / audio distance)
+  anchorX: number; anchorZ: number;              // the takeoff/resting spot the wheel drifts around
   cruiseAlt: number;                             // target flying altitude (m)
-  orbitR: number; orbitAng: number; orbitW: number;  // orbit radius, angle, angular speed (rad/s)
+  wanderR: number;                               // how far the goal roams from the anchor (m)
+  gx: number; gy: number; gz: number;            // the GOAL point every bird steers toward (the wheel centre)
+  goalAlt: number;                               // ramps SEA_Y↔cruiseAlt over takeoff/landing
+  wTx: number; wTz: number; wanderTimer: number; // slow random-walk target the goal eases toward
   driftX: number; driftZ: number;                // RESTING: slow surface drift (m/s)
   nearShipDist: number;                          // nearest-ship distance last frame (−1 = re-initialise)
+  // B6 ship-following: while `following`, the wheel anchor tracks a point behind a moving ship's stern.
+  following: boolean; followTimer: number; followCooldown: number;
   members: Member[];
-}
-
-/** Linear blend. */
-function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
-/** Smooth 0→1 ease (Hermite) for the climb/descent. */
-function ease01(t: number): number { const u = Math.max(0, Math.min(1, t)); return u * u * (3 - 2 * u); }
-/** Shortest-arc angle blend (so a bird turning to its flight heading never spins the long way round). */
-function lerpAngle(a: number, b: number, t: number): number {
-  let d = (b - a) % (Math.PI * 2);
-  if (d > Math.PI) { d -= Math.PI * 2; } else if (d < -Math.PI) { d += Math.PI * 2; }
-  return a + d * t;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -117,8 +124,9 @@ export class BirdService {
   // ── Asset config ─────────────────────────────────────────────────────────────
   private static readonly VARIANTS = [
     { file: 'bird_a.glb', ampScale: 1.0 },   // 0 flying, full flap
-    { file: 'bird_b.glb', ampScale: 0.4 },   // 1 gliding, gentle flap
+    { file: 'bird_b.glb', ampScale: 0.4 },   // 1 gliding/soaring (dihedral, gentle flap)
     { file: 'bird_c.glb', ampScale: 1.0 },   // 2 perched (geometry folds the wings → barely flaps)
+    { file: 'bird_d.glb', ampScale: 0.5 },   // 3 landing-flare (gear down, tail fanned, braking flap)
   ];
   private static readonly TINTS: readonly Color3[] = [
     new Color3(1.00, 1.00, 1.00),   // white — herring/common gull
@@ -163,6 +171,46 @@ export class BirdService {
   private readonly IMMINENT_RADIUS = 26;
   private readonly CANNON_RADIUS = 130;
   private readonly _shipXZ: number[] = [];   // scratch: flattened [x,z,x,z,…] ship positions this frame
+
+  // ── B1 flight dynamics (per-bird momentum-limited steering) ──────────────────
+  private readonly CRUISE_SPD = 8.5;    // m/s typical gull cruise
+  private readonly MIN_SPD    = 5.5;    // stall floor while airborne
+  private readonly ACCEL      = 5.0;    // m/s² airspeed change (momentum)
+  private readonly TURN_RATE  = 0.85;   // rad/s max yaw rate → min turn radius ≈ spd/TURN ≈ 10 m (a real wheel)
+  private readonly MAX_BANK   = 0.62;   // rad (~36°) roll into a hard turn
+  private readonly BANK_EASE  = 3.0;    // how fast the roll catches up to the turn
+  private readonly CLIMB_RATE = 2.8;    // m/s max vertical speed
+  private readonly VACCEL     = 3.5;    // m/s² vertical-speed change
+  private readonly PITCH_GAIN = 1.0;    // nose pitch from climb angle
+  // B2 boids: each bird blends goal-seek with separation / alignment / cohesion over its airborne flockmates.
+  private readonly NEIGH_R = 12;        // m — alignment + cohesion neighbourhood
+  private readonly SEP_R   = 4.5;       // m — personal space (separation kicks in inside this)
+  private readonly W_GOAL  = 0.85;      // pull toward the wheel centre (keeps the flock together near the anchor)
+  private readonly W_ALI   = 0.5;       // match neighbours' heading (coherent wheeling)
+  private readonly W_COH   = 0.35;      // toward the local cluster centroid
+  private readonly W_SEP   = 1.7;       // push off close neighbours (no clipping/stacking)
+  private readonly VSEP    = 1.3;       // vertical separation gain (spread out altitude when stacked)
+  // B5 landing approach
+  private readonly FLARE_ALT   = 7;     // m — below this on a landing, the gull goes gear-down + flares
+  private readonly LAND_SPD    = 4.5;   // m/s — bleeds airspeed off on final approach
+  private readonly FLARE_PITCH = 0.55;  // rad nose-up at full flare (braking, feet forward to the water)
+  // B6 ship-following (gulls trail a moving boat for scraps, then peel off when it stops)
+  private readonly FOLLOW_TRIGGER = 75;  // m — a flying flock this close to a MOVING ship adopts it
+  private readonly FOLLOW_DROP    = 150; // m — peel off if the ship pulls this far away
+  private readonly FOLLOW_TRAIL   = 22;  // m — wheel centre sits this far behind the stern
+  private readonly FOLLOW_ALT     = 14;  // m — lower wheel, just above the rig, riding the wake
+  private readonly FOLLOW_WANDER  = 14;  // m — tighter wheel while trailing
+  private readonly FOLLOW_MIN_SPD = 1.0; // units/s — below this (or anchored) the ship counts as stopped
+  // B7 surface-dip feeding (an individual gull swoops to the surface to snatch, then climbs back out)
+  private readonly DIP_SKIM_H      = 0.8;   // m above the water it levels off to skim
+  private readonly DIP_RATE        = 0.015; // per-second chance a cruising gull starts a dip
+  private readonly DIP_RATE_FOLLOW = 0.07;  // …much higher while trailing a ship's wake (scraps)
+  private readonly DIP_DIVE_RATE   = 6.5;   // m/s — a dip dives faster than the normal climb limit (a real swoop)
+  // scratch (no per-bird allocation): orientation = yaw(Y) ∘ pitch(Z) ∘ roll(X) for the model (nose −X, span ±Z)
+  private readonly _qP = new Quaternion();
+  private readonly _qR = new Quaternion();
+  private readonly _axX = new Vector3(1, 0, 0);
+  private readonly _axZ = new Vector3(0, 0, 1);
 
   /** Current wildlife level (0 Off … 4 Ultra) — for the settings slider. */
   getWildlifeQuality(): number { return this._quality; }
@@ -213,7 +261,9 @@ export class BirdService {
 
       // useVertexColors=false: COLOR_0 is flap data, not albedo.
       const mesh = await loadScatterGeometry(scene, cfg.file, `scatter_bird_${v}`, mat, false);
-      if (!mesh) { console.warn(`[birds] variant ${v} (${cfg.file}) failed — birds disabled`); return; }
+      // A missing variant is non-fatal: leave meshes[v] null and carry on (writeBird falls back to the flyer).
+      // So an undeployed bird_d (landing) only loses the gear-down pose — it can't disable the whole flock.
+      if (!mesh) { console.warn(`[birds] variant ${v} (${cfg.file}) failed to load — falling back`); continue; }
       this.sceneService.excludeFromGlow(mesh);
       // loadScatterGeometry hides the base mesh (it's built for the patch system, which clones a visible
       // copy per patch). We thin-instance the base mesh directly, so it MUST be visible to render.
@@ -234,6 +284,7 @@ export class BirdService {
       this.oceanService.addToRenderList(mesh);
       this.meshes[v] = mesh;
     }
+    if (!this.meshes[0]) { console.warn('[birds] flyer mesh (bird_a) failed — birds disabled'); return; }
 
     this.loaded = true;
     this.applyWildlifeParams(this._quality);   // enables only if the level is > 0
@@ -284,10 +335,13 @@ export class BirdService {
 
     // Collect every ship position once (local + remote) for the startle checks.
     const ships = this.gatherShips();
+    // The player's boat as a follow target (gulls trail it for scraps) — only while the weather's fair.
+    const follow = this.birdsWelcome ? this.playerFollowTarget() : null;
 
     // Advance each flock, then write its members into the per-variant thin-instance buffers.
-    const counts = [0, 0, 0];
+    const counts = new Array(this.meshes.length).fill(0);
     for (const f of this.flocks) {
+      this.updateFollow(f, dt, follow);
       this.advanceFlock(f, dt);
       if (f.state === 'RESTING') { this.checkShipStartle(f, ships); }
       if (f.state === 'RESTING') { this.updateRestPoses(f, dt); }
@@ -311,29 +365,32 @@ export class BirdService {
    *  takeoff spot and back down onto it). */
   private advanceFlock(f: Flock, dt: number): void {
     f.stateTimer += dt;
+    const climb = (f.cruiseAlt - this.SEA_Y);
     switch (f.state) {
       case 'RESTING':
         // Drift slowly across the surface (anchor follows the raft so it lifts off from where it sits).
         f.cx += f.driftX * dt; f.cz += f.driftZ * dt;
-        f.anchorX = f.cx; f.anchorZ = f.cz; f.cy = this.SEA_Y; f.lift = 0;
+        f.anchorX = f.cx; f.anchorZ = f.cz; f.cy = this.SEA_Y; f.goalAlt = this.SEA_Y;
         if (f.stateTimer >= f.dwell) { this.beginTakeoff(f); }
         break;
       case 'TAKEOFF':
-        f.lift = Math.min(1, f.lift + dt / this.TAKEOFF_TIME);
-        this.orbit(f, dt);
-        if (f.lift >= 1) { f.state = 'FLYING'; f.stateTimer = 0; f.dwell = 14 + Math.random() * 18; }
+        f.goalAlt = Math.min(f.cruiseAlt, f.goalAlt + climb / this.TAKEOFF_TIME * dt);
+        this.updateGoal(f, dt); this.flyMembers(f, dt, false);
+        if (f.goalAlt >= f.cruiseAlt - 0.5) { f.state = 'FLYING'; f.stateTimer = 0; f.dwell = 14 + Math.random() * 18; }
         break;
       case 'FLYING':
-        this.orbit(f, dt);
-        if (f.stateTimer >= f.dwell) { f.state = 'LANDING'; f.stateTimer = 0; }
+        f.goalAlt = f.cruiseAlt;
+        this.updateGoal(f, dt); this.flyMembers(f, dt, false);
+        if (f.stateTimer >= f.dwell && !f.following) { f.state = 'LANDING'; f.stateTimer = 0; f.wanderTimer = 1e9; }
         break;
       case 'LANDING':
-        f.lift = Math.max(0, f.lift - dt / this.LAND_TIME);
-        this.orbit(f, dt);
-        if (f.lift <= 0) {
-          // Settle: resume drifting from wherever the spiral set down, and rest a while. Re-initialise the
-          // approach detector (−1) so a ship that's merely parked nearby doesn't read as "closing" and
-          // immediately flush a raft that deliberately landed beside it.
+        // Goal converges on the anchor and sinks to the water; birds spiral down + settle individually (no snap).
+        f.wTx = f.anchorX; f.wTz = f.anchorZ;
+        f.goalAlt = Math.max(this.SEA_Y, f.goalAlt - climb / this.LAND_TIME * dt);
+        this.updateGoal(f, dt); this.flyMembers(f, dt, true);
+        if (!f.members.some((m) => m.airborne)) {
+          // All down: resume drifting from where they settled. Re-init the approach detector (−1) so a ship
+          // merely parked nearby doesn't immediately re-flush a raft that deliberately landed beside it.
           f.state = 'RESTING'; f.stateTimer = 0; f.dwell = 9 + Math.random() * 14;
           f.cx = f.anchorX; f.cz = f.anchorZ; f.nearShipDist = -1;
         }
@@ -393,6 +450,46 @@ export class BirdService {
     if (me) { out.push(me.x, me.z); }
     for (const r of this.multiplayer.getVesselWakeSources()) { out.push(r.x, r.z); }
     return out;
+  }
+
+  // ── Ship-following (B6) ──────────────────────────────────────────────────────────
+
+  /** The player's boat as a follow target while it's UNDERWAY (gulls trail a moving ship, not a parked one). */
+  private playerFollowTarget(): { x: number; z: number; hr: number } | null {
+    const s = this.vesselService.state();
+    if (!s || s.anchored || Math.abs(s.speed) < this.FOLLOW_MIN_SPD) { return null; }
+    return { x: s.x, z: s.z, hr: s.heading * Math.PI / 180 };   // heading 0=N=+Z, 90=E=+X → forward (sin,cos)
+  }
+
+  /** Make a flying flock TRAIL a moving ship: its wheel anchor rides a point behind the stern, so the gulls
+   *  wheel over the wake and chase the boat. They peel off (back to coastal wandering → land) when it stops,
+   *  outruns them, or after a while — then sit out a cooldown so they don't instantly re-glom on. */
+  private updateFollow(f: Flock, dt: number, ship: { x: number; z: number; hr: number } | null): void {
+    if (f.following) {
+      f.followTimer -= dt;
+      const dShip = ship ? Math.hypot(ship.x - f.cx, ship.z - f.cz) : Infinity;
+      if (!ship || dShip > this.FOLLOW_DROP || f.followTimer <= 0) {
+        f.following = false;
+        f.followCooldown = 8 + Math.random() * 10;
+        f.anchorX = f.gx; f.anchorZ = f.gz;                  // resume wheeling where they are
+        f.wanderR = 16 + Math.random() * 26;
+        if (f.state === 'FLYING') { f.dwell = Math.min(f.dwell, f.stateTimer + 6 + Math.random() * 6); }  // then drift down and land
+        return;
+      }
+      // Track a point behind the stern + ride lower over the wake.
+      f.anchorX = ship.x - Math.sin(ship.hr) * this.FOLLOW_TRAIL;
+      f.anchorZ = ship.z - Math.cos(ship.hr) * this.FOLLOW_TRAIL;
+      f.cruiseAlt = this.FOLLOW_ALT; f.wanderR = this.FOLLOW_WANDER;
+    } else {
+      if (f.followCooldown > 0) { f.followCooldown -= dt; }
+      // A flying flock close to the moving ship adopts it.
+      if (f.state === 'FLYING' && f.followCooldown <= 0 && ship
+          && Math.hypot(ship.x - f.cx, ship.z - f.cz) < this.FOLLOW_TRIGGER) {
+        f.following = true;
+        f.followTimer = 18 + Math.random() * 22;
+        f.cruiseAlt = this.FOLLOW_ALT; f.wanderR = this.FOLLOW_WANDER;
+      }
+    }
   }
 
   /** Flush a resting raft when a ship APPROACHES (distance closing) within STARTLE_RADIUS, or any ship is
@@ -527,59 +624,205 @@ export class BirdService {
     f.state = 'TAKEOFF';
     f.stateTimer = 0;
     f.anchorX = f.cx; f.anchorZ = f.cz;
-    f.orbitAng = Math.random() * Math.PI * 2;
+    f.gx = f.cx; f.gz = f.cz; f.goalAlt = this.SEA_Y;
+    f.wTx = f.cx; f.wTz = f.cz; f.wanderTimer = 0;
+    // Seed each gull's kinematic state at its raft position, fanning outward off the water with a hard first beat.
+    for (const m of f.members) {
+      m.airborne = true;
+      m.px = f.cx + m.ox; m.py = this.SEA_Y; m.pz = f.cz + m.oz;
+      m.hdg = Math.atan2(m.px - f.cx, m.pz - f.cz) + (Math.random() - 0.5) * 0.6;
+      m.spd = this.MIN_SPD; m.vy = this.CLIMB_RATE * 0.7; m.bank = 0;
+    }
   }
 
-  /** Circle the anchor, swung out by `lift` (0 = sat on the anchor → 1 = full orbit radius), with a gentle
-   *  altitude wander; heading tracks the orbit tangent so the formation faces its travel direction. */
-  private orbit(f: Flock, dt: number): void {
-    f.orbitAng += f.orbitW * dt;
-    const r = f.orbitR * f.lift;
-    f.cx = f.anchorX + Math.cos(f.orbitAng) * r;
-    f.cz = f.anchorZ + Math.sin(f.orbitAng) * r;
-    const e = ease01(f.lift);
-    f.cy = lerp(this.SEA_Y, f.cruiseAlt + Math.sin(f.orbitAng * 0.7) * 2.5, e);
-    f.heading = f.orbitAng + (f.orbitW >= 0 ? Math.PI / 2 : -Math.PI / 2);
+  /** Seed a flock that SPAWNS already airborne (no takeoff): scatter the gulls around the goal at cruise. */
+  private seedAirborne(f: Flock): void {
+    for (const m of f.members) {
+      m.airborne = true;
+      m.px = f.gx + m.ox; m.py = f.cruiseAlt + m.altBias * 0.5; m.pz = f.gz + m.oz;
+      m.hdg = Math.random() * Math.PI * 2; m.spd = this.CRUISE_SPD; m.vy = 0; m.bank = 0;
+    }
+  }
+
+  /** Slowly roam the flock GOAL (the wheel centre) around the anchor — a smoothed random walk. The birds steer
+   *  toward it with momentum + turn limits, so a flock no longer snaps around a perfect circle. */
+  private updateGoal(f: Flock, dt: number): void {
+    if ((f.wanderTimer -= dt) <= 0) {
+      const ang = Math.random() * Math.PI * 2, r = f.wanderR * (0.3 + Math.random() * 0.7);
+      f.wTx = f.anchorX + Math.cos(ang) * r; f.wTz = f.anchorZ + Math.sin(ang) * r;
+      f.wanderTimer = 4 + Math.random() * 5;
+    }
+    const k = Math.min(1, dt * 0.3);
+    f.gx += (f.wTx - f.gx) * k; f.gz += (f.wTz - f.gz) * k; f.gy = f.goalAlt;
+    f.cx = f.gx; f.cz = f.gz; f.cy = f.goalAlt;   // centroid proxy for despawn / startle / audio distance
+  }
+
+  /** Integrate every airborne member's momentum-limited flight one tick. On a landing, birds on FINAL approach
+   *  (below the flare altitude) drop their gear, bleed airspeed, flare nose-up, and settle individually as each
+   *  touches the water — a staggered approach, never a synchronized snap. */
+  private flyMembers(f: Flock, dt: number, landing: boolean): void {
+    for (const m of f.members) {
+      if (!m.airborne) { continue; }
+      if (landing) { m.dipState = 0; } else { this.updateDip(f, m, dt); }   // no feeding dips on a landing approach
+      this.steerBird(f, m, dt);
+      const onFinal = landing && m.py < this.FLARE_ALT;
+      m.onFinal = onFinal;
+      if (onFinal) {
+        // Bleed airspeed toward landing speed (decelerate only — momentum, never an instant stop).
+        if (m.spd > this.LAND_SPD) { m.spd = Math.max(this.LAND_SPD, m.spd - this.ACCEL * 2 * dt); }
+        // Flare: ease the nose-up bias in as it nears the water.
+        const f01 = Math.max(0, Math.min(1, 1 - (m.py - this.SEA_Y) / (this.FLARE_ALT - this.SEA_Y)));
+        m.flare += (f01 - m.flare) * Math.min(1, dt * 4);
+        if (m.py <= this.SEA_Y + 0.8 && m.vy <= 0.3) { this.settleMember(f, m); }
+      } else if (m.flare > 0.001) {
+        m.flare += (0 - m.flare) * Math.min(1, dt * 3);   // ease the flare back out if it climbs away
+      }
+    }
+  }
+
+  /** One bird's momentum-limited steering toward the flock goal: turn-rate-limited heading, eased airspeed,
+   *  limited climb, and a roll banked into the turn. This is the heart of the lifelike motion (B1). */
+  private steerBird(f: Flock, m: Member, dt: number): void {
+    // ── B2 boids: blend goal-seek with separation / alignment / cohesion over airborne flockmates ──
+    const NEIGH2 = this.NEIGH_R * this.NEIGH_R, SEP2 = this.SEP_R * this.SEP_R;
+    let sepX = 0, sepZ = 0, sepY = 0, aliX = 0, aliZ = 0, cohX = 0, cohZ = 0, cohN = 0;
+    for (const o of f.members) {
+      if (o === m || !o.airborne) { continue; }
+      const ddx = m.px - o.px, ddz = m.pz - o.pz;
+      const d2 = ddx * ddx + ddz * ddz;
+      if (d2 > NEIGH2) { continue; }
+      aliX += Math.sin(o.hdg); aliZ += Math.cos(o.hdg);        // alignment: neighbours' heading
+      cohX += o.px; cohZ += o.pz; cohN++;                       // cohesion: local centroid
+      if (d2 < SEP2) {                                          // separation: push off close neighbours
+        const d = Math.sqrt(d2) || 1e-3, w = 1 - d / this.SEP_R;
+        sepX += (ddx / d) * w; sepZ += (ddz / d) * w;
+        const ddy = m.py - o.py;
+        if (Math.abs(ddy) < 2.5) { sepY += (ddy >= 0 ? 1 : -1) * (1 - Math.abs(ddy) / 2.5) * w; }
+      }
+    }
+    // Goal-seek toward the wheel centre (normalised), then add the three boids urges.
+    let dirX = f.gx - m.px, dirZ = f.gz - m.pz;
+    const gl = Math.hypot(dirX, dirZ) || 1;
+    dirX = (dirX / gl) * this.W_GOAL; dirZ = (dirZ / gl) * this.W_GOAL;
+    if (cohN > 0) {
+      const al = Math.hypot(aliX, aliZ) || 1;
+      dirX += (aliX / al) * this.W_ALI; dirZ += (aliZ / al) * this.W_ALI;
+      let cx = cohX / cohN - m.px, cz = cohZ / cohN - m.pz; const cl = Math.hypot(cx, cz) || 1;
+      dirX += (cx / cl) * this.W_COH; dirZ += (cz / cl) * this.W_COH;
+    }
+    dirX += sepX * this.W_SEP; dirZ += sepZ * this.W_SEP;       // separation already proximity-weighted
+    // Surface dip (B7): while descending/skimming, aim just above the water; climbing-out (3) or none → flock alt.
+    const ty = (m.dipState === 1 || m.dipState === 2) ? this.SEA_Y + this.DIP_SKIM_H : f.gy + m.altBias * 0.5;
+    const desired = Math.atan2(dirX, dirZ);                     // hdg convention: velocity = (sin hdg, cos hdg)
+    let dh = (desired - m.hdg) % (Math.PI * 2);
+    if (dh > Math.PI) { dh -= Math.PI * 2; } else if (dh < -Math.PI) { dh += Math.PI * 2; }
+    const maxTurn = this.TURN_RATE * dt;
+    const turn = Math.max(-maxTurn, Math.min(maxTurn, dh));
+    m.hdg += turn;
+    const yawRate = dt > 1e-4 ? turn / dt : 0;
+    // Airspeed eases toward cruise (a touch slower when climbing hard) — momentum, never an instant start/stop.
+    const targetSpd = (ty - m.py) > 1.5 ? this.CRUISE_SPD * 0.85 : this.CRUISE_SPD;
+    m.spd += Math.max(-this.ACCEL * dt, Math.min(this.ACCEL * dt, targetSpd - m.spd));
+    if (m.spd < this.MIN_SPD) { m.spd = this.MIN_SPD; }
+    m.px += Math.sin(m.hdg) * m.spd * dt;
+    m.pz += Math.cos(m.hdg) * m.spd * dt;
+    // Limited climb/descent toward the target altitude, plus vertical separation so birds don't stack.
+    // A surface dip (descend, state 1) is allowed to plunge faster than the normal climb limit — a real swoop.
+    const diveMax = m.dipState === 1 ? this.DIP_DIVE_RATE : this.CLIMB_RATE;
+    const targetVy = Math.max(-diveMax, Math.min(this.CLIMB_RATE, (ty - m.py) * 0.8 + sepY * this.VSEP));
+    m.vy += Math.max(-this.VACCEL * dt, Math.min(this.VACCEL * dt, targetVy - m.vy));
+    m.py += m.vy * dt;
+    // Stay clear of land beneath (headlands/hills under the wheel push the bird up; water ≈ 0 → untouched).
+    const ground = this.terrainService.getElevation(m.px, m.pz);
+    if (ground > 0.5) { const floor = ground + this.GROUND_CLEARANCE; if (m.py < floor) { m.py = floor; if (m.vy < 0) { m.vy = 0; } } }
+    // Bank into the turn (roll ∝ how hard it's yawing), eased so it rolls in/out smoothly.
+    const targetBank = Math.max(-this.MAX_BANK, Math.min(this.MAX_BANK, (yawRate / this.TURN_RATE) * this.MAX_BANK));
+    m.bank += (targetBank - m.bank) * Math.min(1, dt * this.BANK_EASE);
+
+    // ── B4 effort → wings: flap energy from vertical speed (climb → hard beat, level → moderate, descent → glide).
+    const eTarget = Math.max(0.08, Math.min(1, 0.5 + m.vy * 0.18));
+    m.flapE += (eTarget - m.flapE) * Math.min(1, dt * 2.5);   // smooth so it doesn't strobe with the wave-driven vy
+    // Committed soar pose (dihedral mesh, wings near-still): switch only after the descent/climb holds, so a bird
+    // hovering around the threshold doesn't flicker meshes.
+    const wantGlide = m.vy < -0.8;
+    if (wantGlide !== m.gliding) {
+      if ((m.glideTimer -= dt) <= 0) { m.gliding = wantGlide; m.glideTimer = 1.5 + Math.random() * 1.5; }
+    } else { m.glideTimer = 1.5 + Math.random() * 1.5; }
+  }
+
+  /** A bird touches down: stop flying, anchor its raft offset where it landed, face its travel heading. */
+  private settleMember(f: Flock, m: Member): void {
+    m.airborne = false;
+    m.py = this.SEA_Y;
+    m.ox = m.px - f.anchorX; m.oz = m.pz - f.anchorZ;
+    m.yaw = Math.atan2(Math.cos(m.hdg), -Math.sin(m.hdg));   // keep facing the way it came in
+    m.bank = 0; m.vy = 0; m.onFinal = false; m.flare = 0; m.dipState = 0;
+    m.restWingsOut = false; m.restTimer = 2 + Math.random() * 6;
+  }
+
+  /** Surface-dip feeding (B7): a cruising gull occasionally swoops to the water — plunge (wings set, gliding via
+   *  B4), skim/snatch, then climb back out (flapping HARD, again via B4). Far more frequent while trailing a
+   *  ship's wake. The dip just overrides the bird's target altitude in steerBird; the rest is the normal flight. */
+  private updateDip(f: Flock, m: Member, dt: number): void {
+    if (m.dipState === 0) {
+      if (m.dipCooldown > 0) { m.dipCooldown -= dt; return; }
+      const rate = f.following ? this.DIP_RATE_FOLLOW : this.DIP_RATE;
+      if (m.py > this.FLARE_ALT + 3 && Math.random() < rate * dt) { m.dipState = 1; m.dipTimer = 6; }
+      return;
+    }
+    m.dipTimer -= dt;
+    if (m.dipState === 1) {                                                  // DIVE to the surface
+      if (m.py <= this.SEA_Y + this.DIP_SKIM_H + 0.5 || m.dipTimer <= 0) { m.dipState = 2; m.dipTimer = 0.3 + Math.random() * 0.5; }
+    } else if (m.dipState === 2) {                                          // SKIM / snatch
+      if (m.dipTimer <= 0) { m.dipState = 3; m.dipTimer = 6; }
+    } else if (m.py >= f.goalAlt - 4 || m.dipTimer <= 0) {                  // 3 = CLIMB back out, then cool down
+      m.dipState = 0; m.dipCooldown = 6 + Math.random() * 12;
+    }
   }
 
   /** Compose one bird's world matrix + tint into its variant's buffer (respecting the per-variant cap).
    *  Position, yaw and wing-state all blend by the flock's `lift`: a loose raft on the water (perched,
    *  bird_c) eases into a travel-aligned flock in the air (wings out, bird_a/b). */
   private writeBird(f: Flock, m: Member, counts: number[]): void {
-    const lift = f.lift;
-    // Airborne (incl. TAKEOFF/LANDING) → flying variant. On the water → perched (folded) unless this gull
-    // is mid-stretch, in which case it shows its flying variant so its wings are out and flapping.
-    const v = lift > 0.08 ? m.flyVariant : (m.restWingsOut ? m.flyVariant : 2);
+    let v: number, wx: number, wy: number, wz: number;
+    let energy = 1;   // per-bird flap energy → instance colour alpha (B4)
+    if (m.airborne) {
+      // Airborne: kinematic position + an orientation banked into the turn and pitched to the climb. Babylon's
+      // RotationY sends local +X → world (cos,−sin); the baked gull noses along −X, so yaw = atan2(vz,−vx) points
+      // the beak along the velocity. Pitch (about the span axis Z) noses up climbing; roll (about the nose axis
+      // X) is the bank. Compose yaw ∘ pitch ∘ roll (roll innermost = the bird's own local frame).
+      // Variant by EFFORT/STATE: on final approach → the gear-down landing-flare mesh (3); a committed glider →
+      // the dihedral soar mesh (1) with wings near-still; everyone else → the flat flapping mesh (0) beating at
+      // its own effort. (Replaces the random a/b split.)
+      v = m.onFinal ? 3 : (m.gliding ? 1 : 0);
+      energy = m.onFinal ? 0.5 : (m.gliding ? 0.12 : m.flapE);   // braking flap on final
+      wx = m.px; wy = m.py; wz = m.pz;
+      const vx = Math.sin(m.hdg), vz = Math.cos(m.hdg);
+      const yaw = Math.atan2(vz, -vx);
+      // Pitch from climb angle, plus a nose-up FLARE bias as it settles onto the water (feet forward, braking).
+      const pitch = Math.max(-0.5, Math.min(0.7,
+        Math.atan2(m.vy, Math.max(m.spd, 1)) * this.PITCH_GAIN + m.flare * this.FLARE_PITCH));
+      Quaternion.RotationAxisToRef(this._up, yaw, this._quat);
+      Quaternion.RotationAxisToRef(this._axZ, pitch, this._qP);
+      Quaternion.RotationAxisToRef(this._axX, m.bank, this._qR);
+      this._quat.multiplyInPlace(this._qP).multiplyInPlace(this._qR);
+    } else {
+      // Resting on the water: drift with the raft; folded (perched) variant unless this gull is mid-stretch.
+      v = m.restWingsOut ? m.flyVariant : 2;
+      wx = f.cx + m.ox; wy = this.SEA_Y; wz = f.cz + m.oz;
+      Quaternion.RotationAxisToRef(this._up, m.yaw, this._quat);
+    }
+    if (!this.meshes[v]) { v = 0; }   // chosen variant didn't load (e.g. undeployed bird_d) → fall back to the flyer
     const n = counts[v];
     if (n >= BirdService.MAX_PER_VARIANT) { return; }
 
-    // Raft offset (unrotated) ↔ flock offset (rotated to the heading), blended by lift.
-    const c = Math.cos(f.heading), s = Math.sin(f.heading);
-    const restX = f.cx + m.ox,                 restZ = f.cz + m.oz;
-    const flyX  = f.cx + m.ox * c - m.oz * s,   flyZ  = f.cz + m.ox * s + m.oz * c;
-    const wx = lerp(restX, flyX, lift);
-    const wz = lerp(restZ, flyZ, lift);
-    let wy = f.cy + m.oy * lift;
-    // Don't clip terrain: once airborne, keep clear of the land beneath. Skip over water (ground ≈ 0 →
-    // resting rafts and offshore birds are untouched); only headlands/hills under the orbit push birds up.
-    if (lift > 0.05) {
-      const ground = this.terrainService.getElevation(wx, wz);
-      if (ground > 0.5) { wy = Math.max(wy, ground + this.GROUND_CLEARANCE); }
-    }
-    // Facing: Babylon's RotationY sends local +X to (cos, −sin), so the travel heading negates (fixes the
-    // handedness). The baked gull model actually noses along −X (wings are ±Z), so add π to point the beak
-    // — not the tail — along the path. A small symmetric per-bird jitter avoids perfect lockstep.
-    const flyYaw = -f.heading + Math.PI + Math.sin(m.yaw) * 0.12;
-    const yaw = lerpAngle(m.yaw, flyYaw, lift);
-
     this._scaleV.set(m.scale, m.scale, m.scale);
     this._posV.set(wx, wy, wz);
-    Quaternion.RotationAxisToRef(this._up, yaw, this._quat);
     Matrix.ComposeToRef(this._scaleV, this._quat, this._posV, this._mat);
     this._mat.copyToArray(this.matBufs[v], n * 16);
     const ci = n * 4;
     const t = m.tint;
-    this.colBufs[v][ci] = t.r; this.colBufs[v][ci + 1] = t.g; this.colBufs[v][ci + 2] = t.b; this.colBufs[v][ci + 3] = 1;
+    this.colBufs[v][ci] = t.r; this.colBufs[v][ci + 1] = t.g; this.colBufs[v][ci + 2] = t.b; this.colBufs[v][ci + 3] = energy;
     counts[v] = n + 1;
   }
 
@@ -595,34 +838,43 @@ export class BirdService {
       members.push({
         ox: (Math.random() - 0.5) * 2 * spread,
         oz: (Math.random() - 0.5) * 2 * spread,
-        oy: (Math.random() - 0.5) * 8,                        // vertical spread once airborne (× lift)
-        flyVariant: Math.random() < 0.35 ? 1 : 0,             // mostly full-flap, some gliders
+        oy: (Math.random() - 0.5) * 8,
+        flyVariant: Math.random() < 0.35 ? 1 : 0,             // mostly full-flap, some gliders (B4 makes this dynamic)
         scale: 0.85 + Math.random() * 0.45,
         tint: BirdService.TINTS[Math.floor(Math.random() * BirdService.TINTS.length)],
         yaw: Math.random() * Math.PI * 2,
         restWingsOut: false,
         restTimer: 3 + Math.random() * 16,                    // staggered first stretch
+        airborne: false,
+        px: x, py: this.SEA_Y, pz: z, hdg: Math.random() * Math.PI * 2, spd: 0, vy: 0, bank: 0,
+        radBias: 0.6 + Math.random() * 0.8,                   // personal wheel-radius / altitude variety
+        altBias: (Math.random() - 0.5) * 12,
+        flapE: 0.6, gliding: false, glideTimer: 0,
+        onFinal: false, flare: 0,
+        dipState: 0, dipTimer: 0, dipCooldown: Math.random() * 10,
       });
     }
     const drift = 0.12 + Math.random() * 0.22, dang = Math.random() * Math.PI * 2;
     const airborne = Math.random() < 0.35;
-    return {
+    const cruiseAlt = 22 + Math.random() * 22;                // 22–44 m
+    const f: Flock = {
       state: airborne ? 'FLYING' : 'RESTING',
       stateTimer: 0,
-      // Stagger the first transition so rafts don't all take off together.
       dwell: airborne ? 14 + Math.random() * 18 : 4 + Math.random() * 16,
-      lift: airborne ? 1 : 0,
       cx: x, cz: z, cy: this.SEA_Y,
-      heading: 0,
       anchorX: x, anchorZ: z,
-      cruiseAlt: 22 + Math.random() * 22,                     // 22–44 m
-      orbitR: 16 + Math.random() * 26,                        // 16–42 m
-      orbitAng: Math.random() * Math.PI * 2,
-      orbitW: (Math.random() < 0.5 ? 1 : -1) * (0.12 + Math.random() * 0.10),  // rad/s
+      cruiseAlt,
+      wanderR: 16 + Math.random() * 26,                       // 16–42 m wheel roam
+      gx: x, gy: airborne ? cruiseAlt : this.SEA_Y, gz: z,
+      goalAlt: airborne ? cruiseAlt : this.SEA_Y,
+      wTx: x, wTz: z, wanderTimer: 0,
       driftX: Math.cos(dang) * drift, driftZ: Math.sin(dang) * drift,
       nearShipDist: -1,
+      following: false, followTimer: 0, followCooldown: 0,
       members,
     };
+    if (airborne) { this.seedAirborne(f); }
+    return f;
   }
 
   /** Find a water spot within the spawn ring of the camera that has land within LAND_PROXIMITY. */

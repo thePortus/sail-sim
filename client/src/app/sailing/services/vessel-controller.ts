@@ -74,9 +74,8 @@ export interface VesselRig {
    *   - waterlineY: root-local Y of the waterline plane the footprint is SLICED at (the rig origin is authored
    *                 at the waterline, so 0 is right; nudge ± if the cut sits a touch high/low on the hull). */
   hullCut?: { floorY: number; alongSign: 1 | -1; waterlineY?: number };
-  /** Per-vessel buoyancy feel (omit → generic sloop response). pitchScale = how far the wave slope tilts it;
-   *  heaveTau = vertical-follow time constant (LOWER = rides waves more, sits at an average level less);
-   *  tiltTau = pitch/roll time constant (LOWER = snaps onto the slope + drops back faster). See VesselBuoyancyService. */
+  /** Per-vessel buoyancy feel. pitchScale = how far the wave slope tilts it; heaveTau = vertical-follow time
+   *  constant (LOWER = rides waves more); tiltTau = pitch/roll time constant. See VesselBuoyancyService. */
   buoyancy?: { pitchScale?: number; heaveTau?: number; tiltTau?: number };
   /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
   hullHalfLen: number;

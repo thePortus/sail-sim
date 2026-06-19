@@ -2253,7 +2253,16 @@ export class OceanService {
   getVisualHeightAt(wx: number, wz: number, t: number): number {
     if (this.heightProvider) {
       const h = this.heightProvider(wx, wz);
-      if (!Number.isNaN(h)) { return h; }   // NaN → FFT map not ready yet, fall back
+      if (!Number.isNaN(h)) {
+        // The FFT provider returns the RAW deep-water swell; the visual vertex shader flattens that swell into
+        // the beach (ocean-material.ts: shoal = 1 - smoothstep(0.52,0.73,_shoreProx)). Apply the SAME shoal here
+        // so the hull bobs with the flattened near-shore water it actually sees — otherwise the boat heaves to
+        // the full open-ocean swell while the shallows look calm ("bouncy in the shallows").
+        const prox = this.shoreProximityAt(wx, wz);
+        const sT = Math.min(1, Math.max(0, (prox - 0.52) / 0.21));
+        const shoal = 1 - sT * sT * (3 - 2 * sT);
+        return h * shoal;
+      }
     }
     const px = wx * this.WAVE_FREQ;
     const py = wz * this.WAVE_FREQ;

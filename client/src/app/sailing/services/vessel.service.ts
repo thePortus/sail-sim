@@ -1209,13 +1209,16 @@ export class VesselService {
 
     this.updateWaterShadow();
 
-    // ── Buoyancy: 8-point hull sampling + wave slope physics ──────────────────
-    // VesselBuoyancyService samples OceanService.getVisualHeightAt() — a CPU
-    // port of the GPU vertex shader's waveHeight() — so the physics height
-    // matches the rendered surface exactly.
+    // ── Buoyancy: per-vessel hull sampling + wave slope physics ───────────────
+    // VesselBuoyancyService samples OceanService.getVisualHeightAt() — a CPU port of the GPU vertex shader's
+    // waveHeight() — so the physics height matches the rendered surface exactly. The hull footprint scales to
+    // each vessel's real dimensions (hullHalfLen/hullHalfBeam).
     const t    = this.simTime;
     const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt, this.rig.buoyancy,
       this.rig.hullHalfLen, this.rig.hullHalfBeam);
+    // Anti-sink floor: gentle 15% correction of any corner that lags below its wave.
+    const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
+    const heaveApplied = buoy.heave + floorLift * 0.15;
 
     // Wave surfing: wave slope makes the boat go faster downhill, slower uphill.
     // Blended gently so it's a subtle 0–30% nudge, not a jarring step-change.
@@ -1308,13 +1311,6 @@ export class VesselService {
       this.root.position.x += this.corrErrX;
       this.root.position.z += this.corrErrZ;
     }
-
-    // Anti-sink floor: apply only a gentle (15 %) correction of the floor excess
-    // rather than a hard snap-to.  The 0.55 m tolerance already absorbs most
-    // momentary corner submersion, so a light blend is enough to prevent the
-    // hull from going dramatically underwater without launching it into the air.
-    const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
-    const heaveApplied = buoy.heave + floorLift * 0.15;
 
     // Sink progress: eased 0→1 over SINK_DUR while sinking (curve handles the accelerating plunge), then
     // eased back to 0 on repair. Drives a deep draft drop + a dramatic capsize layered on below.

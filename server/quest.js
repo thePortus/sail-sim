@@ -119,6 +119,10 @@ function isNewPlayer(qs) { return !qs || Object.keys(qs).length === 0; }
 
 function quest(id) { return QUESTS[id]; }
 function activeQuestId(qs) { for (const id of Object.keys(qs)) { if (qs[id] && qs[id].status === 'active') return id; } return null; }
+/** True while the player is still working through the INTRO tutorial arc (their active quest is an intro quest).
+ *  Used to shield brand-new captains — e.g. pirates leave them be until the tutorial's done so they aren't
+ *  discouraged by an immediate attack. A skipped/finished intro → no intro quest active → false. */
+function inIntro(qs) { const id = qs ? activeQuestId(qs) : null; return !!(id && QUESTS[id] && QUESTS[id].intro); }
 
 /** Resolve a port symbol ('tutorial.portA' | literal townId) to a townId, or null if anchors aren't ready. */
 function resolvePort(sym) {
@@ -243,5 +247,5 @@ module.exports = {
   QUESTS, FIRST_INTRO,
   parseState, serializeState, isNewPlayer,
   startIfNew, skipIntro, onEvent, renderActive,
-  activeQuestId, resolvePort, quest,
+  activeQuestId, inIntro, resolvePort, quest,
 };

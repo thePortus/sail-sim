@@ -855,6 +855,7 @@ export class MultiplayerService {
         callsign:   String(data.callsign ?? ''),
         npc:        !!data.npc,
         faction:    data.faction ?? null,
+        role:       data.role ?? null,
         buffer:      [],
         dispX:       sx,
         dispZ:       sz,
@@ -892,6 +893,7 @@ export class MultiplayerService {
     entry.vesselSlug = String(data.vesselSlug ?? 'sloop').slice(0, 64);
     entry.npc        = !!data.npc;
     if (data.faction !== undefined) entry.faction = data.faction ?? null;
+    if (data.role !== undefined) entry.role = data.role ?? null;
     // Hull swapped under us (a remote player bought a new ship at a shipwright) → rebuild their mesh so
     // everyone sees the new vessel, not the old one. Guarded against re-entry; keeps the same root + pose.
     if (!isNew && entry.controller && entry.builtSlug && entry.builtSlug !== entry.vesselSlug && !entry.rebuilding) {
@@ -1619,7 +1621,11 @@ export class MultiplayerService {
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
     // Unparented (the shared builder returns it free-standing) so the hull LOD (root.setEnabled(false) when
     // impostored) can't hide the nameplate; tickRemoteMotion positions it at the masthead each frame instead.
-    entry.label = this.buildCallsignLabel(prefix + 'label', labelText, scene, entry.npc ? (entry.faction || null) : null);
+    entry.label = this.buildCallsignLabel(
+      prefix + 'label', labelText, scene,
+      entry.npc ? (entry.faction || null) : null,
+      entry.npc ? (entry.role || null) : null,
+    );
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1680,8 +1686,26 @@ export class MultiplayerService {
    *  "⚑ NATION MERCHANT" tag, with the redundant "Merchant " name prefix stripped); players → a single dark-slate
    *  callsign line. Shared ornate plaque renderer (see nameplate.ts); the caller positions/scales it per frame. */
   private buildCallsignLabel(
-    name: string, text: string, scene: Scene, faction: string | null = null,
+    name: string, text: string, scene: Scene, faction: string | null = null, role: string | null = null,
   ): Mesh {
+    // Pirates: a menacing BLACK plaque with a RED brass border + a skull-and-crossbones flanking the name —
+    // instantly distinct from both players (dark slate) and the nation-coloured merchants.
+    if (role === 'pirate') {
+      return buildNameplate(scene, name, {
+        title: `☠ ${text} ☠`, subtitle: 'PIRATE',
+        baseColor: '#1a0a0a', accentColor: '#d92020',
+        width: this.LABEL_WIDTH, height: this.LABEL_HEIGHT,
+      });
+    }
+    // Navy pirate-hunters: a nation-coloured warship plaque with a STEEL border + crossed-swords reading
+    // "<Nation> Navy — Pirate Hunter", so it's clearly a faction man-o'-war on the prowl, not a merchant.
+    if (role === 'hunter') {
+      return buildNameplate(scene, name, {
+        title: `⚔ ${factionName(faction).toUpperCase()} NAVY`, subtitle: 'PIRATE HUNTER',
+        baseColor: factionColor(faction), accentColor: '#c9d4e2',
+        width: this.LABEL_WIDTH, height: this.LABEL_HEIGHT,
+      });
+    }
     const merchant = !!faction;
     const title    = merchant ? (text.replace(/^\s*merchant\s+/i, '').trim() || text) : text.toUpperCase();
     const subtitle = merchant ? `⚑ ${factionName(faction).toUpperCase()} MERCHANT` : undefined;

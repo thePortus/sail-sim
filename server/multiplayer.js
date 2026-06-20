@@ -648,6 +648,31 @@ const REP_TRADE_MAX = 8;     // cap per transaction (a fat sale can't vault your
 const PARDON_STEP          = 20;    // max points restored per petition
 const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt petition ≈ 2 800g)
 
+// ── Pirate bounties ───────────────────────────────────────────────────────────
+// Pirates fly no flag, so sinking one is a service to the local powers rather than an act of piracy: it pays a
+// gold bounty (richer if the pirate had already plundered ships — see npc.pirateLoot) and earns standing with the
+// nation(s) whose waters it menaced. The protecting nation = any faction with a town within PIRATE_PROTECT_RANGE
+// of the wreck; if none is that close, the single faction owning the NEAREST town.
+const PIRATE_BOUNTY_GOLD   = 900;    // base gold bounty (floats as salvage at the wreck, like merchant loot)
+const PIRATE_BOUNTY_REP    = 22;     // standing earned with EACH protecting faction (decently large — a real lever)
+const PIRATE_PROTECT_RANGE = 1500;   // a faction with a town within this of the kill shares the bounty rep
+
+/** Faction ids that reward sinking a pirate at (x,z): every faction owning a town within PIRATE_PROTECT_RANGE; or,
+ *  if none is that near, the single faction owning the nearest town. Returns a (possibly empty) deduped array. */
+function protectingFactions(x, z) {
+  const within = new Set();
+  let nearestF = null, nearestD2 = Infinity;
+  const R2 = PIRATE_PROTECT_RANGE * PIRATE_PROTECT_RANGE;
+  for (const t of economy.townList()) {
+    if (!t.faction) continue;
+    const dx = t.x - x, dz = t.z - z, d2 = dx * dx + dz * dz;
+    if (d2 <= R2) within.add(t.faction);
+    if (d2 < nearestD2) { nearestD2 = d2; nearestF = t.faction; }
+  }
+  if (within.size) return [...within];
+  return nearestF ? [nearestF] : [];
+}
+
 /** Award `gain` standing with `factionId` to `player` and push the live readout. Returns the delta map (or null). */
 function awardFactionRep(player, factionId, gain, reason) {
   if (!player || player.isNpc || !factions.isFaction(factionId) || gain <= 0) return null;
@@ -809,7 +834,12 @@ function attachMultiplayer(server) {
         }
       }
     }
-    npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
+    // Keep the merchant fleet + pirates topped up, and dispatch navy hunters at lane-strangling pirates. The
+    // launch is telegraphed to everyone (a notable world event — the powers strike back at a notorious raider).
+    npc.spawnerTick(players, (faction, townName, pirateName) => {
+      const nation = factions.factionName(faction) || townName || 'A';
+      broadcastSystem(`⚔ The ${nation} Navy dispatches a pirate hunter to run down ${pirateName}!`);
+    });
     for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
 
     // Mast self-repair: jury-rig a shot-away mast back to 50 % after 45 s. tickMastRepair arms the timer
@@ -898,14 +928,14 @@ function attachMultiplayer(server) {
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
-    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). Only a PLAYER
-    // hit provokes it — collateral from another NPC's shot doesn't spark merchant-vs-merchant brawls. The
-    // tactical helm + return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
-    if (victim.isNpc && shooter && !shooter.isNpc) {
+    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). A PLAYER hit provokes
+    // it; so does a PIRATE's hit (so merchants fight/flee raiders), but ordinary merchant-vs-merchant collateral
+    // does not. The tactical helm + return fire that consume this live in the NPC tick (A2–A4); here we just arm it.
+    if (victim.isNpc && shooter && (!shooter.isNpc || shooter.isPirate)) {
       npc.markHostile(victim, shot.shooterId, Date.now());
-      // Piracy reputation (D2): a connecting shot on a nation's merchant dings your standing. The killing blow
-      // is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
-      if (!justSunk && victim.faction && !victim.questTag) awardPiracyRep(shooter, victim.faction, 'attack');
+      // Piracy reputation (D2): a connecting PLAYER shot on a nation's merchant dings your standing. The killing
+      // blow is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
+      if (!shooter.isNpc && !justSunk && victim.faction && !victim.questTag) awardPiracyRep(shooter, victim.faction, 'attack');
     }
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
@@ -929,6 +959,15 @@ function attachMultiplayer(server) {
       });
       for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
 
+      // A PIRATE that just sent a vessel down pockets the plunder — banked on its `pirateLoot` tally so a raider
+      // that's been preying on shipping is worth a fatter bounty when a player finally hunts it down. Sinking a
+      // nation's MERCHANT also ticks `piracyKills`: enough of them (PIRATE_HUNT_THRESHOLD) and a navy hunter sails.
+      if (shooter && shooter.isPirate && shooter !== victim) {
+        const took = victim.isNpc ? Math.floor((victim.gold || 0) * 0.6) + 200 : 350;   // merchant chest, or a player's purse
+        shooter.pirateLoot = (shooter.pirateLoot | 0) + took;
+        if (victim.isNpc && !victim.isPirate && !victim.isHunter) shooter.piracyKills = (shooter.piracyKills | 0) + 1;
+      }
+
       // Quest: the OWNER sinking their intro-tutorial target completes the combat quest. The sunk hull lingers
       // for the capsize animation then despawns via the NPC tick; just clear the ref so it isn't respawned.
       if (shooter && !shooter.isNpc && victim.questTag === 'tutorial'
@@ -937,7 +976,24 @@ function attachMultiplayer(server) {
         shooter.tutorialNpcId = null;
       }
 
-      if (victim.isNpc) {
+      if (victim.isPirate) {
+        // A pirate sank → a gold BOUNTY (base + whatever it had plundered) floats at the wreck, and the player
+        // who rid these waters of it earns standing with the protecting nation(s): every faction with a town
+        // within PIRATE_PROTECT_RANGE, or the nearest town's nation if none is that close.
+        const bounty = PIRATE_BOUNTY_GOLD + (victim.pirateLoot | 0);
+        const crate = salvage.spawnCrate(victim.state.x, victim.state.z, {}, bounty, Date.now());
+        const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+        for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+        if (shooter && !shooter.isNpc) {
+          const fids = protectingFactions(victim.state.x, victim.state.z);
+          for (const fid of fids) awardFactionRep(shooter, fid, PIRATE_BOUNTY_REP, 'pirate');
+          const nations = fids.map((f) => factions.factionName(f)).join(', ');
+          sysReply(shooter.ws, `You sank the pirate ${victim.state.vesselName || 'raider'}! A bounty of ${bounty} gold floats among the wreckage`
+            + (nations ? ` — the ${nations} are grateful.` : '.'));
+          saveEconomyState(shooter);
+        }
+        victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
+      } else if (victim.isNpc) {
         // A merchant sank → drop floating salvage (a fraction of its cargo + gold) at the wreck; the ship is
         // despawned after a short capsize-linger by the NPC tick. Anyone can sail over and collect.
         const LOOT = 0.5;

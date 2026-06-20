@@ -322,8 +322,9 @@ export interface OtherPlayer {
   vesselName:  string;
   vesselSlug:  string;
   callsign:    string;
-  npc?:        boolean;    // an NPC merchant trader (server-controlled), not a real player
-  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players
+  npc?:        boolean;    // an NPC ship (server-controlled), not a real player
+  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players + pirates
+  role?:       'merchant' | 'pirate' | 'hunter' | null;   // NPC kind — pirates get a black/red ☠ plaque, navy hunters a steel one
 }
 
 export interface ChatMessage {

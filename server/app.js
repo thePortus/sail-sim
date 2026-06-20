@@ -13,6 +13,12 @@ const path = require('path');
 
 const app = express();
 
+// Behind a reverse proxy in production (it sets X-Forwarded-For). Trust the first hop so express-rate-limit
+// can identify clients by their real IP — without this it throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR (which
+// was crashing requests / dropping connections live). `1` = trust exactly one proxy (don't use `true`, which
+// would let clients spoof the header to dodge rate limits). Bump if more proxy hops are added.
+app.set('trust proxy', 1);
+
 // favicon location
 app.use(favicon(path.join(__dirname, 'favicon.ico')));
 

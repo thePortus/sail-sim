@@ -62,6 +62,7 @@ const salvage = require('./salvage');
 const factions = require('./factions');
 const diplomacy = require('./diplomacy');
 const quest = require('./quest');
+const anchors = require('./quest-anchors');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
@@ -562,6 +563,10 @@ function applyQuestEvent(p, eventType, data, players) {
     // A reward with NO story beat (e.g. the steer sub-stage) would otherwise land silently → a small toast.
     p.ws.send(JSON.stringify({ type: 'quest_reward', gold: r.rewardGold | 0 }));
   }
+  // A quest just COMPLETED → the next one activated. If its first objective is "dock at town X" and the player
+  // is ALREADY docked there (e.g. sold at portB, and the combat tavern is also portB), the dock-change detector
+  // would never re-fire. Clear the tracked dock so the next update re-detects the current berth as an arrival.
+  if (r.completed && r.completed.length) { p._questDockTown = undefined; }
   sendQuest(p);
   ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
 }
@@ -673,7 +678,17 @@ function sendMarket(p, townId) {
   const mk = economy.marketFor(townId);
   if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
   recordVisit(p, mk);   // ledger keeps the town's BASE prices (comparable across players + the demand hint)
-  const hint = economy.hintFor(townId);
+  let hint = economy.hintFor(townId);
+  // Intro tutorial: keep the new player LOCAL — point the sell-hint at the nearby neighbour port (portB) so they
+  // don't chase the global best buyer across the map. Falls back to the normal hint if portB buys none of this
+  // town's exports.
+  if (p.questState && quest.activeQuestId(p.questState) === 'intro_trade') {
+    const a = anchors.getAnchors();
+    if (a && a.portB && a.portB !== townId) {
+      const near = economy.hintToTown(townId, a.portB);
+      if (near) { hint = near; }
+    }
+  }
   // Display the quote nudged by THIS player's standing with the town's nation — matches what tradeCore charges.
   const shown = economy.playerMarket(p, townId, mk);
   p.ws.send(JSON.stringify({

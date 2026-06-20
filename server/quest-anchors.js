@@ -5,9 +5,10 @@
  * changes, so it can never go stale and needs no separate bake step.
  *
  *   portA      — the humble start port (small/medium coastal town that has a sea-reachable neighbour for the
- *                trade leg). The tutorial's tavern (rumour mechanic) is here too (taverns aren't town-gated).
- *   portB      — that nearest sea-reachable neighbour (a convenience waypoint; the SELL port in the trade quest
- *                is resolved live from economy's sell-hint, not baked).
+ *                trade leg). The buy leg of the trade quest happens here.
+ *   portB      — that nearest sea-reachable neighbour: the trade SELL port (the tutorial forces the sell-hint
+ *                here, keeping the new player local) AND the combat tavern (rumour mechanic), so the player
+ *                doesn't backtrack between phases — buy at portA, then everything else clusters at nearby portB.
  *   spawn      — a navigable open-water point just off portA's pier, facing toward portB (open sea).
  *
  * Consumed by quest.js (resolves symbolic anchors like 'tutorial.spawn'/'tutorial.portA') and by the new-player
@@ -71,7 +72,9 @@ function derive() {
   }
   if (!portA) { portA = towns[0]; portB = nearestReachable(towns[0], towns); }   // fallback: any town
   const spawn = offshoreSpawn(portA, portB);
-  return { spawn, portA: portA.id, portB: portB ? portB.id : portA.id, tavernPort: portA.id };
+  // tavernPort = portB (the trade SELL port): the combat rumour is heard at the same town the player just sold
+  // at, so there's no backtrack across the map to reach the combat phase. Falls back to portA if no neighbour.
+  return { spawn, portA: portA.id, portB: portB ? portB.id : portA.id, tavernPort: portB ? portB.id : portA.id };
 }
 
 /** The cached anchors for the current map (derives on first call). null if the map isn't loaded yet. */

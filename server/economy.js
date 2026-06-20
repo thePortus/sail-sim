@@ -214,6 +214,31 @@ function bestBuyerFor(goodId, excludeTownId) {
   return best;
 }
 
+/** A trade rumour FORCED to a specific destination (the intro tutorial keeps the new player LOCAL, so the
+ *  sell-hint points at the nearby neighbour port instead of the global best buyer): among the FROM town's
+ *  exports, the one the TO town pays the most for → { goodId, goodName, townId, townName, bid }. null if `to`
+ *  isn't sea-reachable / buys none of from's exports (caller then falls back to the normal hintFor). */
+function hintToTown(fromTownId, toTownId) {
+  const from = getTown(fromTownId), to = getTown(toTownId);
+  if (!from || !to || from.id === to.id) return null;
+  if (!reachableFrom(fromTownId, to)) return null;
+  const prof = profileFor(from);
+  const mkTo = marketFor(to.id), mkFrom = marketFor(from.id);
+  if (!mkTo) return null;
+  let best = null;
+  for (const g of goods.GOODS) {
+    if (prof[g.id].role !== 'produced') continue;
+    const sell = mkTo.goods.find((x) => x.goodId === g.id);        // what `to` pays (bid)
+    if (!sell) continue;
+    const buy = mkFrom && mkFrom.goods.find((x) => x.goodId === g.id);   // what `from` charges (ask)
+    if (buy && sell.bid <= buy.ask) continue;                      // require SOME profit on the local hop
+    if (!best || sell.bid > best.bid) {
+      best = { goodId: g.id, goodName: g.name, townId: to.id, townName: to.name, bid: sell.bid };
+    }
+  }
+  return best;
+}
+
 /** A trade rumour for a town: among the goods it PRODUCES (its exports), the one with the best buyer elsewhere
  *  right now → { goodId, goodName, townId, townName, bid }. null if the town produces nothing / no buyer. */
 function hintFor(townId) {
@@ -507,7 +532,7 @@ module.exports = {
   load, ensureLoaded, townAt, getTown, townList, marketFor, playerMarket,
   parseCargo, usedSlots, capacityFor, goodsCatalog,
   applyBuy, applySell, applyRepair,
-  bestBuyerFor, hintFor, currentDay: economyDay,
+  bestBuyerFor, hintFor, hintToTown, currentDay: economyDay,
   npcBuy, npcSell, needList, distressList, bestSellerFor, bestArbitrage,
   tick, tickToToday, loadState, flushState, seedMarkets,
   REPAIR_FEE: goods.REPAIR_FEE, RECRUIT_COST: goods.RECRUIT_COST, STARTING_GOLD: goods.STARTING_GOLD, DOCK_RADIUS_M,

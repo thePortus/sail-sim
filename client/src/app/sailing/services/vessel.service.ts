@@ -344,6 +344,14 @@ export class VesselService {
   private fpPitch = 0;   // free-look pitch (deg, + = up)
 
   toggleFirstPerson(): void { this.firstPerson.update(v => !v); }
+
+  /** Current free-look camera offset in degrees — third-person orbit (azimuth from dead-astern + elevation),
+   *  or the first-person look offset when on deck. Used by the intro tutorial to detect "look about your ship". */
+  cameraOrbit(): { azimuth: number; elevation: number } {
+    return this.firstPerson()
+      ? { azimuth: this.fpYaw, elevation: this.fpPitch }
+      : { azimuth: this.camAzimuth, elevation: this.camElevation };
+  }
   private lastMouseX   = 0;
   private lastMouseY   = 0;
 

@@ -324,7 +324,7 @@ export class OceanFFTMaterial {
           float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
           float ringR  = age * 6.0;
           float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
-          sum += crater + geyser + ring;
+          sum += (crater + geyser + ring) * _SplashData[i].w;   // .w = per-impact strength (1 cannonball, small for dolphin/grape ripples)
         }
         return sum;
       }
@@ -341,7 +341,7 @@ export class OceanFFTMaterial {
           float col  = exp(-(r * r) / 4.0) * smoothstep(0.0, 0.25, age) * life;   // churned column
           float ringR = age * 6.0;
           float ring  = exp(-((r - ringR) * (r - ringR)) / 3.0) * life * 0.8;      // foam ring
-          f = max(f, max(col, ring));
+          f = max(f, max(col, ring) * _SplashData[i].w);   // .w = per-impact strength (small splash → little foam)
         }
         return f;
       }

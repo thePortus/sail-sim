@@ -312,8 +312,8 @@ export class DolphinService {
         const prevY = d.y;
         d.breachVy -= DolphinService.BREACH_G * dt;
         d.y += d.breachVy * dt;
-        if (prevY < 0 && d.y >= 0) { this.ocean.addSplash(d.x, d.z); }        // bursts clear of the water
-        if (prevY >= 0 && d.y < 0) { this.ocean.addSplash(d.x, d.z); }        // clean re-entry
+        if (prevY < 0 && d.y >= 0) { this.ocean.addSplash(d.x, d.z, 0.35); }   // bursts clear of the water (gentle splash)
+        if (prevY >= 0 && d.y < 0) { this.ocean.addSplash(d.x, d.z, 0.35); }   // clean re-entry
         if (d.y <= DolphinService.BREACH_REENTRY && d.breachVy < 0) { d.breaching = false; }
       } else {
         let yTarget = d.baseY + Math.sin(t * d.depthRate + d.depthPhase) * d.depthAmp;

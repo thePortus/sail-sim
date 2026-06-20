@@ -28,6 +28,7 @@ import { ScatterService }     from '../sailing/services/scatter/scatter.service'
 import { BirdService }         from '../sailing/services/bird.service';
 import { DolphinService }      from '../sailing/services/dolphin.service';
 import { FishSchoolService }   from '../sailing/services/fish-school.service';
+import { QuestActionService }  from '../sailing/services/quest-action.service';
 import { SeaweedService }      from '../sailing/services/seaweed.service';
 import { ReedService }         from '../sailing/services/reed.service';
 import { ShipBellService }     from '../sailing/services/ship-bell.service';
@@ -410,6 +411,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private birdService        = inject(BirdService);
   private dolphinService     = inject(DolphinService);
   private fishSchoolService  = inject(FishSchoolService);
+  private questActionService = inject(QuestActionService);
   private seaweedService     = inject(SeaweedService);
   private reedService        = inject(ReedService);
   private shipBellService    = inject(ShipBellService);
@@ -795,6 +797,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         if (!location.search.includes('nodolphins')) { await this.dolphinService.init(); }
         // Colored bait-fish schools in the shallows (seen through the refraction). PERF DIAGNOSTIC: ?nofish skips.
         if (!location.search.includes('nofish')) { await this.fishSchoolService.init(); }
+        // Intro-tutorial action detection (look/steer/trim acks complete by DOING them, not a button).
+        this.questActionService.start();
         // Underwater seaweed clumps, shallows-only, seen through the shallow refraction. ?noseaweed skips.
         if (!location.search.includes('noseaweed')) { await this.seaweedService.init(); }
         // Shoreline reeds — rooted in the water's edge, tops peeking above the surface. ?noreeds skips.
@@ -932,6 +936,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.oceanAudioService.dispose();
     this.dolphinService.dispose();
     this.fishSchoolService.dispose();
+    this.questActionService.stop();
     this.seaweedService.dispose();
     this.reedService.dispose();
     this.shipBellService.dispose();

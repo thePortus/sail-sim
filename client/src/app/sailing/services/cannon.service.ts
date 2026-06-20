@@ -1206,9 +1206,13 @@ export class CannonService {
         continue;
       }
 
-      // Misses into water/land.
-      if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
-        this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
+      // Misses into water/land. Impact at the SURFACE the ball strikes: sea level (0) over water, or the terrain
+      // TOP over land — the heightfield can be well above y=0, so testing only `by < 0.8` let the shot punch
+      // through a hill and "impact" at sea level inside the land. Use the terrain height at the ball's x,z.
+      const surfaceY = this.terrainService.getElevation(bx, bz);   // terrain top (land >0) / seabed (water <0)
+      const groundY  = surfaceY > 0 ? surfaceY : 0;
+      if ((by < groundY + 0.5 && ball.t > 0.4) || ball.t > 25) {
+        this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz, ball.kind, groundY);
         ball.alive = false;
         ball.mesh.setEnabled(false);
       }
@@ -2108,7 +2112,8 @@ export class CannonService {
 
   // ── Impact ────────────────────────────────────────────────────────────────
 
-  private onImpact(wx: number, wz: number, vx: number, vyImpact: number, vz: number): void {
+  private onImpact(wx: number, wz: number, vx: number, vyImpact: number, vz: number,
+                   kind: ShotKind, groundY: number): void {
     // Reverse-incoming cone: ejecta sprays back along the ball's entry angle, flipped.
     const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);
 
@@ -2119,19 +2124,28 @@ export class CannonService {
 
     const isLand = this.terrainService.isOnLand(wx, wz);
     if (isLand) {
-      // Dust thrown BACK along the entry line (plus a little lift), not a vertical column.
+      // Dust thrown BACK along the entry line (plus a little lift), not a vertical column. Spawned at the terrain
+      // SURFACE height (groundY) so a hillside hit kicks dust up on the slope, not down at sea level.
       this.setCone(this.dirtPS, rx, ry, rz, 1.2, 0.65, 0.45, 0.5);
-      this.dirtEmit.set(wx, 0.6, wz);
+      this.dirtEmit.set(wx, groundY + 0.6, wz);
       this.dirtPS.emitRate = 2400;
       this.dirtCutoffT     = this.elapsed + 0.16;
       // Lingering dust pall: drifts back along the entry then hangs (dusty browns).
       this.setCone(this.landSmokePS, rx, ry, rz, 0.5, 0.35, 0.25, 0.2);
-      this.landSmokeEmit.set(wx, 0.7, wz);
+      this.landSmokeEmit.set(wx, groundY + 0.7, wz);
       this.landSmokePS.emitRate  = 220;
       this.landSmokeCutoffT      = this.elapsed + 0.5;
       if (vol > 0.01) this.playLandImpactSound(vol);
+    } else if (kind === 'grape') {
+      // Grapeshot pellets prick the surface — NOT the heavy round/bar plunge. A tiny rain-drop ripple (no geyser
+      // column, no spout particles) + a soft high patter (throttled, since a volley lands many pellets at once).
+      this.oceanService.addSplash(wx, wz, 0.18);
+      if (vol > 0.01 && this.elapsed - this._lastGrapeSplashSound > 0.18) {
+        this._lastGrapeSplashSound = this.elapsed;
+        this.playGrapeWaterSound(vol);
+      }
     } else {
-      // Spray thrown BACK along the entry (toward where the ball came from) plus an
+      // Round/bar: spray thrown BACK along the entry (toward where the ball came from) plus an
       // upward bias so it still reads as a spout; strong gravity arcs it back down.
       const fx = this.splashFx.find(f => f.startT < 0 && f.cutoffT < 0) ?? this.splashFx[0];
       this.setCone(fx.ps, rx, ry, rz, 1.1, 0.65, 0.7, 1.1);
@@ -2144,5 +2158,25 @@ export class CannonService {
       this.oceanService.addSplash(wx, wz);
       if (vol > 0.01) this.playSplashSound(vol);
     }
+  }
+
+  private _lastGrapeSplashSound = -1;
+
+  /** Soft, brief high "patter/hiss" of grape pellets pricking the water — no deep plunge of a round/bar splash. */
+  private playGrapeWaterSound(vol = 1.0): void {
+    const ctx = this.sfxCtx;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const src = this.noiseSource(0.25); if (!src) return;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1700;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.7; bp.frequency.value = 3000;
+    const g  = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.5 * vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    src.connect(hp); hp.connect(bp); bp.connect(g); g.connect(out);
+    src.start(t); src.stop(t + 0.2);
   }
 }

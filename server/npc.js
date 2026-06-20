@@ -779,11 +779,27 @@ function makeTutorialTarget(players, owner) {
   m.questTag = 'tutorial'; m.questOwnerId = (owner.auth && owner.auth.userId) ?? null;
   m.state.vesselName = 'a lone pinnace';
   m.physics = { ...(m.physics || {}), maxSpeed: (((m.physics && m.physics.maxSpeed) || 6) * 0.6) };   // catchable
-  // Reposition ~700 m off the owner on navigable water.
-  const ang = Math.random() * Math.PI * 2;
-  let sx = op.x + Math.cos(ang) * 700, sz = op.z + Math.sin(ang) * 700;
-  const pc = nav.worldToCell(sx, sz), sn = nav.snapToNav(pc.cx, pc.cz);
-  if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+  // Spawn it SOMEWHAT NEAR the owner (~520 m) on navigable water they can actually sail to: try 8 bearings,
+  // snap each to the sea, require sea-reachability from the owner (no land wall between), keep the CLOSEST valid
+  // one — so the marked prey is reliably nearby, not flung across a bay by a bad snap.
+  const DIST = 520;
+  const a0 = Math.random() * Math.PI * 2;
+  let sx = op.x, sz = op.z, bestD2 = Infinity, found = false;
+  for (let k = 0; k < 8; k++) {
+    const ang = a0 + (k / 8) * Math.PI * 2;
+    const tx = op.x + Math.cos(ang) * DIST, tz = op.z + Math.sin(ang) * DIST;
+    const pc = nav.worldToCell(tx, tz), sn = nav.snapToNav(pc.cx, pc.cz);
+    if (!sn) continue;
+    const w = nav.cellToWorld(sn.cx, sn.cz);
+    if (!nav.reachable(op.x, op.z, w.x, w.z)) continue;            // must be sailable to (no land barrier)
+    const d2 = (w.x - op.x) ** 2 + (w.z - op.z) ** 2;
+    if (d2 < bestD2) { bestD2 = d2; sx = w.x; sz = w.z; found = true; }
+  }
+  if (!found) {                                                    // fallback: a single snapped offset (rare)
+    const tx = op.x + Math.cos(a0) * DIST, tz = op.z + Math.sin(a0) * DIST;
+    const pc = nav.worldToCell(tx, tz), sn = nav.snapToNav(pc.cx, pc.cz);
+    if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+  }
   m.state.x = sx; m.state.z = sz; m.authPose.x = sx; m.authPose.z = sz;
   for (const z in m.combat.zones) { m.combat.zones[z] = Math.max(1, Math.round(m.combat.zones[z] * 0.4)); m.combat.maxHp[z] = m.combat.zones[z]; }
   return m;

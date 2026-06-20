@@ -66,6 +66,13 @@ export class MusicService {
     this.initialized = true;
     this.apiUrl = apiUrl;
 
+    // Schedule notes well AHEAD of the audio clock so the music survives main-thread jank. Tone's Transport runs
+    // its scheduling clock on the MAIN thread; with the default 0.1 s lookAhead, any stall longer than that (much
+    // more likely on a slower Windows machine, e.g. while a held turn-key drives extra render/CD work) makes the
+    // clock fall behind → notes batch up and "chunk"/hold. 0.3 s tolerates a 300 ms stall with no audible effect
+    // (background music has no interactive-timing need; the only cost is a one-time ~0.2 s longer start latency).
+    Tone.getContext().lookAhead = 0.3;
+
     // ── Build shared reverb bus ────────────────────────────────────────────
     // Reverb must be generated (async IR build) before connecting audio.
     this.reverb = new Tone.Reverb({ decay: 3.5, wet: 0.35 });

@@ -490,13 +490,16 @@ float rainField(vec2 p, float t){
   float r    = length(f - center);
   float sz   = mix(0.16, 0.42, h4);                        // per-drop size: drizzle → fat splash
 
-  // Sharp central plip the instant the drop lands.
-  float impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
-  // Ripple ring that expands outward and fades — the real drop-on-water signature.
-  float ringR  = life * sz * 1.6;
-  float ring   = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
-  ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
-  return impact + ring * 0.6;
+  // Splash signature — a miniature of splashDisplacement (the cannonball ring): a brief CRATER dip on
+  // impact, a sharp central PLIP/rebound bead, then an expanding RING that grows out and fades. SIGNED
+  // (crater < 0, plip+ring > 0) so it drives the surface NORMAL like a real pocked surface; consumers that
+  // paint a bright flash take max(0,…) (the plip + ring).
+  float crater = -exp(-(r * r) / (sz * sz * 0.20)) * (1.0 - smoothstep(0.0, 0.16, life)) * 1.2;
+  float plip   =  exp(-(r * r) / (sz * sz * 0.06)) * (1.0 - smoothstep(0.04, 0.30, life)) * 0.9;
+  float ringR  = life * sz * 1.9;
+  float ring   =  exp(-((r - ringR) * (r - ringR)) / (sz * sz * 0.05))
+                  * smoothstep(0.0, 0.10, life) * (1.0 - smoothstep(0.5, 1.0, life));
+  return crater + plip + ring;
 }
 
 void main() {
@@ -545,7 +548,7 @@ void main() {
       float n0 = rainField(rp, rt);
       vec2  grad = vec2(rainField(rp + vec2(e, 0.0), rt) - n0,
                         rainField(rp + vec2(0.0, e), rt) - n0) / e;
-      N = normalize(N + vec3(grad.x, 0.0, grad.y) * (0.18 * u_rainIntensity * nearF));
+      N = normalize(N + vec3(grad.x, 0.0, grad.y) * (0.24 * u_rainIntensity * nearF));
     }
   }
 
@@ -639,14 +642,16 @@ void main() {
     // Gate strictly to the shallow/surf zone (where the seabed-reveal washed out the
     // normal-based ripples). Open water — even within the shore-map bounds — keeps only
     // the subtle normal ripples, so drops there aren't over-painted.
-    float rainShoreMask = smoothstep(0.45, 0.75, proximity);
-    if (u_rainIntensity > 0.01 && rainShoreMask > 0.001) {
+    if (u_rainIntensity > 0.01) {
       float rNear = 1.0 - smoothstep(25.0, 180.0, length(v_worldPos - u_cameraPosition));
       if (rNear > 0.001) {
-        float drops = rainField(worldXZ * 2.2, u_Time);
-        float dAmt = drops * (0.4 + 0.6 * u_rainIntensity) * rNear * rainShoreMask;
-        color *= 1.0 - dAmt * 0.85;
-        color += vec3(0.9, 0.95, 1.0) * dAmt * 0.5;
+        float bright = max(0.0, rainField(worldXZ * 2.2, u_Time));   // plip + expanding ring (the bright part)
+        // Stronger over the shallow/surf zone (the seabed-reveal washes out the normal ripples there),
+        // but a faint bright flash on OPEN water too so each drop pops like a miniature splash.
+        float shoreM = smoothstep(0.45, 0.75, proximity);
+        float dAmt = bright * (0.4 + 0.6 * u_rainIntensity) * rNear * (0.3 + 0.7 * shoreM);
+        color *= 1.0 - dAmt * 0.6;
+        color += vec3(0.9, 0.95, 1.0) * dAmt * 0.55;
       }
     }
   }
@@ -686,6 +691,9 @@ void main() {
     // Fish: dark drifting silhouettes on the seabed — only when the camera is above the
     // surface (avoids artifacts when the view dips underwater).
     float fish = (u_cameraPosition.y > 0.05) ? fishField(worldXZ, u_Time) : 0.0;
+    // F3: the real 3D colored bait-ball schools (FishSchoolService) take over the NEAR zone, so fade the
+    // cheap shader silhouettes out close to the camera (no doubling); keep them only for DISTANCE density.
+    fish *= smoothstep(28.0, 70.0, length(worldXZ - u_cameraPosition.xz));
     seabed *= (1.0 - fish * 0.50);   // a touch fainter
     // Tint toward water teal with depth so the deeper shallows read as water,
     // not bare sand. Narrower reveal (8 m) keeps it to genuinely shallow water.
@@ -1215,11 +1223,15 @@ fn rainField(p: vec2f, t: f32) -> f32 {
   let life = fract(t * rate + h1 * 7.0);
   let r    = length(f - center);
   let sz   = mix(0.16, 0.42, h4);
-  let impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
-  let ringR  = life * sz * 1.6;
-  var ring   = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
-  ring = ring * smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
-  return impact + ring * 0.6;
+  // Splash signature (mirrors the GLSL path): brief CRATER dip on impact, sharp central PLIP, then an
+  // expanding RING that grows out and fades. Signed (crater < 0, plip+ring > 0) → drives the normal like a
+  // pocked surface; the bright-flash consumer uses max(0,…).
+  let crater = -exp(-(r * r) / (sz * sz * 0.20)) * (1.0 - smoothstep(0.0, 0.16, life)) * 1.2;
+  let plip   =  exp(-(r * r) / (sz * sz * 0.06)) * (1.0 - smoothstep(0.04, 0.30, life)) * 0.9;
+  let ringR  = life * sz * 1.9;
+  let ring   =  exp(-((r - ringR) * (r - ringR)) / (sz * sz * 0.05))
+                * smoothstep(0.0, 0.10, life) * (1.0 - smoothstep(0.5, 1.0, life));
+  return crater + plip + ring;
 }
 
 @fragment
@@ -1268,7 +1280,7 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
       let n0 = rainField(rp, rt);
       let grad = vec2f(rainField(rp + vec2f(e, 0.0), rt) - n0,
                        rainField(rp + vec2f(0.0, e), rt) - n0) / e;
-      N = normalize(N + vec3f(grad.x, 0.0, grad.y) * (0.18 * uniforms.u_rainIntensity * nearF));
+      N = normalize(N + vec3f(grad.x, 0.0, grad.y) * (0.24 * uniforms.u_rainIntensity * nearF));
     }
   }
 
@@ -1349,14 +1361,14 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     color = mix(color, vec3f(0.92, 0.97, 1.00), vec3f(foamF * foamAnim * 0.50));
     // 5. Rain impacts on the shallow turquoise/surf (seabed-reveal overwrites the
     //    normal-based ripples here, so paint the drop splashes directly).
-    let rainShoreMask = smoothstep(0.45, 0.75, proximity);
-    if (uniforms.u_rainIntensity > 0.01 && rainShoreMask > 0.001) {
+    if (uniforms.u_rainIntensity > 0.01) {
       let rNear = 1.0 - smoothstep(25.0, 180.0, length(input.v_worldPos - uniforms.u_cameraPosition));
       if (rNear > 0.001) {
-        let drops = rainField(worldXZ * 2.2, uniforms.u_Time);
-        let dAmt = drops * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear * rainShoreMask;
-        color *= 1.0 - dAmt * 0.85;
-        color += vec3f(0.9, 0.95, 1.0) * (dAmt * 0.5);
+        let bright = max(0.0, rainField(worldXZ * 2.2, uniforms.u_Time));   // plip + expanding ring
+        let shoreM = smoothstep(0.45, 0.75, proximity);
+        let dAmt = bright * (0.4 + 0.6 * uniforms.u_rainIntensity) * rNear * (0.3 + 0.7 * shoreM);
+        color *= 1.0 - dAmt * 0.6;
+        color += vec3f(0.9, 0.95, 1.0) * (dAmt * 0.55);
       }
     }
   }
@@ -1384,6 +1396,8 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     // Fish: dark drifting silhouettes — only with the camera above the surface.
     var fish = 0.0;
     if (uniforms.u_cameraPosition.y > 0.05) { fish = fishField(worldXZ, uniforms.u_Time); }
+    // F3: real mesh schools own the near zone — fade the cheap silhouettes near the camera, keep them at distance.
+    fish = fish * smoothstep(28.0, 70.0, length(worldXZ - uniforms.u_cameraPosition.xz));
     seabed = seabed * (1.0 - fish * 0.50);   // a touch fainter
     let depthTint = smoothstep(0.0, 44.0, dz);
     let shallowWater = mix(seabed, vec3f(0.07, 0.30, 0.38), vec3f(depthTint * 0.65));

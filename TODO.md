@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* Give dolphins the seagulls treatment, add other schools of differently colored fish to the shallows
 * Expand list of NPC merchant vessel names
 * Switch to Georgia font
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind

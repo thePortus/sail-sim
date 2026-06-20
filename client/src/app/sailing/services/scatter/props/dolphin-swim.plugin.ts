@@ -47,11 +47,16 @@ export class DolphinSwimPlugin extends MaterialPluginBase {
     #ifdef DOLPHIN_SWIM
       float dPump = 1.0 - smoothstep(-0.9, 0.3, positionUpdated.x);   // 0 head → 1 flukes
       float dPh   = 0.0;
+      float dEnergy = 1.0;
       #ifdef INSTANCES
         dPh = (world3.x + world3.z) * 0.6;                            // per-dolphin desync
       #endif
-      float dW = dolSwim.z * dolSwim.w - positionUpdated.x * dolSwim.y + dPh;
-      positionUpdated.y += sin(dW) * dPump * dolSwim.x;
+      #ifdef INSTANCESCOLOR
+        dEnergy = clamp(instanceColor.a, 0.0, 1.0);                   // D1: per-dolphin tail EFFORT (darts pump hard)
+      #endif
+      // Effort scales both the pump amplitude and the beat speed — a darting dolphin thrashes faster + wider.
+      float dW = dolSwim.z * dolSwim.w * (0.7 + 0.6 * dEnergy) - positionUpdated.x * dolSwim.y + dPh;
+      positionUpdated.y += sin(dW) * dPump * dolSwim.x * (0.4 + 0.85 * dEnergy);
     #endif
   `;
 
@@ -59,11 +64,15 @@ export class DolphinSwimPlugin extends MaterialPluginBase {
     #ifdef DOLPHIN_SWIM
       let dPump = 1.0 - smoothstep(-0.9, 0.3, positionUpdated.x);
       var dPh = 0.0;
+      var dEnergy = 1.0;
       #ifdef INSTANCES
         dPh = (vertexInputs.world3.x + vertexInputs.world3.z) * 0.6;
       #endif
-      let dW = uniforms.dolSwim.z * uniforms.dolSwim.w - positionUpdated.x * uniforms.dolSwim.y + dPh;
-      positionUpdated.y += sin(dW) * dPump * uniforms.dolSwim.x;
+      #ifdef INSTANCESCOLOR
+        dEnergy = clamp(vertexInputs.instanceColor.a, 0.0, 1.0);      // D1: per-dolphin tail EFFORT
+      #endif
+      let dW = uniforms.dolSwim.z * uniforms.dolSwim.w * (0.7 + 0.6 * dEnergy) - positionUpdated.x * uniforms.dolSwim.y + dPh;
+      positionUpdated.y += sin(dW) * dPump * uniforms.dolSwim.x * (0.4 + 0.85 * dEnergy);
     #endif
   `;
 }

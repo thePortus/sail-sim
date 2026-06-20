@@ -27,6 +27,7 @@ import { OceanAudioService }  from '../sailing/services/ocean-audio.service';
 import { ScatterService }     from '../sailing/services/scatter/scatter.service';
 import { BirdService }         from '../sailing/services/bird.service';
 import { DolphinService }      from '../sailing/services/dolphin.service';
+import { FishSchoolService }   from '../sailing/services/fish-school.service';
 import { SeaweedService }      from '../sailing/services/seaweed.service';
 import { ReedService }         from '../sailing/services/reed.service';
 import { ShipBellService }     from '../sailing/services/ship-bell.service';
@@ -408,6 +409,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private scatterService     = inject(ScatterService);
   private birdService        = inject(BirdService);
   private dolphinService     = inject(DolphinService);
+  private fishSchoolService  = inject(FishSchoolService);
   private seaweedService     = inject(SeaweedService);
   private reedService        = inject(ReedService);
   private shipBellService    = inject(ShipBellService);
@@ -791,6 +793,8 @@ export class GameComponent implements AfterViewInit, OnDestroy {
         if (!location.search.includes('nobirds')) { await this.birdService.init(); }
         // A single pod of dolphins that frolics around the boat. PERF DIAGNOSTIC: ?nodolphins skips it.
         if (!location.search.includes('nodolphins')) { await this.dolphinService.init(); }
+        // Colored bait-fish schools in the shallows (seen through the refraction). PERF DIAGNOSTIC: ?nofish skips.
+        if (!location.search.includes('nofish')) { await this.fishSchoolService.init(); }
         // Underwater seaweed clumps, shallows-only, seen through the shallow refraction. ?noseaweed skips.
         if (!location.search.includes('noseaweed')) { await this.seaweedService.init(); }
         // Shoreline reeds — rooted in the water's edge, tops peeking above the surface. ?noreeds skips.
@@ -927,6 +931,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.telescopeService.dispose();
     this.oceanAudioService.dispose();
     this.dolphinService.dispose();
+    this.fishSchoolService.dispose();
     this.seaweedService.dispose();
     this.reedService.dispose();
     this.shipBellService.dispose();

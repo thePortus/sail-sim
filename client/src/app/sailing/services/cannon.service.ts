@@ -13,6 +13,7 @@ import { MultiplayerService } from './multiplayer.service';
 import { SfxService }         from './sfx.service';
 import { BirdService }        from './bird.service';
 import { DolphinService }     from './dolphin.service';
+import { FishSchoolService }  from './fish-school.service';
 import { MuzzleExplosions }   from './muzzle-explosion';
 import { MuzzleSmoke }        from './muzzle-smoke';
 
@@ -119,6 +120,7 @@ export class CannonService {
   private sfx                = inject(SfxService);
   private birds              = inject(BirdService);
   private dolphins           = inject(DolphinService);
+  private fishSchool         = inject(FishSchoolService);
   private zone               = inject(NgZone);
 
   // ── Public signals (consumed by HUD) — per-side gun state + reload progress ──
@@ -362,6 +364,7 @@ export class CannonService {
       this.launchBall(ox, oy, oz, vx, vy, vz, shooterId, seq, kind);
       this.fireRemoteEffect(shooterId, ox, oy, oz, vx, vz);
       this.birds.startleAt(ox, oz);   // a remote ship's broadside startles gulls near its muzzle too
+      this.fishSchool.scatterFrom(ox, oz);   // …and scatters nearby bait-fish schools
       this.dolphins.scatterFrom(ox, oz);   // …and scatters any nearby dolphins
       this.oceanService.startleFish(ox, oz);   // …and the shallow-water fish
     };
@@ -1352,6 +1355,7 @@ export class CannonService {
     }
     this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
     this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting
+    this.fishSchool.scatterFrom(mwx, mwz);   // …and scatters the bait-fish schools
     this.oceanService.startleFish(mwx, mwz);   // …and scatters the drifting shallow-water fish
     this.muzzleEffect(side, mwx, mwy, mwz, dirX, dirZ);
     this.playCannonSound();

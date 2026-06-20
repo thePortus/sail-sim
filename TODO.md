@@ -12,7 +12,6 @@
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * placeholder ship for other players when that model hasnt loaded yet (or LOD imposter?)
-* grapeshot doesn't make cannonball impacts on the water
 * update to cannon aim sight to show spread of all cannon shots somehow
 * add ship armor + cannon upgrades
 * general materials atlas draw cycle reduction

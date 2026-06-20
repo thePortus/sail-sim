@@ -55,6 +55,22 @@ import { CombatService } from '../sailing/services/combat.service';
         @if (mp.rumorError(); as err)  { <div class="tv-note tv-rumour-none">{{ prettyRumor(err) }}</div> }
       </div>
 
+      <div class="tv-pirate">
+        <button class="tv-pirate-btn" (click)="askPirates()">☠ Ask about pirate activity</button>
+        @if (mp.pirateReport(); as rep) {
+          <div class="tv-pirate-report">
+            <div class="tv-pirate-line">“{{ pirateFlavour(rep) }}”</div>
+            <div class="tv-pirate-stats">
+              <span>Vessel: <b>{{ vesselName(rep.slug) }}</b></span>
+              <span>Sunk: <b>{{ rep.kills }}</b></span>
+              <span>Bounty: <b class="tv-bounty">{{ rep.bounty }}g</b></span>
+            </div>
+            <div class="tv-pirate-mark">Marked in red on your map.</div>
+          </div>
+        }
+        @if (mp.pirateReportError(); as err) { <div class="tv-note tv-rumour-none">{{ prettyPirate(err) }}</div> }
+      </div>
+
       <button class="tv-close" (click)="onClose()">Go Back to Town</button>
     </div>
   `,
@@ -88,6 +104,16 @@ import { CombatService } from '../sailing/services/combat.service';
     .tv-listen:hover { background: linear-gradient(135deg, #574773, #3a3052); }
     .tv-rumour-line { margin-top: 0.55rem; font-size: 0.85rem; font-style: italic; line-height: 1.4; color: #e8d9b6; }
     .tv-rumour-none { color: #cdbb95; }
+    .tv-pirate { margin-top: 0.9rem; padding-top: 0.8rem; border-top: 1px solid rgba(184,138,62,0.25); }
+    .tv-pirate-btn { width: 100%; padding: 0.5rem 0.7rem; border-radius: 8px; border: 1px solid #6e3030; cursor: pointer;
+                     background: linear-gradient(135deg, #5a2727, #3a1a1a); color: #f3d9d9; font-family: inherit; font-size: 0.92rem; }
+    .tv-pirate-btn:hover { background: linear-gradient(135deg, #6b2f2f, #45201f); }
+    .tv-pirate-report { margin-top: 0.55rem; }
+    .tv-pirate-line { font-size: 0.85rem; font-style: italic; line-height: 1.4; color: #ecc9b6; }
+    .tv-pirate-stats { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; margin-top: 0.5rem; font-size: 0.82rem; color: #cdbb95; }
+    .tv-pirate-stats b { color: #e8d3a0; }
+    .tv-pirate-stats .tv-bounty { color: #f0c869; }
+    .tv-pirate-mark { margin-top: 0.4rem; font-size: 0.74rem; color: #d98a8a; }
     .tv-err { margin-top: 0.6rem; padding: 0.4rem 0.6rem; border-radius: 6px; background: rgba(150,40,30,0.25); border: 1px solid rgba(190,80,60,0.5); color: #f0c0b0; font-size: 0.84rem; }
     .tv-close { margin-top: 0.9rem; width: 100%; padding: 0.55rem; border-radius: 8px; border: 1px solid #6e5326; background: #3a2817; color: #e8d3a0; font-family: inherit; font-size: 0.95rem; cursor: pointer; }
     .tv-close:hover { background: #4a3420; }
@@ -110,6 +136,20 @@ export class TavernMenuComponent {
 
   hire(): void { this.mp.recruitCrew(); }
   listen(): void { this.mp.listenRumor(); }
+  askPirates(): void { this.mp.askPirateActivity(); }
+
+  /** Pretty vessel name for the pirate report (mirrors the rumour vessel mapping). */
+  vesselName(slug: string): string {
+    return ({ sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' } as Record<string, string>)[slug] ?? (slug || 'ship');
+  }
+
+  /** A bit of tavern colour for the pirate report. */
+  pirateFlavour(rep: { name: string; slug: string; kills: number; bounty: number }): string {
+    const ship = this.vesselName(rep.slug);
+    if (rep.kills <= 0) return `${rep.name} has been seen prowling these waters in a ${ship} — no blood spilt yet, but mark my words.`;
+    if (rep.kills >= 4) return `${rep.name}! That ${ship} has sent ${rep.kills} good ships to the bottom — the powers want ${rep.name} dead, and will pay for it.`;
+    return `Aye, ${rep.name} works a ${ship} hereabouts — ${rep.kills} ${rep.kills === 1 ? 'ship' : 'ships'} taken already.`;
+  }
 
   prettyError(reason: string): string {
     const map: Record<string, string> = {
@@ -128,10 +168,20 @@ export class TavernMenuComponent {
     return map[reason] ?? `No rumours (${reason}).`;
   }
 
+  prettyPirate(reason: string): string {
+    const map: Record<string, string> = {
+      not_docked: 'You must be docked at a port.',
+      no_pirates: 'No pirates abroad that anyone here knows of — quiet seas, for now.',
+    };
+    return map[reason] ?? `No pirate news (${reason}).`;
+  }
+
   onClose(): void {
     this.mp.recruitError.set(null);
     this.mp.rumorError.set(null);
     this.mp.rumorText.set(null);   // clear the flavour line; the map mark persists
+    this.mp.pirateReportError.set(null);
+    this.mp.pirateReport.set(null);   // clear the report text; the red map mark persists
     this.close.emit();
   }
 }

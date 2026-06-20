@@ -649,13 +649,16 @@ const PARDON_STEP          = 20;    // max points restored per petition
 const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt petition ≈ 2 800g)
 
 // ── Pirate bounties ───────────────────────────────────────────────────────────
-// Pirates fly no flag, so sinking one is a service to the local powers rather than an act of piracy: it pays a
-// gold bounty (richer if the pirate had already plundered ships — see npc.pirateLoot) and earns standing with the
-// nation(s) whose waters it menaced. The protecting nation = any faction with a town within PIRATE_PROTECT_RANGE
-// of the wreck; if none is that close, the single faction owning the NEAREST town.
-const PIRATE_BOUNTY_GOLD   = 900;    // base gold bounty (floats as salvage at the wreck, like merchant loot)
-const PIRATE_BOUNTY_REP    = 22;     // standing earned with EACH protecting faction (decently large — a real lever)
-const PIRATE_PROTECT_RANGE = 1500;   // a faction with a town within this of the kill shares the bounty rep
+// Pirates fly no flag, so sinking one is a service to the local powers rather than an act of piracy. A pirate
+// spawns with a small purse (npc PIRATE_SEED_GOLD) and grows richer + more wanted as it raids: each merchant it
+// sinks adds a cut of that merchant's gold to its hold AND raises the price on its head (PIRATE_BOUNTY_PER_KILL).
+// The player who sinks it collects a salvage crate worth its full hold + head-bounty (pirate.gold + pirate.bounty),
+// and earns standing with the nation(s) whose waters it menaced (any faction with a town within
+// PIRATE_PROTECT_RANGE of the wreck; if none that close, the nearest town's nation).
+const PIRATE_BOUNTY_PER_KILL = 300;  // the head-bounty rises by this for every merchant the pirate sends down
+const PIRATE_LOOT_CUT        = 0.3;  // fraction of a sunk merchant's gold the pirate pockets into its own hold
+const PIRATE_BOUNTY_REP      = 22;   // standing earned with EACH protecting faction (decently large — a real lever)
+const PIRATE_PROTECT_RANGE   = 1500; // a faction with a town within this of the kill shares the bounty rep
 
 /** Faction ids that reward sinking a pirate at (x,z): every faction owning a town within PIRATE_PROTECT_RANGE; or,
  *  if none is that near, the single faction owning the nearest town. Returns a (possibly empty) deduped array. */
@@ -959,13 +962,13 @@ function attachMultiplayer(server) {
       });
       for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
 
-      // A PIRATE that just sent a vessel down pockets the plunder — banked on its `pirateLoot` tally so a raider
-      // that's been preying on shipping is worth a fatter bounty when a player finally hunts it down. Sinking a
-      // nation's MERCHANT also ticks `piracyKills`: enough of them (PIRATE_HUNT_THRESHOLD) and a navy hunter sails.
-      if (shooter && shooter.isPirate && shooter !== victim) {
-        const took = victim.isNpc ? Math.floor((victim.gold || 0) * 0.6) + 200 : 350;   // merchant chest, or a player's purse
-        shooter.pirateLoot = (shooter.pirateLoot | 0) + took;
-        if (victim.isNpc && !victim.isPirate && !victim.isHunter) shooter.piracyKills = (shooter.piracyKills | 0) + 1;
+      // A PIRATE that just sent a MERCHANT down plunders its chest (a cut into the pirate's own hold) and earns a
+      // higher price on its head — so a raider that's been preying on shipping is worth a fatter payout when a
+      // player finally hunts it down, and its merchant tally (piracyKills) drives the navy-hunter threshold.
+      if (shooter && shooter.isPirate && victim.isNpc && !victim.isPirate && !victim.isHunter) {
+        shooter.gold        = (shooter.gold | 0) + Math.floor((victim.gold || 0) * PIRATE_LOOT_CUT);
+        shooter.bounty      = (shooter.bounty | 0) + PIRATE_BOUNTY_PER_KILL;
+        shooter.piracyKills = (shooter.piracyKills | 0) + 1;
       }
 
       // Quest: the OWNER sinking their intro-tutorial target completes the combat quest. The sunk hull lingers
@@ -977,10 +980,10 @@ function attachMultiplayer(server) {
       }
 
       if (victim.isPirate) {
-        // A pirate sank → a gold BOUNTY (base + whatever it had plundered) floats at the wreck, and the player
-        // who rid these waters of it earns standing with the protecting nation(s): every faction with a town
-        // within PIRATE_PROTECT_RANGE, or the nearest town's nation if none is that close.
-        const bounty = PIRATE_BOUNTY_GOLD + (victim.pirateLoot | 0);
+        // A pirate sank → its full hold + the price on its head (gold + bounty) floats at the wreck, and the
+        // player who rid these waters of it earns standing with the protecting nation(s): every faction with a
+        // town within PIRATE_PROTECT_RANGE, or the nearest town's nation if none is that close.
+        const bounty = (victim.gold | 0) + (victim.bounty | 0);
         const crate = salvage.spawnCrate(victim.state.x, victim.state.z, {}, bounty, Date.now());
         const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
         for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
@@ -1474,6 +1477,35 @@ function attachMultiplayer(server) {
               const srcT = (np.phase === 'toDest' && np.trip) ? economy.getTown(np.trip.srcTownId) : null;
               me.rumorShipId = np.id;                                        // force-included in this player's interest set
               reply(true, { shipId: np.id, slug: np.state.vesselSlug, from: srcT ? srcT.name : null, to: sel.destT.name });
+            }
+          }
+        }
+
+      } else if (msg.type === 'pirate_report') {
+        // Tavern: ask after pirate activity. Marks the NEAREST pirate on the player's map (a separate mark from
+        // the merchant rumour, so they don't clobber each other) and reports its bounty, the number of vessels
+        // it's sunk, its rig, and its name. Must be docked.
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, data) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'pirate_report_result', ok, ...(data || {}) }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, { reason: 'not_docked' }); }
+          else {
+            const px = me.authPose.x, pz = me.authPose.z;
+            let best = null, bestD2 = Infinity;
+            for (const [, p] of players) {
+              if (!p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+              const dx = p.state.x - px, dz = p.state.z - pz, d2 = dx * dx + dz * dz;
+              if (d2 < bestD2) { bestD2 = d2; best = p; }
+            }
+            if (!best) { reply(false, { reason: 'no_pirates' }); }
+            else {
+              me.pirateMarkId = best.id;   // force-streamed + map-marked for this player (see broadcastInterest)
+              reply(true, {
+                shipId: best.id, slug: best.state.vesselSlug, name: best.state.vesselName,
+                kills: best.piracyKills | 0, bounty: (best.gold | 0) + (best.bounty | 0),
+              });
             }
           }
         }

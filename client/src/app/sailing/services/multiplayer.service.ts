@@ -159,6 +159,11 @@ export class MultiplayerService {
   markedMerchantId = signal<string | null>(null);
   rumorText        = signal<string | null>(null);
   rumorError       = signal<string | null>(null);
+  // Tavern "ask about pirate activity": the marked pirate id (a SEPARATE mark from the merchant rumour, so they
+  // don't clobber each other), the report (name/rig/kills/bounty) the tavern panel shows, and the last error.
+  markedPirateId   = signal<string | null>(null);
+  pirateReport     = signal<{ name: string; slug: string; kills: number; bounty: number } | null>(null);
+  pirateReportError = signal<string | null>(null);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   // ── Quests (intro tutorial + future storyline) ──────────────────────────────
@@ -331,6 +336,13 @@ export class MultiplayerService {
   listenRumor(): void {
     this.rumorError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'listen_rumor' }));
+  }
+
+  /** Tavern: ask about pirate activity. The server marks the nearest pirate on the map and reports its bounty,
+   *  kills, rig + name (server-authoritative; must be docked). Reply arrives as pirate_report_result. */
+  askPirateActivity(): void {
+    this.pirateReportError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'pirate_report' }));
   }
 
   /** Quest: confirm a client-verified tutorial step (rotate camera, trim sails, listen for a rumour, …). The
@@ -716,6 +728,19 @@ export class MultiplayerService {
         this.rumorError.set(String(msg.reason ?? 'no_rumours'));
       }
 
+    } else if (msg.type === 'pirate_report_result') {
+      // Tavern pirate report: on success mark the nearest pirate + show its bounty/kills/rig/name; else the reason.
+      if (msg.ok) {
+        this.markedPirateId.set(String(msg.shipId));
+        this.pirateReport.set({
+          name: String(msg.name ?? 'an unknown rogue'), slug: String(msg.slug ?? ''),
+          kills: +msg.kills || 0, bounty: +msg.bounty || 0,
+        });
+        this.pirateReportError.set(null);
+      } else {
+        this.pirateReportError.set(String(msg.reason ?? 'no_pirates'));
+      }
+
     } else if (msg.type === 'quest_update') {
       // The active quest's current stage + objectives (server-authoritative). null clears the tracker.
       this.quest.set((msg.questId ? msg : null) as QuestUpdate | null);
@@ -932,6 +957,8 @@ export class MultiplayerService {
     this.remoteZones.delete(id);
     // The rumour target sailed off / sank → drop its map mark (the gossip's gone cold).
     if (this.markedMerchantId() === id) { this.markedMerchantId.set(null); this.rumorText.set(null); }
+    // The reported pirate sank / despawned → clear its mark too.
+    if (this.markedPirateId() === id) { this.markedPirateId.set(null); this.pirateReport.set(null); }
     this.publishSignal();
   }
 

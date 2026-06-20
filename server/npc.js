@@ -127,7 +127,8 @@ function targetPirates(townCount) { return Math.max(3, Math.min(8, Math.round(to
 // When its quarry is dead (or gone) it sails back to its home port and vanishes — one hunter per pirate.
 const HUNTER_NAMES = ['Vengeance', 'Retribution', 'Intrepid', 'Vigilant', 'Defiance', 'Sentinel', 'Avenger',
   'Indomitable', 'Relentless', 'Dauntless', 'Tempest', 'Valiant', 'Conqueror', 'Fury', 'Implacable', 'Resolute'];
-const PIRATE_HUNT_THRESHOLD = 3;   // merchant kills before a pirate draws a navy hunter (players get first crack)
+const PIRATE_SEED_GOLD = 200;      // a pirate spawns with this small purse; its bounty + plundered gold grow as it raids
+const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a navy hunter (players get first crack)
 const HUNTER_SKILL    = 0.95;      // veteran navy gunnery + nerve (built to win the duel)
 const HUNTER_CRUISE   = 0.9;       // a shade faster than the pirate (0.85) so it can run it down
 const HUNTER_APPROACH = 220;       // within this it jockeys for a broadside; beyond, it bears straight for the pirate
@@ -1005,13 +1006,16 @@ function makePirate(players, lair, slug) {
     lastUpdateMs: Date.now(),
     physics: getVesselDef(slug)?.physics || { maxSpeed: 8, accelerationRate: 0.28, minTackAngle: 36, sailAreaFactor: 0.34 },
     tack: 1, route: null, routeIdx: 0, curTownId: null, legTarget: null,
-    gold: 0, cargo: {}, trip: null, phase: null,
+    gold: PIRATE_SEED_GOLD, cargo: {}, trip: null, phase: null,
     hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
     maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
     convoyId: null, convoyRole: null, convoySlot: 0,
     skill: PIRATE_SKILL, combatRole: 'pirate',
-    // Pirate-specific: a fixed haunt, the current quarry id, an orbit phase, and the running plunder tally.
-    lair: { x: lair.x, z: lair.z }, pirateTarget: null, patrolPhase: Math.random() * Math.PI * 2, pirateLoot: 0,
+    // Pirate-specific: a fixed haunt, the current quarry id, an orbit phase. `gold` grows as it plunders merchants;
+    // `bounty` is the price on its head (rises per merchant sunk); `piracyKills` counts merchants for the hunter
+    // threshold + the tavern report. Player payout for sinking it = gold + bounty.
+    lair: { x: lair.x, z: lair.z }, pirateTarget: null, patrolPhase: Math.random() * Math.PI * 2,
+    bounty: 0, piracyKills: 0,
   };
   players.set(id, npc);
   return npc;
@@ -1416,6 +1420,11 @@ function broadcastInterest(players, nowMs) {
     if (p.rumorShipId) {
       if (players.has(p.rumorShipId)) visible.add(p.rumorShipId);
       else p.rumorShipId = null;
+    }
+    // Same for the pirate the player asked the tavern about — keep it streamed (+ its map marker) at any range.
+    if (p.pirateMarkId) {
+      if (players.has(p.pirateMarkId)) visible.add(p.pirateMarkId);
+      else p.pirateMarkId = null;
     }
     if (!p._visNpcs) p._visNpcs = new Set();
     for (const id of visible) p.ws.send(msgFor(players.get(id)));               // RENDER updates for nearby merchants

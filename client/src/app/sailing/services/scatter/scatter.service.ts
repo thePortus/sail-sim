@@ -20,13 +20,14 @@ import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { FarFadePlugin } from './far-fade.plugin';
+import { NearFadePlugin } from './near-fade.plugin';
 import { ImpostorHazePlugin } from './impostor-haze.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
 import { ShadowBlobPlugin } from './props/shadow-blob.plugin';
 import {
   loadScatterMesh, createCrossImpostor, measureBottomPad, loadScatterGeometry, buildScatterPBR,
-  buildGrassMaterial, scatterTextureUrl, setScatterVersion, clearScatterCache,
+  buildScatterRockPBR, buildGrassMaterial, scatterTextureUrl, setScatterVersion, clearScatterCache,
 } from './asset-loader';
 
 const EMPTY = new Float32Array(0);
@@ -212,6 +213,7 @@ export class ScatterService {
       if (c) {
         GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z;
         FarFadePlugin.camera.x   = c.position.x; FarFadePlugin.camera.z   = c.position.z;   // far-forest fade
+        NearFadePlugin.camera.x  = c.position.x; NearFadePlugin.camera.z  = c.position.z;   // palm/beech LoD dissolve
       }
       // Drive the palm wind from the weather wind (the same source the sails use): unit direction +
       // a gust amplitude that grows with wind speed, plus a steadily-advancing clock.
@@ -222,14 +224,13 @@ export class ScatterService {
         const gust = Math.min(1, (wd.speed ?? 8) / 24);   // 0 calm → 1 gale
         PalmWindPlugin.WIND.dirX = dx;
         PalmWindPlugin.WIND.dirZ = dz;
-        PalmWindPlugin.WIND.amplitude = 0.10 + gust * 0.30;
+        PalmWindPlugin.WIND.amplitude = 0.18 + gust * 0.45;   // fuller frond sway (cloud-halo issue is fixed)
         TreeWindPlugin.WIND.dirX = dx;
         TreeWindPlugin.WIND.dirZ = dz;
-        // Canopy sway kept SMALL on purpose: a larger silhouette swing exposes a halo against the
-        // volumetric clouds (the cloud depth pass can't replicate the per-vertex sway), so we trade a
-        // little motion for a clean edge. Gentle lean + faint shimmer only.
-        TreeWindPlugin.WIND.branchAmp = 0.05 + gust * 0.10;   // whole-canopy sway grows with wind
-        TreeWindPlugin.WIND.leafAmp   = 0;                    // leaf flutter off — it wiggled the canopy edge and drove the cloud halo
+        // Sway restored to a lively amount now that the volumetric-cloud halo issue (a swinging silhouette
+        // exposing a halo the cloud depth pass couldn't follow) is resolved. Whole-canopy lean + leaf shimmer.
+        TreeWindPlugin.WIND.branchAmp = 0.12 + gust * 0.24;   // whole-canopy sway grows with wind
+        TreeWindPlugin.WIND.leafAmp   = 0.05 + gust * 0.07;   // leaf flutter back on — the canopy edge shimmers in a breeze
       }
       this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
       PalmWindPlugin.WIND.time = this._palmTime;
@@ -545,7 +546,10 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
-      const layer = this.makeGlbLayer(full, imp, 130, (cx, cz) => this.buildPalms(cx, cz, v));
+      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
+      new NearFadePlugin(full.material, false);
+      if (imp.material) { new NearFadePlugin(imp.material, true); }
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v));   // full-detail radius (wider hi-detail range)
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('palms', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -585,8 +589,11 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
       this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
-      // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
-      const layer = this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v));
+      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
+      new NearFadePlugin(full.material, false);
+      if (imp.material) { new NearFadePlugin(imp.material, true); }
+      // Beeches are ~2× the palm's tris, but use the SAME full-detail radius as palms (260 m) per request.
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v));   // full-detail radius (wider hi-detail range)
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -838,21 +845,33 @@ export class ScatterService {
     { file: 'rock_e.glb', lod: 'rock_e_lod.glb' },   // small pebble
   ];
 
-  /** Per-instance stone tints (multiply the neutral-gray albedo × baked AO). Bright so they shift hue
-   *  without over-darkening: granite, sandstone, basalt, red, moss, gray. */
-  private static readonly ROCK_TINTS: ReadonlyArray<readonly [number, number, number]> = [
-    [0.92, 0.94, 1.00], [1.00, 0.84, 0.58], [0.50, 0.50, 0.56],
-    [0.96, 0.56, 0.42], [0.62, 0.72, 0.50], [0.85, 0.85, 0.85],
+  /** Three CC0 photoreal PBR stone sets (KTX2: albedo + OpenGL normal + roughness). The 5 rock SHAPES are
+   *  spread across these as visual variations (shape v → material v % 3). */
+  private static readonly ROCK_MATERIALS = [
+    { albedo: 'rock_05_albedo.ktx2',      normal: 'rock_05_normal.ktx2',      rough: 'rock_05_rough.ktx2' },
+    { albedo: 'rock_04_albedo.ktx2',      normal: 'rock_04_normal.ktx2',      rough: 'rock_04_rough.ktx2' },
+    { albedo: 'rock_cracked_albedo.ktx2', normal: 'rock_cracked_normal.ktx2', rough: 'rock_cracked_rough.ktx2' },
   ];
 
-  /** Load the 5 authored rock shapes (geometry-only) sharing ONE normal-mapped stone material, with a
-   *  real decimated *_lod.glb far-LOD per shape, and register one scatter sub-layer per shape. Any load
-   *  failure → the procedural-primitive rock. */
+  /** Per-instance stone tints — now GENTLE (near-neutral) since the 3 photoreal textures carry the real colour;
+   *  these only add subtle lightness/hue scatter within a set. KEEP IN SYNC with scatter-compute.ts `tints`. */
+  private static readonly ROCK_TINTS: ReadonlyArray<readonly [number, number, number]> = [
+    [1.00, 1.00, 1.00], [0.92, 0.90, 0.87], [0.87, 0.89, 0.93],
+    [1.00, 0.97, 0.92], [0.91, 0.93, 0.90], [0.96, 0.96, 0.99],
+  ];
+
+  /** Load the 5 authored rock shapes (geometry-only), each assigned one of the 3 photoreal PBR stone
+   *  materials as a variation, with a real decimated *_lod.glb far-LOD per shape. Any load failure → the
+   *  procedural-primitive rock. */
   private async registerRocks(scene: Scene): Promise<void> {
-    const mat = buildScatterPBR(scene, 'scatter_rock_mat', 'rock_albedo.png', 'rock_normal.png');
-    this.sceneService.excludeFromPrePass(mat);
+    const mats = ScatterService.ROCK_MATERIALS.map((m, i) => {
+      const mat = buildScatterRockPBR(scene, `scatter_rock_mat_${i}`, m.albedo, m.normal, m.rough);
+      this.sceneService.excludeFromPrePass(mat);
+      return mat;
+    });
     for (let v = 0; v < ScatterService.ROCK_SHAPES.length; v++) {
       const cfg = ScatterService.ROCK_SHAPES[v];
+      const mat = mats[v % mats.length];   // spread the 5 shapes across the 3 stone variations
       const full = await loadScatterGeometry(scene, cfg.file, `scatter_rock_${v}_full`, mat);
       const lod  = await loadScatterGeometry(scene, cfg.lod,  `scatter_rock_${v}_lod`,  mat);
       if (!full || !lod) {
@@ -887,20 +906,31 @@ export class ScatterService {
     { file: 'drift_e.glb', lod: 'drift_e_lod.glb' },   // small twig
   ];
 
-  /** Per-instance driftwood tints (multiply the bleached-gray albedo × baked AO): silver, bleached,
-   *  tan, brown, driftbrown, waterlogged. */
-  private static readonly DRIFT_TINTS: ReadonlyArray<readonly [number, number, number]> = [
-    [1.00, 1.00, 1.02], [1.05, 1.03, 0.98], [1.05, 0.95, 0.76],
-    [0.86, 0.70, 0.50], [0.95, 0.82, 0.63], [0.60, 0.62, 0.64],
+  /** Driftwood IS weathered tree wood — so it reuses the SAME bark PBR sets as the palm + beech (KTX2),
+   *  as two material variations (shape v → material v % 2), slightly bleached via albedoTint. */
+  private static readonly DRIFT_MATERIALS = [
+    { albedo: 'palm_bark_albedo.ktx2',  normal: 'palm_bark_normal.ktx2',  rough: 'palm_bark_rough.ktx2',  tint: [1.04, 1.00, 0.92] as const },
+    { albedo: 'beech_bark_albedo.ktx2', normal: 'beech_bark_normal.ktx2', rough: 'beech_bark_rough.ktx2', tint: [0.98, 0.99, 1.00] as const },
   ];
 
-  /** Load the 5 authored driftwood shapes (geometry-only) sharing ONE bleached-wood material, with a
-   *  real *_lod.glb far-LOD per shape, one scatter sub-layer per shape. Any failure → the primitive. */
+  /** Per-instance driftwood tints — gentle now that the bark texture carries the look: silver, bleached,
+   *  tan, brown, driftbrown, waterlogged (subtle). */
+  private static readonly DRIFT_TINTS: ReadonlyArray<readonly [number, number, number]> = [
+    [1.00, 1.00, 1.02], [1.02, 1.00, 0.96], [0.96, 0.93, 0.88],
+    [0.90, 0.86, 0.80], [0.97, 0.94, 0.88], [0.86, 0.88, 0.90],
+  ];
+
+  /** Load the 5 authored driftwood shapes (geometry-only), each assigned one of the 2 bark PBR materials,
+   *  with a real *_lod.glb far-LOD per shape. Any failure → the primitive. */
   private async registerDriftwood(scene: Scene): Promise<void> {
-    const mat = buildScatterPBR(scene, 'scatter_drift_mat', 'drift_albedo.png', 'drift_normal.png');
-    this.sceneService.excludeFromPrePass(mat);
+    const mats = ScatterService.DRIFT_MATERIALS.map((m, i) => {
+      const mat = buildScatterRockPBR(scene, `scatter_drift_mat_${i}`, m.albedo, m.normal, m.rough, m.tint);
+      this.sceneService.excludeFromPrePass(mat);
+      return mat;
+    });
     for (let v = 0; v < ScatterService.DRIFT_SHAPES.length; v++) {
       const cfg = ScatterService.DRIFT_SHAPES[v];
+      const mat = mats[v % mats.length];
       const full = await loadScatterGeometry(scene, cfg.file, `scatter_drift_${v}_full`, mat);
       const lod  = await loadScatterGeometry(scene, cfg.lod,  `scatter_drift_${v}_lod`,  mat);
       if (!full || !lod) {

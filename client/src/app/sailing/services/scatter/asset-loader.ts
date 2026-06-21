@@ -1,5 +1,5 @@
 import {
-  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, Scene, SceneLoader,
+  AssetContainer, Color3, Material, Matrix, Mesh, MeshBuilder, PBRMaterial, Scene, SceneLoader,
   StandardMaterial, Texture,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
@@ -193,6 +193,33 @@ export function buildScatterPBR(scene: Scene, name: string, albedoFile: string, 
   // Rocks/driftwood never change → freeze so Babylon stops re-checking material readiness every frame for
   // each of the (many) patch submeshes. The effect still compiles on first render (the freeze only caches
   // afterwards); per-instance tint (colour buffer) + baked AO (vertex colour) both still apply.
+  mat.freeze();
+  return mat;
+}
+
+/**
+ * Photoreal PBR stone material for the rocks / driftwood (the scatter-realism overhaul). Each variant has its
+ * own CC0 albedo + OpenGL normal + roughness (KTX2, served from geometry/scatter/textures/), so the surface
+ * reads as real granite / weathered wood instead of a flat tinted blob. metallic = 0; roughness comes from the
+ * roughness map's green channel. Per-instance thin-instance tint + baked-AO vertex colour still multiply on top
+ * (kept subtle now that the texture itself carries the variation). Frozen — these never change per frame.
+ */
+export function buildScatterRockPBR(
+  scene: Scene, name: string, albedoFile: string, normalFile: string, roughFile: string,
+  albedoTint: readonly [number, number, number] = [1, 1, 1],
+): PBRMaterial {
+  const mat = new PBRMaterial(name, scene);
+  mat.albedoTexture = new Texture(scatterTextureUrl(albedoFile), scene);
+  mat.albedoColor = new Color3(albedoTint[0], albedoTint[1], albedoTint[2]);
+  mat.bumpTexture = new Texture(scatterTextureUrl(normalFile), scene, false, false);   // linear OpenGL normal
+  const rough = new Texture(scatterTextureUrl(roughFile), scene, false, false);
+  mat.metallicTexture = rough;
+  mat.useRoughnessFromMetallicTextureGreen = true;     // roughness from the map's G channel
+  mat.useRoughnessFromMetallicTextureAlpha = false;
+  mat.useMetallnessFromMetallicTextureBlue = false;    // keep metallic at the scalar (0) — pure dielectric stone
+  mat.metallic = 0;
+  mat.roughness = 1;
+  mat.specularIntensity = 0.4;                         // subtle highlight — matte stone, not plastic
   mat.freeze();
   return mat;
 }

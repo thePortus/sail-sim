@@ -20,6 +20,7 @@ import {
   VertexData,
   RawTexture,
   RawTexture2DArray,
+  BaseTexture,
   Vector2,
   Vector3,
   Vector4,
@@ -101,7 +102,7 @@ export class TerrainService {
   private terrainMaterialPBR: PBRCustomMaterial | null = null;   // S0 spike: ?terrainpbr path
   // S1b: biome PBR texture arrays (5 layers: 0 sand,1 grass,2 gravel,3 rock,4 snow). One sampler each
   // (vs 5 per map) → fixes the 16-sampler cap. albedo = RGB diffuse; orm = R roughness, G ambient-occl.
-  private biomeAlbedoArr: RawTexture2DArray | null = null;
+  private biomeAlbedoArr: BaseTexture | null = null;   // KTX2 array Texture (compressed) OR RawTexture2DArray (fallback)
   private biomeOrmArr: RawTexture2DArray | null = null;
   private biomePlaceholderArr: RawTexture2DArray | null = null;
   private splatTex: Texture | null = null;   // S2 control/splat map (RGBA soft biome weights, world-aligned)
@@ -110,7 +111,12 @@ export class TerrainService {
   // S3 anti-tiling: the ALBEDO array packs 3 extra variant layers (5/6/7) that the shader cross-fades
   // with the matching core layer over a large-scale noise so no single tile visibly repeats. The ORM
   // array stays at the 5 core layers (variants reuse the base roughness/AO).
-  private static readonly ALBEDO_LAYERS = ['sand', 'grass', 'gravel', 'rock', 'snow', 'sand2', 'grass2', 'rock2'];
+  // 0-4 core biomes · 5-7 anti-tiling variants · 8-12 REGIONAL variants (different beaches/areas use different
+  // sand/grass/rock, blended at edges). Indices are referenced directly in the PBR shader's regional-pool taps.
+  //   8 sand3 (aerial_beach_01) · 9 sand4 (aerial_beach_02) · 10 grass3 (coast_sand_rocks_02) ·
+  //   11 rock3 (rocks_ground_06) · 12 rock4 (lichen_rock). All diffuse-only (reuse core roughness/AO).
+  private static readonly ALBEDO_LAYERS = ['sand', 'grass', 'gravel', 'rock', 'snow', 'sand2', 'grass2', 'rock2',
+                                           'sand3', 'sand4', 'grass3', 'rock3', 'rock4'];
   private terrainTextures: Texture[] = [];
   private treePrototypeMeshes: Mesh[] = [];
   private treePatches: TreePatch[] = [];
@@ -2421,14 +2427,25 @@ export class TerrainService {
       ctx.clearRect(0, 0, SIZE, SIZE); ctx.drawImage(img, 0, 0, SIZE, SIZE);
       try { return ctx.getImageData(0, 0, SIZE, SIZE).data; } catch { return null; }
     };
-    // Albedo: all 8 layers (core + variants), diffuse only.
-    const albedo = new Uint8Array(albN * SIZE * SIZE * 4);
-    for (let L = 0; L < albN; L++) {
-      const d = pixels(await loadImg(`${ALB[L]}_diff`));
-      const off = L * SIZE * SIZE * 4;
-      for (let i = 0; i < SIZE * SIZE; i++) {
-        const j = off + i * 4, k = i * 4;
-        albedo[j] = d ? d[k] : 200; albedo[j + 1] = d ? d[k + 1] : 200; albedo[j + 2] = d ? d[k + 2] : 200; albedo[j + 3] = 255;
+    // Albedo array: prefer the GPU-compressed KTX2 array (geometry/terrain/biome_albedo.ktx2 — Basis-LZ, ~4×
+    // less VRAM than the uncompressed RawTexture2DArray). loadKtx2Array VERIFIES it actually bound as an
+    // albN-layer 2D-array and returns null otherwise, so a load failure / mis-bind / opt-out all fall through
+    // to the uncompressed canvas build below (terrain never goes invisible). Opt out: localStorage ignis_terrain_ktx2='0'.
+    let albArr: BaseTexture | null = null;
+    if ((localStorage.getItem('ignis_terrain_ktx2') ?? '1') !== '0') {
+      albArr = await this.loadKtx2Array(scene, `${Settings.apiUrl}geometry/terrain/biome_albedo.ktx2`, albN);
+    }
+    let albedo: Uint8Array | null = null;
+    if (!albArr) {
+      // Fallback: build the uncompressed RawTexture2DArray from the served tiles (the original path).
+      albedo = new Uint8Array(albN * SIZE * SIZE * 4);
+      for (let L = 0; L < albN; L++) {
+        const d = pixels(await loadImg(`${ALB[L]}_diff`));
+        const off = L * SIZE * SIZE * 4;
+        for (let i = 0; i < SIZE * SIZE; i++) {
+          const j = off + i * 4, k = i * 4;
+          albedo[j] = d ? d[k] : 200; albedo[j + 1] = d ? d[k + 1] : 200; albedo[j + 2] = d ? d[k + 2] : 200; albedo[j + 3] = 255;
+        }
       }
     }
     // ORM: 5 core layers only (R = roughness, G = AO).
@@ -2451,8 +2468,32 @@ export class TerrainService {
       t.wrapU = Texture.WRAP_ADDRESSMODE; t.wrapV = Texture.WRAP_ADDRESSMODE;
       return t;
     };
-    this.biomeAlbedoArr = mk(albedo, albN);
+    this.biomeAlbedoArr = albArr ?? mk(albedo as Uint8Array, albN);   // KTX2 array if it bound, else uncompressed
     this.biomeOrmArr = mk(orm, ORMN);
+  }
+
+  /**
+   * Load a GPU-compressed KTX2 ARRAY texture (Basis-LZ) for the biome albedo, returning it ONLY if it actually
+   * bound as an `expectLayers`-layer 2D-array — otherwise null (so the caller falls back to the uncompressed
+   * RawTexture2DArray). This guards against both a load failure AND Babylon decoding it as a plain 2D texture
+   * (which would sample wrong), since terrain can't be verified live and a bad bind = invisible/garbled land.
+   */
+  private loadKtx2Array(scene: Scene, url: string, expectLayers: number): Promise<BaseTexture | null> {
+    return new Promise((resolve) => {
+      const tex = new Texture(url, scene, false, false, Texture.TRILINEAR_SAMPLINGMODE,
+        () => {
+          const it = tex._texture as (typeof tex._texture & { is2DArray?: boolean; depth?: number }) | null;
+          if (it?.is2DArray && it.depth === expectLayers) {
+            tex.wrapU = Texture.WRAP_ADDRESSMODE; tex.wrapV = Texture.WRAP_ADDRESSMODE;
+            resolve(tex);
+          } else {
+            console.warn(`[terrain] biome_albedo.ktx2 did not bind as a ${expectLayers}-layer array `
+              + `(is2DArray=${it?.is2DArray}, depth=${it?.depth}) — using the uncompressed array.`);
+            tex.dispose(); resolve(null);
+          }
+        },
+        () => { console.warn('[terrain] biome_albedo.ktx2 failed to load — using the uncompressed array.'); resolve(null); });
+    });
   }
 
   /**
@@ -2736,15 +2777,29 @@ export class TerrainService {
       // S6 perf: the variant cross-fade (9 extra taps) is only visible up close; past ~170 m skip it entirely.
       // texture() can't go in a per-pixel branch (mip derivatives need uniform flow), so the variants use
       // textureLod inside the branch; the base fine taps above keep auto-mip. Most of the screen saves 9 taps.
-      float varFade = 1.0 - smoothstep(70.0, 170.0, dCam);
+      float varFade = 1.0 - smoothstep(120.0, 280.0, dCam);   // variants visible further out (was 70-170)
       if (varFade > 0.003) {
         float vlod = clamp(log2(max(dCam, 1.0) / 35.0), 0.0, 4.0);
-        float vSand  = smoothstep(0.35, 0.65, _dVal(wq * 0.0017 + 11.3)) * varFade;
-        float vGrass = smoothstep(0.35, 0.65, _dVal(wq * 0.0019 + 27.7)) * varFade;
-        float vRock  = smoothstep(0.35, 0.65, _dVal(wq * 0.0015 + 51.1)) * varFade;
-        sandFine  = mix(sandFine,  TRIAL(5,0.061,vlod), vSand);
-        grassFine = mix(grassFine, TRIAL(6,0.047,vlod), vGrass);
-        rockFine  = mix(rockFine,  TRIAL(7,0.078,vlod), vRock);
+        // Variant strength: a 0.5 FLOOR so the regional variant is always at least half-present (the regions
+        // were barely visible before), rising to full in its strong areas. Region IDENTITY still varies below.
+        float vSand  = (0.5 + 0.5 * smoothstep(0.30, 0.62, _dVal(wq * 0.0017 + 11.3))) * varFade;
+        float vGrass = (0.5 + 0.5 * smoothstep(0.30, 0.62, _dVal(wq * 0.0019 + 27.7))) * varFade;
+        float vRock  = (0.5 + 0.5 * smoothstep(0.30, 0.62, _dVal(wq * 0.0015 + 51.1))) * varFade;
+        // REGIONAL variant selection: a slow ~900 m noise picks WHICH variant a region uses from each biome's
+        // pool, blended at the region seams. CONSTANT layer indices (nested smoothstep bands) — no dynamic
+        // array index, so the GLSL→WGSL transpile stays on the proven path. Sand pool {5,8,9}, rock {7,11,12}
+        // each split into thirds; grass {6,10} into halves. Gated to the near field (varFade) for perf.
+        float sN = _dVal(wq * 0.0011 + 5.3);
+        vec3 sandVar = mix(mix(TRIAL(5,0.061,vlod), TRIAL(8,0.063,vlod), smoothstep(0.30,0.46,sN)),
+                           TRIAL(9,0.059,vlod), smoothstep(0.62,0.78,sN));
+        float gN = _dVal(wq * 0.0013 + 27.7);
+        vec3 grassVar = mix(TRIAL(6,0.047,vlod), TRIAL(10,0.045,vlod), smoothstep(0.40,0.60,gN));
+        float kN = _dVal(wq * 0.0015 + 51.1);
+        vec3 rockVar = mix(mix(TRIAL(7,0.078,vlod), TRIAL(11,0.071,vlod), smoothstep(0.30,0.46,kN)),
+                           TRIAL(12,0.066,vlod), smoothstep(0.62,0.78,kN));
+        sandFine  = mix(sandFine,  sandVar,  vSand);
+        grassFine = mix(grassFine, grassVar, vGrass);
+        rockFine  = mix(rockFine,  rockVar,  vRock);
       }
       #undef TRIAL
       vec3 sandC = clamp((sandFine*0.65 + texture(uAlbedoArr, vec3(wpW.xz*0.018,0.0)).rgb*0.35) * vec3(1.20,1.08,0.80), 0.0, 1.0);

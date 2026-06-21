@@ -304,9 +304,11 @@ const RES: f32 = 24.0;
     hash2(vec2f(px * 1.11 + 4.0, pz * 1.07 - 4.0)) * TAU,
     (hash2(vec2f(px * 2.3, pz * 5.1)) - 0.5) * 0.5,
     (hash2(vec2f(px * 5.1, pz * 2.3)) - 0.5) * 0.5);
+  // GENTLE near-neutral tints — the 3 photoreal PBR rock textures carry the colour now (KEEP IN SYNC with
+  // scatter.service ROCK_TINTS).
   var tints = array<vec3f, 6>(
-    vec3f(0.92, 0.94, 1.00), vec3f(1.00, 0.84, 0.58), vec3f(0.50, 0.50, 0.56),
-    vec3f(0.96, 0.56, 0.42), vec3f(0.62, 0.72, 0.50), vec3f(0.85, 0.85, 0.85),
+    vec3f(1.00, 1.00, 1.00), vec3f(0.92, 0.90, 0.87), vec3f(0.87, 0.89, 0.93),
+    vec3f(1.00, 0.97, 0.92), vec3f(0.91, 0.93, 0.90), vec3f(0.96, 0.96, 0.99),
   );
   let ti = u32(hash2(vec2f(px * 0.9 - 11.0, pz * 0.9 + 11.0)) * 6.0) % 6u;
   _ = emit(composeMat(q, sx, sy, sz, px, y - base * 0.1, pz), tintJitter(px, pz, tints[ti], 0.10));
@@ -338,9 +340,10 @@ const RES: f32 = 20.0;
     hash2(vec2f(px * 1.11 + 4.0, pz * 1.07 - 4.0)) * TAU,
     (hash2(vec2f(px * 2.3, pz * 5.1)) - 0.5) * 0.3,
     (hash2(vec2f(px * 5.1, pz * 2.3)) - 0.5) * 0.3);
+  // Gentle tints — driftwood now uses the bark PBR sets (KEEP IN SYNC with scatter.service DRIFT_TINTS).
   var tints = array<vec3f, 6>(
-    vec3f(1.00, 1.00, 1.02), vec3f(1.05, 1.03, 0.98), vec3f(1.05, 0.95, 0.76),
-    vec3f(0.86, 0.70, 0.50), vec3f(0.95, 0.82, 0.63), vec3f(0.60, 0.62, 0.64),
+    vec3f(1.00, 1.00, 1.02), vec3f(1.02, 1.00, 0.96), vec3f(0.96, 0.93, 0.88),
+    vec3f(0.90, 0.86, 0.80), vec3f(0.97, 0.94, 0.88), vec3f(0.86, 0.88, 0.90),
   );
   let ti = u32(hash2(vec2f(px * 0.9 - 11.0, pz * 0.9 + 11.0)) * 6.0) % 6u;
   _ = emit(composeMat(q, s, s, s, px, y - 0.03, pz), tintJitter(px, pz, tints[ti], 0.08));

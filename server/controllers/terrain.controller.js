@@ -55,7 +55,10 @@ exports.getAuxMap      = serveTerrainPng('aux_map.png',      'Aux map');   // S4
  * map ∈ {diff (albedo), nor (normal), rough (roughness), ao (ambient occlusion)}. The S1b PBR terrain
  * skinning consumes diff+rough+ao; the older Standard path used diff+nor. Files: assets/terrain/tiles/.
  */
-const TILE_BIOMES = ['sand', 'sand2', 'grass', 'grass2', 'gravel', 'rock', 'rock2', 'snow'];
+// Core biomes + anti-tiling variants (sand2/grass2/rock2) + REGIONAL variants (sand3/sand4/grass3/rock3/rock4 —
+// scatter realism: different beaches/areas use different sand/grass/rock, blended at edges). Regional variants
+// are diffuse-only (they reuse the core biome's roughness/AO in the ORM array).
+const TILE_BIOMES = ['sand', 'sand2', 'sand3', 'sand4', 'grass', 'grass2', 'grass3', 'gravel', 'rock', 'rock2', 'rock3', 'rock4', 'snow'];
 const TILE_MAPS   = ['diff', 'nor', 'rough', 'ao'];
 const VALID_TILES = new Set(TILE_BIOMES.flatMap((b) => TILE_MAPS.map((m) => `${b}_${m}`)));
 

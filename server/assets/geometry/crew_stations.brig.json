@@ -11,106 +11,637 @@
   },
   "heading_convention": "yaw degrees about +Y; 0 = facing +Z (bow), 90 = facing +X (starboard), 180 = facing -Z (stern), -90 = facing -X (port)",
   "deck_levels": {
-    "waist": 4.0,
-    "quarterdeck": 5.0,
-    "forecastle": 5.0
+    "waist": 4,
+    "quarterdeck": 5,
+    "forecastle": 5
   },
   "landmarks": {
-    "foremast": [0.0, 4.6, 5.16],
-    "mainmast": [0.0, 4.6, -4.01],
-    "wheel": [0.0, 5.74, -11.1],
+    "foremast": [
+      0,
+      4.6,
+      5.16
+    ],
+    "mainmast": [
+      0,
+      4.6,
+      -4.01
+    ],
+    "wheel": [
+      0,
+      5.74,
+      -11.1
+    ],
     "bow": 13.3,
     "stern": -13.2,
     "note": "Two masts: square-rigged FORE (z+5.16) + gaff MAIN (z-4.01). Decks: forecastle z8..12.4, waist z-4.9..8, quarterdeck z-12.4..-4.9, both raised ~1m over the waist."
   },
   "waypoints": {
-    "wp_helm":        [0.0, 5.0, -10.2],
-    "wp_qd_aft":      [0.0, 5.0, -8.4],
-    "wp_qd_fwd":      [0.0, 5.0, -5.4],
-    "wp_qd_ladder_top": [-1.5, 5.0, -5.1],
-    "wp_qd_ladder_bot": [-1.5, 4.0, -4.4],
-    "wp_waist_aft":   [0.0, 4.0, -3.0],
-    "wp_waist_mid":   [0.0, 3.95, 0.6],
-    "wp_waist_fwd":   [0.0, 4.0, 4.2],
-    "wp_port_waist":  [-2.0, 4.0, 0.8],
-    "wp_stbd_waist":  [2.0, 4.0, 0.8],
-    "wp_port_qd":     [-2.0, 5.0, -7.2],
-    "wp_stbd_qd":     [2.0, 5.0, -7.2],
-    "wp_fc_ladder_bot": [-1.5, 4.0, 7.2],
-    "wp_fc_ladder_top": [-1.5, 5.0, 8.2],
-    "wp_forecastle":  [0.0, 5.0, 10.0],
-    "wp_fc_port":     [-2.0, 5.0, 9.0],
-    "wp_fc_stbd":     [2.0, 5.0, 9.0]
+    "wp_helm": [
+      0,
+      5,
+      -10.2
+    ],
+    "wp_qd_aft": [
+      0,
+      5,
+      -8.4
+    ],
+    "wp_qd_fwd": [
+      0,
+      5,
+      -5.4
+    ],
+    "wp_qd_ladder_top": [
+      -1.5,
+      5,
+      -5.1
+    ],
+    "wp_qd_ladder_bot": [
+      -1.5,
+      4,
+      -4.4
+    ],
+    "wp_waist_aft": [
+      0,
+      4,
+      -3
+    ],
+    "wp_waist_mid": [
+      0,
+      3.95,
+      0.6
+    ],
+    "wp_waist_fwd": [
+      0,
+      4,
+      4.2
+    ],
+    "wp_port_waist": [
+      -2,
+      4,
+      0.8
+    ],
+    "wp_stbd_waist": [
+      2,
+      4,
+      0.8
+    ],
+    "wp_port_qd": [
+      -2,
+      5,
+      -7.2
+    ],
+    "wp_stbd_qd": [
+      2,
+      5,
+      -7.2
+    ],
+    "wp_fc_ladder_bot": [
+      -1.5,
+      4,
+      7.2
+    ],
+    "wp_fc_ladder_top": [
+      -1.5,
+      5,
+      8.2
+    ],
+    "wp_forecastle": [
+      0,
+      5,
+      10
+    ],
+    "wp_fc_port": [
+      -2,
+      5,
+      9
+    ],
+    "wp_fc_stbd": [
+      2,
+      5,
+      9
+    ]
   },
   "edges": [
-    ["wp_helm", "wp_qd_aft", { "kind": "walk" }],
-    ["wp_qd_aft", "wp_qd_fwd", { "kind": "walk", "note": "quarterdeck, abaft the mainmast" }],
-    ["wp_qd_fwd", "wp_qd_ladder_top", { "kind": "walk" }],
-    ["wp_qd_ladder_top", "wp_qd_ladder_bot", { "kind": "ladder", "note": "quarterdeck break, port ladder down to the waist" }],
-    ["wp_qd_ladder_bot", "wp_waist_aft", { "kind": "walk" }],
-    ["wp_qd_aft", "wp_port_qd", { "kind": "walk" }],
-    ["wp_qd_aft", "wp_stbd_qd", { "kind": "walk" }],
-    ["wp_waist_aft", "wp_waist_mid", { "kind": "walk", "note": "passes the mainmast (z-4.0) to port/stbd" }],
-    ["wp_waist_mid", "wp_waist_fwd", { "kind": "walk", "note": "passes the foremast (z+5.16)" }],
-    ["wp_waist_mid", "wp_port_waist", { "kind": "walk" }],
-    ["wp_waist_mid", "wp_stbd_waist", { "kind": "walk" }],
-    ["wp_waist_fwd", "wp_fc_ladder_bot", { "kind": "walk" }],
-    ["wp_fc_ladder_bot", "wp_fc_ladder_top", { "kind": "ladder", "note": "forecastle break, port ladder up" }],
-    ["wp_fc_ladder_top", "wp_forecastle", { "kind": "walk" }],
-    ["wp_forecastle", "wp_fc_port", { "kind": "walk" }],
-    ["wp_forecastle", "wp_fc_stbd", { "kind": "walk" }]
+    [
+      "wp_helm",
+      "wp_qd_aft",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qd_aft",
+      "wp_qd_fwd",
+      {
+        "kind": "walk",
+        "note": "quarterdeck, abaft the mainmast"
+      }
+    ],
+    [
+      "wp_qd_fwd",
+      "wp_qd_ladder_top",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qd_ladder_top",
+      "wp_qd_ladder_bot",
+      {
+        "kind": "ladder",
+        "note": "quarterdeck break, port ladder down to the waist"
+      }
+    ],
+    [
+      "wp_qd_ladder_bot",
+      "wp_waist_aft",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qd_aft",
+      "wp_port_qd",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qd_aft",
+      "wp_stbd_qd",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_waist_aft",
+      "wp_waist_mid",
+      {
+        "kind": "walk",
+        "note": "passes the mainmast (z-4.0) to port/stbd"
+      }
+    ],
+    [
+      "wp_waist_mid",
+      "wp_waist_fwd",
+      {
+        "kind": "walk",
+        "note": "passes the foremast (z+5.16)"
+      }
+    ],
+    [
+      "wp_waist_mid",
+      "wp_port_waist",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_waist_mid",
+      "wp_stbd_waist",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_waist_fwd",
+      "wp_fc_ladder_bot",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_fc_ladder_bot",
+      "wp_fc_ladder_top",
+      {
+        "kind": "ladder",
+        "note": "forecastle break, port ladder up"
+      }
+    ],
+    [
+      "wp_fc_ladder_top",
+      "wp_forecastle",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_forecastle",
+      "wp_fc_port",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_forecastle",
+      "wp_fc_stbd",
+      {
+        "kind": "walk"
+      }
+    ]
   ],
   "stations": [
-    { "id": "helm", "kind": "helm", "pos": [0.0, 5.0, -10.4], "heading_deg": 0, "clip": "Idle", "wp": "wp_helm", "note": "abaft the wheel (z-11.1), facing the bow" },
-
-    { "id": "gun_P_0", "kind": "cannon", "pos": [-2.2, 5.0, 9.0],  "heading_deg": -90, "clip": "Work_Cannon", "wp": "wp_fc_port",   "note": "forecastle bow chaser, port" },
-    { "id": "gun_P_1", "kind": "cannon", "pos": [-2.2, 4.0, 1.5],  "heading_deg": -90, "clip": "Work_Cannon", "wp": "wp_port_waist" },
-    { "id": "gun_P_2", "kind": "cannon", "pos": [-2.2, 5.0, -6.5], "heading_deg": -90, "clip": "Work_Cannon", "wp": "wp_port_qd" },
-    { "id": "gun_P_3", "kind": "cannon", "pos": [-2.2, 5.0, -9.0], "heading_deg": -90, "clip": "Work_Cannon", "wp": "wp_port_qd" },
-    { "id": "gun_S_0", "kind": "cannon", "pos": [2.2, 5.0, 9.0],   "heading_deg": 90,  "clip": "Work_Cannon", "wp": "wp_fc_stbd",   "note": "forecastle bow chaser, starboard" },
-    { "id": "gun_S_1", "kind": "cannon", "pos": [2.2, 4.0, 1.5],   "heading_deg": 90,  "clip": "Work_Cannon", "wp": "wp_stbd_waist" },
-    { "id": "gun_S_2", "kind": "cannon", "pos": [2.2, 5.0, -6.5],  "heading_deg": 90,  "clip": "Work_Cannon", "wp": "wp_stbd_qd" },
-    { "id": "gun_S_3", "kind": "cannon", "pos": [2.2, 5.0, -9.0],  "heading_deg": 90,  "clip": "Work_Cannon", "wp": "wp_stbd_qd" },
-
-    { "id": "ropes_fore", "kind": "ropes", "pos": [0.0, 4.0, 6.0],  "heading_deg": 0,   "clip": "Work_Ropes", "wp": "wp_waist_fwd", "note": "foremast fife rail / pin rail" },
-    { "id": "ropes_main", "kind": "ropes", "pos": [0.0, 3.95, -4.9],"heading_deg": 180, "clip": "Work_Ropes", "wp": "wp_waist_aft", "note": "mainmast fife rail" },
-    { "id": "ropes_P", "kind": "ropes", "pos": [-2.4, 4.0, -1.0], "heading_deg": -90, "clip": "Work_Ropes", "wp": "wp_port_waist", "note": "port pin rail" },
-    { "id": "ropes_S", "kind": "ropes", "pos": [2.4, 4.0, -1.0],  "heading_deg": 90,  "clip": "Work_Ropes", "wp": "wp_stbd_waist", "note": "starboard pin rail" },
-
-    { "id": "lookout", "kind": "lookout", "pos": [0.0, 5.0, 11.5], "heading_deg": 0, "clip": "Lookout", "wp": "wp_forecastle", "note": "forecastle, forward at the bow" },
-
-    { "id": "capstan",     "kind": "ropes", "pos": [0.0, 3.95, 1.2],  "heading_deg": 0,   "clip": "Work_Ropes", "wp": "wp_waist_mid", "note": "amidships capstan / deck work" },
-    { "id": "deck_mid",    "kind": "idle",  "pos": [0.6, 3.95, -1.0], "heading_deg": 30,  "clip": "Idle",       "wp": "wp_waist_mid", "note": "idling amidships, between the masts" },
-    { "id": "deck_fwd",    "kind": "idle",  "pos": [-0.6, 4.0, 3.4],  "heading_deg": 200, "clip": "Idle",       "wp": "wp_waist_fwd", "note": "idling by the foremast" },
-    { "id": "deck_qd",     "kind": "idle",  "pos": [0.7, 5.0, -8.0],  "heading_deg": 200, "clip": "Idle",       "wp": "wp_qd_aft",    "note": "officer on the quarterdeck centre" },
-    { "id": "deck_fc",     "kind": "idle",  "pos": [-0.7, 5.0, 9.4],  "heading_deg": 160, "clip": "Idle",       "wp": "wp_forecastle","note": "hand on the forecastle centre" }
+    {
+      "id": "helm",
+      "kind": "helm",
+      "pos": [
+        0,
+        5,
+        -10.4
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_helm",
+      "note": "abaft the wheel (z-11.1), facing the bow"
+    },
+    {
+      "id": "gun_P_0",
+      "kind": "cannon",
+      "pos": [
+        -1.5,
+        5,
+        9
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Cannon",
+      "wp": "wp_fc_port",
+      "note": "forecastle bow chaser, port"
+    },
+    {
+      "id": "gun_P_1",
+      "kind": "cannon",
+      "pos": [
+        -1.85,
+        4,
+        1.5
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_waist"
+    },
+    {
+      "id": "gun_P_2",
+      "kind": "cannon",
+      "pos": [
+        -1.85,
+        5,
+        -6.5
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_qd"
+    },
+    {
+      "id": "gun_P_3",
+      "kind": "cannon",
+      "pos": [
+        -1.5,
+        5,
+        -9
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Cannon",
+      "wp": "wp_port_qd"
+    },
+    {
+      "id": "gun_S_0",
+      "kind": "cannon",
+      "pos": [
+        1.5,
+        5,
+        9
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Cannon",
+      "wp": "wp_fc_stbd",
+      "note": "forecastle bow chaser, starboard"
+    },
+    {
+      "id": "gun_S_1",
+      "kind": "cannon",
+      "pos": [
+        1.85,
+        4,
+        1.5
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_waist"
+    },
+    {
+      "id": "gun_S_2",
+      "kind": "cannon",
+      "pos": [
+        1.85,
+        5,
+        -6.5
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_qd"
+    },
+    {
+      "id": "gun_S_3",
+      "kind": "cannon",
+      "pos": [
+        1.5,
+        5,
+        -9
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Cannon",
+      "wp": "wp_stbd_qd"
+    },
+    {
+      "id": "ropes_fore",
+      "kind": "ropes",
+      "pos": [
+        0,
+        4,
+        6
+      ],
+      "heading_deg": 0,
+      "clip": "Work_Ropes",
+      "wp": "wp_waist_fwd",
+      "note": "foremast fife rail / pin rail"
+    },
+    {
+      "id": "ropes_main",
+      "kind": "ropes",
+      "pos": [
+        0,
+        3.95,
+        -4.9
+      ],
+      "heading_deg": 180,
+      "clip": "Work_Ropes",
+      "wp": "wp_waist_aft",
+      "note": "mainmast fife rail"
+    },
+    {
+      "id": "ropes_P",
+      "kind": "ropes",
+      "pos": [
+        -2.05,
+        4,
+        -1
+      ],
+      "heading_deg": -90,
+      "clip": "Work_Ropes",
+      "wp": "wp_port_waist",
+      "note": "port pin rail"
+    },
+    {
+      "id": "ropes_S",
+      "kind": "ropes",
+      "pos": [
+        2.05,
+        4,
+        -1
+      ],
+      "heading_deg": 90,
+      "clip": "Work_Ropes",
+      "wp": "wp_stbd_waist",
+      "note": "starboard pin rail"
+    },
+    {
+      "id": "lookout",
+      "kind": "lookout",
+      "pos": [
+        0,
+        5,
+        11.5
+      ],
+      "heading_deg": 0,
+      "clip": "Lookout",
+      "wp": "wp_forecastle",
+      "note": "forecastle, forward at the bow"
+    },
+    {
+      "id": "capstan",
+      "kind": "ropes",
+      "pos": [
+        0,
+        3.95,
+        1.2
+      ],
+      "heading_deg": 0,
+      "clip": "Work_Ropes",
+      "wp": "wp_waist_mid",
+      "note": "amidships capstan / deck work"
+    },
+    {
+      "id": "deck_mid",
+      "kind": "idle",
+      "pos": [
+        0.6,
+        3.95,
+        -1
+      ],
+      "heading_deg": 30,
+      "clip": "Idle",
+      "wp": "wp_waist_mid",
+      "note": "idling amidships, between the masts"
+    },
+    {
+      "id": "deck_fwd",
+      "kind": "idle",
+      "pos": [
+        -0.6,
+        4,
+        3.4
+      ],
+      "heading_deg": 200,
+      "clip": "Idle",
+      "wp": "wp_waist_fwd",
+      "note": "idling by the foremast"
+    },
+    {
+      "id": "deck_qd",
+      "kind": "idle",
+      "pos": [
+        0.7,
+        5,
+        -8
+      ],
+      "heading_deg": 200,
+      "clip": "Idle",
+      "wp": "wp_qd_aft",
+      "note": "officer on the quarterdeck centre"
+    },
+    {
+      "id": "deck_fc",
+      "kind": "idle",
+      "pos": [
+        -0.7,
+        5,
+        9.4
+      ],
+      "heading_deg": 160,
+      "clip": "Idle",
+      "wp": "wp_forecastle",
+      "note": "hand on the forecastle centre"
+    }
   ],
   "climb_paths": [
     {
-      "id": "climb_fore_P", "side": "port", "mast": "fore", "clip": "Climb", "approach_wp": "wp_waist_fwd",
+      "id": "climb_fore_P",
+      "side": "port",
+      "mast": "fore",
+      "clip": "Climb",
+      "approach_wp": "wp_waist_fwd",
       "polyline": [
-        [-2.9, 4.5, 5.4], [-3.0, 6.0, 5.2], [-2.4, 8.5, 5.0], [-1.7, 11.0, 4.8], [-1.0, 12.8, 4.6], [-0.6, 13.4, 4.5]
+        [
+          -2.9,
+          4.5,
+          5.4
+        ],
+        [
+          -3,
+          6,
+          5.2
+        ],
+        [
+          -2.4,
+          8.5,
+          5
+        ],
+        [
+          -1.7,
+          11,
+          4.8
+        ],
+        [
+          -1,
+          12.8,
+          4.6
+        ],
+        [
+          -0.6,
+          13.4,
+          4.5
+        ]
       ],
       "note": "foremast port ratlines, deck channel to the foretop (ForeCap y13.4); face inboard as he rises"
     },
     {
-      "id": "climb_fore_S", "side": "starboard", "mast": "fore", "clip": "Climb", "approach_wp": "wp_waist_fwd",
+      "id": "climb_fore_S",
+      "side": "starboard",
+      "mast": "fore",
+      "clip": "Climb",
+      "approach_wp": "wp_waist_fwd",
       "polyline": [
-        [2.9, 4.5, 5.4], [3.0, 6.0, 5.2], [2.4, 8.5, 5.0], [1.7, 11.0, 4.8], [1.0, 12.8, 4.6], [0.6, 13.4, 4.5]
+        [
+          2.9,
+          4.5,
+          5.4
+        ],
+        [
+          3,
+          6,
+          5.2
+        ],
+        [
+          2.4,
+          8.5,
+          5
+        ],
+        [
+          1.7,
+          11,
+          4.8
+        ],
+        [
+          1,
+          12.8,
+          4.6
+        ],
+        [
+          0.6,
+          13.4,
+          4.5
+        ]
       ],
       "note": "mirror of climb_fore_P"
     },
     {
-      "id": "climb_main_P", "side": "port", "mast": "main", "clip": "Climb", "approach_wp": "wp_waist_aft",
+      "id": "climb_main_P",
+      "side": "port",
+      "mast": "main",
+      "clip": "Climb",
+      "approach_wp": "wp_waist_aft",
       "polyline": [
-        [-2.9, 4.5, -3.8], [-3.0, 6.0, -4.0], [-2.4, 9.0, -4.2], [-1.7, 12.0, -4.5], [-1.0, 14.5, -4.7], [-0.6, 15.4, -4.8]
+        [
+          -2.9,
+          4.5,
+          -3.8
+        ],
+        [
+          -3,
+          6,
+          -4
+        ],
+        [
+          -2.4,
+          9,
+          -4.2
+        ],
+        [
+          -1.7,
+          12,
+          -4.5
+        ],
+        [
+          -1,
+          14.5,
+          -4.7
+        ],
+        [
+          -0.6,
+          15.4,
+          -4.8
+        ]
       ],
       "note": "mainmast port ratlines to the maintop (MainCap y15.4)"
     },
     {
-      "id": "climb_main_S", "side": "starboard", "mast": "main", "clip": "Climb", "approach_wp": "wp_waist_aft",
+      "id": "climb_main_S",
+      "side": "starboard",
+      "mast": "main",
+      "clip": "Climb",
+      "approach_wp": "wp_waist_aft",
       "polyline": [
-        [2.9, 4.5, -3.8], [3.0, 6.0, -4.0], [2.4, 9.0, -4.2], [1.7, 12.0, -4.5], [1.0, 14.5, -4.7], [0.6, 15.4, -4.8]
+        [
+          2.9,
+          4.5,
+          -3.8
+        ],
+        [
+          3,
+          6,
+          -4
+        ],
+        [
+          2.4,
+          9,
+          -4.2
+        ],
+        [
+          1.7,
+          12,
+          -4.5
+        ],
+        [
+          1,
+          14.5,
+          -4.7
+        ],
+        [
+          0.6,
+          15.4,
+          -4.8
+        ]
       ],
       "note": "mirror of climb_main_P"
     }

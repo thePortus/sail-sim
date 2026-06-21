@@ -10,8 +10,13 @@ import { VesselAssetCacheService } from './vessel-asset-cache.service';
 const BRACE_FACTOR = 0.55;   // crew counter-lean this fraction of the deck slope (0 = ride flat with the deck,
                              // 1 = bolt upright). ~0.55 reads as bracing without looking detached from the deck.
 const BRACE_MAX    = 0.45;   // rad cap on the brace lean (a hard knockdown won't over-rotate them)
-const SWAY_AMP     = 0.022;  // m — subtle idle weight-shift sway at a station (desynced per member)
+const SWAY_AMP     = 0.03;   // m — idle weight-shift sway at a station (desynced per member)
 const HEEL_SHIFT   = 0.05;   // m of lateral weight-shift per rad of heel (leaning onto the downhill foot)
+// ALWAYS-ON idle life so the crew never read as statues even in flat calm (the brace alone only moves them when
+// the deck actually heels). A slow, desynced weight-shift LEAN (the head visibly sways) + a breathing bob.
+const IDLE_LEAN_AMP  = 0.06;   // rad (~3.4°) idle side-to-side weight-shift lean — the main "alive" cue
+const IDLE_PITCH_AMP = 0.03;   // rad fore-aft idle lean (smaller)
+const IDLE_BOB       = 0.013;  // m vertical breathing bob
 // Locomotion (P2): scale the Walk clip's playback to the actual ground speed so the FEET PLANT instead of
 // skating. STRIDE_SCALE matches the clip's authored stride to walk_speed_mps — tune live via
 // localStorage.ignis_crew_stride if a footskate remains. TURN_SLOW slows forward progress while turning sharply
@@ -238,6 +243,7 @@ export class CrewHandle {
   private shipHeel = 0;
   private shipPitch = 0;
   private clock = 0;
+  private maxStationX = 0;   // widest station |x| (rail proxy) — damps idle motion for crew at the bulwarks
 
   constructor(
     private scene: Scene,
@@ -249,6 +255,8 @@ export class CrewHandle {
   ) {
     this.rootRng = mulberry32(seed);
     this.walkSpeed = manifest.constants?.['walk_speed_mps'] ?? 1.2;
+    // The rail-most station's lateral offset — used to damp idle lean/sway for crew near a bulwark (P1 follow-up).
+    for (const s of layout.stations) this.maxStationX = Math.max(this.maxStationX, Math.abs(s.pos[0]));
     for (const [a, b, meta] of layout.edges) {
       const kind = meta?.kind ?? 'walk';
       (this.adjacency.get(a) ?? this.adjacency.set(a, []).get(a)!).push({ to: b, kind });
@@ -543,6 +551,13 @@ export class CrewHandle {
     }
   }
 
+  /** Idle-motion damping for crew near a rail: 1 at the centreline, ~0.4 at the rail-most station, so a gun/rope
+   *  crew at the bulwark never sways/leans OUT through it. */
+  private railDamp(m: CrewMember): number {
+    const f = Math.abs(m.stationPos.x) / (this.maxStationX || 1);   // 0 centre → 1 rail-most
+    return 1 - 0.6 * f * f;
+  }
+
   /** Blink envelope + slow, subtle expression drift. Dead crew keep eyes shut. */
   private tickFace(m: CrewMember, dt: number): void {
     const f = m.face;
@@ -592,16 +607,27 @@ export class CrewHandle {
       while (d > Math.PI) d -= 2 * Math.PI;
       while (d < -Math.PI) d += 2 * Math.PI;
       m.yaw += d * Math.min(1, dt * 8);
-      const roll  = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, -this.shipHeel  * BRACE_FACTOR));
-      const pitch = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, -this.shipPitch * BRACE_FACTOR));
+      let roll  = -this.shipHeel  * BRACE_FACTOR;
+      let pitch = -this.shipPitch * BRACE_FACTOR;
+      // Always-on idle weight-shift lean while standing at a station — what keeps them from looking like statues
+      // in flat calm (walking/climbing have their own motion, so skip there). Damped near a rail (large |x|) so a
+      // gun/rope crew at the bulwark never leans OUT through it.
+      if (m.state === 'station') {
+        roll  += Math.sin(this.clock * m.swayFreq + m.swayPhase) * IDLE_LEAN_AMP * this.railDamp(m);
+        pitch += Math.sin(this.clock * m.swayFreq * 0.7 + m.swayPhase * 1.7) * IDLE_PITCH_AMP;
+      }
+      roll  = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, roll));
+      pitch = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, pitch));
       const qYaw = Quaternion.RotationAxis(Vector3.Up(), m.yaw);
       m.holder.rotationQuaternion = Quaternion.RotationYawPitchRoll(0, pitch, roll).multiply(qYaw);
     }
-    // Idle weight-shift sway at a station (desynced) + a lean onto the downhill foot as she heels. Skipped while
-    // walking/climbing (their position is driven by the path) and while dead.
+    // Idle weight-shift sway + breathing bob at a station (desynced) + a lean onto the downhill foot as she
+    // heels. Skipped while walking/climbing (their position is driven by the path) and while dead.
     if (m.state === 'station') {
-      m.holder.position.x = m.stationPos.x + Math.sin(this.clock * m.swayFreq + m.swayPhase) * SWAY_AMP + this.shipHeel * HEEL_SHIFT;
+      const rd = this.railDamp(m);
+      m.holder.position.x = m.stationPos.x + (Math.sin(this.clock * m.swayFreq + m.swayPhase) * SWAY_AMP + this.shipHeel * HEEL_SHIFT) * rd;
       m.holder.position.z = m.stationPos.z + Math.cos(this.clock * m.swayFreq * 0.8 + m.swayPhase) * SWAY_AMP * 0.6;
+      m.holder.position.y = m.stationPos.y + Math.sin(this.clock * 0.9 + m.swayPhase) * IDLE_BOB;
 
       // Glance (P3): occasionally break off the work loop to look about (Lookout), then resume the station clip.
       if (m.glanceT > 0) {

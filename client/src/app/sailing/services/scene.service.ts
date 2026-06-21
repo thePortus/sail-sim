@@ -1602,7 +1602,13 @@ export class SceneService {
       s.captureFrameTime = on;
       s.captureInterFrameTime = on;
     }
-    if (e) { e.captureGPUFrameTime = on; }
+    // GPU timestamp timing (captureGPUFrameTime) creates a WebGPU TimestampQuery QuerySet that, under device
+    // churn / a cache self-heal, gets "used while destroyed" → a validation-error flood that then trips the
+    // invalid-pipeline watchdog (making it worse). It's a dev-only number, so make it OPT-IN
+    // (localStorage.ignis_gpu_timing='1'); the rest of the overlay (FPS + CPU breakdown) is unaffected.
+    let gpuTiming = false;
+    try { gpuTiming = localStorage.getItem('ignis_gpu_timing') === '1'; } catch { /* no storage → off */ }
+    if (e) { e.captureGPUFrameTime = on && gpuTiming; }
     this._spanActive = on;
     if (!on) this._spans.clear();
   }

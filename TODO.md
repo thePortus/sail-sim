@@ -2,9 +2,8 @@
 
 # General or Current TODO Items
 
-* Now, I'd love the implement the ability to name one's ship, and that this is stored server-side. That you are automatically asked to rename your ship when finishing the tutorial. (Before it is automatically Saltmeadow). Ship names do not have to be unique. Afterwards ships can be renamed at the Shipwright. You are also asked to name any new ship you buy. Ship's names should be visible to other players as a subtitle in the player's label. Now all that doesn't seem too hard to implement, but I am wondering if there is anyway to have a player's custom set ship name show in the game, in 3d, on the ship. Like if we could find a place on the vessel where the name could go and it could render in 3d. This last part seems like a reach, but I just wnated to see if you had any ideas of how we might implement that and make it look good.
+* Make pirates and pirate hunters visible to admins on the map
 * Make cannons reload on an individual basis... allow firing of partial broadsides
-* Expand list of NPC merchant vessel names
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
 * increase render resolution in spyglass

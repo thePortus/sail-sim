@@ -60,16 +60,19 @@ export class DolphinSwimPlugin extends MaterialPluginBase {
     #endif
   `;
 
+  // NOTE: unlike GLSL, the WGSL path does NOT read instanceColor.a for per-dolphin effort. The dolphins are
+  // rendered into the ocean refraction RTT + (intermittently) the depth prepass, and in those passes WebGPU
+  // sets the INSTANCESCOLOR define WITHOUT actually declaring `instanceColor` in the vertex-input struct — so
+  // `vertexInputs.instanceColor` fails to compile ("struct member instanceColor not found"), which invalidates
+  // the pipeline and floods an invalid-RenderPipeline cascade (oceanRefraction / sceneprePassRT). Defaulting
+  // dEnergy to 1.0 keeps the swim animation everywhere on WebGPU; only the per-instance effort nuance is lost.
   private static readonly WGSL = `
     #ifdef DOLPHIN_SWIM
       let dPump = 1.0 - smoothstep(-0.9, 0.3, positionUpdated.x);
       var dPh = 0.0;
-      var dEnergy = 1.0;
+      let dEnergy = 1.0;
       #ifdef INSTANCES
         dPh = (vertexInputs.world3.x + vertexInputs.world3.z) * 0.6;
-      #endif
-      #ifdef INSTANCESCOLOR
-        dEnergy = clamp(vertexInputs.instanceColor.a, 0.0, 1.0);      // D1: per-dolphin tail EFFORT
       #endif
       let dW = uniforms.dolSwim.z * uniforms.dolSwim.w * (0.7 + 0.6 * dEnergy) - positionUpdated.x * uniforms.dolSwim.y + dPh;
       positionUpdated.y += sin(dW) * dPump * uniforms.dolSwim.x * (0.4 + 0.85 * dEnergy);

@@ -1,6 +1,7 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import { TransformNode, Mesh, Material, Scene } from '@babylonjs/core';
 import { buildNameplate } from './nameplate';
+import { buildSternNameboard, SternNameboardHandle } from './stern-nameboard';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
@@ -87,6 +88,8 @@ interface OtherPlayerEntry extends OtherPlayer {
   label?:          Mesh | null;
   mastTop?:        number;   // height (m) of the masthead above the hull origin — label floats above THIS (tall brig vs short pinnace)
   labelScale?:     number;   // cached label scale; recomputed ~15 Hz (distance changes slowly), reused for the per-frame position
+  nameboard?:      SternNameboardHandle | null;   // 3D carved ship name on the stern (players only)
+  labelName?:      string;   // the ship name currently baked into the label + nameboard (to detect a rename → rebuild)
 }
 
 @Injectable({ providedIn: 'root' })
@@ -164,6 +167,10 @@ export class MultiplayerService {
   markedPirateId   = signal<string | null>(null);
   pirateReport     = signal<{ name: string; slug: string; kills: number; bounty: number } | null>(null);
   pirateReportError = signal<string | null>(null);
+  // Ship naming: the player's own custom ship name (from the server), and a request to open the rename modal
+  // (set on tutorial completion, on buying a ship, or from the Shipwright's Rename button; null = closed).
+  myShipName       = signal<string>('Saltmeadow');
+  shipNameModal    = signal<{ current: string; reason: 'tutorial' | 'buy' | 'rename' } | null>(null);
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   // ── Quests (intro tutorial + future storyline) ──────────────────────────────
@@ -343,6 +350,18 @@ export class MultiplayerService {
   askPirateActivity(): void {
     this.pirateReportError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'pirate_report' }));
+  }
+
+  /** Set / rename the player's ship. Server validates + persists + broadcasts; reply arrives as ship_name_set. */
+  setShipName(name: string): void {
+    const n = (name || '').trim().slice(0, 28);
+    if (!n) return;
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'set_ship_name', shipName: n }));
+  }
+
+  /** Open the ship-naming modal (from the Shipwright's "Rename ship" button). */
+  openShipNameModal(reason: 'tutorial' | 'buy' | 'rename' = 'rename'): void {
+    this.shipNameModal.set({ current: this.myShipName(), reason });
   }
 
   /** Quest: confirm a client-verified tutorial step (rotate camera, trim sails, listen for a rumour, …). The
@@ -766,6 +785,11 @@ export class MultiplayerService {
       }
       if (msg.factionRep && typeof msg.factionRep === 'object') this.factionRep.set(msg.factionRep as Record<string, number>);
       if (typeof msg.ship === 'string' && msg.ship) { this.ownedShip.set(msg.ship); this.localState.vesselSlug = msg.ship; }
+      if (typeof msg.shipName === 'string' && msg.shipName) {
+        this.myShipName.set(msg.shipName);
+        this.localState.vesselName = msg.shipName;
+        this.vesselService.setShipName(msg.shipName);   // paint it onto the local 3D stern nameboard
+      }
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
@@ -839,9 +863,23 @@ export class MultiplayerService {
       // The wallet message arriving alongside already updated gold/ownedShip; trigger the in-world swap.
       this.shipError.set(null);
       this.purchasedShip.set(String(msg.slug ?? ''));
+      // A new hull deserves a name — invite the captain to christen it (they can keep the current one).
+      this.shipNameModal.set({ current: this.myShipName(), reason: 'buy' });
 
     } else if (msg.type === 'ship_error') {
       this.shipError.set(String(msg.reason ?? 'purchase failed'));
+
+    } else if (msg.type === 'ship_name_set') {
+      // Server confirmed our rename → update our own readouts + the local 3D nameboard, and close the modal.
+      const n = String(msg.shipName ?? 'Saltmeadow');
+      this.myShipName.set(n);
+      this.localState.vesselName = n;
+      this.vesselService.setShipName(n);
+      this.shipNameModal.set(null);
+
+    } else if (msg.type === 'rename_prompt') {
+      // The intro tutorial just finished → invite the new captain to name their ship.
+      this.shipNameModal.set({ current: String(msg.shipName ?? this.myShipName()), reason: 'tutorial' });
     }
   }
 
@@ -923,6 +961,17 @@ export class MultiplayerService {
     // everyone sees the new vessel, not the old one. Guarded against re-entry; keeps the same root + pose.
     if (!isNew && entry.controller && entry.builtSlug && entry.builtSlug !== entry.vesselSlug && !entry.rebuilding) {
       this.rebuildRemoteVessel(data.id, entry, scene);
+    }
+    // A remote PLAYER renamed their ship → repaint the stern nameboard + rebuild the floating label's subtitle.
+    if (!isNew && !entry.npc && entry.labelName !== undefined && entry.vesselName !== entry.labelName) {
+      entry.labelName = entry.vesselName;
+      entry.nameboard?.update(entry.vesselName || 'Saltmeadow');
+      if (entry.label) {
+        const pos = entry.label.position.clone(), sc = entry.label.scaling.clone(), en = entry.label.isEnabled();
+        entry.label.dispose(false, true);
+        entry.label = this.buildCallsignLabel((data.id) + 'label', entry.callsign, scene, null, null, entry.vesselName || null);
+        entry.label.position.copyFrom(pos); entry.label.scaling.copyFrom(sc); entry.label.setEnabled(en);
+      }
     }
     entry.sheetAngle = +data.sheetAngle || 0;
     entry.isPortTack = !!data.isPortTack;
@@ -1011,6 +1060,10 @@ export class MultiplayerService {
     // its unique DynamicTexture/material here.
     entry.label?.dispose(false, true);
     entry.label = null;
+    // 3D stern nameboard owns a unique DynamicTexture + material; free it (parented to root, but dispose
+    // explicitly so a hull-swap rebuild re-creates it cleanly for the new slug).
+    entry.nameboard?.dispose();
+    entry.nameboard = null;
     entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
     entry.crew = null;
     entry.controller?.dispose();
@@ -1648,11 +1701,19 @@ export class MultiplayerService {
     const labelText = entry.npc ? (entry.vesselName || 'Merchant') : callsign;
     // Unparented (the shared builder returns it free-standing) so the hull LOD (root.setEnabled(false) when
     // impostored) can't hide the nameplate; tickRemoteMotion positions it at the masthead each frame instead.
+    entry.labelName = entry.vesselName;
     entry.label = this.buildCallsignLabel(
       prefix + 'label', labelText, scene,
       entry.npc ? (entry.faction || null) : null,
       entry.npc ? (entry.role || null) : null,
+      entry.npc ? null : (entry.vesselName || null),   // players: their custom ship name as the label subtitle
     );
+
+    // 3D carved nameboard on the stern — PLAYERS only (their custom ship name). NPCs keep just the floating tag.
+    if (!entry.npc) {
+      entry.nameboard?.dispose();
+      entry.nameboard = buildSternNameboard(scene, prefix + 'nameboard', entry.root, slug, rig, entry.vesselName || 'Saltmeadow');
+    }
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean
     // so remote vessels appear mirrored in the surface and their submerged hull shows
@@ -1714,6 +1775,7 @@ export class MultiplayerService {
    *  callsign line. Shared ornate plaque renderer (see nameplate.ts); the caller positions/scales it per frame. */
   private buildCallsignLabel(
     name: string, text: string, scene: Scene, faction: string | null = null, role: string | null = null,
+    shipName: string | null = null,
   ): Mesh {
     // Pirates: a menacing BLACK plaque with a RED brass border + a skull-and-crossbones flanking the name —
     // instantly distinct from both players (dark slate) and the nation-coloured merchants.
@@ -1734,8 +1796,11 @@ export class MultiplayerService {
       });
     }
     const merchant = !!faction;
+    // Merchant NPC → ship name over a nation tag. Player → CALLSIGN over their custom SHIP NAME (the same name
+    // carved on the stern), so you can read both who's sailing and what they're sailing.
     const title    = merchant ? (text.replace(/^\s*merchant\s+/i, '').trim() || text) : text.toUpperCase();
-    const subtitle = merchant ? `⚑ ${factionName(faction).toUpperCase()} MERCHANT` : undefined;
+    const subtitle = merchant ? `⚑ ${factionName(faction).toUpperCase()} MERCHANT`
+                              : (shipName && shipName.trim() ? `⚓ ${shipName.trim()}` : undefined);
     return buildNameplate(scene, name, {
       title, subtitle,
       baseColor: merchant ? factionColor(faction) : null,

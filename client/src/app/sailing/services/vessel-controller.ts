@@ -80,6 +80,10 @@ export interface VesselRig {
   /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
   hullHalfLen: number;
   hullHalfBeam: number;
+  /** Placement (root-local) of the 3D ship-name board on the stern transom. z = aft offset (negative; bow is
+   *  +Z), y = height above the waterline origin, width/height = board size in metres. Tunable live via
+   *  localStorage `ignis_nameboard_<slug>` = "z,y,width,height". Omit → no nameboard for that hull. */
+  nameboard?: { z: number; y: number; width: number; height: number };
   /** v2 sailing polar (omit → falls back to the legacy step curve). */
   sail?: SailRig;
 }
@@ -106,15 +110,15 @@ const BRIG_SAIL: SailRig = {
 };
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
-  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, sail: SLOOP_SAIL },
-  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.5,  hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.16, heaveTau: 0.45, tiltTau: 0.30 }, sail: PINNACE_SAIL },
+  sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, nameboard: { z: -6.5, y: 1.4, width: 2.4, height: 0.6 },  sail: SLOOP_SAIL },
+  pinnace: { glb: 'pinnace.glb',              manifest: 'pinnace.manifest.json',              importFlipY: false, rightSign: -1, controller: 'pinnace', floatDraft: -0.5,  hullHalfLen: 4.1, hullHalfBeam: 1.1, hullCut: { floorY: 0.15, alongSign: 1 }, trimPitch: 0.05, buoyancy: { pitchScale: 0.16, heaveTau: 0.45, tiltTau: 0.30 }, nameboard: { z: -3.8, y: 0.9, width: 1.5, height: 0.42 }, sail: PINNACE_SAIL },
   // Brigantine — a big, decked two-master. Sits at normal draft (no hull cut). A heavy hull rides the swell
   // ponderously (low pitchScale, longer time constants) rather than bobbing like the open boats.
   // floatDraft −2.0 (was −2.3): +0.3m FREEBOARD so the low waist deck (deck-local ~3.6 → world ~1.6) clears the
   // wave crests that were occasionally washing it. waterlineY tracks −floatDraft (=2.0) so the cut footprint
   // sits at the real waterline. floorY −0.3 keeps the interior sink deep (root.y −2.0 + −0.3 − 0.38 ≈ −2.7, at
   // the hull bottom) so no water reads through the gratings.
-  brig:    { glb: 'brig.glb',                  manifest: 'brig.manifest.json',                 importFlipY: false, rightSign: 1,  controller: 'brig',    floatDraft: -2.0,  hullHalfLen: 12.0, hullHalfBeam: 3.2, hullCut: { floorY: -0.3, alongSign: 1, waterlineY: 2.0 }, buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 }, sail: BRIG_SAIL },
+  brig:    { glb: 'brig.glb',                  manifest: 'brig.manifest.json',                 importFlipY: false, rightSign: 1,  controller: 'brig',    floatDraft: -2.0,  hullHalfLen: 12.0, hullHalfBeam: 3.2, hullCut: { floorY: -0.3, alongSign: 1, waterlineY: 2.0 }, buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 }, nameboard: { z: -11.0, y: 3.4, width: 3.6, height: 0.85 }, sail: BRIG_SAIL },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {

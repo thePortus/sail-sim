@@ -51,6 +51,7 @@ import { TavernMenuComponent } from './tavern-menu.component';
 import { GovernorMenuComponent } from './governor-menu.component';
 import { DiplomacyMenuComponent } from './diplomacy-menu.component';
 import { QuestModalComponent } from './quest-modal.component';
+import { ShipNameModalComponent } from './ship-name-modal.component';
 import { QuestTrackerComponent } from './quest-tracker.component';
 import { QuestGuidanceComponent } from './quest-guidance.component';
 import { QuestToastComponent } from './quest-toast.component';
@@ -63,7 +64,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
 @Component({
   selector: 'app-game',
   standalone: true,
-  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent, QuestModalComponent, QuestTrackerComponent, QuestGuidanceComponent, QuestToastComponent],
+  imports: [CommonModule, HudComponent, MinimapComponent, AdminPanelComponent, PauseMenuComponent, SettingsMenuComponent, HelpMenuComponent, TraderMenuComponent, ShipwrightMenuComponent, TavernMenuComponent, GovernorMenuComponent, DiplomacyMenuComponent, QuestModalComponent, QuestTrackerComponent, QuestGuidanceComponent, QuestToastComponent, ShipNameModalComponent],
   template: `
     <div class="game-root" [class.photo-mode]="photoMode()">
       <!-- BabylonJS canvas -->
@@ -132,6 +133,9 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
           <app-quest-modal />
           <app-quest-toast />
         }
+
+        <!-- Ship-naming modal — opens on tutorial completion, buying a hull, or the Shipwright's Rename button. -->
+        <app-ship-name-modal />
 
         <!-- Pause menu — shown when Esc is pressed -->
         @if (paused()) {

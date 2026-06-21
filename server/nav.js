@@ -35,6 +35,8 @@ function isNav(cx, cz) {
   return (bits[i >> 3] & (1 << (i & 7))) !== 0;
 }
 function worldToCell(x, z) {
+  if (!loaded) loadNavGrid();               // lazy-load on first use (e.g. a direct caller before any findPath)
+  if (!wb) return { cx: 0, cz: 0 };          // grid unavailable → harmless default; callers' snapToNav fails safe
   const u = (x - wb.minX) / (wb.maxX - wb.minX);
   const v = (wb.maxZ - z) / (wb.maxZ - wb.minZ);   // Z flip: +Z (north) → row 0
   let cx = Math.floor(u * res), cz = Math.floor(v * res);
@@ -43,6 +45,8 @@ function worldToCell(x, z) {
   return { cx, cz };
 }
 function cellToWorld(cx, cz) {
+  if (!loaded) loadNavGrid();
+  if (!wb) return { x: 0, z: 0 };
   return {
     x: wb.minX + ((cx + 0.5) / res) * (wb.maxX - wb.minX),
     z: wb.maxZ - ((cz + 0.5) / res) * (wb.maxZ - wb.minZ),

@@ -50,6 +50,15 @@ interface ShipRow {
         </button>
       </div>
 
+      <!-- Rename: re-christen the current hull. The shipwright's signwriter carves a fresh nameboard. -->
+      <div class="sw-repair">
+        <div class="sw-repair-info">
+          <span class="sw-repair-title">Ship's name</span>
+          <span class="sw-repair-sub">She answers to <em>{{ mp.myShipName() }}</em>.</span>
+        </div>
+        <button class="sw-buy sw-repair-btn" (click)="mp.openShipNameModal('rename')">Rename</button>
+      </div>
+
       <div class="sw-list">
         @for (s of ships(); track s.slug) {
           <div class="sw-card" [class.sw-card--owned]="owned(s.slug)">

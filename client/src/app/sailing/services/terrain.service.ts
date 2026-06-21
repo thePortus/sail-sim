@@ -1776,8 +1776,11 @@ export class TerrainService {
     material.bumpTexture = neutralNormal;
     this.terrainTextures.push(neutralNormal);
 
-    // Still load the real map so it exists on disk and the 404 warning stays quiet
-    loadTerrainTex('terrain/normal-map', 'normal_map.png');
+    // NOTE: the real macro normal_map.png (≈54 MB on disk, ~64 MB decoded in VRAM) is DELIBERATELY NOT loaded.
+    // bumpTexture is the 2×2 neutral above (the real map has sun-stripe artifacts until it's regenerated from the
+    // beach-graded heightfield). Previously we still `new Texture(...)`'d it "so the 404 stays quiet" — but that
+    // UPLOADS the whole thing to the GPU for nothing (a big chunk of the descriptor/VRAM pressure behind the
+    // live OOM). To re-enable once the map is regenerated: load it here AND assign `material.bumpTexture = tex`.
 
     // AO map — multiplies final lighting so valleys / depressions look darker.
     const aoTex = loadTerrainTex('terrain/ao-map', 'ao_map.png');

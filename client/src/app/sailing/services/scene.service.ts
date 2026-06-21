@@ -673,21 +673,22 @@ export class SceneService {
     // fetched by `npm run download:sky-textures`). JPG has no alpha, so getAlphaFromRGB derives opacity
     // from luminance → the black sky stays transparent (the procedural night-sky shows through) and only
     // stars/Milky Way draw. Falls back to the procedural starfield if the server texture is missing.
-    const tex = new Texture(
-      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
-      null,
-      () => {
-        console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
-        const fb = this.buildStarTexture();
-        mat.emissiveTexture = fb;
-        mat.opacityTexture  = fb;
-      },
-    );
-    tex.getAlphaFromRGB = true;
-
     mat.disableLighting = true;
-    mat.emissiveTexture = tex;
-    mat.opacityTexture  = tex;            // alpha from the texture → black sky stays clear
+    // Star map, preferring the GPU-compressed KTX2 (the 4096² JPG decodes to ~33 MB RGBA in VRAM; the .ktx2
+    // transcodes to BC7/ASTC at ~8 MB → ~25 MB saved, a real OOM lever). Graceful fallback chain so a deploy
+    // missing the encoded file (assets/ is gitignored + asset-prep generated) still shows stars:
+    //   stars.ktx2  →  stars.jpg  →  procedural starfield.
+    const applyStars = (t: Texture) => { t.getAlphaFromRGB = true; mat.emissiveTexture = t; mat.opacityTexture = t; };
+    const proceduralStars = () => {
+      console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures` (+ encode-ktx2.mjs). Using procedural fallback.');
+      const fb = this.buildStarTexture();
+      mat.emissiveTexture = fb; mat.opacityTexture = fb;
+    };
+    const loadStarsJpg = () => applyStars(new Texture(
+      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE, null, proceduralStars));
+    // KTX2 first — the `.ktx2` extension selects Babylon's transcoding loader; on a miss, fall back to the JPG.
+    applyStars(new Texture(
+      `${Settings.apiUrl}sky/stars.ktx2`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE, null, loadStarsJpg));
     mat.diffuseColor    = Color3.Black();
     mat.specularColor   = Color3.Black();
     mat.backFaceCulling = false;          // viewed from inside the dome

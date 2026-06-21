@@ -416,6 +416,10 @@ export class BrigController implements VesselController {
 
   dispose(): void {
     for (const g of this.clips.values()) { g.stop(); g.dispose(); }
+    // Free the per-vessel cloned skeleton + morph managers (GPU-texture-backed on WebGPU) — disposing the
+    // meshes alone leaks them as NPCs churn through interest range. See RiggedVesselController.dispose.
+    for (const m of this.morphs.values()) { m.dispose(); }
+    this.skeleton?.dispose();
     this.clips.clear(); this.morphs.clear(); this.morphIndex.clear();
     this.nodes.clear(); this.restQ.clear();
     this.furlCur.clear(); this.furlTarget.clear(); this.pairBySail.clear();

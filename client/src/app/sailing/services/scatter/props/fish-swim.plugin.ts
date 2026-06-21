@@ -58,16 +58,17 @@ export class FishSwimPlugin extends MaterialPluginBase {
     #endif
   `;
 
+  // NOTE: the WGSL path does NOT read instanceColor.a (see DolphinSwimPlugin for the full rationale): fish render
+  // into the ocean refraction RTT / depth prepass, where WebGPU sets INSTANCESCOLOR without declaring the
+  // `instanceColor` vertex input → a WGSL compile failure that cascades into invalid pipelines. fEnergy defaults
+  // to 1.0 so the school still swims on WebGPU; only the per-fish effort variance is dropped there (kept on WebGL).
   private static readonly WGSL = `
     #ifdef FISH_SWIM
       let fSway = 1.0 - smoothstep(-0.45, 0.25, positionUpdated.x);
       var fPh = 0.0;
-      var fEnergy = 1.0;
+      let fEnergy = 1.0;
       #ifdef INSTANCES
         fPh = (vertexInputs.world3.x + vertexInputs.world3.z) * 0.7;
-      #endif
-      #ifdef INSTANCESCOLOR
-        fEnergy = clamp(vertexInputs.instanceColor.a, 0.0, 1.0);
       #endif
       let fW = uniforms.fishSwim.z * uniforms.fishSwim.w * (0.8 + 0.5 * fEnergy) - positionUpdated.x * uniforms.fishSwim.y + fPh;
       positionUpdated.z += sin(fW) * fSway * uniforms.fishSwim.x * (0.5 + 0.7 * fEnergy);

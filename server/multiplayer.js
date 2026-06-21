@@ -420,6 +420,7 @@ async function saveEconomyState(p) {
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
         ship: p.ship || 'pinnace',
+        shipName: p.shipName || 'Saltmeadow',
         ...(p.questState ? { questState: quest.serializeState(p.questState) } : {}),   // quest progress (if loaded)
       },
       { where: { id: p.auth.userId } },
@@ -427,6 +428,15 @@ async function saveEconomyState(p) {
   } catch (err) {
     console.warn('[WS] saveEconomyState failed:', err.message);
   }
+}
+
+/** Clean a player-supplied ship name: strip control chars, collapse whitespace, trim, cap length. Returns '' for
+ *  anything empty/garbage (caller falls back to the default). Names need not be unique. */
+function sanitizeShipName(raw) {
+  if (typeof raw !== 'string') return '';
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
+  return cleaned.slice(0, 28);
 }
 
 /** Safe-parse the persisted combatState TEXT column → object or null. */
@@ -454,7 +464,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'crew', 'questState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -463,6 +473,10 @@ async function loadAndSendWallet(id, p, players) {
     // can't sail a hull it doesn't own. capacity/physics derive from it too.
     p.ship = (u.ship && getVesselDef(u.ship)) ? u.ship : 'pinnace';
     if (p.state) p.state.vesselSlug = p.ship;
+    // Custom ship name — server-authoritative (the 'update' handler forces the broadcast vesselName to this, so a
+    // client can't spoof it), shown to others as a label subtitle + a 3D stern nameboard. Default 'Saltmeadow'.
+    p.shipName = sanitizeShipName(u.shipName) || 'Saltmeadow';
+    if (p.state) p.state.vesselName = p.shipName;
 
     // Crew resource — clamp the saved count to the owned vessel's complement (NULL → full). crewWound is the
     // in-memory fractional-casualty accumulator (grapeshot), never persisted (a partial wound heals on relog).
@@ -528,6 +542,7 @@ function sendWallet(p) {
       catalog: economy.goodsCatalog(),
       factionRep: p.factionRep || factions.defaultRep(),
       ship: p.ship || 'pinnace',
+      shipName: p.shipName || 'Saltmeadow',   // the player's own custom ship name (for their HUD + 3D nameboard)
     }));
   }
 }
@@ -567,6 +582,11 @@ function applyQuestEvent(p, eventType, data, players) {
   // is ALREADY docked there (e.g. sold at portB, and the combat tavern is also portB), the dock-change detector
   // would never re-fire. Clear the tracked dock so the next update re-detects the current berth as an arrival.
   if (r.completed && r.completed.length) { p._questDockTown = undefined; }
+  // Finishing the intro arc (the combat quest is the last one) → invite the new captain to name their ship. The
+  // client pops a rename modal (prefilled with the current name); they can keep 'Saltmeadow' or christen anew.
+  if (r.completed && r.completed.includes('intro_combat') && p.ws.readyState === 1) {
+    p.ws.send(JSON.stringify({ type: 'rename_prompt', shipName: p.shipName || 'Saltmeadow' }));
+  }
   sendQuest(p);
   ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
 }
@@ -1123,7 +1143,9 @@ function attachMultiplayer(server) {
           anchored:   !!msg.anchored,
           anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
-          vesselName: String(msg.vesselName ?? '').slice(0, 64),
+          // Ship-name authority: the broadcast vesselName is the server's stored custom name (set via
+          // set_ship_name + persisted), NOT the client's claim — so a client can't spoof another's nameplate.
+          vesselName: players.get(id)?.shipName || 'Saltmeadow',
           // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
           // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
           // bought. capacity + movement physics then derive from the real hull.
@@ -1508,6 +1530,20 @@ function attachMultiplayer(server) {
               });
             }
           }
+        }
+
+      } else if (msg.type === 'set_ship_name') {
+        // Name / rename the player's ship. Server-authoritative + persisted; the new name rides the next pose
+        // broadcast (vesselName is forced from p.shipName), so everyone's label + 3D nameboard updates. A pose
+        // is pushed immediately so it doesn't wait for the player's ~100 ms update tick.
+        const me = players.get(id);
+        if (me) {
+          const name = sanitizeShipName(msg.shipName) || 'Saltmeadow';
+          me.shipName = name;
+          if (me.state) me.state.vesselName = name;
+          saveEconomyState(me);
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
+          if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
         }
 
       } else if (msg.type === 'trade_open') {

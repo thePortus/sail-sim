@@ -1039,6 +1039,9 @@ export class CannonService {
       // One arc per cannon: each gun launches from its own muzzle, sharing the side's launch solution, so the
       // arcs run parallel on free aim and converge onto the lock — a sheaf that reads as the whole broadside.
       for (let i = 0; i < muzzles.length; i++) {
+        // Per-cannon: only show this gun's arc if THAT gun is actually loaded (reloading guns have no arc).
+        const loaded = i < this.gunsPerSide && this.elapsed >= this.gun[side].loadAt[i];
+        if (!loaded) { if (tubes[i]) tubes[i].setEnabled(false); continue; }
         const path = this.buildArcPath(side, sol, muzzles[i]);
         const prev = tubes[i];
         if (prev) {

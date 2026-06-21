@@ -9,6 +9,11 @@ import {
   SceneInstrumentation, EngineInstrumentation,
   VolumetricLightScatteringPostProcess,
 } from '@babylonjs/core';
+// Register the STANDALONE .ktx/.ktx2 texture loader. Without this, `new Texture('foo.ktx2')` fails (the
+// glTF loader only wires KTX2 for GLB-embedded textures) — which is why the scatter rock/driftwood .ktx2
+// showed the magenta error-checkerboard and sky/stars.ktx2 silently fell back to the JPG. The KTX2 transcoder
+// is already reachable (GLB palms/beeches use it); this just hooks it up for direct Texture() loads too.
+import '@babylonjs/core/Materials/Textures/Loaders/ktxTextureLoader';
 import { SkyMaterial, CustomMaterial } from '@babylonjs/materials';
 import { Settings } from '../../app.settings';
 import { Weather } from '../models';

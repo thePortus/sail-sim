@@ -46,6 +46,13 @@ const TILES = [
   { biome: 'rock',   polyId: 'rock_face',         note: '~6 m tile'  },
   { biome: 'rock2',  polyId: 'rock_face_03',      note: '~7 m tile'  },
   { biome: 'snow',   polyId: 'snow_02',           note: '~15 m tile' },
+  // REGIONAL variants (scatter realism) — different beaches/areas use different sand/grass/rock, blended at
+  // edges. diffOnly: they reuse the core biome's roughness/AO, so only the diffuse map is needed.
+  { biome: 'sand3',  polyId: 'aerial_beach_01',     note: 'beach variant',  diffOnly: true },
+  { biome: 'sand4',  polyId: 'aerial_beach_02',     note: 'beach variant',  diffOnly: true },
+  { biome: 'grass3', polyId: 'coast_sand_rocks_02', note: 'coastal scrub',  diffOnly: true },
+  { biome: 'rock3',  polyId: 'rocks_ground_06',     note: 'rocky ground',   diffOnly: true },
+  { biome: 'rock4',  polyId: 'lichen_rock',         note: 'lichen cliff',   diffOnly: true },
 ];
 
 // Full PBR channel set. diff + nor are required; rough + ao are OPTIONAL (a few Polyhaven assets lack
@@ -117,6 +124,7 @@ async function main() {
   let missing = 0;
   for (const tile of TILES) {
     for (const map of MAPS) {
+      if (tile.diffOnly && map.suffix !== 'diff') { continue; }   // regional variants: diffuse only
       const filename = `${tile.biome}_${map.outSuffix}.jpg`;
       const dest     = path.join(OUTPUT_DIR, filename);
       const url      = `${CDN_BASE}/${tile.polyId}/${tile.polyId}_${map.suffix}_${RES}.jpg`;

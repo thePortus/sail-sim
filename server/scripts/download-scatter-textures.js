@@ -58,15 +58,24 @@ const SETS = [
     rough:  'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/palm_tree_bark/palm_tree_bark_rough_2k.png',
   }},
 
-  // ── P3 ROCKS (runtime — external PBR, replaces rock_albedo.png / rock_normal.png) ──
-  // { name: 'rock', role: 'runtime', maps: {
-  //   albedo: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_06/rock_06_diff_2k.png',
-  //   normal: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_06/rock_06_nor_gl_2k.png',
-  //   rough:  'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_06/rock_06_rough_2k.png',
-  // }},
+  // ── P3 ROCKS (runtime — external PBR, 3 Poly Haven variations served from cc0/) ──
+  { name: 'rock_05', role: 'runtime', maps: {
+    albedo: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_05/rock_05_diff_2k.png',
+    normal: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_05/rock_05_nor_gl_2k.png',
+    rough:  'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_05/rock_05_rough_2k.png',
+  }},
+  { name: 'rock_04', role: 'runtime', maps: {
+    albedo: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_04/rock_04_diff_2k.png',
+    normal: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_04/rock_04_nor_gl_2k.png',
+    rough:  'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_04/rock_04_rough_2k.png',
+  }},
+  { name: 'rock_cracked', role: 'runtime', maps: {
+    albedo: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_boulder_cracked/rock_boulder_cracked_diff_2k.png',
+    normal: 'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_boulder_cracked/rock_boulder_cracked_nor_gl_2k.png',
+    rough:  'https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/rock_boulder_cracked/rock_boulder_cracked_rough_2k.png',
+  }},
   //
-  // ── P4 DRIFTWOOD (runtime) ──
-  // { name: 'drift', role: 'runtime', maps: { albedo: '…', normal: '…', rough: '…' }},
+  // ── P4 DRIFTWOOD: reuses the palm + beech bark (already in scatter-src) — no separate download. ──
   //
   // ── P2 BEECH ──────────────────────────────────────────────────────────────
   // Bark: Poly Haven "sakura_bark" (CC0, grey). Baked into the committed beech GLB → role:'source'.

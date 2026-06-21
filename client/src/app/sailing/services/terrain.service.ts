@@ -103,7 +103,7 @@ export class TerrainService {
   // S1b: biome PBR texture arrays (5 layers: 0 sand,1 grass,2 gravel,3 rock,4 snow). One sampler each
   // (vs 5 per map) → fixes the 16-sampler cap. albedo = RGB diffuse; orm = R roughness, G ambient-occl.
   private biomeAlbedoArr: BaseTexture | null = null;   // KTX2 array Texture (compressed) OR RawTexture2DArray (fallback)
-  private biomeOrmArr: RawTexture2DArray | null = null;
+  private biomeOrmArr: BaseTexture | null = null;   // KTX2 array Texture (compressed) OR RawTexture2DArray (fallback)
   private biomePlaceholderArr: RawTexture2DArray | null = null;
   private splatTex: Texture | null = null;   // S2 control/splat map (RGBA soft biome weights, world-aligned)
   private auxTex: Texture | null = null;     // S4 aux map (R slope, G shoreDist, B wetness, A flow), world-aligned
@@ -2449,18 +2449,26 @@ export class TerrainService {
         }
       }
     }
-    // ORM: 5 core layers only (R = roughness, G = AO).
-    const orm = new Uint8Array(ORMN * SIZE * SIZE * 4);
-    for (let L = 0; L < ORMN; L++) {
-      const b = TerrainService.BIOME_TILES[L];
-      const [rImg, aImg] = await Promise.all([loadImg(`${b}_rough`), loadImg(`${b}_ao`)]);
-      const r = pixels(rImg), a = pixels(aImg);
-      const off = L * SIZE * SIZE * 4;
-      for (let i = 0; i < SIZE * SIZE; i++) {
-        const j = off + i * 4, k = i * 4;
-        orm[j] = r ? r[k] : 230;            // R = roughness (default fairly matte)
-        orm[j + 1] = a ? a[k] : 255;        // G = ambient occlusion (default none)
-        orm[j + 2] = 0; orm[j + 3] = 255;
+    // ORM array (R = roughness, G = AO): prefer the GPU-compressed KTX2 array, else build the uncompressed
+    // RawTexture2DArray from the rough+ao tiles. Same verified-bind fallback as the albedo array.
+    let ormArr: BaseTexture | null = null;
+    if ((localStorage.getItem('ignis_terrain_ktx2') ?? '1') !== '0') {
+      ormArr = await this.loadKtx2Array(scene, `${Settings.apiUrl}geometry/terrain/biome_orm.ktx2`, ORMN);
+    }
+    let orm: Uint8Array | null = null;
+    if (!ormArr) {
+      orm = new Uint8Array(ORMN * SIZE * SIZE * 4);
+      for (let L = 0; L < ORMN; L++) {
+        const b = TerrainService.BIOME_TILES[L];
+        const [rImg, aImg] = await Promise.all([loadImg(`${b}_rough`), loadImg(`${b}_ao`)]);
+        const r = pixels(rImg), a = pixels(aImg);
+        const off = L * SIZE * SIZE * 4;
+        for (let i = 0; i < SIZE * SIZE; i++) {
+          const j = off + i * 4, k = i * 4;
+          orm[j] = r ? r[k] : 230;            // R = roughness (default fairly matte)
+          orm[j + 1] = a ? a[k] : 255;        // G = ambient occlusion (default none)
+          orm[j + 2] = 0; orm[j + 3] = 255;
+        }
       }
     }
     const mk = (data: Uint8Array, depth: number): RawTexture2DArray => {
@@ -2470,7 +2478,7 @@ export class TerrainService {
       return t;
     };
     this.biomeAlbedoArr = albArr ?? mk(albedo as Uint8Array, albN);   // KTX2 array if it bound, else uncompressed
-    this.biomeOrmArr = mk(orm, ORMN);
+    this.biomeOrmArr = ormArr ?? mk(orm as Uint8Array, ORMN);
   }
 
   /**

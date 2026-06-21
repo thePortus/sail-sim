@@ -129,7 +129,10 @@ const VALID_ORIGIN_RADIUS = 16.0;   // muzzle must be within this of the shooter
 const VALID_V_MIN = 45.0;           // |muzzle velocity| plausible band (fixed cannon ~= 55)
 const VALID_V_MAX = 66.0;
 const RATE_WINDOW_MS   = 7000;      // sliding window for the fire-rate cap
-const RATE_MAX_SHOTS   = 7;         // <= 2 full 3-ball broadsides + slack per window
+// Anti-spam ceiling sized to the LARGEST legit battery firing at its natural cadence: a brig is 4 guns/side (8
+// total), and with per-gun reloads + partial broadsides both sides can come online more than once in a ~7 s
+// window. 18 leaves slack above that while still blocking a hacked client's machine-gun fire (90 ms min-gap holds).
+const RATE_MAX_SHOTS   = 18;
 const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
 
 // ── Shot types (ammunition) ─────────────────────────────────────────────────────

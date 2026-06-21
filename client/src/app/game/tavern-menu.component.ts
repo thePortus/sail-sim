@@ -64,6 +64,7 @@ import { CombatService } from '../sailing/services/combat.service';
               <span>Vessel: <b>{{ vesselName(rep.slug) }}</b></span>
               <span>Sunk: <b>{{ rep.kills }}</b></span>
               <span>Bounty: <b class="tv-bounty">{{ rep.bounty }}g</b></span>
+              @if (rep.plunder > 0) { <span>Plunder: <b class="tv-bounty">{{ rep.plunder }}g</b></span> }
             </div>
             <div class="tv-pirate-mark">Marked in red on your map.</div>
           </div>

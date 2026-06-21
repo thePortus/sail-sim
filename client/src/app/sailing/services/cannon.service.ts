@@ -32,11 +32,16 @@ const MUZZLE_V_GRAPE = 26;               // grapeshot: ~22% range (shortest) —
 const GRAPE_PELLETS    = 5;               // pellets thrown per gun
 const GRAPE_SPREAD_RAD = 7 * Math.PI / 180;   // azimuth cone half-angle (fan width)
 const GRAPE_ELEV_RAD   = 4 * Math.PI / 180;   // elevation jitter half-angle (vertical scatter)
-// Gap between the 3 cannons of a broadside — randomized per shot so the volley reads
-// as a human gun crew firing in sequence, not a single mechanical burst.
+// Gap between guns of a broadside — randomized per shot so the volley reads as a human gun crew firing in
+// sequence, not a single mechanical burst. A press fires every LOADED gun on the side in this rippled order.
 const STAGGER_MIN = 0.18;
 const STAGGER_MAX = 0.42;
-const FIRE_HOLD  = 0.45;                 // dwell after last shot before stowing (let recoil settle)
+// Per-cannon reload realism: each gun reloads INDEPENDENTLY, with its own cadence. `factor` is a fixed per-gun
+// multiplier (one gun crew is a touch quicker than the next); `jitter` adds small shot-to-shot variation. So a
+// broadside's guns come back online at slightly different times → you can loose partial broadsides as they're
+// ready instead of waiting for the whole battery.
+const RELOAD_VAR    = 0.16;              // ± fixed per-gun reload spread (assigned once per gun)
+const RELOAD_JITTER = 0.07;              // ± extra random spread each reload
 const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s) — a touch longer
 
 // Aiming-aid trajectory tube. Fixed sample count so the tube can be updated in place
@@ -85,15 +90,21 @@ interface Ball {
   hitAt?: number;                          // flight-time (s) at which to play pendingHit (server tof)
 }
 
-/** Per-side gunnery cycle. */
+/** HUD-facing gunnery state (published per side). 'ready' = engaged with ≥1 gun loaded, 'reloading' = engaged
+ *  but every gun is still reloading. 'firing' is unused now (the ripple is driven per-gun). */
 type GunState = 'stowed' | 'arming' | 'ready' | 'firing' | 'reloading';
 
+/** Internal per-side run-out state. The battery is run out ONCE (arm), then fires at will (every press looses the
+ *  guns currently loaded) until stand-down — no per-broadside re-arm. */
+type SideState = 'stowed' | 'arming' | 'engaged';
+
 interface SideGun {
-  state:      GunState;
-  shotsFired: number;   // 0..3 within the current broadside
-  shotTimer:  number;   // stagger accumulator within firing
-  nextShotAt: number;   // shotTimer threshold at which the next cannon fires (randomized)
-  timer:      number;   // dwell (firing) / countdown (reloading)
+  state:     SideState;
+  // Per-gun reload bookkeeping (length = gunsPerSide). A gun is LOADED when `elapsed >= loadAt[i]`.
+  loadAt:    number[];   // elapsed time at which gun i finishes reloading (0 = loaded since arm)
+  loadStart: number[];   // elapsed time gun i's current reload began (for the HUD readiness bar)
+  fireAt:    number[];   // elapsed time a queued shot for gun i fires (Infinity = nothing queued)
+  factor:    number[];   // fixed per-gun reload-time multiplier (each gun its own cadence)
 }
 
 /** One self-contained remote muzzle rig: a flash light + flame/smoke/linger plumes, pooled and
@@ -128,6 +139,10 @@ export class CannonService {
   readonly stbdGunState  = signal<GunState>('stowed');
   readonly portReloadFrac = signal(0);   // 0..1 reload progress
   readonly stbdReloadFrac = signal(0);
+  // How many guns are LOADED on each side, and the side's total — drives a small "ready cannons" pip readout.
+  readonly portLoaded = signal(0);
+  readonly stbdLoaded = signal(0);
+  readonly gunCount   = signal(DEFAULT_MUZZLES.port.length);
 
   // ── Gun elevation / targeting ───────────────────────────────────────────────
   // Elevation is the launch angle (deg). Flat (low) keeps the ball in the hull band
@@ -218,8 +233,8 @@ export class CannonService {
 
   // Per-side gunnery state machines.
   private readonly gun: Record<'port' | 'stbd', SideGun> = {
-    port: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
-    stbd: { state: 'stowed', shotsFired: 0, shotTimer: 0, nextShotAt: 0, timer: 0 },
+    port: { state: 'stowed', loadAt: [], loadStart: [], fireAt: [], factor: [] },
+    stbd: { state: 'stowed', loadAt: [], loadStart: [], fireAt: [], factor: [] },
   };
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
   private keyUpHandler: ((e: KeyboardEvent) => void) | null = null;
@@ -876,86 +891,126 @@ export class CannonService {
     const c = this.vesselService.getCannons();
     this.muzzles = (c && c.port.length && c.stbd.length) ? c : DEFAULT_MUZZLES;
     this.gunsPerSide = Math.max(1, this.muzzles.port.length);
+    this.zone.run(() => this.gunCount.set(this.gunsPerSide));
   }
 
-  /** Z / port button, C / stbd button. ARM if stowed; FIRE if ready; else ignore. */
+  /** Size + seed a side's per-gun reload arrays for the current battery. Each gun gets a FIXED reload-time
+   *  factor (its own cadence) and starts LOADED (run out + charged). */
+  private armGunArrays(side: 'port' | 'stbd'): void {
+    const g = this.gun[side], n = this.gunsPerSide;
+    g.loadAt = new Array(n).fill(0);        // 0 ≤ elapsed → loaded
+    g.loadStart = new Array(n).fill(0);
+    g.fireAt = new Array(n).fill(Infinity);
+    g.factor = Array.from({ length: n }, () => 1 + (Math.random() * 2 - 1) * RELOAD_VAR);
+  }
+
+  /** Z / port button, C / stbd button. ARM (run out) if stowed; otherwise FIRE every gun currently loaded. */
   armOrFire(side: 'port' | 'stbd'): void {
     const g = this.gun[side];
     if (g.state === 'stowed') {
       this.syncGuns();
+      this.armGunArrays(side);
       g.state = 'arming';
       this.vesselService.setGunDeploy(side, 1);
       this.multiplayerService.broadcastGunState(side, 1);
       this.publishState(side);
-    } else if (g.state === 'ready') {
-      g.state = 'firing';
-      g.shotsFired = 0; g.shotTimer = 0; g.nextShotAt = 0; g.timer = 0;
-      this.publishState(side);
+    } else if (g.state === 'engaged') {
+      this.fireLoaded(side);
     }
   }
 
-  /** Esc / stand-down: cancel an arming/ready side back to stowed (no fire). */
+  /** Queue every LOADED, not-already-firing gun on this side to fire, rippled by a human stagger (so a full
+   *  battery still rolls down the side). Guns mid-reload simply don't fire → a partial broadside. */
+  private fireLoaded(side: 'port' | 'stbd'): void {
+    const g = this.gun[side];
+    let order = 0;
+    for (let i = 0; i < this.gunsPerSide; i++) {
+      if (this.elapsed >= g.loadAt[i] && g.fireAt[i] === Infinity) {   // loaded + no shot already queued
+        g.fireAt[i] = this.elapsed + order * (STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN));
+        order++;
+      }
+    }
+  }
+
+  /** Esc / stand-down: stow an arming/engaged side back to closed ports (no fire). */
   cancel(side?: 'port' | 'stbd'): void {
     const sides: ('port' | 'stbd')[] = side ? [side] : ['port', 'stbd'];
     for (const s of sides) {
       const g = this.gun[s];
-      if (g.state === 'arming' || g.state === 'ready') {
+      if (g.state === 'arming' || g.state === 'engaged') {
         g.state = 'stowed';
         this.vesselService.setGunDeploy(s, 0);
         this.multiplayerService.broadcastGunState(s, 0);
+        this.zone.run(() => {
+          (s === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(0);
+          (s === 'port' ? this.portLoaded : this.stbdLoaded).set(0);
+        });
         this.publishState(s);
       }
     }
   }
 
-  /** True if any side is mid-arm/ready (so Esc should stand down rather than pause). */
+  /** True if any side is run out (arming/engaged) so Esc should stand down rather than pause. */
   anyCancellable(): boolean {
-    return this.gun.port.state === 'arming' || this.gun.port.state === 'ready'
-        || this.gun.stbd.state === 'arming' || this.gun.stbd.state === 'ready';
+    return this.gun.port.state === 'arming' || this.gun.port.state === 'engaged'
+        || this.gun.stbd.state === 'arming' || this.gun.stbd.state === 'engaged';
   }
 
+  /** Map the internal run-out state + per-gun load to the HUD GunState. */
   private publishState(side: 'port' | 'stbd'): void {
-    const st = this.gun[side].state;
+    const g = this.gun[side];
+    let st: GunState;
+    if (g.state === 'arming') st = 'arming';
+    else if (g.state !== 'engaged') st = 'stowed';
+    else st = this.loadedCount(side) > 0 ? 'ready' : 'reloading';   // ≥1 loaded → can fire; else still reloading
     this.zone.run(() => (side === 'port' ? this.portGunState : this.stbdGunState).set(st));
   }
 
-  /** Advance one side's gunnery state machine each frame. */
-  private tickGun(side: 'port' | 'stbd', dt: number): void {
+  /** How many of a side's guns are currently loaded. */
+  private loadedCount(side: 'port' | 'stbd'): number {
+    const g = this.gun[side];
+    let n = 0;
+    for (let i = 0; i < this.gunsPerSide; i++) if (this.elapsed >= g.loadAt[i]) n++;
+    return n;
+  }
+
+  /** Advance one side's gunnery each frame: run-out, queued fires, and per-gun reloads. */
+  private tickGun(side: 'port' | 'stbd', _dt: number): void {
     const g = this.gun[side];
     if (g.state === 'arming') {
-      if (this.vesselService.isGunReady(side)) { g.state = 'ready'; this.publishState(side); }
+      if (this.vesselService.isGunReady(side)) { g.state = 'engaged'; this.publishState(side); }
+      return;
+    }
+    if (g.state !== 'engaged') return;
 
-    } else if (g.state === 'firing') {
-      g.shotTimer += dt;
-      // Fire this side's cannons in sequence with a randomized human gap; one full
-      // hull-roll impulse per shot.
-      while (g.shotsFired < this.gunsPerSide && g.shotTimer >= g.nextShotAt) {
-        this.vesselService.addCannonRecoil(side);   // hull shudder per shot
-        this.fireOneCannon(side, g.shotsFired);
+    const prevLoaded = this.loadedCount(side);
+    // Fire any guns whose queued shot time has arrived; each then begins its own reload.
+    for (let i = 0; i < this.gunsPerSide; i++) {
+      if (g.fireAt[i] !== Infinity && this.elapsed >= g.fireAt[i]) {
+        g.fireAt[i] = Infinity;
+        this.vesselService.addCannonRecoil(side);   // hull shudder
+        this.fireOneCannon(side, i);
         this.vesselService.addGunRecoilKick(side);
-        g.shotsFired++;
-        g.nextShotAt += STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN);
-      }
-      if (g.shotsFired >= this.gunsPerSide) {
-        g.timer += dt;
-        if (g.timer >= FIRE_HOLD) {
-          g.state = 'reloading'; g.timer = 0;
-          this.vesselService.setGunDeploy(side, 0);   // stow gun + close ports
-          this.multiplayerService.broadcastGunState(side, 0);
-          this.publishState(side);
-        }
-      }
-
-    } else if (g.state === 'reloading') {
-      g.timer += dt;
-      const frac = Math.min(1, g.timer / this.vesselService.getReloadWindow());
-      this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(frac));
-      if (frac >= 1 && this.vesselService.isGunSettled(side)) {
-        g.state = 'stowed';
-        this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(0));
-        this.publishState(side);
+        this.vesselService.crewGunWork(side);        // gun crew works the piece (crew P3)
+        const dur = this.vesselService.getReloadWindow() * g.factor[i] * (1 + (Math.random() * 2 - 1) * RELOAD_JITTER);
+        g.loadStart[i] = this.elapsed;
+        g.loadAt[i] = this.elapsed + Math.max(0.3, dur);
       }
     }
+
+    // HUD readiness bar = mean per-gun load progress (smooth; full = whole battery loaded).
+    let progSum = 0;
+    for (let i = 0; i < this.gunsPerSide; i++) {
+      const span = g.loadAt[i] - g.loadStart[i];
+      progSum += span <= 0 ? 1 : Math.min(1, Math.max(0, (this.elapsed - g.loadStart[i]) / span));
+    }
+    this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(progSum / this.gunsPerSide));
+
+    // Surface the loaded count (for the pip readout); re-publish the FIRE!/Reloading… label on the 0↔≥1 boundary.
+    const nowLoaded = this.loadedCount(side);
+    const loadSig = side === 'port' ? this.portLoaded : this.stbdLoaded;
+    if (loadSig() !== nowLoaded) this.zone.run(() => loadSig.set(nowLoaded));
+    if ((prevLoaded > 0) !== (nowLoaded > 0)) this.publishState(side);
   }
 
   // ── Aiming aid (predicted trajectory) ───────────────────────────────────────
@@ -966,7 +1021,7 @@ export class CannonService {
     let lock: { id: string; x: number; z: number } | null = null;   // for the HUD reticle (locked ship)
     for (const side of ['port', 'stbd'] as const) {
       const tubes = this.aimTubes[side];
-      const ready = this.gun[side].state === 'ready';
+      const ready = this.gun[side].state === 'engaged';   // show the aim tubes whenever the battery is run out
       if (!ready) { for (const t of tubes) t.setEnabled(false); continue; }
 
       // Solve the lock ONCE (round/bar) — reused for every gun's arc shape, its colour, and the reticle.

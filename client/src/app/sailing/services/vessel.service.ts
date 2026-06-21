@@ -242,6 +242,10 @@ export class VesselService {
   addGunRecoilKick(side: 'port' | 'stbd', kick = 0.7): void {
     this.controller?.addGunRecoil(this.gunSide(side), kick);
   }
+  /** A gun on `side` just fired → the deck crew at that side's gun stations work harder for a beat (crew P3). */
+  crewGunWork(side: 'port' | 'stbd'): void {
+    this.crewHandle?.emphasizeGun(side);
+  }
   /** True once a side has finished running out (safe to fire). */
   isGunReady(side: 'port' | 'stbd'): boolean {
     return this.controller?.isGunReady(this.gunSide(side)) ?? false;

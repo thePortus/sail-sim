@@ -173,7 +173,7 @@ export class MultiplayerService {
   // Tavern "ask about pirate activity": the marked pirate id (a SEPARATE mark from the merchant rumour, so they
   // don't clobber each other), the report (name/rig/kills/bounty) the tavern panel shows, and the last error.
   markedPirateId   = signal<string | null>(null);
-  pirateReport     = signal<{ name: string; slug: string; kills: number; bounty: number } | null>(null);
+  pirateReport     = signal<{ name: string; slug: string; kills: number; bounty: number; plunder: number } | null>(null);
   pirateReportError = signal<string | null>(null);
   // Ship naming: the player's own custom ship name (from the server), and a request to open the rename modal
   // (set on tutorial completion, on buying a ship, or from the Shipwright's Rename button; null = closed).
@@ -183,6 +183,8 @@ export class MultiplayerService {
   myFlagColor      = signal<string>('#b22222');
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
+  // Set when a sunk pirate's head-bounty is paid instantly — the game overlay flashes a transient toast.
+  bountyToast = signal<{ gold: number; name: string; nations: string } | null>(null);
   // ── Quests (intro tutorial + future storyline) ──────────────────────────────
   // The active quest's current stage + objectives (server-authoritative). null = no active quest.
   quest          = signal<QuestUpdate | null>(null);
@@ -785,7 +787,7 @@ export class MultiplayerService {
         this.markedPirateId.set(String(msg.shipId));
         this.pirateReport.set({
           name: String(msg.name ?? 'an unknown rogue'), slug: String(msg.slug ?? ''),
-          kills: +msg.kills || 0, bounty: +msg.bounty || 0,
+          kills: +msg.kills || 0, bounty: +msg.bounty || 0, plunder: +msg.plunder || 0,
         });
         this.pirateReportError.set(null);
       } else {
@@ -867,6 +869,10 @@ export class MultiplayerService {
     } else if (msg.type === 'salvage_collected') {
       // The wallet update arrives separately; surface a transient toast of what we scooped.
       this.salvageToast.set({ goods: (msg.goods && typeof msg.goods === 'object') ? msg.goods : {}, gold: +msg.gold || 0 });
+
+    } else if (msg.type === 'bounty_collected') {
+      // A sunk pirate's head-bounty was paid straight to the purse (wallet arrives separately) — flash a toast.
+      this.bountyToast.set({ gold: +msg.gold || 0, name: String(msg.name ?? 'pirate'), nations: String(msg.nations ?? '') });
 
     } else if (msg.type === 'diplomacy_state') {
       // Full inter-faction relations matrix (on connect + on any shift) → the Diplomacy panel.

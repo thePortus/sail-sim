@@ -36,7 +36,19 @@ const ZONE_HP_BY_SLUG = {
   // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
   brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
 };
-function zoneHpFor(slug) { return ZONE_HP_BY_SLUG[slug] || ZONE_HP_BY_SLUG.sloop; }
+// ── Shipwright ARMOR upgrade ──────────────────────────────────────────────────────────────────────────────
+// A once-per-hull armor upgrade adds +25% HP to the four HULL zones (masts excluded — they're rigging, not
+// plating). Tuned so an upgraded hull stays BELOW the next ship up (e.g. an armored sloop broadside 163 < brig
+// 200), so upgrading is a budget boost, not a way to leapfrog a tier. Returns a fresh per-zone HP map.
+const ARMOR_UPGRADE_MULT = 1.25;
+const ARMOR_ZONES = ['bow', 'stern', 'port', 'starboard'];   // hull plating (not masts)
+function zoneHpFor(slug, armorUpgrade) {
+  const base = ZONE_HP_BY_SLUG[slug] || ZONE_HP_BY_SLUG.sloop;
+  if (!armorUpgrade) return base;
+  const out = { ...base };
+  for (const z of ARMOR_ZONES) if (out[z] != null) out[z] = Math.round(out[z] * ARMOR_UPGRADE_MULT);
+  return out;
+}
 // Back-compat default (sloop) for any caller without a slug.
 const ZONE_HP = ZONE_HP_BY_SLUG.sloop;
 
@@ -61,7 +73,14 @@ const DMG_PERP_EXP = 1.3;
 // brig's ball hurts far more than a pinnace's — ON TOP of the brig carrying more guns AND more hull HP (armour).
 // Net: a brig wrecks a pinnace fast, while a pinnace peppering a brig barely dents it. Keyed by the SHOOTER slug.
 const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7 };
-function caliberFor(slug) { return CALIBER_BY_SLUG[slug] || 1.0; }
+// Shipwright CANNON upgrade (once per hull): heavier guns → more stopping power, but tuned to stay BELOW the
+// next ship up (armed pinnace 0.9 < sloop 1.0; armed sloop 1.3 < brig 1.7) so it never matches the next tier.
+// The brig (top tier) gets a flat ~+24% with no cap.
+const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1 };
+function caliberFor(slug, cannonUpgrade) {
+  if (cannonUpgrade) return CALIBER_UPGRADED_BY_SLUG[slug] || ((CALIBER_BY_SLUG[slug] || 1.0) * 1.2);
+  return CALIBER_BY_SLUG[slug] || 1.0;
+}
 
 // Waterline bonus: a shot striking at/near the waterline holes the ship below the
 // floodline and hurts far more. Hull y runs 0 (waterline) .. DECK_Y (deck). A hit at or
@@ -138,8 +157,8 @@ const GRAPE_RATE_MAX = 72;
 module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
-  ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL,
-  DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, caliberFor,
+  ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL, ARMOR_UPGRADE_MULT, ARMOR_ZONES,
+  DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, CALIBER_UPGRADED_BY_SLUG, caliberFor,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
   MAST_DAMAGE_ONSET, MAST_SLOW_FLOOR, mastSpeedMult,
   MAST_REPAIR_MS, MAST_REPAIR_FRAC,

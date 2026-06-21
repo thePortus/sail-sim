@@ -61,6 +61,11 @@ module.exports = (sequelize, DataTypes) => {
     // 'Saltmeadow' (the tutorial's starter trader). Not unique. Persists across maps (the player's, not the world's).
     shipName:     { type: DataTypes.STRING(64), allowNull: true, defaultValue: 'Saltmeadow' },
 
+    // Shipwright UPGRADES on the CURRENT hull (each buyable once): cannonUpgrade → heavier guns (more damage),
+    // armorUpgrade → +25% hull HP. Per-hull — reset to false when a new ship is bought. Persist across maps.
+    cannonUpgrade: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    armorUpgrade:  { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+
     // Crew resource: remaining sailors aboard (grapeshot attrites it; a port tavern re-hires). NULL = never
     // recorded → treated as the current vessel's FULL complement on load. Clamped to the vessel's max. A
     // ship change / sunk→respawn resets it to full. Drives sail/turn/reload/mast-repair speed (with a floor).

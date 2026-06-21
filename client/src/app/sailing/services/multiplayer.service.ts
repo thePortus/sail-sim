@@ -145,6 +145,11 @@ export class MultiplayerService {
   purchasedShip = signal<string | null>(null);
   // Last shipwright rejection reason (transient; the shipwright panel surfaces it).
   shipError    = signal<string | null>(null);
+  // Per-hull shipwright upgrades on the owned ship (server-authoritative): heavier cannons / +25% armor. Each once.
+  cannonUpgrade = signal<boolean>(false);
+  armorUpgrade  = signal<boolean>(false);
+  // Last upgrade-purchase rejection reason (transient; the shipwright panel surfaces it).
+  upgradeError  = signal<string | null>(null);
   /** Last Governor's-Mansion pardon rejection reason (transient; the governor panel surfaces it). null = ok/cleared. */
   pardonError  = signal<string | null>(null);
   /** Last tavern-recruit rejection reason (transient; the tavern panel surfaces it). null = ok/cleared. */
@@ -331,6 +336,12 @@ export class MultiplayerService {
   buyShip(slug: string): void {
     this.shipError.set(null);
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ship_buy', slug }));
+  }
+
+  /** Buy a once-per-hull shipwright upgrade ('cannon' = heavier guns, 'armor' = +25% hull). Server-authoritative. */
+  buyUpgrade(kind: 'cannon' | 'armor'): void {
+    this.upgradeError.set(null);
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'buy_upgrade', kind }));
   }
 
   /** Tavern (Crew C4): hire one sailor at the docked port. Server-authoritative (docked + gold/free-floor);
@@ -792,6 +803,8 @@ export class MultiplayerService {
         this.localState.vesselName = msg.shipName;
         this.vesselService.setShipName(msg.shipName);   // paint it onto the local 3D stern nameboard
       }
+      if (msg.cannonUpgrade !== undefined) this.cannonUpgrade.set(!!msg.cannonUpgrade);
+      if (msg.armorUpgrade !== undefined) this.armorUpgrade.set(!!msg.armorUpgrade);
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
@@ -878,6 +891,13 @@ export class MultiplayerService {
 
     } else if (msg.type === 'ship_error') {
       this.shipError.set(String(msg.reason ?? 'purchase failed'));
+
+    } else if (msg.type === 'upgrade_bought') {
+      // The wallet message arriving alongside already flipped the flag + gold; just clear any stale error.
+      this.upgradeError.set(null);
+
+    } else if (msg.type === 'upgrade_error') {
+      this.upgradeError.set(String(msg.reason ?? 'upgrade failed'));
 
     } else if (msg.type === 'ship_name_set') {
       // Server confirmed our rename → update our own readouts + the local 3D nameboard, and close the modal.

@@ -120,7 +120,7 @@ const VESSELS = [
     zoneHp: { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
     crew: 12,                     // Crew resource: a big ship needs hands at every station
     cargo: 60,                    // hold capacity in cargo slots — a roomy warship hold
-    price: 800000,                // Ships-as-economy: the top-tier shipwright purchase
+    price: 200000,                // Ships-as-economy: the top-tier shipwright purchase
     parts: [],
   },
 ];
@@ -128,6 +128,17 @@ const VESSELS = [
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
  *  read per-vessel physics (maxSpeed, etc.) when checking the plausibility of a position update. */
 exports.getVesselDef = (slug) => VESSELS.find(v => v.slug === slug) || VESSELS.find(v => v.slug === 'sloop') || VESSELS[0];
+
+// ── Shipwright per-hull UPGRADE costs (each buyable once) ────────────────────────────────────────────────────
+// Scales by tier; BOTH upgrades together stay cheaper than the next ship up (pinnace 6k < sloop 10k; sloop 50k <
+// brig 200k). Cannon = armor cost per tier for now (kept as separate fields so either can be tuned independently).
+const UPGRADE_COST = {
+  pinnace: { cannon: 3000,  armor: 3000  },
+  sloop:   { cannon: 25000, armor: 25000 },
+  brig:    { cannon: 60000, armor: 60000 },
+};
+/** Cost of a 'cannon' | 'armor' upgrade for a vessel slug (0 if unknown). */
+exports.upgradeCost = (slug, kind) => (UPGRADE_COST[slug] && UPGRADE_COST[slug][kind]) || 0;
 
 /** Full crew complement for a vessel (the Crew resource's max). Defaults to the sloop's if unknown. */
 exports.crewFor = (slug) => (exports.getVesselDef(slug)?.crew | 0) || 4;
@@ -138,6 +149,7 @@ exports.getVessels = (req, res) => {
     id: v.id, name: v.name, slug: v.slug, description: v.description,
     price: v.price | 0, cargo: v.cargo | 0,
     maxSpeed: v.physics?.maxSpeed ?? 0, guns: (v.cannons?.port?.length ?? 3),
+    cannonUpgradeCost: exports.upgradeCost(v.slug, 'cannon'), armorUpgradeCost: exports.upgradeCost(v.slug, 'armor'),
   }));
   res.json(summaries);
 };

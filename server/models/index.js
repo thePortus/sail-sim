@@ -42,6 +42,9 @@ db.ensureColumns = async () => {
     ['ship',         { type: Sequelize.DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' }],
     // Player's custom ship name (shown to others + a 3D stern nameboard). Default 'Saltmeadow' (the starter trader).
     ['shipName',     { type: Sequelize.DataTypes.STRING(64), allowNull: true,  defaultValue: 'Saltmeadow' }],
+    // Shipwright per-hull upgrades (each buyable once; reset on a new ship): heavier cannons + +25% hull armor.
+    ['cannonUpgrade', { type: Sequelize.DataTypes.BOOLEAN, allowNull: false, defaultValue: false }],
+    ['armorUpgrade',  { type: Sequelize.DataTypes.BOOLEAN, allowNull: false, defaultValue: false }],
     // Crew resource: remaining sailors (NULL backfills as "full complement" on next load). Persists across
     // maps (the player's, not the world's). Grapeshot lowers it; a port tavern raises it back.
     ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],

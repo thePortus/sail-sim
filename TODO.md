@@ -2,6 +2,8 @@
 
 # General or Current TODO Items
 
+* Add ship's name plaque
+* Player customizable flag colors for all vessels
 * Make cannons reload on an individual basis... allow firing of partial broadsides
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
@@ -9,7 +11,6 @@
 * update profile page and update password page (and 404 page with a funny 404)
 * make trading and ship buying server-side secure
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert
-* Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * placeholder ship for other players when that model hasnt loaded yet (or LOD imposter?)
 * update to cannon aim sight to show spread of all cannon shots somehow
 * general materials atlas draw cycle reduction

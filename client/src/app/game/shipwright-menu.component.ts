@@ -9,6 +9,7 @@ import { Settings } from '../app.settings';
 interface ShipRow {
   slug: string; name: string; description: string;
   price: number; cargo: number; maxSpeed: number; guns: number;
+  cannonUpgradeCost: number; armorUpgradeCost: number;
 }
 
 /**
@@ -57,6 +58,39 @@ interface ShipRow {
           <span class="sw-repair-sub">She answers to <em>{{ mp.myShipName() }}</em>.</span>
         </div>
         <button class="sw-buy sw-repair-btn" (click)="mp.openShipNameModal('rename')">Rename</button>
+      </div>
+
+      <!-- Per-hull upgrades (each once). Heavier guns / +25% armor — a budget boost that won't match the next ship. -->
+      <div class="sw-upgrades">
+        <div class="sw-upg-head">Refit this hull <span class="sw-upg-note">— one of each, stays with this ship</span></div>
+
+        <div class="sw-repair">
+          <div class="sw-repair-info">
+            <span class="sw-repair-title">⚔ Heavier cannons</span>
+            <span class="sw-repair-sub">More stopping power on every broadside.</span>
+          </div>
+          @if (mp.cannonUpgrade()) {
+            <span class="sw-installed">Installed ✓</span>
+          } @else {
+            <button class="sw-buy sw-repair-btn" [disabled]="!admin && mp.gold() < cannonCost()"
+                    (click)="buyUpgrade('cannon')">{{ admin ? 'Fit (free)' : 'Fit · ' + cannonCost() + 'g' }}</button>
+          }
+        </div>
+
+        <div class="sw-repair">
+          <div class="sw-repair-info">
+            <span class="sw-repair-title">🛡 Reinforced hull</span>
+            <span class="sw-repair-sub">+25% hull armour — soaks more shot before she sinks.</span>
+          </div>
+          @if (mp.armorUpgrade()) {
+            <span class="sw-installed">Installed ✓</span>
+          } @else {
+            <button class="sw-buy sw-repair-btn" [disabled]="!admin && mp.gold() < armorCost()"
+                    (click)="buyUpgrade('armor')">{{ admin ? 'Fit (free)' : 'Fit · ' + armorCost() + 'g' }}</button>
+          }
+        </div>
+
+        @if (mp.upgradeError(); as err) { <div class="sw-err">{{ prettyUpgradeError(err) }}</div> }
       </div>
 
       <div class="sw-list">
@@ -115,6 +149,10 @@ interface ShipRow {
     .sw-repair-sub { font-size: 0.78rem; color: #cdbb95; }
     .sw-repair-ok { color: #9fc98a; }
     .sw-repair-btn { white-space: nowrap; }
+    .sw-upgrades { margin-top: 0.7rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .sw-upg-head { font-size: 0.92rem; color: #e8d3a0; font-weight: 600; }
+    .sw-upg-note { font-size: 0.74rem; color: #b89a62; font-weight: 400; font-style: italic; }
+    .sw-installed { font-size: 0.82rem; color: #9fe0a0; font-weight: 600; white-space: nowrap; }
     .sw-list { display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.7rem; }
     .sw-card { border: 1px solid rgba(184,138,62,0.3); border-radius: 8px; padding: 0.6rem 0.7rem; background: rgba(255,255,255,0.03); }
     .sw-card--owned { border-color: rgba(240,200,105,0.55); background: rgba(240,200,105,0.07); }
@@ -177,6 +215,19 @@ export class ShipwrightMenuComponent implements OnInit {
 
   buy(slug: string): void { this.mp.buyShip(slug); }
 
+  /** The owned ship's row (for its per-hull upgrade costs). */
+  private ownedRow = computed(() => this.ships().find((s) => s.slug === this.mp.ownedShip()) ?? null);
+  cannonCost(): number { return this.ownedRow()?.cannonUpgradeCost ?? 0; }
+  armorCost(): number { return this.ownedRow()?.armorUpgradeCost ?? 0; }
+  buyUpgrade(kind: 'cannon' | 'armor'): void { this.mp.buyUpgrade(kind); }
+  prettyUpgradeError(reason: string): string {
+    const map: Record<string, string> = {
+      not_docked: 'You must be docked at a port.', no_gold: 'Not enough gold.',
+      already_owned: 'This hull already has that refit.', bad_kind: 'No such upgrade.',
+    };
+    return map[reason] ?? `Upgrade failed (${reason}).`;
+  }
+
   /** Repair the hull to full in place (server-authoritative; the updated combat_state disables the button). */
   repair(): void { this.mp.requestCombatReset(); }
 
@@ -189,5 +240,5 @@ export class ShipwrightMenuComponent implements OnInit {
     return map[reason] ?? `Purchase failed (${reason}).`;
   }
 
-  onClose(): void { this.mp.shipError.set(null); this.close.emit(); }
+  onClose(): void { this.mp.shipError.set(null); this.mp.upgradeError.set(null); this.close.emit(); }
 }

@@ -37,7 +37,7 @@ const HAT_FIT: Record<string, { lower: number; fwd: number; scale: number }> = {
   Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // best fit already — leave it
   Hat_WideBrim: { lower: 0.035, fwd: 0.000, scale: 1.12 },   // floats ~3–4 cm + small crown
   Hat_Bicorne:  { lower: 0.025, fwd: 0.000, scale: 1.00 },   // floats ~2–3 cm
-  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.10 },   // floats + sits back + small
+  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.00 },   // scale was flinging it up (pivot off the head); fixed
 };
 
 /**
@@ -392,19 +392,27 @@ export class CrewHandle {
         if ([lower, fwd, scale].every(Number.isFinite)) fit = { lower, fwd, scale };
       }
     } catch { /* ignore */ }
-    if (fit.scale && fit.scale !== 1) mesh.scaling.scaleInPlace(fit.scale);
-    if (fit.lower || fit.fwd) {
-      const parent = mesh.parent as TransformNode | null;
-      // World-space nudge: down (−Y) + toward the face (−Z is the character's forward in the GLB).
-      const world = new Vector3(0, -fit.lower, -fit.fwd);
-      let local = world;
-      if (parent) {
-        parent.computeWorldMatrix(true);
-        const inv = parent.getWorldMatrix().clone(); inv.invert();
-        local = Vector3.TransformNormal(world, inv);
-      }
-      mesh.position.addInPlace(local);
+    const parent = mesh.parent as TransformNode | null;
+    // Convert a WORLD-space delta into the hat's local (parent) frame, so corrections are intuitive regardless
+    // of how the head bone is oriented.
+    const toLocal = (w: Vector3): Vector3 => {
+      if (!parent) return w;
+      parent.computeWorldMatrix(true);
+      const inv = parent.getWorldMatrix().clone(); inv.invert();
+      return Vector3.TransformNormal(w, inv);
+    };
+    // Scale about the hat's WORLD CENTRE (not its mesh pivot): a hat whose pivot sits away from the head — e.g.
+    // the skullcap — would otherwise be flung up/down by scaling. Measure the centre, scale, undo the shift.
+    if (fit.scale && fit.scale !== 1) {
+      mesh.computeWorldMatrix(true);
+      const before = mesh.getBoundingInfo().boundingBox.centerWorld.clone();
+      mesh.scaling.scaleInPlace(fit.scale);
+      mesh.computeWorldMatrix(true);
+      const after = mesh.getBoundingInfo().boundingBox.centerWorld;
+      mesh.position.addInPlace(toLocal(before.subtract(after)));
     }
+    // Position nudge: down (−Y world) + toward the face (−Z world).
+    if (fit.lower || fit.fwd) mesh.position.addInPlace(toLocal(new Vector3(0, -fit.lower, -fit.fwd)));
   }
 
   start(): void {

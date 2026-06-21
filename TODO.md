@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* Make cannons reload on an individual basis... allow firing of partial broadsides
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
 * increase render resolution in spyglass

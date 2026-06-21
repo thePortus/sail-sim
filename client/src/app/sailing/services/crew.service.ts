@@ -6,6 +6,35 @@ import {
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 
+// ── Ship-motion presence (crew realism P1) ───────────────────────────────────────────────────────────────────
+const BRACE_FACTOR = 0.55;   // crew counter-lean this fraction of the deck slope (0 = ride flat with the deck,
+                             // 1 = bolt upright). ~0.55 reads as bracing without looking detached from the deck.
+const BRACE_MAX    = 0.45;   // rad cap on the brace lean (a hard knockdown won't over-rotate them)
+const SWAY_AMP     = 0.022;  // m — subtle idle weight-shift sway at a station (desynced per member)
+const HEEL_SHIFT   = 0.05;   // m of lateral weight-shift per rad of heel (leaning onto the downhill foot)
+// Locomotion (P2): scale the Walk clip's playback to the actual ground speed so the FEET PLANT instead of
+// skating. STRIDE_SCALE matches the clip's authored stride to walk_speed_mps — tune live via
+// localStorage.ignis_crew_stride if a footskate remains. TURN_SLOW slows forward progress while turning sharply
+// so they rotate INTO a corner rather than sliding through it.
+const STRIDE_SCALE = (() => {
+  try { const v = parseFloat(localStorage.getItem('ignis_crew_stride') || ''); return Number.isFinite(v) && v > 0 ? v : 1.0; }
+  catch { return 1.0; }
+})();
+// Life + combat sync (P3).
+const WORK_BURST_DUR  = 1.4;   // s a gun crew works visibly harder after their broadside fires
+const WORK_BURST_GAIN = 1.1;   // peak extra work-clip speed (×) at the moment of firing
+const GLANCE_CHANCE   = 0.02;  // per-second chance a stationed crew breaks off to glance about
+
+// Per-hat FIT corrections (P4, runtime — the GLB authored 3 of the 4 hats with one shared head offset so most
+// float above the scalp). World-space terms: lower = m DOWN onto the head, fwd = m toward the face, scale =
+// uniform. Seeded from Blender renders; perfect each live (no rebuild) via localStorage ignis_hat_<name>.
+const HAT_FIT: Record<string, { lower: number; fwd: number; scale: number }> = {
+  Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // best fit already — leave it
+  Hat_WideBrim: { lower: 0.035, fwd: 0.000, scale: 1.12 },   // floats ~3–4 cm + small crown
+  Hat_Bicorne:  { lower: 0.025, fwd: 0.000, scale: 1.00 },   // floats ~2–3 cm
+  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.10 },   // floats + sits back + small
+};
+
 /**
  * Animated pirate crew for vessel decks.
  *
@@ -176,15 +205,24 @@ interface CrewMember {
   rng: () => number;
   detail: AbstractMesh[];   // tiny parts (buckles/eyes/laces/…) culled when the member is far
   lodFar: boolean;          // true while the detail meshes are hidden (distance LOD)
+  // Ship-motion presence (P1): a desynced idle sway + the station anchor it sways around.
+  swayPhase: number;
+  swayFreq: number;
+  stationPos: Vector3;      // the exact station position; sway is a small offset from this
+  // Life + combat sync (P3).
+  stationClip: string;      // the looping work clip for the current station (to resume after a glance)
+  workBurst: number;        // >0 → working harder (e.g. the gun crew right after a broadside); decays
+  glanceT: number;          // >0 → briefly broke off work to glance about (Lookout), then resumes
 }
 
 export class CrewHandle {
   private members: CrewMember[] = [];
   private reserved = new Set<string>();
   private climbBusy = false;
-  /** The one member currently allowed on the walkways — keeps crew from
-   *  threading the same narrow path (and colliding) simultaneously. */
-  private walker: CrewMember | null = null;
+  /** Members currently on the move. Capped (not single) so the deck feels busy — a couple can walk at once —
+   *  while still keeping the narrow walkways from turning into a crowd. Climbing has its own single-slot lock. */
+  private readonly walkers = new Set<CrewMember>();
+  private readonly WALKER_CAP = 2;
   private observer: Nullable<Observer<Scene>> = null;
   private readonly adjacency = new Map<string, { to: string; kind: string }[]>();
   private readonly walkSpeed: number;
@@ -195,6 +233,11 @@ export class CrewHandle {
   // backed on WebGPU). Disposing the mesh subtree does NOT free these, so they're collected + freed in dispose().
   private readonly skeletons: Skeleton[] = [];
   private readonly rootRng: () => number;
+  // Ship-motion presence (P1): the deck's current heel/pitch (rad), recomputed each frame from the ship root's
+  // world orientation, and a running clock for the idle sway. Crew counter-lean these so they ride the swell.
+  private shipHeel = 0;
+  private shipPitch = 0;
+  private clock = 0;
 
   constructor(
     private scene: Scene,
@@ -265,6 +308,8 @@ export class CrewHandle {
       legs: [], legT: 0, legFrom: new Vector3(), yaw: 0, yawTarget: 0,
       climb: null, animSpeed: 0.92 + rng() * 0.16, rng,
       detail, lodFar: false,
+      swayPhase: rng() * Math.PI * 2, swayFreq: 0.7 + rng() * 0.5, stationPos: new Vector3(),
+      stationClip: 'Idle', workBurst: 0, glanceT: 0,
     };
 
     // Spawn directly at a free station (no walk-in pop).
@@ -314,21 +359,69 @@ export class CrewHandle {
     tint('Breeches_fall', briches, v.breeches.linked_slot?.factor ?? 0.75);
     tint('Boots', pick(v.boots.options));
 
-    // Headwear: show at most one of the four (or bareheaded).
+    // Headwear: show at most one of the four (or bareheaded). The chosen hat then gets a per-hat FIT correction
+    // (the GLB authored 3 of the 4 with one shared head offset, so most float/sit wrong — see HAT_FIT).
     const hats = v.headwear.nodes;
     const choice = Math.floor(rng() * (hats.length + 1));   // == hats.length ⇒ none
     hats.forEach((hat, i) => {
       const mesh = find(hat);
-      mesh?.setEnabled(i === choice);
+      if (!mesh) return;
+      mesh.setEnabled(i === choice);
+      if (i === choice) this.fitHat(hat, mesh);
     });
+  }
+
+  /** Nudge one hat so it seats on the head. The correction is given in intuitive WORLD terms — `lower` (metres
+   *  down), `fwd` (metres toward the face), `scale` (uniform) — and converted into the hat's local frame via its
+   *  parent (head-bone) inverse rotation, so it's right regardless of how the bone is oriented. Live-tunable per
+   *  hat via localStorage `ignis_hat_<name>` = "lower,fwd,scale" (e.g. ignis_hat_Skullcap = "0.035,0.025,1.1"). */
+  private fitHat(name: string, mesh: AbstractMesh): void {
+    let fit = HAT_FIT[name] ?? { lower: 0, fwd: 0, scale: 1 };
+    try {
+      const raw = typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hat_' + name);
+      if (raw) {
+        const [lower, fwd, scale] = raw.split(',').map((n) => parseFloat(n.trim()));
+        if ([lower, fwd, scale].every(Number.isFinite)) fit = { lower, fwd, scale };
+      }
+    } catch { /* ignore */ }
+    if (fit.scale && fit.scale !== 1) mesh.scaling.scaleInPlace(fit.scale);
+    if (fit.lower || fit.fwd) {
+      const parent = mesh.parent as TransformNode | null;
+      // World-space nudge: down (−Y) + toward the face (−Z is the character's forward in the GLB).
+      const world = new Vector3(0, -fit.lower, -fit.fwd);
+      let local = world;
+      if (parent) {
+        parent.computeWorldMatrix(true);
+        const inv = parent.getWorldMatrix().clone(); inv.invert();
+        local = Vector3.TransformNormal(world, inv);
+      }
+      mesh.position.addInPlace(local);
+    }
   }
 
   start(): void {
     this.observer = this.scene.onBeforeRenderObservable.add(() => {
       if (this.shipRoot.isDisposed()) { this.dispose(); return; }
       const dt = Math.min(0.05, this.scene.getEngine().getDeltaTime() / 1000);
+      this.clock += dt;
+      // Deck slope from the ship root's world orientation: how far its right/forward axes tip off level → the
+      // heel (lateral) and pitch (fore-aft) the crew brace against. Works for the local ship + every remote.
+      const wm = this.shipRoot.getWorldMatrix();
+      const right = Vector3.TransformNormal(Vector3.Right(), wm);
+      const fwd = Vector3.TransformNormal(Vector3.Forward(), wm);
+      this.shipHeel  = Math.asin(Math.max(-1, Math.min(1, right.y / (right.length() || 1))));
+      this.shipPitch = Math.asin(Math.max(-1, Math.min(1, fwd.y / (fwd.length() || 1))));
       for (const m of this.members) this.tick(m, dt);
     });
+  }
+
+  /** A broadside just fired on `side` — make the gun crews on that side work harder for a beat (P3). Gun station
+   *  ids are `gun_P_*` (port) / `gun_S_*` (starboard); matches the crew_stations layouts. */
+  emphasizeGun(side: 'port' | 'stbd'): void {
+    const tag = side === 'port' ? 'gun_P' : 'gun_S';
+    for (const m of this.members) {
+      if (m.state === 'station' && m.stationId && m.stationId.startsWith(tag)) m.workBurst = WORK_BURST_DUR;
+    }
   }
 
   /** Mark one (random alive) crew member as a casualty: stagger, fall, stay down. */
@@ -343,7 +436,7 @@ export class CrewHandle {
     }
     const mm = m as CrewMember & { _climb?: CrewClimb | null };
     if (m.state === 'climb' || mm._climb) this.climbBusy = false;   // free the ratlines
-    if (this.walker === m) this.walker = null;                      // free the walkways
+    this.walkers.delete(m);                      // free the walkways
     mm._climb = null;
     this.releaseStation(m);
     m.state = 'dead'; m.legs = []; m.climb = null;
@@ -383,7 +476,7 @@ export class CrewHandle {
   private hideMember(m: CrewMember): void {
     const mm = m as CrewMember & { _climb?: CrewClimb | null };
     if (m.state === 'climb' || mm._climb) this.climbBusy = false;
-    if (this.walker === m) this.walker = null;
+    this.walkers.delete(m);
     mm._climb = null;
     this.releaseStation(m);
     m.state = 'reserve'; m.legs = []; m.climb = null;
@@ -491,13 +584,38 @@ export class CrewHandle {
     if (m.state === 'reserve') return;   // unrecruited reserve: hidden, no animation/logic
     this.tickFace(m, dt);
     this.tickLod(m);
-    // Smooth yaw toward target everywhere except while dead.
+    // Smooth yaw toward target everywhere except while dead, then BRACE against the deck slope: counter-lean the
+    // heel/pitch so the crew ride the swell instead of standing rigidly perpendicular to a heeled deck. Composed
+    // OUTSIDE the yaw so the lean is about the SHIP's fore-aft/lateral axes regardless of which way they face.
     if (m.state !== 'dead') {
       let d = m.yawTarget - m.yaw;
       while (d > Math.PI) d -= 2 * Math.PI;
       while (d < -Math.PI) d += 2 * Math.PI;
       m.yaw += d * Math.min(1, dt * 8);
-      Quaternion.RotationAxisToRef(Vector3.Up(), m.yaw, m.holder.rotationQuaternion!);
+      const roll  = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, -this.shipHeel  * BRACE_FACTOR));
+      const pitch = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, -this.shipPitch * BRACE_FACTOR));
+      const qYaw = Quaternion.RotationAxis(Vector3.Up(), m.yaw);
+      m.holder.rotationQuaternion = Quaternion.RotationYawPitchRoll(0, pitch, roll).multiply(qYaw);
+    }
+    // Idle weight-shift sway at a station (desynced) + a lean onto the downhill foot as she heels. Skipped while
+    // walking/climbing (their position is driven by the path) and while dead.
+    if (m.state === 'station') {
+      m.holder.position.x = m.stationPos.x + Math.sin(this.clock * m.swayFreq + m.swayPhase) * SWAY_AMP + this.shipHeel * HEEL_SHIFT;
+      m.holder.position.z = m.stationPos.z + Math.cos(this.clock * m.swayFreq * 0.8 + m.swayPhase) * SWAY_AMP * 0.6;
+
+      // Glance (P3): occasionally break off the work loop to look about (Lookout), then resume the station clip.
+      if (m.glanceT > 0) {
+        m.glanceT -= dt;
+        if (m.glanceT <= 0) this.play(m, m.stationClip, true);
+      } else if (m.workBurst <= 0 && m.dwell > 5 && m.clips.has('Lookout') && m.rng() < GLANCE_CHANCE * dt) {
+        m.glanceT = 2 + m.rng() * 2.5;
+        this.play(m, 'Lookout', true);
+      }
+      // Work burst (P3): a gun crew works harder right after their broadside — speed up the work clip, decaying.
+      if (m.workBurst > 0) m.workBurst = Math.max(0, m.workBurst - dt);
+      if (m.glanceT <= 0 && m.current) {
+        m.current.speedRatio = m.animSpeed * (1 + WORK_BURST_GAIN * (m.workBurst / WORK_BURST_DUR));
+      }
     }
 
     switch (m.state) {
@@ -506,7 +624,7 @@ export class CrewHandle {
         if (m.dwell > 0) return;
         // Walkways are single-occupancy: if someone else is on the move, keep
         // working a little longer and check again shortly.
-        if (this.walker) { m.dwell = 4 + m.rng() * 6; return; }
+        if (this.walkers.size >= this.WALKER_CAP) { m.dwell = 4 + m.rng() * 6; return; }
         // Occasionally go aloft (one climber at a time), otherwise change station.
         if (!this.climbBusy && (this.layout.climb_paths?.length ?? 0) > 0 && m.rng() < 0.08) {
           const climb = this.layout.climb_paths![Math.floor(m.rng() * this.layout.climb_paths!.length)];
@@ -524,36 +642,52 @@ export class CrewHandle {
     }
   }
 
+  /** Ground speed (m/s) for a leg kind. */
+  private legSpeed(kind: string): number {
+    return kind === 'squeeze' ? this.walkSpeed * 0.4
+      : kind === 'ladder' ? 0.5
+      : kind === 'step' ? this.walkSpeed * 0.6
+      : kind === 'step_over' ? this.walkSpeed * 0.75
+      : this.walkSpeed;
+  }
+
+  /** Play the right locomotion clip for a leg, with the Walk clip's playback matched to ground speed (feet plant). */
+  private playLeg(m: CrewMember, kind: string): void {
+    const ladder = kind === 'ladder';
+    const g = this.play(m, ladder ? 'Climb' : 'Walk', true);
+    if (g && !ladder) g.speedRatio = m.animSpeed * Math.max(0.35, this.legSpeed(kind) / this.walkSpeed) * STRIDE_SCALE;
+  }
+
   private tickWalk(m: CrewMember, dt: number): void {
     const leg = m.legs[0];
     if (!leg) { this.finishWalk(m); return; }
     const span = Vector3.Distance(m.legFrom, leg.to);
-    const speed = leg.kind === 'squeeze' ? this.walkSpeed * 0.4
-      : leg.kind === 'ladder' ? 0.5
-      : leg.kind === 'step' ? this.walkSpeed * 0.6
-      : leg.kind === 'step_over' ? this.walkSpeed * 0.75
-      : this.walkSpeed;
+    // Face the travel direction; SLOW forward progress while still turning toward it, so a sharp corner is taken
+    // as a turn-in-place rather than a slide through it.
+    const dx = leg.to.x - m.legFrom.x, dz = leg.to.z - m.legFrom.z;
+    if (dx * dx + dz * dz > 0.01) m.yawTarget = Math.atan2(dx, dz);
+    let err = m.yawTarget - m.yaw;
+    while (err > Math.PI) err -= 2 * Math.PI;
+    while (err < -Math.PI) err += 2 * Math.PI;
+    const turnSlow = Math.max(0.25, Math.cos(Math.min(Math.abs(err), Math.PI / 2)));   // 1 aligned → 0.25 at ≥90°
+    const speed = this.legSpeed(leg.kind) * turnSlow;
     m.legT = span > 1e-4 ? Math.min(1, m.legT + (speed * dt) / span) : 1;
     Vector3.LerpToRef(m.legFrom, leg.to, m.legT, m.holder.position);
     if (leg.kind === 'step_over') {
       m.holder.position.y += 0.45 * Math.sin(Math.PI * m.legT);   // arc over the thwart
     }
-    // Face travel direction (horizontal component only — ladders keep prior yaw).
-    const dx = leg.to.x - m.legFrom.x, dz = leg.to.z - m.legFrom.z;
-    if (dx * dx + dz * dz > 0.01) m.yawTarget = Math.atan2(dx, dz);
     if (m.legT >= 1) {
       m.legFrom.copyFrom(leg.to);
       m.legs.shift();
       m.legT = 0;
       const next = m.legs[0];
       if (!next) { this.finishWalk(m); return; }
-      // Ladder legs play the climb loop, everything else walks.
-      this.play(m, next.kind === 'ladder' ? 'Climb' : 'Walk', true);
+      this.playLeg(m, next.kind);   // ladder → climb loop, else speed-matched walk
     }
   }
 
   private finishWalk(m: CrewMember): void {
-    if (this.walker === m) this.walker = null;   // free the walkways
+    this.walkers.delete(m);   // free the walkways
     const target = (m as CrewMember & { _target?: CrewStation | null })._target;
     const climb = (m as CrewMember & { _climb?: CrewClimb | null })._climb;
     if (climb) {
@@ -625,6 +759,8 @@ export class CrewHandle {
     m.stationId = st.id;
     m.wpId = st.wp;
     m.state = 'station';
+    m.stationPos.set(st.pos[0], st.pos[1], st.pos[2]);   // sway anchor (P1)
+    m.stationClip = st.clip; m.glanceT = 0;              // remember the work clip to resume after a glance (P3)
     // Long task dwell — crew settle into a job and only occasionally rotate.
     m.dwell = 45 + m.rng() * 75;
     m.yawTarget = (st.heading_deg * Math.PI) / 180;
@@ -661,10 +797,10 @@ export class CrewHandle {
     (m as CrewMember & { _target?: CrewStation | null })._target = target;
     (m as CrewMember & { _climb?: CrewClimb | null })._climb = climb;
     if (climb) this.climbBusy = true;
-    this.walker = m;   // single-occupancy walkways
+    this.walkers.add(m);   // count toward the walker cap
     m.state = 'walk';
     m.legT = 0;
-    this.play(m, m.legs[0]?.kind === 'ladder' ? 'Climb' : 'Walk', true);
+    this.playLeg(m, m.legs[0]?.kind ?? 'walk');
   }
 
   /** Shortest hop path between waypoints (graphs are <20 nodes — BFS is plenty). */

@@ -254,6 +254,11 @@ export class HudComponent implements OnInit, OnDestroy {
     return state === 'ready' ? 'sail-btn--active' : '';
   }
 
+  /** [0..gunCount) — one entry per cannon on a side, for the "ready cannons" pip readout. */
+  pipArray(): number[] {
+    return Array.from({ length: this.cannonService.gunCount() }, (_, i) => i);
+  }
+
   refloat(): void {
     this.vesselService.refloat();
   }

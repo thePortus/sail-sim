@@ -181,6 +181,24 @@ p {
   transition: width 0.1s linear;
   pointer-events: none;
 }
+// "Ready cannons" pips — one dot per gun; lit when that gun is loaded.
+.gun-pips {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+  pointer-events: none;
+}
+.gun-pips .pip {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);   // empty (still reloading)
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+  transition: background 0.12s ease;
+}
+.gun-pips .pip--on {
+  background: #fbbf24;                       // loaded + ready
+  box-shadow: 0 0 4px rgba(251, 191, 36, 0.7);
+}
 // Hull/Mast target preset toggles
 .tgt-btn {
   padding: 2px 9px;

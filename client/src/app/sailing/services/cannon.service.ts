@@ -139,6 +139,10 @@ export class CannonService {
   readonly stbdGunState  = signal<GunState>('stowed');
   readonly portReloadFrac = signal(0);   // 0..1 reload progress
   readonly stbdReloadFrac = signal(0);
+  // How many guns are LOADED on each side, and the side's total — drives a small "ready cannons" pip readout.
+  readonly portLoaded = signal(0);
+  readonly stbdLoaded = signal(0);
+  readonly gunCount   = signal(DEFAULT_MUZZLES.port.length);
 
   // ── Gun elevation / targeting ───────────────────────────────────────────────
   // Elevation is the launch angle (deg). Flat (low) keeps the ball in the hull band
@@ -887,6 +891,7 @@ export class CannonService {
     const c = this.vesselService.getCannons();
     this.muzzles = (c && c.port.length && c.stbd.length) ? c : DEFAULT_MUZZLES;
     this.gunsPerSide = Math.max(1, this.muzzles.port.length);
+    this.zone.run(() => this.gunCount.set(this.gunsPerSide));
   }
 
   /** Size + seed a side's per-gun reload arrays for the current battery. Each gun gets a FIXED reload-time
@@ -936,7 +941,10 @@ export class CannonService {
         g.state = 'stowed';
         this.vesselService.setGunDeploy(s, 0);
         this.multiplayerService.broadcastGunState(s, 0);
-        this.zone.run(() => (s === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(0));
+        this.zone.run(() => {
+          (s === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(0);
+          (s === 'port' ? this.portLoaded : this.stbdLoaded).set(0);
+        });
         this.publishState(s);
       }
     }
@@ -983,6 +991,7 @@ export class CannonService {
         this.vesselService.addCannonRecoil(side);   // hull shudder
         this.fireOneCannon(side, i);
         this.vesselService.addGunRecoilKick(side);
+        this.vesselService.crewGunWork(side);        // gun crew works the piece (crew P3)
         const dur = this.vesselService.getReloadWindow() * g.factor[i] * (1 + (Math.random() * 2 - 1) * RELOAD_JITTER);
         g.loadStart[i] = this.elapsed;
         g.loadAt[i] = this.elapsed + Math.max(0.3, dur);
@@ -997,8 +1006,10 @@ export class CannonService {
     }
     this.zone.run(() => (side === 'port' ? this.portReloadFrac : this.stbdReloadFrac).set(progSum / this.gunsPerSide));
 
-    // Re-publish the FIRE!/Reloading… label only when the loaded count crosses the 0↔≥1 boundary.
+    // Surface the loaded count (for the pip readout); re-publish the FIRE!/Reloading… label on the 0↔≥1 boundary.
     const nowLoaded = this.loadedCount(side);
+    const loadSig = side === 'port' ? this.portLoaded : this.stbdLoaded;
+    if (loadSig() !== nowLoaded) this.zone.run(() => loadSig.set(nowLoaded));
     if ((prevLoaded > 0) !== (nowLoaded > 0)) this.publishState(side);
   }
 

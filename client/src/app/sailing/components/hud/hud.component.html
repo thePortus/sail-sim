@@ -326,12 +326,22 @@
               [class]="'sail-btn gun-btn ' + gunBtnClass(cannonService.portGunState())">
         <span class="sail-icon">◀</span>
         <span class="flex-1 text-left">Port · {{ gunLabel(cannonService.portGunState()) }}</span>
+        <span class="gun-pips" [title]="cannonService.portLoaded() + ' of ' + cannonService.gunCount() + ' guns loaded'">
+          @for (i of pipArray(); track i) {
+            <span class="pip" [class.pip--on]="i < cannonService.portLoaded()"></span>
+          }
+        </span>
         <span class="sail-key">Z</span>
         <span class="gun-reload" [style.width.%]="cannonService.portReloadFrac() * 100"></span>
       </button>
       <button (click)="fireGun('stbd')"
               [class]="'sail-btn gun-btn ' + gunBtnClass(cannonService.stbdGunState())">
         <span class="sail-key">C</span>
+        <span class="gun-pips" [title]="cannonService.stbdLoaded() + ' of ' + cannonService.gunCount() + ' guns loaded'">
+          @for (i of pipArray(); track i) {
+            <span class="pip" [class.pip--on]="i < cannonService.stbdLoaded()"></span>
+          }
+        </span>
         <span class="flex-1 text-right">{{ gunLabel(cannonService.stbdGunState()) }} · Stbd</span>
         <span class="sail-icon">▶</span>
         <span class="gun-reload" [style.width.%]="cannonService.stbdReloadFrac() * 100"></span>

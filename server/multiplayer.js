@@ -692,9 +692,9 @@ const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt pet
 // Pirates fly no flag, so sinking one is a service to the local powers rather than an act of piracy. A pirate
 // spawns with a small purse (npc PIRATE_SEED_GOLD) and grows richer + more wanted as it raids: each merchant it
 // sinks adds a cut of that merchant's gold to its hold AND raises the price on its head (PIRATE_BOUNTY_PER_KILL).
-// The player who sinks it collects a salvage crate worth its full hold + head-bounty (pirate.gold + pirate.bounty),
-// and earns standing with the nation(s) whose waters it menaced (any faction with a town within
-// PIRATE_PROTECT_RANGE of the wreck; if none that close, the nearest town's nation).
+// The player who sinks it is PAID the head-bounty (pirate.bounty) INSTANTLY, while the pirate's looted gold
+// (pirate.gold) floats at the wreck as salvage; they also earn standing with the nation(s) whose waters it
+// menaced (any faction with a town within PIRATE_PROTECT_RANGE of the wreck; if none that close, the nearest).
 const PIRATE_BOUNTY_PER_KILL = 300;  // the head-bounty rises by this for every merchant the pirate sends down
 const PIRATE_LOOT_CUT        = 0.3;  // fraction of a sunk merchant's gold the pirate pockets into its own hold
 const PIRATE_BOUNTY_REP      = 22;   // standing earned with EACH protecting faction (decently large — a real lever)
@@ -1020,20 +1020,31 @@ function attachMultiplayer(server) {
       }
 
       if (victim.isPirate) {
-        // A pirate sank → its full hold + the price on its head (gold + bounty) floats at the wreck, and the
-        // player who rid these waters of it earns standing with the protecting nation(s): every faction with a
-        // town within PIRATE_PROTECT_RANGE, or the nearest town's nation if none is that close.
-        const bounty = (victim.gold | 0) + (victim.bounty | 0);
-        const crate = salvage.spawnCrate(victim.state.x, victim.state.z, {}, bounty, Date.now());
-        const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
-        for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+        // A pirate sank. The BOUNTY (the price on its head) is paid to the killer INSTANTLY — a head-price is
+        // collected from the authorities, not pried off a sinking hull. The pirate's own PLUNDER (gold it looted
+        // from the ships it raided) is what actually floats at the wreck. The killer also earns standing with
+        // the protecting nation(s): every faction with a town within PIRATE_PROTECT_RANGE, or the nearest if none.
+        const bounty  = victim.bounty | 0;   // head price → instant wallet
+        const plunder = victim.gold   | 0;   // looted from its victims → floats at the wreck
         if (shooter && !shooter.isNpc) {
+          shooter.gold = (shooter.gold | 0) + bounty;
           const fids = protectingFactions(victim.state.x, victim.state.z);
           for (const fid of fids) awardFactionRep(shooter, fid, PIRATE_BOUNTY_REP, 'pirate');
           const nations = fids.map((f) => factions.factionName(f)).join(', ');
-          sysReply(shooter.ws, `You sank the pirate ${victim.state.vesselName || 'raider'}! A bounty of ${bounty} gold floats among the wreckage`
-            + (nations ? ` — the ${nations} are grateful.` : '.'));
+          if (shooter.ws.readyState === 1) {
+            shooter.ws.send(JSON.stringify({ type: 'bounty_collected', gold: bounty, name: victim.state.vesselName || 'raider', nations }));
+          }
+          sysReply(shooter.ws, `You sank the pirate ${victim.state.vesselName || 'raider'}! A ${bounty} gold bounty is paid`
+            + (nations ? ` — the ${nations} are grateful.` : '.')
+            + (plunder > 0 ? ' Its plunder floats among the wreckage.' : ''));
           saveEconomyState(shooter);
+          sendWallet(shooter);   // refresh the purse with the bounty
+        }
+        // Only the looted gold floats at the wreck (nothing if this pirate never managed to raid anyone).
+        if (plunder > 0) {
+          const crate = salvage.spawnCrate(victim.state.x, victim.state.z, {}, plunder, Date.now());
+          const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+          for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
         }
         victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
       } else if (victim.isNpc) {
@@ -1549,7 +1560,8 @@ function attachMultiplayer(server) {
               me.pirateMarkId = best.id;   // force-streamed + map-marked for this player (see broadcastInterest)
               reply(true, {
                 shipId: best.id, slug: best.state.vesselSlug, name: best.state.vesselName,
-                kills: best.piracyKills | 0, bounty: (best.gold | 0) + (best.bounty | 0),
+                // `bounty` = the head price paid on the kill; `plunder` = the looted gold that floats at the wreck.
+                kills: best.piracyKills | 0, bounty: best.bounty | 0, plunder: best.gold | 0,
               });
             }
           }

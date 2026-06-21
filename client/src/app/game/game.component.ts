@@ -679,6 +679,18 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       });
     });
 
+    // Pirate head-bounty paid instantly → flash a "Bounty: …" toast (reuses the salvage-notice banner).
+    effect(() => {
+      const b = this.multiplayerService.bountyToast();
+      if (!b) return;
+      untracked(() => {
+        this.salvageNotice.set(`⚓ Bounty: ${b.gold} gold — ${b.name} sent to the bottom`);
+        this.multiplayerService.bountyToast.set(null);
+        if (this.salvageTimer) clearTimeout(this.salvageTimer);
+        this.salvageTimer = setTimeout(() => this.salvageNotice.set(null), 3500);
+      });
+    });
+
     // Reputation change (attacked/sank a nation's shipping) → flash the per-nation deltas as a toast.
     effect(() => {
       const t = this.multiplayerService.repToast();

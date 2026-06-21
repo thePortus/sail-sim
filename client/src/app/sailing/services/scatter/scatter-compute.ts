@@ -306,8 +306,8 @@ const RES: f32 = 24.0;
     (hash2(vec2f(px * 5.1, pz * 2.3)) - 0.5) * 0.5);
   var tints = array<vec3f, 6>(
     vec3f(0.92, 0.94, 1.00), vec3f(1.00, 0.84, 0.58), vec3f(0.50, 0.50, 0.56),
-    vec3f(0.96, 0.56, 0.42), vec3f(0.62, 0.72, 0.50), vec3f(0.85, 0.85, 0.85),
-  );
+    vec3f(0.72, 0.58, 0.48), vec3f(0.66, 0.69, 0.63), vec3f(0.85, 0.85, 0.85),
+  );   // [3]/[4]: was a vibrant red + moss-green that read out of place → muted iron-brown + weathered gray-green
   let ti = u32(hash2(vec2f(px * 0.9 - 11.0, pz * 0.9 + 11.0)) * 6.0) % 6u;
   _ = emit(composeMat(q, sx, sy, sz, px, y - base * 0.1, pz), tintJitter(px, pz, tints[ti], 0.10));
 }

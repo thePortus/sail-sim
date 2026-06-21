@@ -21,6 +21,11 @@ server/assets/maps/sources/
 # downloaded sky textures (re-fetchable via npm run download:sky-textures)
 server/assets/sky/
 
+# downloaded CC0 scatter textures (re-fetchable via npm run download:scatter-textures)
+# runtime (served) set + raw authoring sources for Blender re-bakes — neither is committed.
+server/assets/geometry/scatter/cc0/
+server/assets/scatter-src/
+
 # user info
 server/seeders/import/**/*
 

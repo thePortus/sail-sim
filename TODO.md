@@ -2,7 +2,7 @@
 
 # General or Current TODO Items
 
-* makes trees and scatter assets more photorealistic
+* Can we source variants of sand and rock and forest from polyhaven, and mix them? Make some areas of beech one kind of sand, and others another?
 * I want to revisit the spyglass... what would it take to render everything correctly zoomed in the spy glass at a higher res? So that objects that might be LOD would appear in full detail (assuming they were close enough to the zoomed camera)... but ONLY to do this when right click is active and only within the small viewing sphere, to make as small a perf impact as possible
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset

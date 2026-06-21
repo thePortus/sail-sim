@@ -20,6 +20,7 @@ import { createTree } from './props/tree';
 import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { FarFadePlugin } from './far-fade.plugin';
+import { NearFadePlugin } from './near-fade.plugin';
 import { ImpostorHazePlugin } from './impostor-haze.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
@@ -212,6 +213,7 @@ export class ScatterService {
       if (c) {
         GrassFadePlugin.camera.x = c.position.x; GrassFadePlugin.camera.z = c.position.z;
         FarFadePlugin.camera.x   = c.position.x; FarFadePlugin.camera.z   = c.position.z;   // far-forest fade
+        NearFadePlugin.camera.x  = c.position.x; NearFadePlugin.camera.z  = c.position.z;   // palm/beech LoD dissolve
       }
       // Drive the palm wind from the weather wind (the same source the sails use): unit direction +
       // a gust amplitude that grows with wind speed, plus a steadily-advancing clock.
@@ -222,14 +224,13 @@ export class ScatterService {
         const gust = Math.min(1, (wd.speed ?? 8) / 24);   // 0 calm → 1 gale
         PalmWindPlugin.WIND.dirX = dx;
         PalmWindPlugin.WIND.dirZ = dz;
-        PalmWindPlugin.WIND.amplitude = 0.10 + gust * 0.30;
+        PalmWindPlugin.WIND.amplitude = 0.18 + gust * 0.45;   // fuller frond sway (cloud-halo issue is fixed)
         TreeWindPlugin.WIND.dirX = dx;
         TreeWindPlugin.WIND.dirZ = dz;
-        // Canopy sway kept SMALL on purpose: a larger silhouette swing exposes a halo against the
-        // volumetric clouds (the cloud depth pass can't replicate the per-vertex sway), so we trade a
-        // little motion for a clean edge. Gentle lean + faint shimmer only.
-        TreeWindPlugin.WIND.branchAmp = 0.05 + gust * 0.10;   // whole-canopy sway grows with wind
-        TreeWindPlugin.WIND.leafAmp   = 0;                    // leaf flutter off — it wiggled the canopy edge and drove the cloud halo
+        // Sway restored to a lively amount now that the volumetric-cloud halo issue (a swinging silhouette
+        // exposing a halo the cloud depth pass couldn't follow) is resolved. Whole-canopy lean + leaf shimmer.
+        TreeWindPlugin.WIND.branchAmp = 0.12 + gust * 0.24;   // whole-canopy sway grows with wind
+        TreeWindPlugin.WIND.leafAmp   = 0.05 + gust * 0.07;   // leaf flutter back on — the canopy edge shimmers in a breeze
       }
       this._palmTime += (scene.getEngine().getDeltaTime() / 1000) * 1.4;
       PalmWindPlugin.WIND.time = this._palmTime;
@@ -545,7 +546,10 @@ export class ScatterService {
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
 
-      const layer = this.makeGlbLayer(full, imp, 130, (cx, cz) => this.buildPalms(cx, cz, v));
+      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
+      new NearFadePlugin(full.material, false);
+      if (imp.material) { new NearFadePlugin(imp.material, true); }
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v));   // full-detail radius (wider hi-detail range)
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('palms', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -585,8 +589,11 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
       this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
-      // Beeches are ~2× the palm's tris — swap to the impostor earlier (85 m vs 130 m).
-      const layer = this.makeGlbLayer(full, imp, 85, (cx, cz) => this.buildTrees(cx, cz, v));
+      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
+      new NearFadePlugin(full.material, false);
+      if (imp.material) { new NearFadePlugin(imp.material, true); }
+      // Beeches are ~2× the palm's tris, but use the SAME full-detail radius as palms (260 m) per request.
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v));   // full-detail radius (wider hi-detail range)
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -840,9 +847,12 @@ export class ScatterService {
 
   /** Per-instance stone tints (multiply the neutral-gray albedo × baked AO). Bright so they shift hue
    *  without over-darkening: granite, sandstone, basalt, red, moss, gray. */
+  // granite, sandstone, basalt, iron-stained brown, weathered gray-green (lichen), gray. KEEP IN SYNC with the
+  // GPU kernel's `tints` array in scatter-compute.ts (the rock branch). [3]/[4] were a vibrant red + moss-green
+  // that looked out of place on a tropical shore → muted to realistic stone.
   private static readonly ROCK_TINTS: ReadonlyArray<readonly [number, number, number]> = [
     [0.92, 0.94, 1.00], [1.00, 0.84, 0.58], [0.50, 0.50, 0.56],
-    [0.96, 0.56, 0.42], [0.62, 0.72, 0.50], [0.85, 0.85, 0.85],
+    [0.72, 0.58, 0.48], [0.66, 0.69, 0.63], [0.85, 0.85, 0.85],
   ];
 
   /** Load the 5 authored rock shapes (geometry-only) sharing ONE normal-mapped stone material, with a

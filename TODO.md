@@ -2,8 +2,6 @@
 
 # General or Current TODO Items
 
-* Add ship's name plaque
-* Player customizable flag colors for all vessels
 * Make cannons reload on an individual basis... allow firing of partial broadsides
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset

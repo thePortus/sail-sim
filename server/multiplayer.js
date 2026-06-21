@@ -62,6 +62,7 @@ const salvage = require('./salvage');
 const factions = require('./factions');
 const diplomacy = require('./diplomacy');
 const quest = require('./quest');
+const anchors = require('./quest-anchors');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 
 /**
@@ -419,6 +420,7 @@ async function saveEconomyState(p) {
         marketLedger: JSON.stringify({ mapVersion: moveConst.MAP_VERSION, towns: p.ledger || {} }),
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
         ship: p.ship || 'pinnace',
+        shipName: p.shipName || 'Saltmeadow',
         ...(p.questState ? { questState: quest.serializeState(p.questState) } : {}),   // quest progress (if loaded)
       },
       { where: { id: p.auth.userId } },
@@ -426,6 +428,15 @@ async function saveEconomyState(p) {
   } catch (err) {
     console.warn('[WS] saveEconomyState failed:', err.message);
   }
+}
+
+/** Clean a player-supplied ship name: strip control chars, collapse whitespace, trim, cap length. Returns '' for
+ *  anything empty/garbage (caller falls back to the default). Names need not be unique. */
+function sanitizeShipName(raw) {
+  if (typeof raw !== 'string') return '';
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
+  return cleaned.slice(0, 28);
 }
 
 /** Safe-parse the persisted combatState TEXT column → object or null. */
@@ -453,7 +464,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'crew', 'questState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -462,6 +473,10 @@ async function loadAndSendWallet(id, p, players) {
     // can't sail a hull it doesn't own. capacity/physics derive from it too.
     p.ship = (u.ship && getVesselDef(u.ship)) ? u.ship : 'pinnace';
     if (p.state) p.state.vesselSlug = p.ship;
+    // Custom ship name — server-authoritative (the 'update' handler forces the broadcast vesselName to this, so a
+    // client can't spoof it), shown to others as a label subtitle + a 3D stern nameboard. Default 'Saltmeadow'.
+    p.shipName = sanitizeShipName(u.shipName) || 'Saltmeadow';
+    if (p.state) p.state.vesselName = p.shipName;
 
     // Crew resource — clamp the saved count to the owned vessel's complement (NULL → full). crewWound is the
     // in-memory fractional-casualty accumulator (grapeshot), never persisted (a partial wound heals on relog).
@@ -527,6 +542,7 @@ function sendWallet(p) {
       catalog: economy.goodsCatalog(),
       factionRep: p.factionRep || factions.defaultRep(),
       ship: p.ship || 'pinnace',
+      shipName: p.shipName || 'Saltmeadow',   // the player's own custom ship name (for their HUD + 3D nameboard)
     }));
   }
 }
@@ -561,6 +577,15 @@ function applyQuestEvent(p, eventType, data, players) {
   } else if (r.rewardGold > 0 && p.ws.readyState === 1) {
     // A reward with NO story beat (e.g. the steer sub-stage) would otherwise land silently → a small toast.
     p.ws.send(JSON.stringify({ type: 'quest_reward', gold: r.rewardGold | 0 }));
+  }
+  // A quest just COMPLETED → the next one activated. If its first objective is "dock at town X" and the player
+  // is ALREADY docked there (e.g. sold at portB, and the combat tavern is also portB), the dock-change detector
+  // would never re-fire. Clear the tracked dock so the next update re-detects the current berth as an arrival.
+  if (r.completed && r.completed.length) { p._questDockTown = undefined; }
+  // Finishing the intro arc (the combat quest is the last one) → invite the new captain to name their ship. The
+  // client pops a rename modal (prefilled with the current name); they can keep 'Saltmeadow' or christen anew.
+  if (r.completed && r.completed.includes('intro_combat') && p.ws.readyState === 1) {
+    p.ws.send(JSON.stringify({ type: 'rename_prompt', shipName: p.shipName || 'Saltmeadow' }));
   }
   sendQuest(p);
   ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
@@ -643,6 +668,34 @@ const REP_TRADE_MAX = 8;     // cap per transaction (a fat sale can't vault your
 const PARDON_STEP          = 20;    // max points restored per petition
 const PARDON_GOLD_PER_POINT = 140;  // gold per point restored (a full 20-pt petition ≈ 2 800g)
 
+// ── Pirate bounties ───────────────────────────────────────────────────────────
+// Pirates fly no flag, so sinking one is a service to the local powers rather than an act of piracy. A pirate
+// spawns with a small purse (npc PIRATE_SEED_GOLD) and grows richer + more wanted as it raids: each merchant it
+// sinks adds a cut of that merchant's gold to its hold AND raises the price on its head (PIRATE_BOUNTY_PER_KILL).
+// The player who sinks it collects a salvage crate worth its full hold + head-bounty (pirate.gold + pirate.bounty),
+// and earns standing with the nation(s) whose waters it menaced (any faction with a town within
+// PIRATE_PROTECT_RANGE of the wreck; if none that close, the nearest town's nation).
+const PIRATE_BOUNTY_PER_KILL = 300;  // the head-bounty rises by this for every merchant the pirate sends down
+const PIRATE_LOOT_CUT        = 0.3;  // fraction of a sunk merchant's gold the pirate pockets into its own hold
+const PIRATE_BOUNTY_REP      = 22;   // standing earned with EACH protecting faction (decently large — a real lever)
+const PIRATE_PROTECT_RANGE   = 1500; // a faction with a town within this of the kill shares the bounty rep
+
+/** Faction ids that reward sinking a pirate at (x,z): every faction owning a town within PIRATE_PROTECT_RANGE; or,
+ *  if none is that near, the single faction owning the nearest town. Returns a (possibly empty) deduped array. */
+function protectingFactions(x, z) {
+  const within = new Set();
+  let nearestF = null, nearestD2 = Infinity;
+  const R2 = PIRATE_PROTECT_RANGE * PIRATE_PROTECT_RANGE;
+  for (const t of economy.townList()) {
+    if (!t.faction) continue;
+    const dx = t.x - x, dz = t.z - z, d2 = dx * dx + dz * dz;
+    if (d2 <= R2) within.add(t.faction);
+    if (d2 < nearestD2) { nearestD2 = d2; nearestF = t.faction; }
+  }
+  if (within.size) return [...within];
+  return nearestF ? [nearestF] : [];
+}
+
 /** Award `gain` standing with `factionId` to `player` and push the live readout. Returns the delta map (or null). */
 function awardFactionRep(player, factionId, gain, reason) {
   if (!player || player.isNpc || !factions.isFaction(factionId) || gain <= 0) return null;
@@ -673,7 +726,17 @@ function sendMarket(p, townId) {
   const mk = economy.marketFor(townId);
   if (!mk) { p.ws.send(JSON.stringify({ type: 'trade_error', reason: 'no_town' })); return; }
   recordVisit(p, mk);   // ledger keeps the town's BASE prices (comparable across players + the demand hint)
-  const hint = economy.hintFor(townId);
+  let hint = economy.hintFor(townId);
+  // Intro tutorial: keep the new player LOCAL — point the sell-hint at the nearby neighbour port (portB) so they
+  // don't chase the global best buyer across the map. Falls back to the normal hint if portB buys none of this
+  // town's exports.
+  if (p.questState && quest.activeQuestId(p.questState) === 'intro_trade') {
+    const a = anchors.getAnchors();
+    if (a && a.portB && a.portB !== townId) {
+      const near = economy.hintToTown(townId, a.portB);
+      if (near) { hint = near; }
+    }
+  }
   // Display the quote nudged by THIS player's standing with the town's nation — matches what tradeCore charges.
   const shown = economy.playerMarket(p, townId, mk);
   p.ws.send(JSON.stringify({
@@ -794,7 +857,12 @@ function attachMultiplayer(server) {
         }
       }
     }
-    npc.spawnerTick(players); // keep the merchant fleet topped up (spawns at town piers)
+    // Keep the merchant fleet + pirates topped up, and dispatch navy hunters at lane-strangling pirates. The
+    // launch is telegraphed to everyone (a notable world event — the powers strike back at a notorious raider).
+    npc.spawnerTick(players, (faction, townName, pirateName) => {
+      const nation = factions.factionName(faction) || townName || 'A';
+      broadcastSystem(`⚔ The ${nation} Navy dispatches a pirate hunter to run down ${pirateName}!`);
+    });
     for (const cid of salvage.sweepExpired(Date.now())) broadcastSalvageDespawn(cid);   // drop expired crates
 
     // Mast self-repair: jury-rig a shot-away mast back to 50 % after 45 s. tickMastRepair arms the timer
@@ -883,14 +951,14 @@ function attachMultiplayer(server) {
 
     const { justSunk } = combat.applyDamage(victim.combat, hit.zone, hit.dmg);
 
-    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). Only a PLAYER
-    // hit provokes it — collateral from another NPC's shot doesn't spark merchant-vs-merchant brawls. The
-    // tactical helm + return fire that consume this state live in the NPC tick (A2–A4); here we just arm it.
-    if (victim.isNpc && shooter && !shooter.isNpc) {
+    // NP-combat: a struck merchant turns on its attacker (timed grudge; refreshed per hit). A PLAYER hit provokes
+    // it; so does a PIRATE's hit (so merchants fight/flee raiders), but ordinary merchant-vs-merchant collateral
+    // does not. The tactical helm + return fire that consume this live in the NPC tick (A2–A4); here we just arm it.
+    if (victim.isNpc && shooter && (!shooter.isNpc || shooter.isPirate)) {
       npc.markHostile(victim, shot.shooterId, Date.now());
-      // Piracy reputation (D2): a connecting shot on a nation's merchant dings your standing. The killing blow
-      // is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
-      if (!justSunk && victim.faction && !victim.questTag) awardPiracyRep(shooter, victim.faction, 'attack');
+      // Piracy reputation (D2): a connecting PLAYER shot on a nation's merchant dings your standing. The killing
+      // blow is handled by the 'sink' tier below (don't double-charge it), so only award the 'attack' tier here.
+      if (!shooter.isNpc && !justSunk && victim.faction && !victim.questTag) awardPiracyRep(shooter, victim.faction, 'attack');
     }
 
     // Cosmetics: everyone sees the splinters/fire/shudder on the struck ship.
@@ -914,6 +982,15 @@ function attachMultiplayer(server) {
       });
       for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(sunkMsg);   // everyone sees the capsize
 
+      // A PIRATE that just sent a MERCHANT down plunders its chest (a cut into the pirate's own hold) and earns a
+      // higher price on its head — so a raider that's been preying on shipping is worth a fatter payout when a
+      // player finally hunts it down, and its merchant tally (piracyKills) drives the navy-hunter threshold.
+      if (shooter && shooter.isPirate && victim.isNpc && !victim.isPirate && !victim.isHunter) {
+        shooter.gold        = (shooter.gold | 0) + Math.floor((victim.gold || 0) * PIRATE_LOOT_CUT);
+        shooter.bounty      = (shooter.bounty | 0) + PIRATE_BOUNTY_PER_KILL;
+        shooter.piracyKills = (shooter.piracyKills | 0) + 1;
+      }
+
       // Quest: the OWNER sinking their intro-tutorial target completes the combat quest. The sunk hull lingers
       // for the capsize animation then despawns via the NPC tick; just clear the ref so it isn't respawned.
       if (shooter && !shooter.isNpc && victim.questTag === 'tutorial'
@@ -922,7 +999,24 @@ function attachMultiplayer(server) {
         shooter.tutorialNpcId = null;
       }
 
-      if (victim.isNpc) {
+      if (victim.isPirate) {
+        // A pirate sank → its full hold + the price on its head (gold + bounty) floats at the wreck, and the
+        // player who rid these waters of it earns standing with the protecting nation(s): every faction with a
+        // town within PIRATE_PROTECT_RANGE, or the nearest town's nation if none is that close.
+        const bounty = (victim.gold | 0) + (victim.bounty | 0);
+        const crate = salvage.spawnCrate(victim.state.x, victim.state.z, {}, bounty, Date.now());
+        const spawnMsg = JSON.stringify({ type: 'salvage_spawn', id: crate.id, x: crate.x, z: crate.z });
+        for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(spawnMsg);
+        if (shooter && !shooter.isNpc) {
+          const fids = protectingFactions(victim.state.x, victim.state.z);
+          for (const fid of fids) awardFactionRep(shooter, fid, PIRATE_BOUNTY_REP, 'pirate');
+          const nations = fids.map((f) => factions.factionName(f)).join(', ');
+          sysReply(shooter.ws, `You sank the pirate ${victim.state.vesselName || 'raider'}! A bounty of ${bounty} gold floats among the wreckage`
+            + (nations ? ` — the ${nations} are grateful.` : '.'));
+          saveEconomyState(shooter);
+        }
+        victim.sinkAt = Date.now();   // the NPC tick removes it after the capsize plays
+      } else if (victim.isNpc) {
         // A merchant sank → drop floating salvage (a fraction of its cargo + gold) at the wreck; the ship is
         // despawned after a short capsize-linger by the NPC tick. Anyone can sail over and collect.
         const LOOT = 0.5;
@@ -1049,7 +1143,9 @@ function attachMultiplayer(server) {
           anchored:   !!msg.anchored,
           anchorSide: msg.anchorSide === 'P' ? 'P' : 'S',
           sailState:  ['reefed','topsails','full'].includes(msg.sailState) ? msg.sailState : 'full',
-          vesselName: String(msg.vesselName ?? '').slice(0, 64),
+          // Ship-name authority: the broadcast vesselName is the server's stored custom name (set via
+          // set_ship_name + persisted), NOT the client's claim — so a client can't spoof another's nameplate.
+          vesselName: players.get(id)?.shipName || 'Saltmeadow',
           // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
           // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
           // bought. capacity + movement physics then derive from the real hull.
@@ -1405,6 +1501,49 @@ function attachMultiplayer(server) {
               reply(true, { shipId: np.id, slug: np.state.vesselSlug, from: srcT ? srcT.name : null, to: sel.destT.name });
             }
           }
+        }
+
+      } else if (msg.type === 'pirate_report') {
+        // Tavern: ask after pirate activity. Marks the NEAREST pirate on the player's map (a separate mark from
+        // the merchant rumour, so they don't clobber each other) and reports its bounty, the number of vessels
+        // it's sunk, its rig, and its name. Must be docked.
+        const me = players.get(id);
+        if (me) {
+          const reply = (ok, data) => {
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'pirate_report_result', ok, ...(data || {}) }));
+          };
+          if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { reply(false, { reason: 'not_docked' }); }
+          else {
+            const px = me.authPose.x, pz = me.authPose.z;
+            let best = null, bestD2 = Infinity;
+            for (const [, p] of players) {
+              if (!p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+              const dx = p.state.x - px, dz = p.state.z - pz, d2 = dx * dx + dz * dz;
+              if (d2 < bestD2) { bestD2 = d2; best = p; }
+            }
+            if (!best) { reply(false, { reason: 'no_pirates' }); }
+            else {
+              me.pirateMarkId = best.id;   // force-streamed + map-marked for this player (see broadcastInterest)
+              reply(true, {
+                shipId: best.id, slug: best.state.vesselSlug, name: best.state.vesselName,
+                kills: best.piracyKills | 0, bounty: (best.gold | 0) + (best.bounty | 0),
+              });
+            }
+          }
+        }
+
+      } else if (msg.type === 'set_ship_name') {
+        // Name / rename the player's ship. Server-authoritative + persisted; the new name rides the next pose
+        // broadcast (vesselName is forced from p.shipName), so everyone's label + 3D nameboard updates. A pose
+        // is pushed immediately so it doesn't wait for the player's ~100 ms update tick.
+        const me = players.get(id);
+        if (me) {
+          const name = sanitizeShipName(msg.shipName) || 'Saltmeadow';
+          me.shipName = name;
+          if (me.state) me.state.vesselName = name;
+          saveEconomyState(me);
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
+          if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
         }
 
       } else if (msg.type === 'trade_open') {

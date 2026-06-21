@@ -14,6 +14,7 @@
 
 const nav = require('./nav');
 const economy = require('./economy');
+const quest = require('./quest');   // to shield intro-tutorial players from pirate aggro
 const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
@@ -26,7 +27,15 @@ const DEG = Math.PI / 180;
 // well-armed prize) shows up at ~1-in-5. Duplicates set the odds via the uniform pick().
 const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
-  'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne'];
+  'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
+  'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',
+  'Industry', 'Diligence', 'Amity', 'Concord', 'Providence', 'Swift Return', 'Golden Hind', 'Silver Fox',
+  'Morning Star', 'Evening Tide', 'Brittania', 'Saint Elmo', 'Notre Dame', 'La Belle', 'Esperanza',
+  'Buena Ventura', 'Santa Lucia', 'Maria Galante', 'Zeelandia', 'Vrijheid', 'Goede Hoop', 'Batavia',
+  'Cinnamon', 'Nutmeg Lass', 'Pepperpot', 'Sugar Isle', 'Molasses', 'Tobacco Maid', 'Cotton Bale',
+  'Rum Runner', 'Salt Cod', 'Whitehaven', 'Bristol Maid', 'Liverpool Belle', 'Plymouth Hope',
+  'Sea Wren', 'Kittiwake', 'Fulmar', 'Shearwater', 'Guillemot', 'Mary Rose', 'Jolly Trader',
+  'Honest Penny', 'Fair Wind', 'Sea Sprite', 'Nimble', 'Patient Jane', 'Bonny Kate', 'Adventure'];
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
 const AVOID_R = 140;         // world units: NPC↔NPC separation radius
 // Interest management — a client only RECEIVES (and so only renders) the nearest few merchants. Distant ships
@@ -62,9 +71,9 @@ let seq = 0;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 
-// Fleet size scales with the number of towns. Bumped (8–15 → 11–20, 0.25 → 0.33/town) to offset the
-// wind-bound merchants now sailing ~40% slower + tacking upwind, so overall trade throughput holds up.
-function targetFleet(townCount) { return Math.max(11, Math.min(20, Math.round(townCount * 0.5))); }
+// Fleet size scales with the number of towns. DOUBLED (11–20 → 22–40, 0.5 → 1.0/town) for a busier sea —
+// interest management (MAX_VISIBLE) still bounds the client draw cost, so a denser fleet is free to render.
+function targetFleet(townCount) { return Math.max(22, Math.min(40, Math.round(townCount * 1.0))); }
 
 // ── Convoys ───────────────────────────────────────────────────────────────────────────────────────────────
 // Some "fleet slots" spawn as a CONVOY of 2–3 merchants that travel together (escorts trail the leader in
@@ -87,14 +96,59 @@ const ANNOUNCE_COOLDOWN_MS   = 25000;
 const convoyTele = new Map();      // convoyId → { prevStance, lastAnnounce } (telegraph transition state)
 const NPC_DEBUG = process.env.NPC_DEBUG === '1';   // NPC_DEBUG=1 → log convoy tactical decisions for tuning/verification
 
-/** Fleet-slot count: each solo merchant is one slot, each distinct convoy is ONE slot (regardless of 2–3 ships). */
+// ── Pirates (unaligned raiders) ──────────────────────────────────────────────────────────────────────────────
+// Pirates fly NO nation's flag (faction null). Each haunts a fixed patch of sea (its "lair") and only leaves to
+// run down any vessel — player OR merchant — that blunders within PIRATE_AGGRO_RANGE, then returns to loiter. They
+// fight hard (high skill, only break off when nearly crippled) and a touch faster than a laden merchant. Sinking
+// one yields a gold bounty (richer if it had already plundered ships) + standing with the nation(s) it menaced.
+// Pirates are a SEPARATE population from the merchant fleet target (they don't count toward npcCount).
+const PIRATE_SLUGS = ['sloop', 'sloop', 'pinnace', 'brig'];   // fast raiders, with the odd heavy brig
+const PIRATE_FIRST = ['Black', 'Red', 'Mad', 'Bloody', 'One-Eyed', 'Calico', 'Long', 'Iron', 'Cutthroat', 'Salty',
+  'Crooked', 'Dead-Eye', 'Gentleman', 'Rackham', 'Bartholomew', 'Edward', 'Henry', 'William', 'Israel', 'Charles',
+  'Roberto', 'Diego', 'Jean', 'Pierre', 'Klaas', 'Hendrik', 'Black-Hearted', 'Grim', 'Savage', 'Wicked'];
+const PIRATE_LAST = ['Flint', 'Teach', 'Bonnet', 'Roberts', 'Hands', 'Vane', 'Rackham', 'Kidd', 'Morgan', 'Read',
+  'Bonny', 'Low', 'Gibbs', 'Sparrow', 'Barbossa', 'Scarfield', 'Bellamy', 'Avery', 'Drake', 'Sawkins',
+  'Magpie', 'Crow', 'Shark', 'Bones', 'Gallows', 'Reaper', 'Hook', 'Ironside', 'Blackwood', 'Skullbreaker'];
+const PIRATE_AGGRO_RANGE = 300;   // a vessel within this of a pirate triggers the chase
+const PIRATE_GIVE_UP     = 560;   // lose a quarry that opens past this from the pirate
+const PIRATE_LEASH       = 950;   // dragged this far from its lair → break off and return home
+const PIRATE_LAIR_R      = 240;   // loiter radius it orbits around its haunt
+const PIRATE_FLEE_HEALTH = 0.22;  // a bold raider only runs when nearly crippled
+const PIRATE_SKILL       = 0.72;  // sharp gunnery + tough nerve (still beatable)
+const PIRATE_CRUISE      = 0.85;  // speed cap (vs MERCHANT_CRUISE) — fast enough to run down shipping, under a trimmed player
+const PIRATE_VIS_R       = 900;   // always render a pirate within this of a player (it may be hunting them), past the nearest-N cutoff
+const PIRATE_VIS_R2      = PIRATE_VIS_R * PIRATE_VIS_R;
+function targetPirates(townCount) { return Math.max(3, Math.min(8, Math.round(townCount * 0.18))); }
+
+// ── Pirate hunters (navy warships) ───────────────────────────────────────────────────────────────────────────
+// A pirate that's STRANGLING a shipping lane (sunk ≥ PIRATE_HUNT_THRESHOLD merchants) draws a heavy navy warship
+// from the nearest faction town — launched to hunt that specific pirate down. The threshold delay gives a PLAYER
+// first crack at the bounty; the hunter is built to WIN (a brig, veteran skill, a shade faster than the pirate).
+// When its quarry is dead (or gone) it sails back to its home port and vanishes — one hunter per pirate.
+const HUNTER_NAMES = ['Vengeance', 'Retribution', 'Intrepid', 'Vigilant', 'Defiance', 'Sentinel', 'Avenger',
+  'Indomitable', 'Relentless', 'Dauntless', 'Tempest', 'Valiant', 'Conqueror', 'Fury', 'Implacable', 'Resolute'];
+const PIRATE_SEED_GOLD = 200;      // a pirate spawns with this small purse; its bounty + plundered gold grow as it raids
+const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a navy hunter (players get first crack)
+const HUNTER_SKILL    = 0.95;      // veteran navy gunnery + nerve (built to win the duel)
+const HUNTER_CRUISE   = 0.9;       // a shade faster than the pirate (0.85) so it can run it down
+const HUNTER_APPROACH = 220;       // within this it jockeys for a broadside; beyond, it bears straight for the pirate
+
+/** Fleet-slot count of MERCHANTS: each solo merchant is one slot, each distinct convoy is ONE slot (regardless of
+ *  2–3 ships). Pirates are a separate population and are excluded. */
 function npcCount(players) {
   let solo = 0; const convoys = new Set();
   for (const [, p] of players) {
-    if (!p.isNpc) continue;
+    if (!p.isNpc || p.isPirate || p.isHunter) continue;   // pirates + navy hunters are separate populations
     if (p.convoyId) convoys.add(p.convoyId); else solo++;
   }
   return solo + convoys.size;
+}
+
+/** Live pirate count (separate population from the merchant fleet). */
+function pirateCount(players) {
+  let n = 0;
+  for (const [, p] of players) if (p.isPirate) n++;
+  return n;
 }
 
 /** Heading (deg, atan2(x,z) convention) from a→b. */
@@ -576,6 +630,80 @@ function escapeHeading(npc, foe, wind, ph) {
   return best;
 }
 
+// ── Pirate helm ──────────────────────────────────────────────────────────────────────────────────────────────
+/** Nearest valid PREY (a player or a non-pirate merchant NPC, not sunk) within `maxR2` of the pirate, or null. */
+function nearestPrey(pirate, players, maxR2) {
+  let best = null, bestD2 = maxR2;
+  for (const [, p] of players) {
+    if (p === pirate || p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (!p.isNpc && p.questState && quest.inIntro(p.questState)) continue;   // leave brand-new captains alone until the tutorial's done
+    const dx = p.state.x - pirate.state.x, dz = p.state.z - pirate.state.z, d2 = dx * dx + dz * dz;
+    if (d2 < bestD2) { bestD2 = d2; best = p; }
+  }
+  return best;
+}
+
+/** A pirate's per-tick decision: HUNT a quarry it's chasing (jockey for a broadside; only run when nearly crippled)
+ *  or, with no quarry, ORBIT its lair (which also carries it home after it breaks off a chase). It acquires any
+ *  vessel that closes within PIRATE_AGGRO_RANGE, keeps the grudge until the foe escapes (GIVE_UP) or it's dragged
+ *  too far from home (LEASH), then returns. Sets npc.engaged/fleeing for the shared gunnery + speed model below;
+ *  returns { desired, foe }. */
+function pirateHelm(npc, players, wind, ph, nowMs) {
+  const lair = npc.lair || (npc.lair = { x: npc.state.x, z: npc.state.z });
+  // Retain or drop the current quarry.
+  let foe = npc.pirateTarget ? players.get(npc.pirateTarget) : null;
+  if (foe) {
+    const gone = !foe.state || (foe.combat && foe.combat.sunk) || foe.isPirate;
+    const dxF = foe.state ? foe.state.x - npc.state.x : 0, dzF = foe.state ? foe.state.z - npc.state.z : 0;
+    const dxL = npc.state.x - lair.x, dzL = npc.state.z - lair.z;
+    const lost    = gone || (dxF * dxF + dzF * dzF) > PIRATE_GIVE_UP * PIRATE_GIVE_UP;   // foe broke contact
+    const strayed = (dxL * dxL + dzL * dzL) > PIRATE_LEASH * PIRATE_LEASH;               // dragged too far from home
+    if (lost || strayed) { foe = null; npc.pirateTarget = null; }
+  }
+  // Acquire a fresh quarry that's blundered into the haunt (only while not already chasing one).
+  if (!foe) {
+    const prey = nearestPrey(npc, players, PIRATE_AGGRO_RANGE * PIRATE_AGGRO_RANGE);
+    if (prey) { foe = prey; npc.pirateTarget = prey.id; }
+  }
+  if (foe) {
+    npc.engaged = true;
+    const flee = hullFraction(npc.combat) < PIRATE_FLEE_HEALTH;   // nearly crippled → run
+    npc.fleeing = flee;
+    return { desired: flee ? escapeHeading(npc, foe, wind, ph) : engageHeading(npc, foe, wind, ph), foe };
+  }
+  // No quarry: slowly orbit the lair. The orbit point sits near home, so a pirate far from its haunt (just off a
+  // chase) naturally steers back toward it; once home it circles, holding station until the next victim sails by.
+  npc.engaged = false; npc.fleeing = false; npc.pirateTarget = null; npc.raking = false;
+  npc.patrolPhase = (npc.patrolPhase || 0) + 0.015;
+  const px = lair.x + Math.cos(npc.patrolPhase) * PIRATE_LAIR_R * 0.7;
+  const pz = lair.z + Math.sin(npc.patrolPhase) * PIRATE_LAIR_R * 0.7;
+  let desired = headingTo(npc.state.x, npc.state.z, px, pz);
+  desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);
+  return { desired, foe: null };
+}
+
+// ── Pirate-hunter helm ───────────────────────────────────────────────────────────────────────────────────────
+/** A navy hunter's per-tick decision: relentlessly run down its assigned pirate (bear straight for it when far,
+ *  jockey for a broadside once within HUNTER_APPROACH), then — once the quarry is dead/gone — sail HOME to its
+ *  origin port and vanish (sets npc._despawn on arrival, handled by the caller). Returns { desired, foe }. */
+function hunterHelm(npc, players, wind, ph) {
+  const target = npc.huntTarget ? players.get(npc.huntTarget) : null;
+  const alive = !!(target && target.isPirate && target.state && !(target.combat && target.combat.sunk));
+  if (alive && !npc.returning) {
+    npc.engaged = true; npc.fleeing = false;
+    const dist = Math.hypot(target.state.x - npc.state.x, target.state.z - npc.state.z);
+    const desired = dist > HUNTER_APPROACH
+      ? tackedHeading(headingTo(npc.state.x, npc.state.z, target.state.x, target.state.z), wind.windBearing, ph.minTackAngle, npc)
+      : engageHeading(npc, target, wind, ph);
+    return { desired, foe: target };
+  }
+  // Quarry dead or gone → mission accomplished: make for home port and pay off (despawn on arrival).
+  npc.returning = true; npc.engaged = false; npc.fleeing = false; npc.raking = false;
+  const o = npc.origin || { x: npc.state.x, z: npc.state.z };
+  if (Math.hypot(o.x - npc.state.x, o.z - npc.state.z) < ARRIVE_M * 2) { npc._despawn = true; return { desired: npc.state.heading, foe: null }; }
+  return { desired: tackedHeading(headingTo(npc.state.x, npc.state.z, o.x, o.z), wind.windBearing, ph.minTackAngle, npc), foe: null };
+}
+
 // ── Gunnery (A3) — the merchant returns fire ────────────────────────────────────────────────────────────────
 // When a gun bears (target roughly abeam) and within range, the NPC computes a leading ballistic solution at
 // fixed muzzle speed, scatters it for moderate accuracy, and hands the shot to the server's shared adjudicator
@@ -779,11 +907,27 @@ function makeTutorialTarget(players, owner) {
   m.questTag = 'tutorial'; m.questOwnerId = (owner.auth && owner.auth.userId) ?? null;
   m.state.vesselName = 'a lone pinnace';
   m.physics = { ...(m.physics || {}), maxSpeed: (((m.physics && m.physics.maxSpeed) || 6) * 0.6) };   // catchable
-  // Reposition ~700 m off the owner on navigable water.
-  const ang = Math.random() * Math.PI * 2;
-  let sx = op.x + Math.cos(ang) * 700, sz = op.z + Math.sin(ang) * 700;
-  const pc = nav.worldToCell(sx, sz), sn = nav.snapToNav(pc.cx, pc.cz);
-  if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+  // Spawn it SOMEWHAT NEAR the owner (~520 m) on navigable water they can actually sail to: try 8 bearings,
+  // snap each to the sea, require sea-reachability from the owner (no land wall between), keep the CLOSEST valid
+  // one — so the marked prey is reliably nearby, not flung across a bay by a bad snap.
+  const DIST = 520;
+  const a0 = Math.random() * Math.PI * 2;
+  let sx = op.x, sz = op.z, bestD2 = Infinity, found = false;
+  for (let k = 0; k < 8; k++) {
+    const ang = a0 + (k / 8) * Math.PI * 2;
+    const tx = op.x + Math.cos(ang) * DIST, tz = op.z + Math.sin(ang) * DIST;
+    const pc = nav.worldToCell(tx, tz), sn = nav.snapToNav(pc.cx, pc.cz);
+    if (!sn) continue;
+    const w = nav.cellToWorld(sn.cx, sn.cz);
+    if (!nav.reachable(op.x, op.z, w.x, w.z)) continue;            // must be sailable to (no land barrier)
+    const d2 = (w.x - op.x) ** 2 + (w.z - op.z) ** 2;
+    if (d2 < bestD2) { bestD2 = d2; sx = w.x; sz = w.z; found = true; }
+  }
+  if (!found) {                                                    // fallback: a single snapped offset (rare)
+    const tx = op.x + Math.cos(a0) * DIST, tz = op.z + Math.sin(a0) * DIST;
+    const pc = nav.worldToCell(tx, tz), sn = nav.snapToNav(pc.cx, pc.cz);
+    if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+  }
   m.state.x = sx; m.state.z = sz; m.authPose.x = sx; m.authPose.z = sz;
   for (const z in m.combat.zones) { m.combat.zones[z] = Math.max(1, Math.round(m.combat.zones[z] * 0.4)); m.combat.maxHp[z] = m.combat.zones[z]; }
   return m;
@@ -824,6 +968,99 @@ function spawnConvoy(players, towns) {
     if (i === 0) leader = m;
   }
   return leader;
+}
+
+/** Pick a pirate lair: a patch of open, navigable water a fair way out from a random town (where shipping passes,
+ *  but not on the pier). Tries several offsets and snaps each to the sea; returns {x,z} or null if none stuck. */
+function pickLair(towns) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const t = pick(towns);
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 650 + Math.random() * 950;                 // ~0.65–1.6 km off a town (in the sea lanes)
+    const tx = t.x + Math.cos(ang) * dist, tz = t.z + Math.sin(ang) * dist;
+    const pc = nav.worldToCell(tx, tz), sn = nav.snapToNav(pc.cx, pc.cz);
+    if (!sn) continue;
+    const w = nav.cellToWorld(sn.cx, sn.cz);
+    const dx = w.x - t.x, dz = w.z - t.z;
+    if (dx * dx + dz * dz < 350 * 350) continue;            // not right on top of the town
+    return { x: w.x, z: w.z };
+  }
+  return null;
+}
+
+/** Build + register one unaligned PIRATE at `lair`. Unique first+last name, no faction, no cargo; haunts the lair
+ *  and runs down any vessel that strays within PIRATE_AGGRO_RANGE (see pirateHelm). `pirateLoot` tallies the gold
+ *  it plunders so a well-fed pirate is worth a fatter bounty when a player finally sinks it. */
+function makePirate(players, lair, slug) {
+  const id = 'npc_' + (++seq);
+  const sx = lair.x, sz = lair.z;
+  const npc = {
+    id, isNpc: true, isPirate: true, ws: { readyState: 3 }, faction: null,
+    state: {
+      x: sx, z: sz, heading: Math.random() * 360, speed: 0, turnRate: 0, sheetAngle: 0,
+      isPortTack: false, anchored: false, sailState: 'full',
+      vesselName: pick(PIRATE_FIRST) + ' ' + pick(PIRATE_LAST), vesselSlug: slug, callsign: '',
+    },
+    authPose: { x: sx, z: sz, heading: 0, speed: 0 },
+    combat: combat.newCombatState(slug),
+    lastUpdateMs: Date.now(),
+    physics: getVesselDef(slug)?.physics || { maxSpeed: 8, accelerationRate: 0.28, minTackAngle: 36, sailAreaFactor: 0.34 },
+    tack: 1, route: null, routeIdx: 0, curTownId: null, legTarget: null,
+    gold: PIRATE_SEED_GOLD, cargo: {}, trip: null, phase: null,
+    hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
+    maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
+    convoyId: null, convoyRole: null, convoySlot: 0,
+    skill: PIRATE_SKILL, combatRole: 'pirate',
+    // Pirate-specific: a fixed haunt, the current quarry id, an orbit phase. `gold` grows as it plunders merchants;
+    // `bounty` is the price on its head (rises per merchant sunk); `piracyKills` counts merchants for the hunter
+    // threshold + the tavern report. Player payout for sinking it = gold + bounty.
+    lair: { x: lair.x, z: lair.z }, pirateTarget: null, patrolPhase: Math.random() * Math.PI * 2,
+    bounty: 0, piracyKills: 0,
+  };
+  players.set(id, npc);
+  return npc;
+}
+
+/** Nearest town owning a faction to (x,z), or null if no faction holds a town. */
+function nearestFactionTown(towns, x, z) {
+  let best = null, bd = Infinity;
+  for (const t of towns) {
+    if (!t.faction) continue;
+    const dx = t.x - x, dz = t.z - z, d = dx * dx + dz * dz;
+    if (d < bd) { bd = d; best = t; }
+  }
+  return best;
+}
+
+/** Launch a navy PIRATE HUNTER from `town` after `pirate`: a heavy brig (≥ any pirate's power), veteran skill,
+ *  flying `town`'s flag. It remembers its origin so it can sail home + pay off once the pirate is dead (hunterHelm).
+ *  Labelled "<Nation> Navy — Pirate Hunter" on the client. */
+function makeHunter(players, town, pirate) {
+  const id = 'npc_' + (++seq);
+  const slug = 'brig';   // a navy warship — equal or greater power than any pirate rig
+  const sx = town.x, sz = town.z;
+  const npc = {
+    id, isNpc: true, isHunter: true, ws: { readyState: 3 }, faction: town.faction,
+    state: {
+      x: sx, z: sz, heading: Math.random() * 360, speed: 0, turnRate: 0, sheetAngle: 0,
+      isPortTack: false, anchored: false, sailState: 'full',
+      vesselName: pick(HUNTER_NAMES), vesselSlug: slug, callsign: '',
+    },
+    authPose: { x: sx, z: sz, heading: 0, speed: 0 },
+    combat: combat.newCombatState(slug),
+    lastUpdateMs: Date.now(),
+    physics: getVesselDef(slug)?.physics || { maxSpeed: 8, accelerationRate: 0.28, minTackAngle: 36, sailAreaFactor: 0.34 },
+    tack: 1, route: null, routeIdx: 0, curTownId: town.id, legTarget: null,
+    gold: 0, cargo: {}, trip: null, phase: null,
+    hostileToward: null, aggroUntil: 0, lastShotAt: 0, shotSeq: 0,
+    maxCrew: crewFor(slug), crew: crewFor(slug), crewWound: 0,
+    convoyId: null, convoyRole: null, convoySlot: 0,
+    skill: HUNTER_SKILL, combatRole: 'hunter',
+    // Hunter-specific: the pirate it's tasked to kill, its home port, and whether it's on the way back to pay off.
+    huntTarget: pirate.id, origin: { x: town.x, z: town.z }, homeTownId: town.id, returning: false,
+  };
+  players.set(id, npc);
+  return npc;
 }
 
 /** Route the NPC from its current position to `town`. Returns true if a route was found. */
@@ -983,8 +1220,19 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     }
 
     const ph = npc.physics;
-    let desired;
+    let desired, foe = null;
     npc.raking = false;   // re-armed by engageHeading each tick it actually has a rake; cleared otherwise
+    if (npc.isPirate) {
+    // Pirates ignore trade routes + nation rep entirely: they hunt any vessel that nears their lair, else loiter
+    // there (pirateHelm sets engaged/fleeing + returns the quarry for the shared gunnery + speed model below).
+    const r = pirateHelm(npc, players, wind, ph, nowMs);
+    desired = r.desired; foe = r.foe;
+    } else if (npc.isHunter) {
+    // Navy pirate-hunter: run the assigned pirate down, then sail home + pay off (despawn on arrival).
+    const r = hunterHelm(npc, players, wind, ph);
+    desired = r.desired; foe = r.foe;
+    if (npc._despawn) { players.delete(npc.id); broadcastLeave(npc.id); continue; }   // reached home port → mission over
+    } else {
     // D3: react to the right threat — a PROVOKED attacker (was fired on) or a nation-HATED player within range —
     // with the stance set by RELATIVE STRENGTH: fight if it can hold its own, flee/avoid if outmatched or badly
     // hurt, or just hold the trade lane (route) while a hated stranger lurks beyond ENGAGE_RANGE.
@@ -1001,7 +1249,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
       threat = findThreat(npc, players, nowMs);
       stance = threat ? combatStance(npc, threat.foe, threat.provoked) : 'route';
     }
-    const foe = (stance === 'fight' || stance === 'flee') ? threat.foe : null;
+    foe = (stance === 'fight' || stance === 'flee') ? threat.foe : null;
     if (foe) {
       // Combat helm: jockey for a broadside when fighting (A2), bear off and run when fleeing (A4). BOTH stay
       // "engaged" so the gunnery arc gate can still loose a parting broadside while running. An UNPROVOKED merchant
@@ -1046,6 +1294,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
         desired = tackedHeading(desired, wind.windBearing, ph.minTackAngle, npc);   // zig-zag through upwind legs
       }
     }
+    }   // end merchant (non-pirate) branch
     const avoid = avoidanceHeading(npc, fleet);
     if (avoid !== null) desired = blendHeading(desired, avoid, 0.45);
     desired = avoidLand(npc, desired);   // never steer through land — round the shore (incl. in combat)
@@ -1096,7 +1345,8 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     const drag   = DRAG_K * vNow * Math.abs(vNow) + TURN_SCRUB * Math.abs(npc.yawRate || 0) * Math.abs(vNow);
     const massK  = Math.max(0.2, (ph.weight || WEIGHT_REF) / WEIGHT_REF);
     let sp = vNow + (thrust - drag) * FORCE_RESPONSE / massK * dtSec;
-    sp = Math.max(-1.5, Math.min(ph.maxSpeed * MERCHANT_CRUISE, sp));              // merchants never hit full speed
+    const cruiseCap = npc.isHunter ? HUNTER_CRUISE : npc.isPirate ? PIRATE_CRUISE : MERCHANT_CRUISE;   // hunters fastest (run the pirate down), pirates next
+    sp = Math.max(-1.5, Math.min(ph.maxSpeed * cruiseCap, sp));                    // NPCs never hit a trimmed player's full speed
     npc.state.speed = Math.abs(sp) < 0.001 ? 0 : sp;
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
@@ -1130,9 +1380,14 @@ function broadcastInterest(players, nowMs) {
   const msgCache = new Map();
   const msgFor = (n) => {
     let m = msgCache.get(n.id);
-    if (!m) { m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, faction: n.faction || null, ts: nowMs, seq: 0 }); msgCache.set(n.id, m); }
+    if (!m) {
+      m = JSON.stringify({ type: 'update', id: n.id, ...n.state, npc: true, faction: n.faction || null,
+        role: n.isPirate ? 'pirate' : n.isHunter ? 'hunter' : 'merchant', ts: nowMs, seq: 0 });
+      msgCache.set(n.id, m);
+    }
     return m;
   };
+  const merchants = npcs.filter((n) => !n.isPirate && !n.isHunter);   // pirates + navy hunters aren't trade ships → out of the merchant map feeds
   // Full-fleet map feed for staff: Owners/Admins get every merchant's position on the minimap (render is still
   // interest-managed below — this is map markers only, no extra ships built). Built once, reused for all staff.
   let allMsg = null;
@@ -1140,7 +1395,7 @@ function broadcastInterest(players, nowMs) {
     if (allMsg === null) {
       allMsg = JSON.stringify({
         type: 'all_merchants',
-        ships: npcs.map((n) => ({ x: +n.state.x.toFixed(1), z: +n.state.z.toFixed(1) })),
+        ships: merchants.map((n) => ({ x: +n.state.x.toFixed(1), z: +n.state.z.toFixed(1) })),
       });
     }
     return allMsg;
@@ -1148,20 +1403,28 @@ function broadcastInterest(players, nowMs) {
   for (const [, p] of players) {
     if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
     const near = [];
-    let nrX = null, nrZ = null, nrD2 = Infinity;   // the single GLOBAL nearest merchant (any distance, for the map)
+    let nrX = null, nrZ = null, nrD2 = Infinity;   // the single GLOBAL nearest MERCHANT (any distance, for the map beacon)
     for (const n of npcs) {
       const dx = n.state.x - p.state.x, dz = n.state.z - p.state.z, d2 = dx * dx + dz * dz;
-      if (d2 < nrD2) { nrD2 = d2; nrX = n.state.x; nrZ = n.state.z; }
+      if (!n.isPirate && !n.isHunter && d2 < nrD2) { nrD2 = d2; nrX = n.state.x; nrZ = n.state.z; }   // beacon → trade ships only
       if (d2 <= VIEW_R2) near.push({ n, d2 });
     }
     near.sort((a, b) => a.d2 - b.d2);
     const visible = new Set();
     for (let i = 0; i < near.length && i < MAX_VISIBLE; i++) visible.add(near[i].n.id);
+    // Always render a pirate OR a navy hunter that's closed within PIRATE_VIS_R (a chase the player should see)
+    // even past the nearest-N cutoff — a combatant you can't see shooting nearby would read as a bug.
+    for (const c of near) if ((c.n.isPirate || c.n.isHunter) && c.d2 <= PIRATE_VIS_R2) visible.add(c.n.id);
     // Always render this player's tavern-rumour target (so its map marker + hull persist while they hunt it
     // down, even past the normal nearest-N cutoff). Auto-clear the grudge once the ship has despawned/sunk.
     if (p.rumorShipId) {
       if (players.has(p.rumorShipId)) visible.add(p.rumorShipId);
       else p.rumorShipId = null;
+    }
+    // Same for the pirate the player asked the tavern about — keep it streamed (+ its map marker) at any range.
+    if (p.pirateMarkId) {
+      if (players.has(p.pirateMarkId)) visible.add(p.pirateMarkId);
+      else p.pirateMarkId = null;
     }
     if (!p._visNpcs) p._visNpcs = new Set();
     for (const id of visible) p.ws.send(msgFor(players.get(id)));               // RENDER updates for nearby merchants
@@ -1179,13 +1442,38 @@ function broadcastInterest(players, nowMs) {
   }
 }
 
-/** Keep the merchant fleet topped up to the target size; spawn fresh ships at town piers. */
-function spawnerTick(players) {
+/** Keep the merchant fleet AND the pirate population topped up; spawn fresh merchants at town piers and fresh
+ *  pirates at open-water lairs. Both ramp gradually (a few per tick) so a fresh server fills in over ~minutes.
+ *  Also dispatches navy PIRATE HUNTERS against any pirate that's strangled a shipping lane. `announceHunter`
+ *  (optional: (faction, townName, pirateName) → void) telegraphs a launch to players. */
+function spawnerTick(players, announceHunter) {
   const towns = economy.townList();
   if (towns.length < 2) return;
   const target = targetFleet(towns.length);
   let spawned = 0;
   while (npcCount(players) < target && spawned < 3) { spawnNpc(players, towns); spawned++; }   // ramp up gradually
+  // Pirates: a separate, smaller population that haunts open water (not counted in the merchant fleet target).
+  const pTarget = targetPirates(towns.length);
+  let pSpawned = 0;
+  while (pirateCount(players) < pTarget && pSpawned < 2) {
+    const lair = pickLair(towns);
+    if (!lair) break;
+    makePirate(players, lair, pick(PIRATE_SLUGS));
+    pSpawned++;
+  }
+  // Pirate hunters: any pirate that's sunk ≥ PIRATE_HUNT_THRESHOLD merchants draws ONE navy warship from the
+  // nearest faction town. The previous hunter being lost (sunk) lets the nation send another — the pirate stays
+  // a marked ship until it's put down. The threshold delay is deliberate: a player gets first crack at the bounty.
+  for (const [, p] of players) {
+    if (!p.isPirate || (p.combat && p.combat.sunk)) continue;
+    if (p.hunterId && !players.has(p.hunterId)) p.hunterId = null;          // previous hunter lost → may send another
+    if (p.hunterId || (p.piracyKills | 0) < PIRATE_HUNT_THRESHOLD) continue;
+    const town = nearestFactionTown(towns, p.state.x, p.state.z);
+    if (!town) continue;
+    const h = makeHunter(players, town, p);
+    p.hunterId = h.id;
+    if (announceHunter) announceHunter(town.faction, town.name, p.state.vesselName);
+  }
 }
 
 module.exports = {
@@ -1206,5 +1494,8 @@ module.exports = {
     chooseNpcShot, foeMastFrac, RAKE_CONE, RAKE_SKILL,
     convoyFocusTarget, convoyScreenHeading, SCREEN_DIST, CONVOY_DOUBLE_ESCORT,
     PRESS_HULL, MORALE_SHAKE_MS, MORALE_SHAKE_FACTOR,
+    makePirate, pickLair, pirateHelm, nearestPrey, pirateCount, targetPirates,
+    PIRATE_AGGRO_RANGE, PIRATE_GIVE_UP, PIRATE_LEASH, PIRATE_SKILL, PIRATE_CRUISE,
+    makeHunter, hunterHelm, nearestFactionTown, PIRATE_HUNT_THRESHOLD, HUNTER_CRUISE, HUNTER_APPROACH,
   },
 };

@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  AbstractMesh, AnimationGroup, Color3, Mesh, MorphTarget, Nullable, Observer, PBRMaterial,
-  Quaternion, Scene, Texture, TransformNode, Vector3,
+  AbstractMesh, AnimationGroup, Color3, Mesh, MorphTarget, MorphTargetManager, Nullable, Observer, PBRMaterial,
+  Quaternion, Scene, Skeleton, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -68,7 +68,7 @@ export class CrewService {
       for (let i = 0; i < n; i++) {
         const rigged = await this.assetCache.instantiateRigged(CrewService.GLB, scene, shipGlbRoot, false);
         if (!rigged || shipGlbRoot.isDisposed()) break;
-        handle.addMember(rigged.root, rigged.entries.animationGroups, i);
+        handle.addMember(rigged.root, rigged.entries.animationGroups, i, rigged.entries.skeletons);
       }
       handle.start();
       return handle;
@@ -191,6 +191,9 @@ export class CrewHandle {
   private disposed = false;
   private readonly texCache = new Map<string, Texture>();
   private readonly clonedMats: PBRMaterial[] = [];
+  // Per-member cloned skeletons (each member is its own instantiateRigged → a cloned 24-joint rig, GPU-texture
+  // backed on WebGPU). Disposing the mesh subtree does NOT free these, so they're collected + freed in dispose().
+  private readonly skeletons: Skeleton[] = [];
   private readonly rootRng: () => number;
 
   constructor(
@@ -211,8 +214,9 @@ export class CrewHandle {
   }
 
   /** Build one crew member from an instantiated pirate GLB. */
-  addMember(glbRoot: TransformNode, groups: AnimationGroup[], index: number): void {
+  addMember(glbRoot: TransformNode, groups: AnimationGroup[], index: number, skeletons: Skeleton[] = []): void {
     const rng = mulberry32((Math.floor(this.rootRng() * 0xffffffff) ^ (index * 0x9e3779b9)) >>> 0);
+    for (const sk of skeletons) { if (sk) this.skeletons.push(sk); }   // track for dispose (mesh dispose won't free it)
 
     // Wrapper node: we position/rotate this, leaving the GLB root's importer
     // transform (handedness conversion) intact underneath.
@@ -408,7 +412,19 @@ export class CrewHandle {
     if (this.disposed) return;
     this.disposed = true;
     if (this.observer) { this.scene.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
-    for (const m of this.members) m.holder.dispose();   // disposes pirate subtree
+    // Per-member cloned animation groups + morph managers (face morphs) are NOT freed by disposing the mesh
+    // subtree, so release them explicitly before the holders go — else a churning crew leaks them.
+    const seenMorph = new Set<MorphTargetManager>();
+    for (const m of this.members) {
+      for (const g of m.clips.values()) { g.stop(); g.dispose(); }
+      for (const mesh of m.holder.getChildMeshes(false)) {
+        const mgr = (mesh as { morphTargetManager?: MorphTargetManager }).morphTargetManager;
+        if (mgr && !seenMorph.has(mgr)) { seenMorph.add(mgr); mgr.dispose(); }
+      }
+      m.holder.dispose();   // disposes the pirate subtree
+    }
+    for (const sk of this.skeletons) sk.dispose();   // per-member cloned 24-joint rigs (GPU bone texture)
+    this.skeletons.length = 0;
     for (const mat of this.clonedMats) mat.dispose();
     for (const tex of this.texCache.values()) tex.dispose();   // per-handle skin albedos
     this.texCache.clear();

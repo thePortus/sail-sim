@@ -13,6 +13,7 @@ export interface NameplateOpts {
   title: string;
   subtitle?: string;          // present → two-line plaque; absent → one big centred line
   baseColor?: string | null;  // null → dark slate (player); '#rrggbb' → tinted panel (nation / town)
+  accentColor?: string;       // present → border + rivets + subtitle use this colour instead of brass (pirate red)
   width: number;
   height: number;
   kind?: 'ship' | 'town';     // 'ship' (default): rounded brass plaque. 'town': swallowtail wooden banner — a
@@ -86,18 +87,20 @@ export function buildNameplate(scene: Scene, name: string, o: NameplateOpts): Me
   outline(0);
   ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 16; ctx.stroke();   // dark halo rim
   outline(0);
+  const accent = o.accentColor;
   const edge = ctx.createLinearGradient(0, 0, 0, texH);
-  if (town) { edge.addColorStop(0, '#9a7647'); edge.addColorStop(0.5, '#5e4022'); edge.addColorStop(1, '#33220f'); }
-  else      { edge.addColorStop(0, '#f7e9ad'); edge.addColorStop(0.5, '#c8a13c'); edge.addColorStop(1, '#7d6020'); }
+  if (accent)     { edge.addColorStop(0, shadeColor(accent, 1.25)); edge.addColorStop(0.5, accent); edge.addColorStop(1, shadeColor(accent, 0.5)); }
+  else if (town)  { edge.addColorStop(0, '#9a7647'); edge.addColorStop(0.5, '#5e4022'); edge.addColorStop(1, '#33220f'); }
+  else            { edge.addColorStop(0, '#f7e9ad'); edge.addColorStop(0.5, '#c8a13c'); edge.addColorStop(1, '#7d6020'); }
   ctx.strokeStyle = edge; ctx.lineWidth = 11; ctx.stroke();
   outline(16);
-  ctx.strokeStyle = town ? 'rgba(226,196,142,0.5)' : 'rgba(247,233,173,0.55)'; ctx.lineWidth = 3; ctx.stroke();
-  // Corner rivets on the brass ship plate only (the town banner's silhouette is its signature).
+  ctx.strokeStyle = accent ? 'rgba(255,150,150,0.6)' : (town ? 'rgba(226,196,142,0.5)' : 'rgba(247,233,173,0.55)'); ctx.lineWidth = 3; ctx.stroke();
+  // Corner rivets on the brass (or pirate-red) ship plate only (the town banner's silhouette is its signature).
   if (!town) {
     for (const [sx, sy] of [[pad + 28, pad + 28], [texW - pad - 28, pad + 28],
                             [pad + 28, texH - pad - 28], [texW - pad - 28, texH - pad - 28]]) {
       ctx.beginPath(); ctx.arc(sx, sy, 8, 0, Math.PI * 2);
-      ctx.fillStyle = '#ecd793'; ctx.fill();
+      ctx.fillStyle = accent ? shadeColor(accent, 1.2) : '#ecd793'; ctx.fill();
       ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(60,40,10,0.7)'; ctx.stroke();
     }
   }
@@ -124,7 +127,7 @@ export function buildNameplate(scene: Scene, name: string, o: NameplateOpts): Me
   if (o.subtitle) {
     ctx.textBaseline = 'alphabetic';
     ls('3px'); draw(o.title, 162, fit(o.title, 116, 44), '#fff6df', 10);
-    ls('2px'); draw(o.subtitle, 250, fit(o.subtitle, 58, 28), '#ffe9b0', 8);
+    ls('2px'); draw(o.subtitle, 250, fit(o.subtitle, 58, 28), accent ? shadeColor(accent, 1.5) : '#ffe9b0', 8);
   } else {
     ctx.textBaseline = 'middle';
     ls('5px'); draw(o.title, texH / 2 + 6, fit(o.title, 150, 52), '#fdf6e3', 13);

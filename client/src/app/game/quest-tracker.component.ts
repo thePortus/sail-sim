@@ -29,7 +29,7 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
               <div class="qt-body">
                 <div class="qt-label">{{ o.label }}</div>
                 @if (!o.done && o.hint) { <div class="qt-hint">{{ o.hint }}</div> }
-                @if (!o.done && o.type === 'client_ack') {
+                @if (!o.done && o.type === 'client_ack' && o.manual) {
                   <button class="qt-ack" (click)="mp.questAck(o.id)">Done ✓</button>
                 }
               </div>

@@ -414,6 +414,9 @@ export class SceneService {
    * the view matrix re-derives the RTT render lists next frame. (This doesn't PREVENT the OOM — that's a
    * separate descriptor-budget reduction task — it just makes the recovery automatic instead of manual.)
    */
+  private _gpuErrBurst = 0;        // recent WebGPU uncaptured-error count (decays); a burst = the invalid-pipeline cascade
+  private _gpuLastRecover = 0;     // perf.now() of the last self-heal, to rate-limit
+
   private wireContextLossRecovery(): void {
     if (!this.engine) { return; }
     this.engine.onContextLostObservable.add(() => {
@@ -421,13 +424,45 @@ export class SceneService {
     });
     this.engine.onContextRestoredObservable.add(() => {
       console.warn('[Scene] GPU context restored — forcing a rebuild to clear the post-restore black frame');
-      try {
-        this.scene?.markAllMaterialsAsDirty(Constants.MATERIAL_AllDirtyFlag);
-        this.camera?.getViewMatrix(true);   // re-derive the view so RTT render lists re-evaluate next frame
-      } catch (e) {
-        console.warn('[Scene] context-restore recovery hiccup', e);
-      }
+      this.forceGpuRebuild('context-restore');
     });
+
+    // WebGPU INVALID-PIPELINE CASCADE (separate from a full context loss): a transient device error — the live
+    // `CreateDescriptorHeap E_OUTOFMEMORY` under peak GPU pressure — leaves a cached render pipeline permanently
+    // invalid, and Babylon keeps resubmitting it every frame (the oceanRefraction / sceneprePassRT flood). NO
+    // context-lost event fires, so the restore path above never runs and it never self-heals. Watch the device's
+    // uncaptured errors; on a sustained BURST, force the same rebuild (wipe caches → dirty all materials → nudge
+    // the view) so the invalid pipelines are recreated once the transient OOM has passed. Heavily rate-limited so
+    // a healthy session never thrashes; a no-op at worst (no worse than the current permanent flood).
+    if (this._isWebGPU) {
+      const dev = (this.engine as unknown as { _device?: { addEventListener?: (t: string, cb: () => void) => void } })._device;
+      if (dev && typeof dev.addEventListener === 'function') {
+        dev.addEventListener('uncapturederror', () => {
+          this._gpuErrBurst++;
+          const now = performance.now();
+          if (this._gpuErrBurst >= 8 && now - this._gpuLastRecover > 8000) {
+            this._gpuLastRecover = now;
+            this._gpuErrBurst = 0;
+            console.warn('[Scene] WebGPU invalid-pipeline burst — forcing a cache+material rebuild to self-heal');
+            this.forceGpuRebuild('pipeline-invalid-burst');
+          }
+          // Decay isolated errors so they don't slowly accumulate into a false trigger.
+          setTimeout(() => { this._gpuErrBurst = Math.max(0, this._gpuErrBurst - 1); }, 2000);
+        });
+      }
+    }
+  }
+
+  /** Clear the engine's pipeline/state caches and force every material + RTT to rebuild next frame. Shared by the
+   *  context-restore path and the invalid-pipeline-burst watchdog. */
+  private forceGpuRebuild(reason: string): void {
+    try {
+      this.engine?.wipeCaches(true);                                   // drop cached pipelines/bind groups (incl. the invalid one)
+      this.scene?.markAllMaterialsAsDirty(Constants.MATERIAL_AllDirtyFlag);
+      this.camera?.getViewMatrix(true);                               // re-derive the view so RTT render lists re-evaluate
+    } catch (e) {
+      console.warn(`[Scene] GPU rebuild hiccup (${reason})`, e);
+    }
   }
 
   /** Add a shadow caster that should DROP OUT of the shadow pass when far from the camera (remote ships, piers) —
@@ -638,21 +673,22 @@ export class SceneService {
     // fetched by `npm run download:sky-textures`). JPG has no alpha, so getAlphaFromRGB derives opacity
     // from luminance → the black sky stays transparent (the procedural night-sky shows through) and only
     // stars/Milky Way draw. Falls back to the procedural starfield if the server texture is missing.
-    const tex = new Texture(
-      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE,
-      null,
-      () => {
-        console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures`. Using procedural fallback.');
-        const fb = this.buildStarTexture();
-        mat.emissiveTexture = fb;
-        mat.opacityTexture  = fb;
-      },
-    );
-    tex.getAlphaFromRGB = true;
-
     mat.disableLighting = true;
-    mat.emissiveTexture = tex;
-    mat.opacityTexture  = tex;            // alpha from the texture → black sky stays clear
+    // Star map, preferring the GPU-compressed KTX2 (the 4096² JPG decodes to ~33 MB RGBA in VRAM; the .ktx2
+    // transcodes to BC7/ASTC at ~8 MB → ~25 MB saved, a real OOM lever). Graceful fallback chain so a deploy
+    // missing the encoded file (assets/ is gitignored + asset-prep generated) still shows stars:
+    //   stars.ktx2  →  stars.jpg  →  procedural starfield.
+    const applyStars = (t: Texture) => { t.getAlphaFromRGB = true; mat.emissiveTexture = t; mat.opacityTexture = t; };
+    const proceduralStars = () => {
+      console.warn('[Scene] star texture unavailable — run `npm run download:sky-textures` (+ encode-ktx2.mjs). Using procedural fallback.');
+      const fb = this.buildStarTexture();
+      mat.emissiveTexture = fb; mat.opacityTexture = fb;
+    };
+    const loadStarsJpg = () => applyStars(new Texture(
+      `${Settings.apiUrl}sky/stars`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE, null, proceduralStars));
+    // KTX2 first — the `.ktx2` extension selects Babylon's transcoding loader; on a miss, fall back to the JPG.
+    applyStars(new Texture(
+      `${Settings.apiUrl}sky/stars.ktx2`, this.scene, true, false, Texture.TRILINEAR_SAMPLINGMODE, null, loadStarsJpg));
     mat.diffuseColor    = Color3.Black();
     mat.specularColor   = Color3.Black();
     mat.backFaceCulling = false;          // viewed from inside the dome

@@ -136,7 +136,7 @@ export interface LedgerEntry { specialty: string; day: number; goods: { id: stri
 /** A story panel: an image slot (resolved to /images/quests/<image>.png, text-only if missing) + atmospheric text. */
 export interface QuestPanel { image: string | null; text: string; }
 /** One objective in the current stage. client_ack types are confirmed by the player; the rest verify server-side. */
-export interface QuestObjective { id: string; type: string; image: string | null; label: string; hint: string; done: boolean; }
+export interface QuestObjective { id: string; type: string; image: string | null; label: string; hint: string; done: boolean; manual?: boolean; }
 /** The active quest's current stage (server-authoritative): narrative to show on entry + the live objective list. */
 export interface QuestUpdate {
   questId: string; title: string; stageIndex: number; stageCount: number;
@@ -322,8 +322,9 @@ export interface OtherPlayer {
   vesselName:  string;
   vesselSlug:  string;
   callsign:    string;
-  npc?:        boolean;    // an NPC merchant trader (server-controlled), not a real player
-  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players
+  npc?:        boolean;    // an NPC ship (server-controlled), not a real player
+  faction?:    string | null;   // owning nation for an NPC merchant (e.g. 'english'); null for players + pirates
+  role?:       'merchant' | 'pirate' | 'hunter' | null;   // NPC kind — pirates get a black/red ☠ plaque, navy hunters a steel one
 }
 
 export interface ChatMessage {

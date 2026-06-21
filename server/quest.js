@@ -33,7 +33,7 @@ const QUESTS = {
           { image: 'intro_04', text: "But a captain is more than a loud voice. There's the helm to master, the wind to read, coin to be made in the coastal ports, and sharper men who'll take what you have if you can't hold it. The bosun grins. \"Well then, Captain. Show us you can sail her.\"" },
         ],
         objectives: [
-          { id: 'accept_command', type: 'client_ack', label: 'Take command of the Saltmeadow', hint: 'The crew await your first order, Captain.' },
+          { id: 'accept_command', type: 'client_ack', manual: true, label: 'Take command of the Saltmeadow', hint: 'The crew await your first order, Captain.' },
         ],
         reward: { gold: 0 },
       },
@@ -50,7 +50,7 @@ const QUESTS = {
         id: 'sails',
         objectives: [
           { id: 'trim_sails', type: 'client_ack', label: 'Set and trim your canvas', hint: 'Raise the sails and ease the sheets to the wind.' },
-          { id: 'read_wind',  type: 'client_ack', label: 'Read the wind', hint: 'Find the wind indicator — it shows where the wind blows from.' },
+          { id: 'read_wind',  type: 'client_ack', manual: true, label: 'Read the wind', hint: 'Find the wind indicator — it shows where the wind blows from.' },
           { id: 'find_reach', type: 'point_of_sail', params: { minSpeed: 3.0 }, label: 'Find a good point of sail', hint: 'Turn off the wind until the sails fill hard and your speed climbs.', verify: 'server' },
         ],
         reward: { gold: 60 },
@@ -119,6 +119,10 @@ function isNewPlayer(qs) { return !qs || Object.keys(qs).length === 0; }
 
 function quest(id) { return QUESTS[id]; }
 function activeQuestId(qs) { for (const id of Object.keys(qs)) { if (qs[id] && qs[id].status === 'active') return id; } return null; }
+/** True while the player is still working through the INTRO tutorial arc (their active quest is an intro quest).
+ *  Used to shield brand-new captains — e.g. pirates leave them be until the tutorial's done so they aren't
+ *  discouraged by an immediate attack. A skipped/finished intro → no intro quest active → false. */
+function inIntro(qs) { const id = qs ? activeQuestId(qs) : null; return !!(id && QUESTS[id] && QUESTS[id].intro); }
 
 /** Resolve a port symbol ('tutorial.portA' | literal townId) to a townId, or null if anchors aren't ready. */
 function resolvePort(sym) {
@@ -228,6 +232,9 @@ function renderActive(qs, townName) {
     narrative: (stage.narrative || []).map((n) => ({ image: n.image, text: fillNames(n.text, townName) })),
     objectives: stage.objectives.map((o) => ({
       id: o.id, type: o.type, image: o.image || null,
+      // manual = a pure narrative acknowledgement (a 'Done' button); the rest are completed by a real action
+      // (client-detected steering/trim/look, or a server-verified event), never by clicking.
+      manual: o.type === 'client_ack' ? !!o.manual : false,
       label: fillNames(o.label, townName), hint: fillNames(o.hint, townName),
       done: st.done.includes(o.id),
     })),
@@ -240,5 +247,5 @@ module.exports = {
   QUESTS, FIRST_INTRO,
   parseState, serializeState, isNewPlayer,
   startIfNew, skipIntro, onEvent, renderActive,
-  activeQuestId, resolvePort, quest,
+  activeQuestId, inIntro, resolvePort, quest,
 };

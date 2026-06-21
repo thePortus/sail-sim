@@ -56,6 +56,11 @@ module.exports = (sequelize, DataTypes) => {
     // New players start in the 'pinnace'; bigger hulls are bought at a port shipwright for gold.
     ship:         { type: DataTypes.STRING(64), allowNull: false, defaultValue: 'pinnace' },
 
+    // Player's custom SHIP NAME — shown to other players (label subtitle + a 3D nameboard on the stern). Set
+    // when the intro tutorial ends, renamable at the shipwright, and named again on buying a new hull. Default
+    // 'Saltmeadow' (the tutorial's starter trader). Not unique. Persists across maps (the player's, not the world's).
+    shipName:     { type: DataTypes.STRING(64), allowNull: true, defaultValue: 'Saltmeadow' },
+
     // Crew resource: remaining sailors aboard (grapeshot attrites it; a port tavern re-hires). NULL = never
     // recorded → treated as the current vessel's FULL complement on load. Clamped to the vessel's max. A
     // ship change / sunk→respawn resets it to full. Drives sail/turn/reload/mast-repair speed (with a floor).

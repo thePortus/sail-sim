@@ -489,6 +489,11 @@ export class SloopController implements VesselController {
 
   dispose(): void {
     for (const g of this.clips.values()) { g.stop(); g.dispose(); }
+    // instantiateModelsToScene CLONES the skeleton + every morph-target manager per vessel (each backed by a
+    // GPU texture on WebGPU). Disposing the meshes does NOT free them — they live in scene.skeletons / on the
+    // mesh — so a churning NPC fleet leaks them indefinitely. Free the per-instance clones here.
+    for (const m of this.morphs.values()) { m.dispose(); }
+    this.skeleton?.dispose();
     this.clips.clear();
     this.morphs.clear();
     this.nodes.clear();

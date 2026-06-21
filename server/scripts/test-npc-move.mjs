@@ -8,7 +8,13 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const nav = require('../nav.js');
 const economy = require('../economy.js');
+const weatherState = require('../weather-state.js');
 const npc = require('../npc.js');
+
+// Pin the wind so routing is DETERMINISTIC (module-load wind bearing is randomised 200–320° → the A↔B leg was
+// flaky: an unfavourable beat sometimes left the merchant short of the town inside the tick budget). A steady
+// northerly is a clean cross-wind reach for the east-west A↔B run, so the leg always completes.
+weatherState.setOverride({ windSpeed: 10, fromBearingDeg: 0, cloudiness: 0.2 });
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { (c ? pass++ : fail++); console.log((c ? '  ✓ ' : '  ✗ FAIL ') + m); };
@@ -50,8 +56,8 @@ ok(away !== null && Math.abs(((away - 270 + 540) % 360) - 180) < 30, 'a steers W
 ok(npc._test.turnToward(0, 100, 30) === 30, 'turnToward clamps to the max step (0→100 by ≤30 = 30)');
 ok(Math.abs(npc._test.angleDelta(350, 10) - 20) < 1e-9, 'angleDelta wraps the circle (350→10 = +20)');
 const fleet = targetTest();
-ok(fleet === true, 'targetFleet clamps to [8,15]');
-function targetTest() { return npc.targetFleet(2) === 8 && npc.targetFleet(40) === 10 && npc.targetFleet(100) === 15; }
+ok(fleet === true, 'targetFleet clamps to [22,40]');
+function targetTest() { return npc.targetFleet(2) === 22 && npc.targetFleet(30) === 30 && npc.targetFleet(100) === 40; }
 
 console.log('interest management (only the nearest few merchants are sent to a client):');
 {

@@ -43,7 +43,7 @@ const FLASH_DUR  = 0.60;                 // muzzle-flash point-light envelope (s
 // (CreateTube `instance`) every frame as the ship turns / elevation changes.
 const AIM_SAMPLES = 40;
 const AIM_WATER_Y = 0.5;                 // stop the predicted arc at the sea surface
-const AIM_RADIUS  = 0.30;                // tube thickness (m)
+const AIM_RADIUS  = 0.16;                // per-gun tube thickness (m) — thin so the sheaf of arcs reads
 
 // Persistent battle damage: charred scorch decals projected onto the struck hull/mast.
 // They live on the victim's mesh hierarchy until the ship is repaired (combat_reset).
@@ -207,11 +207,11 @@ export class CannonService {
   private scorchMat: StandardMaterial | null = null;
   private readonly decals = new Map<string, Mesh[]>();
 
-  // Aiming aid: a translucent red trajectory tube per side, shown only while that side's
-  // guns are run out and ready to fire (not stowed, arming, firing or reloading).
+  // Aiming aid: a translucent trajectory tube PER CANNON per side (a converging sheaf of arcs, one from
+  // each muzzle), shown only while that side's guns are run out and ready (not stowed/arming/firing/reloading).
   private aimMat: StandardMaterial | null = null;       // free-aim arc (red)
   private aimMatLock: StandardMaterial | null = null;   // locked solution arc (green)
-  private readonly aimTube: Record<'port' | 'stbd', Mesh | null> = { port: null, stbd: null };
+  private readonly aimTubes: Record<'port' | 'stbd', Mesh[]> = { port: [], stbd: [] };
   // Lock reticle: a camera-facing corner-bracket billboard parked on the soft-locked enemy (built lazily).
   private reticle: Mesh | null = null;
   private readonly RETICLE_Y = 3.5;   // sit it on the hull/low rig of the locked ship
@@ -400,8 +400,10 @@ export class CannonService {
     this.decals.clear();
     this.scorchMat?.dispose();
 
-    this.aimTube.port?.dispose();
-    this.aimTube.stbd?.dispose();
+    for (const t of this.aimTubes.port) t.dispose();
+    for (const t of this.aimTubes.stbd) t.dispose();
+    this.aimTubes.port.length = 0;
+    this.aimTubes.stbd.length = 0;
     this.aimMat?.dispose();
     this.aimMatLock?.dispose();
     this.reticle?.dispose(false, true);   // also frees its DynamicTexture + material
@@ -963,10 +965,11 @@ export class CannonService {
   private updateAimArcs(): void {
     let lock: { id: string; x: number; z: number } | null = null;   // for the HUD reticle (locked ship)
     for (const side of ['port', 'stbd'] as const) {
+      const tubes = this.aimTubes[side];
       const ready = this.gun[side].state === 'ready';
-      if (!ready) { this.aimTube[side]?.setEnabled(false); continue; }
+      if (!ready) { for (const t of tubes) t.setEnabled(false); continue; }
 
-      // Solve the lock ONCE (round/bar) — reused for the arc shape, its colour, and the reticle.
+      // Solve the lock ONCE (round/bar) — reused for every gun's arc shape, its colour, and the reticle.
       let sol: ReturnType<CannonService['solveLock']> = null;
       if (this.shotType() !== 'grape') {
         const vs = this.vesselService.state();
@@ -976,25 +979,32 @@ export class CannonService {
         if (sol && !lock) lock = { id: sol.lockId, x: sol.cx, z: sol.cz };   // park the reticle ON the locked ship
       }
 
-      const path = this.buildArcPath(side, sol);
-      const mat  = this.aimMaterial(!!sol);   // locked → green solution arc; free → red
-      const prev = this.aimTube[side];
-      if (prev) {
-        // Reuse the geometry — same sample count, so update in place (cheap).
-        const tube = MeshBuilder.CreateTube('aim_' + side, { path, instance: prev }, this.scene);
-        tube.material = mat;                  // recolour by lock state each frame
-        tube.setEnabled(true);
-        this.aimTube[side] = tube;
-      } else {
-        const tube = MeshBuilder.CreateTube('aim_' + side, {
-          path, radius: AIM_RADIUS, tessellation: 8, cap: Mesh.NO_CAP, updatable: true,
-        }, this.scene);
-        tube.material         = mat;
-        tube.isPickable       = false;
-        tube.renderingGroupId = 3;        // draw over the water like the cannon FX
-        tube.alphaIndex       = 0;        // behind the smoke/flame within the group
-        this.aimTube[side]    = tube;
+      const mat     = this.aimMaterial(!!sol);   // locked → green solution arc; free → red
+      const muzzles = this.muzzles[side];
+      // One arc per cannon: each gun launches from its own muzzle, sharing the side's launch solution, so the
+      // arcs run parallel on free aim and converge onto the lock — a sheaf that reads as the whole broadside.
+      for (let i = 0; i < muzzles.length; i++) {
+        const path = this.buildArcPath(side, sol, muzzles[i]);
+        const prev = tubes[i];
+        if (prev) {
+          // Reuse the geometry — same sample count, so update in place (cheap).
+          const tube = MeshBuilder.CreateTube('aim_' + side + i, { path, instance: prev }, this.scene);
+          tube.material = mat;                  // recolour by lock state each frame
+          tube.setEnabled(true);
+          tubes[i] = tube;
+        } else {
+          const tube = MeshBuilder.CreateTube('aim_' + side + i, {
+            path, radius: AIM_RADIUS, tessellation: 6, cap: Mesh.NO_CAP, updatable: true,
+          }, this.scene);
+          tube.material         = mat;
+          tube.isPickable       = false;
+          tube.renderingGroupId = 3;        // draw over the water like the cannon FX
+          tube.alphaIndex       = 0;        // behind the smoke/flame within the group
+          tubes[i]              = tube;
+        }
       }
+      // Gun count dropped (vessel/def change): retire the surplus tubes.
+      for (let i = muzzles.length; i < tubes.length; i++) tubes[i].setEnabled(false);
     }
     // World-space reticle on the locked ship (camera-facing); gentle pulse so it reads as a live lock.
     const ret = this.reticleMesh();
@@ -1064,7 +1074,7 @@ export class CannonService {
   /** Sample the predicted arc this side would fly. With a lock `sol` (round/bar) it traces the SOLVED leading
    *  shot and STOPS at the target intercept (so the arc visually lands on the locked ship); free aim splashes
    *  down at the waterline. `sol` is solved once by updateAimArcs and passed in (no double-solve). */
-  private buildArcPath(side: 'port' | 'stbd', sol: ReturnType<CannonService['solveLock']>): Vector3[] {
+  private buildArcPath(side: 'port' | 'stbd', sol: ReturnType<CannonService['solveLock']>, muz: Muz): Vector3[] {
     const vs   = this.vesselService.state();
     const hRad = vs.heading * Math.PI / 180;
     const sinH = Math.sin(hRad), cosH = Math.cos(hRad);
@@ -1074,8 +1084,6 @@ export class CannonService {
     const elevRad = this.gunElevDeg() * Math.PI / 180;
     const mv      = this.muzzleV();
 
-    const m = this.muzzles[side];
-    const muz = m[Math.floor(m.length / 2)] ?? m[0];   // centre gun, representative
     const ox  = vs.x + muz.x * cosH + muz.z * sinH;
     const oy  = muz.y;
     const oz  = vs.z - muz.x * sinH + muz.z * cosH;
@@ -1206,9 +1214,13 @@ export class CannonService {
         continue;
       }
 
-      // Misses into water/land.
-      if ((by < 0.8 && ball.t > 0.4) || ball.t > 25) {
-        this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz);
+      // Misses into water/land. Impact at the SURFACE the ball strikes: sea level (0) over water, or the terrain
+      // TOP over land — the heightfield can be well above y=0, so testing only `by < 0.8` let the shot punch
+      // through a hill and "impact" at sea level inside the land. Use the terrain height at the ball's x,z.
+      const surfaceY = this.terrainService.getElevation(bx, bz);   // terrain top (land >0) / seabed (water <0)
+      const groundY  = surfaceY > 0 ? surfaceY : 0;
+      if ((by < groundY + 0.5 && ball.t > 0.4) || ball.t > 25) {
+        this.onImpact(bx, bz, ball.vx, ball.vy - G * ball.t, ball.vz, ball.kind, groundY);
         ball.alive = false;
         ball.mesh.setEnabled(false);
       }
@@ -2108,7 +2120,8 @@ export class CannonService {
 
   // ── Impact ────────────────────────────────────────────────────────────────
 
-  private onImpact(wx: number, wz: number, vx: number, vyImpact: number, vz: number): void {
+  private onImpact(wx: number, wz: number, vx: number, vyImpact: number, vz: number,
+                   kind: ShotKind, groundY: number): void {
     // Reverse-incoming cone: ejecta sprays back along the ball's entry angle, flipped.
     const [rx, ry, rz] = this.reverseDir(vx, vyImpact, vz);
 
@@ -2119,19 +2132,28 @@ export class CannonService {
 
     const isLand = this.terrainService.isOnLand(wx, wz);
     if (isLand) {
-      // Dust thrown BACK along the entry line (plus a little lift), not a vertical column.
+      // Dust thrown BACK along the entry line (plus a little lift), not a vertical column. Spawned at the terrain
+      // SURFACE height (groundY) so a hillside hit kicks dust up on the slope, not down at sea level.
       this.setCone(this.dirtPS, rx, ry, rz, 1.2, 0.65, 0.45, 0.5);
-      this.dirtEmit.set(wx, 0.6, wz);
+      this.dirtEmit.set(wx, groundY + 0.6, wz);
       this.dirtPS.emitRate = 2400;
       this.dirtCutoffT     = this.elapsed + 0.16;
       // Lingering dust pall: drifts back along the entry then hangs (dusty browns).
       this.setCone(this.landSmokePS, rx, ry, rz, 0.5, 0.35, 0.25, 0.2);
-      this.landSmokeEmit.set(wx, 0.7, wz);
+      this.landSmokeEmit.set(wx, groundY + 0.7, wz);
       this.landSmokePS.emitRate  = 220;
       this.landSmokeCutoffT      = this.elapsed + 0.5;
       if (vol > 0.01) this.playLandImpactSound(vol);
+    } else if (kind === 'grape') {
+      // Grapeshot pellets prick the surface — NOT the heavy round/bar plunge. A tiny rain-drop ripple (no geyser
+      // column, no spout particles) + a soft high patter (throttled, since a volley lands many pellets at once).
+      this.oceanService.addSplash(wx, wz, 0.18);
+      if (vol > 0.01 && this.elapsed - this._lastGrapeSplashSound > 0.18) {
+        this._lastGrapeSplashSound = this.elapsed;
+        this.playGrapeWaterSound(vol);
+      }
     } else {
-      // Spray thrown BACK along the entry (toward where the ball came from) plus an
+      // Round/bar: spray thrown BACK along the entry (toward where the ball came from) plus an
       // upward bias so it still reads as a spout; strong gravity arcs it back down.
       const fx = this.splashFx.find(f => f.startT < 0 && f.cutoffT < 0) ?? this.splashFx[0];
       this.setCone(fx.ps, rx, ry, rz, 1.1, 0.65, 0.7, 1.1);
@@ -2144,5 +2166,25 @@ export class CannonService {
       this.oceanService.addSplash(wx, wz);
       if (vol > 0.01) this.playSplashSound(vol);
     }
+  }
+
+  private _lastGrapeSplashSound = -1;
+
+  /** Soft, brief high "patter/hiss" of grape pellets pricking the water — no deep plunge of a round/bar splash. */
+  private playGrapeWaterSound(vol = 1.0): void {
+    const ctx = this.sfxCtx;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+    const out = this.cannonBus ?? this.sfxMaster ?? ctx.destination;
+    const t   = ctx.currentTime;
+    const src = this.noiseSource(0.25); if (!src) return;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1700;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.7; bp.frequency.value = 3000;
+    const g  = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.5 * vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    src.connect(hp); hp.connect(bp); bp.connect(g); g.connect(out);
+    src.start(t); src.stop(t + 0.2);
   }
 }

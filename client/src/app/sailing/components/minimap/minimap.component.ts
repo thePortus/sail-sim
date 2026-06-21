@@ -447,6 +447,28 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     }
 
+    // Tavern pirate report — a RED, pulsing marker on the pirate the player asked about (looked up live by id;
+    // the server keeps it streamed past the normal cutoff). Kept distinct from the gold merchant rumour so the
+    // two marks never read as the same thing.
+    const pirateId = this.multiplayerService.markedPirateId();
+    if (pirateId) {
+      const tgt = others.find(p => p.id === pirateId);
+      if (tgt) {
+        const mxp = wx(tgt.x), mzp = wz(tgt.z);
+        const s = this.expanded() ? 7 : 6;
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 240);
+        ctx.strokeStyle = `rgba(230,60,40,${0.45 + 0.5 * pulse})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(mxp, mzp, s + 4 + pulse * 4, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#e23a2a';
+        ctx.strokeStyle = 'rgba(20,0,0,0.9)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(mxp, mzp - s); ctx.lineTo(mxp + s, mzp); ctx.lineTo(mxp, mzp + s); ctx.lineTo(mxp - s, mzp);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+    }
+
     for (const p of others) {
       if (p.npc) continue;   // merchants are shown via the nearest-merchant beacon above, not per-ship
       const px = wx(p.x);

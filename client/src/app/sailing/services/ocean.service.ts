@@ -137,7 +137,7 @@ float splashDisplacement(vec2 worldPos) {
     float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;   // rebound UP (delayed)
     float ringR  = age * 6.0;
     float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
-    sum += crater + geyser + ring;
+    sum += (crater + geyser + ring) * u_splashData[i].w;   // .w = per-impact strength
   }
   return sum;
 }
@@ -317,7 +317,7 @@ float splashDisplacement(vec2 worldPos) {
     float geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;   // rebound UP (delayed)
     float ringR  = age * 6.0;
     float ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
-    sum += crater + geyser + ring;
+    sum += (crater + geyser + ring) * u_splashData[i].w;   // .w = per-impact strength
   }
   return sum;
 }
@@ -716,7 +716,10 @@ void main() {
     float across = dot(rel, rgt);
     float e = (along * along) / (9.0 * 9.0) + (across * across) / (3.6 * 3.6);
     float boatShadow = (1.0 - smoothstep(0.5, 1.0, e)) * (1.0 - seabedReveal);
-    color *= 1.0 - boatShadow * 0.32;
+    // Subtle + COOL: a flat 0.32 multiply crushed deep-blue water into a murky brown disc (the halo the
+    // player noticed). Darken much less, and PER-CHANNEL (red most, blue least) so the shadow reads as a
+    // faint cool tint rather than a brown one. Set all three to 0 to drop the boat shadow entirely.
+    color *= vec3(1.0) - boatShadow * vec3(0.13, 0.10, 0.05);
   }
 
   // Soft waterline foam for the hull edge — but suppressed where the seabed shows
@@ -884,7 +887,7 @@ fn splashDisplacement(worldPos: vec2f) -> f32 {
     let geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
     let ringR  = age * 6.0;
     let ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
-    sum = sum + crater + geyser + ring;
+    sum = sum + (crater + geyser + ring) * uniforms.u_splashData[i].w;   // .w = per-impact strength
   }
   return sum;
 }
@@ -1058,7 +1061,7 @@ fn splashDisplacement(worldPos: vec2f) -> f32 {
     let geyser =  exp(-(r * r) / 2.56) * exp(-qg * qg) * 2.6;
     let ringR  = age * 6.0;
     let ring   =  exp(-((r - ringR) * (r - ringR)) / 2.56) * life * 0.5;
-    sum = sum + crater + geyser + ring;
+    sum = sum + (crater + geyser + ring) * uniforms.u_splashData[i].w;   // .w = per-impact strength
   }
   return sum;
 }
@@ -1416,7 +1419,9 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     let across = dot(rel, rgt);
     let e = (along * along) / (9.0 * 9.0) + (across * across) / (3.6 * 3.6);
     let boatShadow = (1.0 - smoothstep(0.5, 1.0, e)) * (1.0 - seabedReveal);
-    color *= 1.0 - boatShadow * 0.32;
+    // Subtle + COOL (same as GLSL): per-channel, gentle darkening so the shadow no longer crushes deep water
+    // into a brown disc — a faint cool tint instead. Zero all three to drop the boat shadow entirely.
+    color *= vec3f(1.0) - boatShadow * vec3f(0.13, 0.10, 0.05);
   }
 
   // Soft waterline foam — suppressed where the seabed shows through (clear shore
@@ -2095,7 +2100,10 @@ export class OceanService {
    * enough while moving. The shader turns this into a path-following, fading wake.
    */
   /** Register a cannonball water impact at (x,z) — drives the surface geyser+ring. */
-  addSplash(x: number, z: number): void {
+  /** Punch a transient ripple into the ocean surface at (x,z). `strength` scales the whole crater/geyser/ring +
+   *  foam: 1 = a full cannonball impact; smaller for gentler ripples (dolphin breach ≈ 0.35, grape pellet ≈ 0.18,
+   *  which reads like a rain drop). */
+  addSplash(x: number, z: number, strength = 1): void {
     const N = 4;
     if (this.splashCount >= this.SPLASH_MAX) {
       this.splashData.copyWithin(0, N, this.SPLASH_MAX * N);   // drop the oldest
@@ -2104,8 +2112,8 @@ export class OceanService {
     const idx = this.splashCount * N;
     this.splashData[idx]     = x;
     this.splashData[idx + 1] = z;
-    this.splashData[idx + 2] = 0;   // age
-    this.splashData[idx + 3] = 0;
+    this.splashData[idx + 2] = 0;          // age
+    this.splashData[idx + 3] = strength;   // .w — per-impact strength (read by the splash shaders)
     this.splashCount++;
   }
 

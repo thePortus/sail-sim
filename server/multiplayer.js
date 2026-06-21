@@ -63,7 +63,7 @@ const factions = require('./factions');
 const diplomacy = require('./diplomacy');
 const quest = require('./quest');
 const anchors = require('./quest-anchors');
-const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
+const { getVesselDef, crewFor, upgradeCost } = require('./controllers/vessels.controller');
 
 /**
  * Split a command argument string into a target callsign and the remaining text.
@@ -421,6 +421,8 @@ async function saveEconomyState(p) {
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
         ship: p.ship || 'pinnace',
         shipName: p.shipName || 'Saltmeadow',
+        flagColor: p.flagColor || DEFAULT_FLAG_COLOR,
+        cannonUpgrade: !!p.cannonUpgrade, armorUpgrade: !!p.armorUpgrade,
         ...(p.questState ? { questState: quest.serializeState(p.questState) } : {}),   // quest progress (if loaded)
       },
       { where: { id: p.auth.userId } },
@@ -437,6 +439,15 @@ function sanitizeShipName(raw) {
   // eslint-disable-next-line no-control-regex
   const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
   return cleaned.slice(0, 28);
+}
+
+// Default flag colour (a deep ensign red) for players who haven't picked one. Custom colours are a #rrggbb hex.
+const DEFAULT_FLAG_COLOR = '#b22222';
+/** Validate a player-supplied flag colour → a normalized #rrggbb hex, or '' if malformed (caller defaults). */
+function sanitizeFlagColor(raw) {
+  if (typeof raw !== 'string') return '';
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(raw.trim());
+  return m ? ('#' + m[1].toLowerCase()) : '';
 }
 
 /** Safe-parse the persisted combatState TEXT column → object or null. */
@@ -464,7 +475,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -477,6 +488,13 @@ async function loadAndSendWallet(id, p, players) {
     // client can't spoof it), shown to others as a label subtitle + a 3D stern nameboard. Default 'Saltmeadow'.
     p.shipName = sanitizeShipName(u.shipName) || 'Saltmeadow';
     if (p.state) p.state.vesselName = p.shipName;
+    // Custom flag colour — authoritative (the 'update' handler forces the broadcast flagColor to this). Default red.
+    p.flagColor = sanitizeFlagColor(u.flagColor) || DEFAULT_FLAG_COLOR;
+    if (p.state) p.state.flagColor = p.flagColor;
+    // Shipwright upgrades on the CURRENT hull (each once; reset on buying a new ship). cannonUpgrade → heavier
+    // guns (read in combat.stepShot); armorUpgrade → +25% hull HP, applied when (re)building the combat state.
+    p.cannonUpgrade = !!u.cannonUpgrade;
+    p.armorUpgrade  = !!u.armorUpgrade;
 
     // Crew resource — clamp the saved count to the owned vessel's complement (NULL → full). crewWound is the
     // in-memory fractional-casualty accumulator (grapeshot), never persisted (a partial wound heals on relog).
@@ -495,7 +513,7 @@ async function loadAndSendWallet(id, p, players) {
 
     const saved = parseCombat(u.combatState);
     if (saved && saved.mapVersion === moveConst.MAP_VERSION && saved.zones) {
-      const restored = combat.restoreCombatState(saved.slug || 'sloop', saved.zones);
+      const restored = combat.restoreCombatState(saved.slug || 'sloop', saved.zones, p.armorUpgrade);
       if (!restored.sunk) p.combat = restored;   // keep battle damage; never restore a sunk hull
     }
 
@@ -543,6 +561,8 @@ function sendWallet(p) {
       factionRep: p.factionRep || factions.defaultRep(),
       ship: p.ship || 'pinnace',
       shipName: p.shipName || 'Saltmeadow',   // the player's own custom ship name (for their HUD + 3D nameboard)
+      flagColor: p.flagColor || DEFAULT_FLAG_COLOR,   // the player's own flag colour (for the shipwright picker + local flags)
+      cannonUpgrade: !!p.cannonUpgrade, armorUpgrade: !!p.armorUpgrade,   // shipwright upgrades on the current hull
     }));
   }
 }
@@ -1146,6 +1166,9 @@ function attachMultiplayer(server) {
           // Ship-name authority: the broadcast vesselName is the server's stored custom name (set via
           // set_ship_name + persisted), NOT the client's claim — so a client can't spoof another's nameplate.
           vesselName: players.get(id)?.shipName || 'Saltmeadow',
+          // Custom FLAG COLOUR — also server-authoritative (set via set_flag_color), broadcast so everyone tints
+          // this player's flags to their chosen colour. Hex string like '#cc2b2b'.
+          flagColor: players.get(id)?.flagColor || DEFAULT_FLAG_COLOR,
           // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
           // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
           // bought. capacity + movement physics then derive from the real hull.
@@ -1227,7 +1250,7 @@ function attachMultiplayer(server) {
         {
           const p = players.get(id);
           if (p.combat && p.combat.slug !== state.vesselSlug) {
-            p.combat = combat.newCombatState(state.vesselSlug);
+            p.combat = combat.newCombatState(state.vesselSlug, p.armorUpgrade);
           }
         }
 
@@ -1388,7 +1411,7 @@ function attachMultiplayer(server) {
           saveEconomyState(me);   // persist the (possibly zero) gold deduction
           if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'repair_result', ok: true, gold: me.gold | 0, charged: rep.charged, mercy: rep.mercy, free: !!rep.free }));
           sendWallet(me);
-          me.combat = combat.newCombatState(me.state?.vesselSlug);
+          me.combat = combat.newCombatState(me.state?.vesselSlug, me.armorUpgrade);
           saveCombatState(me);   // persist the repaired (full) hull
           // Full hull broadcast to all: resets the victim's HUD and everyone's listing tilt.
           const stateMsg = JSON.stringify({
@@ -1410,7 +1433,7 @@ function attachMultiplayer(server) {
         // actually being sunk so it can't be used as a free teleport mid-sail.
         const me = players.get(id);
         if (me && me.combat && me.combat.sunk) {
-          me.combat = combat.newCombatState(me.state?.vesselSlug);
+          me.combat = combat.newCombatState(me.state?.vesselSlug, me.armorUpgrade);
           // Crew carries over a respawn too (no free refill — recruit at a tavern to replace losses). Hull is
           // restored, but lost hands stay lost.
           me.maxCrew = crewFor(me.state?.vesselSlug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
@@ -1546,6 +1569,19 @@ function attachMultiplayer(server) {
           if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
         }
 
+      } else if (msg.type === 'set_flag_color') {
+        // Set the player's custom flag colour. Server-authoritative + persisted; rides the next pose broadcast
+        // (flagColor forced from p.flagColor), so everyone re-tints this ship's flags. Pushed at once.
+        const me = players.get(id);
+        if (me) {
+          const color = sanitizeFlagColor(msg.flagColor) || DEFAULT_FLAG_COLOR;
+          me.flagColor = color;
+          if (me.state) me.state.flagColor = color;
+          saveEconomyState(me);
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'flag_color_set', flagColor: color }));
+          if (me.state) broadcastPose(id, me);   // others see the new flag colour at once
+        }
+
       } else if (msg.type === 'trade_open') {
         // Open a town's trader: send its (static) market quote + the player's wallet. Read-only.
         const me = players.get(id);
@@ -1655,8 +1691,10 @@ function attachMultiplayer(server) {
               if (!admin) me.gold -= cost;
               me.ship = slug;
               if (me.state) me.state.vesselSlug = slug;   // the 'update' handler keeps forcing this to me.ship
+              // Shipwright upgrades are per-hull → a fresh ship starts STOCK (re-buy them for the new vessel).
+              me.cannonUpgrade = false; me.armorUpgrade = false;
               // A newly-acquired hull arrives whole AND with the new vessel's zone HP (pinnace ≠ sloop).
-              me.combat = combat.newCombatState(slug);
+              me.combat = combat.newCombatState(slug, me.armorUpgrade);
               // Crew CARRIES OVER to the new hull (clamped to its complement) — buying a bigger ship doesn't
               // refill the crew; you must recruit at a tavern to man the extra stations.
               me.maxCrew = crewFor(slug); me.crew = Math.min(me.crew | 0, me.maxCrew); me.crewWound = 0;
@@ -1667,6 +1705,38 @@ function attachMultiplayer(server) {
               saveEconomyState(me).then(() => {
                 sendWallet(me);   // authoritative new gold + ship + capacity
                 if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_bought', slug, cost }));
+              });
+            }
+          }
+        }
+
+      } else if (msg.type === 'buy_upgrade') {
+        // Shipwright per-hull upgrade: 'cannon' (heavier guns → more damage) or 'armor' (+25% hull HP). Each
+        // buyable ONCE per hull; server-authoritative (must be docked, can't re-buy, gold checked; admins free).
+        // Armor rebuilds the combat state to a full boosted hull (you're docked — effectively a repair too).
+        const me = players.get(id);
+        if (me) {
+          const kind = msg.kind === 'armor' ? 'armor' : msg.kind === 'cannon' ? 'cannon' : null;
+          const upErr = (reason) => { if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'upgrade_error', reason })); };
+          const owned = !!(kind === 'cannon' ? me.cannonUpgrade : me.armorUpgrade);
+          if (!kind) { upErr('bad_kind'); }
+          else if (!(me.authPose && economy.townAt(me.authPose.x, me.authPose.z))) { upErr('not_docked'); }
+          else if (owned) { upErr('already_owned'); }
+          else {
+            const admin = isStaff(me);
+            const cost = admin ? 0 : upgradeCost(me.ship, kind);
+            if (!admin && me.gold < cost) { upErr('no_gold'); }
+            else {
+              if (!admin) me.gold -= cost;
+              if (kind === 'cannon') me.cannonUpgrade = true; else me.armorUpgrade = true;
+              // Rebuild the hull so an armor upgrade's boosted maxHp takes effect at once (full hull — bought dockside).
+              me.combat = combat.newCombatState(me.state?.vesselSlug || me.ship, me.armorUpgrade);
+              saveCombatState(me);
+              const hullMsg = JSON.stringify({ type: 'combat_state', playerId: id, zones: me.combat.zones, maxHp: me.combat.maxHp });
+              for (const [, p] of players) if (p.ws.readyState === 1) p.ws.send(hullMsg);
+              saveEconomyState(me).then(() => {
+                sendWallet(me);   // authoritative gold + the new upgrade flags
+                if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'upgrade_bought', kind, cost }));
               });
             }
           }
@@ -1819,7 +1889,7 @@ function attachMultiplayer(server) {
             for (const [pid, p] of players) { if (!p.isNpc && p.state && p.state.callsign === name) { target = p; targetId = pid; break; } }
             if (!name || !target) { sysReply(me.ws, `No online player named "${name}".`); }
             else {
-              target.combat = combat.newCombatState((target.ship) || (target.state && target.state.vesselSlug));
+              target.combat = combat.newCombatState((target.ship) || (target.state && target.state.vesselSlug), target.armorUpgrade);
               saveCombatState(target);
               // Full hull → everyone's HUD/listing resets; combat_repair clears scorch decals AND (for the
               // target's own client) refloats a sinking/sunk hull. Sent to ALL incl. the target.

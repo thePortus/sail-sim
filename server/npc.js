@@ -1400,6 +1400,26 @@ function broadcastInterest(players, nowMs) {
     }
     return allMsg;
   };
+  // Staff also get every PIRATE + navy HUNTER on the minimap (distinct markers + a hover readout): pirates carry
+  // their name / bounty / kills, hunters their nation. Built once, reused for all staff.
+  let pirMsg = null;
+  const allPiratesMsg = () => {
+    if (pirMsg === null) {
+      const ships = [];
+      for (const n of npcs) {
+        if (n.isPirate) {
+          ships.push({ x: +n.state.x.toFixed(1), z: +n.state.z.toFixed(1), role: 'pirate',
+            name: n.state.vesselName || 'Pirate', bounty: (n.gold | 0) + (n.bounty | 0), kills: n.piracyKills | 0,
+            slug: n.state.vesselSlug });
+        } else if (n.isHunter) {
+          ships.push({ x: +n.state.x.toFixed(1), z: +n.state.z.toFixed(1), role: 'hunter',
+            name: n.state.vesselName || 'Hunter', faction: n.faction || null });
+        }
+      }
+      pirMsg = JSON.stringify({ type: 'all_pirates', ships });
+    }
+    return pirMsg;
+  };
   for (const [, p] of players) {
     if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
     const near = [];
@@ -1435,6 +1455,7 @@ function broadcastInterest(players, nowMs) {
     const staff = p.auth && (p.auth.role === 'Owner' || p.auth.role === 'Admin');
     if (staff) {
       p.ws.send(allMerchantsMsg());
+      p.ws.send(allPiratesMsg());   // pirates + navy hunters on the staff minimap
     } else {
       p.ws.send(nrX === null ? JSON.stringify({ type: 'nearest_merchant', x: null })
         : JSON.stringify({ type: 'nearest_merchant', x: +nrX.toFixed(1), z: +nrZ.toFixed(1) }));

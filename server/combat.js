@@ -14,13 +14,13 @@
 const C = require('./combat-constants');
 
 /** Fresh full-HP hull for a player, seeded from their vessel's per-zone HP (slug → vessel). */
-function newCombatState(slug) {
-  const hp = C.zoneHpFor(slug);
+function newCombatState(slug, armorUpgrade) {
+  const hp = C.zoneHpFor(slug, armorUpgrade);   // armorUpgrade → +25% on the hull zones (shipwright upgrade)
   const zones = {};
   for (const z of C.ZONES) zones[z] = hp[z];
-  // maxHp travels in the combat_state broadcast so clients can size the HUD severity bands
-  // per vessel without a separate slug lookup.
-  return { zones, maxHp: { ...hp }, slug: slug || 'sloop', sunk: false, shotTimes: [] };
+  // maxHp travels in the combat_state broadcast so clients can size the HUD severity bands per vessel without a
+  // separate slug lookup. armorUpgrade is recorded so a repair/restore re-applies the boosted maxHp consistently.
+  return { zones, maxHp: { ...hp }, slug: slug || 'sloop', armorUpgrade: !!armorUpgrade, sunk: false, shotTimes: [] };
 }
 
 /** Which hull zone (if any) contains a point in vessel-local space. null = no hit. */
@@ -113,9 +113,10 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 
   const { ox, oy, oz, vx, vy, vz } = shot;
   const reach2 = (C.HALF_LEN + C.BROADPHASE_PAD) * (C.HALF_LEN + C.BROADPHASE_PAD);
-  // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug.
+  // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug, with
+  // the shooter's once-per-hull CANNON upgrade applied (a player who bought it at the shipwright hits harder).
   const shooter = players.get(shot.shooterId);
-  const caliber = C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null);
+  const caliber = C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null, shooter && shooter.cannonUpgrade);
 
   // Sub-step the ball through the freshly-elapsed window so a fast ball can't tunnel a hull.
   const tEnd = Math.min(tTo, C.SIM_MAX_T);
@@ -225,8 +226,8 @@ function tickMastRepair(combat, nowMs, crewFactor = 1) {
  * the vessel (so maxHp/zone list are authoritative for the current vessel), then clamps in the saved current
  * HP and recomputes the sunk flag. Used on reconnect to restore battle damage.
  */
-function restoreCombatState(slug, savedZones) {
-  const s = newCombatState(slug);
+function restoreCombatState(slug, savedZones, armorUpgrade) {
+  const s = newCombatState(slug, armorUpgrade);
   if (savedZones && typeof savedZones === 'object') {
     for (const z of C.ZONES) {
       const v = savedZones[z];

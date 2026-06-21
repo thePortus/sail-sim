@@ -298,6 +298,7 @@ export class TerrainService {
     if (this.clipmapHealTimer) { clearTimeout(this.clipmapHealTimer); this.clipmapHealTimer = null; }
     if (this.clipHeightHealObs) { this.sceneService.scene.onAfterRenderObservable.remove(this.clipHeightHealObs); this.clipHeightHealObs = null; }
     this.clipHeightData = null;
+    this.clipHeightDataKeep = null;
     if (this.clipmap) {
       for (const cm of this.clipmap.allMeshes()) this.oceanService.removeFromRenderList(cm);
       this.clipmap.dispose();
@@ -2987,12 +2988,29 @@ export class TerrainService {
       : null;
   }
 
+  /**
+   * Force a re-upload of the CPU heightfield to the GPU height texture. A LATE belt-and-suspenders for the
+   * WebGPU cold-start race (and any frame-storm that drops the upload, e.g. an invalid-pipeline cascade): the
+   * minimap calls this when its bake comes back as an all-water world, which means the GPU height texture is
+   * empty even though the map has land. Returns false if there's nothing to re-upload (no texture / data freed).
+   */
+  forceHeightReupload(): boolean {
+    const tex = this.clipHeightTex, data = this.clipHeightDataKeep;
+    if (!tex || !data) { return false; }
+    try { tex.update(data); console.info('[terrain] forced height re-upload (minimap-blue heal)'); return true; }
+    catch { return false; }   // device busy → caller retries on the next bake
+  }
+
   // The decoded height data is kept so we can RE-UPLOAD it to the GPU a few times after creation: on a WebGPU
   // cold start the initial R32F upload occasionally lands empty (silent — no error), which leaves the terrain
   // displacing to sea level (invisible) AND the ocean reading zero depth (uniformly shallow, seabed showing) while
   // scatter — fed by the CPU heightfield — stays correct. Re-uploading once the device is warm self-heals it in
   // ~1 s with no page refresh, and is harmless when the first upload already succeeded. Freed after the last pass.
   private clipHeightData: Float32Array | null = null;
+  // RETAINED copy (same array) that the content-verified heal does NOT free, so a LATE re-upload is still
+  // possible — e.g. the minimap-blue heal (forceHeightReupload) when the bake shows an all-water world after
+  // the landmark heal already gave up. Freed only on terrain rebuild/dispose.
+  private clipHeightDataKeep: Float32Array | null = null;
   private clipHeightHealObs: import('@babylonjs/core').Observer<Scene> | null = null;
 
   private createClipHeightTexture(scene: Scene, m: TerrainManifest): void {
@@ -3013,6 +3031,7 @@ export class TerrainService {
       m.worldBounds.maxX - m.worldBounds.minX, m.worldBounds.maxZ - m.worldBounds.minZ);
     this.clipTexSize = new Vector2(m.width, m.height);
     this.clipHeightData = data;
+    this.clipHeightDataKeep = data;   // same array; retained for the late minimap-blue re-upload
 
     this.scheduleClipHeightHeal(scene, m.width);
   }

@@ -233,6 +233,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.animFrameId !== null) cancelAnimationFrame(this.animFrameId);
+    if (this.heightHealTimer) { clearTimeout(this.heightHealTimer); this.heightHealTimer = null; }
     window.removeEventListener('keydown', this.keyHandler);
     this.canvasRef?.nativeElement.removeEventListener('wheel', this.wheelHandler);
     window.removeEventListener('mousemove', this.onDragMove);   // in case torn down mid-drag
@@ -608,7 +609,9 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
         this.sceneService.engine as WebGPUEngine, this.sceneService.scene);
       const apply = (res: number, assign: (c: HTMLCanvasElement) => void) =>
         baker.bake(res, hf.tex, hf.texSize, peak).then((px) => {
-          if (gen === this.bakeGeneration) { assign(this.pixelsToCanvas(res, px)); }
+          if (gen !== this.bakeGeneration) { return; }
+          if (res === 256) { this.healIfHeightfieldEmpty(px); }   // minimap-blue → empty heightfield probe
+          assign(this.pixelsToCanvas(res, px));
         });
       apply(256, (c) => { this.terrainLayerSmall = c; })
         .then(() => apply(2048, (c) => { this.terrainLayerLarge = c; }))
@@ -625,6 +628,27 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.terrainLayerSmall = this.buildTerrainLayer(256, 256);
     this.terrainLayerLarge = this.buildTerrainLayer(2048, 2048);   // hi-res so zoomed-in terrain stays crisp
+  }
+
+  // Minimap-blue heal: the bake kernel paints submerged texels the water colour (13,38,64); the whole-world map
+  // always has land, so an ~all-water bake means the GPU heightfield is EMPTY (cold-start race / a frame-storm
+  // dropped the upload — the "no terrain, no bathymetry" live bug). Force a height re-upload + re-bake, bounded.
+  private heightHealAttempts = 0;
+  private heightHealTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly HEIGHT_HEAL_MAX = 6;
+
+  private healIfHeightfieldEmpty(px: Uint8Array): void {
+    let water = 0; const n = px.length / 4;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] < 20 && px[i + 1] < 50 && px[i + 2] < 80) { water++; }   // ≈ the kernel's (13,38,64) water
+    }
+    if (water / n < 0.998) { this.heightHealAttempts = 0; return; }      // land present → healthy heightfield
+    if (this.heightHealTimer || this.heightHealAttempts >= this.HEIGHT_HEAL_MAX) { return; }
+    this.heightHealAttempts++;
+    console.warn(`[Minimap] all-water bake — GPU heightfield looks empty; forcing re-upload (attempt ${this.heightHealAttempts}/${this.HEIGHT_HEAL_MAX})`);
+    if (!this.terrainService.forceHeightReupload()) { return; }          // data freed / no texture → nothing to do
+    // Re-bake once the re-upload has had a few frames to land; rebuildTerrainLayers re-probes → re-heals if still empty.
+    this.heightHealTimer = setTimeout(() => { this.heightHealTimer = null; this.rebuildTerrainLayers(); }, 700);
   }
 
   /** Wrap GPU-baked RGBA bytes (canvas row order) in a canvas for drawImage. */

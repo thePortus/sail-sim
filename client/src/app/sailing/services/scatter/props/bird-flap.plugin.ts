@@ -77,12 +77,15 @@ export class BirdFlapPlugin extends MaterialPluginBase {
     #endif
   `;
 
+  // NOTE: like DolphinSwimPlugin/FishSwimPlugin, the WGSL path does NOT read instanceColor.a. Birds are rendered
+  // into the ocean reflection/refraction RTTs (and the depth prepass), and in those passes WebGPU sets the
+  // INSTANCESCOLOR define WITHOUT declaring `instanceColor` in the vertex-input struct — so reading
+  // `vertexInputs.instanceColor` fails to compile ("struct member instanceColor not found"), which invalidates
+  // the pipeline and floods an invalid-RenderPipeline cascade (was crashing the whole frame on WebGPU live).
+  // Defaulting bEnergy to 1.0 keeps the flap everywhere; only the per-bird effort nuance is lost on WebGPU.
   private static readonly WGSL = `
     #ifdef BIRD_FLAP
-      var bEnergy = 1.0;
-      #ifdef INSTANCESCOLOR
-        bEnergy = clamp(vertexInputs.instanceColor.a, 0.0, 1.0);
-      #endif
+      let bEnergy = 1.0;
       let bWf  = smoothstep(0.10, 0.70, abs(positionUpdated.z));
       let bBob = 1.0 - smoothstep(0.05, 0.25, abs(positionUpdated.z));
       var bPh = 0.0;

@@ -358,6 +358,22 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
           }
         }
       }
+      // Pirates + navy hunters (staff only) — hover for a readout: name, bounty, ships sunk / nation.
+      if (hp && this.isAdmin) {
+        for (const pr of this.multiplayerService.allPirates()) {
+          const pxp = wx(pr.x), pyp = wz(pr.z);
+          const d = Math.hypot(hp.x - pxp, hp.y - pyp);
+          if (d < bestD) {
+            bestD = d;
+            hovered = {
+              lines: pr.role === 'pirate'
+                ? [`☠ ${pr.name}`, 'Pirate', `Bounty: ${pr.bounty ?? 0}g`, `Ships sunk: ${pr.kills ?? 0}`]
+                : [`⚔ ${pr.name}`, `${factionName(pr.faction)} Navy`, 'Pirate Hunter'],
+              x: pxp, y: pyp,
+            };
+          }
+        }
+      }
       if (hovered) {
         // Highlight the hovered marker, then draw a multi-line pill above it.
         ctx.fillStyle = '#fff4d0';
@@ -423,6 +439,25 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       } else {
         const nm = this.multiplayerService.nearestMerchant();
         if (nm) drawMerchant(wx(nm.x), wz(nm.z), this.expanded() ? 7 : 6);
+      }
+    }
+
+    // Pirates + navy hunters (staff only) — distinct from the cyan merchants: a blood-red diamond with a black
+    // "skull" dot for pirates, a steel diamond for navy hunters. Hover (expanded map) shows name/bounty/kills.
+    if (this.isAdmin) {
+      const s = this.expanded() ? 6 : 5;
+      for (const pr of this.multiplayerService.allPirates()) {
+        const mx = wx(pr.x), mz = wz(pr.z);
+        if (pr.role === 'pirate') { ctx.fillStyle = '#c81e2a'; ctx.strokeStyle = 'rgba(0,0,0,0.85)'; }
+        else                      { ctx.fillStyle = '#cfd9e6'; ctx.strokeStyle = '#33506e'; }
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(mx, mz - s); ctx.lineTo(mx + s, mz); ctx.lineTo(mx, mz + s); ctx.lineTo(mx - s, mz);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+        if (pr.role === 'pirate') {   // a small black centre so it reads as a skull at a glance
+          ctx.fillStyle = 'rgba(0,0,0,0.82)';
+          ctx.beginPath(); ctx.arc(mx, mz, Math.max(1, s * 0.32), 0, Math.PI * 2); ctx.fill();
+        }
       }
     }
 

@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* Make pirates and pirate hunters visible to admins on the map
 * Make cannons reload on an individual basis... allow firing of partial broadsides
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
@@ -13,7 +12,6 @@
 * Add ship names, which display somewhere on the ship... think for each, renaming at shipwright.... changable flag colors
 * placeholder ship for other players when that model hasnt loaded yet (or LOD imposter?)
 * update to cannon aim sight to show spread of all cannon shots somehow
-* add ship armor + cannon upgrades
 * general materials atlas draw cycle reduction
 * Paying for powder and shot
 * any way to reduce load times?

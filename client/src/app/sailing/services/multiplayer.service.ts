@@ -157,6 +157,8 @@ export class MultiplayerService {
   nearestMerchant = signal<{ x: number; z: number } | null>(null);
   // Owners/Admins receive every merchant's position for the minimap (full-fleet view); empty for regular players.
   allMerchants = signal<{ x: number; z: number }[]>([]);
+  // Owners/Admins also receive every PIRATE + navy HUNTER for the minimap (distinct markers); empty for others.
+  allPirates = signal<{ x: number; z: number; role: 'pirate' | 'hunter'; name: string; bounty?: number; kills?: number; faction?: string | null; slug?: string }[]>([]);
   // Tavern "listen to rumours": the merchant id the player overheard about (marked on the map until it
   // despawns or is replaced), the flavour line the tavern shows, and the last rejection reason.
   markedMerchantId = signal<string | null>(null);
@@ -809,6 +811,14 @@ export class MultiplayerService {
 
     } else if (msg.type === 'all_merchants') {
       this.allMerchants.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({ x: +s.x, z: +s.z })) : []);
+
+    } else if (msg.type === 'all_pirates') {
+      // Staff-only: every pirate + navy hunter for the minimap (distinct markers + hover readout).
+      this.allPirates.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({
+        x: +s.x, z: +s.z, role: s.role === 'hunter' ? 'hunter' : 'pirate', name: String(s.name ?? ''),
+        bounty: s.bounty != null ? +s.bounty : undefined, kills: s.kills != null ? +s.kills : undefined,
+        faction: s.faction ?? null, slug: s.slug ?? undefined,
+      })) : []);
 
     } else if (msg.type === 'salvage_spawn') {
       this.salvageService.spawn(String(msg.id), +msg.x, +msg.z);

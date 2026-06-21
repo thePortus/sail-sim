@@ -66,6 +66,10 @@ module.exports = (sequelize, DataTypes) => {
     cannonUpgrade: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
     armorUpgrade:  { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
 
+    // Custom FLAG COLOUR (#rrggbb) — the player's chosen flag/ensign tint, shown on their ship's flags to
+    // everyone. Set at the shipwright (RGB picker). The player's identity → persists across ship changes + maps.
+    flagColor:    { type: DataTypes.STRING(7), allowNull: true, defaultValue: '#b22222' },
+
     // Crew resource: remaining sailors aboard (grapeshot attrites it; a port tavern re-hires). NULL = never
     // recorded → treated as the current vessel's FULL complement on load. Clamped to the vessel's max. A
     // ship change / sunk→respawn resets it to full. Drives sail/turn/reload/mast-repair speed (with a floor).

@@ -12,7 +12,7 @@ import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from '.
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselController, createVesselController, rigForSlug, VesselRig, SailRig } from './vessel-controller';
-import { buildSternNameboard, SternNameboardHandle } from './stern-nameboard';
+import { applyFlagColor, flagColor3, FlagColorHandle } from './flag-color';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
 import { MastCrackService } from './mast-crack.service';
@@ -40,10 +40,10 @@ export class VesselService {
   /** Animated deck crew on the local vessel (null until the GLB + crew assets load). */
   private crewHandle: CrewHandle | null = null;
 
-  /** 3D carved nameboard on the stern (null until the GLB loads / for hulls without a transom spec). */
-  private nameboard: SternNameboardHandle | null = null;
-  /** The player's custom ship name — applied to the nameboard whenever it (re)builds; updated via setShipName. */
-  private shipName = 'Saltmeadow';
+  /** Per-vessel flag-colour override (null until the GLB loads). */
+  private flagHandle: FlagColorHandle | null = null;
+  /** The player's custom flag colour (#rrggbb) — applied to the flags whenever they (re)build; via setFlagColor. */
+  private flagColor = '#b22222';
 
   /** Reflect the authoritative crew count onto the deck as it changes — grapeshot casualties drop, tavern
    *  hires return. Runs in the injection context (field initializer); the handle may be null early (guarded). */
@@ -667,10 +667,10 @@ export class VesselService {
     this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
     this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
 
-    // 3D carved nameboard on the stern transom, showing this captain's ship name (the same name others read on
-    // the label). Parented to the root so it banks with the hull. Rebuilt on each vessel build (ship swap).
-    this.nameboard?.dispose();
-    this.nameboard = buildSternNameboard(scene, 'local_nameboard', this.root, this.vesselSlug, this.rig, this.shipName);
+    // Flag colour — override the baked flag texture with this captain's chosen RGB (per-vessel material).
+    this.flagHandle?.dispose();
+    this.flagHandle = applyFlagColor(scene, this.root, flagColor3(this.flagColor),
+      { excludeFromPrePass: (m) => this.sceneService.excludeFromPrePass(m) });
 
     // Animated deck crew — seeded look, station/waypoint behaviour from the
     // companion crew_stations JSON. Fire-and-forget: the vessel is sailable
@@ -687,11 +687,11 @@ export class VesselService {
   /** Animated deck crew handle (casualties via killOne()/reviveAll()); null until loaded. */
   get crew(): CrewHandle | null { return this.crewHandle; }
 
-  /** Set the local ship's name — repaints the 3D stern nameboard in place (and is reapplied on the next build).
-   *  Called by MultiplayerService when the server confirms the name (on connect via wallet, and on rename). */
-  setShipName(name: string): void {
-    this.shipName = name || 'Saltmeadow';
-    this.nameboard?.update(this.shipName);
+  /** Set the local ship's flag colour (#rrggbb) — recolours the flags in place (and is reapplied on the next
+   *  build). Called by MultiplayerService when the server confirms it (on connect via wallet, and on change). */
+  setFlagColor(hex: string): void {
+    this.flagColor = hex || '#b22222';
+    this.flagHandle?.setColor(flagColor3(this.flagColor));
   }
 
   private buildWaterShadow(scene: Scene): void {

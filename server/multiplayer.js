@@ -421,6 +421,7 @@ async function saveEconomyState(p) {
         factionRep: JSON.stringify(p.factionRep || factions.defaultRep()),
         ship: p.ship || 'pinnace',
         shipName: p.shipName || 'Saltmeadow',
+        flagColor: p.flagColor || DEFAULT_FLAG_COLOR,
         cannonUpgrade: !!p.cannonUpgrade, armorUpgrade: !!p.armorUpgrade,
         ...(p.questState ? { questState: quest.serializeState(p.questState) } : {}),   // quest progress (if loaded)
       },
@@ -438,6 +439,15 @@ function sanitizeShipName(raw) {
   // eslint-disable-next-line no-control-regex
   const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
   return cleaned.slice(0, 28);
+}
+
+// Default flag colour (a deep ensign red) for players who haven't picked one. Custom colours are a #rrggbb hex.
+const DEFAULT_FLAG_COLOR = '#b22222';
+/** Validate a player-supplied flag colour → a normalized #rrggbb hex, or '' if malformed (caller defaults). */
+function sanitizeFlagColor(raw) {
+  if (typeof raw !== 'string') return '';
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(raw.trim());
+  return m ? ('#' + m[1].toLowerCase()) : '';
 }
 
 /** Safe-parse the persisted combatState TEXT column → object or null. */
@@ -465,7 +475,7 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState'] });
     if (!u) return;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
@@ -478,6 +488,9 @@ async function loadAndSendWallet(id, p, players) {
     // client can't spoof it), shown to others as a label subtitle + a 3D stern nameboard. Default 'Saltmeadow'.
     p.shipName = sanitizeShipName(u.shipName) || 'Saltmeadow';
     if (p.state) p.state.vesselName = p.shipName;
+    // Custom flag colour — authoritative (the 'update' handler forces the broadcast flagColor to this). Default red.
+    p.flagColor = sanitizeFlagColor(u.flagColor) || DEFAULT_FLAG_COLOR;
+    if (p.state) p.state.flagColor = p.flagColor;
     // Shipwright upgrades on the CURRENT hull (each once; reset on buying a new ship). cannonUpgrade → heavier
     // guns (read in combat.stepShot); armorUpgrade → +25% hull HP, applied when (re)building the combat state.
     p.cannonUpgrade = !!u.cannonUpgrade;
@@ -548,6 +561,7 @@ function sendWallet(p) {
       factionRep: p.factionRep || factions.defaultRep(),
       ship: p.ship || 'pinnace',
       shipName: p.shipName || 'Saltmeadow',   // the player's own custom ship name (for their HUD + 3D nameboard)
+      flagColor: p.flagColor || DEFAULT_FLAG_COLOR,   // the player's own flag colour (for the shipwright picker + local flags)
       cannonUpgrade: !!p.cannonUpgrade, armorUpgrade: !!p.armorUpgrade,   // shipwright upgrades on the current hull
     }));
   }
@@ -1152,6 +1166,9 @@ function attachMultiplayer(server) {
           // Ship-name authority: the broadcast vesselName is the server's stored custom name (set via
           // set_ship_name + persisted), NOT the client's claim — so a client can't spoof another's nameplate.
           vesselName: players.get(id)?.shipName || 'Saltmeadow',
+          // Custom FLAG COLOUR — also server-authoritative (set via set_flag_color), broadcast so everyone tints
+          // this player's flags to their chosen colour. Hex string like '#cc2b2b'.
+          flagColor: players.get(id)?.flagColor || DEFAULT_FLAG_COLOR,
           // Owned-ship authority: ignore the client's claimed hull and use the server's owned-ship record
           // (p.ship, loaded from the DB on connect), so a tampered client can't sail a vessel it hasn't
           // bought. capacity + movement physics then derive from the real hull.
@@ -1550,6 +1567,19 @@ function attachMultiplayer(server) {
           saveEconomyState(me);
           if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
           if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
+        }
+
+      } else if (msg.type === 'set_flag_color') {
+        // Set the player's custom flag colour. Server-authoritative + persisted; rides the next pose broadcast
+        // (flagColor forced from p.flagColor), so everyone re-tints this ship's flags. Pushed at once.
+        const me = players.get(id);
+        if (me) {
+          const color = sanitizeFlagColor(msg.flagColor) || DEFAULT_FLAG_COLOR;
+          me.flagColor = color;
+          if (me.state) me.state.flagColor = color;
+          saveEconomyState(me);
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'flag_color_set', flagColor: color }));
+          if (me.state) broadcastPose(id, me);   // others see the new flag colour at once
         }
 
       } else if (msg.type === 'trade_open') {

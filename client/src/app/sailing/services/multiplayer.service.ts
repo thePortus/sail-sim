@@ -1,7 +1,7 @@
 import { Injectable, NgZone, inject, signal } from '@angular/core';
 import { TransformNode, Mesh, Material, Scene } from '@babylonjs/core';
 import { buildNameplate } from './nameplate';
-import { buildSternNameboard, SternNameboardHandle } from './stern-nameboard';
+import { applyFlagColor, flagColor3, FlagColorHandle } from './flag-color';
 import { SceneService }  from './scene.service';
 import { OceanService }  from './ocean.service';
 import { WeatherService } from './weather.service';
@@ -88,8 +88,9 @@ interface OtherPlayerEntry extends OtherPlayer {
   label?:          Mesh | null;
   mastTop?:        number;   // height (m) of the masthead above the hull origin — label floats above THIS (tall brig vs short pinnace)
   labelScale?:     number;   // cached label scale; recomputed ~15 Hz (distance changes slowly), reused for the per-frame position
-  nameboard?:      SternNameboardHandle | null;   // 3D carved ship name on the stern (players only)
-  labelName?:      string;   // the ship name currently baked into the label + nameboard (to detect a rename → rebuild)
+  labelName?:      string;   // the ship name currently baked into the floating label (to detect a rename → rebuild)
+  flagHandle?:     FlagColorHandle | null;        // per-vessel flag-colour override (players only)
+  flagColor?:      string;   // this remote's current flag colour (#rrggbb) — to detect a change → recolour
 }
 
 @Injectable({ providedIn: 'root' })
@@ -178,6 +179,8 @@ export class MultiplayerService {
   // (set on tutorial completion, on buying a ship, or from the Shipwright's Rename button; null = closed).
   myShipName       = signal<string>('Saltmeadow');
   shipNameModal    = signal<{ current: string; reason: 'tutorial' | 'buy' | 'rename' } | null>(null);
+  // The player's own custom flag colour (#rrggbb) — drives the shipwright colour picker + local flags.
+  myFlagColor      = signal<string>('#b22222');
   // Set when the player collects salvage — the game overlay shows a transient toast.
   salvageToast = signal<{ goods: Record<string, number>; gold: number } | null>(null);
   // ── Quests (intro tutorial + future storyline) ──────────────────────────────
@@ -375,6 +378,22 @@ export class MultiplayerService {
   /** Open the ship-naming modal (from the Shipwright's "Rename ship" button). */
   openShipNameModal(reason: 'tutorial' | 'buy' | 'rename' = 'rename'): void {
     this.shipNameModal.set({ current: this.myShipName(), reason });
+  }
+
+  /** Live LOCAL-only preview while dragging the colour picker (no network) — keeps the wheel smooth. */
+  previewFlagColor(hex: string): void {
+    const c = /^#?[0-9a-fA-F]{6}$/.test(hex) ? (hex.startsWith('#') ? hex : '#' + hex) : '#b22222';
+    this.myFlagColor.set(c);
+    this.vesselService.setFlagColor(c);
+  }
+
+  /** Set the player's flag colour (#rrggbb). Optimistically recolours the LOCAL flags at once (snappy picker),
+   *  then the server confirms + persists + broadcasts to others. */
+  setFlagColor(hex: string): void {
+    const c = /^#?[0-9a-fA-F]{6}$/.test(hex) ? (hex.startsWith('#') ? hex : '#' + hex) : '#b22222';
+    this.myFlagColor.set(c);
+    this.vesselService.setFlagColor(c);   // instant local feedback while the picker drags
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'set_flag_color', flagColor: c }));
   }
 
   /** Quest: confirm a client-verified tutorial step (rotate camera, trim sails, listen for a rumour, …). The
@@ -801,10 +820,13 @@ export class MultiplayerService {
       if (typeof msg.shipName === 'string' && msg.shipName) {
         this.myShipName.set(msg.shipName);
         this.localState.vesselName = msg.shipName;
-        this.vesselService.setShipName(msg.shipName);   // paint it onto the local 3D stern nameboard
       }
       if (msg.cannonUpgrade !== undefined) this.cannonUpgrade.set(!!msg.cannonUpgrade);
       if (msg.armorUpgrade !== undefined) this.armorUpgrade.set(!!msg.armorUpgrade);
+      if (typeof msg.flagColor === 'string' && msg.flagColor) {
+        this.myFlagColor.set(msg.flagColor);
+        this.vesselService.setFlagColor(msg.flagColor);   // tint the local flags to the saved colour
+      }
 
     } else if (msg.type === 'market_state') {
       // A town's market quote (+ our wallet) — opens/refreshes the trader panel.
@@ -900,16 +922,22 @@ export class MultiplayerService {
       this.upgradeError.set(String(msg.reason ?? 'upgrade failed'));
 
     } else if (msg.type === 'ship_name_set') {
-      // Server confirmed our rename → update our own readouts + the local 3D nameboard, and close the modal.
+      // Server confirmed our rename → update our own readouts and close the modal. (Others see the new name on
+      // the floating label; the local player has no self-label, so there's nothing else to repaint.)
       const n = String(msg.shipName ?? 'Saltmeadow');
       this.myShipName.set(n);
       this.localState.vesselName = n;
-      this.vesselService.setShipName(n);
       this.shipNameModal.set(null);
 
     } else if (msg.type === 'rename_prompt') {
       // The intro tutorial just finished → invite the new captain to name their ship.
       this.shipNameModal.set({ current: String(msg.shipName ?? this.myShipName()), reason: 'tutorial' });
+
+    } else if (msg.type === 'flag_color_set') {
+      // Server confirmed our flag colour → sync the readout (the local flags were already recoloured optimistically).
+      const c = String(msg.flagColor ?? '#b22222');
+      this.myFlagColor.set(c);
+      this.vesselService.setFlagColor(c);
     }
   }
 
@@ -987,15 +1015,18 @@ export class MultiplayerService {
     entry.npc        = !!data.npc;
     if (data.faction !== undefined) entry.faction = data.faction ?? null;
     if (data.role !== undefined) entry.role = data.role ?? null;
+    if (typeof data.flagColor === 'string' && data.flagColor && data.flagColor !== entry.flagColor) {
+      entry.flagColor = data.flagColor;
+      if (!entry.npc) entry.flagHandle?.setColor(flagColor3(data.flagColor));   // live recolour (no rebuild)
+    }
     // Hull swapped under us (a remote player bought a new ship at a shipwright) → rebuild their mesh so
     // everyone sees the new vessel, not the old one. Guarded against re-entry; keeps the same root + pose.
     if (!isNew && entry.controller && entry.builtSlug && entry.builtSlug !== entry.vesselSlug && !entry.rebuilding) {
       this.rebuildRemoteVessel(data.id, entry, scene);
     }
-    // A remote PLAYER renamed their ship → repaint the stern nameboard + rebuild the floating label's subtitle.
+    // A remote PLAYER renamed their ship → rebuild the floating label's subtitle.
     if (!isNew && !entry.npc && entry.labelName !== undefined && entry.vesselName !== entry.labelName) {
       entry.labelName = entry.vesselName;
-      entry.nameboard?.update(entry.vesselName || 'Saltmeadow');
       if (entry.label) {
         const pos = entry.label.position.clone(), sc = entry.label.scaling.clone(), en = entry.label.isEnabled();
         entry.label.dispose(false, true);
@@ -1090,10 +1121,8 @@ export class MultiplayerService {
     // its unique DynamicTexture/material here.
     entry.label?.dispose(false, true);
     entry.label = null;
-    // 3D stern nameboard owns a unique DynamicTexture + material; free it (parented to root, but dispose
-    // explicitly so a hull-swap rebuild re-creates it cleanly for the new slug).
-    entry.nameboard?.dispose();
-    entry.nameboard = null;
+    entry.flagHandle?.dispose();   // per-vessel flag-colour materials
+    entry.flagHandle = null;
     entry.crew?.dispose();   // frees the crew's per-member cloned materials + observer
     entry.crew = null;
     entry.controller?.dispose();
@@ -1739,10 +1768,11 @@ export class MultiplayerService {
       entry.npc ? null : (entry.vesselName || null),   // players: their custom ship name as the label subtitle
     );
 
-    // 3D carved nameboard on the stern — PLAYERS only (their custom ship name). NPCs keep just the floating tag.
+    // Flag colour — tint this remote captain's flags to their chosen colour (PLAYERS only; NPCs keep authored flags).
     if (!entry.npc) {
-      entry.nameboard?.dispose();
-      entry.nameboard = buildSternNameboard(scene, prefix + 'nameboard', entry.root, slug, rig, entry.vesselName || 'Saltmeadow');
+      entry.flagHandle?.dispose();
+      entry.flagHandle = applyFlagColor(scene, entry.root, flagColor3(entry.flagColor || '#b22222'),
+        { excludeFromPrePass: (m) => this.sceneService.excludeFromPrePass(m) });
     }
 
     // Ocean reflection + refraction — register every hull/rig/sail mesh with the ocean

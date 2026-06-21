@@ -45,6 +45,8 @@ db.ensureColumns = async () => {
     // Shipwright per-hull upgrades (each buyable once; reset on a new ship): heavier cannons + +25% hull armor.
     ['cannonUpgrade', { type: Sequelize.DataTypes.BOOLEAN, allowNull: false, defaultValue: false }],
     ['armorUpgrade',  { type: Sequelize.DataTypes.BOOLEAN, allowNull: false, defaultValue: false }],
+    // Custom flag colour (#rrggbb) — the player's chosen flag tint, shown to everyone. Persists across ships.
+    ['flagColor',    { type: Sequelize.DataTypes.STRING(7), allowNull: true, defaultValue: '#b22222' }],
     // Crew resource: remaining sailors (NULL backfills as "full complement" on next load). Persists across
     // maps (the player's, not the world's). Grapeshot lowers it; a port tavern raises it back.
     ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],

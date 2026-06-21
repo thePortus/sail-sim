@@ -51,13 +51,26 @@ interface ShipRow {
         </button>
       </div>
 
-      <!-- Rename: re-christen the current hull. The shipwright's signwriter carves a fresh nameboard. -->
+      <!-- Rename: re-christen the current hull (shown to others as the floating label subtitle). -->
       <div class="sw-repair">
         <div class="sw-repair-info">
           <span class="sw-repair-title">Ship's name</span>
           <span class="sw-repair-sub">She answers to <em>{{ mp.myShipName() }}</em>.</span>
         </div>
         <button class="sw-buy sw-repair-btn" (click)="mp.openShipNameModal('rename')">Rename</button>
+      </div>
+
+      <!-- Flag colours: a sailmaker dyes your ensigns. Native RGB picker; live preview while dragging, sent on commit. -->
+      <div class="sw-repair">
+        <div class="sw-repair-info">
+          <span class="sw-repair-title">Flag colours</span>
+          <span class="sw-repair-sub">Dye your ensigns — others see your colours too.</span>
+        </div>
+        <label class="sw-flag-swatch" [style.background]="mp.myFlagColor()">
+          <input type="color" [value]="mp.myFlagColor()"
+                 (input)="mp.previewFlagColor($any($event.target).value)"
+                 (change)="mp.setFlagColor($any($event.target).value)" />
+        </label>
       </div>
 
       <!-- Per-hull upgrades (each once). Heavier guns / +25% armor — a budget boost that won't match the next ship. -->
@@ -153,6 +166,10 @@ interface ShipRow {
     .sw-upg-head { font-size: 0.92rem; color: #e8d3a0; font-weight: 600; }
     .sw-upg-note { font-size: 0.74rem; color: #b89a62; font-weight: 400; font-style: italic; }
     .sw-installed { font-size: 0.82rem; color: #9fe0a0; font-weight: 600; white-space: nowrap; }
+    .sw-flag-swatch { display: inline-block; width: 46px; height: 30px; border-radius: 6px; border: 1px solid #6e5326;
+                      box-shadow: inset 0 0 0 2px rgba(0,0,0,0.35); cursor: pointer; overflow: hidden; position: relative; }
+    .sw-flag-swatch input[type=color] { position: absolute; inset: -4px; width: 200%; height: 200%; border: none;
+                      padding: 0; background: none; cursor: pointer; opacity: 0; }
     .sw-list { display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.7rem; }
     .sw-card { border: 1px solid rgba(184,138,62,0.3); border-radius: 8px; padding: 0.6rem 0.7rem; background: rgba(255,255,255,0.03); }
     .sw-card--owned { border-color: rgba(240,200,105,0.55); background: rgba(240,200,105,0.07); }

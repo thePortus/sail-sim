@@ -200,7 +200,8 @@ export class SceneService {
     // themselves (tagged excludeFromRefraction / stencilProxy) so they never occlude their own smoke.
     dm.renderListPredicate = (m) =>
       !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_')
-      && !m.metadata?.excludeFromRefraction && !m.metadata?.stencilProxy;
+      && !m.metadata?.excludeFromRefraction && !m.metadata?.stencilProxy
+      && !(m as Mesh).hasThinInstances;  // see scene-depth crash guard in buildPostProcessing
     dm.refreshRate = 1;   // every frame while active (stale depth misaligns under camera rotation)
     this.smokeDepthRenderer = dr;
     this._smokeDepthMap = dm;
@@ -877,7 +878,8 @@ export class SceneService {
     // flagged excludeFromOceanDepth (the rain SPS) so falling streaks don't speckle the
     // water with soft-waterline foam.
     depthMap.renderListPredicate = (m) =>
-      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.skeleton && !m.metadata?.excludeFromOceanDepth;
+      !m.name.startsWith('ocean_') && !m.name.startsWith('scatter_') && !m.skeleton && !m.metadata?.excludeFromOceanDepth
+      && !(m as Mesh).hasThinInstances;  // see scene-depth crash guard below
     // ^ scatter_* = inland foliage (grass/trees/palms/rocks — hundreds of patch meshes). They're above
     // water and never want shoreline foam, so drawing them into this FULL-SCREEN, EVERY-FRAME depth pass
     // was pure cost (the refraction RTT already excludes them for the same reason).
@@ -954,6 +956,19 @@ export class SceneService {
     this.pipeline.depthOfField.focalLength   = 85;     // mm — telephoto compresses depth nicely
     this.pipeline.depthOfField.focusDistance = 8000;   // mm (~8 world units) — focused on ship
     this.pipeline.depthOfField.lensSize      = 50;     // physical lens diameter in mm
+
+    // ── Depth-pass crash guard (WebGPU) ──────────────────────────────────────────
+    // DepthOfField (and any depth-reading post) pulls from the scene-default DepthRenderer,
+    // which renders the WHOLE scene with NO render-list filter. Thin-instanced decoratives
+    // (reeds, seaweed, dolphins, ship/town impostors) register a custom 'color' instanced vertex
+    // attribute; in a WebGPU DepthRenderer the depth effect's vertex-buffer layout includes that
+    // extra instanced buffer at a slot the depth render path never binds, so the draw fails with
+    // "Vertex buffer slot N required by [RenderPipeline r16float_depth32float] was not set" → the
+    // command buffer is invalidated → black screen (reproduced live when a dolphin pod / reed bed
+    // is on-camera). These meshes don't need DoF/AO depth, so keep every thin-instanced mesh out
+    // of the scene depth pass (our ocean + smoke DepthRenderers apply the same guard).
+    this.scene.enableDepthRenderer(this.camera, false, false).getDepthMap().renderListPredicate =
+      (m) => !(m as Mesh).hasThinInstances;
 
     // Image processing: ACES tone mapping + vignette + contrast.
     // ACES remaps how bright highlights clip — prevents blown-out whites and

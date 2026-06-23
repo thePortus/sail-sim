@@ -20,7 +20,9 @@ const terrainConfig = require('./config/terrain.config');
 let res = 0;                 // grid resolution (res×res)
 let bits = null;            // Uint8Array bitset, bit (cz*res+cx)
 let wb = null;              // { minX, maxX, minZ, maxZ }
-let loaded = false;
+let loaded = false;         // true ONLY after a SUCCESSFUL navgrid load — a failed load is NOT cached (self-heals)
+let lastNavTry = 0;         // last load attempt (ms) — throttles retries until the manifest + navgrid appear
+const NAV_RETRY_MS = 3000;
 let comp = null;            // Int32Array component id per cell (-1 = non-nav), using A*'s move rule
 let mainComp = -1;          // the largest component (the open sea everything routes through)
 const pathCache = new Map(); // 'cx,cz>cx,cz' → waypoints[] | null
@@ -34,8 +36,18 @@ function isNav(cx, cz) {
   const i = cz * res + cx;
   return (bits[i >> 3] & (1 << (i & 7))) !== 0;
 }
+// Self-healing load: retry (throttled) until the navgrid actually loads, so a server that booted BEFORE the terrain
+// bake finished still picks the grid up once it appears (mirrors economy's manifest self-heal). Without this the
+// one-shot lazy load cached a permanent failure → snapToNav null → pickLair null → pirates never spawned.
+function ensureNav() {
+  if (loaded) return;
+  const now = Date.now();
+  if (now - lastNavTry < NAV_RETRY_MS) return;
+  lastNavTry = now;
+  loadNavGrid();
+}
 function worldToCell(x, z) {
-  if (!loaded) loadNavGrid();               // lazy-load on first use (e.g. a direct caller before any findPath)
+  ensureNav();                              // lazy-load on first use (e.g. a direct caller before any findPath)
   if (!wb) return { cx: 0, cz: 0 };          // grid unavailable → harmless default; callers' snapToNav fails safe
   const u = (x - wb.minX) / (wb.maxX - wb.minX);
   const v = (wb.maxZ - z) / (wb.maxZ - wb.minZ);   // Z flip: +Z (north) → row 0
@@ -45,7 +57,7 @@ function worldToCell(x, z) {
   return { cx, cz };
 }
 function cellToWorld(cx, cz) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   if (!wb) return { x: 0, z: 0 };
   return {
     x: wb.minX + ((cx + 0.5) / res) * (wb.maxX - wb.minX),
@@ -172,7 +184,7 @@ function stringPull(cells) {
 /** Component id of the nearest navigable cell to (x,z) — searching outward, NOT forced to the main sea (unlike
  *  snapToNav). This is the LOCAL water body a point touches. -1 if no navigable cell within SNAP_MAX_RINGS. */
 function componentAt(x, z) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   if (!bits || !comp) return -1;
   const { cx, cz } = worldToCell(x, z);
   if (isNav(cx, cz)) return comp[cz * res + cx];
@@ -192,7 +204,7 @@ function componentAt(x, z) {
  *  component (no land barrier between them). Fail-open (true) when no navgrid is loaded, so trading still
  *  works on maps built before the grid existed. Used to keep demand hints / NPC sourcing to reachable ports. */
 function reachable(ax, az, bx, bz) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   if (!bits || !comp) return true;   // no grid → don't filter
   const a = componentAt(ax, az);
   return a >= 0 && a === componentAt(bx, bz);
@@ -202,7 +214,7 @@ function reachable(ax, az, bx, bz) {
  *  crossing). Fail-open (true) when no navgrid is loaded. Used by the NPC helm to steer AROUND land in combat,
  *  where it follows a free heading instead of the A* route. */
 function clearLine(ax, az, bx, bz) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   if (!bits) return true;
   const a = worldToCell(ax, az), b = worldToCell(bx, bz);
   return lineClear(a.cx, a.cz, b.cx, b.cz);
@@ -213,7 +225,7 @@ function clearLine(ax, az, bx, bz) {
  *  helm rank candidate headings by HOW MUCH open water lies ahead instead of an all-or-nothing pass/fail — so a
  *  boxed-in merchant turns toward the most open water rather than holding course into the nearest rock. */
 function openDistance(ax, az, bx, bz) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   const full = Math.hypot(bx - ax, bz - az);
   if (!bits || full < 1e-3) return full;
   const cellW = (wb.maxX - wb.minX) / res, cellH = (wb.maxZ - wb.minZ) / res;
@@ -233,7 +245,7 @@ function openDistance(ax, az, bx, bz) {
  * with navigable-water waypoints between, or null if unreachable. Snaps A/B to open water + adds approach legs.
  */
 function findPath(ax, az, bx, bz) {
-  if (!loaded) loadNavGrid();
+  ensureNav();
   if (!bits) return [{ x: ax, z: az }, { x: bx, z: bz }];   // no navgrid → straight line (fail-open)
   const s = snapToNav(worldToCell(ax, az).cx, worldToCell(ax, az).cz);
   const g = snapToNav(worldToCell(bx, bz).cx, worldToCell(bx, bz).cz);
@@ -248,23 +260,25 @@ function findPath(ax, az, bx, bz) {
 }
 
 function loadNavGrid() {
-  loaded = true;
+  // Commit res/wb/bits into module state ONLY on a fully-successful read, and set `loaded` only then — so a failed
+  // attempt (manifest/navgrid not baked yet) leaves clean null state and is retried by ensureNav (no partial state,
+  // no cached failure). This is what lets a server that booted before the bake finished self-heal.
   try {
     const manifestPath = path.join(terrainConfig.outputDir, 'manifest.json');
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const ng = m.navGrid;
-    if (!ng || !ng.file) { console.warn('[nav] manifest has no navGrid — NPC routing falls back to straight lines'); return; }
-    res = ng.resolution;
-    wb = m.worldBounds;
-    bits = new Uint8Array(fs.readFileSync(path.join(terrainConfig.outputDir, ng.file)));
-    const need = Math.ceil((res * res) / 8);
-    if (bits.length < need) { console.warn(`[nav] navgrid too small (${bits.length}<${need}) — disabling`); bits = null; return; }
+    if (!ng || !ng.file) { console.warn('[nav] manifest has no navGrid yet — straight-line routing, will retry'); return; }
+    const nres = ng.resolution;
+    const nbits = new Uint8Array(fs.readFileSync(path.join(terrainConfig.outputDir, ng.file)));
+    const need = Math.ceil((nres * nres) / 8);
+    if (nbits.length < need) { console.warn(`[nav] navgrid too small (${nbits.length}<${need}) — will retry`); return; }
+    res = nres; wb = m.worldBounds; bits = nbits;       // commit only once fully read
     computeComponents();
     let nav = 0; for (let i = 0; i < res * res; i++) if (isNav(i % res, (i - i % res) / res)) nav++;
     console.log(`[nav] navgrid ${res}² loaded — ${(100 * nav / (res * res)).toFixed(1)}% navigable; open sea = component of ${(() => { let c = 0; for (let i = 0; i < res * res; i++) if (comp[i] === mainComp) c++; return c; })()} cells`);
+    loaded = true;
   } catch (err) {
-    bits = null;
-    console.warn('[nav] navgrid load failed — NPC routing falls back to straight lines:', err.message);
+    console.warn('[nav] navgrid load failed (straight-line routing, will retry):', err.message);
   }
 }
 

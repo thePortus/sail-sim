@@ -135,6 +135,13 @@ const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a nav
 const PIRATE_RESPAWN_MIN_MS = 5 * 60 * 1000;
 const PIRATE_RESPAWN_MAX_MS = 10 * 60 * 1000;
 const pirateRespawnQueue = [];     // due-times (ms) for sunk pirates awaiting their delayed replacement
+let _lastLairWarn = 0;             // throttle the "pickLair null" warning (nav grid not ready) to once / 30s
+function warnNoLair(ctx) {
+  const now = Date.now();
+  if (now - _lastLairWarn < 30000) return;
+  _lastLairWarn = now;
+  console.warn(`[pirate] ${ctx}: pickLair returned null — nav grid not loaded yet; will keep retrying (it self-heals once the terrain navgrid is available)`);
+}
 const HUNTER_SKILL    = 0.95;      // veteran navy gunnery + nerve (built to win the duel)
 const HUNTER_CRUISE   = 0.9;       // a shade faster than the pirate (0.85) so it can run it down
 const HUNTER_APPROACH = 220;       // within this it jockeys for a broadside; beyond, it bears straight for the pirate
@@ -1498,7 +1505,7 @@ function spawnerTick(players, announceHunter) {
     const i = pirateRespawnQueue.findIndex((t) => t <= nowP);
     if (i === -1) break;
     const lair = pickLair(towns);
-    if (!lair) { console.warn('[pirate] respawn due but pickLair returned null — retrying next tick'); break; }
+    if (!lair) { warnNoLair('respawn due'); break; }
     pirateRespawnQueue.splice(i, 1);
     makePirate(players, lair, pick(PIRATE_SLUGS));
     pSpawned++;
@@ -1509,7 +1516,7 @@ function spawnerTick(players, announceHunter) {
   //     driven respawns via the queue above; this keeps a fresh server (and any unaccounted gap) populated promptly.
   while (pSpawned < 2 && pirateCount(players) + pirateRespawnQueue.length < pTarget) {
     const lair = pickLair(towns);
-    if (!lair) { console.warn('[pirate] safety-fill wanted a pirate but pickLair returned null'); break; }
+    if (!lair) { warnNoLair('safety-fill'); break; }
     makePirate(players, lair, pick(PIRATE_SLUGS));
     pSpawned++;
     console.log(`[pirate] safety-fill spawned (live=${pirateCount(players)}/${pTarget})`);

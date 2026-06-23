@@ -1529,8 +1529,47 @@ function spawnerTick(players, announceHunter) {
   }
 }
 
+/** Admin diagnostic: force the pirate population up to target NOW (ignoring the respawn cooldown) and log a full
+ *  trace to the server console — town count, target, each lair pick, and a deep nav probe if NOTHING spawns. This is
+ *  the tool for the "no pirates on live but fine locally" case: if pickLair keeps returning null here, the live nav
+ *  grid / terrain data is the culprit (not the spawn logic). Returns a summary object. Clears the respawn queue too. */
+function debugSpawnPirates(players) {
+  const towns = economy.townList();
+  const target = targetPirates(towns.length);
+  const before = pirateCount(players);
+  const lines = [`towns=${towns.length} target=${target} liveBefore=${before} queued=${pirateRespawnQueue.length}`];
+  if (towns.length < 2) {
+    lines.push('ABORT: fewer than 2 towns — economy/nav not ready');
+    lines.forEach((l) => console.log('[pirate-debug]', l));
+    return { ok: false, towns: towns.length, target, before, after: before, spawned: 0, lairFails: 0, lines };
+  }
+  pirateRespawnQueue.length = 0;   // a manual full spawn supersedes any pending cooldowns
+  let spawned = 0, lairFails = 0, guard = 0;
+  while (pirateCount(players) < target && guard++ < 60) {
+    const lair = pickLair(towns);
+    if (!lair) { lairFails++; continue; }
+    const p = makePirate(players, lair, pick(PIRATE_SLUGS));
+    spawned++;
+    lines.push(`spawned ${p.state.vesselName} (${p.state.vesselSlug}) @ (${lair.x.toFixed(0)}, ${lair.z.toFixed(0)})`);
+  }
+  if (lairFails) lines.push(`pickLair returned null ${lairFails}×`);
+  if (spawned === 0) {
+    // Deep nav probe: is snapToNav itself failing on this host? Try a fixed offshore point off the first town.
+    const t = towns[0];
+    const tx = t.x + 1200, tz = t.z + 1200;
+    let cell = null, snap = null, err = null;
+    try { cell = nav.worldToCell(tx, tz); snap = nav.snapToNav(cell.cx, cell.cz); }
+    catch (e) { err = e.message; }
+    lines.push(`NAV PROBE town0="${t.name}" @(${t.x | 0},${t.z | 0}) → cell=${cell ? `(${cell.cx},${cell.cz})` : 'NULL'} snap=${snap ? `(${snap.cx},${snap.cz})` : 'NULL'}${err ? ` ERR=${err}` : ''}`);
+    lines.push('→ snap NULL means the nav grid is empty/unloaded on this host (the live data differs from local).');
+  }
+  lines.push(`liveAfter=${pirateCount(players)} spawned=${spawned}`);
+  lines.forEach((l) => console.log('[pirate-debug]', l));
+  return { ok: true, towns: towns.length, target, before, after: pirateCount(players), spawned, lairFails, lines };
+}
+
 module.exports = {
-  tickNpcs, broadcastInterest, spawnerTick, targetFleet, npcCount, markHostile, isHostile, makeTutorialTarget,
+  tickNpcs, broadcastInterest, spawnerTick, debugSpawnPirates, targetFleet, npcCount, markHostile, isHostile, makeTutorialTarget,
   _test: {
     spawnNpc, planTrip, chooseTrip, scoreNeed, pickFaction, onArrive, tickNpcs, broadcastInterest,
     avoidanceHeading, headingTo, turnToward, blendHeading, angleDelta, VIEW_RADIUS, MAX_VISIBLE,

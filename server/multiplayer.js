@@ -1834,6 +1834,19 @@ function attachMultiplayer(server) {
           const parsed = parseTargetAndRest(arg);
           handleModCommand(id, senderCallsign, action, parsed?.target, players);
 
+        } else if (text === '/pirates' || text.startsWith('/pirates')) {
+          // Force a full pirate population spawn NOW + dump a diagnostic trace to the server console. The tool for
+          // the "no pirates on live, fine locally" case — if the console shows pickLair/snap NULL, it's the nav grid.
+          const me = players.get(id);
+          if (!isStaff(me)) { sysReply(me?.ws, 'Only an Owner or Admin may force pirate spawns.'); }
+          else {
+            const r = npc.debugSpawnPirates(players);
+            sysReply(me.ws, r.ok
+              ? `Pirates ${r.before}→${r.after} / target ${r.target} (towns ${r.towns}, spawned ${r.spawned}`
+                + `${r.lairFails ? `, pickLair-null ×${r.lairFails} — NAV GRID issue, see console` : ''}). Full trace in server console.`
+              : `Could not spawn: ${r.lines[r.lines.length - 1]} (see console).`);
+          }
+
         } else if (text === '/godmode' || text.startsWith('/godmode ')) {
           // Toggle invulnerability for the calling admin (session-only; cleared on disconnect).
           const me = players.get(id);

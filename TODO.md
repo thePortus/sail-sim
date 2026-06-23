@@ -2,9 +2,21 @@
 
 # General or Current TODO Items
 
+* nations at war fight each other if they are warships or convoy with a warship
+* fix: pirates respawn after a cooldown period of 5-10 minutes (with a different name)
+* actual merchantman vessel (never used as a warship/pirate/piratehunter)
+* frigate, galleon
+* redo crew
+* forts and taking towns
+* swordfighting
+* dancing
+* career of lands gained, etc. adapted to this game
+* capture ships
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
 * increase render resolution in spyglass
+* fleets with prize crews to take them over
+* town forts... capturing towns
 * update profile page and update password page (and 404 page with a funny 404)
 * make trading and ship buying server-side secure
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert

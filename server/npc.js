@@ -129,6 +129,12 @@ const HUNTER_NAMES = ['Vengeance', 'Retribution', 'Intrepid', 'Vigilant', 'Defia
   'Indomitable', 'Relentless', 'Dauntless', 'Tempest', 'Valiant', 'Conqueror', 'Fury', 'Implacable', 'Resolute'];
 const PIRATE_SEED_GOLD = 200;      // a pirate spawns with this small purse; its bounty + plundered gold grow as it raids
 const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a navy hunter (players get first crack)
+// Respawn cooldown: when a pirate is sunk it does NOT refill instantly — a replacement is scheduled 5–10 min later
+// (varied), so the seas keep getting plagued but a cleared lane stays clear for a while. A fresh server still fills
+// promptly (the cooldown only gates SINK replacements; the initial/deficit fill below is immediate).
+const PIRATE_RESPAWN_MIN_MS = 5 * 60 * 1000;
+const PIRATE_RESPAWN_MAX_MS = 10 * 60 * 1000;
+const pirateRespawnQueue = [];     // due-times (ms) for sunk pirates awaiting their delayed replacement
 const HUNTER_SKILL    = 0.95;      // veteran navy gunnery + nerve (built to win the duel)
 const HUNTER_CRUISE   = 0.9;       // a shade faster than the pirate (0.85) so it can run it down
 const HUNTER_APPROACH = 220;       // within this it jockeys for a broadside; beyond, it bears straight for the pirate
@@ -144,10 +150,11 @@ function npcCount(players) {
   return solo + convoys.size;
 }
 
-/** Live pirate count (separate population from the merchant fleet). */
+/** Live pirate count (separate population from the merchant fleet). Excludes sunk/lingering hulls so the spawner
+ *  refills correctly — counting a capsizing (or stuck) pirate as "alive" was leaving the seas permanently empty. */
 function pirateCount(players) {
   let n = 0;
-  for (const [, p] of players) if (p.isPirate) n++;
+  for (const [, p] of players) if (p.isPirate && !(p.combat && p.combat.sunk)) n++;
   return n;
 }
 
@@ -1215,7 +1222,16 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
         // Morale shock: losing a consort rattles the rest of the convoy (E4) → far more flee-prone for a while.
         if (npc.convoyId) { for (const m of convoyMembers(npc, players)) { if (m !== npc) m.moraleShakeUntil = nowMs + MORALE_SHAKE_MS; } }
       }
-      if (nowMs - npc.sinkAt >= SINK_LINGER_MS) { players.delete(npc.id); broadcastLeave(npc.id); }
+      if (nowMs - npc.sinkAt >= SINK_LINGER_MS) {
+        // A sunk pirate schedules its replacement for 5–10 min out (varied) so the lane it haunted stays clear a
+        // while, then the plague returns. Capped so a burst of sinkings can't balloon the queue.
+        if (npc.isPirate && !npc.isHunter && pirateRespawnQueue.length < 16) {
+          const dueMs = nowMs + PIRATE_RESPAWN_MIN_MS + Math.random() * (PIRATE_RESPAWN_MAX_MS - PIRATE_RESPAWN_MIN_MS);
+          pirateRespawnQueue.push(dueMs);
+          console.log(`[pirate] ${npc.state.vesselName || 'raider'} sunk → respawn in ~${Math.round((dueMs - nowMs) / 60000)} min (queued=${pirateRespawnQueue.length})`);
+        }
+        players.delete(npc.id); broadcastLeave(npc.id);
+      }
       continue;
     }
 
@@ -1475,12 +1491,28 @@ function spawnerTick(players, announceHunter) {
   while (npcCount(players) < target && spawned < 3) { spawnNpc(players, towns); spawned++; }   // ramp up gradually
   // Pirates: a separate, smaller population that haunts open water (not counted in the merchant fleet target).
   const pTarget = targetPirates(towns.length);
+  const nowP = Date.now();
   let pSpawned = 0;
-  while (pirateCount(players) < pTarget && pSpawned < 2) {
+  // (a) Delayed respawns: a pirate sunk earlier scheduled its replacement 5–10 min out. Spawn any that are now due.
+  while (pSpawned < 2 && pirateCount(players) < pTarget) {
+    const i = pirateRespawnQueue.findIndex((t) => t <= nowP);
+    if (i === -1) break;
     const lair = pickLair(towns);
-    if (!lair) break;
+    if (!lair) { console.warn('[pirate] respawn due but pickLair returned null — retrying next tick'); break; }
+    pirateRespawnQueue.splice(i, 1);
     makePirate(players, lair, pick(PIRATE_SLUGS));
     pSpawned++;
+    console.log(`[pirate] respawn fired (live=${pirateCount(players)}/${pTarget}, queued=${pirateRespawnQueue.length})`);
+  }
+  // (b) Initial / safety fill: cover any deficit NOT already waiting on a cooldown (fresh server, or pirates lost
+  //     without a scheduled replacement) so the seas are never permanently empty. The cooldown only gates sink-
+  //     driven respawns via the queue above; this keeps a fresh server (and any unaccounted gap) populated promptly.
+  while (pSpawned < 2 && pirateCount(players) + pirateRespawnQueue.length < pTarget) {
+    const lair = pickLair(towns);
+    if (!lair) { console.warn('[pirate] safety-fill wanted a pirate but pickLair returned null'); break; }
+    makePirate(players, lair, pick(PIRATE_SLUGS));
+    pSpawned++;
+    console.log(`[pirate] safety-fill spawned (live=${pirateCount(players)}/${pTarget})`);
   }
   // Pirate hunters: any pirate that's sunk ≥ PIRATE_HUNT_THRESHOLD merchants draws ONE navy warship from the
   // nearest faction town. The previous hunter being lost (sunk) lets the nation send another — the pirate stays

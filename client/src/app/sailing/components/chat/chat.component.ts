@@ -318,6 +318,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   private readonly SERVER_COMMANDS = [
     't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban', 'reloadassets',
     'godmode', 'teleport', 'teleporto', 'repair', 'crew', 'givegold', 'diplomacy', 'mast', 'squad', 's',
+    'pirates',
   ];
 
   sendMessage(): void {
@@ -471,6 +472,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
         '/givegold "<name>" <amount> — gift gold to a player',
         '/diplomacy [<nationA> <nationB> war|peace|alliance] — view or set faction relations',
         '/mast [hp] — set your own mast HP for testing (no arg = dismast; auto jury-rigs to 50% in 45s)',
+        '/pirates — force-spawn pirates to full population now + log a nav diagnostic to the server console',
       );
     }
     if (this.isOwner) {

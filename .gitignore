@@ -14,6 +14,7 @@ certbot/
 
 # generated terrain files
 server/assets/terrain/
+server/assets/geometry/terrain/biome/
 
 # downloaded terrain source rasters (re-fetchable via npm run fetch:terrain-sources)
 server/assets/maps/sources/

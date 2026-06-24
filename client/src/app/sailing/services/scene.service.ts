@@ -312,6 +312,10 @@ export class SceneService {
             // (Apple/Metal reports far more); clamp so the request can never exceed what the adapter offers
             // (an over-request would reject the device and drop us to WebGL).
             let maxUBO = 12, maxStorageTex = 8, hasTimestamp = false;
+            // GPU texture-compression features the adapter offers — REQUIRED at device creation for the KTX2
+            // basis transcoder to target a compressed format (BC7 on desktop / ASTC on Apple); without them
+            // it falls back to uncompressed RGBA (4× the VRAM, defeats the terrain biome-array compression).
+            const compressionFeats: string[] = [];
             try {
               type AdapterLike = {
                 limits?: { maxUniformBuffersPerShaderStage?: number; maxStorageTexturesPerShaderStage?: number };
@@ -326,10 +330,13 @@ export class SceneService {
               if (adapter?.limits?.maxUniformBuffersPerShaderStage) maxUBO = adapter.limits.maxUniformBuffersPerShaderStage;
               if (adapter?.limits?.maxStorageTexturesPerShaderStage) maxStorageTex = Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
               hasTimestamp = adapter?.features?.has('timestamp-query') ?? false;   // enables the perf overlay's GPU-ms
+              for (const f of ['texture-compression-bc', 'texture-compression-astc', 'texture-compression-etc2']) {
+                if (adapter?.features?.has(f)) compressionFeats.push(f);
+              }
               const inf = adapter?.info;
               if (inf) console.log(`[Scene] WebGPU adapter: ${inf.vendor ?? '?'} ${inf.architecture ?? ''} ${inf.device ?? ''} ${inf.description ?? ''}`.trim());
             } catch { /* fall back to defaults below */ }
-            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}, timestamp-query=${hasTimestamp}`);
+            console.log(`[Scene] adapter limits: maxUniformBuffersPerShaderStage=${maxUBO}, maxStorageTexturesPerShaderStage=${maxStorageTex}, timestamp-query=${hasTimestamp}, compression=[${compressionFeats.join(',')}]`);
             this.engine = await WebGPUEngine.CreateAsync(canvas, {
               antialias: true,
               // Babylon forwards these options verbatim to navigator.gpu.requestAdapter() — without
@@ -342,7 +349,7 @@ export class SceneService {
                 // timestamp-query (only when the adapter offers it — requesting an unavailable feature
                 // rejects device creation → WebGL fallback) lets Babylon's EngineInstrumentation report
                 // real per-frame GPU time in the perf overlay; without it gpuFrameTimeCounter reads 0.
-                requiredFeatures: hasTimestamp ? ['timestamp-query'] : [],
+                requiredFeatures: [...(hasTimestamp ? ['timestamp-query'] : []), ...compressionFeats],
                 requiredLimits: {
                   maxStorageTexturesPerShaderStage: maxStorageTex,
                   maxUniformBuffersPerShaderStage: Math.min(maxUBO, 24),

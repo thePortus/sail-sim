@@ -70,6 +70,14 @@ type ScatterType = {
   logged: boolean;
 };
 
+// Minimal WebGPU shapes used by assembleCompressedBiomeArray (this tsconfig doesn't pull @webgpu/types,
+// and Babylon's ambient GPUTexture lacks .format/.mipLevelCount). Structural — just what we touch.
+interface GpuTexLike { format: string; mipLevelCount: number; width: number; height: number; }
+interface GpuDeviceLike {
+  createCommandEncoder(): { copyTextureToTexture(src: object, dst: object, size: object): void; finish(): unknown };
+  queue: { submit(buffers: unknown[]): void };
+}
+
 @Injectable({ providedIn: 'root' })
 export class TerrainService {
   private readonly CHUNK_CONCURRENCY = 8;
@@ -2428,14 +2436,11 @@ export class TerrainService {
       ctx.clearRect(0, 0, SIZE, SIZE); ctx.drawImage(img, 0, 0, SIZE, SIZE);
       try { return ctx.getImageData(0, 0, SIZE, SIZE).data; } catch { return null; }
     };
-    // Albedo array: prefer the GPU-compressed KTX2 array (geometry/terrain/biome_albedo.ktx2 — Basis-LZ, ~4×
-    // less VRAM than the uncompressed RawTexture2DArray). loadKtx2Array VERIFIES it actually bound as an
-    // albN-layer 2D-array and returns null otherwise, so a load failure / mis-bind / opt-out all fall through
-    // to the uncompressed canvas build below (terrain never goes invisible). Opt out: localStorage ignis_terrain_ktx2='0'.
-    let albArr: BaseTexture | null = null;
-    if ((localStorage.getItem('ignis_terrain_ktx2') ?? '1') !== '0') {
-      albArr = await this.loadKtx2Array(scene, `${Settings.apiUrl}geometry/terrain/biome_albedo.ktx2`, albN);
-    }
+    // Albedo array: prefer the GPU-compressed array, assembled from per-layer KTX2 files
+    // (geometry/terrain/biome/albedo_NN.ktx2 — Basis, ~4× less VRAM than the uncompressed RawTexture2DArray).
+    // assembleCompressedBiomeArray returns null on WebGL / any failure / opt-out, falling through to the
+    // uncompressed canvas build below (terrain never goes invisible/garbled). Opt out: ignis_terrain_ktx2='0'.
+    const albArr: BaseTexture | null = await this.assembleCompressedBiomeArray(scene, 'biome/albedo', albN);
     let albedo: Uint8Array | null = null;
     if (!albArr) {
       // Fallback: build the uncompressed RawTexture2DArray from the served tiles (the original path).
@@ -2449,12 +2454,9 @@ export class TerrainService {
         }
       }
     }
-    // ORM array (R = roughness, G = AO): prefer the GPU-compressed KTX2 array, else build the uncompressed
-    // RawTexture2DArray from the rough+ao tiles. Same verified-bind fallback as the albedo array.
-    let ormArr: BaseTexture | null = null;
-    if ((localStorage.getItem('ignis_terrain_ktx2') ?? '1') !== '0') {
-      ormArr = await this.loadKtx2Array(scene, `${Settings.apiUrl}geometry/terrain/biome_orm.ktx2`, ORMN);
-    }
+    // ORM array (R = roughness, G = AO): prefer the GPU-compressed array (per-layer biome/orm_NN.ktx2), else
+    // build the uncompressed RawTexture2DArray from the rough+ao tiles. Same hard fallback as the albedo array.
+    const ormArr: BaseTexture | null = await this.assembleCompressedBiomeArray(scene, 'biome/orm', ORMN);
     let orm: Uint8Array | null = null;
     if (!ormArr) {
       orm = new Uint8Array(ORMN * SIZE * SIZE * 4);
@@ -2482,26 +2484,94 @@ export class TerrainService {
   }
 
   /**
-   * Load a GPU-compressed KTX2 ARRAY texture (Basis-LZ) for the biome albedo, returning it ONLY if it actually
-   * bound as an `expectLayers`-layer 2D-array — otherwise null (so the caller falls back to the uncompressed
-   * RawTexture2DArray). This guards against both a load failure AND Babylon decoding it as a plain 2D texture
-   * (which would sample wrong), since terrain can't be verified live and a bad bind = invisible/garbled land.
+   * Assemble a GPU-COMPRESSED biome 2D-array (BC7 on desktop / ASTC on Apple etc. — the Basis transcoder
+   * picks per device) from PER-LAYER KTX2 files (`geometry/terrain/<prefix>_NN.ktx2`). ~4× less VRAM than
+   * the uncompressed RawTexture2DArray. Babylon 9.x can't LOAD an array-KTX2 directly (its KTX2 decoder
+   * rejects 2D-array containers), and there's no public API to build a compressed array — so we load each
+   * layer as a normal compressed 2D texture, then GPU-stack them: create a compressed 2D-array of the same
+   * format and `copyTextureToTexture` every layer+mip into its slice (legal because both are the same
+   * compressed GPU format, and Babylon gives Raw/loaded textures COPY_SRC|COPY_DST usage by default).
+   * WEBGPU-ONLY (needs the copy + raw device); returns null on WebGL or on ANY mismatch/failure so the
+   * caller falls back to the uncompressed array — terrain can NEVER go garbled/invisible from this path.
+   * Opt out entirely: localStorage ignis_terrain_ktx2='0'.
    */
-  private loadKtx2Array(scene: Scene, url: string, expectLayers: number): Promise<BaseTexture | null> {
+  private async assembleCompressedBiomeArray(scene: Scene, prefix: string, layerCount: number): Promise<BaseTexture | null> {
+    const engine = scene.getEngine();
+    const device = (engine as unknown as { _device?: GpuDeviceLike })._device;
+    const isWebGPU = (engine as unknown as { isWebGPU?: boolean }).isWebGPU === true;
+    if ((localStorage.getItem('ignis_terrain_ktx2') ?? '1') === '0' || !isWebGPU || !device) { return null; }
+    const hw = (t: Texture) => (t._texture as unknown as { _hardwareTexture?: { underlyingResource: GpuTexLike } } | null)?._hardwareTexture;
+    const layers: (Texture | null)[] = [];
+    try {
+      for (let L = 0; L < layerCount; L++) {
+        const url = `${Settings.apiUrl}geometry/terrain/${prefix}_${String(L).padStart(2, '0')}.ktx2`;
+        layers.push(await this.loadKtx2Single(scene, url));
+      }
+      if (layers.some((t) => !t)) { throw new Error('a per-layer KTX2 failed to load'); }
+      const it0 = (layers[0] as Texture)._texture!;
+      const gpu0 = hw(layers[0] as Texture)?.underlyingResource;
+      if (!gpu0) { throw new Error('layer 0 has no GPU texture'); }
+      // Read dims/mips/format from the GPUTexture — the Babylon InternalTexture's .width/.height stay at the
+      // 1×1 PLACEHOLDER for KTX2 (its dims aren't synced post-decode), but the underlying GPUTexture is correct.
+      const w = gpu0.width, h = gpu0.height, fmt = it0.format, type = it0.type, mips = gpu0.mipLevelCount, gpuFmt = gpu0.format;
+      for (let L = 1; L < layerCount; L++) {
+        const g = hw(layers[L] as Texture)?.underlyingResource;
+        if (!g || g.width !== w || g.height !== h || g.mipLevelCount !== mips || g.format !== gpuFmt) {
+          throw new Error(`layer ${L} mismatch (dims/format/mips)`);
+        }
+      }
+      // Compressed 2D-array target. genMips=TRUE so the GPU texture allocates the full mip CHAIN (Babylon
+      // sizes the texture from generateMipMaps, NOT the mipLevelCount arg); with null data no mips are
+      // auto-generated — we copy all `mips` levels in by hand. Then clear the flag so nothing tries to
+      // regenerate mips on a compressed texture later (that would fail — can't render-gen into BC/ASTC).
+      const arrInt = (engine as unknown as {
+        createRawTexture2DArray(d: ArrayBufferView | null, w: number, h: number, depth: number, format: number,
+          genMips: boolean, invertY: boolean, sampling: number, comp: null, type: number, flags: number, mipLevelCount: number): {
+            _hardwareTexture: { underlyingResource: GpuTexLike }; isReady: boolean; generateMipMaps: boolean;
+            incrementReferences(): void; dispose(): void;
+          };
+      }).createRawTexture2DArray(null, w, h, layerCount, fmt, true, false, Texture.TRILINEAR_SAMPLINGMODE, null, type, 0, mips);
+      arrInt.generateMipMaps = false;
+      const arrGpu = arrInt._hardwareTexture.underlyingResource;
+      if (arrGpu.format !== gpuFmt) { arrInt.dispose(); throw new Error(`array format ${arrGpu.format} != layer ${gpuFmt}`); }
+      // Compressed copies must be a multiple of the format's block size (4×4 for every basis transcode
+      // target — ETC2/ASTC-4x4/BC*). The sub-block mips (2×2, 1×1) physically store a full 4×4 block, so
+      // round the copy extent UP to the block — copyTextureToTexture does NOT honour the logical-mip-edge
+      // exception that buffer↔texture copies do. (ASTC can have other block sizes, so parse them.)
+      const am = /astc-(\d+)x(\d+)/.exec(gpuFmt);
+      const bw = am ? +am[1] : 4, bh = am ? +am[2] : 4;
+      const align = (v: number, b: number) => Math.ceil(v / b) * b;
+      const enc = device.createCommandEncoder();
+      for (let L = 0; L < layerCount; L++) {
+        const src = hw(layers[L] as Texture)!.underlyingResource;
+        for (let m = 0; m < mips; m++) {
+          enc.copyTextureToTexture(
+            { texture: src, mipLevel: m },
+            { texture: arrGpu, mipLevel: m, origin: { x: 0, y: 0, z: L } },
+            { width: align(Math.max(1, w >> m), bw), height: align(Math.max(1, h >> m), bh), depthOrArrayLayers: 1 });
+        }
+      }
+      device.queue.submit([enc.finish()]);
+      layers.forEach((t) => t!.dispose());   // texels now live in the array slices
+      const base = new BaseTexture(scene);
+      (base as unknown as { _texture: unknown })._texture = arrInt;
+      arrInt.incrementReferences();
+      arrInt.isReady = true;
+      base.wrapU = Texture.WRAP_ADDRESSMODE; base.wrapV = Texture.WRAP_ADDRESSMODE;
+      console.info(`[terrain] biome '${prefix}' → compressed ${gpuFmt} ${layerCount}-layer array (${w}×${h}, ${mips} mips)`);
+      return base;
+    } catch (e) {
+      console.warn(`[terrain] compressed biome-array assembly failed (${prefix}) — using the uncompressed array.`, e);
+      layers.forEach((t) => t?.dispose());
+      return null;
+    }
+  }
+
+  /** Load ONE KTX2 as a compressed 2D texture (Basis transcodes to the device format), null on error. */
+  private loadKtx2Single(scene: Scene, url: string): Promise<Texture | null> {
     return new Promise((resolve) => {
-      const tex = new Texture(url, scene, false, false, Texture.TRILINEAR_SAMPLINGMODE,
-        () => {
-          const it = tex._texture as (typeof tex._texture & { is2DArray?: boolean; depth?: number }) | null;
-          if (it?.is2DArray && it.depth === expectLayers) {
-            tex.wrapU = Texture.WRAP_ADDRESSMODE; tex.wrapV = Texture.WRAP_ADDRESSMODE;
-            resolve(tex);
-          } else {
-            console.warn(`[terrain] biome_albedo.ktx2 did not bind as a ${expectLayers}-layer array `
-              + `(is2DArray=${it?.is2DArray}, depth=${it?.depth}) — using the uncompressed array.`);
-            tex.dispose(); resolve(null);
-          }
-        },
-        () => { console.warn('[terrain] biome_albedo.ktx2 failed to load — using the uncompressed array.'); resolve(null); });
+      const tex: Texture = new Texture(url, scene, false, false, Texture.TRILINEAR_SAMPLINGMODE,
+        () => resolve(tex), () => { tex.dispose(); resolve(null); });
     });
   }
 

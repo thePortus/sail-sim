@@ -41,7 +41,15 @@ app.use('/api', express.static(path.join(__dirname, 'pages')));
 app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry'), {
   etag: true,
   maxAge: 0,
-  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+  setHeaders: (res, filePath) => {
+    res.setHeader('Cache-Control', 'no-cache');
+    // Express/`mime` doesn't know `.ktx2` → it'd send a generic type. Babylon's KTX2 loader
+    // still parses it, but send the correct content type for correctness/proxies. (NOTE: this
+    // does NOT fix the `biome_*.ktx2` array-texture fallback — Babylon 9.10.1's KTX2 decoder
+    // rejects 2D-array KTX2 outright ("Array textures are not currently supported"), so the
+    // terrain correctly falls back to the uncompressed RawTexture2DArray.)
+    if (filePath.endsWith('.ktx2')) res.setHeader('Content-Type', 'image/ktx2');
+  },
 }));
 // set API routes
 require('./routes/index')(app);

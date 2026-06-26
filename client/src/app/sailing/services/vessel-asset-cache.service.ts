@@ -94,7 +94,7 @@ export class VesselAssetCacheService {
    * single-file rigged vessels. Default flipY=false — the rigged model is authored +Z=bow.
    */
   async instantiateRigged(
-    filename: string, scene: Scene, parent: TransformNode, flipY = false,
+    filename: string, scene: Scene, parent: TransformNode, flipY = false, yawDeg = 0,
   ): Promise<{ root: TransformNode; entries: InstantiatedEntries } | null> {
     try {
       const container = await this.getContainer(filename, scene);
@@ -102,7 +102,7 @@ export class VesselAssetCacheService {
       const root = entries.rootNodes[0] as TransformNode | undefined;
       if (!root) return null;
 
-      this.orient(root, parent, flipY);
+      this.orient(root, parent, flipY, yawDeg);
       return { root, entries };
     } catch (err) {
       console.warn(`[VesselAssetCache] instantiateRigged failed: ${filename}`, err);
@@ -128,8 +128,10 @@ export class VesselAssetCacheService {
     return pending;
   }
 
-  /** Apply optional 180° Y-flip, parent, and renderingGroupId=2 on the deep subtree. */
-  private orient(root: TransformNode, parent: TransformNode, flipY: boolean): void {
+  /** Apply optional 180° Y-flip + a base yaw (for models authored with a non-+Z bow), parent, and
+   *  renderingGroupId=2 on the deep subtree. yawDeg pre-multiplies a world-up rotation so e.g. a +X-bow
+   *  hull (the merchantman) reads bow=+Z (−90°). */
+  private orient(root: TransformNode, parent: TransformNode, flipY: boolean, yawDeg = 0): void {
     if (flipY) {
       // Compound the 180° Y-flip onto the loader's coordinate-conversion rotation,
       // exactly as the previous per-mesh import did.
@@ -137,6 +139,12 @@ export class VesselAssetCacheService {
       root.rotationQuaternion = root.rotationQuaternion
         ? flip.multiply(root.rotationQuaternion)
         : flip;
+    }
+    if (yawDeg) {
+      const yaw = Quaternion.RotationAxis(Vector3.Up(), yawDeg * Math.PI / 180);
+      root.rotationQuaternion = root.rotationQuaternion
+        ? yaw.multiply(root.rotationQuaternion)
+        : yaw;
     }
     root.parent = parent;
     for (const m of root.getChildMeshes(false)) m.renderingGroupId = 2;

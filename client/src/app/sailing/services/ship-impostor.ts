@@ -24,7 +24,10 @@ const CALIB_DIR = +(localStorage.getItem('ignis_shipimp_dir') ?? '1') < 0 ? -1 :
 // Per-slug bow offset: the bake loads the RAW GLB (no runtime importFlipY), so a model authored bow-reversed
 // vs the others bakes a 180°-rotated atlas and reads "sailing backwards". The brig's GLB is one such — give it
 // a half-turn. Override any slug live with localStorage ignis_shipimp_calib_<slug> (degrees) if one's still off.
-const CALIB_DEG_BY_SLUG: Record<string, number> = { brig: 180 };
+// merchantman: its atlas was rendered straight from the .blend (bow = Blender +X) rather than an imported
+// glTF like the others, so cell 0 lands on the PORT beam not the bow — a −90° correction (best analytic
+// guess; tune live via ignis_shipimp_calib_merchantman if it reads off).
+const CALIB_DEG_BY_SLUG: Record<string, number> = { brig: 180, merchantman: -90 };
 function calibRadFor(slug: string): number {
   const per = localStorage.getItem('ignis_shipimp_calib_' + slug);
   const deg = per !== null ? +per : CALIB_DEG + (CALIB_DEG_BY_SLUG[slug] ?? 0);

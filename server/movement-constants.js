@@ -41,8 +41,9 @@ const MOVE_BURST_SEC = 0.6;
 
 // Ship-to-ship collision capsule per vessel slug (mirrors the client COLL_DIMS_BY_SLUG). Phase 4.
 const COLL_DIMS_BY_SLUG = {
-  sloop:   { halfLen: 5.0, radius: 2.2 },
-  pinnace: { halfLen: 3.8, radius: 1.4 },
+  sloop:       { halfLen: 5.0, radius: 2.2 },
+  pinnace:     { halfLen: 3.8, radius: 1.4 },
+  merchantman: { halfLen: 13.0, radius: 3.6 },   // the biggest hull (brig still falls back to sloop dims)
 };
 function collDims(slug) { return COLL_DIMS_BY_SLUG[slug] || COLL_DIMS_BY_SLUG.sloop; }
 

@@ -24,8 +24,9 @@ const weatherState = require('./weather-state');   // server-authoritative wind 
 
 const DEG = Math.PI / 180;
 // Weighted merchant vessel pool: sloops + pinnaces are the common traders; the occasional brigantine (a fat,
-// well-armed prize) shows up at ~1-in-5. Duplicates set the odds via the uniform pick().
-const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig'];
+// well-armed prize) and the big slow merchantman/hagboat (the richest, tankiest haul) round it out. The
+// merchantman is a TRADER ONLY — never a pirate/hunter/escort (those stay 'brig'). Duplicates set the odds.
+const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig', 'merchantman'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
   'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
   'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',
@@ -194,10 +195,13 @@ function angleFromWind(heading, windBearing) {
 // Both fore-and-aft: the sloop points higher and is stronger on a reach but weak dead-downwind; the pinnace
 // points a touch lower and holds its drive far better on the run. [apparentAngle°, coeff], interpolated.
 // The brig (square fore + gaff main) points LOW but holds strong drive on a reach and dead downwind.
+// The merchantman (three-masted square-rigger) mirrors the client MERCHANTMAN_SAIL: points even lower than
+// the brig, but huge drive on a reach and holds it dead downwind.
 const SAIL_POLARS = {
-  sloop:   [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
-  pinnace: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
-  brig:    [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+  sloop:       [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
+  pinnace:     [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+  brig:        [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+  merchantman: [[52, 0.38], [72, 0.60], [92, 0.80], [120, 1.00], [150, 0.96], [180, 0.88]],
 };
 
 /** Per-rig drive coefficient at wind angle `aw` (0 = bow into wind). Below the no-go angle the sail
@@ -348,7 +352,7 @@ const HEEL_K        = 0.22;   // heel = HEEL_K·SAF·V_app²·sin(angle) (canvas
 const COMFORT_HEEL  = 16;     // ° before the sail spills wind
 const SPILL_RANGE   = 14;     // ° of heel over comfort that ramps spill 0→1
 const SPILL_MAX     = 0.75;   // max forward-drive fraction lost to an over-pressed (heeled) sail
-const FORCE_K_BY_SLUG = { sloop: SAIL_FORCE_K, pinnace: SAIL_FORCE_K, brig: 1.12 };   // mirrors VESSEL_RIGS sail.forceK
+const FORCE_K_BY_SLUG = { sloop: SAIL_FORCE_K, pinnace: SAIL_FORCE_K, brig: 1.12, merchantman: 1.18 };   // mirrors VESSEL_RIGS sail.forceK
 
 /** Current (and max) non-mast hull points of a combat state. */
 function hullPoints(combat) {

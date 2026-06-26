@@ -24,6 +24,14 @@
       "cols": 8,
       "rows": 1,
       "cell": 512
+    },
+    "merchantman": {
+      "size": 51.197,
+      "centerY": 13.831,
+      "n": 8,
+      "cols": 8,
+      "rows": 1,
+      "cell": 512
     }
   }
 }

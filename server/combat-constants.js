@@ -35,6 +35,9 @@ const ZONE_HP_BY_SLUG = {
   pinnace: { bow: 55,  stern: 55,  port: 80,  starboard: 80,  masts: 60  },
   // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
   brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
+  // Merchantman / hagboat — the largest, most heavily-timbered hull (tankiest), but lightly gunned: a fat
+  // trader that soaks punishment. Three masts collapse off the one masts zone.
+  merchantman: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
 };
 // ── Shipwright ARMOR upgrade ──────────────────────────────────────────────────────────────────────────────
 // A once-per-hull armor upgrade adds +25% HP to the four HULL zones (masts excluded — they're rigging, not
@@ -72,11 +75,13 @@ const DMG_PERP_EXP = 1.3;
 // Per-vessel cannon CALIBER → damage multiplier. Bigger ships carry heavier guns with real stopping power, so a
 // brig's ball hurts far more than a pinnace's — ON TOP of the brig carrying more guns AND more hull HP (armour).
 // Net: a brig wrecks a pinnace fast, while a pinnace peppering a brig barely dents it. Keyed by the SHOOTER slug.
-const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7 };
+// The merchantman is a TRADER: lightly gunned (modest caliber) despite its size — its tough hull, not its
+// guns, is what keeps it alive.
+const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7, merchantman: 1.1 };
 // Shipwright CANNON upgrade (once per hull): heavier guns → more stopping power, but tuned to stay BELOW the
 // next ship up (armed pinnace 0.9 < sloop 1.0; armed sloop 1.3 < brig 1.7) so it never matches the next tier.
 // The brig (top tier) gets a flat ~+24% with no cap.
-const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1 };
+const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1, merchantman: 1.4 };
 function caliberFor(slug, cannonUpgrade) {
   if (cannonUpgrade) return CALIBER_UPGRADED_BY_SLUG[slug] || ((CALIBER_BY_SLUG[slug] || 1.0) * 1.2);
   return CALIBER_BY_SLUG[slug] || 1.0;

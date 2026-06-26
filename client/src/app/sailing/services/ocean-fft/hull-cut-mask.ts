@@ -277,21 +277,41 @@ export function buildHullStencilCap(
  * Render wiring (caller): renderingGroupId 0 + the group-0 opaque sort that draws stencilProxy meshes
  * first, so the stamp lands before the water reads it. Returns null if the hull can't be cloned.
  */
-export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene): Mesh | null {
+export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene, waterlineLocalY?: number): Mesh | null {
   // An InstancedMesh shares its sourceMesh's geometry; clone the SOURCE (a real Mesh with a material slot).
   const src = (hull as unknown as { sourceMesh?: Mesh }).sourceMesh ?? (hull as Mesh);
   if (typeof (src as Mesh).clone !== 'function') { return null; }
-  const clone = (src as Mesh).clone('hull_stencil_proxy', null, true);   // share geometry, skip children
-  if (!clone) { return null; }
+
+  let clone: Mesh;
+  if (waterlineLocalY != null) {
+    // Build a FRESH mesh from the hull's geometry with every vertex below the hull-local waterline CLAMPED up
+    // to it — so the stencil masks ONLY the above-water hull, never the submerged hull/keel (which showed
+    // through the sea). Building new VertexData is bulletproof; the earlier clone+updateVerticesData silently
+    // did nothing in-game. The hull this clamps (merchantman) is STATIC, so no skinning is lost.
+    const pos = (src as Mesh).getVerticesData(VertexBuffer.PositionKind);
+    const idx = (src as Mesh).getIndices();
+    if (!pos || !idx) { return null; }
+    const p = new Float32Array(pos);
+    for (let i = 1; i < p.length; i += 3) { if (p[i] < waterlineLocalY) { p[i] = waterlineLocalY; } }
+    const nrm = (src as Mesh).getVerticesData(VertexBuffer.NormalKind);
+    const vd = new VertexData();
+    vd.positions = p; vd.indices = Array.from(idx);
+    if (nrm) { vd.normals = new Float32Array(nrm); }
+    clone = new Mesh('hull_stencil_proxy', scene);
+    vd.applyToMesh(clone);
+  } else {
+    clone = (src as Mesh).clone('hull_stencil_proxy', null, true);   // share geometry, skip children
+    if (!clone) { return null; }
+    clone.skeleton = hull.skeleton;
+  }
 
   // Overlay it exactly on the LIVE hull (not the source, which may sit hidden at the origin): copy the
-  // hull's parent + local transform, and share its skeleton so the clone skins identically each frame.
+  // hull's parent + local transform (so it skins/floats identically each frame).
   clone.parent = hull.parent;
   clone.position.copyFrom(hull.position);
   if (hull.rotationQuaternion) { clone.rotationQuaternion = hull.rotationQuaternion.clone(); }
   else { clone.rotationQuaternion = null; clone.rotation.copyFrom(hull.rotation); }
   clone.scaling.copyFrom(hull.scaling);
-  clone.skeleton = hull.skeleton;
 
   const mat = new StandardMaterial('hull_stencil_mat', scene);
   mat.disableLighting   = true;

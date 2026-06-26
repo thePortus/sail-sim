@@ -17,6 +17,9 @@ export const ZONE_HP_BY_SLUG: Record<string, Record<Zone, number>> = {
   pinnace: { bow: 55,  stern: 55,  port: 80,  starboard: 80,  masts: 60  },
   // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
   brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
+  // Merchantman / hagboat — the largest, most heavily-timbered hull (tankiest), but lightly gunned: a fat
+  // trader that soaks punishment. Three masts collapse off the one masts zone.
+  merchantman: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
 };
 
 /** Per-zone max HP for a vessel slug (defaults to the sloop). */

@@ -8,7 +8,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
+import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
@@ -1081,7 +1081,7 @@ export class MultiplayerService {
   /** Build the overheard-rumour line from the server's structured reply (vessel + origin→destination). */
   private composeRumor(slug: string, from: string | null, to: string): string {
     const tellers = ['barkeep', 'grizzled sailor', 'serving girl', 'harbour drunk', 'one-eyed fisherman'];
-    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' };
+    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine', merchantman: 'merchantman' };
     const teller = tellers[Math.floor(Math.random() * tellers.length)];
     const vessel = vessels[slug] ?? 'ship';
     const route = from ? `sailing from ${from} to ${to}` : `bound for ${to}`;
@@ -1324,7 +1324,7 @@ export class MultiplayerService {
     // REMOTE_DRAFT matches the local vessel's FLOAT_DRAFT so remotes sit at the SAME
     // waterline as your own ship (they were floating ~2.4 m too high at the old fixed
     // REMOTE_FLOAT_Y=1.65 baseline).
-    const heaveTarget = hC + this.REMOTE_DRAFT + rigForSlug(entry.vesselSlug).floatDraft;
+    const heaveTarget = hC + this.REMOTE_DRAFT + floatDraftFor(entry.vesselSlug, rigForSlug(entry.vesselSlug));
     const pitchTarget = Math.atan2(hStern - hBow, HALF_LEN * 2);   // +bow up
     const rollTarget  = Math.atan2(hStbd - hPort, HALF_BEAM * 2);  // +stbd down
 
@@ -1524,8 +1524,9 @@ export class MultiplayerService {
   // Per-vessel collision capsule (keel half-length + radius ≈ half-beam + margin). Each ship uses its
   // OWN size, so a small pinnace collides at its true hull, not the sloop's bulk. Default = sloop.
   private readonly COLL_DIMS_BY_SLUG: Record<string, { halfLen: number; radius: number }> = {
-    sloop:   { halfLen: 5.0, radius: 2.2 },
-    pinnace: { halfLen: 3.8, radius: 1.4 },
+    sloop:       { halfLen: 5.0, radius: 2.2 },
+    pinnace:     { halfLen: 3.8, radius: 1.4 },
+    merchantman: { halfLen: 13.0, radius: 3.6 },   // mirrors server movement-constants.js
   };
   private collDims(slug: string | undefined): { halfLen: number; radius: number } {
     return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
@@ -1722,7 +1723,7 @@ export class MultiplayerService {
     // renderingGroupId 2 happen in the cache.
     const rig = rigForSlug(slug);
     const [rigged, manifest] = await Promise.all([
-      this.assetCache.instantiateRigged(rig.glb, scene, entry.root, rig.importFlipY),
+      this.assetCache.instantiateRigged(rig.glb, scene, entry.root, rig.importFlipY, baseYawDegFor(slug, rig)),
       this.assetCache.loadManifest(rig.manifest),
     ]);
     if (!rigged) { console.warn('[Multiplayer] rigged vessel failed to load for', playerId); return; }

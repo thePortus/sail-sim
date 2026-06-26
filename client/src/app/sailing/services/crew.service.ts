@@ -71,11 +71,12 @@ export class CrewService {
   private static readonly GLB = 'pirate.glb';
   private static readonly MANIFEST = 'pirate.manifest.json';
   private static readonly LAYOUTS: Record<string, string> = {
-    pinnace: 'crew_stations.pinnace.json',
-    sloop:   'crew_stations.sloop.json',
-    brig:    'crew_stations.brig.json',
+    pinnace:     'crew_stations.pinnace.json',
+    sloop:       'crew_stations.sloop.json',
+    brig:        'crew_stations.brig.json',
+    merchantman: 'crew_stations.merchantman.json',
   };
-  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12 };
+  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12, merchantman: 9 };
 
   /**
    * Spawn a crew on one vessel.
@@ -157,6 +158,10 @@ interface CrewLayout {
   edges: [string, string, { kind?: string }][];
   stations: CrewStation[];
   climb_paths?: CrewClimb[];
+  /** Which local axis is the BEAM (across-ship, the rail-proxy for idle-sway damping). Default 'x' (bow=+Z
+   *  ships like the sloop/brig). The merchantman is authored in its GLB-native frame (bow=+X), so its beam is
+   *  'z'. */
+  beam_axis?: 'x' | 'z';
 }
 interface CrewStation {
   id: string; kind: string; pos: [number, number, number];
@@ -243,7 +248,8 @@ export class CrewHandle {
   private shipHeel = 0;
   private shipPitch = 0;
   private clock = 0;
-  private maxStationX = 0;   // widest station |x| (rail proxy) — damps idle motion for crew at the bulwarks
+  private maxStationX = 0;   // widest station |beam| (rail proxy) — damps idle motion for crew at the bulwarks
+  private beamAxis: 'x' | 'z' = 'x';   // which local axis is across-ship (see CrewLayout.beam_axis)
 
   constructor(
     private scene: Scene,
@@ -256,7 +262,9 @@ export class CrewHandle {
     this.rootRng = mulberry32(seed);
     this.walkSpeed = manifest.constants?.['walk_speed_mps'] ?? 1.2;
     // The rail-most station's lateral offset — used to damp idle lean/sway for crew near a bulwark (P1 follow-up).
-    for (const s of layout.stations) this.maxStationX = Math.max(this.maxStationX, Math.abs(s.pos[0]));
+    this.beamAxis = layout.beam_axis === 'z' ? 'z' : 'x';
+    const beamIdx = this.beamAxis === 'z' ? 2 : 0;
+    for (const s of layout.stations) this.maxStationX = Math.max(this.maxStationX, Math.abs(s.pos[beamIdx]));
     for (const [a, b, meta] of layout.edges) {
       const kind = meta?.kind ?? 'walk';
       (this.adjacency.get(a) ?? this.adjacency.set(a, []).get(a)!).push({ to: b, kind });
@@ -562,7 +570,8 @@ export class CrewHandle {
   /** Idle-motion damping for crew near a rail: 1 at the centreline, ~0.4 at the rail-most station, so a gun/rope
    *  crew at the bulwark never sways/leans OUT through it. */
   private railDamp(m: CrewMember): number {
-    const f = Math.abs(m.stationPos.x) / (this.maxStationX || 1);   // 0 centre → 1 rail-most
+    const beam = this.beamAxis === 'z' ? m.stationPos.z : m.stationPos.x;
+    const f = Math.abs(beam) / (this.maxStationX || 1);   // 0 centre → 1 rail-most
     return 1 - 0.6 * f * f;
   }
 

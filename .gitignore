@@ -3,6 +3,7 @@
 Thumbs.db
 .vscode/
 .claude/
+CLAUDE.md
 certbot/
 */coverage/
 
@@ -15,6 +16,9 @@ certbot/
 # generated terrain files
 server/assets/terrain/
 server/assets/geometry/terrain/biome/
+
+# code graph
+graphify-out
 
 # downloaded terrain source rasters (re-fetchable via npm run fetch:terrain-sources)
 server/assets/maps/sources/

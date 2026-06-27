@@ -31,6 +31,10 @@ server/assets/sky/
 server/assets/geometry/scatter/cc0/
 server/assets/scatter-src/
 
+# downloaded CC0 ship-wood textures (re-fetchable via npm run download:ship-wood)
+# authoring-only source baked into the ship GLBs in Blender — never served, never committed.
+server/assets/ship-wood-src/
+
 # user info
 server/seeders/import/**/*
 

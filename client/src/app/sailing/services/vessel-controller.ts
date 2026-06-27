@@ -133,7 +133,7 @@ export const VESSEL_RIGS: Record<string, VesselRig> = {
   // wave crests that were occasionally washing it. waterlineY tracks −floatDraft (=2.0) so the cut footprint
   // sits at the real waterline. floorY −0.3 keeps the interior sink deep (root.y −2.0 + −0.3 − 0.38 ≈ −2.7, at
   // the hull bottom) so no water reads through the gratings.
-  brig:    { glb: 'brig.glb',                  manifest: 'brig.manifest.json',                 importFlipY: false, rightSign: 1,  controller: 'brig',    floatDraft: -2.0,  hullHalfLen: 12.0, hullHalfBeam: 3.2, hullCut: { floorY: -0.3, alongSign: 1, waterlineY: 2.0 }, buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 }, sail: BRIG_SAIL },
+  brig:    { glb: 'brig.glb',                  manifest: 'brig.manifest.json',                 importFlipY: false, rightSign: 1,  controller: 'brig',    floatDraft: -2.0,  hullHalfLen: 12.0, hullHalfBeam: 3.2, oceanMask: false, hullCut: { floorY: -0.3, alongSign: 1, waterlineY: 2.0 }, buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 }, sail: BRIG_SAIL },
   // Merchantman / hagboat — the biggest, heaviest hull. Authored bow=+X; baseYawDeg=90 turns it to the
   // fleet's bow=+Z (live-confirmed: 45° got halfway, 90° lands it). Override via localStorage.ignis_yaw_merchantman.
   // Model origin is at the KEEL (bboxMin Y=0), so floatDraft sinks it ~2.7m to float the waterline. A very heavy

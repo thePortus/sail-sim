@@ -18,6 +18,7 @@
     "build:terrain-region": "node scripts/build-terrain-region.mjs",
     "download:sky-textures": "node scripts/download-sky-textures.js",
     "download:scatter-textures": "node scripts/download-scatter-textures.js",
+    "download:ship-wood": "node scripts/download-ship-wood.js",
     "build:biome": "bash scripts/build-biome-array.sh && bash scripts/build-biome-orm.sh",
     "download:terrain-tiles": "node scripts/download-terrain-tiles.js && node scripts/download-sky-textures.js && node scripts/download-scatter-textures.js && npm run build:biome",
     "build:terrain": "npm run download:terrain-tiles && npm run terrain",

@@ -589,9 +589,16 @@ export class VesselService {
   private registerMeshesForRendering(meshes: AbstractMesh[]): void {
     const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
+    // PERF: sails + flags are SKINNED cloth re-rendered into all 3 shadow cascades EVERY frame, and
+    // (transparencyShadow=true) as the priciest alpha shadow draws — yet their shadow on the deck/water
+    // is faint. Skip them from the shadow pass (they still render in the main view + water reflection).
+    // This helps the square-rigged ships most (the brig has 13 sails + 4 flags = ~17 skinned draws ×3
+    // cascades). Opt back in with localStorage.ignis_sailshadows='on'.
+    const sailShadows = localStorage.getItem('ignis_sailshadows') === 'on';
     for (const mesh of meshes) {
       this.oceanService.addToRenderList(mesh);
-      sg?.addShadowCaster(mesh, true);
+      const isCloth = /sail|flag/i.test(mesh.name);
+      if (!isCloth || sailShadows) sg?.addShadowCaster(mesh, true);
       mesh.receiveShadows = false;
       const mat = mesh.material;
       if (mat && !seenMats.has(mat)) {

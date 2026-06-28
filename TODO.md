@@ -2,26 +2,23 @@
 
 # General or Current TODO Items
 
-* Give controls page a "print" button, make sure it formats to a printer
-* forced logout if credentials no longer valid
-* deeper longer cannon boom
 * I am still seeing NPCs sail into land in combat situations. I came upon a pirate who had chased a merchant well onto land, fully past a town. Then as I approached the pirate, he swung into the town itself (cutting through the land) trying to evade my fire
 * npcs suck at hitting each other, battles take a long time
+* reduce FPS draw on explosions up close (I know volumetric is a cost)
 * LOD imposters too white
 * nations at war fight each other if they are warships or convoy with a warship
-* actual merchantman vessel (never used as a warship/pirate/piratehunter)
-* frigate, galleon
+* frigate, galleon, barque, junk
 * redo crew
 * forts and taking towns
-* swordfighting
+* swordfighting, surrender & capture
+* fleets with prize crews to take them over
 * dancing
 * career of lands gained, etc. adapted to this game
 * server only accepts local requests, restricted to client
 * capture ships
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
-* increase render resolution in spyglass
-* fleets with prize crews to take them over
+* pirate fame: as a mechanism to allow you access to best ships... and larger fleet to have more ships following and aiding you
 * town forts... capturing towns
 * update profile page and update password page (and 404 page with a funny 404)
 * make trading and ship buying server-side secure

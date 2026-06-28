@@ -894,14 +894,23 @@ export class CannonService {
     this.zone.run(() => this.gunCount.set(this.gunsPerSide));
   }
 
-  /** Size + seed a side's per-gun reload arrays for the current battery. Each gun gets a FIXED reload-time
-   *  factor (its own cadence) and starts LOADED (run out + charged). */
+  /** Size + seed a side's per-gun reload arrays for the current battery. A FRESH battery starts LOADED (run out
+   *  + charged); but a re-arm of an EXISTING battery PRESERVES the per-gun reload timers.
+   *
+   *  Exploit fixed: fire → Esc (stand down) → run the guns straight back out → fire again, with the long reload
+   *  bypassed because re-arming wiped loadAt back to 0. Now we only seed fresh when there's no battery yet or the
+   *  size changed (a different ship); otherwise the in-progress reload carries through. loadAt[]/loadStart[] are
+   *  absolute `elapsed` times and `elapsed` advances every frame (run out OR stowed), so a genuine reload still
+   *  finishes in real time — cancelling and re-running-out can no longer reset it. */
   private armGunArrays(side: 'port' | 'stbd'): void {
     const g = this.gun[side], n = this.gunsPerSide;
-    g.loadAt = new Array(n).fill(0);        // 0 ≤ elapsed → loaded
-    g.loadStart = new Array(n).fill(0);
-    g.fireAt = new Array(n).fill(Infinity);
-    g.factor = Array.from({ length: n }, () => 1 + (Math.random() * 2 - 1) * RELOAD_VAR);
+    if (g.loadAt.length !== n) {            // no battery yet / battery size changed → fresh, fully-loaded battery
+      g.loadAt = new Array(n).fill(0);       // 0 ≤ elapsed → loaded
+      g.loadStart = new Array(n).fill(0);
+      g.factor = Array.from({ length: n }, () => 1 + (Math.random() * 2 - 1) * RELOAD_VAR);
+    }
+    // else: keep loadAt/loadStart/factor — an in-progress reload must survive the stow → re-arm.
+    g.fireAt = new Array(n).fill(Infinity);  // drop any shots queued before the last stand-down
   }
 
   /** Z / port button, C / stbd button. ARM (run out) if stowed; otherwise FIRE every gun currently loaded. */
@@ -939,6 +948,7 @@ export class CannonService {
       const g = this.gun[s];
       if (g.state === 'arming' || g.state === 'engaged') {
         g.state = 'stowed';
+        g.fireAt = g.fireAt.map(() => Infinity);   // stand-down cancels queued-but-unfired shots (reload state kept)
         this.vesselService.setGunDeploy(s, 0);
         this.multiplayerService.broadcastGunState(s, 0);
         this.zone.run(() => {

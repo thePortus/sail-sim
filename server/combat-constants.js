@@ -133,12 +133,20 @@ const BROADPHASE_PAD = 4.0;   // extra metres around the hull for the cheap prox
 const VALID_ORIGIN_RADIUS = 16.0;   // muzzle must be within this of the shooter's known pos
 const VALID_V_MIN = 45.0;           // |muzzle velocity| plausible band (fixed cannon ~= 55)
 const VALID_V_MAX = 66.0;
-const RATE_WINDOW_MS   = 7000;      // sliding window for the fire-rate cap
-// Anti-spam ceiling sized to the LARGEST legit battery firing at its natural cadence: a brig is 4 guns/side (8
-// total), and with per-gun reloads + partial broadsides both sides can come online more than once in a ~7 s
-// window. 18 leaves slack above that while still blocking a hacked client's machine-gun fire (90 ms min-gap holds).
-const RATE_MAX_SHOTS   = 18;
-const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
+const RATE_WINDOW_MS   = 7000;      // (legacy; superseded by the per-side reload token bucket) sliding window
+const RATE_MAX_SHOTS   = 18;        // (legacy)
+const RATE_MIN_GAP_MS  = 90;        // (legacy) minimum spacing between any two shots
+
+// ── Per-side, PER-SHIP reload gate (authoritative; mirrors the client per-gun reload) ─────────────────────────
+// The fire-rate ceiling is the ship's OWN battery, not a fixed number, so a future ship with a bigger broadside
+// isn't throttled and a small one isn't over-permitted: each side gets a token bucket of capacity = that ship's
+// guns-per-side (grape: ×GRAPE_PELLET_CAP, a multi-pellet volley), refilling over one reload window. Firing a full
+// broadside empties the side; you can't fire it again until it genuinely reloads — so cancel-and-re-run-out can't
+// bypass the reload (the exploit). RELOAD_BASE_MS matches the client's default reloadWindow (6 s); it's divided by
+// the crewFactor (0.5..1) so a short-handed gun crew reloads slower, exactly like the client.
+const RELOAD_BASE_MS   = 6000;      // base per-gun reload window (full crew), matches client physics.reloadWindow ?? 6
+const RELOAD_SLACK     = 0.9;       // refill a hair faster than nominal to tolerate the client's ±reload variance
+const GRAPE_PELLET_CAP = 8;         // grape tokens per gun, per side (a volley is ~5 pellets/gun → one volley fits)
 
 // ── Shot types (ammunition) ─────────────────────────────────────────────────────
 // Per-type muzzle speed `v` (range ∝ v², so a slower ball falls short), the anti-exploit speed band
@@ -173,5 +181,6 @@ module.exports = {
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,
+  RELOAD_BASE_MS, RELOAD_SLACK, GRAPE_PELLET_CAP,
   SHOT_TYPES, shotDef, GRAPE_RATE_MAX,
 };

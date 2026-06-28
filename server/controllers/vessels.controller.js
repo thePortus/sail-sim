@@ -107,7 +107,9 @@ const VESSELS = [
     },
     // Helm — at the wheel aft (B_Wheel ≈ model 0,5.74,-11.1), standing eye height, looking forward.
     // y is vessel-local (rides the floated hull); the quarterdeck sits high on this ship.
-    firstPersonCam: { x: 0, y: 6.6, z: -9.5 },
+    // x offset to STARBOARD off the centreline so the helmsman sees forward AROUND the centreline boom/gaff
+    // (dead-centre put the view straight into the main boom & gaff).
+    firstPersonCam: { x: 1.2, y: 6.6, z: -9.5 },
     // Four guns a side, taken from the actual gunport (B_Lid) bone positions — and they are NOT on one deck:
     // a forecastle chase (z≈9), a main-deck waist gun (z≈1.5, sitting ~1 m lower), and two on the raised
     // quarterdeck (z≈-6.5, -9). y is the WORLD muzzle height = model gunport y + floatDraft(-2.3) - barrel.
@@ -139,9 +141,11 @@ const VESSELS = [
       sailAreaFactor:   0.50,     // a great spread of canvas
       weight:           6500,     // the deepest, heaviest hull in the fleet
     },
-    // Helm — at the wheel on the high quarterdeck aft (B_Wheel, model −7 on the bow→stern axis), standing
-    // eye height, looking forward. y is vessel-local (rides the floated hull).
-    firstPersonCam: { x: 0, y: 6.0, z: -9.0 },
+    // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
+    // forward. y is vessel-local (rides the floated hull). y RAISED 6.0→8.8 (= wheel 7.93 + ~0.9 eye): the old
+    // 6.0 sat ~2 m BELOW the wheel, down inside the cabin beneath the quarterdeck. x offset to STARBOARD off the
+    // centreline so the view clears the centreline spanker/gaff and the masts.
+    firstPersonCam: { x: 1.4, y: 8.8, z: -9.0 },
     // THREE guns a side on the gun deck (game frame: +Z bow, +X starboard). Fore→aft positions taken from the
     // actual B_Lid gunport bones; muzzle y is the WORLD height = model gunport y(~6.3) + floatDraft(−3.8) ≈ 2.5.
     cannons: {

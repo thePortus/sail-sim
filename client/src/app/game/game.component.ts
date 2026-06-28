@@ -921,6 +921,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.teardown(false);      // full teardown (engine included) of whatever booted so far
     this.selectedSlug = '';
     this.phase.set('selecting');
+    this.authService.flagSessionExpired();   // login screen explains WHY they were bounced here
     this.authService.clearStorage();
     this.router.navigate(['/login']);
   }

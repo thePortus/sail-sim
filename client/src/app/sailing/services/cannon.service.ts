@@ -1609,24 +1609,24 @@ export class CannonService {
     limiter.knee.value      = 6;
     limiter.ratio.value     = 16;
     limiter.attack.value    = 0.002;
-    limiter.release.value   = 0.30;
+    limiter.release.value   = 0.45;   // longer release so the long thunder roll isn't pumped/ducked
     limiter.connect(dest);
 
     // Reverb chain (parallel wet path): pre-delay → long slow convolver → darkening
-    // lowpass → wet gain → limiter. A 5 s, slow-decaying impulse plus pre-delay makes
-    // the boom BLOOM and roll out across the bay for seconds instead of stopping dead
-    // like a drum hit. The lowpass keeps the long tail dark/distant, not hissy.
+    // lowpass → wet gain → limiter. An 8 s, slowly-decaying impulse plus a longer pre-delay makes the boom
+    // BLOOM and roll out across the bay for many seconds (rolling thunder) instead of stopping dead like a
+    // drum hit. The lowpass keeps the long tail dark/distant, not hissy.
     const preDelay = ctx.createDelay(0.5);
-    preDelay.delayTime.value = 0.09;
+    preDelay.delayTime.value = 0.12;
 
     const reverb = ctx.createConvolver();
-    reverb.buffer = this.makeReverbIR(ctx, 5.0, 1.3);
+    reverb.buffer = this.makeReverbIR(ctx, 8.0, 1.0);   // 5.0/1.3 → 8.0/1.0: longer tail, slower decay = bigger bloom
 
     const dark = ctx.createBiquadFilter(); dark.type = 'lowpass';
-    dark.frequency.value = 1500;
+    dark.frequency.value = 1300;   // a touch darker — the long tail reads as distant rolling thunder
 
     const wet = ctx.createGain();
-    wet.gain.value = 1.0;
+    wet.gain.value = 1.3;   // more bloom in the wet path
 
     preDelay.connect(reverb); reverb.connect(dark); dark.connect(wet); wet.connect(limiter);
 
@@ -1687,58 +1687,73 @@ export class CannonService {
       src.start(t); src.stop(t + 0.07);
     }
 
-    // 2) BLAST — lowpassed noise sweeping down hard: the throaty roar of the powder.
+    // 2) BLAST — lowpassed noise sweeping down hard: the throaty roar of the powder. Longer sweep, deeper floor.
     {
-      const src = noise(0.7);
+      const src = noise(1.1);
       const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.8;
-      lp.frequency.setValueAtTime(rnd(800, 1000), t);
-      lp.frequency.exponentialRampToValueAtTime(85, t + 0.45);
+      lp.frequency.setValueAtTime(rnd(780, 980), t);
+      lp.frequency.exponentialRampToValueAtTime(70, t + 0.6);
       const g = ctx.createGain();
-      g.gain.setValueAtTime(1.6 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+      g.gain.setValueAtTime(1.7 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
       src.connect(lp); lp.connect(g); g.connect(out);
-      src.start(t); src.stop(t + 0.7);
+      src.start(t); src.stop(t + 1.1);
     }
 
     // 3) PUNCH — a pitched thump for the percussive hit.
     {
       const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.setValueAtTime(rnd(105, 125), t);
-      osc.frequency.exponentialRampToValueAtTime(38, t + 0.18);
+      osc.frequency.setValueAtTime(rnd(108, 126), t);
+      osc.frequency.exponentialRampToValueAtTime(34, t + 0.20);
       const g = ctx.createGain();
       g.gain.setValueAtTime(1.0 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.42);
       osc.connect(g); g.connect(out);
-      osc.start(t); osc.stop(t + 0.33);
+      osc.start(t); osc.stop(t + 0.43);
     }
 
-    // 4) SUB — the deep chest-thump that makes it feel powerful (kept controlled).
+    // 4) SUB — the deep chest-thump that makes it feel powerful. Deeper + longer for more weight/thunder.
     {
       const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.setValueAtTime(rnd(58, 66), t);
-      osc.frequency.exponentialRampToValueAtTime(24, t + 0.55);
+      osc.frequency.setValueAtTime(rnd(52, 60), t);
+      osc.frequency.exponentialRampToValueAtTime(18, t + 0.7);
       const g = ctx.createGain();
-      g.gain.setValueAtTime(0.9 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.95);
+      g.gain.setValueAtTime(1.15 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 1.45);
       osc.connect(g); g.connect(out);
-      osc.start(t); osc.stop(t + 0.97);
+      osc.start(t); osc.stop(t + 1.47);
     }
 
-    // 5) ROLL — a long, sustained low rumble. Fed through the bus reverb it becomes
-    //    the boom rolling out across the water for several seconds (the part that
-    //    turns a "drum hit" into a "cannon"). Two stages: a near growl then a long
-    //    decaying thunder.
+    // 5) ROLL — a long, sustained low rumble. Fed through the bus reverb it becomes the boom rolling out across
+    //    the water for several seconds (the part that turns a "drum hit" into a "cannon"). Lengthened to ~3.6 s
+    //    with a slower decay so the thunder rolls instead of snapping off.
     {
-      const src = noise(1.7);
+      const src = noise(3.6);
       const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass';
-      lp.frequency.setValueAtTime(380, t);
-      lp.frequency.exponentialRampToValueAtTime(95, t + 1.5);
+      lp.frequency.setValueAtTime(360, t);
+      lp.frequency.exponentialRampToValueAtTime(75, t + 2.6);
       const g = ctx.createGain();
       g.gain.setValueAtTime(0.0, t);
-      g.gain.linearRampToValueAtTime(0.72 * vol, t + 0.05);
-      g.gain.setTargetAtTime(0.0, t + 0.28, 0.42);   // tighter thunder decay (less breathy tail)
+      g.gain.linearRampToValueAtTime(0.80 * vol, t + 0.06);
+      g.gain.setTargetAtTime(0.0, t + 0.40, 1.05);   // long, slowly-decaying thunder tail
       src.connect(lp); lp.connect(g); g.connect(out);
-      src.start(t); src.stop(t + 1.7);
+      src.start(t); src.stop(t + 3.6);
+    }
+
+    // 6) ROLLING THUNDER ECHO — a second, DELAYED deep rumble that swells just after the shot, so the boom
+    //    reads as rolling thunder echoing back off the islands rather than a single hit. Lower, darker, slow.
+    {
+      const te  = t + 0.45;
+      const src = noise(3.2);
+      const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(230, te);
+      lp.frequency.exponentialRampToValueAtTime(55, te + 2.4);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, te);
+      g.gain.linearRampToValueAtTime(0.45 * vol, te + 0.18);
+      g.gain.setTargetAtTime(0.0, te + 0.6, 1.2);
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(te); src.stop(te + 3.2);
     }
   }
 

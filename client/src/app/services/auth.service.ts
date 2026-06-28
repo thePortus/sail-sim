@@ -1,4 +1,4 @@
-import { Injectable } from '@angular/core';
+import { Injectable, signal } from '@angular/core';
 
 /**
  * AuthService provides methods to store and retrieve user info
@@ -11,6 +11,18 @@ import { Injectable } from '@angular/core';
 export class AuthService {
 
   constructor() { }
+
+  /** Set when a stored session is found to be expired/invalid (a 401/403 on a validated request), so the auth
+   *  flow auto-logs-out and the login screen can explain WHY the player is back there ("session expired"). In
+   *  memory (not localStorage) so it survives clearStorage but is gone on a real page refresh. */
+  readonly sessionExpired = signal(false);
+  flagSessionExpired(): void { this.sessionExpired.set(true); }
+  /** Read-and-clear: true exactly once after a session expiry, for the login banner. */
+  consumeSessionExpired(): boolean {
+    const v = this.sessionExpired();
+    if (v) { this.sessionExpired.set(false); }
+    return v;
+  }
 
   /**
    * Checks local storage for stored data. Returns null if no data stored.

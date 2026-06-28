@@ -2,7 +2,7 @@
 
 # General or Current TODO Items
 
-* nations at war fight each other if they are warships or convoy with a warship
+* use network analysis or some other method to calculate where would likely be good place to set up shop to try to find the greatest concentration of merchants, and then put some kind of hint on all player's maps. That way the might have a guess where to find a target rich environment (beyond rumors of individual ships)
 * frigate, galleon, barque, junk
 * redo crew
 * forts and taking towns

@@ -18,6 +18,7 @@ const quest = require('./quest');   // to shield intro-tutorial players from pir
 const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
+const diplomacy = require('./diplomacy');   // war/peace/alliance — drives nation-vs-nation NPC warship combat
 const moveConst = require('./movement-constants');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
@@ -326,6 +327,12 @@ const HOSTILE_REP  = -70;    // a player at/below this standing with the merchan
 const DETECT_RANGE = 650;    // world units: how far off a merchant notices a hated player (to start avoiding / closing)
 const ENGAGE_RANGE = 320;    // world units: an even/stronger merchant defends its lane once a hated player closes to here
 const AVOID_RATIO  = 1.25;   // the foe must be ≥25% stronger for the merchant to break off and run rather than fight
+// Nation-vs-nation: a WARSHIP (convoy escort or navy hunter) of one nation engages enemy-nation NPCs when the two
+// nations are AT WAR (diplomacy). Only warships INITIATE — a lone merchant never starts a fight (it only defends).
+// The chase is LEASHED: a convoy drops an enemy NPC that opens past WAR_LEASH of the convoy's centre, so a fleeing
+// foe can't drag it wildly off its trade route (it breaks off + reforms). Pirates are unaligned — separate path.
+const WAR_DETECT = 500;      // world units: a warship picks up an enemy-nation NPC this close (initiate the fight)
+const WAR_LEASH  = 650;      // world units: ...and breaks off once the foe opens past this from the convoy/warship
 // Morale & commitment (E4): PRESS a crippled foe (close to finish it even if nominally outmatched); a convoy that
 // just lost a consort loses heart for a while (more flee-prone, recovering its composure over MORALE_SHAKE_MS).
 const PRESS_HULL          = 0.3;     // foe hull fraction at/below which a healthy NPC commits to the kill
@@ -384,6 +391,27 @@ function shipStrength(entry) {
 /** A player's standing with `faction` (0 if absent / not yet loaded). */
 function repWith(player, faction) {
   return (player && player.factionRep && Number.isFinite(player.factionRep[faction])) ? player.factionRep[faction] : 0;
+}
+
+/** True if two nations are actively AT WAR (both must be real, distinct factions — pirates are null/unaligned). */
+function atWar(a, b) {
+  return !!(a && b && a !== b && diplomacy.relation(a, b) === diplomacy.WAR);
+}
+
+/** Nearest enemy-nation NPC (warship OR merchant) to (ox,oz) whose faction is at war with `faction`, within r2.
+ *  Excludes pirates (unaligned), sunk hulls, allies/neutrals, and an optional own-convoy id. Players take the
+ *  separate reputation path, so non-NPCs are skipped here. Used by warships to acquire a target on sight. */
+function nearestWarEnemy(faction, ox, oz, players, r2, exclConvoyId) {
+  if (!faction) return null;
+  let best = null, bestD2 = r2;
+  for (const [, p] of players) {
+    if (!p.isNpc || p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (!atWar(faction, p.faction)) continue;
+    if (exclConvoyId && p.convoyId === exclConvoyId) continue;
+    const dx = p.state.x - ox, dz = p.state.z - oz, d2 = dx * dx + dz * dz;
+    if (d2 < bestD2) { bestD2 = d2; best = p; }
+  }
+  return best;
 }
 
 // ── Role-scaled skill (NPC combat realism E0) ────────────────────────────────────────────────────────────────
@@ -558,18 +586,39 @@ function convoyFocusTarget(members, players, nowMs) {
   let pool = [];
   for (const m of members) { const f = engageTarget(m, players, nowMs); if (f && !pool.includes(f)) pool.push(f); }
   const provoked = pool.length > 0;
+  const faction = members[0].faction;
   if (!provoked) {
-    const faction = members[0].faction, R2 = DETECT_RANGE * DETECT_RANGE;
+    const R2 = DETECT_RANGE * DETECT_RANGE;
     for (const [, p] of players) {
       if (p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
       if (repWith(p, faction) > HOSTILE_REP) continue;
       if (members.some((m) => { const dx = p.state.x - m.state.x, dz = p.state.z - m.state.z; return dx * dx + dz * dz <= R2; })) pool.push(p);
     }
+    // Nation-vs-nation: a convoy WITH AN ESCORT (a warship that can initiate) picks up enemy-nation NPCs that come
+    // within WAR_DETECT of any member. A convoy of bare traders (no escort, or escort sunk) does NOT initiate —
+    // it'll only flee/defend. (Lone merchants take the solo findThreat path, which has no war scan at all.)
+    if (faction && members.some((m) => m.combatRole === 'escort')) {
+      const W2 = WAR_DETECT * WAR_DETECT, cid = members[0].convoyId;
+      for (const [, p] of players) {
+        if (!p.isNpc || p.isPirate || !p.state || (p.combat && p.combat.sunk) || p.convoyId === cid) continue;
+        if (!atWar(faction, p.faction)) continue;
+        if (members.some((m) => { const dx = p.state.x - m.state.x, dz = p.state.z - m.state.z; return dx * dx + dz * dz <= W2; }) && !pool.includes(p)) pool.push(p);
+      }
+    }
   }
+  if (!pool.length) return null;
+  // LEASH the chase of any enemy NPC (war target or a grudge from a stray shot) to WAR_LEASH of the convoy's
+  // centre — so a fleeing enemy ship is chased only a little, then the convoy breaks off and reforms on its route
+  // (players are NOT leashed — that's the unchanged piracy/reputation path).
+  let cx = 0, cz = 0; for (const m of members) { cx += m.state.x; cz += m.state.z; } cx /= members.length; cz /= members.length;
+  const L2 = WAR_LEASH * WAR_LEASH;
+  pool = pool.filter((p) => !p.isNpc || ((p.state.x - cx) ** 2 + (p.state.z - cz) ** 2) <= L2);
   if (!pool.length) return null;
   let best = pool[0], bestHull = Infinity;
   for (const p of pool) { const h = p.combat ? hullPoints(p.combat).cur : 100; if (h < bestHull) { bestHull = h; best = p; } }
-  return { foe: best, provoked };
+  // `war` → an enemy-nation NPC engagement (not a grudge): the convoy commits like a provoked one (see convoyStance)
+  // even before the foe is point-blank, so warships actually close and fight rather than just shadowing at range.
+  return { foe: best, provoked, war: !provoked && best.isNpc === true };
 }
 
 /** A screened convoy TRADER evades by keeping its nearest ESCORT between itself and the threat — steering to a point
@@ -748,13 +797,24 @@ function pirateHelm(npc, players, wind, ph, nowMs) {
 function hunterHelm(npc, players, wind, ph) {
   const target = npc.huntTarget ? players.get(npc.huntTarget) : null;
   const alive = !!(target && target.isPirate && target.state && !(target.combat && target.combat.sunk));
+  const pirateDist = alive ? Math.hypot(target.state.x - npc.state.x, target.state.z - npc.state.z) : Infinity;
+  // Priority: a live pirate quarry that's CLOSE — press the kill, ignore distractions.
+  if (alive && !npc.returning && pirateDist <= HUNTER_APPROACH) {
+    npc.engaged = true; npc.fleeing = false;
+    return { desired: engageHeading(npc, target, wind, ph), foe: target };
+  }
+  // Opportunistic nation combat: a navy warship en route (still closing on its pirate, or sailing home) fights an
+  // enemy-nation NPC it passes within WAR_DETECT. Re-acquired by proximity each tick → a foe that flees past
+  // WAR_DETECT is dropped and the hunter resumes its mission, so it never chases wildly off track.
+  const enemy = nearestWarEnemy(npc.faction, npc.state.x, npc.state.z, players, WAR_DETECT * WAR_DETECT, null);
+  if (enemy) {
+    npc.engaged = true; npc.fleeing = false;
+    return { desired: engageHeading(npc, enemy, wind, ph), foe: enemy };
+  }
+  // No closer business: a live pirate still out there → bear for it.
   if (alive && !npc.returning) {
     npc.engaged = true; npc.fleeing = false;
-    const dist = Math.hypot(target.state.x - npc.state.x, target.state.z - npc.state.z);
-    const desired = dist > HUNTER_APPROACH
-      ? tackedHeading(headingTo(npc.state.x, npc.state.z, target.state.x, target.state.z), wind.windBearing, ph.minTackAngle, npc)
-      : engageHeading(npc, target, wind, ph);
-    return { desired, foe: target };
+    return { desired: tackedHeading(headingTo(npc.state.x, npc.state.z, target.state.x, target.state.z), wind.windBearing, ph.minTackAngle, npc), foe: target };
   }
   // Quarry dead or gone → mission accomplished: make for home port and pay off (despawn on arrival).
   npc.returning = true; npc.engaged = false; npc.fleeing = false; npc.raking = false;
@@ -1303,7 +1363,9 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
   for (const [cid, members] of convoyGroups) {
     members.forEach((m) => { m.pincerSide = null; });   // cleared unless re-assigned for a 2-escort crossfire below
     const threat = convoyFocusTarget(members, players, nowMs);   // ONE shared focus target (weakest reachable enemy)
-    const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players, nowMs) : 'route';
+    // A war target commits the convoy like a provoked one (close + fight if it can hold its own; a weaker convoy
+    // still flees — so a strong convoy presses, a weak one runs: convoy-on-convoy resolves naturally).
+    const stance = threat ? convoyStance(members, threat.foe, threat.provoked || threat.war, players, nowMs) : 'route';
     const escorts = members.filter((m) => m.combatRole === 'escort' && !(m.combat && m.combat.sunk));
     // Pincer: 2+ escorts fighting → lock alternating flanks so they catch the foe in a crossfire.
     if (stance === 'fight' && escorts.length >= 2) escorts.forEach((e, i) => { e.pincerSide = i % 2 === 0 ? 1 : -1; });
@@ -1705,6 +1767,7 @@ module.exports = {
     HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
     spawnConvoy, npcCount, convoyMembers, convoyStance, threatStrength, convoyLeader, convoyFollowHeading,
     convoyStation, convoyLeaderDrag, CONVOY_SPACING, CONVOY_FORM_BAND, CONVOY_SPEED_GAIN, CONVOY_LAG_FULL, CONVOY_LEADER_MIN,
+    atWar, nearestWarEnemy, WAR_DETECT, WAR_LEASH,
     CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
     npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,

@@ -11,6 +11,14 @@
  *    background contributes nothing — like the flame it replaces.
  *  - Per-instance `uLife` (0..1) drives a quick-decay envelope; the pool lets a broadside / remotes overlap.
  *  - Raymarch steps + spiral-noise iterations trimmed (the game is GPU-bound); the blast is brief + small.
+ *
+ * PERF (close-up): the effect is fragment-bound — up close the billboard fills the screen and the per-pixel
+ * raymarch dominates the frame for ~1 s. To cut that WITHOUT touching the proven shader's control flow (a
+ * dynamic, uniform-driven loop bound was tried and broke the WebGPU transpile → the fireball vanished), the
+ * step count is baked as a COMPILE-TIME LITERAL into two variants: HIGH (44 steps, byte-identical to the
+ * original — used for normal/distant fire) and LOW (fewer steps + a baked stride scale so it still covers the
+ * full fireball, only coarser — used only when a blast is close enough to fill the screen). The tier is picked
+ * ONCE at spawn from the camera distance, so there's no per-frame uniform churn and each shader stays static.
  */
 import { Constants, Material, Mesh, MeshBuilder, Scene, ShaderMaterial, Vector3 } from '@babylonjs/core';
 
@@ -26,7 +34,13 @@ void main(void) {
 }
 `;
 
-const FRAG = `
+// The fragment shader, parameterised by the raymarch STEP COUNT (a literal, not a uniform). `sScale` = 44/steps is
+// likewise baked in as a numeric literal so fewer steps take bigger strides + faster opacity build-up and still
+// traverse the whole fireball at full extent — only the fine internal detail coarsens (hidden by the brief flash).
+// At steps=44 → sScale=1.0 → identical to the original, so the HIGH variant is exactly the user-confirmed shader.
+const FRAG = (STEPS: number): string => {
+  const S = (44 / STEPS).toFixed(5);   // stride / opacity-accumulation scale for this step count
+  return `
 precision highp float;
 varying vec2 vUV;
 uniform float uLife;   // 0 at spawn → 1 at death
@@ -108,7 +122,7 @@ void main(void) {
   float maxD = -b + dsq;
   if (delta >= 0.0 && maxD > 0.0) {
     t = minD * step(t, minD);
-    for (int i = 0; i < 44; i++) {           // was 86 — trimmed for perf (brief, small on screen)
+    for (int i = 0; i < ${STEPS}; i++) {     // step count is a LITERAL per variant (44 = HIGH, fewer = close-up LOW)
       vec3 pos = ro + t * rd;
       if (td > 0.9 || d < 0.12 * t || t > 10.0 || sum.a > 0.99 || t > maxD) break;
       float dd = map(pos);
@@ -116,19 +130,19 @@ void main(void) {
       vec3 ldst = vec3(0.0) - pos;
       float lDist = max(length(ldst), 0.001);
       vec3 lightColor = vec3(1.0, 0.5, 0.25);
-      sum.rgb += (lightColor / exp(lDist * lDist * lDist * 0.08) / 30.0);   // bloom
+      sum.rgb += (lightColor / exp(lDist * lDist * lDist * 0.08) / 30.0) * ${S};   // bloom (scaled to the step count)
       if (dd < h) {
         ld = h - dd;
         w = (1.0 - td) * ld;
-        td += w + 1.0 / 200.0;
+        td += w + ${S} / 200.0;
         vec4 col = vec4(computeColor(td, lDist), td);
         sum += sum.a * vec4(sum.rgb, 0.0) * 0.2 / lDist;   // emission
         col.a *= 0.2;
         col.rgb *= col.a;
         sum = sum + col * (1.0 - sum.a);
       }
-      td += 1.0 / 70.0;
-      t += max(dd * 0.08 * max(min(length(ldst), dd), 2.0), 0.01);
+      td += ${S} / 70.0;
+      t += max(dd * 0.08 * max(min(length(ldst), dd), 2.0), 0.01) * ${S};
       // NB: do NOT write the outer d here. In the original it stays 1.0 so the break test (d lt 0.12*t)
       // is a FAR cutoff (t gt 8.3). Setting d = dd made it ~0.03 at the sphere entry, breaking after one
       // step (the near-black silhouette bug).
@@ -150,20 +164,37 @@ void main(void) {
   gl_FragColor = vec4(col * radial * fade, 1.0);
 }
 `;
+};
 
-interface Slot { mesh: Mesh; mat: ShaderMaterial; life: number; lifetime: number; active: boolean; seed: number; size: number; }
+// HIGH = 44 steps (byte-identical to the original, used for normal/distant fire). LOW = the close-up budget cut.
+const HIGH_STEPS = 44;
+const LOW_STEPS  = 26;   // ~41% fewer marches; stride-compensated → same fireball extent, coarser detail
+
+interface Slot {
+  mesh: Mesh; matHigh: ShaderMaterial; matLow: ShaderMaterial; mat: ShaderMaterial;
+  life: number; lifetime: number; active: boolean; seed: number; size: number;
+}
 
 export class MuzzleExplosions {
   private slots: Slot[] = [];
+  private readonly scene: Scene;
   private readonly LIFETIME = 0.9;    // seconds the fireball lives (longer — then the smoke carries on)
   // Animation time runs at ANIM_RATE "shader seconds" per real second of life, so the noise roils/rotates a
   // visible amount in the flash (the demo swirls over many seconds; we compress that into the brief life).
   private readonly ANIM_RATE = 6.3;   // slowed ~30% for a lazier swirl
+  // A blast within (size × NEAR_MULT) metres of the camera fills enough of the screen to be worth the cheaper LOW
+  // shader. 0 disables the LOW tier entirely (always full quality). Tunable live via localStorage.ignis_muzzle_near.
+  private readonly NEAR_MULT: number;
 
   constructor(scene: Scene, excludeFromPrePass: (m: Material) => void, pool = 16, includeInGlow?: (m: Mesh) => void) {
-    for (let i = 0; i < pool; i++) {
-      const mat = new ShaderMaterial('muzzleExplosionMat' + i, scene,
-        { vertexSource: VERT, fragmentSource: FRAG },
+    this.scene = scene;
+    const nm = parseFloat(localStorage.getItem('ignis_muzzle_near') || '');
+    this.NEAR_MULT = (nm >= 0 && nm < 1000) ? nm : 9;   // default: switch to LOW within ~9× the blast size
+
+    const fragHigh = FRAG(HIGH_STEPS), fragLow = FRAG(LOW_STEPS);
+    const makeMat = (i: number, frag: string, tag: string): ShaderMaterial => {
+      const mat = new ShaderMaterial('muzzleExplosionMat' + tag + i, scene,
+        { vertexSource: VERT, fragmentSource: frag },
         { attributes: ['position', 'uv'], uniforms: ['worldViewProjection', 'uLife', 'uTime'] });
       mat.alphaMode = Constants.ALPHA_ONEONE;   // additive (ONE, ONE) — bright fire, black adds nothing
       // A raw ShaderMaterial renders OPAQUE unless it thinks it's transparent — then it occludes the smoke
@@ -178,9 +209,15 @@ export class MuzzleExplosions {
       // Keep it OUT of the SSAO/DoF prePass — a billboard rendered there is treated as opaque geometry and
       // punches a defocused/darkened cutout (the "inverse profile" artifact). Same trick the vessel uses.
       excludeFromPrePass(mat);
+      return mat;
+    };
+
+    for (let i = 0; i < pool; i++) {
+      const matHigh = makeMat(i, fragHigh, 'H');
+      const matLow  = makeMat(i, fragLow,  'L');
 
       const mesh = MeshBuilder.CreatePlane('muzzleExplosion' + i, { size: 1 }, scene);
-      mesh.material = mat;
+      mesh.material = matHigh;
       mesh.billboardMode = Mesh.BILLBOARDMODE_ALL;             // always face the camera
       mesh.renderingGroupId = 3;                              // above the ocean LODs, with the flame it replaces
       mesh.isPickable = false;
@@ -189,7 +226,7 @@ export class MuzzleExplosions {
       mesh.metadata = { excludeFromRefraction: true };
       includeInGlow?.(mesh);   // bloom the fireball through the glow layer (day + night)
       mesh.setEnabled(false);
-      this.slots.push({ mesh, mat, life: 0, lifetime: this.LIFETIME, active: false, seed: 0, size: 1 });
+      this.slots.push({ mesh, matHigh, matLow, mat: matHigh, life: 0, lifetime: this.LIFETIME, active: false, seed: 0, size: 1 });
     }
   }
 
@@ -199,6 +236,19 @@ export class MuzzleExplosions {
     if (!slot) {                                              // pool exhausted → recycle the oldest (highest life)
       slot = this.slots.reduce((a, b) => (b.life > a.life ? b : a), this.slots[0]);
     }
+    // Pick the quality tier ONCE, from how close the camera is relative to the blast size (close = fills the screen
+    // = use the cheaper LOW shader). Fixed for the blast's life, so there's no mid-flight material swap / pop.
+    const cam = this.scene.activeCamera;
+    let useLow = false;
+    if (cam && this.NEAR_MULT > 0) {
+      const cp = cam.globalPosition;
+      const dist = Math.hypot(cp.x - x, cp.y - y, cp.z - z);
+      useLow = dist < size * this.NEAR_MULT;
+    }
+    const mat = useLow ? slot.matLow : slot.matHigh;
+    if (slot.mesh.material !== mat) { slot.mesh.material = mat; }
+    slot.mat = mat;
+
     slot.size = size;
     slot.seed = Math.abs((x * 0.37 + z * 0.91) % 50);         // per-shot phase so blasts don't look identical
     slot.life = 0;
@@ -224,7 +274,7 @@ export class MuzzleExplosions {
   }
 
   dispose(): void {
-    for (const s of this.slots) { s.mesh.dispose(); s.mat.dispose(); }
+    for (const s of this.slots) { s.mesh.dispose(); s.matHigh.dispose(); s.matLow.dispose(); }
     this.slots = [];
   }
 }

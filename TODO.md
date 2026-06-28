@@ -2,9 +2,8 @@
 
 # General or Current TODO Items
 
-* reduce FPS draw on explosions up close (I know volumetric is a cost)
-* convoys more together more intelligently... not just follow the leader. They move coordinated, at least until combat breaks out and merchantmen maybe panic
 * LOD imposters too white
+* convoys more together more intelligently... not just follow the leader. They move coordinated, at least until combat breaks out and merchantmen maybe panic
 * nations at war fight each other if they are warships or convoy with a warship
 * frigate, galleon, barque, junk
 * redo crew

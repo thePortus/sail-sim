@@ -2,9 +2,8 @@
 
 # General or Current TODO Items
 
-* I am still seeing NPCs sail into land in combat situations. I came upon a pirate who had chased a merchant well onto land, fully past a town. Then as I approached the pirate, he swung into the town itself (cutting through the land) trying to evade my fire
-* npcs suck at hitting each other, battles take a long time
 * reduce FPS draw on explosions up close (I know volumetric is a cost)
+* convoys more together more intelligently... not just follow the leader. They move coordinated, at least until combat breaks out and merchantmen maybe panic
 * LOD imposters too white
 * nations at war fight each other if they are warships or convoy with a warship
 * frigate, galleon, barque, junk

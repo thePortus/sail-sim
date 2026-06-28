@@ -733,6 +733,12 @@ const MAX_FIRE_RANGE  = 260;       // world units: don't open fire beyond this (
 const NPC_RELOAD_MS   = 4200;      // min ms between a merchant's shots (one aimed ball per reload — deliberately unhurried)
 const NPC_AZ_SPREAD   = 7.5;       // deg: half-width of random bearing scatter (loosened — merchants miss more)
 const NPC_EL_SPREAD   = 3.5;       // deg: half-width of random elevation scatter (more over/undershoot)
+// NPCs are deliberately POOR gunners against the PLAYER (so duels are winnable). But that same wide scatter makes
+// NPC-vs-NPC duels drag on forever (the player watched two sloops trade misses for 10+ minutes). So when the foe is
+// ANOTHER NPC, tighten the scatter and quicken the cadence — a private fight resolves like real ships of the line,
+// while fire at a human player is unchanged. Gated purely on foe.isNpc at the call site, so it never buffs vs-player.
+const NPC_VS_NPC_ACC   = 0.45;     // multiply the scatter half-widths when the target is an NPC (≈2× tighter aim)
+const NPC_VS_NPC_RELOAD = 0.7;     // and reload this much faster vs an NPC (a brisker exchange of broadsides)
 const MUZZLE_Y        = 2.6;       // gun height above the waterline (world units, ~deck)
 const AIM_Y           = 1.4;       // aim point on the target hull (mid-freeboard)
 // Bar/dismantling shot (anti-rig) — NPCs now mix it in when a real captain would: to bring a foe's MASTS down so
@@ -768,7 +774,7 @@ function spreadRad(halfDeg) { return (Math.random() * 2 - 1) * halfDeg * DEG; }
  * scatter. Speed of the returned velocity stays exactly NPC_MUZZLE_V, so it sits in the round-shot band.
  * Returns world-space { ox, oy, oz, vx, vy, vz }.
  */
-function firingSolution(npc, foeState, muzzleV) {
+function firingSolution(npc, foeState, muzzleV, accMul = 1) {
   const hr = npc.state.heading * DEG;
   const sx = Math.cos(hr), sz = -Math.sin(hr);   // starboard (right) unit vector in world XZ
   const dx = foeState.x - npc.state.x, dz = foeState.z - npc.state.z;
@@ -800,7 +806,7 @@ function firingSolution(npc, foeState, muzzleV) {
     tof = R / vh;
   }
   // Aim azimuth at the lead point, then scatter both axes (speed magnitude preserved → stays in band).
-  const sm = aimSpreadMul(npcSkill(npc));   // veteran tight, timid sprays (role-scaled accuracy)
+  const sm = aimSpreadMul(npcSkill(npc)) * accMul;   // veteran tight, timid sprays (role-scaled); accMul tightens vs NPCs
   const az = Math.atan2(px - ox, pz - oz) + spreadRad(NPC_AZ_SPREAD * sm);
   const el = theta + spreadRad(NPC_EL_SPREAD * sm);
   const vhs = v * Math.cos(el);
@@ -850,6 +856,57 @@ function avoidLand(npc, desired) {
     }
   }
   return best;   // most-open heading found — turn toward water rather than hold course into the rocks
+}
+
+// ── Hard land BACKSTOP for translation ────────────────────────────────────────────────────────────────────────
+// avoidLand() steers the HEADING away from land, but it's a soft hint: a crippled, boxed-in or hard-pressed NPC —
+// above all a pirate/merchant in combat, following a FREE engage/escape heading off the A* route, whose turn rate
+// can't finish the swing in time — could still translate straight INTO a land/town cell in a single tick (the
+// reported bug: a pirate chasing a quarry well up onto land, then cutting through a town to dodge fire). This is the
+// non-negotiable floor: clamp the forward STEP to the open-water distance so an NPC can NEVER cross a non-navigable
+// cell, regardless of where the helm points. avoidLand turns it away; this stops it dead at the shore until it does.
+const LAND_MARGIN = 6;     // halt this many world-units short of the shore so the hull never noses onto a land cell
+const LAND_BRAKE  = 0.4;   // when the clamp bites, bleed speed hard — grinding the beach shouldn't build momentum
+
+/** True on a legitimate final approach to a pier/home point, which by design sits on a NON-navigable cell (nav.js
+ *  piers). The clamp is skipped here so a merchant still closes its delivery radius and a hunter pays off at home —
+ *  every EARLIER waypoint is snapped to open water, so clamping those legs (and all combat) stays safe. */
+function onLandApproach(npc) {
+  if (npc.returning) return true;                                // navy hunter homing onto its origin port point
+  return !!(npc.route && npc.routeIdx >= npc.route.length - 1);  // merchant on the last leg → the real pier point
+}
+
+/** Integrate the NPC's position for this tick with the hard land backstop. If the ship is somehow ALREADY embedded
+ *  in land (a stale spawn, or one that slipped through before this guard), it ignores the helm and crawls toward the
+ *  nearest open water so it works itself free instead of freezing in the rocks. */
+function advanceNpc(npc, dtSec) {
+  const step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
+
+  // Recovery: on a non-navigable cell → steer for the nearest open water and crawl out, overriding the combat helm.
+  const oc = nav.worldToCell(npc.state.x, npc.state.z);
+  if (!nav.isNav(oc.cx, oc.cz)) {
+    const snap = nav.snapToNav(oc.cx, oc.cz);
+    if (snap) {
+      const w = nav.cellToWorld(snap.cx, snap.cz);
+      const eh = headingTo(npc.state.x, npc.state.z, w.x, w.z), ehr = eh * DEG;
+      const es = Math.max(Math.abs(step), moveConst.TRAVEL_SCALE * dtSec);   // a steady crawl even if speed stalled
+      npc.state.x += Math.sin(ehr) * es; npc.state.z += Math.cos(ehr) * es;
+      npc.state.heading = eh; npc.yawRate = 0;
+      return;
+    }
+  }
+
+  const hr = npc.state.heading * DEG;
+  let nx = npc.state.x + Math.sin(hr) * step, nz = npc.state.z + Math.cos(hr) * step;
+  if (step > 0.001 && !onLandApproach(npc)) {
+    const open = nav.openDistance(npc.state.x, npc.state.z, nx, nz);   // world dist ahead that stays on water
+    if (open < step - 0.01) {
+      const f = Math.max(0, open - LAND_MARGIN) / step;               // advance only the clear portion, short of shore
+      nx = npc.state.x + Math.sin(hr) * step * f; nz = npc.state.z + Math.cos(hr) * step * f;
+      npc.state.speed *= LAND_BRAKE;   // bleed momentum so it stops grinding the shore; avoidLand swings it away
+    }
+  }
+  npc.state.x = nx; npc.state.z = nz;
 }
 
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
@@ -1376,9 +1433,7 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     sp = Math.max(-1.5, Math.min(ph.maxSpeed * cruiseCap, sp));                    // NPCs never hit a trimmed player's full speed
     npc.state.speed = Math.abs(sp) < 0.001 ? 0 : sp;
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
-    const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
-    npc.state.x += Math.sin(hr) * step;
-    npc.state.z += Math.cos(hr) * step;
+    advanceNpc(npc, dtSec);   // integrate position with the HARD land backstop (never translate through land/town)
     // keep the authoritative pose in sync so player↔NPC collision (which reads authPose) works
     npc.authPose.x = npc.state.x; npc.authPose.z = npc.state.z;
     npc.authPose.heading = npc.state.heading; npc.authPose.speed = npc.state.speed;
@@ -1387,10 +1442,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     // ── Return fire (A3): when engaged, a gun bears, and the reload is up, hand a leading solution to the
     // server's shared shot adjudicator. The reload SCALES WITH CREW (a thinned crew works the guns slower — the
     // same crewMul the player feels via getReloadWindow), and the merchant picks round vs bar shot tactically.
-    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= NPC_RELOAD_MS / crewMul) {
+    const vsNpc = !!(foe && foe.isNpc);   // private NPC-vs-NPC fight → tighter aim + brisker reload (never vs a player)
+    const reloadMs = (NPC_RELOAD_MS / crewMul) * (vsNpc ? NPC_VS_NPC_RELOAD : 1);
+    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= reloadMs) {
       const dist = Math.hypot(foe.state.x - npc.state.x, foe.state.z - npc.state.z);
       const shot = chooseNpcShot(npc, foe, dist);
-      const sol = firingSolution(npc, foe.state, Cc.SHOT_TYPES[shot].v);
+      const sol = firingSolution(npc, foe.state, Cc.SHOT_TYPES[shot].v, vsNpc ? NPC_VS_NPC_ACC : 1);
       if (sol) { fireShot(npc, sol, shot); npc.lastShotAt = nowMs; }
     }
   }
@@ -1600,5 +1657,6 @@ module.exports = {
     makePirate, pickLair, pirateHelm, nearestPrey, pirateCount, targetPirates,
     PIRATE_AGGRO_RANGE, PIRATE_GIVE_UP, PIRATE_LEASH, PIRATE_SKILL, PIRATE_CRUISE,
     makeHunter, hunterHelm, nearestFactionTown, PIRATE_HUNT_THRESHOLD, HUNTER_CRUISE, HUNTER_APPROACH,
+    avoidLand, advanceNpc, onLandApproach, LAND_MARGIN,
   },
 };

@@ -303,7 +303,6 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       const harbors = this.terrainService.getHarbors();
       const hp = this.hoverPx;
       const ledger = this.multiplayerService.ledger();
-      const hinted = this.multiplayerService.hintedHarbor();
       const cat = this.multiplayerService.goodsCatalog();
       const now = performance.now();
       const cap = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
@@ -312,13 +311,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       for (const h of harbors) {
         const hxp = wx(h.x), hyp = wz(h.z);
         const known = !!ledger[h.id];
-        // Pulsing beacon ring at the rumoured town (drawn under the marker dot).
-        if (hinted && h.id === hinted) {
-          const pulse = 0.5 + 0.5 * Math.sin(now / 350);
-          ctx.strokeStyle = `rgba(240,200,105,${0.4 + 0.5 * pulse})`;
-          ctx.lineWidth = 2;
-          ctx.beginPath(); ctx.arc(hxp, hyp, 7 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
-        }
+        // (The "SELL HERE" beacon for the hinted town is drawn separately below — on BOTH map sizes, with a label.)
         // Dot coloured by the owning nation (dimmed until the player has discovered it). A dark halo behind it
         // lifts the marker off the terrain — towns sit on tan/green land where a small flat dot vanishes.
         // Contested towns get a ring in their rival's colour; discovered towns get a bright white ring.
@@ -490,6 +483,30 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     }
 
+    // A bold, dark-outlined label above a marker so a new player can read the objective at a glance over terrain.
+    const tagLabel = (text: string, px: number, py: number, fill: string) => {
+      ctx.font = `700 ${this.expanded() ? 10 : 8}px system-ui, sans-serif`;
+      ctx.textAlign = 'center'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.strokeText(text, px, py); ctx.fillStyle = fill; ctx.fillText(text, px, py);
+      ctx.textAlign = 'left'; ctx.lineWidth = 1;
+    };
+
+    // SELL-HERE beacon — the town the trade hint points at, now shown on BOTH the small and expanded minimap with
+    // a clear label so a new player knows exactly where to take their cargo (was a ring on the big map only).
+    const sellTownId = this.multiplayerService.hintedHarbor();
+    if (sellTownId) {
+      const ht = this.terrainService.getHarbors().find(h => h.id === sellTownId);
+      if (ht) {
+        const hxp = wx(ht.x), hyp = wz(ht.z);
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
+        ctx.strokeStyle = `rgba(245,205,90,${0.45 + 0.5 * pulse})`; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(hxp, hyp, 8 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#ffd24a'; ctx.strokeStyle = 'rgba(60,40,0,0.9)'; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.arc(hxp, hyp, this.expanded() ? 4 : 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        tagLabel(this.expanded() && ht.name ? `SELL HERE — ${ht.name}` : 'SELL HERE', hxp, hyp - (this.expanded() ? 16 : 12), '#ffe79a');
+      }
+    }
+
     // Tavern rumour target — a gold, pulsing diamond on the one merchant the player overheard about (looked
     // up live in otherPlayers by id; the server keeps it streamed even past the normal interest cutoff).
     const markId = this.multiplayerService.markedMerchantId();
@@ -508,6 +525,7 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
         ctx.beginPath();
         ctx.moveTo(mxp, mzp - s); ctx.lineTo(mxp + s, mzp); ctx.lineTo(mxp, mzp + s); ctx.lineTo(mxp - s, mzp);
         ctx.closePath(); ctx.fill(); ctx.stroke();
+        tagLabel('TARGET', mxp, mzp - s - (this.expanded() ? 9 : 7), '#ffe79a');
       }
     }
 
@@ -530,6 +548,8 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
         ctx.beginPath();
         ctx.moveTo(mxp, mzp - s); ctx.lineTo(mxp + s, mzp); ctx.lineTo(mxp, mzp + s); ctx.lineTo(mxp - s, mzp);
         ctx.closePath(); ctx.fill(); ctx.stroke();
+        const pn = this.multiplayerService.pirateReport()?.name;
+        tagLabel(this.expanded() && pn ? `HUNT — ${pn}` : 'HUNT', mxp, mzp - s - (this.expanded() ? 9 : 7), '#ff9a8a');
       }
     }
 

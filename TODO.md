@@ -2,7 +2,6 @@
 
 # General or Current TODO Items
 
-* convoys more together more intelligently... not just follow the leader. They move coordinated, at least until combat breaks out and merchantmen maybe panic
 * nations at war fight each other if they are warships or convoy with a warship
 * frigate, galleon, barque, junk
 * redo crew

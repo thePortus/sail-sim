@@ -87,6 +87,15 @@ const CONVOY_MIN         = 2;      // smallest convoy
 const CONVOY_MAX         = 3;      // largest convoy
 const CONVOY_SPACING     = 24;     // world units between formation slots
 const CONVOY_SQUAD_RANGE = 2500;   // a player's squadron-mate only reinforces the threat if within this of the convoy
+// Formation-keeping (non-combat): a follower steers to its STATION when out of position, but adopts the LEADER's
+// heading once close (so the convoy sails as one body, not each chasing a point). It regulates SPEED to hold
+// station — matching the leader, pressing on to close a gap, easing when it overruns. The leader eases for a bad
+// straggler so the group moves TOGETHER. All of this drops the moment combat starts (members fight/flee normally).
+const CONVOY_FORM_BAND     = 40;   // world units of station error over which heading lerps station→leader-parallel
+const CONVOY_SPEED_GAIN    = 0.05; // speed units added per metre of ALONG-track station error (catch up / ease off)
+const CONVOY_SPEED_RESPONSE= 1.5;  // how briskly a follower's speed eases toward its station-keeping target (1/s)
+const CONVOY_LAG_FULL      = 120;  // a follower this many metres BEHIND its station drags the leader to its floor
+const CONVOY_LEADER_MIN    = 0.5;  // the slowest the leader will throttle to while waiting for a straggler
 // E3 coordination: a screened TRADER tucks this far behind its escort (keeping the escort interposed); a 3-ship
 // convoy occasionally fields TWO escorts (a heavily-guarded run) that flank the foe in a crossfire (pincer).
 const SCREEN_DIST          = 65;   // world units a trader holds on the far side of its escort from the threat
@@ -488,18 +497,10 @@ function convoyLeader(convoyId, players) {
   return null;
 }
 
-/** Heading for an ESCORT to hold its formation slot astern-and-abeam of the convoy leader. Returns null (→ route
- *  normally) when there's no leader — the escort PROMOTES itself to leader so a beheaded convoy keeps trading. */
-function convoyFollowHeading(npc, players) {
-  const leader = convoyLeader(npc.convoyId, players);
-  if (!leader) {
-    // Leader lost. The lowest-slot survivor takes command (deterministic → exactly one new leader); the rest route
-    // for a tick, then fall in behind it next tick.
-    const members = convoyMembers(npc, players);
-    let lead = members[0]; for (const m of members) { if ((m.convoySlot | 0) < (lead.convoySlot | 0)) lead = m; }
-    if (lead === npc) { npc.convoyRole = 'leader'; npc.route = null; }
-    return null;
-  }
+/** The world-space formation STATION (astern-and-abeam of the leader, rotated with its heading) for a follower's
+ *  slot, plus the leader's forward unit vector. The whole formation turns as one because the station rides the
+ *  leader's heading. */
+function convoyStation(npc, leader) {
   const hr = leader.state.heading * DEG;
   const fx = Math.sin(hr), fz = Math.cos(hr);      // leader forward
   const rx = Math.cos(hr), rz = -Math.sin(hr);     // leader starboard
@@ -508,7 +509,46 @@ function convoyFollowHeading(npc, players) {
   const lane = Math.ceil(slot / 2);                // how far astern
   const tx = leader.state.x - fx * CONVOY_SPACING * lane + rx * side * CONVOY_SPACING * 0.7;
   const tz = leader.state.z - fz * CONVOY_SPACING * lane + rz * side * CONVOY_SPACING * 0.7;
-  return headingTo(npc.state.x, npc.state.z, tx, tz);
+  return { tx, tz, fx, fz, lane };
+}
+
+/** Non-combat formation heading for a follower holding its slot on the convoy leader. Out of position → steer to
+ *  the station; on station → adopt the leader's heading so the convoy sails as ONE coordinated body (not each ship
+ *  chasing a moving point — the old "follow-the-leader" wobble). Also stashes `_formSpeed`, the station-keeping
+ *  speed the speed step applies (match the leader + close the along-track gap). Returns null (→ route normally)
+ *  when there's no leader — the lowest-slot survivor PROMOTES itself so a beheaded convoy keeps trading. */
+function convoyFollowHeading(npc, players) {
+  const leader = convoyLeader(npc.convoyId, players);
+  if (!leader) {
+    const members = convoyMembers(npc, players);
+    let lead = members[0]; for (const m of members) { if ((m.convoySlot | 0) < (lead.convoySlot | 0)) lead = m; }
+    if (lead === npc) { npc.convoyRole = 'leader'; npc.route = null; }
+    npc._formSpeed = null;
+    return null;
+  }
+  const { tx, tz, fx, fz } = convoyStation(npc, leader);
+  const ex = tx - npc.state.x, ez = tz - npc.state.z;          // station error vector
+  const errDist = Math.hypot(ex, ez);
+  const toStation = headingTo(npc.state.x, npc.state.z, tx, tz);
+  const t = Math.min(1, errDist / CONVOY_FORM_BAND);           // 0 on-station → leader heading; 1 → steer to station
+  const along = ex * fx + ez * fz;                             // +ve = station ahead of me → I'm lagging → press on
+  npc._formSpeed = Math.max(0, (leader.state.speed || 0) + along * CONVOY_SPEED_GAIN);
+  return blendHeading(leader.state.heading, toStation, t);
+}
+
+/** Speed multiplier [CONVOY_LEADER_MIN..1] for a convoy LEADER: it eases off when its worst non-combat follower is
+ *  lagging well behind its station, so the convoy keeps station as a group instead of the leader sailing away from
+ *  a slow merchantman. A follower that's fighting/fleeing doesn't count (it's not "straggling", it's in combat). */
+function convoyLeaderDrag(leader, players) {
+  const hr = leader.state.heading * DEG, fx = Math.sin(hr), fz = Math.cos(hr);
+  let worstLag = 0;
+  for (const m of convoyMembers(leader, players)) {
+    if (m === leader || m.engaged || m.fleeing) continue;
+    const along = (leader.state.x - m.state.x) * fx + (leader.state.z - m.state.z) * fz;   // +ve = astern of leader
+    const lag = along - CONVOY_SPACING * Math.ceil((m.convoySlot || 1) / 2);               // beyond its station depth
+    if (lag > worstLag) worstLag = lag;
+  }
+  return Math.max(CONVOY_LEADER_MIN, 1 - worstLag / CONVOY_LAG_FULL);
 }
 
 /** ONE shared FOCUS target for the whole convoy (E3) → its escort guns concentrate. Prefers ACTIVE attackers (any
@@ -915,6 +955,10 @@ function avoidanceHeading(npc, fleet) {
   let sx = 0, sz = 0, n = 0;
   for (const o of fleet) {
     if (o === npc) continue;
+    // Convoy-mates sail in a TIGHT formation (CONVOY_SPACING ≪ AVOID_R) — exempt them from the generic
+    // separation force or it would blow the formation apart to the full avoidance radius (the old "loose
+    // follow-the-leader" look). Their stations + station-keeping speed already keep them safely spaced.
+    if (npc.convoyId && o.convoyId === npc.convoyId) continue;
     const dx = npc.state.x - o.state.x, dz = npc.state.z - o.state.z, d = Math.hypot(dx, dz);
     if (d > 1e-3 && d < AVOID_R) { const w = (AVOID_R - d) / AVOID_R; sx += (dx / d) * w; sz += (dz / d) * w; n++; }
   }
@@ -1432,6 +1476,17 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     let sp = vNow + (thrust - drag) * FORCE_RESPONSE / massK * dtSec;
     const cruiseCap = npc.isHunter ? HUNTER_CRUISE : npc.isPirate ? PIRATE_CRUISE : MERCHANT_CRUISE;   // hunters fastest (run the pirate down), pirates next
     sp = Math.max(-1.5, Math.min(ph.maxSpeed * cruiseCap, sp));                    // NPCs never hit a trimmed player's full speed
+    // ── Convoy formation speed (non-combat) ──────────────────────────────────────────────────────────────────
+    // A FOLLOWER in formation regulates its sails to hold STATION (the `_formSpeed` convoyFollowHeading stashed
+    // this tick) rather than sailing flat-out → the column matches pace + closes gaps instead of stringing out.
+    if (npc._formSpeed != null) {
+      const target = Math.max(0, Math.min(ph.maxSpeed * cruiseCap, npc._formSpeed));
+      sp = vNow + (target - vNow) * Math.min(1, CONVOY_SPEED_RESPONSE * dtSec);    // ease toward station-keeping speed
+      npc._formSpeed = null;                                                       // consume (cleared if combat next tick)
+    } else if (npc.convoyId && npc.convoyRole === 'leader' && !npc.engaged && !npc.fleeing) {
+      // The LEADER throttles back for a lagging straggler so the convoy moves together (released the instant it fights).
+      sp = Math.min(sp, ph.maxSpeed * cruiseCap * convoyLeaderDrag(npc, players));
+    }
     npc.state.speed = Math.abs(sp) < 0.001 ? 0 : sp;
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
     advanceNpc(npc, dtSec);   // integrate position with the HARD land backstop (never translate through land/town)
@@ -1649,6 +1704,7 @@ module.exports = {
     shipStrength, hullPoints, repWith, findThreat, combatStance,
     HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
     spawnConvoy, npcCount, convoyMembers, convoyStance, threatStrength, convoyLeader, convoyFollowHeading,
+    convoyStation, convoyLeaderDrag, CONVOY_SPACING, CONVOY_FORM_BAND, CONVOY_SPEED_GAIN, CONVOY_LAG_FULL, CONVOY_LEADER_MIN,
     CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
     npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,

@@ -47,9 +47,18 @@ export class AuthService {
   }
 
   /**
-   * Clears all local storage data.
+   * Clear AUTH/session state, but PRESERVE the player's game settings (every `ignis_*` key — music on/off &
+   * volume, graphics presets, draft/mask overrides, physics, etc.). This runs on every auth flow (login,
+   * register, logout, profile update, game teardown); a blanket `localStorage.clear()` here was wiping those
+   * preferences, so e.g. music-off was forgotten and music restarted itself after a re-login/session refresh.
    */
   clearStorage() {
+    const keep: Record<string, string> = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('ignis_')) { const v = localStorage.getItem(k); if (v !== null) keep[k] = v; }
+    }
     localStorage.clear();
+    for (const k of Object.keys(keep)) localStorage.setItem(k, keep[k]);
   }
 }

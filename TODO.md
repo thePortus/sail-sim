@@ -2,7 +2,8 @@
 
 # General or Current TODO Items
 
-* Fix merchantman POV
+* still forgetting and occasionally music is switched back to on
+* Fix merchantman/brig POV
 * Give controls page a "print" button, make sure it formats to a printer
 * deeper longer cannon boom
 * I am still seeing NPCs sail into land in combat situations. I came upon a pirate who had chased a merchant well onto land, fully past a town. Then as I approached the pirate, he swung into the town itself (cutting through the land) trying to evade my fire

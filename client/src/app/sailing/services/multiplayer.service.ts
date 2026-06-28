@@ -1448,7 +1448,8 @@ export class MultiplayerService {
     if (entry.root.isEnabled() === want) entry.root.setEnabled(!want);   // root ON when NOT impostored
     if (imp.mesh.isEnabled() !== want) imp.mesh.setEnabled(want);
     if (want) {
-      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z);
+      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z,
+        this.sceneService.getImpostorLighting());
       return true;
     }
     return false;

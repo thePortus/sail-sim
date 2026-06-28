@@ -23,10 +23,11 @@ const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
 
 const DEG = Math.PI / 180;
-// Weighted merchant vessel pool: sloops + pinnaces are the common traders; the occasional brigantine (a fat,
-// well-armed prize) and the big slow merchantman/hagboat (the richest, tankiest haul) round it out. The
-// merchantman is a TRADER ONLY — never a pirate/hunter/escort (those stay 'brig'). Duplicates set the odds.
-const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig', 'merchantman'];
+// Weighted merchant vessel pool (solo traders + convoy CARGO). The big slow merchantman/hagboat is the iconic
+// haul and the most common trader; sloops + pinnaces are the lighter traders seen sometimes. The BRIG is a
+// WARSHIP, NOT a trade ship — it is deliberately ABSENT here so it only ever sails as a convoy ESCORT
+// (spawnConvoy hard-codes 'brig'), a PIRATE (PIRATE_SLUGS), or a navy HUNTER (makeHunter). Duplicates set the odds.
+const MERCHANT_SLUGS = ['merchantman', 'merchantman', 'merchantman', 'merchantman', 'sloop', 'sloop', 'pinnace'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
   'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
   'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',

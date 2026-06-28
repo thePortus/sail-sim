@@ -1151,6 +1151,35 @@ export class SceneService {
     this.targetSkyCloudiness = Math.max(0, Math.min(1, weather.cloudiness));
   }
 
+  // ── Distant-ship impostor lighting ───────────────────────────────────────────
+  // The ship LOD impostors (ship-impostor.ts) are UNLIT billboards with the bake's bright daylight burned into
+  // their pixels — so a distant ship stays vivid daylight while the real GLB beside it darkens under storm/night
+  // and hazes into the fog, making the LOD swap obvious (esp. in rain). This hands the impostor shader the live
+  // scene lighting so it can match: a brightness TINT from the sun/ambient/moon, plus the fog colour + density so
+  // it recedes into haze exactly like the lit meshes. Reuses one object (no per-frame allocation).
+  private readonly IMPOSTOR_DIM = (() => {
+    const v = parseFloat(localStorage.getItem('ignis_shipimp_dim') ?? '');   // baked sun reads hotter than in-game
+    return (v > 0 && v <= 1.5) ? v : 0.82;                                    // → dim the impostor to match by default
+  })();
+  private readonly _impLight = { tint: new Color3(1, 1, 1), fogColor: new Color3(0.6, 0.65, 0.7), fogDensity: 0, fogEnabled: false };
+  /** Live lighting/fog for the distant-ship impostors so they track day/night/storm + haze like the real meshes. */
+  getImpostorLighting(): { tint: Color3; fogColor: Color3; fogDensity: number; fogEnabled: boolean } {
+    const sun  = this.sun?.intensity ?? 1;
+    const amb  = this.ambient?.intensity ?? 0;
+    const moon = this.moonLight?.intensity ?? 0;
+    // Total scene illumination, normalised so a clear midday (sun ~1.8 + ambient) maps to ~1; floor keeps a night
+    // ship a dim silhouette rather than pure black; cap at 1 so it can never read BRIGHTER than the baked daylight.
+    const illum = sun + moon * 0.6 + amb * 0.4;
+    const b = Math.max(0.16, Math.min(1, illum / 1.9)) * this.IMPOSTOR_DIM;
+    this._impLight.tint.set(b, b, b);
+    if (this.scene) {
+      this._impLight.fogColor.copyFrom(this.scene.fogColor);
+      this._impLight.fogDensity = this.scene.fogDensity;
+      this._impLight.fogEnabled = this.scene.fogEnabled;
+    }
+    return this._impLight;
+  }
+
   // ── Time of day ──────────────────────────────────────────────────────────────
 
   // Returns a unit vector pointing FROM the scene origin TOWARD the sun.

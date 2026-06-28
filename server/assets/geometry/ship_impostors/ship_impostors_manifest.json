@@ -4,32 +4,32 @@
     "sloop": {
       "size": 24.758,
       "centerY": 7.653,
-      "n": 8,
-      "cols": 8,
+      "n": 16,
+      "cols": 16,
       "rows": 1,
       "cell": 512
     },
     "pinnace": {
       "size": 12.178,
       "centerY": 2.684,
-      "n": 8,
-      "cols": 8,
+      "n": 16,
+      "cols": 16,
       "rows": 1,
       "cell": 512
     },
     "brig": {
       "size": 38.379,
       "centerY": 12.4,
-      "n": 8,
-      "cols": 8,
+      "n": 16,
+      "cols": 16,
       "rows": 1,
       "cell": 512
     },
     "merchantman": {
       "size": 51.197,
-      "centerY": 13.831,
-      "n": 8,
-      "cols": 8,
+      "centerY": 13.332,
+      "n": 16,
+      "cols": 16,
       "rows": 1,
       "cell": 512
     }

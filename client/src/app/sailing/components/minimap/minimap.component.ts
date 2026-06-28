@@ -430,6 +430,34 @@ export class MinimapComponent implements OnInit, AfterViewInit, OnDestroy {
       ctx.fill();
       ctx.stroke();
     };
+    // Merchant-cluster hotspots — shown to EVERY player: where the NPC fleet ACTUALLY is right now (server live
+    // density), drawn as a soft teal glowing zone + a slow pulsing dashed ring, so a newcomer knows roughly where
+    // the ships are concentrated. Larger/brighter for the bigger cluster.
+    const lanes = this.multiplayerService.shippingLanes();
+    if (lanes.length) {
+      const lanePulse = 0.5 + 0.5 * Math.sin(performance.now() / 700);
+      for (const ln of lanes) {
+        const lx = wx(ln.x), lz = wz(ln.z);
+        const worldR = 1600 + 1500 * ln.w;                               // busier hotspot → bigger zone
+        const rPx = Math.max(6, Math.abs(wx(ln.x + worldR) - lx));
+        const grad = ctx.createRadialGradient(lx, lz, 0, lx, lz, rPx);
+        grad.addColorStop(0, `rgba(70,220,200,${0.10 + 0.12 * ln.w})`);
+        grad.addColorStop(1, 'rgba(70,220,200,0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(lx, lz, rPx, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = `rgba(120,235,215,${0.28 + 0.35 * lanePulse * ln.w})`;
+        ctx.lineWidth = 1.4; ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.arc(lx, lz, rPx * (0.9 + 0.06 * lanePulse), 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+        if (this.expanded() && ln.w >= 0.6) {                            // label only the primary cluster, expanded map
+          ctx.fillStyle = 'rgba(155,245,225,0.92)';
+          ctx.font = '9px system-ui, sans-serif'; ctx.textAlign = 'center';
+          ctx.fillText('ships sighted', lx, lz - rPx - 3);
+          ctx.textAlign = 'left';
+        }
+      }
+    }
+
     // Merchants are HIDDEN from regular players (only staff see the fleet). Everyone can still see a single
     // ship they've heard a tavern rumour about — drawn as a gold pulsing diamond just below.
     if (this.isAdmin) {

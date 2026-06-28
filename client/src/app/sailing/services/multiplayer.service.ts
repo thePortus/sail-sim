@@ -165,6 +165,9 @@ export class MultiplayerService {
   allMerchants = signal<{ x: number; z: number }[]>([]);
   // Owners/Admins also receive every PIRATE + navy HUNTER for the minimap (distinct markers); empty for others.
   allPirates = signal<{ x: number; z: number; role: 'pirate' | 'hunter'; name: string; bounty?: number; kills?: number; faction?: string | null; slug?: string }[]>([]);
+  // EVERY player: the busiest merchant shipping-lane hotspots (server betweenness over town routes) — a "where's
+  // the traffic" hint on the minimap so newcomers know roughly where to hunt for trade, beyond a single rumour.
+  shippingLanes = signal<{ x: number; z: number; w: number }[]>([]);
   // Tavern "listen to rumours": the merchant id the player overheard about (marked on the map until it
   // despawns or is replaced), the flavour line the tavern shows, and the last rejection reason.
   markedMerchantId = signal<string | null>(null);
@@ -845,6 +848,11 @@ export class MultiplayerService {
 
     } else if (msg.type === 'nearest_merchant') {
       this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
+
+    } else if (msg.type === 'shipping_lanes') {
+      // Busiest shipping-lane hotspots for EVERY player's minimap (re-sent only when the set changes).
+      this.shippingLanes.set(Array.isArray(msg.hotspots)
+        ? msg.hotspots.map((s: any) => ({ x: +s.x, z: +s.z, w: Math.max(0, Math.min(1, +s.w || 0)) })) : []);
 
     } else if (msg.type === 'all_merchants') {
       this.allMerchants.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({ x: +s.x, z: +s.z })) : []);

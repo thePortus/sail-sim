@@ -19,6 +19,7 @@ const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
 const diplomacy = require('./diplomacy');   // war/peace/alliance — drives nation-vs-nation NPC warship combat
+const shippingLanes = require('./shipping-lanes');   // busiest-lane hotspots → a "where's the traffic" map hint
 const moveConst = require('./movement-constants');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
@@ -1579,6 +1580,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
 function broadcastInterest(players, nowMs) {
   const npcs = [];
   for (const [, p] of players) if (p.isNpc) npcs.push(p);
+  // "Where are the ships" hint for EVERY player: feed the live fleet to the density tracker (throttled inside),
+  // then re-send the cluster hotspots to a player only when they change (version bump) or on first connect.
+  shippingLanes.update(npcs, nowMs);
+  const laneVer = shippingLanes.getVersion();
+  let laneMsg = null;
+  const laneMsgFor = () => (laneMsg || (laneMsg = JSON.stringify({ type: 'shipping_lanes', hotspots: shippingLanes.hotspots() })));
   const msgCache = new Map();
   const msgFor = (n) => {
     let m = msgCache.get(n.id);
@@ -1624,6 +1631,7 @@ function broadcastInterest(players, nowMs) {
   };
   for (const [, p] of players) {
     if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
+    if (p._laneVer !== laneVer) { p.ws.send(laneMsgFor()); p._laneVer = laneVer; }   // lane hint (all players, on change)
     const near = [];
     let nrX = null, nrZ = null, nrD2 = Infinity;   // the single GLOBAL nearest MERCHANT (any distance, for the map beacon)
     for (const n of npcs) {

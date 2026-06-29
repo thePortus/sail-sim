@@ -259,7 +259,7 @@
       "id": "gun_P_0",
       "kind": "cannon",
       "pos": [
-        -1.5,
+        -1.0,
         5,
         9
       ],
@@ -272,7 +272,7 @@
       "id": "gun_P_1",
       "kind": "cannon",
       "pos": [
-        -1.85,
+        -1.0,
         4,
         1.5
       ],
@@ -284,7 +284,7 @@
       "id": "gun_P_2",
       "kind": "cannon",
       "pos": [
-        -1.85,
+        -1.0,
         5,
         -6.5
       ],
@@ -296,7 +296,7 @@
       "id": "gun_P_3",
       "kind": "cannon",
       "pos": [
-        -1.5,
+        -1.0,
         5,
         -9
       ],
@@ -308,7 +308,7 @@
       "id": "gun_S_0",
       "kind": "cannon",
       "pos": [
-        1.5,
+        1.0,
         5,
         9
       ],
@@ -321,7 +321,7 @@
       "id": "gun_S_1",
       "kind": "cannon",
       "pos": [
-        1.85,
+        1.0,
         4,
         1.5
       ],
@@ -333,7 +333,7 @@
       "id": "gun_S_2",
       "kind": "cannon",
       "pos": [
-        1.85,
+        1.0,
         5,
         -6.5
       ],
@@ -345,7 +345,7 @@
       "id": "gun_S_3",
       "kind": "cannon",
       "pos": [
-        1.5,
+        1.0,
         5,
         -9
       ],
@@ -422,13 +422,13 @@
       "id": "capstan",
       "kind": "ropes",
       "pos": [
-        0,
-        3.95,
-        1.2
+        0.7,
+        5,
+        -5.6
       ],
-      "heading_deg": 0,
+      "heading_deg": -90,
       "clip": "Work_Ropes",
-      "wp": "wp_waist_mid",
+      "wp": "wp_port_qd",
       "note": "amidships capstan / deck work"
     },
     {
@@ -651,6 +651,6 @@
     "Three deck levels: waist y4.0 (z-4.9..8), quarterdeck y5.0 (z-12.4..-4.9), forecastle y5.0 (z8..12.4). Lerp Y along edges; the two breaks use 'ladder' edges.",
     "4 guns/side at z 9.0 (forecastle), 1.5 (waist), -6.5 & -9.0 (quarterdeck); gun stations sit ~0.5m inboard (x +-2.2) of the muzzle and face outboard so Work_Cannon's reach lands on the carriage.",
     "Two masts get climb paths each side; the ratline base is at the channels (x +-2.9..3.0) and rises inboard to the top (ForeCap y13.4 / MainCap y15.4).",
-    "max_crew_suggested: 12 (helm, up to 8 guns, ropes x2-4, lookout, climbers). FIRST PASS from measured landmarks — refine waypoint Y for deck sheer + dodge the hatches/capstan/gratings if crew clip through deck fittings."
+    "max_crew_suggested: 12 (helm, up to 8 guns, ropes x2-4, lookout, climbers). FIRST PASS from measured landmarks \u2014 refine waypoint Y for deck sheer + dodge the hatches/capstan/gratings if crew clip through deck fittings."
   ]
 }

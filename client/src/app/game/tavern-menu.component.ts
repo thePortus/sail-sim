@@ -141,7 +141,7 @@ export class TavernMenuComponent {
 
   /** Pretty vessel name for the pirate report (mirrors the rumour vessel mapping). */
   vesselName(slug: string): string {
-    return ({ sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' } as Record<string, string>)[slug] ?? (slug || 'ship');
+    return ({ sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine', merchantman: 'merchantman' } as Record<string, string>)[slug] ?? (slug || 'ship');
   }
 
   /** A bit of tavern colour for the pirate report. */

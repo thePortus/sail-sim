@@ -2,20 +2,20 @@
 
 # General or Current TODO Items
 
-* nations at war fight each other if they are warships or convoy with a warship
-* fix: pirates respawn after a cooldown period of 5-10 minutes (with a different name)
-* actual merchantman vessel (never used as a warship/pirate/piratehunter)
-* frigate, galleon
+* put merchantman ahead of brig in shipwright list
+* long summer day?
+* frigate, galleon, barque, junk
 * redo crew
 * forts and taking towns
-* swordfighting
+* swordfighting, surrender & capture
+* fleets with prize crews to take them over
 * dancing
 * career of lands gained, etc. adapted to this game
+* server only accepts local requests, restricted to client
 * capture ships
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
-* increase render resolution in spyglass
-* fleets with prize crews to take them over
+* pirate fame: as a mechanism to allow you access to best ships... and larger fleet to have more ships following and aiding you
 * town forts... capturing towns
 * update profile page and update password page (and 404 page with a funny 404)
 * make trading and ship buying server-side secure
@@ -25,7 +25,6 @@
 * Paying for powder and shot
 * any way to reduce load times?
 * add forts to town that will fire when super hostile
-* streaming assets has gotten weird, trees move in and out.. can we make them fade in?
 * Plan to make towns or areas "different"... things to see, special marvels... missions?
 * server optimization pass
 * Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words

@@ -35,6 +35,9 @@ const ZONE_HP_BY_SLUG = {
   pinnace: { bow: 55,  stern: 55,  port: 80,  starboard: 80,  masts: 60  },
   // Brigantine — a big, heavily-built warship: the toughest hull, and two masts to shoot away.
   brig:    { bow: 140, stern: 140, port: 200, starboard: 200, masts: 150 },
+  // Merchantman / hagboat — the largest, most heavily-timbered hull (tankiest), but lightly gunned: a fat
+  // trader that soaks punishment. Three masts collapse off the one masts zone.
+  merchantman: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
 };
 // ── Shipwright ARMOR upgrade ──────────────────────────────────────────────────────────────────────────────
 // A once-per-hull armor upgrade adds +25% HP to the four HULL zones (masts excluded — they're rigging, not
@@ -72,11 +75,13 @@ const DMG_PERP_EXP = 1.3;
 // Per-vessel cannon CALIBER → damage multiplier. Bigger ships carry heavier guns with real stopping power, so a
 // brig's ball hurts far more than a pinnace's — ON TOP of the brig carrying more guns AND more hull HP (armour).
 // Net: a brig wrecks a pinnace fast, while a pinnace peppering a brig barely dents it. Keyed by the SHOOTER slug.
-const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7 };
+// The merchantman is a TRADER: lightly gunned (modest caliber) despite its size — its tough hull, not its
+// guns, is what keeps it alive.
+const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7, merchantman: 1.1 };
 // Shipwright CANNON upgrade (once per hull): heavier guns → more stopping power, but tuned to stay BELOW the
 // next ship up (armed pinnace 0.9 < sloop 1.0; armed sloop 1.3 < brig 1.7) so it never matches the next tier.
 // The brig (top tier) gets a flat ~+24% with no cap.
-const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1 };
+const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1, merchantman: 1.4 };
 function caliberFor(slug, cannonUpgrade) {
   if (cannonUpgrade) return CALIBER_UPGRADED_BY_SLUG[slug] || ((CALIBER_BY_SLUG[slug] || 1.0) * 1.2);
   return CALIBER_BY_SLUG[slug] || 1.0;
@@ -128,12 +133,20 @@ const BROADPHASE_PAD = 4.0;   // extra metres around the hull for the cheap prox
 const VALID_ORIGIN_RADIUS = 16.0;   // muzzle must be within this of the shooter's known pos
 const VALID_V_MIN = 45.0;           // |muzzle velocity| plausible band (fixed cannon ~= 55)
 const VALID_V_MAX = 66.0;
-const RATE_WINDOW_MS   = 7000;      // sliding window for the fire-rate cap
-// Anti-spam ceiling sized to the LARGEST legit battery firing at its natural cadence: a brig is 4 guns/side (8
-// total), and with per-gun reloads + partial broadsides both sides can come online more than once in a ~7 s
-// window. 18 leaves slack above that while still blocking a hacked client's machine-gun fire (90 ms min-gap holds).
-const RATE_MAX_SHOTS   = 18;
-const RATE_MIN_GAP_MS  = 90;        // minimum spacing between any two shots
+const RATE_WINDOW_MS   = 7000;      // (legacy; superseded by the per-side reload token bucket) sliding window
+const RATE_MAX_SHOTS   = 18;        // (legacy)
+const RATE_MIN_GAP_MS  = 90;        // (legacy) minimum spacing between any two shots
+
+// ── Per-side, PER-SHIP reload gate (authoritative; mirrors the client per-gun reload) ─────────────────────────
+// The fire-rate ceiling is the ship's OWN battery, not a fixed number, so a future ship with a bigger broadside
+// isn't throttled and a small one isn't over-permitted: each side gets a token bucket of capacity = that ship's
+// guns-per-side (grape: ×GRAPE_PELLET_CAP, a multi-pellet volley), refilling over one reload window. Firing a full
+// broadside empties the side; you can't fire it again until it genuinely reloads — so cancel-and-re-run-out can't
+// bypass the reload (the exploit). RELOAD_BASE_MS matches the client's default reloadWindow (6 s); it's divided by
+// the crewFactor (0.5..1) so a short-handed gun crew reloads slower, exactly like the client.
+const RELOAD_BASE_MS   = 6000;      // base per-gun reload window (full crew), matches client physics.reloadWindow ?? 6
+const RELOAD_SLACK     = 0.9;       // refill a hair faster than nominal to tolerate the client's ±reload variance
+const GRAPE_PELLET_CAP = 8;         // grape tokens per gun, per side (a volley is ~5 pellets/gun → one volley fits)
 
 // ── Shot types (ammunition) ─────────────────────────────────────────────────────
 // Per-type muzzle speed `v` (range ∝ v², so a slower ball falls short), the anti-exploit speed band
@@ -168,5 +181,6 @@ module.exports = {
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,
+  RELOAD_BASE_MS, RELOAD_SLACK, GRAPE_PELLET_CAP,
   SHOT_TYPES, shotDef, GRAPE_RATE_MAX,
 };

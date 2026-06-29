@@ -107,7 +107,9 @@ const VESSELS = [
     },
     // Helm — at the wheel aft (B_Wheel ≈ model 0,5.74,-11.1), standing eye height, looking forward.
     // y is vessel-local (rides the floated hull); the quarterdeck sits high on this ship.
-    firstPersonCam: { x: 0, y: 6.6, z: -9.5 },
+    // x offset to STARBOARD off the centreline so the helmsman sees forward AROUND the centreline boom/gaff
+    // (dead-centre put the view straight into the main boom & gaff).
+    firstPersonCam: { x: 1.2, y: 6.6, z: -9.5 },
     // Four guns a side, taken from the actual gunport (B_Lid) bone positions — and they are NOT on one deck:
     // a forecastle chase (z≈9), a main-deck waist gun (z≈1.5, sitting ~1 m lower), and two on the raised
     // quarterdeck (z≈-6.5, -9). y is the WORLD muzzle height = model gunport y + floatDraft(-2.3) - barrel.
@@ -123,6 +125,39 @@ const VESSELS = [
     price: 200000,                // Ships-as-economy: the top-tier shipwright purchase
     parts: [],
   },
+  {
+    id: 4,
+    name: 'Merchantman',
+    slug: 'merchantman',
+    description: 'A three-masted hagboat — fore and main square-rigged, a gaff spanker aft. A huge hold and the toughest hull afloat, but only six guns and slow to gather way: the trader\'s ship, built to haul cargo, not to fight.',
+    glb:      'merchantman.glb',
+    manifest: 'merchantman.manifest.json',
+    importFlipY: false,           // merchantman exports bow = +X; the client rights it via baseYawDeg −90 (VESSEL_RIGS)
+    rightSign:   1,               // after the −90 yaw, starboard is +X
+    physics: {
+      maxSpeed:         8.6,      // big sail plan but a heavy laden hull → lower top end than the brig
+      accelerationRate: 0.12,     // very heavy → slowest to gather way
+      minTackAngle:     52,       // square-rigged → points even lower than the brig
+      sailAreaFactor:   0.50,     // a great spread of canvas
+      weight:           6500,     // the deepest, heaviest hull in the fleet
+    },
+    // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
+    // forward. y is vessel-local (rides the floated hull). y RAISED 6.0→8.8 (= wheel 7.93 + ~0.9 eye): the old
+    // 6.0 sat ~2 m BELOW the wheel, down inside the cabin beneath the quarterdeck. x offset to STARBOARD off the
+    // centreline so the view clears the centreline spanker/gaff and the masts.
+    firstPersonCam: { x: 1.4, y: 8.8, z: -9.0 },
+    // THREE guns a side on the gun deck (game frame: +Z bow, +X starboard). Fore→aft positions taken from the
+    // actual B_Lid gunport bones; muzzle y is the WORLD height = model gunport y(~6.3) + floatDraft(−3.8) ≈ 2.5.
+    cannons: {
+      port: [{ x: -3.4, y: 2.5, z: 4.1 }, { x: -3.4, y: 2.5, z: -2.4 }, { x: -3.4, y: 2.5, z: -5.9 }],
+      stbd: [{ x:  3.4, y: 2.5, z: 4.1 }, { x:  3.4, y: 2.5, z: -2.4 }, { x:  3.4, y: 2.5, z: -5.9 }],
+    },
+    zoneHp: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
+    crew: 9,                      // Crew resource: a thinly-manned trader (not a warship's full complement)
+    cargo: 120,                   // hold capacity — the whole point: the biggest hold in the fleet
+    price: 90000,                 // Ships-as-economy: a major purchase below the brig warship, for haulers
+    parts: [],
+  },
 ];
 
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
@@ -133,9 +168,10 @@ exports.getVesselDef = (slug) => VESSELS.find(v => v.slug === slug) || VESSELS.f
 // Scales by tier; BOTH upgrades together stay cheaper than the next ship up (pinnace 6k < sloop 10k; sloop 50k <
 // brig 200k). Cannon = armor cost per tier for now (kept as separate fields so either can be tuned independently).
 const UPGRADE_COST = {
-  pinnace: { cannon: 3000,  armor: 3000  },
-  sloop:   { cannon: 25000, armor: 25000 },
-  brig:    { cannon: 60000, armor: 60000 },
+  pinnace:     { cannon: 3000,  armor: 3000  },
+  sloop:       { cannon: 25000, armor: 25000 },
+  brig:        { cannon: 60000, armor: 60000 },
+  merchantman: { cannon: 30000, armor: 30000 },   // both together < the brig (200k); a hauler's modest refit
 };
 /** Cost of a 'cannon' | 'armor' upgrade for a vessel slug (0 if unknown). */
 exports.upgradeCost = (slug, kind) => (UPGRADE_COST[slug] && UPGRADE_COST[slug][kind]) || 0;

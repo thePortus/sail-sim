@@ -3,6 +3,7 @@
 Thumbs.db
 .vscode/
 .claude/
+CLAUDE.md
 certbot/
 */coverage/
 
@@ -16,6 +17,9 @@ certbot/
 server/assets/terrain/
 server/assets/geometry/terrain/biome/
 
+# code graph
+graphify-out
+
 # downloaded terrain source rasters (re-fetchable via npm run fetch:terrain-sources)
 server/assets/maps/sources/
 
@@ -26,6 +30,10 @@ server/assets/sky/
 # runtime (served) set + raw authoring sources for Blender re-bakes — neither is committed.
 server/assets/geometry/scatter/cc0/
 server/assets/scatter-src/
+
+# downloaded CC0 ship-wood textures (re-fetchable via npm run download:ship-wood)
+# authoring-only source baked into the ship GLBs in Blender — never served, never committed.
+server/assets/ship-wood-src/
 
 # user info
 server/seeders/import/**/*

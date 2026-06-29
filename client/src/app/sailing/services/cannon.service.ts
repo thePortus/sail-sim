@@ -517,9 +517,17 @@ export class CannonService {
 
   // ── Flash lights ──────────────────────────────────────────────────────────
 
-  private buildFlashLights(): void {
+  /** Create the 3 muzzle/impact flash PointLights (intensity 0). IDEMPOTENT and safe to call BEFORE init() —
+   *  `reserveDynamicLights` (game bootstrap) calls it right after the scene boots so the scene's dynamic-light
+   *  COUNT is fixed before any heavy PBR material (terrain/vessel/crew) compiles. Adding these lights later forces
+   *  a material recompile that races the WebGPU bind-group cache → the intermittent "Can't find buffer Light6"
+   *  crash during the intro swoop. They live at intensity 0 and only flare when a gun fires. */
+  reserveFlashLights(): void {
+    if (this.flashPort) return;                       // already reserved (early or by buildFlashLights)
+    const scene = this.scene ?? this.sceneService.scene;
+    if (!scene) return;
     const make = (name: string) => {
-      const l = new PointLight(name, Vector3.Zero(), this.scene);
+      const l = new PointLight(name, Vector3.Zero(), scene);
       l.diffuse   = new Color3(1.0, 0.72, 0.22);
       l.specular  = new Color3(1.0, 0.50, 0.08);
       l.intensity = 0;
@@ -539,22 +547,26 @@ export class CannonService {
     this.flashPort   = make('cannonFlashPort');
     this.flashStbd   = make('cannonFlashStbd');
     this.shipFlash   = make('cannonShipHitFlash');
+    // The flash lights terrain, distant cliffs and other ships within ~1 km (STANDARD falloff
+    // fades it with distance). The water is lit separately via an emissive glow in the ocean
+    // shader (a point light can't light the emissive sea).
+  }
 
-    // Pool of independent remote rigs — each gets its own flash light here; its flame/smoke/linger
-    // plumes are filled in by the particle builders below (which run after this).
+  private buildFlashLights(): void {
+    this.reserveFlashLights();   // lights may already exist (reserved early); this only fills the remote-rig pool
+
+    // Pool of independent remote rigs — flame/smoke/linger plumes are filled in by the particle builders
+    // below (which run after this). The rig LIGHT is decoupled (null) — remote shots use particles + the
+    // terrain/water glow, not a point light, to keep the dynamic-light count fixed.
     for (let i = 0; i < this.REMOTE_RIG_COUNT; i++) {
       this.remoteRigs.push({
-        light: null, lightEndT: -1,   // decoupled: remote shots use particles + terrain/water glow, no point light
+        light: null, lightEndT: -1,
         flamePS:  null as unknown as ParticleSystem, flameEmit:  new Vector3(0, 0, 0), flameCutoffT:  -1,
         smokePS:  null as unknown as ParticleSystem, smokeEmit:  new Vector3(0, 0, 0), smokeCutoffT:  -1,
         lingerPS: null as unknown as ParticleSystem, lingerEmit: new Vector3(0, 0, 0), lingerCutoffT: -1,
         shooterId: null, lastUsed: 0,
       });
     }
-
-    // The flash lights terrain, distant cliffs and other ships within ~1 km (STANDARD falloff
-    // fades it with distance). The water is lit separately via an emissive glow in the ocean
-    // shader (a point light can't light the emissive sea).
   }
 
   // ── Shared turbulence noise for smoke ─────────────────────────────────────
@@ -894,14 +906,23 @@ export class CannonService {
     this.zone.run(() => this.gunCount.set(this.gunsPerSide));
   }
 
-  /** Size + seed a side's per-gun reload arrays for the current battery. Each gun gets a FIXED reload-time
-   *  factor (its own cadence) and starts LOADED (run out + charged). */
+  /** Size + seed a side's per-gun reload arrays for the current battery. A FRESH battery starts LOADED (run out
+   *  + charged); but a re-arm of an EXISTING battery PRESERVES the per-gun reload timers.
+   *
+   *  Exploit fixed: fire → Esc (stand down) → run the guns straight back out → fire again, with the long reload
+   *  bypassed because re-arming wiped loadAt back to 0. Now we only seed fresh when there's no battery yet or the
+   *  size changed (a different ship); otherwise the in-progress reload carries through. loadAt[]/loadStart[] are
+   *  absolute `elapsed` times and `elapsed` advances every frame (run out OR stowed), so a genuine reload still
+   *  finishes in real time — cancelling and re-running-out can no longer reset it. */
   private armGunArrays(side: 'port' | 'stbd'): void {
     const g = this.gun[side], n = this.gunsPerSide;
-    g.loadAt = new Array(n).fill(0);        // 0 ≤ elapsed → loaded
-    g.loadStart = new Array(n).fill(0);
-    g.fireAt = new Array(n).fill(Infinity);
-    g.factor = Array.from({ length: n }, () => 1 + (Math.random() * 2 - 1) * RELOAD_VAR);
+    if (g.loadAt.length !== n) {            // no battery yet / battery size changed → fresh, fully-loaded battery
+      g.loadAt = new Array(n).fill(0);       // 0 ≤ elapsed → loaded
+      g.loadStart = new Array(n).fill(0);
+      g.factor = Array.from({ length: n }, () => 1 + (Math.random() * 2 - 1) * RELOAD_VAR);
+    }
+    // else: keep loadAt/loadStart/factor — an in-progress reload must survive the stow → re-arm.
+    g.fireAt = new Array(n).fill(Infinity);  // drop any shots queued before the last stand-down
   }
 
   /** Z / port button, C / stbd button. ARM (run out) if stowed; otherwise FIRE every gun currently loaded. */
@@ -939,6 +960,7 @@ export class CannonService {
       const g = this.gun[s];
       if (g.state === 'arming' || g.state === 'engaged') {
         g.state = 'stowed';
+        g.fireAt = g.fireAt.map(() => Infinity);   // stand-down cancels queued-but-unfired shots (reload state kept)
         this.vesselService.setGunDeploy(s, 0);
         this.multiplayerService.broadcastGunState(s, 0);
         this.zone.run(() => {
@@ -1609,24 +1631,24 @@ export class CannonService {
     limiter.knee.value      = 6;
     limiter.ratio.value     = 16;
     limiter.attack.value    = 0.002;
-    limiter.release.value   = 0.30;
+    limiter.release.value   = 0.45;   // longer release so the long thunder roll isn't pumped/ducked
     limiter.connect(dest);
 
     // Reverb chain (parallel wet path): pre-delay → long slow convolver → darkening
-    // lowpass → wet gain → limiter. A 5 s, slow-decaying impulse plus pre-delay makes
-    // the boom BLOOM and roll out across the bay for seconds instead of stopping dead
-    // like a drum hit. The lowpass keeps the long tail dark/distant, not hissy.
+    // lowpass → wet gain → limiter. An 8 s, slowly-decaying impulse plus a longer pre-delay makes the boom
+    // BLOOM and roll out across the bay for many seconds (rolling thunder) instead of stopping dead like a
+    // drum hit. The lowpass keeps the long tail dark/distant, not hissy.
     const preDelay = ctx.createDelay(0.5);
-    preDelay.delayTime.value = 0.09;
+    preDelay.delayTime.value = 0.12;
 
     const reverb = ctx.createConvolver();
-    reverb.buffer = this.makeReverbIR(ctx, 5.0, 1.3);
+    reverb.buffer = this.makeReverbIR(ctx, 8.0, 1.0);   // 5.0/1.3 → 8.0/1.0: longer tail, slower decay = bigger bloom
 
     const dark = ctx.createBiquadFilter(); dark.type = 'lowpass';
-    dark.frequency.value = 1500;
+    dark.frequency.value = 1300;   // a touch darker — the long tail reads as distant rolling thunder
 
     const wet = ctx.createGain();
-    wet.gain.value = 1.0;
+    wet.gain.value = 1.3;   // more bloom in the wet path
 
     preDelay.connect(reverb); reverb.connect(dark); dark.connect(wet); wet.connect(limiter);
 
@@ -1687,58 +1709,73 @@ export class CannonService {
       src.start(t); src.stop(t + 0.07);
     }
 
-    // 2) BLAST — lowpassed noise sweeping down hard: the throaty roar of the powder.
+    // 2) BLAST — lowpassed noise sweeping down hard: the throaty roar of the powder. Longer sweep, deeper floor.
     {
-      const src = noise(0.7);
+      const src = noise(1.1);
       const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.8;
-      lp.frequency.setValueAtTime(rnd(800, 1000), t);
-      lp.frequency.exponentialRampToValueAtTime(85, t + 0.45);
+      lp.frequency.setValueAtTime(rnd(780, 980), t);
+      lp.frequency.exponentialRampToValueAtTime(70, t + 0.6);
       const g = ctx.createGain();
-      g.gain.setValueAtTime(1.6 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+      g.gain.setValueAtTime(1.7 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
       src.connect(lp); lp.connect(g); g.connect(out);
-      src.start(t); src.stop(t + 0.7);
+      src.start(t); src.stop(t + 1.1);
     }
 
     // 3) PUNCH — a pitched thump for the percussive hit.
     {
       const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.setValueAtTime(rnd(105, 125), t);
-      osc.frequency.exponentialRampToValueAtTime(38, t + 0.18);
+      osc.frequency.setValueAtTime(rnd(108, 126), t);
+      osc.frequency.exponentialRampToValueAtTime(34, t + 0.20);
       const g = ctx.createGain();
       g.gain.setValueAtTime(1.0 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.42);
       osc.connect(g); g.connect(out);
-      osc.start(t); osc.stop(t + 0.33);
+      osc.start(t); osc.stop(t + 0.43);
     }
 
-    // 4) SUB — the deep chest-thump that makes it feel powerful (kept controlled).
+    // 4) SUB — the deep chest-thump that makes it feel powerful. Deeper + longer for more weight/thunder.
     {
       const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.setValueAtTime(rnd(58, 66), t);
-      osc.frequency.exponentialRampToValueAtTime(24, t + 0.55);
+      osc.frequency.setValueAtTime(rnd(52, 60), t);
+      osc.frequency.exponentialRampToValueAtTime(18, t + 0.7);
       const g = ctx.createGain();
-      g.gain.setValueAtTime(0.9 * vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.95);
+      g.gain.setValueAtTime(1.15 * vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 1.45);
       osc.connect(g); g.connect(out);
-      osc.start(t); osc.stop(t + 0.97);
+      osc.start(t); osc.stop(t + 1.47);
     }
 
-    // 5) ROLL — a long, sustained low rumble. Fed through the bus reverb it becomes
-    //    the boom rolling out across the water for several seconds (the part that
-    //    turns a "drum hit" into a "cannon"). Two stages: a near growl then a long
-    //    decaying thunder.
+    // 5) ROLL — a long, sustained low rumble. Fed through the bus reverb it becomes the boom rolling out across
+    //    the water for several seconds (the part that turns a "drum hit" into a "cannon"). Lengthened to ~3.6 s
+    //    with a slower decay so the thunder rolls instead of snapping off.
     {
-      const src = noise(1.7);
+      const src = noise(3.6);
       const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass';
-      lp.frequency.setValueAtTime(380, t);
-      lp.frequency.exponentialRampToValueAtTime(95, t + 1.5);
+      lp.frequency.setValueAtTime(360, t);
+      lp.frequency.exponentialRampToValueAtTime(75, t + 2.6);
       const g = ctx.createGain();
       g.gain.setValueAtTime(0.0, t);
-      g.gain.linearRampToValueAtTime(0.72 * vol, t + 0.05);
-      g.gain.setTargetAtTime(0.0, t + 0.28, 0.42);   // tighter thunder decay (less breathy tail)
+      g.gain.linearRampToValueAtTime(0.80 * vol, t + 0.06);
+      g.gain.setTargetAtTime(0.0, t + 0.40, 1.05);   // long, slowly-decaying thunder tail
       src.connect(lp); lp.connect(g); g.connect(out);
-      src.start(t); src.stop(t + 1.7);
+      src.start(t); src.stop(t + 3.6);
+    }
+
+    // 6) ROLLING THUNDER ECHO — a second, DELAYED deep rumble that swells just after the shot, so the boom
+    //    reads as rolling thunder echoing back off the islands rather than a single hit. Lower, darker, slow.
+    {
+      const te  = t + 0.45;
+      const src = noise(3.2);
+      const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(230, te);
+      lp.frequency.exponentialRampToValueAtTime(55, te + 2.4);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, te);
+      g.gain.linearRampToValueAtTime(0.45 * vol, te + 0.18);
+      g.gain.setTargetAtTime(0.0, te + 0.6, 1.2);
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(te); src.stop(te + 3.2);
     }
   }
 

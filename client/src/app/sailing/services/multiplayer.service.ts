@@ -8,7 +8,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { VesselController, createVesselController, rigForSlug } from './vessel-controller';
+import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
@@ -165,6 +165,9 @@ export class MultiplayerService {
   allMerchants = signal<{ x: number; z: number }[]>([]);
   // Owners/Admins also receive every PIRATE + navy HUNTER for the minimap (distinct markers); empty for others.
   allPirates = signal<{ x: number; z: number; role: 'pirate' | 'hunter'; name: string; bounty?: number; kills?: number; faction?: string | null; slug?: string }[]>([]);
+  // EVERY player: the busiest merchant shipping-lane hotspots (server betweenness over town routes) — a "where's
+  // the traffic" hint on the minimap so newcomers know roughly where to hunt for trade, beyond a single rumour.
+  shippingLanes = signal<{ x: number; z: number; w: number }[]>([]);
   // Tavern "listen to rumours": the merchant id the player overheard about (marked on the map until it
   // despawns or is replaced), the flavour line the tavern shows, and the last rejection reason.
   markedMerchantId = signal<string | null>(null);
@@ -846,6 +849,11 @@ export class MultiplayerService {
     } else if (msg.type === 'nearest_merchant') {
       this.nearestMerchant.set(msg.x == null ? null : { x: +msg.x, z: +msg.z });
 
+    } else if (msg.type === 'shipping_lanes') {
+      // Busiest shipping-lane hotspots for EVERY player's minimap (re-sent only when the set changes).
+      this.shippingLanes.set(Array.isArray(msg.hotspots)
+        ? msg.hotspots.map((s: any) => ({ x: +s.x, z: +s.z, w: Math.max(0, Math.min(1, +s.w || 0)) })) : []);
+
     } else if (msg.type === 'all_merchants') {
       this.allMerchants.set(Array.isArray(msg.ships) ? msg.ships.map((s: any) => ({ x: +s.x, z: +s.z })) : []);
 
@@ -1081,7 +1089,7 @@ export class MultiplayerService {
   /** Build the overheard-rumour line from the server's structured reply (vessel + origin→destination). */
   private composeRumor(slug: string, from: string | null, to: string): string {
     const tellers = ['barkeep', 'grizzled sailor', 'serving girl', 'harbour drunk', 'one-eyed fisherman'];
-    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine' };
+    const vessels: Record<string, string> = { sloop: 'sloop', pinnace: 'pinnace', brig: 'brigantine', merchantman: 'merchantman' };
     const teller = tellers[Math.floor(Math.random() * tellers.length)];
     const vessel = vessels[slug] ?? 'ship';
     const route = from ? `sailing from ${from} to ${to}` : `bound for ${to}`;
@@ -1324,7 +1332,7 @@ export class MultiplayerService {
     // REMOTE_DRAFT matches the local vessel's FLOAT_DRAFT so remotes sit at the SAME
     // waterline as your own ship (they were floating ~2.4 m too high at the old fixed
     // REMOTE_FLOAT_Y=1.65 baseline).
-    const heaveTarget = hC + this.REMOTE_DRAFT + rigForSlug(entry.vesselSlug).floatDraft;
+    const heaveTarget = hC + this.REMOTE_DRAFT + floatDraftFor(entry.vesselSlug, rigForSlug(entry.vesselSlug));
     const pitchTarget = Math.atan2(hStern - hBow, HALF_LEN * 2);   // +bow up
     const rollTarget  = Math.atan2(hStbd - hPort, HALF_BEAM * 2);  // +stbd down
 
@@ -1448,7 +1456,8 @@ export class MultiplayerService {
     if (entry.root.isEnabled() === want) entry.root.setEnabled(!want);   // root ON when NOT impostored
     if (imp.mesh.isEnabled() !== want) imp.mesh.setEnabled(want);
     if (want) {
-      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z);
+      updateShipImpostor(imp, entry.dispX, entry.root.position.y, entry.dispZ, entry.dispHeading, cam.position.x, cam.position.z,
+        this.sceneService.getImpostorLighting());
       return true;
     }
     return false;
@@ -1524,8 +1533,9 @@ export class MultiplayerService {
   // Per-vessel collision capsule (keel half-length + radius ≈ half-beam + margin). Each ship uses its
   // OWN size, so a small pinnace collides at its true hull, not the sloop's bulk. Default = sloop.
   private readonly COLL_DIMS_BY_SLUG: Record<string, { halfLen: number; radius: number }> = {
-    sloop:   { halfLen: 5.0, radius: 2.2 },
-    pinnace: { halfLen: 3.8, radius: 1.4 },
+    sloop:       { halfLen: 5.0, radius: 2.2 },
+    pinnace:     { halfLen: 3.8, radius: 1.4 },
+    merchantman: { halfLen: 13.0, radius: 3.6 },   // mirrors server movement-constants.js
   };
   private collDims(slug: string | undefined): { halfLen: number; radius: number } {
     return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
@@ -1722,7 +1732,7 @@ export class MultiplayerService {
     // renderingGroupId 2 happen in the cache.
     const rig = rigForSlug(slug);
     const [rigged, manifest] = await Promise.all([
-      this.assetCache.instantiateRigged(rig.glb, scene, entry.root, rig.importFlipY),
+      this.assetCache.instantiateRigged(rig.glb, scene, entry.root, rig.importFlipY, baseYawDegFor(slug, rig)),
       this.assetCache.loadManifest(rig.manifest),
     ]);
     if (!rigged) { console.warn('[Multiplayer] rigged vessel failed to load for', playerId); return; }

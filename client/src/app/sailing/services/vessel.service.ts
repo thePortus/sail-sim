@@ -11,7 +11,7 @@ import { OceanService }  from './ocean.service';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { VesselController, createVesselController, rigForSlug, VesselRig, SailRig } from './vessel-controller';
+import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor, VesselRig, SailRig } from './vessel-controller';
 import { applyFlagColor, flagColor3, FlagColorHandle } from './flag-color';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
@@ -449,6 +449,10 @@ export class VesselService {
       buoyancy:   base.buoyancy,
       hullHalfLen:  base.hullHalfLen,
       hullHalfBeam: base.hullHalfBeam,
+      baseYawDeg:  base.baseYawDeg,
+      sail:        base.sail,
+      oceanMask:   base.oceanMask,
+      oceanMaskFloorY: base.oceanMaskFloorY,
     };
     this.rightSign = this.rig.rightSign;
 
@@ -510,6 +514,14 @@ export class VesselService {
     this.hullStencilCap = null;
     this.oceanService.setHullStencilMask(false);
     if (!this.root) { this.oceanService.setHullCutEnabled(false); return; }
+
+    // Per-rig opt-out: DECKED, deep-draft hulls (merchantman) skip the mask entirely — the stencil would
+    // reveal their big underwater hull (keel visible through the sea) + cut foreground waves, and the deck
+    // already hides the interior so there's nothing to mask. Live override: ignis_oceanmask_<slug>=on|off.
+    const omo = (typeof localStorage !== 'undefined') ? localStorage.getItem('ignis_oceanmask_' + this.vesselSlug) : null;
+    const oceanMask = omo === 'on' ? true : omo === 'off' ? false : (this.rig.oceanMask !== false);
+    if (!oceanMask) { this.oceanService.setHullStencilMask(false); this.oceanService.setHullCutEnabled(false); return; }
+
     const hull = this.root.getChildMeshes()
       .find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
 
@@ -527,7 +539,12 @@ export class VesselService {
       // gunwale-height lid floats above the sea (parallax), a waterline lid pokes its wide outline past the
       // narrower waterline hull (a skirt). The hull's own geometry is the only silhouette that's exactly
       // right from any camera, so we mask to that.
-      this.hullStencilCap = buildHullStencilProxy(hull, this.root, this.sceneService.scene);
+      // Clamp the proxy at the hull-local DECK level (oceanMaskFloorY) so it masks only the open deck — well
+      // above the wave zone, so it never masks the sea surface in front of the submerged hull (clamping at the
+      // waterline still revealed the keel, because the proxy's flat bottom sat right where the line of sight to
+      // the underwater hull crosses the sea). Undefined → mask the whole hull (shallow open boats).
+      this.hullStencilCap = buildHullStencilProxy(
+        hull, this.root, this.sceneService.scene, maskFloorFor(this.vesselSlug, this.rig));
       if (this.hullStencilCap) {
         this.oceanService.setHullStencilMask(true);
         this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
@@ -572,9 +589,16 @@ export class VesselService {
   private registerMeshesForRendering(meshes: AbstractMesh[]): void {
     const sg = this.sceneService.shadowGenerator;
     const seenMats = new Set<Material>();
+    // PERF: sails + flags are SKINNED cloth re-rendered into all 3 shadow cascades EVERY frame, and
+    // (transparencyShadow=true) as the priciest alpha shadow draws — yet their shadow on the deck/water
+    // is faint. Skip them from the shadow pass (they still render in the main view + water reflection).
+    // This helps the square-rigged ships most (the brig has 13 sails + 4 flags = ~17 skinned draws ×3
+    // cascades). Opt back in with localStorage.ignis_sailshadows='on'.
+    const sailShadows = localStorage.getItem('ignis_sailshadows') === 'on';
     for (const mesh of meshes) {
       this.oceanService.addToRenderList(mesh);
-      sg?.addShadowCaster(mesh, true);
+      const isCloth = /sail|flag/i.test(mesh.name);
+      if (!isCloth || sailShadows) sg?.addShadowCaster(mesh, true);
       mesh.receiveShadows = false;
       const mat = mesh.material;
       if (mat && !seenMats.has(mat)) {
@@ -631,6 +655,10 @@ export class VesselService {
       buoyancy:    base.buoyancy,
       hullHalfLen:  base.hullHalfLen,
       hullHalfBeam: base.hullHalfBeam,
+      baseYawDeg:  base.baseYawDeg,
+      sail:        base.sail,
+      oceanMask:   base.oceanMask,
+      oceanMaskFloorY: base.oceanMaskFloorY,
     };
     this.rightSign = this.rig.rightSign;
     this.vesselCannons = vessel.cannons ?? null;
@@ -663,7 +691,7 @@ export class VesselService {
   // Parenting + renderingGroupId 2 still happen inside instantiateRigged().
   private async buildGLBMeshes(scene: Scene): Promise<void> {
     const [rigged, manifest] = await Promise.all([
-      this.assetCache.instantiateRigged(this.rig.glb, scene, this.root, this.rig.importFlipY),
+      this.assetCache.instantiateRigged(this.rig.glb, scene, this.root, this.rig.importFlipY, baseYawDegFor(this.vesselSlug, this.rig)),
       this.assetCache.loadManifest(this.rig.manifest),
     ]);
     if (!rigged) { console.warn(`[Vessel] rigged ${this.vesselSlug} failed to load`); return; }
@@ -1278,7 +1306,7 @@ export class VesselService {
     // FLOAT_DRAFT: vertical offset so the hull sits correctly in the water. The rigged sloop's origin is
     // authored AT the waterline so 0 sits it right; per-vessel `floatDraft` raises a shallow open boat
     // (the pinnace) so the sea surface doesn't wash through its low hull.
-    const FLOAT_DRAFT = this.rig.floatDraft;
+    const FLOAT_DRAFT = floatDraftFor(this.vesselSlug, this.rig);
 
     // Cannon recoil: damped lateral roll response driven only by fire impulses.
     const recoilAcc = -this.RECOIL_SPRING * this.recoilRoll - this.RECOIL_DAMPING * this.recoilRollVel;

@@ -12,6 +12,22 @@
  */
 
 const C = require('./combat-constants');
+const { getVesselDef } = require('./controllers/vessels.controller');   // per-ship guns-per-side for the reload gate
+
+const DEG = Math.PI / 180;
+/** Which side a shot left from, derived from the shooter's heading + the ball's horizontal velocity (broadsides
+ *  fire perpendicular to the fore-aft axis, so the cross product is unambiguous). Labels are arbitrary but stable
+ *  — all that matters is that port shots and starboard shots land in separate reload buckets. */
+function shotSide(headingDeg, vx, vz) {
+  const fx = Math.sin((headingDeg || 0) * DEG), fz = Math.cos((headingDeg || 0) * DEG);
+  return (fx * vz - fz * vx) >= 0 ? 'port' : 'stbd';
+}
+/** This ship's guns per side (the broadside size), straight from its vessel def → the gate auto-scales to any
+ *  future ship without a hand-maintained table. */
+function gunsPerSideFor(slug) {
+  const def = getVesselDef(slug);
+  return Math.max(1, (def && def.cannons && def.cannons.port && def.cannons.port.length) || 3);
+}
 
 /** Fresh full-HP hull for a player, seeded from their vessel's per-zone HP (slug → vessel). */
 function newCombatState(slug, armorUpgrade) {
@@ -20,7 +36,9 @@ function newCombatState(slug, armorUpgrade) {
   for (const z of C.ZONES) zones[z] = hp[z];
   // maxHp travels in the combat_state broadcast so clients can size the HUD severity bands per vessel without a
   // separate slug lookup. armorUpgrade is recorded so a repair/restore re-applies the boosted maxHp consistently.
-  return { zones, maxHp: { ...hp }, slug: slug || 'sloop', armorUpgrade: !!armorUpgrade, sunk: false, shotTimes: [] };
+  // gunsPerSide + per-side reload buckets (lazily filled in allowShot) gate fire-rate to THIS ship's battery.
+  return { zones, maxHp: { ...hp }, slug: slug || 'sloop', armorUpgrade: !!armorUpgrade, sunk: false,
+           shotTimes: [], gunsPerSide: gunsPerSideFor(slug), load: {} };
 }
 
 /** Which hull zone (if any) contains a point in vessel-local space. null = no hit. */
@@ -152,24 +170,35 @@ function validateShot(shot, shooterState, shotType) {
   return dx * dx + dz * dz <= C.VALID_ORIGIN_RADIUS * C.VALID_ORIGIN_RADIUS;
 }
 
-/** Fire-rate gate (sliding window + min spacing). Mutates combat.shotTimes. Grapeshot fires a many-pellet
- *  burst, so it uses a SEPARATE, generous budget with no min-gap (the pellets leave together) — kept apart
- *  from the round/bar counter so a grape burst can't lock out solid shot or vice-versa. */
-function allowShot(combat, nowMs, shotType = 'round') {
-  if (!combat) return false;
-  if (shotType === 'grape') {
-    const gt = combat.grapeTimes || (combat.grapeTimes = []);
-    while (gt.length && nowMs - gt[0] > C.RATE_WINDOW_MS) gt.shift();
-    if (gt.length >= C.GRAPE_RATE_MAX) return false;
-    gt.push(nowMs);
-    return true;
-  }
-  const times = combat.shotTimes;
-  while (times.length && nowMs - times[0] > C.RATE_WINDOW_MS) times.shift();
-  if (times.length >= C.RATE_MAX_SHOTS) return false;
-  if (times.length && nowMs - times[times.length - 1] < C.RATE_MIN_GAP_MS) return false;
-  times.push(nowMs);
-  return true;
+/** Authoritative PER-SIDE, PER-SHIP reload gate — a token bucket per side mirroring the client's per-gun reload.
+ *
+ *  Capacity = this ship's guns-per-side (grape: ×GRAPE_PELLET_CAP for a multi-pellet volley); it starts FULL
+ *  (a fresh battery is loaded) and refills over one reload window (`reloadWindowMs`, already crew-stretched by the
+ *  caller). Firing empties the side; a second instant volley finds an empty bucket and is rejected — so cancelling
+ *  the run-out and immediately re-running the guns out can NOT bypass the reload (the exploit). Solid (round/bar)
+ *  and grape use separate pools so one can't lock out the other. Returns true (and consumes a token) iff the shot
+ *  is allowed. NPC shots don't pass through here — they're server-driven and trusted.
+ *
+ *  @param side       'port' | 'stbd' (from shotSide); a missing side rejects (can't gate it safely).
+ *  @param crewFactor 0.5..1 (full crew = 1); a short-handed crew reloads slower, exactly like the client. */
+function allowShot(combat, nowMs, shotType, side, crewFactor) {
+  if (!combat || (side !== 'port' && side !== 'stbd')) return false;
+  const n = Math.max(1, combat.gunsPerSide || 3);
+  const solidCap = n;
+  const grapeCap = n * C.GRAPE_PELLET_CAP;
+  const cf = crewFactor > 0 ? crewFactor : 1;
+  const reloadSec = Math.max(0.5, (C.RELOAD_BASE_MS / 1000) / cf * C.RELOAD_SLACK);
+  const load = combat.load || (combat.load = {});
+  const b = load[side] || (load[side] = { solid: solidCap, grape: grapeCap, t: nowMs });
+  // Refill both pools toward their caps by the time elapsed since the last shot on this side (guns reload whether
+  // run out or stowed). `t` is the last refill stamp; clamp dt ≥ 0 against clock weirdness.
+  const dt = Math.max(0, (nowMs - b.t) / 1000);
+  b.solid = Math.min(solidCap, b.solid + dt * (solidCap / reloadSec));
+  b.grape = Math.min(grapeCap, b.grape + dt * (grapeCap / reloadSec));
+  b.t = nowMs;
+  const key = shotType === 'grape' ? 'grape' : 'solid';
+  if (b[key] >= 1) { b[key] -= 1; return true; }
+  return false;
 }
 
 /**
@@ -242,5 +271,5 @@ function restoreCombatState(slug, savedZones, armorUpgrade) {
 
 module.exports = {
   newCombatState, restoreCombatState, zoneAtLocal, deadReckon, computeDamage,
-  stepShot, validateShot, allowShot, applyDamage, applyGrapeCrew, tickMastRepair,
+  stepShot, validateShot, allowShot, shotSide, applyDamage, applyGrapeCrew, tickMastRepair,
 };

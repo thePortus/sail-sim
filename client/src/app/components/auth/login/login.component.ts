@@ -21,6 +21,8 @@ export class LoginComponent implements OnInit {
   errorMsgs: string[] = [];
   userDetails$!: Observable<User>;
   user: any;
+  /** True when the player was bounced here because their stored session had expired (shows a banner). */
+  expiredNotice = false;
 
   constructor(
     private _api: ApiService,
@@ -31,6 +33,7 @@ export class LoginComponent implements OnInit {
   ) {}
 
   ngOnInit(): void {
+    this.expiredNotice = this._auth.consumeSessionExpired();
     this.isUserLogin();
     this.userDetails$ = this._user.user$;
     this.userDetails$.subscribe(result => { this.user = result; });

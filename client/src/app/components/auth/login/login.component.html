@@ -3,6 +3,10 @@
     <h1>Bay of Pirates</h1>
     <p class="subtitle">Sign in to your account</p>
 
+    <div class="expired-notice" *ngIf="expiredNotice">
+      ⚓ Your session has expired — please log in again.
+    </div>
+
     <form #myform="ngForm" (ngSubmit)="onSubmit(myform)" class="auth-form">
       <div class="field-group">
         <label for="username">Username</label>

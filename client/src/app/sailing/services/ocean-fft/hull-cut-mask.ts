@@ -277,21 +277,51 @@ export function buildHullStencilCap(
  * Render wiring (caller): renderingGroupId 0 + the group-0 opaque sort that draws stencilProxy meshes
  * first, so the stamp lands before the water reads it. Returns null if the hull can't be cloned.
  */
-export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene): Mesh | null {
+export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene, waterlineLocalY?: number): Mesh | null {
   // An InstancedMesh shares its sourceMesh's geometry; clone the SOURCE (a real Mesh with a material slot).
-  const src = (hull as unknown as { sourceMesh?: Mesh }).sourceMesh ?? (hull as Mesh);
-  if (typeof (src as Mesh).clone !== 'function') { return null; }
-  const clone = (src as Mesh).clone('hull_stencil_proxy', null, true);   // share geometry, skip children
-  if (!clone) { return null; }
+  // Gather ALL of the hull's primitives, not just the one mesh handed in. A wood-reskinned hull is split into
+  // many material primitives (the open pinnace went 4→9); Babylon loads each primitive as a separate sibling
+  // mesh under the hull node, so cloning just ONE covers only a fraction of the silhouette → the sea leaks
+  // through the gaps (invisible on decked hulls, glaring on the open pinnace). Combine every sibling whose name
+  // matches the hull (they share the node-local frame: glTF primitives carry an identity local transform) into
+  // one fresh VertexData. The hull is STATIC on every vessel (object-parented to the rig, no deform), so a
+  // freshly-built proxy loses no skinning. Excludes any prior 'hull_stencil_proxy' so re-runs don't double up.
+  const parent = hull.parent as (TransformNode | null);
+  const siblings = (parent ? parent.getChildMeshes(true) : [hull]) as Mesh[];
+  const parts = siblings.filter(m =>
+    /hull/i.test(m.name) && !/stencil/i.test(m.name) &&
+    m.getTotalVertices() > 0 && typeof (m as Mesh).getVerticesData === 'function');
+  const meshes = parts.length ? parts : [(hull as unknown as { sourceMesh?: Mesh }).sourceMesh ?? (hull as Mesh)];
+  const allPos: number[] = []; const allIdx: number[] = []; const allNrm: number[] = [];
+  let base = 0; let haveNrm = true;
+  for (const m of meshes) {
+    const pos = (m as Mesh).getVerticesData(VertexBuffer.PositionKind);
+    const idx = (m as Mesh).getIndices();
+    if (!pos || !idx) { continue; }
+    for (let i = 0; i < pos.length; i++) { allPos.push(pos[i]); }
+    for (let i = 0; i < idx.length; i++) { allIdx.push(idx[i] + base); }
+    const nrm = (m as Mesh).getVerticesData(VertexBuffer.NormalKind);
+    if (nrm) { for (let i = 0; i < nrm.length; i++) { allNrm.push(nrm[i]); } } else { haveNrm = false; }
+    base += pos.length / 3;
+  }
+  if (!allPos.length) { return null; }
+  const p = new Float32Array(allPos);
+  // Clamp below the hull-local waterline (when given) so the stencil masks only the above-water hull, never the
+  // submerged hull/keel (which showed through the sea). Undefined → keep the whole hull (shallow open boats).
+  if (waterlineLocalY != null) { for (let i = 1; i < p.length; i += 3) { if (p[i] < waterlineLocalY) { p[i] = waterlineLocalY; } } }
+  const vd = new VertexData();
+  vd.positions = p; vd.indices = allIdx;
+  if (haveNrm && allNrm.length === allPos.length) { vd.normals = new Float32Array(allNrm); }
+  const clone = new Mesh('hull_stencil_proxy', scene);
+  vd.applyToMesh(clone);
 
   // Overlay it exactly on the LIVE hull (not the source, which may sit hidden at the origin): copy the
-  // hull's parent + local transform, and share its skeleton so the clone skins identically each frame.
+  // hull's parent + local transform (so it skins/floats identically each frame).
   clone.parent = hull.parent;
   clone.position.copyFrom(hull.position);
   if (hull.rotationQuaternion) { clone.rotationQuaternion = hull.rotationQuaternion.clone(); }
   else { clone.rotationQuaternion = null; clone.rotation.copyFrom(hull.rotation); }
   clone.scaling.copyFrom(hull.scaling);
-  clone.skeleton = hull.skeleton;
 
   const mat = new StandardMaterial('hull_stencil_mat', scene);
   mat.disableLighting   = true;

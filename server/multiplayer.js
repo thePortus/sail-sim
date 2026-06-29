@@ -1395,7 +1395,12 @@ function attachMultiplayer(server) {
         const now = Date.now();
 
         // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
-        if (!combat.validateShot(shotData, me?.state, shotType) || !combat.allowShot(me?.combat, now, shotType)) {
+        // Per-SIDE, per-SHIP reload gate: derive which broadside the ball left from (heading + velocity) and gate
+        // it against THAT side's reload bucket, sized to this ship's guns-per-side and stretched by its crew. A
+        // cancelled run-out can't reset it, and a bigger future broadside scales automatically.
+        const fireSide = combat.shotSide(me?.state?.heading, shotData.vx, shotData.vz);
+        if (!combat.validateShot(shotData, me?.state, shotType)
+            || !combat.allowShot(me?.combat, now, shotType, fireSide, crewFactor(me))) {
           return;
         }
 

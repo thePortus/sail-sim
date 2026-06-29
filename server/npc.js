@@ -18,14 +18,18 @@ const quest = require('./quest');   // to shield intro-tutorial players from pir
 const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
+const diplomacy = require('./diplomacy');   // war/peace/alliance — drives nation-vs-nation NPC warship combat
+const shippingLanes = require('./shipping-lanes');   // busiest-lane hotspots → a "where's the traffic" map hint
 const moveConst = require('./movement-constants');
 const { getVesselDef, crewFor } = require('./controllers/vessels.controller');
 const weatherState = require('./weather-state');   // server-authoritative wind (speed + bearing)
 
 const DEG = Math.PI / 180;
-// Weighted merchant vessel pool: sloops + pinnaces are the common traders; the occasional brigantine (a fat,
-// well-armed prize) shows up at ~1-in-5. Duplicates set the odds via the uniform pick().
-const MERCHANT_SLUGS = ['sloop', 'sloop', 'pinnace', 'pinnace', 'brig'];
+// Weighted merchant vessel pool (solo traders + convoy CARGO). The big slow merchantman/hagboat is the iconic
+// haul and the most common trader; sloops + pinnaces are the lighter traders seen sometimes. The BRIG is a
+// WARSHIP, NOT a trade ship — it is deliberately ABSENT here so it only ever sails as a convoy ESCORT
+// (spawnConvoy hard-codes 'brig'), a PIRATE (PIRATE_SLUGS), or a navy HUNTER (makeHunter). Duplicates set the odds.
+const MERCHANT_SLUGS = ['merchantman', 'merchantman', 'merchantman', 'merchantman', 'sloop', 'sloop', 'pinnace'];
 const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
   'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
   'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',
@@ -85,6 +89,15 @@ const CONVOY_MIN         = 2;      // smallest convoy
 const CONVOY_MAX         = 3;      // largest convoy
 const CONVOY_SPACING     = 24;     // world units between formation slots
 const CONVOY_SQUAD_RANGE = 2500;   // a player's squadron-mate only reinforces the threat if within this of the convoy
+// Formation-keeping (non-combat): a follower steers to its STATION when out of position, but adopts the LEADER's
+// heading once close (so the convoy sails as one body, not each chasing a point). It regulates SPEED to hold
+// station — matching the leader, pressing on to close a gap, easing when it overruns. The leader eases for a bad
+// straggler so the group moves TOGETHER. All of this drops the moment combat starts (members fight/flee normally).
+const CONVOY_FORM_BAND     = 40;   // world units of station error over which heading lerps station→leader-parallel
+const CONVOY_SPEED_GAIN    = 0.05; // speed units added per metre of ALONG-track station error (catch up / ease off)
+const CONVOY_SPEED_RESPONSE= 1.5;  // how briskly a follower's speed eases toward its station-keeping target (1/s)
+const CONVOY_LAG_FULL      = 120;  // a follower this many metres BEHIND its station drags the leader to its floor
+const CONVOY_LEADER_MIN    = 0.5;  // the slowest the leader will throttle to while waiting for a straggler
 // E3 coordination: a screened TRADER tucks this far behind its escort (keeping the escort interposed); a 3-ship
 // convoy occasionally fields TWO escorts (a heavily-guarded run) that flank the foe in a crossfire (pincer).
 const SCREEN_DIST          = 65;   // world units a trader holds on the far side of its escort from the threat
@@ -194,10 +207,13 @@ function angleFromWind(heading, windBearing) {
 // Both fore-and-aft: the sloop points higher and is stronger on a reach but weak dead-downwind; the pinnace
 // points a touch lower and holds its drive far better on the run. [apparentAngle°, coeff], interpolated.
 // The brig (square fore + gaff main) points LOW but holds strong drive on a reach and dead downwind.
+// The merchantman (three-masted square-rigger) mirrors the client MERCHANTMAN_SAIL: points even lower than
+// the brig, but huge drive on a reach and holds it dead downwind.
 const SAIL_POLARS = {
-  sloop:   [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
-  pinnace: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
-  brig:    [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+  sloop:       [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
+  pinnace:     [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+  brig:        [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+  merchantman: [[52, 0.38], [72, 0.60], [92, 0.80], [120, 1.00], [150, 0.96], [180, 0.88]],
 };
 
 /** Per-rig drive coefficient at wind angle `aw` (0 = bow into wind). Below the no-go angle the sail
@@ -312,6 +328,12 @@ const HOSTILE_REP  = -70;    // a player at/below this standing with the merchan
 const DETECT_RANGE = 650;    // world units: how far off a merchant notices a hated player (to start avoiding / closing)
 const ENGAGE_RANGE = 320;    // world units: an even/stronger merchant defends its lane once a hated player closes to here
 const AVOID_RATIO  = 1.25;   // the foe must be ≥25% stronger for the merchant to break off and run rather than fight
+// Nation-vs-nation: a WARSHIP (convoy escort or navy hunter) of one nation engages enemy-nation NPCs when the two
+// nations are AT WAR (diplomacy). Only warships INITIATE — a lone merchant never starts a fight (it only defends).
+// The chase is LEASHED: a convoy drops an enemy NPC that opens past WAR_LEASH of the convoy's centre, so a fleeing
+// foe can't drag it wildly off its trade route (it breaks off + reforms). Pirates are unaligned — separate path.
+const WAR_DETECT = 500;      // world units: a warship picks up an enemy-nation NPC this close (initiate the fight)
+const WAR_LEASH  = 650;      // world units: ...and breaks off once the foe opens past this from the convoy/warship
 // Morale & commitment (E4): PRESS a crippled foe (close to finish it even if nominally outmatched); a convoy that
 // just lost a consort loses heart for a while (more flee-prone, recovering its composure over MORALE_SHAKE_MS).
 const PRESS_HULL          = 0.3;     // foe hull fraction at/below which a healthy NPC commits to the kill
@@ -348,7 +370,7 @@ const HEEL_K        = 0.22;   // heel = HEEL_K·SAF·V_app²·sin(angle) (canvas
 const COMFORT_HEEL  = 16;     // ° before the sail spills wind
 const SPILL_RANGE   = 14;     // ° of heel over comfort that ramps spill 0→1
 const SPILL_MAX     = 0.75;   // max forward-drive fraction lost to an over-pressed (heeled) sail
-const FORCE_K_BY_SLUG = { sloop: SAIL_FORCE_K, pinnace: SAIL_FORCE_K, brig: 1.12 };   // mirrors VESSEL_RIGS sail.forceK
+const FORCE_K_BY_SLUG = { sloop: SAIL_FORCE_K, pinnace: SAIL_FORCE_K, brig: 1.12, merchantman: 1.18 };   // mirrors VESSEL_RIGS sail.forceK
 
 /** Current (and max) non-mast hull points of a combat state. */
 function hullPoints(combat) {
@@ -370,6 +392,27 @@ function shipStrength(entry) {
 /** A player's standing with `faction` (0 if absent / not yet loaded). */
 function repWith(player, faction) {
   return (player && player.factionRep && Number.isFinite(player.factionRep[faction])) ? player.factionRep[faction] : 0;
+}
+
+/** True if two nations are actively AT WAR (both must be real, distinct factions — pirates are null/unaligned). */
+function atWar(a, b) {
+  return !!(a && b && a !== b && diplomacy.relation(a, b) === diplomacy.WAR);
+}
+
+/** Nearest enemy-nation NPC (warship OR merchant) to (ox,oz) whose faction is at war with `faction`, within r2.
+ *  Excludes pirates (unaligned), sunk hulls, allies/neutrals, and an optional own-convoy id. Players take the
+ *  separate reputation path, so non-NPCs are skipped here. Used by warships to acquire a target on sight. */
+function nearestWarEnemy(faction, ox, oz, players, r2, exclConvoyId) {
+  if (!faction) return null;
+  let best = null, bestD2 = r2;
+  for (const [, p] of players) {
+    if (!p.isNpc || p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (!atWar(faction, p.faction)) continue;
+    if (exclConvoyId && p.convoyId === exclConvoyId) continue;
+    const dx = p.state.x - ox, dz = p.state.z - oz, d2 = dx * dx + dz * dz;
+    if (d2 < bestD2) { bestD2 = d2; best = p; }
+  }
+  return best;
 }
 
 // ── Role-scaled skill (NPC combat realism E0) ────────────────────────────────────────────────────────────────
@@ -483,18 +526,10 @@ function convoyLeader(convoyId, players) {
   return null;
 }
 
-/** Heading for an ESCORT to hold its formation slot astern-and-abeam of the convoy leader. Returns null (→ route
- *  normally) when there's no leader — the escort PROMOTES itself to leader so a beheaded convoy keeps trading. */
-function convoyFollowHeading(npc, players) {
-  const leader = convoyLeader(npc.convoyId, players);
-  if (!leader) {
-    // Leader lost. The lowest-slot survivor takes command (deterministic → exactly one new leader); the rest route
-    // for a tick, then fall in behind it next tick.
-    const members = convoyMembers(npc, players);
-    let lead = members[0]; for (const m of members) { if ((m.convoySlot | 0) < (lead.convoySlot | 0)) lead = m; }
-    if (lead === npc) { npc.convoyRole = 'leader'; npc.route = null; }
-    return null;
-  }
+/** The world-space formation STATION (astern-and-abeam of the leader, rotated with its heading) for a follower's
+ *  slot, plus the leader's forward unit vector. The whole formation turns as one because the station rides the
+ *  leader's heading. */
+function convoyStation(npc, leader) {
   const hr = leader.state.heading * DEG;
   const fx = Math.sin(hr), fz = Math.cos(hr);      // leader forward
   const rx = Math.cos(hr), rz = -Math.sin(hr);     // leader starboard
@@ -503,7 +538,46 @@ function convoyFollowHeading(npc, players) {
   const lane = Math.ceil(slot / 2);                // how far astern
   const tx = leader.state.x - fx * CONVOY_SPACING * lane + rx * side * CONVOY_SPACING * 0.7;
   const tz = leader.state.z - fz * CONVOY_SPACING * lane + rz * side * CONVOY_SPACING * 0.7;
-  return headingTo(npc.state.x, npc.state.z, tx, tz);
+  return { tx, tz, fx, fz, lane };
+}
+
+/** Non-combat formation heading for a follower holding its slot on the convoy leader. Out of position → steer to
+ *  the station; on station → adopt the leader's heading so the convoy sails as ONE coordinated body (not each ship
+ *  chasing a moving point — the old "follow-the-leader" wobble). Also stashes `_formSpeed`, the station-keeping
+ *  speed the speed step applies (match the leader + close the along-track gap). Returns null (→ route normally)
+ *  when there's no leader — the lowest-slot survivor PROMOTES itself so a beheaded convoy keeps trading. */
+function convoyFollowHeading(npc, players) {
+  const leader = convoyLeader(npc.convoyId, players);
+  if (!leader) {
+    const members = convoyMembers(npc, players);
+    let lead = members[0]; for (const m of members) { if ((m.convoySlot | 0) < (lead.convoySlot | 0)) lead = m; }
+    if (lead === npc) { npc.convoyRole = 'leader'; npc.route = null; }
+    npc._formSpeed = null;
+    return null;
+  }
+  const { tx, tz, fx, fz } = convoyStation(npc, leader);
+  const ex = tx - npc.state.x, ez = tz - npc.state.z;          // station error vector
+  const errDist = Math.hypot(ex, ez);
+  const toStation = headingTo(npc.state.x, npc.state.z, tx, tz);
+  const t = Math.min(1, errDist / CONVOY_FORM_BAND);           // 0 on-station → leader heading; 1 → steer to station
+  const along = ex * fx + ez * fz;                             // +ve = station ahead of me → I'm lagging → press on
+  npc._formSpeed = Math.max(0, (leader.state.speed || 0) + along * CONVOY_SPEED_GAIN);
+  return blendHeading(leader.state.heading, toStation, t);
+}
+
+/** Speed multiplier [CONVOY_LEADER_MIN..1] for a convoy LEADER: it eases off when its worst non-combat follower is
+ *  lagging well behind its station, so the convoy keeps station as a group instead of the leader sailing away from
+ *  a slow merchantman. A follower that's fighting/fleeing doesn't count (it's not "straggling", it's in combat). */
+function convoyLeaderDrag(leader, players) {
+  const hr = leader.state.heading * DEG, fx = Math.sin(hr), fz = Math.cos(hr);
+  let worstLag = 0;
+  for (const m of convoyMembers(leader, players)) {
+    if (m === leader || m.engaged || m.fleeing) continue;
+    const along = (leader.state.x - m.state.x) * fx + (leader.state.z - m.state.z) * fz;   // +ve = astern of leader
+    const lag = along - CONVOY_SPACING * Math.ceil((m.convoySlot || 1) / 2);               // beyond its station depth
+    if (lag > worstLag) worstLag = lag;
+  }
+  return Math.max(CONVOY_LEADER_MIN, 1 - worstLag / CONVOY_LAG_FULL);
 }
 
 /** ONE shared FOCUS target for the whole convoy (E3) → its escort guns concentrate. Prefers ACTIVE attackers (any
@@ -513,18 +587,39 @@ function convoyFocusTarget(members, players, nowMs) {
   let pool = [];
   for (const m of members) { const f = engageTarget(m, players, nowMs); if (f && !pool.includes(f)) pool.push(f); }
   const provoked = pool.length > 0;
+  const faction = members[0].faction;
   if (!provoked) {
-    const faction = members[0].faction, R2 = DETECT_RANGE * DETECT_RANGE;
+    const R2 = DETECT_RANGE * DETECT_RANGE;
     for (const [, p] of players) {
       if (p.isNpc || !p.state || (p.combat && p.combat.sunk)) continue;
       if (repWith(p, faction) > HOSTILE_REP) continue;
       if (members.some((m) => { const dx = p.state.x - m.state.x, dz = p.state.z - m.state.z; return dx * dx + dz * dz <= R2; })) pool.push(p);
     }
+    // Nation-vs-nation: a convoy WITH AN ESCORT (a warship that can initiate) picks up enemy-nation NPCs that come
+    // within WAR_DETECT of any member. A convoy of bare traders (no escort, or escort sunk) does NOT initiate —
+    // it'll only flee/defend. (Lone merchants take the solo findThreat path, which has no war scan at all.)
+    if (faction && members.some((m) => m.combatRole === 'escort')) {
+      const W2 = WAR_DETECT * WAR_DETECT, cid = members[0].convoyId;
+      for (const [, p] of players) {
+        if (!p.isNpc || p.isPirate || !p.state || (p.combat && p.combat.sunk) || p.convoyId === cid) continue;
+        if (!atWar(faction, p.faction)) continue;
+        if (members.some((m) => { const dx = p.state.x - m.state.x, dz = p.state.z - m.state.z; return dx * dx + dz * dz <= W2; }) && !pool.includes(p)) pool.push(p);
+      }
+    }
   }
+  if (!pool.length) return null;
+  // LEASH the chase of any enemy NPC (war target or a grudge from a stray shot) to WAR_LEASH of the convoy's
+  // centre — so a fleeing enemy ship is chased only a little, then the convoy breaks off and reforms on its route
+  // (players are NOT leashed — that's the unchanged piracy/reputation path).
+  let cx = 0, cz = 0; for (const m of members) { cx += m.state.x; cz += m.state.z; } cx /= members.length; cz /= members.length;
+  const L2 = WAR_LEASH * WAR_LEASH;
+  pool = pool.filter((p) => !p.isNpc || ((p.state.x - cx) ** 2 + (p.state.z - cz) ** 2) <= L2);
   if (!pool.length) return null;
   let best = pool[0], bestHull = Infinity;
   for (const p of pool) { const h = p.combat ? hullPoints(p.combat).cur : 100; if (h < bestHull) { bestHull = h; best = p; } }
-  return { foe: best, provoked };
+  // `war` → an enemy-nation NPC engagement (not a grudge): the convoy commits like a provoked one (see convoyStance)
+  // even before the foe is point-blank, so warships actually close and fight rather than just shadowing at range.
+  return { foe: best, provoked, war: !provoked && best.isNpc === true };
 }
 
 /** A screened convoy TRADER evades by keeping its nearest ESCORT between itself and the threat — steering to a point
@@ -703,13 +798,24 @@ function pirateHelm(npc, players, wind, ph, nowMs) {
 function hunterHelm(npc, players, wind, ph) {
   const target = npc.huntTarget ? players.get(npc.huntTarget) : null;
   const alive = !!(target && target.isPirate && target.state && !(target.combat && target.combat.sunk));
+  const pirateDist = alive ? Math.hypot(target.state.x - npc.state.x, target.state.z - npc.state.z) : Infinity;
+  // Priority: a live pirate quarry that's CLOSE — press the kill, ignore distractions.
+  if (alive && !npc.returning && pirateDist <= HUNTER_APPROACH) {
+    npc.engaged = true; npc.fleeing = false;
+    return { desired: engageHeading(npc, target, wind, ph), foe: target };
+  }
+  // Opportunistic nation combat: a navy warship en route (still closing on its pirate, or sailing home) fights an
+  // enemy-nation NPC it passes within WAR_DETECT. Re-acquired by proximity each tick → a foe that flees past
+  // WAR_DETECT is dropped and the hunter resumes its mission, so it never chases wildly off track.
+  const enemy = nearestWarEnemy(npc.faction, npc.state.x, npc.state.z, players, WAR_DETECT * WAR_DETECT, null);
+  if (enemy) {
+    npc.engaged = true; npc.fleeing = false;
+    return { desired: engageHeading(npc, enemy, wind, ph), foe: enemy };
+  }
+  // No closer business: a live pirate still out there → bear for it.
   if (alive && !npc.returning) {
     npc.engaged = true; npc.fleeing = false;
-    const dist = Math.hypot(target.state.x - npc.state.x, target.state.z - npc.state.z);
-    const desired = dist > HUNTER_APPROACH
-      ? tackedHeading(headingTo(npc.state.x, npc.state.z, target.state.x, target.state.z), wind.windBearing, ph.minTackAngle, npc)
-      : engageHeading(npc, target, wind, ph);
-    return { desired, foe: target };
+    return { desired: tackedHeading(headingTo(npc.state.x, npc.state.z, target.state.x, target.state.z), wind.windBearing, ph.minTackAngle, npc), foe: target };
   }
   // Quarry dead or gone → mission accomplished: make for home port and pay off (despawn on arrival).
   npc.returning = true; npc.engaged = false; npc.fleeing = false; npc.raking = false;
@@ -729,6 +835,12 @@ const MAX_FIRE_RANGE  = 260;       // world units: don't open fire beyond this (
 const NPC_RELOAD_MS   = 4200;      // min ms between a merchant's shots (one aimed ball per reload — deliberately unhurried)
 const NPC_AZ_SPREAD   = 7.5;       // deg: half-width of random bearing scatter (loosened — merchants miss more)
 const NPC_EL_SPREAD   = 3.5;       // deg: half-width of random elevation scatter (more over/undershoot)
+// NPCs are deliberately POOR gunners against the PLAYER (so duels are winnable). But that same wide scatter makes
+// NPC-vs-NPC duels drag on forever (the player watched two sloops trade misses for 10+ minutes). So when the foe is
+// ANOTHER NPC, tighten the scatter and quicken the cadence — a private fight resolves like real ships of the line,
+// while fire at a human player is unchanged. Gated purely on foe.isNpc at the call site, so it never buffs vs-player.
+const NPC_VS_NPC_ACC   = 0.45;     // multiply the scatter half-widths when the target is an NPC (≈2× tighter aim)
+const NPC_VS_NPC_RELOAD = 0.7;     // and reload this much faster vs an NPC (a brisker exchange of broadsides)
 const MUZZLE_Y        = 2.6;       // gun height above the waterline (world units, ~deck)
 const AIM_Y           = 1.4;       // aim point on the target hull (mid-freeboard)
 // Bar/dismantling shot (anti-rig) — NPCs now mix it in when a real captain would: to bring a foe's MASTS down so
@@ -764,7 +876,7 @@ function spreadRad(halfDeg) { return (Math.random() * 2 - 1) * halfDeg * DEG; }
  * scatter. Speed of the returned velocity stays exactly NPC_MUZZLE_V, so it sits in the round-shot band.
  * Returns world-space { ox, oy, oz, vx, vy, vz }.
  */
-function firingSolution(npc, foeState, muzzleV) {
+function firingSolution(npc, foeState, muzzleV, accMul = 1) {
   const hr = npc.state.heading * DEG;
   const sx = Math.cos(hr), sz = -Math.sin(hr);   // starboard (right) unit vector in world XZ
   const dx = foeState.x - npc.state.x, dz = foeState.z - npc.state.z;
@@ -796,7 +908,7 @@ function firingSolution(npc, foeState, muzzleV) {
     tof = R / vh;
   }
   // Aim azimuth at the lead point, then scatter both axes (speed magnitude preserved → stays in band).
-  const sm = aimSpreadMul(npcSkill(npc));   // veteran tight, timid sprays (role-scaled accuracy)
+  const sm = aimSpreadMul(npcSkill(npc)) * accMul;   // veteran tight, timid sprays (role-scaled); accMul tightens vs NPCs
   const az = Math.atan2(px - ox, pz - oz) + spreadRad(NPC_AZ_SPREAD * sm);
   const el = theta + spreadRad(NPC_EL_SPREAD * sm);
   const vhs = v * Math.cos(el);
@@ -848,11 +960,66 @@ function avoidLand(npc, desired) {
   return best;   // most-open heading found — turn toward water rather than hold course into the rocks
 }
 
+// ── Hard land BACKSTOP for translation ────────────────────────────────────────────────────────────────────────
+// avoidLand() steers the HEADING away from land, but it's a soft hint: a crippled, boxed-in or hard-pressed NPC —
+// above all a pirate/merchant in combat, following a FREE engage/escape heading off the A* route, whose turn rate
+// can't finish the swing in time — could still translate straight INTO a land/town cell in a single tick (the
+// reported bug: a pirate chasing a quarry well up onto land, then cutting through a town to dodge fire). This is the
+// non-negotiable floor: clamp the forward STEP to the open-water distance so an NPC can NEVER cross a non-navigable
+// cell, regardless of where the helm points. avoidLand turns it away; this stops it dead at the shore until it does.
+const LAND_MARGIN = 6;     // halt this many world-units short of the shore so the hull never noses onto a land cell
+const LAND_BRAKE  = 0.4;   // when the clamp bites, bleed speed hard — grinding the beach shouldn't build momentum
+
+/** True on a legitimate final approach to a pier/home point, which by design sits on a NON-navigable cell (nav.js
+ *  piers). The clamp is skipped here so a merchant still closes its delivery radius and a hunter pays off at home —
+ *  every EARLIER waypoint is snapped to open water, so clamping those legs (and all combat) stays safe. */
+function onLandApproach(npc) {
+  if (npc.returning) return true;                                // navy hunter homing onto its origin port point
+  return !!(npc.route && npc.routeIdx >= npc.route.length - 1);  // merchant on the last leg → the real pier point
+}
+
+/** Integrate the NPC's position for this tick with the hard land backstop. If the ship is somehow ALREADY embedded
+ *  in land (a stale spawn, or one that slipped through before this guard), it ignores the helm and crawls toward the
+ *  nearest open water so it works itself free instead of freezing in the rocks. */
+function advanceNpc(npc, dtSec) {
+  const step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
+
+  // Recovery: on a non-navigable cell → steer for the nearest open water and crawl out, overriding the combat helm.
+  const oc = nav.worldToCell(npc.state.x, npc.state.z);
+  if (!nav.isNav(oc.cx, oc.cz)) {
+    const snap = nav.snapToNav(oc.cx, oc.cz);
+    if (snap) {
+      const w = nav.cellToWorld(snap.cx, snap.cz);
+      const eh = headingTo(npc.state.x, npc.state.z, w.x, w.z), ehr = eh * DEG;
+      const es = Math.max(Math.abs(step), moveConst.TRAVEL_SCALE * dtSec);   // a steady crawl even if speed stalled
+      npc.state.x += Math.sin(ehr) * es; npc.state.z += Math.cos(ehr) * es;
+      npc.state.heading = eh; npc.yawRate = 0;
+      return;
+    }
+  }
+
+  const hr = npc.state.heading * DEG;
+  let nx = npc.state.x + Math.sin(hr) * step, nz = npc.state.z + Math.cos(hr) * step;
+  if (step > 0.001 && !onLandApproach(npc)) {
+    const open = nav.openDistance(npc.state.x, npc.state.z, nx, nz);   // world dist ahead that stays on water
+    if (open < step - 0.01) {
+      const f = Math.max(0, open - LAND_MARGIN) / step;               // advance only the clear portion, short of shore
+      nx = npc.state.x + Math.sin(hr) * step * f; nz = npc.state.z + Math.cos(hr) * step * f;
+      npc.state.speed *= LAND_BRAKE;   // bleed momentum so it stops grinding the shore; avoidLand swings it away
+    }
+  }
+  npc.state.x = nx; npc.state.z = nz;
+}
+
 /** A heading pointing away from nearby merchants (separation), or null if none are close. */
 function avoidanceHeading(npc, fleet) {
   let sx = 0, sz = 0, n = 0;
   for (const o of fleet) {
     if (o === npc) continue;
+    // Convoy-mates sail in a TIGHT formation (CONVOY_SPACING ≪ AVOID_R) — exempt them from the generic
+    // separation force or it would blow the formation apart to the full avoidance radius (the old "loose
+    // follow-the-leader" look). Their stations + station-keeping speed already keep them safely spaced.
+    if (npc.convoyId && o.convoyId === npc.convoyId) continue;
     const dx = npc.state.x - o.state.x, dz = npc.state.z - o.state.z, d = Math.hypot(dx, dz);
     if (d > 1e-3 && d < AVOID_R) { const w = (AVOID_R - d) / AVOID_R; sx += (dx / d) * w; sz += (dz / d) * w; n++; }
   }
@@ -1197,7 +1364,9 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
   for (const [cid, members] of convoyGroups) {
     members.forEach((m) => { m.pincerSide = null; });   // cleared unless re-assigned for a 2-escort crossfire below
     const threat = convoyFocusTarget(members, players, nowMs);   // ONE shared focus target (weakest reachable enemy)
-    const stance = threat ? convoyStance(members, threat.foe, threat.provoked, players, nowMs) : 'route';
+    // A war target commits the convoy like a provoked one (close + fight if it can hold its own; a weaker convoy
+    // still flees — so a strong convoy presses, a weak one runs: convoy-on-convoy resolves naturally).
+    const stance = threat ? convoyStance(members, threat.foe, threat.provoked || threat.war, players, nowMs) : 'route';
     const escorts = members.filter((m) => m.combatRole === 'escort' && !(m.combat && m.combat.sunk));
     // Pincer: 2+ escorts fighting → lock alternating flanks so they catch the foe in a crossfire.
     if (stance === 'fight' && escorts.length >= 2) escorts.forEach((e, i) => { e.pincerSide = i % 2 === 0 ? 1 : -1; });
@@ -1370,11 +1539,20 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     let sp = vNow + (thrust - drag) * FORCE_RESPONSE / massK * dtSec;
     const cruiseCap = npc.isHunter ? HUNTER_CRUISE : npc.isPirate ? PIRATE_CRUISE : MERCHANT_CRUISE;   // hunters fastest (run the pirate down), pirates next
     sp = Math.max(-1.5, Math.min(ph.maxSpeed * cruiseCap, sp));                    // NPCs never hit a trimmed player's full speed
+    // ── Convoy formation speed (non-combat) ──────────────────────────────────────────────────────────────────
+    // A FOLLOWER in formation regulates its sails to hold STATION (the `_formSpeed` convoyFollowHeading stashed
+    // this tick) rather than sailing flat-out → the column matches pace + closes gaps instead of stringing out.
+    if (npc._formSpeed != null) {
+      const target = Math.max(0, Math.min(ph.maxSpeed * cruiseCap, npc._formSpeed));
+      sp = vNow + (target - vNow) * Math.min(1, CONVOY_SPEED_RESPONSE * dtSec);    // ease toward station-keeping speed
+      npc._formSpeed = null;                                                       // consume (cleared if combat next tick)
+    } else if (npc.convoyId && npc.convoyRole === 'leader' && !npc.engaged && !npc.fleeing) {
+      // The LEADER throttles back for a lagging straggler so the convoy moves together (released the instant it fights).
+      sp = Math.min(sp, ph.maxSpeed * cruiseCap * convoyLeaderDrag(npc, players));
+    }
     npc.state.speed = Math.abs(sp) < 0.001 ? 0 : sp;
     npc.state.isPortTack = (((npc.state.heading - wind.windBearing) % 360 + 360) % 360) <= 180;
-    const hr = npc.state.heading * DEG, step = npc.state.speed * moveConst.TRAVEL_SCALE * dtSec;
-    npc.state.x += Math.sin(hr) * step;
-    npc.state.z += Math.cos(hr) * step;
+    advanceNpc(npc, dtSec);   // integrate position with the HARD land backstop (never translate through land/town)
     // keep the authoritative pose in sync so player↔NPC collision (which reads authPose) works
     npc.authPose.x = npc.state.x; npc.authPose.z = npc.state.z;
     npc.authPose.heading = npc.state.heading; npc.authPose.speed = npc.state.speed;
@@ -1383,10 +1561,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
     // ── Return fire (A3): when engaged, a gun bears, and the reload is up, hand a leading solution to the
     // server's shared shot adjudicator. The reload SCALES WITH CREW (a thinned crew works the guns slower — the
     // same crewMul the player feels via getReloadWindow), and the merchant picks round vs bar shot tactically.
-    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= NPC_RELOAD_MS / crewMul) {
+    const vsNpc = !!(foe && foe.isNpc);   // private NPC-vs-NPC fight → tighter aim + brisker reload (never vs a player)
+    const reloadMs = (NPC_RELOAD_MS / crewMul) * (vsNpc ? NPC_VS_NPC_RELOAD : 1);
+    if (npc.engaged && foe && fireShot && nowMs - (npc.lastShotAt || 0) >= reloadMs) {
       const dist = Math.hypot(foe.state.x - npc.state.x, foe.state.z - npc.state.z);
       const shot = chooseNpcShot(npc, foe, dist);
-      const sol = firingSolution(npc, foe.state, Cc.SHOT_TYPES[shot].v);
+      const sol = firingSolution(npc, foe.state, Cc.SHOT_TYPES[shot].v, vsNpc ? NPC_VS_NPC_ACC : 1);
       if (sol) { fireShot(npc, sol, shot); npc.lastShotAt = nowMs; }
     }
   }
@@ -1400,6 +1580,12 @@ function tickNpcs(players, dtSec, broadcastLeave, nowMs, fireShot, announce) {
 function broadcastInterest(players, nowMs) {
   const npcs = [];
   for (const [, p] of players) if (p.isNpc) npcs.push(p);
+  // "Where are the ships" hint for EVERY player: feed the live fleet to the density tracker (throttled inside),
+  // then re-send the cluster hotspots to a player only when they change (version bump) or on first connect.
+  shippingLanes.update(npcs, nowMs);
+  const laneVer = shippingLanes.getVersion();
+  let laneMsg = null;
+  const laneMsgFor = () => (laneMsg || (laneMsg = JSON.stringify({ type: 'shipping_lanes', hotspots: shippingLanes.hotspots() })));
   const msgCache = new Map();
   const msgFor = (n) => {
     let m = msgCache.get(n.id);
@@ -1445,6 +1631,7 @@ function broadcastInterest(players, nowMs) {
   };
   for (const [, p] of players) {
     if (p.isNpc || !p.ws || p.ws.readyState !== 1 || !p.state) continue;
+    if (p._laneVer !== laneVer) { p.ws.send(laneMsgFor()); p._laneVer = laneVer; }   // lane hint (all players, on change)
     const near = [];
     let nrX = null, nrZ = null, nrD2 = Infinity;   // the single GLOBAL nearest MERCHANT (any distance, for the map beacon)
     for (const n of npcs) {
@@ -1587,6 +1774,8 @@ module.exports = {
     shipStrength, hullPoints, repWith, findThreat, combatStance,
     HOSTILE_REP, DETECT_RANGE, ENGAGE_RANGE, AVOID_RATIO,
     spawnConvoy, npcCount, convoyMembers, convoyStance, threatStrength, convoyLeader, convoyFollowHeading,
+    convoyStation, convoyLeaderDrag, CONVOY_SPACING, CONVOY_FORM_BAND, CONVOY_SPEED_GAIN, CONVOY_LAG_FULL, CONVOY_LEADER_MIN,
+    atWar, nearestWarEnemy, WAR_DETECT, WAR_LEASH,
     CONVOY_CHANCE, CONVOY_MIN, CONVOY_MAX, CONVOY_SQUAD_RANGE,
     npcSkill, fleeHealthFor, avoidRatioFor, aimSpreadMul, fleeWanderAmp,
     SKILL_TRADER_SOLO, SKILL_TRADER_CONVOY, SKILL_ESCORT,
@@ -1596,5 +1785,6 @@ module.exports = {
     makePirate, pickLair, pirateHelm, nearestPrey, pirateCount, targetPirates,
     PIRATE_AGGRO_RANGE, PIRATE_GIVE_UP, PIRATE_LEASH, PIRATE_SKILL, PIRATE_CRUISE,
     makeHunter, hunterHelm, nearestFactionTown, PIRATE_HUNT_THRESHOLD, HUNTER_CRUISE, HUNTER_APPROACH,
+    avoidLand, advanceNpc, onLandApproach, LAND_MARGIN,
   },
 };

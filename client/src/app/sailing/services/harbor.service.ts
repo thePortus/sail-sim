@@ -135,21 +135,31 @@ export class HarborService {
   private readonly LBL_H      = 12.8;   // ≈ LBL_W / 3.6 (texture aspect)
   private readonly LBL_LIFT   = 18;     // lower edge this far above the town's pad (clears the buildings)
 
-  async init(): Promise<void> {
+  /** Create the civic-square night light (intensity 0). IDEMPOTENT and safe to call BEFORE init() — the game
+   *  bootstrap calls it right after the scene boots so the scene's dynamic-light COUNT is fixed before any heavy
+   *  PBR material (terrain/vessel/crew) compiles. Adding this light later forces a material recompile that races
+   *  the WebGPU bind-group cache → the intermittent "Can't find buffer Light6" crash during the intro swoop.
+   *  Parked per-frame at the nearest town's square (intensity driven by the night curve). STANDARD falloff = a
+   *  plain range-cutoff multiplier (PBR's default inverse-square would vanish at this scale). */
+  reserveLights(): void {
+    if (this.squareLight) return;
     const scene = this.sceneService.scene;
-    this.harbors = this.terrainService.getHarbors();
-    if (!scene || !this.harbors.length) return;
-    this.root = new TransformNode('harbors_root', scene);
-
-    // Civic-square night light (warm). Parked per-frame at the nearest town's square, intensity driven
-    // by the night curve. STANDARD falloff = a plain range-cutoff multiplier (PBR's default inverse-
-    // square would vanish at this scale). Range reaches the waterfront so the pier reads at night too.
+    if (!scene) return;
     this.squareLight = new PointLight('townSquareLight', new Vector3(0, 8, 0), scene);
     this.squareLight.diffuse = new Color3(1.0, 0.80, 0.52);
     this.squareLight.specular = new Color3(0.35, 0.26, 0.16);
     this.squareLight.falloffType = PointLight.FALLOFF_STANDARD;
     this.squareLight.range = 85;   // square sits ~28 m inland; reach the pier/waterfront too
     this.squareLight.intensity = 0;
+  }
+
+  async init(): Promise<void> {
+    const scene = this.sceneService.scene;
+    this.harbors = this.terrainService.getHarbors();
+    if (!scene || !this.harbors.length) return;
+    this.root = new TransformNode('harbors_root', scene);
+
+    this.reserveLights();   // civic-square light (idempotent; normally already created early — see reserveLights)
 
     this.tickObs = scene.onBeforeRenderObservable.add(() => this.sceneService.span('harbor', () => this.tick()));
     // Piers are streamed by the tick (first tick runs on frame 0), nearest-first — nothing to

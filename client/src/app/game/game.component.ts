@@ -771,6 +771,13 @@ export class GameComponent implements AfterViewInit, OnDestroy {
       await this.runInitStep('init-scene', 'Preparing the ocean…', async () => {
         await this.sceneService.initAsync(this.canvasRef.nativeElement);
         this.sceneStarted = true;
+        // Reserve ALL dynamic lights NOW — before any heavy PBR material (terrain/vessel/crew) compiles. The
+        // scene already renders during the rest of init, so adding lights later (cannon flashes at init-cannons,
+        // the town light at init-harbors) forces material recompiles that race the WebGPU bind-group cache → an
+        // intermittent "Can't find buffer Light6" crash during the intro camera swoop. Created at intensity 0;
+        // cannon/harbor init just adopt them. Fixing the light COUNT from frame 0 removes the race.
+        this.cannonService.reserveFlashLights();
+        this.harborService.reserveLights();
       });
 
       // 2. Build ocean + atmosphere

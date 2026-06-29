@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  AbstractMesh, AnimationGroup, Color3, Mesh, MorphTarget, MorphTargetManager, Nullable, Observer, PBRMaterial,
-  Quaternion, Scene, Skeleton, Texture, TransformNode, Vector3,
+  AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, Mesh, MorphTarget, MorphTargetManager, Nullable,
+  Observer, PBRMaterial, Quaternion, Scene, Skeleton, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -17,6 +17,9 @@ const HEEL_SHIFT   = 0.05;   // m of lateral weight-shift per rad of heel (leani
 const IDLE_LEAN_AMP  = 0.06;   // rad (~3.4°) idle side-to-side weight-shift lean — the main "alive" cue
 const IDLE_PITCH_AMP = 0.03;   // rad fore-aft idle lean (smaller)
 const IDLE_BOB       = 0.013;  // m vertical breathing bob
+// Default resting hand: drive the 'Relaxed' grip morph so idle fingers are naturally curled, not ramrod-straight.
+// (Track A's IK will later modulate hands toward the 'Grip' morph at rope/cannon stations.)
+const HAND_RELAX = 0.8;
 // Locomotion (P2): scale the Walk clip's playback to the actual ground speed so the FEET PLANT instead of
 // skating. STRIDE_SCALE matches the clip's authored stride to walk_speed_mps — tune live via
 // localStorage.ignis_crew_stride if a footskate remains. TURN_SLOW slows forward progress while turning sharply
@@ -30,14 +33,42 @@ const WORK_BURST_DUR  = 1.4;   // s a gun crew works visibly harder after their 
 const WORK_BURST_GAIN = 1.1;   // peak extra work-clip speed (×) at the moment of firing
 const GLANCE_CHANCE   = 0.02;  // per-second chance a stationed crew breaks off to glance about
 
-// Per-hat FIT corrections (P4, runtime — the GLB authored 3 of the 4 hats with one shared head offset so most
-// float above the scalp). World-space terms: lower = m DOWN onto the head, fwd = m toward the face, scale =
-// uniform. Seeded from Blender renders; perfect each live (no rebuild) via localStorage ignis_hat_<name>.
+// ── Environmental grip IK (crew realism v2, track A1+A2) ─────────────────────────────────────────────────────
+// Make working hands actually REACH their station instead of miming in the air. Post-clip 2-bone arm IK
+// (UpperArm→Forearm→Hand) plants each Hand on a grip point in front of the station, and the GLB's `Grip` shape
+// key closes the fingers (fading the idle `Relaxed` curl). PLAYER-DECK ONLY: gated to crew near the camera
+// (which only the player's own ship ever is) — remote/NPC crew keep the canned clips, so the cost stays tiny.
+// Opt-out `localStorage.ignis_crew_ik='0'`; the geometry knobs below are all live-tunable for one calibration pass.
+const IK_ENABLED   = (() => { try { return (localStorage.getItem('ignis_crew_ik') ?? '1') !== '0'; } catch { return true; } })();
+const IK_GATE_NEAR = 16;    // m — build + run IK for crew within this of the camera
+const IK_GATE_FAR  = 22;    // m — tear down beyond this (hysteresis band avoids edge flap)
+const GRIP_W       = 0.85;  // `Grip` morph influence while a hand is working a station
+const GRIP_EASE    = 5.0;   // per-second ease rate for the Grip↔Relaxed hand blend
+const IK_SLERP     = 0.35;  // BoneIKController slerp — eases toward the solution so a slightly-off calib drifts, not snaps
+// Elbow bend axis + pole angle (rig-dependent → live-tunable). If forearms bend the wrong way, set
+// `ignis_crew_ik_bend`="x,y,z" and/or `ignis_crew_ik_pole`=<radians>.
+const IK_BEND = (() => {
+  try { const p = (localStorage.getItem('ignis_crew_ik_bend') || '').split(',').map(Number);
+        if (p.length === 3 && p.every(Number.isFinite)) return new Vector3(p[0], p[1], p[2]); } catch { /* */ }
+  return new Vector3(0, 0, 1);
+})();
+const IK_POLE = (() => { try { const v = parseFloat(localStorage.getItem('ignis_crew_ik_pole') || ''); return Number.isFinite(v) ? v : 0; } catch { return 0; } })();
+// Grip-point geometry per work clip, in the member's station frame (fwd = along heading, up = +Y, lat = half-spread
+// to each hand). Ship-FIXED (computed from the authored station pos+heading), so hands stay on the work while the
+// body micro-sways around them. Cannon = both hands low-forward on the carriage; Ropes = hand-over-hand haul.
+const GRIP_CANNON = { fwd: 0.40, up: 0.74, lat: 0.16 };
+const GRIP_ROPES  = { fwd: 0.30, up: 1.30, lat: 0.10, haulAmp: 0.16, haulRate: 2.2 };
+
+// Per-hat FIT corrections (runtime). World-space terms: lower = m DOWN onto the head, fwd = m toward the face,
+// scale = uniform. Live-tunable per hat via localStorage ignis_hat_<name> = "lower,fwd,scale".
+// The 3 brimmed hats (Tricorn/Bicorne/WideBrim) were RESEATED IN THE GLB MESH (2026-06-28 — band dropped to brow
+// level + slight upscale), so they now sit correctly with NO runtime nudge — leave them at identity or they
+// double-correct (sink too low). Only the Skullcap keeps a small runtime nudge (its mesh was left untouched).
 const HAT_FIT: Record<string, { lower: number; fwd: number; scale: number }> = {
-  Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // best fit already — leave it
-  Hat_WideBrim: { lower: 0.035, fwd: 0.000, scale: 1.12 },   // floats ~3–4 cm + small crown
-  Hat_Bicorne:  { lower: 0.025, fwd: 0.000, scale: 1.00 },   // floats ~2–3 cm
-  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.00 },   // scale was flinging it up (pivot off the head); fixed
+  Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity
+  Hat_WideBrim: { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity (was 0.035/0/1.12)
+  Hat_Bicorne:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity (was 0.025/0/1.00)
+  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.00 },   // mesh untouched — keep its small seat nudge
 };
 
 /**
@@ -223,6 +254,20 @@ interface CrewMember {
   stationClip: string;      // the looping work clip for the current station (to resume after a glance)
   workBurst: number;        // >0 → working harder (e.g. the gun crew right after a broadside); decays
   glanceT: number;          // >0 → briefly broke off work to glance about (Lookout), then resumes
+  // Environmental grip IK (track A). Built lazily the first time the member is near the camera.
+  skeleton: Skeleton | null;   // this member's cloned 24-joint rig (arm bones live here)
+  bodyMesh: AbstractMesh | null; // the skinned 'Human' mesh (BoneIKController world-space anchor)
+  ik: CrewIK | null;           // arm-IK controllers + grip-target nodes (null until built)
+  ikActive: boolean;           // true while IK is steering the hands this frame
+  ikGrip: number;              // eased Grip-morph influence (0 relaxed → GRIP_W gripping)
+}
+
+/** Per-member arm-IK rig: a BoneIKController per arm + the (invisible) grip-target / elbow-pole anchor nodes. */
+interface CrewIK {
+  ctrlL: BoneIKController | null; ctrlR: BoneIKController | null;
+  tgtL: Mesh; tgtR: Mesh;       // where each Hand should reach (ship-space, parented under the ship root)
+  poleL: Mesh; poleR: Mesh;     // elbow pole targets (steer the elbow direction)
+  haulPhase: number;            // hand-over-hand phase for rope-hauling
 }
 
 export class CrewHandle {
@@ -306,6 +351,9 @@ export class CrewHandle {
         cur: { BrowsUp: 0, Frown: 0, Smile: 0 },
         tgt: { BrowsUp: 0, Frown: 0, Smile: 0 },
       };
+      // Idle hands rest gently curled (set once; tickFace only touches Blink/expressions, so it persists).
+      const relax = targets.get('Relaxed');
+      if (relax) { relax.influence = HAND_RELAX; }
     }
 
     // Distance-LOD: the tiny parts (buckles, eye globes, grommets, laces, cuffs, soles, fall flap)
@@ -326,6 +374,8 @@ export class CrewHandle {
       detail, lodFar: false,
       swayPhase: rng() * Math.PI * 2, swayFreq: 0.7 + rng() * 0.5, stationPos: new Vector3(),
       stationClip: 'Idle', workBurst: 0, glanceT: 0,
+      skeleton: skeletons.find((s) => s && s.bones?.length) ?? skeletons[0] ?? null,
+      bodyMesh: human ?? null, ik: null, ikActive: false, ikGrip: 0,
     };
 
     // Spawn directly at a free station (no walk-in pop).
@@ -533,6 +583,7 @@ export class CrewHandle {
     // subtree, so release them explicitly before the holders go — else a churning crew leaks them.
     const seenMorph = new Set<MorphTargetManager>();
     for (const m of this.members) {
+      if (m.ik) { for (const n of [m.ik.tgtL, m.ik.tgtR, m.ik.poleL, m.ik.poleR]) n.dispose(); m.ik = null; }
       for (const g of m.clips.values()) { g.stop(); g.dispose(); }
       for (const mesh of m.holder.getChildMeshes(false)) {
         const mgr = (mesh as { morphTargetManager?: MorphTargetManager }).morphTargetManager;
@@ -611,6 +662,87 @@ export class CrewHandle {
     }
   }
 
+  // ── environmental grip IK (track A1+A2) ──────────────────────────────────────
+  /** Build this member's arm-IK rig (lazy — only when first near the camera). Two BoneIKControllers steer the
+   *  UpperArm/Forearm so each Hand reaches an (invisible) target node; a pole node steers the elbow. */
+  private buildIK(m: CrewMember): void {
+    const sk = m.skeleton, body = m.bodyMesh;
+    if (!sk || !body) { m.ik = null; return; }
+    const bone = (n: string): Bone | null =>
+      sk.bones.find((b) => b.name === n || b.name.endsWith('.' + n) || b.name.endsWith(n)) ?? null;
+    const faL = bone('Forearm.L'), faR = bone('Forearm.R');
+    if (!faL || !faR) { m.ik = null; return; }   // unexpected rig — skip IK, keep canned clips
+    const node = (tag: string): Mesh => {
+      const t = new Mesh(`ik_${tag}_${this.skeletons.indexOf(sk)}`, this.scene);
+      t.parent = this.shipRoot; t.isPickable = false; t.setEnabled(false);   // empty mesh: a transform anchor, never drawn
+      return t;
+    };
+    const tgtL = node('tgtL'), tgtR = node('tgtR'), poleL = node('poleL'), poleR = node('poleR');
+    const opt = (target: Mesh, pole: Mesh) => ({
+      targetMesh: target, poleTargetMesh: pole, bendAxis: IK_BEND.clone(), poleAngle: IK_POLE,
+      slerpAmount: IK_SLERP, maxAngle: Math.PI,
+    });
+    m.ik = {
+      tgtL, tgtR, poleL, poleR, haulPhase: 0,
+      ctrlL: new BoneIKController(body, faL, opt(tgtL, poleL)),
+      ctrlR: new BoneIKController(body, faR, opt(tgtR, poleR)),
+    };
+  }
+
+  /** Ease the Grip↔Relaxed hand morphs toward `target` (0 idle-curl … GRIP_W gripping). */
+  private setGrip(m: CrewMember, target: number, dt: number): void {
+    m.ikGrip += (target - m.ikGrip) * Math.min(1, dt * GRIP_EASE);
+    const t = m.face?.targets;
+    if (!t) return;
+    const g = t.get('Grip'), r = t.get('Relaxed');
+    if (g) g.influence = m.ikGrip;
+    if (r) r.influence = HAND_RELAX * (1 - m.ikGrip);   // relaxed curl fades out as the fist closes
+  }
+
+  /** Per frame: when a near member is working a grip station, place the hand/elbow targets and solve the arms. */
+  private tickIK(m: CrewMember, dt: number): void {
+    if (!IK_ENABLED) return;
+    const cam = this.scene.activeCamera;
+    const isWork = m.state === 'station' && (m.stationClip === 'Work_Cannon' || m.stationClip === 'Work_Ropes');
+    const near = cam ? Vector3.Distance(cam.globalPosition, m.holder.getAbsolutePosition()) : 1e9;
+    const want = isWork && near <= (m.ikActive ? IK_GATE_FAR : IK_GATE_NEAR);
+    if (want && !m.ik) this.buildIK(m);
+    if (!want || !m.ik) {                 // not gripping (far / walking / non-work) — let the clip drive the arms
+      if (m.ikGrip > 0.001) this.setGrip(m, 0, dt);   // and release the fist back to the idle curl
+      m.ikActive = false;
+      return;
+    }
+    m.ikActive = true;
+
+    // Ship-fixed grip frame from the station heading (the body micro-sways around these fixed points).
+    const yaw = m.yaw;
+    const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));      // along the station heading
+    const rgt = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));     // station-right
+    const ropes = m.stationClip === 'Work_Ropes';
+    const G = ropes ? GRIP_ROPES : GRIP_CANNON;
+    m.ik.haulPhase += dt * (ropes ? GRIP_ROPES.haulRate : 0);
+    const haul = ropes ? Math.sin(m.ik.haulPhase) * GRIP_ROPES.haulAmp : 0;   // hand-over-hand: hands rise/fall in anti-phase
+    const place = (mesh: Mesh, latSign: number, up: number) => {
+      mesh.position.copyFrom(m.stationPos)
+        .addInPlace(fwd.scale(G.fwd)).addInPlace(rgt.scale(latSign * G.lat)).addInPlaceFromFloats(0, up, 0);
+      mesh.computeWorldMatrix(true);   // disabled node — force the world matrix so the controller reads it fresh
+    };
+    place(m.ik.tgtL, -1, G.up + haul);
+    place(m.ik.tgtR, +1, G.up - haul);
+    // Elbows: pole below + outboard of each hand so they bend down-and-out, not into the body.
+    const pole = (mesh: Mesh, latSign: number) => {
+      mesh.position.copyFrom(m.stationPos)
+        .addInPlace(rgt.scale(latSign * (G.lat + 0.30))).addInPlace(fwd.scale(-0.10))
+        .addInPlaceFromFloats(0, G.up - 0.45, 0);
+      mesh.computeWorldMatrix(true);
+    };
+    pole(m.ik.poleL, -1); pole(m.ik.poleR, +1);
+
+    m.ik.ctrlL?.update();
+    m.ik.ctrlR?.update();
+    this.setGrip(m, GRIP_W, dt);
+  }
+
   // ── per-member state machine ────────────────────────────────────────────────
   private tick(m: CrewMember, dt: number): void {
     if (m.state === 'reserve') return;   // unrecruited reserve: hidden, no animation/logic
@@ -660,6 +792,11 @@ export class CrewHandle {
         m.current.speedRatio = m.animSpeed * (1 + WORK_BURST_GAIN * (m.workBurst / WORK_BURST_DUR));
       }
     }
+
+    // Environmental grip IK (track A): plant working hands on the station + close the fingers. Runs every frame
+    // for near (player-deck) members; internally a no-op when far / not at a work station. Animations are already
+    // evaluated by the time onBeforeRender fires, so this cleanly overrides the arm pose post-clip.
+    this.tickIK(m, dt);
 
     switch (m.state) {
       case 'station': {

@@ -517,9 +517,17 @@ export class CannonService {
 
   // ── Flash lights ──────────────────────────────────────────────────────────
 
-  private buildFlashLights(): void {
+  /** Create the 3 muzzle/impact flash PointLights (intensity 0). IDEMPOTENT and safe to call BEFORE init() —
+   *  `reserveDynamicLights` (game bootstrap) calls it right after the scene boots so the scene's dynamic-light
+   *  COUNT is fixed before any heavy PBR material (terrain/vessel/crew) compiles. Adding these lights later forces
+   *  a material recompile that races the WebGPU bind-group cache → the intermittent "Can't find buffer Light6"
+   *  crash during the intro swoop. They live at intensity 0 and only flare when a gun fires. */
+  reserveFlashLights(): void {
+    if (this.flashPort) return;                       // already reserved (early or by buildFlashLights)
+    const scene = this.scene ?? this.sceneService.scene;
+    if (!scene) return;
     const make = (name: string) => {
-      const l = new PointLight(name, Vector3.Zero(), this.scene);
+      const l = new PointLight(name, Vector3.Zero(), scene);
       l.diffuse   = new Color3(1.0, 0.72, 0.22);
       l.specular  = new Color3(1.0, 0.50, 0.08);
       l.intensity = 0;
@@ -539,22 +547,26 @@ export class CannonService {
     this.flashPort   = make('cannonFlashPort');
     this.flashStbd   = make('cannonFlashStbd');
     this.shipFlash   = make('cannonShipHitFlash');
+    // The flash lights terrain, distant cliffs and other ships within ~1 km (STANDARD falloff
+    // fades it with distance). The water is lit separately via an emissive glow in the ocean
+    // shader (a point light can't light the emissive sea).
+  }
 
-    // Pool of independent remote rigs — each gets its own flash light here; its flame/smoke/linger
-    // plumes are filled in by the particle builders below (which run after this).
+  private buildFlashLights(): void {
+    this.reserveFlashLights();   // lights may already exist (reserved early); this only fills the remote-rig pool
+
+    // Pool of independent remote rigs — flame/smoke/linger plumes are filled in by the particle builders
+    // below (which run after this). The rig LIGHT is decoupled (null) — remote shots use particles + the
+    // terrain/water glow, not a point light, to keep the dynamic-light count fixed.
     for (let i = 0; i < this.REMOTE_RIG_COUNT; i++) {
       this.remoteRigs.push({
-        light: null, lightEndT: -1,   // decoupled: remote shots use particles + terrain/water glow, no point light
+        light: null, lightEndT: -1,
         flamePS:  null as unknown as ParticleSystem, flameEmit:  new Vector3(0, 0, 0), flameCutoffT:  -1,
         smokePS:  null as unknown as ParticleSystem, smokeEmit:  new Vector3(0, 0, 0), smokeCutoffT:  -1,
         lingerPS: null as unknown as ParticleSystem, lingerEmit: new Vector3(0, 0, 0), lingerCutoffT: -1,
         shooterId: null, lastUsed: 0,
       });
     }
-
-    // The flash lights terrain, distant cliffs and other ships within ~1 km (STANDARD falloff
-    // fades it with distance). The water is lit separately via an emissive glow in the ocean
-    // shader (a point light can't light the emissive sea).
   }
 
   // ── Shared turbulence noise for smoke ─────────────────────────────────────

@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, Mesh, MorphTarget, MorphTargetManager, Nullable,
-  Observer, PBRMaterial, Quaternion, Scene, Skeleton, Texture, TransformNode, Vector3,
+  AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, Mesh, MorphTarget, MorphTargetManager, Node,
+  Nullable, Observer, PBRMaterial, Quaternion, Ray, Scene, Skeleton, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -61,14 +61,14 @@ const GRIP_ROPES  = { fwd: 0.30, up: 1.30, lat: 0.10, haulAmp: 0.16, haulRate: 2
 
 // Per-hat FIT corrections (runtime). World-space terms: lower = m DOWN onto the head, fwd = m toward the face,
 // scale = uniform. Live-tunable per hat via localStorage ignis_hat_<name> = "lower,fwd,scale".
-// The 3 brimmed hats (Tricorn/Bicorne/WideBrim) were RESEATED IN THE GLB MESH (2026-06-28 — band dropped to brow
-// level + slight upscale), so they now sit correctly with NO runtime nudge — leave them at identity or they
-// double-correct (sink too low). Only the Skullcap keeps a small runtime nudge (its mesh was left untouched).
+// All 4 hats now fit on their own in the GLB MESH (2026-06-28 — the 3 brimmed hats reseated; the skullcap's mesh
+// already seats snug crown-to-brow), so EVERY hat is at identity here — a runtime nudge now DOUBLE-corrects (the
+// skullcap was sliding down onto the face). Kept the table + live `ignis_hat_<name>` override for future tweaks.
 const HAT_FIT: Record<string, { lower: number; fwd: number; scale: number }> = {
-  Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity
+  Hat_Tricorn:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh fits — identity
   Hat_WideBrim: { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity (was 0.035/0/1.12)
   Hat_Bicorne:  { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh reseated — identity (was 0.025/0/1.00)
-  Skullcap:     { lower: 0.035, fwd: 0.025, scale: 1.00 },   // mesh untouched — keep its small seat nudge
+  Skullcap:     { lower: 0.000, fwd: 0.000, scale: 1.00 },   // mesh fits crown-to-brow — identity (was 0.035/0.025: shoved it onto the face)
 };
 
 /**
@@ -295,6 +295,8 @@ export class CrewHandle {
   private clock = 0;
   private maxStationX = 0;   // widest station |beam| (rail proxy) — damps idle motion for crew at the bulwarks
   private beamAxis: 'x' | 'z' = 'x';   // which local axis is across-ship (see CrewLayout.beam_axis)
+  private deckMeshes: AbstractMesh[] | null = null;   // cached ship structural meshes to raycast feet onto
+  private readonly wpSnapCache = new Map<string, Vector3>();   // waypoint id → open-deck-snapped position (static)
 
   constructor(
     private scene: Scene,
@@ -616,6 +618,108 @@ export class CrewHandle {
       m.lodFar = false;
       for (const me of m.detail) me.setEnabled(true);
     }
+  }
+
+  // ── deck-surface snapping (react to geometry) ────────────────────────────────
+  /** The ship's structural meshes (hull/deck/furniture) to raycast crew feet onto — everything under the ship
+   *  root EXCEPT sails/rigging/flags/water and the crew themselves. Merging renames meshes unpredictably, so we
+   *  filter by what to EXCLUDE, not by a deck name. Computed once. */
+  private deckCands(): AbstractMesh[] {
+    if (this.deckMeshes) return this.deckMeshes;
+    // INCLUDE all structural ship geometry — the down-ray is short (≈deck±1.8 m) so sails/yards/flags overhead are
+    // never hit anyway, and we NEED the cannons/capstan (which live in the merged `*_Rigging` mesh) IN the set so
+    // the open-deck search can detect and stand clear of them. Only drop crew themselves + non-physical layers.
+    // (Do NOT filter by 'rig' — every brig mesh is named "Brig_…" and contains the substring "rig"!)
+    const skip = /water|ocean|impostor/i;
+    const isCrew = (n: Nullable<Node>): boolean => {
+      for (let a = n; a; a = a.parent) if (a.name?.startsWith('crew_') || a.name?.startsWith('ik_')) return true;
+      return false;
+    };
+    const out: AbstractMesh[] = [];
+    for (const me of this.shipRoot.getChildMeshes(false)) {
+      if (!me.getTotalVertices() || skip.test(me.name) || isCrew(me)) continue;
+      // Picking octree: the hull/deck are big merged meshes; without this every ray tests every triangle. The
+      // octree lets ray.intersectsMesh test only nearby submeshes → the open-deck search stays cheap.
+      if (me.getTotalVertices() > 1500) { try { (me as unknown as { createOrUpdateSubmeshesOctree?(c: number, d: number): void }).createOrUpdateSubmeshesOctree?.(64, 2); } catch { /* */ } }
+      out.push(me);
+    }
+    this.deckMeshes = out;
+    return out;
+  }
+
+  // A station's feet must land on OPEN DECK — not on a cannon/capstan/hatch that occupies the authored spot. The
+  // authored station Y is a measured deck level (±~0.2 m); deck furniture stands ~0.8–1.3 m proud of it. So a spot
+  // is "open" iff a ray cast straight down finds its HIGHEST surface within a tight window of the authored Y (i.e.
+  // nothing tall is sitting on it). If the authored spot is blocked, we search outward (biased inboard + fore/aft)
+  // for the nearest open spot. This is what makes them stand clear of the guns instead of perched on the barrels.
+  private static readonly DECK_WIN_DOWN = 0.7;   // accept a deck up to this far BELOW the authored Y
+  private static readonly DECK_WIN_UP   = 0.35;  // …and this far ABOVE (authored can be slightly under the planks)
+  private static readonly OPEN_RAY_UP   = 1.8;   // start the down-ray this far above the station (clears tall furniture)
+  private static readonly OPEN_RAY_LEN  = 3.0;
+  // Candidate offsets, nearest-first: [inboard, fore/aft] in metres (inboard = toward centreline). Mostly inboard
+  // and along-deck (where a gun crew's clear footing is), a touch outboard only as a last resort.
+  private static readonly OPEN_OFFSETS: [number, number][] = [
+    [0, 0],
+    [0.5, 0], [0, 0.8], [0, -0.8],
+    [0.5, 0.8], [0.5, -0.8], [1.0, 0],
+    [0, 1.5], [0, -1.5], [1.0, 0.8], [1.0, -0.8],
+    [0.5, 1.5], [0.5, -1.5], [1.5, 0],
+    [-0.4, 0.8], [-0.4, -0.8],
+  ];
+
+  /** Highest ship-local Y hit by a ray cast straight down the ship vertical through (cx,cz) from `topY`. null if
+   *  nothing is hit (off the deck edge). Assumes candidate world matrices are already warm (see findOpenDeck). */
+  private castHighest(cx: number, cz: number, topY: number): number | null {
+    const wm = this.shipRoot.getWorldMatrix();
+    const origin = Vector3.TransformCoordinates(new Vector3(cx, topY, cz), wm);
+    const down = Vector3.TransformNormal(new Vector3(0, -1, 0), wm).normalize();
+    const ray = new Ray(origin, down, CrewHandle.OPEN_RAY_LEN);
+    const inv = wm.clone(); inv.invert();
+    let best: number | null = null;
+    for (const me of this.deckCands()) {
+      const pick = ray.intersectsMesh(me as never, false);
+      if (pick.hit && pick.pickedPoint) {
+        const ly = Vector3.TransformCoordinates(pick.pickedPoint, inv).y;
+        if (best === null || ly > best) best = ly;
+      }
+    }
+    return best;
+  }
+
+  /** Find the nearest OPEN deck spot to a station (feet clear of furniture). Returns the ship-local feet position,
+   *  or null if every candidate is blocked / off-deck (then we keep the authored spot). */
+  private findOpenDeck(local: Vector3): { x: number; y: number; z: number } | null {
+    if (!this.deckCands().length) return null;
+    this.shipRoot.computeWorldMatrix(true);
+    for (const me of this.deckCands()) me.computeWorldMatrix(true);   // warm once (matrices are cold at spawn)
+    const inb = local.x >= 0 ? -1 : 1;                                // toward centreline
+    const topY = local.y + CrewHandle.OPEN_RAY_UP;
+    const lo = local.y - CrewHandle.DECK_WIN_DOWN, hi = local.y + CrewHandle.DECK_WIN_UP;
+    for (const [a, b] of CrewHandle.OPEN_OFFSETS) {
+      const cx = local.x + inb * a, cz = local.z + b;
+      const ly = this.castHighest(cx, cz, topY);
+      if (ly !== null && ly >= lo && ly <= hi) return { x: cx, y: ly, z: cz };   // highest hit IS the deck → open
+    }
+    return null;
+  }
+
+  /** Move a station's feet onto the nearest open patch of deck (clear of cannon/capstan/hatch). */
+  private deckSnapStation(m: CrewMember): void {
+    const open = this.findOpenDeck(m.stationPos);
+    if (open) m.stationPos.set(open.x, open.y, open.z);
+  }
+
+  /** A waypoint's position nudged to open deck (so walk paths bend AROUND the boat/companionway/hatches instead of
+   *  cutting through them). Cached per id — waypoints are static in ship-local space. */
+  private snappedWp(id: string, raw: [number, number, number]): Vector3 {
+    let v = this.wpSnapCache.get(id);
+    if (!v) {
+      const p = new Vector3(raw[0], raw[1], raw[2]);
+      const open = this.findOpenDeck(p);
+      v = open ? new Vector3(open.x, open.y, open.z) : p;
+      this.wpSnapCache.set(id, v);
+    }
+    return v.clone();
   }
 
   /** Idle-motion damping for crew near a rail: 1 at the centreline, ~0.4 at the rail-most station, so a gun/rope
@@ -940,6 +1044,9 @@ export class CrewHandle {
     m.wpId = st.wp;
     m.state = 'station';
     m.stationPos.set(st.pos[0], st.pos[1], st.pos[2]);   // sway anchor (P1)
+    // Plant the feet on the real deck, clear of furniture — EXCEPT seats, which intentionally sit ON a
+    // thwart/bench (the open-deck search would shove a rower off his thwart onto the sole).
+    if (st.kind !== 'seat') this.deckSnapStation(m);
     m.stationClip = st.clip; m.glanceT = 0;              // remember the work clip to resume after a glance (P3)
     // Long task dwell — crew settle into a job and only occasionally rotate.
     m.dwell = 45 + m.rng() * 75;
@@ -967,8 +1074,7 @@ export class CrewHandle {
     let prev = m.wpId;
     for (const id of ids) {
       const kind = this.edgeKind(prev, id);
-      const p = wps[id];
-      m.legs.push({ to: new Vector3(p[0], p[1], p[2]), kind });
+      m.legs.push({ to: this.snappedWp(id, wps[id]), kind });   // route AROUND deck furniture (boat/companionway/…)
       prev = id;
     }
     if (target) m.legs.push({ to: new Vector3(target.pos[0], target.pos[1], target.pos[2]), kind: 'walk' });

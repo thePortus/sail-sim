@@ -2,6 +2,8 @@
 
 # General or Current TODO Items
 
+* put merchantman ahead of brig in shipwright list
+* long summer day?
 * frigate, galleon, barque, junk
 * redo crew
 * forts and taking towns
@@ -35,5 +37,3 @@
 * Security pass
 
 # TODO Items by Module
-
-Oh, one think I notice, skull caps now appear in the middle of someone's face... I think this may be because we noticed the skullcaps not fitting before, and put a skullcap-only code-side fix, which moved the skullcap down. now that we have corrected it blender-side, it is an overcorrection and puts the skullcap in the middle of their face

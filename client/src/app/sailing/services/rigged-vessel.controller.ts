@@ -117,8 +117,14 @@ export class SloopController implements VesselController {
     this.frameEnd = manifest.frame_range?.[1] ?? 30;
 
     // Index animation clips and stop any that the loader may have auto-started.
+    // PRUNE CONSTANT CHANNELS: the sloop's clips are now FULL-SKELETON bakes (every clip keys all ~21 bones,
+    // not just its own targets — a Blender round-trip during the wood reskin baked them). Without pruning,
+    // layered scrubbing clobbers: posing Gun_S after Lid_S re-applies Gun_S's CONSTANT lid-bone channel and
+    // resets the lids to rest (which is OPEN) → gun ports never close. Stripping each clip to only the bones it
+    // actually MOVES restores the sparse composition the controller assumes (same fix as BrigController).
     for (const g of entries.animationGroups) {
       g.stop();
+      SloopController.pruneConstantChannels(g);
       this.clips.set(SloopController.strip(g.name), g);
     }
 
@@ -215,6 +221,33 @@ export class SloopController implements VesselController {
    *  names stay clean, so this is a no-op for nodes). */
   private static strip(name: string): string { return name.replace(/\.\d{3,}$/, ''); }
 
+  /** Strip a clip down to the channels it actually MOVES: drop CONSTANT bone channels (so a clip can't reset
+   *  bones it doesn't animate — e.g. Gun_S re-opening the lids) and all MORPH-WEIGHT channels (sail furl / sheet
+   *  morphs are driven directly via setMorph, so a clip's baked influence curve would fight that). Mirrors
+   *  BrigController — needed because the sloop's clips are full-skeleton bakes. */
+  private static pruneConstantChannels(g: AnimationGroup): void {
+    const arr = g.targetedAnimations;
+    const keep = arr.filter((ta) => {
+      const anim = ta.animation as unknown as { getKeys(): { value: unknown }[]; targetProperty?: string };
+      if (anim.targetProperty === 'influence') return false;
+      return !SloopController.isConstantAnim(anim);
+    });
+    if (keep.length !== arr.length) { arr.length = 0; for (const ta of keep) arr.push(ta); }
+  }
+
+  private static isConstantAnim(anim: { getKeys(): { value: unknown }[] }): boolean {
+    const keys = anim.getKeys();
+    if (keys.length <= 1) return true;
+    const v0 = keys[0].value as number | { equalsWithEpsilon?: (o: unknown, e: number) => boolean };
+    for (let i = 1; i < keys.length; i++) {
+      const v = keys[i].value;
+      if (typeof v0 === 'number') { if (Math.abs((v as number) - v0) > 1e-5) return false; }
+      else if (v0.equalsWithEpsilon) { if (!v0.equalsWithEpsilon(v, 1e-5)) return false; }
+      else if (v !== v0) return false;
+    }
+    return true;
+  }
+
   // ── clip scrubbing ─────────────────────────────────────────────────────────
   /** Pose a scrub clip at an absolute frame without playing it. Lazily starts+pauses
    *  the group so goToFrame has live animatables to write through. */
@@ -278,7 +311,7 @@ export class SloopController implements VesselController {
 
   /** Gunport lids per side: 0 = closed (default), 1 = open. */
   setGunports(side: 'S' | 'P', open: number): void {
-    this.pose(`Lid_${side}`, Math.max(0, Math.min(1, open)) * this.frameEnd);
+    this.poseNorm(`Lid_${side}`, Math.max(0, Math.min(1, open)));   // normalized → ports reach the FULL open pose
   }
 
   /** Mast damage from the masts-zone health (1 intact .. 0 destroyed). Sets the collapse + splinter
@@ -315,8 +348,11 @@ export class SloopController implements VesselController {
     const dep = this.gunDeployCur[side];
     const lid = Math.max(0, Math.min(1, dep * 2));
     const gun = Math.max(0, Math.min(1, dep * 2 - 1) - this.gunRecoil[side]);
-    this.pose(`Lid_${side}`, lid * this.frameEnd);
-    this.pose(`Gun_${side}`, gun * this.frameEnd);
+    // NORMALIZED scrub (like BrigController): the glTF loader resamples these 1.25 s clips so g.to is well past
+    // `frameEnd` (30) — an absolute `lid*frameEnd` scrub only reaches ~40% of the clip, so the ports opened a mere
+    // ~45° and the guns barely ran out. poseNorm hits the TRUE fully-open / fully-run-out pose at lid/gun = 1.
+    this.poseNorm(`Lid_${side}`, lid);
+    this.poseNorm(`Gun_${side}`, gun);
   }
 
   /** Anchor per side: 0 = stowed, 1 = fully lowered. */

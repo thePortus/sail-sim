@@ -226,7 +226,7 @@
         1.52,
         -1.1
       ],
-      "heading_deg": 180,
+      "heading_deg": -90,
       "clip": "Work_Cannon",
       "wp": "wp_port_lane1",
       "note": "aft of port gun 0 (z-1.58)"
@@ -239,7 +239,7 @@
         1.52,
         -2.15
       ],
-      "heading_deg": 180,
+      "heading_deg": -90,
       "clip": "Work_Cannon",
       "wp": "wp_port_lane1"
     },
@@ -251,7 +251,7 @@
         1.6,
         -3.15
       ],
-      "heading_deg": 180,
+      "heading_deg": -90,
       "clip": "Work_Cannon",
       "wp": "wp_port_lane2"
     },
@@ -263,7 +263,7 @@
         1.52,
         -1.1
       ],
-      "heading_deg": 180,
+      "heading_deg": 90,
       "clip": "Work_Cannon",
       "wp": "wp_stbd_lane1"
     },
@@ -275,7 +275,7 @@
         1.52,
         -2.15
       ],
-      "heading_deg": 180,
+      "heading_deg": 90,
       "clip": "Work_Cannon",
       "wp": "wp_stbd_lane1"
     },
@@ -287,7 +287,7 @@
         1.6,
         -3.15
       ],
-      "heading_deg": 180,
+      "heading_deg": 90,
       "clip": "Work_Cannon",
       "wp": "wp_stbd_lane2"
     },

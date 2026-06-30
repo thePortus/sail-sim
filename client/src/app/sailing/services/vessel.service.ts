@@ -11,7 +11,7 @@ import { OceanService }  from './ocean.service';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor, VesselRig, SailRig } from './vessel-controller';
+import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor, VesselRig, SailRig } from './vessel-controller';
 import { applyFlagColor, flagColor3, FlagColorHandle } from './flag-color';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
@@ -352,6 +352,7 @@ export class VesselService {
   private fpEye: Vector3 | null = null;   // vessel-local eye position (from the server vessel def)
   private fpYaw   = 0;   // free-look yaw offset from the bow (deg)
   private fpPitch = 0;   // free-look pitch (deg, + = up)
+  private invertCamY = false;   // invert the vertical look axis (settings toggle 'ignis_invert_camera'); read per-drag
 
   toggleFirstPerson(): void { this.firstPerson.update(v => !v); }
 
@@ -697,6 +698,9 @@ export class VesselService {
     if (!rigged) { console.warn(`[Vessel] rigged ${this.vesselSlug} failed to load`); return; }
 
     this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
+    // Metal parts (cannon iron/brass) reflect the sky LUT so they read as dark metal, not a black void — the
+    // scene runs no environmentTexture, so factor-only metals (brig SHIP_IRON) are otherwise unlit/black.
+    applyShipMetalEnv(this.controller.getMeshes(), this.sceneService.getSkyEnvTexture());
     this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
 
     // Flag colour — override the baked flag texture with this captain's chosen RGB (per-vessel material).
@@ -1593,6 +1597,7 @@ export class VesselService {
             this.isDragging = true;
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
+            this.invertCamY = localStorage.getItem('ignis_invert_camera') === '1';   // refresh per-drag
             if (canvas) canvas.style.cursor = 'grabbing';
           }
           break;
@@ -1602,13 +1607,14 @@ export class VesselService {
             const dy = ev.clientY - this.lastMouseY;
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
+            const invY = this.invertCamY ? -1 : 1;   // flips the vertical-look axis when enabled
             if (this.firstPerson()) {
               // Free-look from the deck: drag yaws/pitches the view (yaw is free 360°; pitch clamped).
               this.fpYaw   += dx * 0.30;
-              this.fpPitch  = Math.max(-70, Math.min(70, this.fpPitch - dy * 0.25));
+              this.fpPitch  = Math.max(-70, Math.min(70, this.fpPitch - dy * 0.25 * invY));
             } else {
               this.camAzimuth   += dx * 0.45;
-              this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3));
+              this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3 * invY));
             }
           }
           break;

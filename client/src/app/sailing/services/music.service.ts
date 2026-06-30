@@ -329,6 +329,11 @@ export class MusicService {
    *   note.time from @tonejs/midi is already in Transport-seconds.
    */
   private async startCurrentTrack(): Promise<void> {
+    // HARD GUARD: music must NEVER play while the user has it disabled, no matter how we got here
+    // (auto-advance, a re-init, a stray caller). The user has hit "music turns itself back on after I
+    // muted it" repeatedly; gating the single place that creates+schedules synths closes every path.
+    if (!this.isEnabled()) { this.stopPlayback(); return; }
+
     const list = this.trackList();
     if (!list.length) return;
 

@@ -1,6 +1,9 @@
 {
   "ship": "merchantman",
   "glb": "merchantman.glb",
+  "wheel_rim": 0.66,
+  "gun_grip_up": 1.05,
+  "rope_grip_up": 1.0,
   "schema_version": 1,
   "space": "ship-local GLB-NATIVE coordinates; crew are parented to the ship GLB root (which the client yaws −90° via baseYawDeg). Author in the GLB's OWN frame so crew sit on the deck regardless of that yaw.",
   "axes": {
@@ -56,16 +59,16 @@
     ["wp_main", "wp_port_mid", { "kind": "walk" }]
   ],
   "stations": [
-    { "id": "helm", "kind": "helm", "pos": [-9.0, 6.7, 0], "heading_deg": 90, "clip": "Idle", "wp": "wp_helm", "note": "abaft the wheel on the quarterdeck, facing the bow" },
+    { "id": "helm", "kind": "helm", "pos": [-7.3, 7.0, 0], "heading_deg": 90, "clip": "Idle", "wp": "wp_qd", "note": "abaft the ship's wheel (hub root-local -7,7.96,0), ~0.3m behind it on the quarterdeck, facing the bow — hands IK onto the wheel rim" },
 
-    { "id": "gun_S_0", "kind": "cannon", "pos": [4.1, 5.3, 2.9], "heading_deg": 0, "clip": "Work_Cannon", "wp": "wp_stbd_fwd", "note": "starboard fwd gun" },
-    { "id": "gun_S_1", "kind": "cannon", "pos": [-2.4, 5.3, 2.9], "heading_deg": 0, "clip": "Work_Cannon", "wp": "wp_stbd_mid" },
-    { "id": "gun_P_0", "kind": "cannon", "pos": [4.1, 5.3, -2.9], "heading_deg": 180, "clip": "Work_Cannon", "wp": "wp_port_fwd", "note": "port fwd gun" },
-    { "id": "gun_P_1", "kind": "cannon", "pos": [-2.4, 5.3, -2.9], "heading_deg": 180, "clip": "Work_Cannon", "wp": "wp_port_mid" },
+    { "id": "gun_S_0", "kind": "cannon", "pos": [4.5, 5.3, 1.1], "heading_deg": 0, "clip": "Idle", "wp": "wp_stbd_fwd", "note": "abaft the starboard fwd gun (breech z~1.5), facing the port/outboard — hands IK onto the barrel" },
+    { "id": "gun_S_1", "kind": "cannon", "pos": [-2.0, 5.3, 1.1], "heading_deg": 0, "clip": "Idle", "wp": "wp_stbd_mid", "note": "abaft the starboard mid gun, hands on the barrel" },
+    { "id": "gun_P_0", "kind": "cannon", "pos": [4.5, 5.3, -1.1], "heading_deg": 180, "clip": "Idle", "wp": "wp_port_fwd", "note": "abaft the port fwd gun, hands on the barrel" },
+    { "id": "gun_P_1", "kind": "cannon", "pos": [-2.0, 5.3, -1.1], "heading_deg": 180, "clip": "Idle", "wp": "wp_port_mid", "note": "abaft the port mid gun, hands on the barrel" },
 
-    { "id": "ropes_fore", "kind": "ropes", "pos": [10.4, 5.3, -1.2], "heading_deg": 180, "clip": "Work_Ropes", "wp": "wp_fore", "note": "at the foremast fife rail" },
-    { "id": "ropes_main", "kind": "ropes", "pos": [0.8, 5.3, 1.2], "heading_deg": 0, "clip": "Work_Ropes", "wp": "wp_main", "note": "at the mainmast fife rail" },
-    { "id": "ropes_mizzen", "kind": "ropes", "pos": [-8.0, 6.7, 1.0], "heading_deg": 0, "clip": "Work_Ropes", "wp": "wp_qd", "note": "mizzen/spanker, on the quarterdeck" },
+    { "id": "ropes_fore", "kind": "ropes", "pos": [10.4, 5.3, -1.1], "heading_deg": 0, "clip": "Idle", "wp": "wp_fore", "note": "at the foremast fife rail (port side), FACING the rail (inboard +Z) — hands IK onto the pins" },
+    { "id": "ropes_main", "kind": "ropes", "pos": [0.8, 5.3, 1.1], "heading_deg": 180, "clip": "Idle", "wp": "wp_main", "note": "at the mainmast fife rail (stbd side), facing the rail (inboard -Z) — hands on the pins" },
+    { "id": "ropes_mizzen", "kind": "ropes", "pos": [-8.0, 6.7, 1.0], "heading_deg": 180, "clip": "Idle", "wp": "wp_qd", "note": "at the mizzen fife rail (stbd side), facing the rail (inboard -Z) — hands on the pins" },
 
     { "id": "capstan_S", "kind": "idle", "pos": [-1.4, 5.3, 0.9], "heading_deg": 180, "clip": "Idle", "wp": "wp_capstan", "note": "at the capstan, facing inboard" },
     { "id": "capstan_P", "kind": "idle", "pos": [-1.4, 5.3, -0.9], "heading_deg": 0, "clip": "Idle", "wp": "wp_capstan" },

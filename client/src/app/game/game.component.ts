@@ -38,6 +38,7 @@ import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
 import { MusicService }        from '../sailing/services/music.service';
 import { AuthService }        from '../services/auth.service';
+import { UserService }        from '../services/user.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
@@ -399,6 +400,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private http               = inject(HttpClient);
   private router             = inject(Router);
   private authService        = inject(AuthService);
+  private userService        = inject(UserService);
   private sceneService       = inject(SceneService);
   private oceanService       = inject(OceanService);
   private oceanFftEngine      = inject(OceanFFTEngine);
@@ -930,6 +932,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.phase.set('selecting');
     this.authService.flagSessionExpired();   // login screen explains WHY they were bounced here
     this.authService.clearStorage();
+    this.userService.logout();               // drop the in-memory logged-in state too — without this the login
+                                             // page still reads `user.loggedIn` and shows "signed in as X" (with no
+                                             // expired banner) instead of the login form. (home's expireSession does this.)
     this.router.navigate(['/login']);
   }
 

@@ -8,7 +8,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
+import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
@@ -1739,6 +1739,8 @@ export class MultiplayerService {
 
     for (const m of rigged.root.getChildMeshes(false)) m.isPickable = false;
     entry.controller = createVesselController(slug, rigged.entries, rigged.root, manifest, scene);
+    // Metal parts reflect the sky LUT so a remote brig's cannon iron reads as dark metal, not a black void.
+    applyShipMetalEnv(entry.controller.getMeshes(), this.sceneService.getSkyEnvTexture());
 
     // Apply the sail state + trim we already know (updates may have arrived pre-build).
     entry.controller.applySailState(entry.sailState, true);   // snap initial pose

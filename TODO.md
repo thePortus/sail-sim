@@ -2,10 +2,12 @@
 
 # General or Current TODO Items
 
+* error in water occlusion on brig for NPCs/other vessels that doesn't affect player. Keel line is visible. this was something we corrected earlier on the player's vessel
 * put merchantman ahead of brig in shipwright list
+* make ships names match nationality (no salted cod for spanish for example. Don't stereotype in naming, just use names in that language)
 * long summer day?
 * frigate, galleon, barque, junk
-* redo crew
+* LOD imposters for other vessel's crews
 * forts and taking towns
 * swordfighting, surrender & capture
 * fleets with prize crews to take them over

@@ -28,6 +28,17 @@ import { BirdService } from '../../services/bird.service';
       </div>
 
       <div class="set-scroll">
+        <!-- ── Controls ─────────────────────────────────────────────────── -->
+        <div class="set-section">
+          <div class="set-section-label">Controls</div>
+          <div class="q-row">
+            <span class="q-label">Invert Camera (Vertical)</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="invertCamera"
+                    (click)="toggleInvertCamera()">{{ invertCamera ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">Flips the up/down look direction when you drag to rotate the camera.</div>
+        </div>
+
         <!-- ── Graphics ─────────────────────────────────────────────────── -->
         <div class="set-section">
           <div class="set-section-label">Graphics</div>
@@ -239,6 +250,13 @@ export class SettingsMenuComponent {
   @Output() close = new EventEmitter<void>();
 
   readonly music   = inject(MusicService);
+
+  /** Invert the vertical camera-look axis. Persisted to localStorage; vessel.service reads it per drag. */
+  invertCamera = localStorage.getItem('ignis_invert_camera') === '1';
+  toggleInvertCamera(): void {
+    this.invertCamera = !this.invertCamera;
+    localStorage.setItem('ignis_invert_camera', this.invertCamera ? '1' : '0');
+  }
   readonly sfx     = inject(SfxService);
   private readonly terrain  = inject(TerrainService);
   private readonly cloudSvc = inject(CloudService);

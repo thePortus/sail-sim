@@ -1,7 +1,8 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, Mesh, MorphTarget, MorphTargetManager, Node,
-  Nullable, Observer, PBRMaterial, Quaternion, Ray, Scene, Skeleton, Texture, TransformNode, Vector3,
+  AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, DynamicTexture, Material, Mesh, MeshBuilder,
+  MorphTarget, MorphTargetManager, Node, Nullable, Observer, PBRMaterial, Quaternion, Ray, Scene, Skeleton,
+  StandardMaterial, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -422,6 +423,11 @@ export class CrewHandle {
   private readonly texCache = new Map<string, Texture>();
   private readonly clonedMats: PBRMaterial[] = [];
   private skinIdx = 0;   // walks SKIN_ORDER so a full crew shows the whole tone range, not random-clustered light
+  // Soft projected blob shadow under each crew member — a flat alpha quad on the deck (cheaper than shadow-map
+  // RECEIVING, which overflows the ship PBR material's WebGPU varying budget). Shared material/texture. Opt-out
+  // `localStorage.ignis_crew_blobshadow='0'`.
+  private blobMat: StandardMaterial | null = null;
+  private readonly blobShadows = (() => { try { return localStorage.getItem('ignis_crew_blobshadow') !== '0'; } catch { return true; } })();
   // Per-member cloned skeletons (each member is its own instantiateRigged → a cloned 24-joint rig, GPU-texture
   // backed on WebGPU). Disposing the mesh subtree does NOT free these, so they're collected + freed in dispose().
   private readonly skeletons: Skeleton[] = [];
@@ -529,14 +535,47 @@ export class CrewHandle {
       bodyMesh: ikBody ?? null, ik: null, ikActive: false, ikGrip: 0,
     };
 
+    if (this.blobShadows) this.addBlobShadow(holder);
+
     // Spawn directly at a free station (no walk-in pop).
     const st = this.pickStation(member);
     if (st) this.arriveAt(member, st, true);
     this.members.push(member);
   }
 
+  /** Shared soft-shadow material (one radial-gradient alpha texture for the whole crew). Black quad, alpha-blended,
+   *  unlit → it just darkens the deck under each sailor. Lazily built. */
+  private getBlobMat(): StandardMaterial {
+    if (this.blobMat) return this.blobMat;
+    const tex = new DynamicTexture('crewBlob', { width: 128, height: 128 }, this.scene, false);
+    const ctx = tex.getContext();
+    const g = ctx.createRadialGradient(64, 64, 6, 64, 64, 62);
+    g.addColorStop(0, 'rgba(0,0,0,0.5)'); g.addColorStop(0.55, 'rgba(0,0,0,0.3)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g as unknown as string; ctx.fillRect(0, 0, 128, 128); tex.update(); tex.hasAlpha = true;
+    const mat = new StandardMaterial('crewBlobMat', this.scene);
+    mat.diffuseColor = new Color3(0, 0, 0); mat.emissiveColor = new Color3(0, 0, 0); mat.specularColor = new Color3(0, 0, 0);
+    mat.disableLighting = true; mat.diffuseTexture = tex; mat.useAlphaFromDiffuseTexture = true;
+    mat.transparencyMode = Material.MATERIAL_ALPHABLEND; mat.backFaceCulling = false; mat.zOffset = -2;
+    mat.fogEnabled = false;
+    this.blobMat = mat;
+    return mat;
+  }
+
+  /** A flat soft blob shadow on the deck under a crew member. Child of the holder → follows the sailor as they
+   *  walk; lies in the deck plane (the holder's brace-lean is only a few degrees, imperceptible on a 1 m quad). */
+  private addBlobShadow(holder: TransformNode): void {
+    const blob = MeshBuilder.CreateGround(`${holder.name}_shadow`, { width: 1.05, height: 1.35 }, this.scene);
+    blob.material = this.getBlobMat();
+    blob.parent = holder;
+    blob.position.y = 0.03;          // just above the planks
+    blob.isPickable = false;
+    blob.renderingGroupId = 2;       // with the ship; alpha-blended → draws after the deck
+    blob.alphaIndex = 0;             // behind the crew's own (opaque) meshes
+  }
+
   /** Seeded look: skin texture, garment tints, headwear visibility. */
   private applyVariants(glbRoot: TransformNode, rng: () => number): void {
+    if (this.useNew) { this.applyKitVariants(glbRoot, rng); return; }
     if (this.useNew) { this.applyKitVariants(glbRoot, rng); return; }
     const v = this.manifest.variants;
     const meshes = glbRoot.getChildMeshes(false);
@@ -873,6 +912,7 @@ export class CrewHandle {
     for (const sk of this.skeletons) sk.dispose();   // per-member cloned 24-joint rigs (GPU bone texture)
     this.skeletons.length = 0;
     for (const mat of this.clonedMats) mat.dispose();
+    if (this.blobMat) { this.blobMat.diffuseTexture?.dispose(); this.blobMat.dispose(); this.blobMat = null; }
     for (const tex of this.texCache.values()) tex.dispose();   // per-handle skin albedos
     this.texCache.clear();
     this.members = [];

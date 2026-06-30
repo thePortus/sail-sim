@@ -613,6 +613,9 @@ export class VesselService {
       this.oceanService.addToRenderList(mesh);
       const isCloth = /sail|flag/i.test(mesh.name);
       if (!isCloth || sailShadows) sg?.addShadowCaster(mesh, true);
+      // Do NOT set receiveShadows on the ship's PBR material: it's already at the WebGPU 16 inter-stage-variable
+      // limit (esp. in the ocean-reflection pass), so adding the shadow-receive varyings overflows → the render
+      // pipeline fails to compile → the scene strobes self-healing. Crew get cheap projected blob shadows instead.
       mesh.receiveShadows = false;
       const mat = mesh.material;
       if (mat && !seenMats.has(mat)) {

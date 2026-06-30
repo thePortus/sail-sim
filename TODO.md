@@ -2,6 +2,8 @@
 
 # General or Current TODO Items
 
+* make server/assets mounted/shared drive, so it can preserve past volumes-down
+* crew/deck furniture shadows
 * error in water occlusion on brig for NPCs/other vessels that doesn't affect player. Keel line is visible. this was something we corrected earlier on the player's vessel
 * put merchantman ahead of brig in shipwright list
 * make ships names match nationality (no salted cod for spanish for example. Don't stereotype in naming, just use names in that language)

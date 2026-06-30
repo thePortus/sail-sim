@@ -2,7 +2,7 @@ import { Injectable, NgZone, effect, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
   AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  DirectionalLight,
+  DirectionalLight, Ray,
 } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
@@ -354,7 +354,20 @@ export class VesselService {
   private fpPitch = 0;   // free-look pitch (deg, + = up)
   private invertCamY = false;   // invert the vertical look axis (settings toggle 'ignis_invert_camera'); read per-drag
 
-  toggleFirstPerson(): void { this.firstPerson.update(v => !v); }
+  // Deck-walk: while ON DECK (first-person) with the LEFT BUTTON HELD, WASD/arrows walk the eye across the deck.
+  // The eye Y is clamped to a downward raycast onto the ship's deck geometry every frame, so it rides up the
+  // stairs to the quarterdeck and back down to the main deck on ANY ship. Keys are read each frame by updateCamera.
+  private walk = { fwd: false, back: false, left: false, right: false };
+  private deckCamMeshes: AbstractMesh[] | null = null;   // cached ship structural meshes for the walk raycast
+  private readonly WALK_SPEED = 4.5;   // m/s across the deck
+  private readonly WALK_EYE   = 1.65;  // standing eye height above the planks
+
+  private clearWalk(): void { this.walk.fwd = this.walk.back = this.walk.left = this.walk.right = false; }
+
+  toggleFirstPerson(): void {
+    this.firstPerson.update(v => !v);
+    if (!this.firstPerson()) this.clearWalk();
+  }
 
   /** Current free-look camera offset in degrees — third-person orbit (azimuth from dead-astern + elevation),
    *  or the first-person look offset when on deck. Used by the intro tutorial to detect "look about your ship". */
@@ -698,6 +711,7 @@ export class VesselService {
     if (!rigged) { console.warn(`[Vessel] rigged ${this.vesselSlug} failed to load`); return; }
 
     this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
+    this.deckCamMeshes = null;   // invalidate the deck-walk raycast cache for the new hull
     // Metal parts (cannon iron/brass) reflect the sky LUT so they read as dark metal, not a black void — the
     // scene runs no environmentTexture, so factor-only metals (brig SHIP_IRON) are otherwise unlit/black.
     applyShipMetalEnv(this.controller.getMeshes(), this.sceneService.getSkyEnvTexture());
@@ -1527,6 +1541,31 @@ export class VesselService {
       // Eye = the vessel-local point through the hull's CURRENT world matrix, so it rides with
       // heave/heel/pitch like a real helmsman. (physicsStep set the pose earlier this frame.)
       this.root.computeWorldMatrix(true);
+
+      // Deck-walk: step the local eye in the look direction (in vessel-local space, so it moves with the ship),
+      // then clamp its height to the deck below. Movement only when a walk key is held (the keyHandler sets these
+      // only while ON DECK with the left button down). The deck raycast blocks stepping off the edge or up a wall.
+      const moveLocal = new Vector3(0, 0, 0);
+      if (this.walk.fwd || this.walk.back || this.walk.left || this.walk.right) {
+        const yawR = this.fpYaw * Math.PI / 180;   // look yaw relative to the bow → forward in vessel-local XZ
+        const fwd = new Vector3(Math.sin(yawR), 0, Math.cos(yawR));
+        const rgt = new Vector3(Math.cos(yawR), 0, -Math.sin(yawR));
+        if (this.walk.fwd)   moveLocal.addInPlace(fwd);
+        if (this.walk.back)  moveLocal.subtractInPlace(fwd);
+        if (this.walk.right) moveLocal.addInPlace(rgt);
+        if (this.walk.left)  moveLocal.subtractInPlace(rgt);
+      }
+      const curDeck = this.fpEye.y - this.WALK_EYE;   // current deck (foot) level — the band reference for the raycast
+      if (moveLocal.lengthSquared() > 1e-6) {
+        moveLocal.normalize().scaleInPlace(this.WALK_SPEED * dt);
+        const tx = this.fpEye.x + moveLocal.x, tz = this.fpEye.z + moveLocal.z;
+        // Step only onto deck within a gentle band of the current level (deckLocalHeight enforces it) — this blocks
+        // walking off the rail (big drop) and climbing the rigging/mast (overhead spars are outside the band).
+        if (this.deckLocalHeight(tx, tz, curDeck) !== null) { this.fpEye.x = tx; this.fpEye.z = tz; }
+      }
+      const deckY = this.deckLocalHeight(this.fpEye.x, this.fpEye.z, curDeck);
+      if (deckY !== null) this.fpEye.y = deckY + this.WALK_EYE;   // glue the eye to standing height above the deck
+
       const eye = Vector3.TransformCoordinates(this.fpEye, this.root.getWorldMatrix());
       eye.addInPlace(this.camShakeOffset);
       cam.position.copyFrom(eye);
@@ -1583,6 +1622,49 @@ export class VesselService {
     cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
   }
 
+  /** Ship structural meshes (hull/deck/furniture) to raycast the deck-walk eye onto. Merged ship meshes get
+   *  unpredictable names, so filter by EXCLUSION (water/sails/flags/crew), like the crew deck raycast. Cached per
+   *  vessel; the picking octree is render-selection OFF (else it frustum-culls deck submeshes on the big ships). */
+  private deckCandsCam(): AbstractMesh[] {
+    if (this.deckCamMeshes) return this.deckCamMeshes;
+    const skip = /water|ocean|impostor|sail|flag/i;
+    const out: AbstractMesh[] = [];
+    for (const me of this.root.getChildMeshes(false)) {
+      if (!me.getTotalVertices() || skip.test(me.name) || me.name.startsWith('crew_') || me.name.startsWith('ik_')) continue;
+      if (me.getTotalVertices() > 1500) {
+        try {
+          const om = me as unknown as { createOrUpdateSubmeshesOctree?(c: number, d: number): void; useOctreeForRenderingSelection?: boolean };
+          om.createOrUpdateSubmeshesOctree?.(64, 2);
+          om.useOctreeForRenderingSelection = false;
+        } catch { /* */ }
+      }
+      out.push(me);
+    }
+    this.deckCamMeshes = out;
+    return out;
+  }
+
+  /** Ship-local Y of the deck below a vessel-local XZ, found by a short down-ray in the ship vertical. Accepts only
+   *  a hit within a gentle band of the current foot level `footY` (`[footY-3, footY+0.9]`): this lets the quarterdeck
+   *  stairs through and follows the deck down, but IGNORES overhead spars/booms/yards/mast-tops (so you can't climb
+   *  the rigging) and refuses a big drop off the rail. Returns the highest in-band hit, or null = off the deck. */
+  private deckLocalHeight(lx: number, lz: number, footY: number): number | null {
+    const wm = this.root.getWorldMatrix();
+    const origin = Vector3.TransformCoordinates(new Vector3(lx, footY + 2.2, lz), wm);
+    const down = Vector3.TransformNormal(new Vector3(0, -1, 0), wm).normalize();
+    const ray = new Ray(origin, down, 6);
+    const inv = wm.clone(); inv.invert();
+    let best: number | null = null;
+    for (const me of this.deckCandsCam()) {
+      const pick = ray.intersectsMesh(me as never, false);
+      if (pick.hit && pick.pickedPoint) {
+        const ly = Vector3.TransformCoordinates(pick.pickedPoint, inv).y;
+        if (ly >= footY - 3 && ly <= footY + 0.9 && (best === null || ly > best)) best = ly;
+      }
+    }
+    return best;
+  }
+
   private setupCameraInput(): void {
     const scene  = this.sceneService.scene;
     const canvas = this.sceneService.engine.getRenderingCanvas();
@@ -1620,6 +1702,7 @@ export class VesselService {
           break;
         case PointerEventTypes.POINTERUP:
           this.isDragging = false;
+          this.clearWalk();   // releasing the button stops deck-walking even if keys are still held
           if (canvas) canvas.style.cursor = 'default';
           break;
       }
@@ -1648,6 +1731,16 @@ export class VesselService {
                          document.activeElement instanceof HTMLTextAreaElement;
     this.keyHandler = (e: KeyboardEvent) => {
       if (e.repeat || typing()) return;   // ignore OS key-repeat: held keys are tracked via keyup below
+      // Deck-walk: while ON DECK (first-person) with the LEFT BUTTON HELD, WASD/arrows walk the camera across the
+      // deck instead of steering/trimming. Set the per-frame boolean and consume the event (no Angular CD needed).
+      if (this.firstPerson() && this.isDragging) {
+        switch (e.code) {
+          case 'KeyW': case 'ArrowUp':    this.walk.fwd = true;   return;
+          case 'KeyS': case 'ArrowDown':  this.walk.back = true;  return;
+          case 'KeyA': case 'ArrowLeft':  this.walk.left = true;  return;
+          case 'KeyD': case 'ArrowRight': this.walk.right = true; return;
+        }
+      }
       // Re-enter the Angular zone so a discrete press refreshes the HUD (sail/anchor/view indicators).
       // The listener itself is registered OUTSIDE the zone (below), so held keys add no per-event CD.
       this.zone.run(() => {
@@ -1675,10 +1768,12 @@ export class VesselService {
     this.keyUpHandler = (e: KeyboardEvent) => {
       if (typing()) return;
       switch (e.code) {   // steering booleans only — read by the render loop, no HUD change → no CD needed
-        case 'ArrowLeft':  case 'KeyA': this.keys.left     = false; break;
-        case 'ArrowRight': case 'KeyD': this.keys.right    = false; break;
+        case 'ArrowLeft':  case 'KeyA': this.keys.left  = false; this.walk.left  = false; break;
+        case 'ArrowRight': case 'KeyD': this.keys.right = false; this.walk.right = false; break;
         case 'KeyQ': this.keys.sheetOut = false; break;
         case 'KeyE': this.keys.sheetIn  = false; break;
+        case 'KeyW': case 'ArrowUp':   this.walk.fwd  = false; break;
+        case 'KeyS': case 'ArrowDown': this.walk.back = false; break;
       }
     };
     // Holding a key fires keydown ~60×/s (OS repeat). Each one reaching an in-zone @HostListener (HUD,

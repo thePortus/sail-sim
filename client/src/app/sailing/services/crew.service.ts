@@ -318,6 +318,10 @@ interface CrewLayout {
    *  guns & bulwark rail are hip-height, unreachable for a standing arm). */
   gun_grip_up?: number;
   rope_grip_up?: number;
+  /** Per-ship vertical correction (m) added to the deck-snapped feet Y. Some merged decks (the merchantman) get
+   *  raycast-hit a few cm below their visible plank surface, sinking the crew to the instep — a small positive
+   *  lift seats the soles back on the planks. Default 0. */
+  deck_lift?: number;
 }
 interface CrewStation {
   id: string; kind: string; pos: [number, number, number];
@@ -417,6 +421,7 @@ export class CrewHandle {
   private disposed = false;
   private readonly texCache = new Map<string, Texture>();
   private readonly clonedMats: PBRMaterial[] = [];
+  private skinIdx = 0;   // walks SKIN_ORDER so a full crew shows the whole tone range, not random-clustered light
   // Per-member cloned skeletons (each member is its own instantiateRigged → a cloned 24-joint rig, GPU-texture
   // backed on WebGPU). Disposing the mesh subtree does NOT free these, so they're collected + freed in dispose().
   private readonly skeletons: Skeleton[] = [];
@@ -597,36 +602,114 @@ export class CrewHandle {
     const meshes = glbRoot.getChildMeshes(false);
     const findMesh = (kw: string) => meshes.find((mm) => new RegExp(kw, 'i').test(mm.name));
     const pick = <T>(a: T[]): T => a[Math.floor(rng() * a.length)];
-    const tintMesh = (kw: string, c: number[], zoff: number) => {
+    // Per-crew BUILD — independent SEX + BULK, driven by the Fem/Heavy/Lean morphs baked on the body + torso
+    // garments (Shirt/Coat/Breeches/Sash). Each member is its own instantiateModelsToScene clone, so every mesh
+    // carries its OWN morphTargetManager → influences are per-member (not shared across the deck). ~1-in-6 female;
+    // bulk splits roughly thirds lean / average / heavy so the crew isn't all one stocky male silhouette.
+    const female = rng() < 0.16;
+    const bulk = rng();
+    const heavy = bulk > 0.64 ? 0.45 + rng() * 0.5 : 0;
+    const lean = heavy === 0 && bulk < 0.34 ? 0.35 + rng() * 0.5 : 0;
+    const fem = female ? 0.9 + rng() * 0.1 : 0;
+    for (const me of meshes) {
+      const mm = (me as { morphTargetManager?: MorphTargetManager }).morphTargetManager;
+      if (!mm) continue;
+      for (let t = 0; t < mm.numTargets; t++) {
+        const tg = mm.getTarget(t);
+        if (tg.name === 'Fem') tg.influence = fem;
+        else if (tg.name === 'Heavy') tg.influence = heavy;
+        else if (tg.name === 'Lean') tg.influence = lean;
+      }
+    }
+    // `lin` linearizes the swatch (for FLAT materials with no albedo texture — Cap/Tricorn/Neckerchief — so a chosen
+    // sRGB colour renders as intended; textured garments multiply their texture so they pass the raw value).
+    const tintMesh = (kw: string, c: number[], zoff: number, lin = false) => {
       const mesh = findMesh(kw);
       if (mesh && mesh.material instanceof PBRMaterial) {
         const mat = mesh.material.clone(`${mesh.material.name}_${this.clonedMats.length}`);
-        mat.albedoColor = new Color3(c[0], c[1], c[2]);
+        mat.albedoColor = lin ? new Color3(c[0], c[1], c[2]).toLinearSpace() : new Color3(c[0], c[1], c[2]);
         mat.zOffset = zoff;
         mesh.material = mat;
+        if (!mesh.isEnabled()) mesh.setEnabled(true);   // a chosen headwear may have been disabled on a prior pick
         this.clonedMats.push(mat);
       }
     };
-    tintMesh('Shirt', pick(SHIRT), -1);
+    // SHIRT — ~30% wear a striped Breton sailor's shirt (texture swap, navy or red), the rest a plain tinted linen.
+    const shirtMesh = findMesh('Shirt');
+    if (shirtMesh && shirtMesh.material instanceof PBRMaterial && rng() < 0.3) {
+      const stripe = rng() < 0.6 ? 'shirt_stripe_navy' : 'shirt_stripe_red';
+      let tex = this.texCache.get(stripe);
+      if (!tex) { tex = new Texture(`${this.baseUrl}crew_skins/${stripe}.webp`, this.scene, undefined, false); this.texCache.set(stripe, tex); }
+      const mat = shirtMesh.material.clone(`shirt_${this.clonedMats.length}`);
+      mat.albedoTexture = tex; mat.albedoColor = new Color3(1, 1, 1); mat.zOffset = -1;
+      shirtMesh.material = mat; this.clonedMats.push(mat);
+    } else tintMesh('Shirt', pick(SHIRT), -1);
     tintMesh('Breeches', pick(BREE), -1);
     tintMesh('Sash', pick(SASH), -4);
     tintMesh('Boots', pick(BOOT), -1);
-    if (rng() < 0.6)  tintMesh('Coat', pick(COAT), -3);  else findMesh('Coat')?.setEnabled(false);
-    if (rng() < 0.72) tintMesh('Bandana', pick(BAND), -2); else findMesh('Bandana')?.setEnabled(false);
-    // Per-crew SKIN TONE so the deck isn't one face repeated — clone M_Skin (the body's only material; the
-    // eye materials are M_Eye_* so /skin/ won't catch them) and set a realistic tone from a fair→dark range.
-    const SKIN = [[0.82, 0.64, 0.52], [0.74, 0.55, 0.43], [0.66, 0.46, 0.34], [0.55, 0.38, 0.27], [0.45, 0.30, 0.21], [0.36, 0.23, 0.16]];
+    // OUTER LAYER — one of none / waistcoat (Vest) / longcoat (Coat). Women favour none or the vest (the heavy coat
+    // hides the female silhouette). Hide the layer not chosen; Vest is a flat mat → linearize its swatch.
+    const VEST = [[0.24, 0.17, 0.10], [0.30, 0.30, 0.32], [0.14, 0.16, 0.26], [0.40, 0.12, 0.10], [0.18, 0.22, 0.15], [0.10, 0.10, 0.12]];
+    const ro = rng();
+    const outer = female ? (ro < 0.30 ? 'Vest' : ro < 0.45 ? 'Coat' : 'none')
+                         : (ro < 0.28 ? 'Vest' : ro < 0.60 ? 'Coat' : 'none');
+    for (const g of ['Vest', 'Coat']) { if (g !== outer) findMesh(g)?.setEnabled(false); }
+    if (outer === 'Vest') tintMesh('Vest', pick(VEST), -2, true);
+    else if (outer === 'Coat') tintMesh('Coat', pick(COAT), -3);
+    // HEADWEAR — exactly ONE of bare / bandana / knit cap / tricorn (weighted; women favour the head-scarf). Hide the
+    // three not chosen, tint the one chosen. Cap/Tricorn flat mats → linearize the swatch.
+    const CAP  = [[0.30, 0.20, 0.12], [0.34, 0.34, 0.36], [0.13, 0.17, 0.30], [0.46, 0.13, 0.11], [0.64, 0.56, 0.42], [0.15, 0.24, 0.17]];
+    const TRI  = [[0.05, 0.05, 0.06], [0.17, 0.11, 0.07], [0.10, 0.12, 0.22]];
+    const NECK = [[0.56, 0.11, 0.09], [0.14, 0.23, 0.44], [0.82, 0.80, 0.74], [0.68, 0.54, 0.13], [0.16, 0.35, 0.19]];
+    const r = rng();
+    const head = female
+      ? (r < 0.55 ? 'Bandana' : r < 0.74 ? 'Cap' : r < 0.82 ? 'Tricorn' : 'bare')
+      : (r < 0.30 ? 'Bandana' : r < 0.58 ? 'Cap' : r < 0.72 ? 'Tricorn' : 'bare');
+    for (const g of ['Bandana', 'Cap', 'Tricorn']) { if (g !== head) findMesh(g)?.setEnabled(false); }
+    if (head === 'Bandana') tintMesh('Bandana', pick(BAND), -2);
+    else if (head === 'Cap') tintMesh('Cap', pick(CAP), -2, true);
+    else if (head === 'Tricorn') tintMesh('Tricorn', pick(TRI), -2, true);
+    // NECKERCHIEF — a knotted neck cloth, independent (~35%).
+    if (rng() < 0.35) tintMesh('Neckerchief', pick(NECK), -2, true); else findMesh('Neckerchief')?.setEnabled(false);
+    // Per-crew FACE + SKIN — assign a real MakeHuman face/skin TEXTURE (brows, eyes, lips, skin detail + baked
+    // tone) to the body's M_Skin (the eye mats are M_Eye_* so /skin/ won't catch them). This REPLACES the old flat
+    // per-crew albedoColor tint: the head used to be a blank skin-coloured blob; these textures carry both the FACE
+    // and the skin tone, so the deck now reads as real, varied, mixed-ethnicity sailors. Set = the official
+    // MakeHuman skins (♂/♀ × african/asian/caucasian × young/middle/old). Female crew get a female face (paired
+    // with the Fem body morph). STRATIFIED by skinIdx over an interleaved order so a full crew spans light→dark
+    // instead of random-clustering. Tiny webp (~40 KB) from crew_skins/, cached; invertY=false matches the glTF UV
+    // convention (like the legacy skin swap). The texture maps via the body's TEXCOORD_0 (kept in the GLB).
+    // HAIR + BEARDS are baked into the face textures (scalp + jaw masks composited onto the MakeHuman skins, varied
+    // colour) so each face is a distinct bald/haired/bearded/mustached combo across ethnicities — see crew_skins/.
+    // (Texture short-hair; geometry long hair/queues is a later step. Interleaved so consecutive crew differ.)
+    const MALE_SKINS = ['m_mcm_hairbeard', 'm_yam_hair', 'm_oasm_goatee', 'm_ycm_hair', 'm_mam_hairbeard',
+      'm_ocm_beard', 'm_yasm_bald', 'm_masm_must', 'm_ycm_bald', 'm_yam_bald', 'm_ocm_hair', 'm_mcm_beard'];
+    const FEMALE_SKINS = ['f_yaf_hair', 'f_mcf_bald', 'f_oasf_hair', 'f_ycf_hair', 'f_maf_hair'];
+    const set = female ? FEMALE_SKINS : MALE_SKINS;
+    const faceName = set[this.skinIdx++ % set.length];
     const body = meshes.find((mm) => mm.material instanceof PBRMaterial && /skin/i.test(mm.material.name));
     if (body && body.material instanceof PBRMaterial) {
+      let tex = this.texCache.get(faceName);
+      if (!tex) { tex = new Texture(`${this.baseUrl}crew_skins/${faceName}.webp`, this.scene, undefined, false); this.texCache.set(faceName, tex); }
       const mat = body.material.clone(`skin_${this.clonedMats.length}`);
-      const c = pick(SKIN); mat.albedoColor = new Color3(c[0], c[1], c[2]);
+      mat.albedoTexture = tex;
+      mat.albedoColor = new Color3(1, 1, 1);   // texture carries tone; don't double-tint
       body.material = mat; this.clonedMats.push(mat);
     }
+    // LONG HAIR — geometry drape, ONLY on a BARE head whose FACE already has (painted) hair, so the long silhouette
+    // matches a haired scalp instead of a dark mass stuck on a bald head (the "white face / black back" bug). Women
+    // favour it. Hair-colour tint (flat mat → linearize).
+    const HAIRCOL = [[0.06, 0.045, 0.03], [0.11, 0.07, 0.04], [0.20, 0.14, 0.08], [0.46, 0.43, 0.41], [0.30, 0.16, 0.07]]; // black/brown/lt-brown/grey/auburn
+    if (head === 'bare' && /hair/i.test(faceName) && rng() < (female ? 0.8 : 0.4)) tintMesh('Hair_long', pick(HAIRCOL), -1, true);
+    else findMesh('Hair_long')?.setEnabled(false);
     // Per-crew STATURE — a uniform scale on the holder. The body's origin is at the feet, and the holder sits at
     // the deck-snapped station, so scaling only changes height (no float/sink) and leaves the per-frame
     // position/heading the lifecycle writes untouched. Uniform (not per-axis) avoids shearing the rotated GLB.
     const holder = glbRoot.parent as TransformNode | null;
-    if (holder) holder.scaling.setAll(0.93 + rng() * 0.13);   // ~±6% stature spread
+    let stature = 0.93 + rng() * 0.13;   // ~±6% spread
+    if (female) stature *= 0.95;         // women a touch shorter
+    if (heavy) stature *= 1.02;          // heavyset read a little bigger
+    if (holder) holder.scaling.setAll(stature);
   }
 
   /** Nudge one hat so it seats on the head. The correction is given in intuitive WORLD terms — `lower` (metres
@@ -911,6 +994,7 @@ export class CrewHandle {
   private deckSnapStation(m: CrewMember): void {
     const open = this.findOpenDeck(m.stationPos);
     if (open) m.stationPos.set(open.x, open.y, open.z);
+    if (this.layout.deck_lift) m.stationPos.y += this.layout.deck_lift;   // per-ship sole-on-planks correction
   }
 
   /** A waypoint's position nudged to open deck (so walk paths bend AROUND the boat/companionway/hatches instead of

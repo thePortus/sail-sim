@@ -2,8 +2,9 @@ import { Injectable, NgZone, effect, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
   AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  DirectionalLight, Ray,
+  DirectionalLight, Ray, Node,
 } from '@babylonjs/core';
+import { ShadowOnlyMaterial } from '@babylonjs/materials/shadowOnly';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
@@ -364,6 +365,19 @@ export class VesselService {
 
   private clearWalk(): void { this.walk.fwd = this.walk.back = this.walk.left = this.walk.right = false; }
 
+  // Deck shadow CATCHERS — the ship's PBR material can't `receiveShadows` (it's at the WebGPU 16-varying limit), so
+  // for each STATIC deck/hull mesh we clone a coincident twin with a minimal ShadowOnlyMaterial that DOES receive,
+  // overlaying the crew/furniture shadows onto the deck. Opt-out `localStorage.ignis_deck_shadows='0'` (→ blob crew
+  // shadows instead). Cheap: ~2 static clones per ship, shared material, not cast/reflected.
+  private shadowCatchers: AbstractMesh[] = [];
+  private shadowCatcherMat: ShadowOnlyMaterial | null = null;
+  private readonly realDeckShadows = (() => { try { return localStorage.getItem('ignis_deck_shadows') !== '0'; } catch { return true; } })();
+
+  private clearShadowCatchers(): void {
+    for (const c of this.shadowCatchers) c.dispose(false, false);   // keep the shared geometry + material
+    this.shadowCatchers = [];
+  }
+
   toggleFirstPerson(): void {
     this.firstPerson.update(v => !v);
     if (!this.firstPerson()) this.clearWalk();
@@ -609,10 +623,17 @@ export class VesselService {
     // This helps the square-rigged ships most (the brig has 13 sails + 4 flags = ~17 skinned draws ×3
     // cascades). Opt back in with localStorage.ignis_sailshadows='on'.
     const sailShadows = localStorage.getItem('ignis_sailshadows') === 'on';
+    // Rigging (masts/yards/guns + the standing rig) casts by DEFAULT so the masts throw their shadow on the deck.
+    // The thin standing rigging (ratlines/shrouds) shadow SHIMMERS (sub-texel in the shadow map) — minimised at a
+    // higher Shadows level (2048) — but it's merged with the masts into skinned meshes, so to drop ONLY the
+    // ratlines needs a Blender split. Opt the skinned rigging OUT entirely (no shimmer, but no mast shadow either)
+    // with `ignis_rig_shadows='0'`.
+    const rigShadows = localStorage.getItem('ignis_rig_shadows') !== '0';
     for (const mesh of meshes) {
       this.oceanService.addToRenderList(mesh);
       const isCloth = /sail|flag/i.test(mesh.name);
-      if (!isCloth || sailShadows) sg?.addShadowCaster(mesh, true);
+      const isSkinnedRig = !isCloth && mesh.isVerticesDataPresent('matricesWeights');
+      if (((!isCloth && (!isSkinnedRig || rigShadows)) || (isCloth && sailShadows))) sg?.addShadowCaster(mesh, true);
       // Do NOT set receiveShadows on the ship's PBR material: it's already at the WebGPU 16 inter-stage-variable
       // limit (esp. in the ocean-reflection pass), so adding the shadow-receive varyings overflows → the render
       // pipeline fails to compile → the scene strobes self-healing. Crew get cheap projected blob shadows instead.
@@ -622,7 +643,43 @@ export class VesselService {
         seenMats.add(mat);
         mat.fogEnabled = false;
       }
+      // Spawn a shadow-CATCHER twin for the STATIC deck/hull surfaces (no skin weights). Skinned parts (rigging) and
+      // cloth are skipped — crew/furniture shadows land on the deck, which is static. The catcher RECEIVES; the
+      // original keeps receiveShadows=false to dodge the varying overflow.
+      if (this.realDeckShadows && !isCloth && mesh.getTotalVertices() > 0
+          && !mesh.isVerticesDataPresent('matricesWeights')) {
+        this.makeShadowCatcher(mesh);
+      }
     }
+  }
+
+  /** Clone a static deck/hull mesh, coincident, with a minimal ShadowOnlyMaterial that receives the sun's shadows —
+   *  a transparent overlay that paints the crew/furniture shadows onto the deck without touching the ship's PBR
+   *  material (which can't receive: WebGPU varying overflow). Shared material; pulled toward the camera (zOffset) so
+   *  it wins the depth test over its opaque twin; NOT a shadow caster and NOT added to the ocean-reflection list. */
+  private makeShadowCatcher(mesh: AbstractMesh): void {
+    const scene = this.sceneService.scene;
+    if (!this.shadowCatcherMat) {
+      const som = new ShadowOnlyMaterial('deckShadowCatcher', scene);
+      const sun = scene.getLightByName('sun');
+      if (sun) som.activeLight = sun as DirectionalLight;
+      som.shadowColor = new Color3(0, 0, 0);
+      som.alpha = 0.62;           // shader outputs (1−shadow)·alpha → this is the shadow darkness (was full-black)
+      som.fogEnabled = false;
+      this.shadowCatcherMat = som;
+    }
+    const catcher = (mesh as Mesh).clone(`${mesh.name}_shadowcatch`, mesh.parent as Node, true);
+    if (!catcher) return;
+    catcher.material = this.shadowCatcherMat;
+    catcher.receiveShadows = true;
+    catcher.isPickable = false;
+    catcher.renderingGroupId = mesh.renderingGroupId;
+    catcher.alphaIndex = 2;
+    // Lift the twin 2 cm off the real deck. (Polygon zOffset barely separates a near-horizontal deck viewed
+    // top-down — its bias scales with surface slope — so a small physical offset is what actually kills the
+    // z-fight. Imperceptible gap; the crew shadow lands at the same XZ.)
+    catcher.position.y += 0.03;
+    this.shadowCatchers.push(catcher);
   }
 
   /** Live-reload the rigged model after /reloadassets bumped the cache version: dispose the
@@ -639,6 +696,7 @@ export class VesselService {
       // leaks dead refs every reload/refit — wasted shadow-pass work and, eventually, a descriptor-heap crash.
       for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); }
     }
+    this.clearShadowCatchers();   // dispose the deck-shadow twins (they clone the old geometry)
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();   // disposes the old instanced meshes (shared materials are kept)
@@ -688,6 +746,7 @@ export class VesselService {
     const sg = this.sceneService.shadowGenerator;
     const oldRoot = this.controller?.root ?? null;
     if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); } }
+    this.clearShadowCatchers();
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();

@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* scatter assets shadow map?
 * make server/assets mounted/shared drive, so it can preserve past volumes-down
 * crew/deck furniture shadows
 * error in water occlusion on brig for NPCs/other vessels that doesn't affect player. Keel line is visible. this was something we corrected earlier on the player's vessel

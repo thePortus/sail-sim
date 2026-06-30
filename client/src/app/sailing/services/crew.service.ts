@@ -1,8 +1,8 @@
 import { Injectable, inject } from '@angular/core';
 import {
   AbstractMesh, AnimationGroup, Bone, BoneIKController, Color3, DynamicTexture, Material, Mesh, MeshBuilder,
-  MorphTarget, MorphTargetManager, Node, Nullable, Observer, PBRMaterial, Quaternion, Ray, Scene, Skeleton,
-  StandardMaterial, Texture, TransformNode, Vector3,
+  MorphTarget, MorphTargetManager, Node, Nullable, Observer, PBRMaterial, Quaternion, Ray, Scene, ShadowGenerator,
+  Skeleton, StandardMaterial, Texture, TransformNode, Vector3,
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -174,10 +174,11 @@ export class CrewService {
   ): Promise<CrewHandle | null> {
     const layoutFile = CrewService.LAYOUTS[slug];
     if (!layoutFile) return null;
-    // P3: the new Mixamo crew (gated by `ignis_crew_spiketest`) now flows through the FULL lifecycle —
-    // placement, deck-snap, walking, sway/brace, dwell — exactly like the old pirate crew, only the GLB
-    // and the variant/kit scheme differ. Clear the flag to fall back to the legacy pirate crew.
-    const useNew = typeof localStorage !== 'undefined' && localStorage.getItem('ignis_crew_spiketest') === '1';
+    // The new Mixamo crew (crew_spike.glb — faces/skins/beards/hair/clothing variety + the full lifecycle) is now
+    // the DEFAULT. It flows through the same lifecycle as the legacy pirate crew (placement, deck-snap, walking,
+    // sway/brace, dwell), only the GLB + variant/kit scheme differ. Opt OUT to the legacy pirate crew with
+    // `localStorage.ignis_crew_spiketest='0'`.
+    const useNew = typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_spiketest') !== '0';
     const glb = useNew ? 'crew_spike.glb' : CrewService.GLB;
     try {
       const layout = await this.loadLayout(layoutFile);
@@ -428,6 +429,11 @@ export class CrewHandle {
   // `localStorage.ignis_crew_blobshadow='0'`.
   private blobMat: StandardMaterial | null = null;
   private readonly blobShadows = (() => { try { return localStorage.getItem('ignis_crew_blobshadow') !== '0'; } catch { return true; } })();
+  // REAL deck shadows (default): cast each crew's silhouette into the sun's shadow map; the VesselService spawns a
+  // ShadowOnlyMaterial deck-catcher that RECEIVES them (the ship's own PBR can't receive — varying overflow). Set
+  // `localStorage.ignis_deck_shadows='0'` to fall back to the cheap projected blob shadows instead.
+  private readonly realDeckShadows = (() => { try { return localStorage.getItem('ignis_deck_shadows') !== '0'; } catch { return true; } })();
+  private readonly shadowCasters: AbstractMesh[] = [];
   // Per-member cloned skeletons (each member is its own instantiateRigged → a cloned 24-joint rig, GPU-texture
   // backed on WebGPU). Disposing the mesh subtree does NOT free these, so they're collected + freed in dispose().
   private readonly skeletons: Skeleton[] = [];
@@ -535,7 +541,20 @@ export class CrewHandle {
       bodyMesh: ikBody ?? null, ik: null, ikActive: false, ikGrip: 0,
     };
 
-    if (this.blobShadows) this.addBlobShadow(holder);
+    // Shadows: REAL (cast silhouette into the sun's shadow map → deck-catcher receives) or, as a fallback, a cheap
+    // projected blob under the feet. Silhouette = body + main garments; disabled hats/layers auto-skip; tiny/inner
+    // parts (eyes, sash, hair) are left out to keep the shadow pass cheap.
+    if (this.realDeckShadows) {
+      const sg = this.scene.getLightByName('sun')?.getShadowGenerator() as ShadowGenerator | null;
+      if (sg) {
+        for (const me of glbRoot.getChildMeshes(false)) {
+          if (!/Crew|base|Shirt|Breeches|Boots|Coat|Vest|Cap|Tricorn|Bandana/i.test(me.name)) continue;
+          sg.addShadowCaster(me, true); this.shadowCasters.push(me);
+        }
+      }
+    } else if (this.blobShadows) {
+      this.addBlobShadow(holder);
+    }
 
     // Spawn directly at a free station (no walk-in pop).
     const st = this.pickStation(member);
@@ -893,6 +912,11 @@ export class CrewHandle {
     if (this.disposed) return;
     this.disposed = true;
     if (this.observer) { this.scene.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
+    if (this.shadowCasters.length) {   // pull crew out of the shadow map before their subtree disposes
+      const sg = this.scene.getLightByName('sun')?.getShadowGenerator() as ShadowGenerator | null;
+      if (sg) for (const me of this.shadowCasters) sg.removeShadowCaster(me, true);
+      this.shadowCasters.length = 0;
+    }
     // Per-member cloned animation groups + morph managers (face morphs) are NOT freed by disposing the mesh
     // subtree, so release them explicitly before the holders go — else a churning crew leaks them.
     const seenMorph = new Set<MorphTargetManager>();

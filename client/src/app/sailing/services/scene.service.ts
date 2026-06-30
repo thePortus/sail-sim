@@ -574,7 +574,10 @@ export class SceneService {
     //   Cascade 0 (~0–30 u)  : vessel hull, cannonballs — high resolution
     //   Cascade 1 (~30–150 u): island self-shadowing, vessel-on-island
     //   Cascade 2 (~150–400 u): distant terrain — low resolution
-    const csg = new CascadedShadowGenerator(512, this.sun);  // was 1024 — cheaper map
+    // Per-cascade map resolution is driven by the user's Shadow-quality level (0/1 → 512, 2 → 1024, 3 → 2048) so
+    // higher tiers get crisp, non-shimmering deck/crew shadows. Read the saved level at construction.
+    const shLevel = (() => { try { return parseInt(localStorage.getItem('shadow-quality') ?? '2', 10); } catch { return 2; } })();
+    const csg = new CascadedShadowGenerator(this.shadowMapSize(shLevel), this.sun);
     csg.numCascades        = 3;                              // render/clear; fine at the
     // NOTE: filteringQuality and sun.shadowEnabled both produce a broken shadow
     // shader on this WebGPU path (scene renders black). Leave filtering at the
@@ -1755,9 +1758,17 @@ export class SceneService {
    *   2 Med  — 3 cascades, every-other-frame (default)
    *   3 High — 3 cascades, every frame
    */
+  /** Per-cascade shadow-map resolution for a Shadow-quality level. 0/1 = 512 (low-end), 2 = 1024 (default/High),
+   *  3 = 2048 (Ultra — crispest, least shimmer). Higher = more VRAM + a costlier shadow pass. */
+  private shadowMapSize(level: number): number {
+    return level <= 1 ? 512 : level === 2 ? 1024 : 2048;
+  }
+
   setShadowMapQuality(level: number): void {
     if (!this.shadowGenerator) return;
     const csg = this.shadowGenerator as CascadedShadowGenerator;
+    const size = this.shadowMapSize(level);
+    if (csg.mapSize !== size) { try { csg.mapSize = size; } catch { /* resize unsupported mid-frame — applies on next reload */ } }
     // Do NOT toggle sun.shadowEnabled — flipping it recompiles every receiver shader
     // and blanks the scene on WebGPU. Vary only cascade count + refresh rate, which
     // recompile to a valid shadow shader and render fine. Level 0 = cheapest (1

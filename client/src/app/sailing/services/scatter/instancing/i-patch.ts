@@ -10,8 +10,13 @@ export interface IPatch {
   clearInstances(): void;
   /** Creates instances of a clone of baseMesh, positioned by the patch's matrix buffer. `fraction`
    *  (0..1) renders only that prefix of the (pre-shuffled) buffer — a uniform random subsample used
-   *  to thin out distant LoD tiers. */
-  createInstances(baseMesh: TransformNode, fraction?: number): void;
+   *  to thin out distant LoD tiers.
+   *
+   *  `secondary` (optional) materializes a SECOND clone bound to the SAME instance buffers — used by the
+   *  tree LoD cross-dissolve to render the impostor and full mesh together across the transition ring
+   *  (each fades by distance via NearFadePlugin). Pass undefined to render a single LoD (and drop any
+   *  secondary from a prior call). */
+  createInstances(baseMesh: TransformNode, fraction?: number, secondary?: TransformNode): void;
   getNbInstances(): number;
   getPosition(): Vector3;
   dispose(): void;

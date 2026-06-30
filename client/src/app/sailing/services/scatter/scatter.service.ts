@@ -21,6 +21,7 @@ import { createPalm } from './props/palm';
 import { GrassFadePlugin } from './grass/grass-fade.plugin';
 import { FarFadePlugin } from './far-fade.plugin';
 import { NearFadePlugin } from './near-fade.plugin';
+import { LodDitherPlugin } from './lod-dither.plugin';
 import { ImpostorHazePlugin } from './impostor-haze.plugin';
 import { PalmWindPlugin } from './props/palm-wind.plugin';
 import { TreeWindPlugin } from './props/tree-wind.plugin';
@@ -84,6 +85,38 @@ function fbm2(x: number, z: number): number {
   return sum / norm;
 }
 
+// ── GPU-MATCHING noise (mirror of scatter-compute.ts) ──────────────────────────────────────────────
+// On WebGPU the camera-following trees are placed by the COMPUTE kernel, which uses a sinless Dave-Hoskins
+// hash (NOT the sin-hash above). Its fbm2 clustering field — which decides where the groves vs clearings
+// sit — therefore differs from the CPU fbm2. The static far-coast layer must use THIS noise (when GPU
+// scatter is on) or its clearings land in different places than the near layer → trees "fade in from
+// nothing" on approach. fbm2 samples the hash on the integer lattice at moderate values, so f64-vs-f32 drift
+// is tiny and the clearings align. (See [[scatter-lod-dissolve]].)
+function gpuHash2(x: number, z: number): number {
+  let qx = x * 0.1031; qx -= Math.floor(qx);
+  let qz = z * 0.1030; qz -= Math.floor(qz);
+  const dotv = qx * (qz + 33.33) + qz * (qx + 33.33);
+  qx += dotv; qz += dotv;
+  const v = (qx + qz) * qx;
+  return v - Math.floor(v);
+}
+function gpuVnoise(x: number, z: number): number {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = gpuHash2(xi, zi), b = gpuHash2(xi + 1, zi), c = gpuHash2(xi, zi + 1), d = gpuHash2(xi + 1, zi + 1);
+  return (a + (b - a) * u) * (1 - v) + (c + (d - c) * u) * v;
+}
+function gpuFbm2(x: number, z: number): number {
+  let sum = 0, amp = 0.5, freq = 1, norm = 0;
+  for (let o = 0; o < 4; o++) {
+    sum += amp * gpuVnoise(x * freq + o * 19.3, z * freq - o * 7.1);
+    norm += amp;
+    amp *= 0.5; freq *= 2;
+  }
+  return sum / norm;
+}
+
 /** One scatter layer (currently just land grass): its own material, LoD patch manager, live patch
  *  grid, and per-cell instance-buffer builder. Kept generic so more layers can be added later. */
 interface Layer {
@@ -132,8 +165,9 @@ export class ScatterService {
   // Fake-shadow blobs (shared flat disc + dark decal material, thin-instanced under each land asset).
   private _shadowDisc: Mesh | null = null;
   private _shadowMat: StandardMaterial | null = null;
-  // Static far-forest impostor layer: the beech impostor textures (captured on load) + the built meshes.
+  // Static far impostor layers (forest slopes + the coast strip): the impostor textures captured on load.
   private beechImpostors: { tex: Texture; w: number; h: number; pad: number }[] = [];
+  private palmImpostors: { tex: Texture; w: number; h: number; pad: number }[] = [];
   private farMeshes: Mesh[] = [];
   private shadowRing = 3;                            // near ring (cells) the blobs build within
   private _sunAcc = 1;                               // throttle the sun-drive recompute (the sun crawls)
@@ -170,6 +204,23 @@ export class ScatterService {
     return Number.isFinite(q) ? Math.max(0, Math.min(4, q)) : 3;
   })();
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
+  // Per-instance draw-radius fade band for the camera-following TREES (palms/beeches) — wider than grass's, so
+  // their impostors dissolve at the patch-cull edge (no pop). Set from RADIUS in applyQualityParams; passed BY
+  // REFERENCE to each tree impostor's GrassFadePlugin so quality changes flow through live.
+  private readonly treeFade = { start: 280, end: 340 };
+  // TRUE LoD cross-dissolve for trees (palms/beeches): in the NearFade ring each patch renders BOTH its
+  // impostor and full clone (shared GPU buffers) so the billboard morphs into the 3D mesh — no pop, no vanish.
+  // On by default; opt out (legacy single-LoD shrink swap) with localStorage ignis_lod_dissolve='0'.
+  private readonly lodDissolve = typeof localStorage === 'undefined' || localStorage.getItem('ignis_lod_dissolve') !== '0';
+  // Impostor DITHER (screen-door) appear band for the camera-ring cross-dissolve: opaque beyond near+band,
+  // dithered to nothing by near-band (so the billboard dissolves into the full mesh by distance, no shrink).
+  private readonly ringAppear = {
+    start: NearFadePlugin.params.near - NearFadePlugin.params.band,
+    end: NearFadePlugin.params.near + NearFadePlugin.params.band,
+  };
+  // Far-COAST impostor appear band (its own, nearer than the forest's): full by the camera-ring cull so the
+  // beach reads as treed right up to where the ring takes over. Set from RADIUS in applyQualityParams.
+  private readonly coastAppear = { start: 260, end: 340 };
   private densityMul = 1;               // grass acceptance multiplier (set from quality)
   // The palm GLB's trunk base is authored this high above its origin (its lowest vertex is a drooping frond,
   // not the base). recenterTrunkXZ bakes this down so the base sits at local y=0 — then placement just plants
@@ -249,8 +300,8 @@ export class ScatterService {
         ShadowBlobPlugin.SHADOW.dirZ = hz;
         const stretch = Math.max(1, Math.min(3.5, 1 / Math.max(sun.y, 0.30)));
         ShadowBlobPlugin.SHADOW.stretch = stretch;
-        // Fade out at night, and softer/fainter as the shadow stretches long (low-sun shadows are diffuse penumbra).
-        this._shadowMat.alpha = 0.30 * smoothstep(0.0, 0.16, sun.y) * (1.0 - 0.12 * (stretch - 1.0));
+        // Fade out at night, and a little softer as the shadow stretches long (low-sun shadows are diffuse penumbra).
+        this._shadowMat.alpha = 0.62 * smoothstep(0.0, 0.16, sun.y) * (1.0 - 0.06 * (stretch - 1.0));
       }
       this.ensurePatches();
       // LoD re-eval is cheap (rate-limited internally); the queue DRAIN is the GPU-heavy bit (geometry
@@ -287,6 +338,11 @@ export class ScatterService {
     await this.registerDriftwood(scene);
     await this.registerBeeches(scene);
     await this.registerPalms(scene);
+    // Static far-impostor layers — built AFTER both tree types register so BOTH beechImpostors AND
+    // palmImpostors are populated (the coast atlas mixes them; building inside registerBeeches left
+    // palmImpostors empty → all coast trees fell back to beeches).
+    this.buildFarForest(scene);   // distant forested hillsides
+    this.buildFarCoast(scene);    // the shore strip the forest layer skips (beach palms + low beeches)
     this.setupSinkDebug();   // console tuner: __palmSink()/__treeSink()
 
     // Cheap fake shadows: a flat dark blob under each static land asset, near-ring only. Skipped on
@@ -322,6 +378,7 @@ export class ScatterService {
     for (const mm of farMats) { mm.dispose(); }
     this.farMeshes = [];
     this.beechImpostors = [];
+    this.palmImpostors = [];
     this.layers = [];
     this._shadowDisc = null; this._shadowMat = null;   // disposed above (shared across the blob layers)
     this.townPads = null;                              // re-fetch town pads after a region/manifest change
@@ -545,11 +602,10 @@ export class ScatterService {
       const imp = createCrossImpostor(scene, `scatter_palm_${v}_imp`, tex, cfg.height * 0.85, cfg.height, pad);
       this.sceneService.excludeFromGlow(imp);
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
+      this.palmImpostors.push({ tex, w: cfg.height * 0.85, h: cfg.height, pad });   // reused by the static far-coast layer
 
-      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
-      new NearFadePlugin(full.material, false);
-      if (imp.material) { new NearFadePlugin(imp.material, true); }
-      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v));   // full-detail radius (wider hi-detail range)
+      this.attachNearLod(full, imp);
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v), true);   // full-detail radius + cross-dissolve
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('palms', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -589,15 +645,12 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
       this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
-      // Soft LoD dissolve (no pop): full mesh collapses out + impostor grows in across the 260 m swap.
-      new NearFadePlugin(full.material, false);
-      if (imp.material) { new NearFadePlugin(imp.material, true); }
+      this.attachNearLod(full, imp);
       // Beeches are ~2× the palm's tris, but use the SAME full-detail radius as palms (260 m) per request.
-      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v));   // full-detail radius (wider hi-detail range)
+      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v), true);   // full-detail radius + cross-dissolve
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
     }
-    this.buildFarForest(scene);   // static whole-island impostor layer for the distant hillsides
   }
 
   /**
@@ -626,7 +679,7 @@ export class ScatterService {
     const BUDGET = 600000;   // far billboards are cheap (instanced into ~3 variant meshes → few draws); doubled for denser distant canopy on faraway islands
     // Reservoir-sample a uniform BUDGET subset of ALL forested cells across the map — uniform coverage,
     // bounded memory, no early-stop spatial bias (which a fixed-cap collect would give on large maps).
-    const res = new Float32Array(BUDGET * 3);   // [px,pz,py, ...]
+    const res = new Float32Array(BUDGET * 4);   // [px,pz,py,variant, ...]
     let seen = 0;
     for (let iz = 0; iz < nz; iz += stride) {
       for (let ix = 0; ix < nx; ix += stride) {
@@ -646,36 +699,132 @@ export class ScatterService {
         if (this.nearShoreline(px, pz, 6)) { continue; }
         let slot = seen;
         if (seen >= BUDGET) { slot = (Math.random() * (seen + 1)) | 0; }
-        if (slot < BUDGET) { res[slot * 3] = px; res[slot * 3 + 1] = pz; res[slot * 3 + 2] = y; }
+        if (slot < BUDGET) {
+          res[slot * 4] = px; res[slot * 4 + 1] = pz; res[slot * 4 + 2] = y;
+          res[slot * 4 + 3] = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));   // beech variant (same partition as buildTrees)
+        }
         seen++;
       }
     }
     const take = Math.min(BUDGET, seen);
     if (!take) { return; }
+    this.emitFarImpostors(scene, 'far_beech', this.beechImpostors, res, take, b,
+      { start: FarFadePlugin.band.start, end: FarFadePlugin.band.end });   // forest: hand off to the beech ring at its usual far band
+  }
 
-    // Spatially CHUNK the impostors so off-screen islands frustum-cull instead of the WHOLE map drawing
-    // every frame. The old layer was one mesh per variant flagged alwaysSelectAsActiveMesh (never culled),
-    // so all 600k impostors were vertex-processed regardless of where the camera pointed. Now: one mesh per
-    // (variant, chunk); only chunks inside the view frustum draw — a big GPU vertex/fill saving (esp. after
-    // the 2× density), at the cost of a few more draw calls (only the handful of on-screen chunks).
-    const chunkM = Math.max(400, Math.max(spanX, spanZ) / 8);   // ~8 chunks across the larger span (~hundreds of m each)
+  /**
+   * Static FAR-COAST impostor layer: the SHORE STRIP that buildFarForest deliberately skips (its band starts at
+   * ~4 % of peak and it excludes near-shoreline cells). Without this, beach palms + low beeches have NO distant
+   * billboard — approaching from the water you see an empty waterline until the camera-following ring's cull
+   * radius (~340 m), where they pop in. This blankets the low coastal band with the SAME palm/beech billboards,
+   * faded in at distance (FarFade), so the shoreline reads as treed from far out and hands off to the ring.
+   */
+  private buildFarCoast(scene: Scene): void {
+    const nPalm = this.palmImpostors.length, nBeech = this.beechImpostors.length;
+    if (nPalm + nBeech < 1) { return; }
+    const tg = this.terrainService;
+    const b = tg.getWorldBounds();
+    const cell = tg.getCellSizeM() || 24;
+    const nx = Math.max(2, Math.round((b.maxX - b.minX) / cell) + 1);
+    const nz = Math.max(2, Math.round((b.maxZ - b.minZ) / cell) + 1);
+    const spanX = b.maxX - b.minX, spanZ = b.maxZ - b.minZ;
+    const COAST_HI = 45;                                  // palm band ceiling — the low coastal strip
+    const dmul = this.densityMul;
+    // The near layers (buildPalms/buildTrees) place on a ~2.5–2.9 m grid; sampling the coast at the terrain cell
+    // (~24 m) was ~90× too sparse → the beach read near-empty at distance then "grew" trees on approach. SUB-SAMPLE
+    // each coastal cell on a fine grid and run the SAME palm + beech recipes, so the far coast matches the near
+    // density AND composition (beech-heavy shoreline + palm groves), not a thin palm-only scatter.
+    const SUB = Math.max(1, Math.round(cell / 3.2));     // ~3.2 m sub-grid
+    // CRITICAL: use the SAME noise the near layer uses, or groves/clearings land in different places and trees
+    // "fade in from nothing" on approach. On WebGPU the near trees come from the compute kernel (GPU hash/fbm);
+    // on WebGL from the CPU builders (CPU hash/fbm). Match whichever is active.
+    const useGpu = this.gpuScatterEnabled();
+    const H = useGpu ? gpuHash2 : hash2;
+    const F = useGpu ? gpuFbm2 : fbm2;
+
+    const BUDGET = 900000;
+    const res = new Float32Array(BUDGET * 4);   // [px,pz,py,variant, ...]
+    let seen = 0;
+    const consider = (px: number, pz: number, py: number, variant: number): void => {
+      let slot = seen;
+      if (seen >= BUDGET) { slot = (Math.random() * (seen + 1)) | 0; }
+      if (slot < BUDGET) {
+        res[slot * 4] = px; res[slot * 4 + 1] = pz; res[slot * 4 + 2] = py; res[slot * 4 + 3] = variant;
+      }
+      seen++;
+    };
+    for (let iz = 0; iz < nz; iz++) {
+      for (let ix = 0; ix < nx; ix++) {
+        const cxw = b.minX + (ix / (nx - 1)) * spanX;
+        const czw = b.maxZ - (iz / (nz - 1)) * spanZ;
+        const yc = tg.getElevationFast(cxw, czw);
+        if (yc < -8 || yc > COAST_HI + 20) { continue; }   // cheap prune: skip deep ocean / clear upland whole-cells
+        for (let sz = 0; sz < SUB; sz++) {
+          for (let sx = 0; sx < SUB; sx++) {
+            const px = cxw + ((sx + hash2(ix * 7.1 + sx, iz * 3.7 + sz)) / SUB - 0.5) * cell;
+            const pz = czw + ((sz + hash2(ix * 5.3 + sz, iz * 9.1 + sx)) / SUB - 0.5) * cell;
+            const y = tg.getElevationFast(px, pz);
+            if (y < 0.6 || y > COAST_HI) { continue; }
+            const slope = this.slopeAt(px, pz, y, 2.5);
+            if (slope > 0.5) { continue; }
+            const hashA = H(px * 3.1 + 1.7, pz * 2.9 - 3.3);   // SAME acceptance hash both near layers use
+            // Palm grove recipe (buildPalms) and forest recipe (buildTrees) — independent, like the two near layers,
+            // so a spot can host both. Each tests the same hashA against its own density.
+            const standP = F(px / 28 + 60, pz / 28 - 40);
+            const densP = smoothstep(0.48, 0.80, standP) * (1 - slope * 0.6) * 0.95 * dmul;
+            const palmOk = nPalm > 0 && hashA <= densP;
+            const standB = F(px / 45, pz / 45), clearB = F(px / 13 + 9, pz / 13 - 4);
+            const densB = smoothstep(0.46, 0.72, standB) * smoothstep(0.4, 0.62, clearB) * (1 - slope * 0.8) * 0.18 * dmul;
+            const beechOk = nBeech > 0 && hashA <= densB;
+            if (!palmOk && !beechOk) { continue; }
+            if (this.nearShoreline(px, pz, 7)) { continue; }       // 7 m setback (matches buildPalms/buildTrees)
+            const vh = H(px * 0.71 + 50, pz * 0.67 - 50);
+            if (palmOk) { consider(px, pz, y, Math.min(nPalm - 1, Math.floor(vh * nPalm))); }
+            if (beechOk) { consider(px, pz, y, nPalm + Math.min(nBeech - 1, Math.floor(vh * nBeech))); }
+          }
+        }
+      }
+    }
+    const take = Math.min(BUDGET, seen);
+    if (!take) { return; }
+    // Combined atlas: palms first [0..nPalm), then beeches [nPalm..); the per-tree variant was baked in above.
+    const imposts = [...this.palmImpostors, ...this.beechImpostors];
+    this.emitFarImpostors(scene, 'far_coast', imposts, res, take, b, this.coastAppear);   // coast fills in by the ring cull
+  }
+
+  /**
+   * Shared emit for the static far-impostor layers (forest slopes, coast strip): compose each sampled placement
+   * into a billboard matrix (per-instance scale/yaw + convexity sink), spatially CHUNK them so off-screen chunks
+   * frustum-cull, and thin-instance one hidden-template-per-variant + per-(variant,chunk) clone, all sharing the
+   * variant's FarFade + haze material. `place` is a packed [px,pz,py, …] buffer; `pickVariant` indexes `imposts`.
+   */
+  private emitFarImpostors(
+    scene: Scene, name: string, imposts: { tex: Texture; w: number; h: number; pad: number }[],
+    place: Float32Array, count: number, b: { minX: number; maxX: number; minZ: number; maxZ: number },
+    appear: { start: number; end: number },
+  ): void {
+    const tg = this.terrainService;
+    const spanX = b.maxX - b.minX, spanZ = b.maxZ - b.minZ;
+    const V = imposts.length;
+    // Spatially CHUNK so off-screen islands frustum-cull instead of the WHOLE map drawing every frame: one mesh
+    // per (variant, chunk); only chunks inside the view frustum draw (a few extra draws, big vertex/fill saving).
+    const chunkM = Math.max(400, Math.max(spanX, spanZ) / 8);   // ~8 chunks across the larger span
     const ncx = Math.max(1, Math.ceil(spanX / chunkM));
     const ncz = Math.max(1, Math.ceil(spanZ / chunkM));
     const scaleV = new Vector3(), posV = new Vector3(), up = Vector3.Up(), q = new Quaternion(), mat = new Matrix();
-    // groups[variant][chunkIndex] = flat column-major matrix array for that (variant, chunk) bucket.
     const groups: number[][][] = Array.from({ length: V }, () => Array.from({ length: ncx * ncz }, () => [] as number[]));
-    for (let k = 0; k < take; k++) {
-      const px = res[k * 3], pz = res[k * 3 + 1], py = res[k * 3 + 2];
-      const v = Math.min(V - 1, Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * V));
+    for (let k = 0; k < count; k++) {
+      const px = place[k * 4], pz = place[k * 4 + 1], py = place[k * 4 + 2];
+      const v = Math.max(0, Math.min(V - 1, place[k * 4 + 3] | 0));
       const s = 0.85 + hash2(px * 5.3 - 2.0, pz * 4.7 + 8.0) * 0.30;
       scaleV.set(s, s, s);
       // Distant hills are drawn at COARSE clipmap LOD whose chord cuts UNDER convex hilltops, so an impostor at
       // the true height floats above the visible hill. Sink it by the local convexity (height above a ~far-LOD-
-      // cell-radius average) so hilltop impostors settle onto the drawn hill; flats/valleys are untouched.
+      // cell-radius average) so hilltop impostors settle onto the drawn hill; flats/valleys (the coast) untouched.
       const d = 24;
       const avg = (tg.getElevationFast(px + d, pz) + tg.getElevationFast(px - d, pz)
                  + tg.getElevationFast(px, pz + d) + tg.getElevationFast(px, pz - d)) * 0.25;
-      const convexSink = Math.min(10, Math.max(0, py - avg) * 1.15);   // sharper peaks undershoot more → sink more
+      const convexSink = Math.min(10, Math.max(0, py - avg) * 1.15);
       posV.set(px, py - 0.4 - convexSink, pz);
       Quaternion.RotationAxisToRef(up, hash2(px * 1.13 + 7, pz * 1.07 - 7) * Math.PI * 2, q);
       Matrix.ComposeToRef(scaleV, q, posV, mat);
@@ -684,18 +833,17 @@ export class ScatterService {
       const arr = groups[v][cgz * ncx + cgx]; mat.copyToArray(arr, arr.length);
     }
 
-    // One SHARED material + geometry TEMPLATE per variant (built once), then a hidden-template / per-chunk
-    // clone pattern: every chunk of a variant shares the variant's material (so still only V materials), but
-    // each chunk is its own mesh with its own bounds, so the frustum culls them independently.
-    let chunkMeshes = 0;
     for (let v = 0; v < V; v++) {
-      const info = this.beechImpostors[v];
-      const template = createCrossImpostor(scene, `far_beech_${v}`, info.tex, info.w, info.h, info.pad);
+      const info = imposts[v];
+      const template = createCrossImpostor(scene, `${name}_${v}`, info.tex, info.w, info.h, info.pad);
       template.isVisible = false;                    // the template never draws — it owns the shared geometry/material
       if (template.material) {
-        template.material.unfreeze();                // FarFade + haze need live per-frame uniform binds
-        new FarFadePlugin(template.material);
-        new ImpostorHazePlugin(template.material);    // aerial-perspective haze → recedes WITH the terrain (not vivid/dark)
+        template.material.unfreeze();                // fade + haze need live per-frame uniform binds
+        // DITHER dissolve (default) — billboards screen-door in/out by distance instead of growing/shrinking;
+        // legacy `ignis_lod_dissolve='0'` keeps the scale-collapse FarFade.
+        if (this.lodDissolve) { new LodDitherPlugin(template.material, appear); }
+        else { new FarFadePlugin(template.material); }
+        new ImpostorHazePlugin(template.material);    // aerial-perspective haze → recedes WITH the terrain
         this.sceneService.excludeFromPrePass(template.material);
       }
       this.sceneService.excludeFromGlow(template);
@@ -703,7 +851,7 @@ export class ScatterService {
       for (let ci = 0; ci < ncx * ncz; ci++) {
         const arr = groups[v][ci];
         if (!arr.length) { continue; }
-        const cm = template.clone(`far_beech_${v}_c${ci}`);
+        const cm = template.clone(`${name}_${v}_c${ci}`);
         cm.makeGeometryUnique();                      // independent thin-instance storage per chunk (mirrors ThinInstancePatch)
         cm.isVisible = true;
         cm.isPickable = false;
@@ -714,18 +862,49 @@ export class ScatterService {
         cm.freezeWorldMatrix();
         this.sceneService.excludeFromGlow(cm);
         this.farMeshes.push(cm);
-        chunkMeshes++;
       }
     }
   }
 
   /** A GLB tree sub-layer: full mesh near, crossed-quad impostor far, swapped per-patch by distance. */
-  private makeGlbLayer(full: Mesh, imp: Mesh, near: number, build: (cx: number, cz: number) => PatchData): Layer {
-    const manager = new PatchManager([imp, full], (patch) => {
+  /** Attach the near LoD transition to a tree (full, impostor) pair. DITHER path (default): the full mesh stays
+   *  SOLID (no fade) and the impostor screen-door dissolves — in across the cross-dissolve ring (revealing the
+   *  full mesh through the dither gaps) and out at the patch-cull edge — so nothing grows/shrinks. Legacy path
+   *  (`ignis_lod_dissolve='0'`): the old scale-collapse swap. */
+  private attachNearLod(full: Mesh, imp: Mesh): void {
+    if (this.lodDissolve) {
+      if (imp.material) { new LodDitherPlugin(imp.material, this.ringAppear, this.treeFade); }
+    } else {
+      new NearFadePlugin(full.material, false);
+      if (imp.material) { new NearFadePlugin(imp.material, true); }
+    }
+  }
+
+  private makeGlbLayer(full: Mesh, imp: Mesh, near: number, build: (cx: number, cz: number) => PatchData,
+                       crossDissolve = false): Layer {
+    const camDist = (patch: IPatch): number => {
       const c = this.sceneService.camera;
-      const d = c ? Vector3.Distance(patch.getPosition(), c.position) : Infinity;
-      return d < near ? 1 : 0;   // 1 = full (near), 0 = impostor (far)
-    }, [1, 1]);
+      return c ? Vector3.Distance(patch.getPosition(), c.position) : Infinity;
+    };
+    let manager: PatchManager;
+    if (crossDissolve && this.lodDissolve) {
+      // 3-state LoD: full only (inside ring) / BOTH (the transition ring → cross-dissolve) / impostor only (past
+      // ring). In the ring the patch materializes its impostor AND full clone on the same instance buffers; each
+      // carries NearFadePlugin (fade curves span the whole ring), so the billboard morphs into the 3D mesh.
+      const band = NearFadePlugin.params.band;
+      manager = new PatchManager([imp, full], (patch) => {
+        const d = camDist(patch);
+        if (d < near - band) { return 2; }   // full only (near)
+        if (d > near + band) { return 0; }   // impostor only (far)
+        return 1;                            // both → cross-dissolve ring
+      }, [1, 1, 1], (patch, level) => {
+        if (level === 2) { patch.createInstances(full); }
+        else if (level === 0) { patch.createInstances(imp); }
+        else { patch.createInstances(imp, 1, full); }   // ring: render both LoDs (NearFade fades each by distance)
+      });
+    } else {
+      manager = new PatchManager([imp, full], (patch) => camDist(patch) < near ? 1 : 0, [1, 1]);
+    }
     manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
     return { mat: full.material as Material, manager, patches: new Map(), build, baseMeshes: [imp, full] };
   }
@@ -737,17 +916,48 @@ export class ScatterService {
    *  -1 → keep every candidate), so the blobs are a single source of truth with the assets — one disc
    *  per palm/tree/rock/log. The `ShadowBlobPlugin` stretches each round disc away from the sun. */
   private registerShadows(scene: Scene): void {
-    // Soft radial-gradient alpha (opaque centre → transparent rim) → a vague blurry blob. Smooth multi-stop
-    // falloff at 128px = a wide diffuse penumbra (no hard ring), which reads far less like a flat decal.
-    const grad = new DynamicTexture('scatter_shadow_grad', 128, scene, false);
+    // DAPPLED CANOPY shadow (alpha): instead of a smooth grey ellipse, a broken-edged blob with radial frond
+    // streaks and light gaps punched through — so it reads as dappled tree shade, not a flat decal. Rotationally
+    // symmetric, so it still works with the ShadowBlobPlugin's sun-direction stretch (no per-frame UV rotation).
+    const S = 256, c = S / 2, R = S / 2 - 6;
+    const grad = new DynamicTexture('scatter_shadow_grad', S, scene, false);
     const ctx = grad.getContext() as CanvasRenderingContext2D;
-    const g = ctx.createRadialGradient(64, 64, 1, 64, 64, 63);
-    g.addColorStop(0.00, 'rgba(255,255,255,1.0)');
-    g.addColorStop(0.30, 'rgba(255,255,255,0.82)');
-    g.addColorStop(0.60, 'rgba(255,255,255,0.45)');
-    g.addColorStop(0.82, 'rgba(255,255,255,0.16)');
-    g.addColorStop(1.00, 'rgba(255,255,255,0.0)');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+    ctx.clearRect(0, 0, S, S);
+    const rnd = (() => { let s = 0x9e3779b9; return () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff); })();
+    // 1) base canopy on a WAVY (irregular) disc → no clean ring
+    const g = ctx.createRadialGradient(c, c, 2, c, c, R);
+    g.addColorStop(0.00, 'rgba(255,255,255,0.82)');
+    g.addColorStop(0.55, 'rgba(255,255,255,0.52)');
+    g.addColorStop(0.85, 'rgba(255,255,255,0.16)');
+    g.addColorStop(1.00, 'rgba(255,255,255,0.00)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    const N = 28;
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * Math.PI * 2;
+      const r = R * (0.80 + 0.18 * Math.sin(a * 5) + 0.06 * Math.sin(a * 11 + 1.3));
+      const x = c + Math.cos(a) * r, y = c + Math.sin(a) * r;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.closePath(); ctx.fill();
+    // 2) frond streaks — additive radial spokes (palm/canopy ribs), slightly past the edge
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * Math.PI * 2 + (rnd() - 0.5) * 0.25;
+      const r = R * (0.7 + rnd() * 0.45);
+      ctx.strokeStyle = `rgba(255,255,255,${0.10 + rnd() * 0.10})`;
+      ctx.lineWidth = 3 + rnd() * 5;
+      ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(c + Math.cos(a) * r, c + Math.sin(a) * r); ctx.stroke();
+    }
+    // 3) dapple — punch light gaps (sun through the leaves)
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000';
+    for (let i = 0; i < 60; i++) {
+      const a = rnd() * Math.PI * 2, rr = rnd() * R * 0.92;
+      ctx.globalAlpha = 0.12 + rnd() * 0.26;   // subtle light gaps — don't hollow the shadow out
+      ctx.beginPath(); ctx.arc(c + Math.cos(a) * rr, c + Math.sin(a) * rr, 2 + rnd() * 6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
     grad.update();
     grad.hasAlpha = true;
 
@@ -1338,6 +1548,21 @@ export class ScatterService {
     const grassRing = Math.min(ScatterService.GRASS_RING, this.RADIUS);
     GrassFadePlugin.fade.end   = (grassRing + 0.5) * this.PATCH;
     GrassFadePlugin.fade.start = Math.max(20, GrassFadePlugin.fade.end - 60);
+    // Palms/beeches dissolve at their OWN (full) draw radius — a fade ring across the last ~1 patch so the
+    // camera-following trees melt into the ground at the patch-cull edge instead of popping into a new spot. The
+    // band sits OUTSIDE the NearFade cross-dissolve RING (near+band), so the impostor reaches full size and
+    // finishes morphing in BEFORE the cull dissolve starts (no double-shrink mid-ring).
+    const ringOuter = NearFadePlugin.params.near + NearFadePlugin.params.band;
+    this.treeFade.end   = (this.RADIUS + 0.5) * this.PATCH;
+    // Prefer the last ~1 patch before the cull, but never start before the cross-dissolve ring ends; and at low
+    // quality (cull inside the ring) clamp so start < end (a reversed smoothstep band would mis-fade).
+    this.treeFade.start = Math.min(this.treeFade.end - 0.5 * this.PATCH,
+                                   Math.max(ringOuter, this.treeFade.end - this.PATCH));
+    // Far-coast billboards ramp IN exactly as the near ring's impostor dithers OUT at its cull edge (the coast
+    // now matches the near density, so it must be COMPLEMENTARY — start at the ring's far edge, full by the cull —
+    // else the [near, cull] zone would render the ring trees AND the coast = double density). Clamp start<end.
+    this.coastAppear.end   = (this.RADIUS + 0.5) * this.PATCH;
+    this.coastAppear.start = Math.min(ringOuter, this.coastAppear.end - 0.5 * this.PATCH);
   }
 
   /** Build one patch's beach rocks: scattered on the sand/low-dune band, mostly small with some

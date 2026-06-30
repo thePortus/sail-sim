@@ -39,6 +39,10 @@ export class GpuScatterPatch implements IPatch {
   private count = -1;
   /** The base mesh the LoD manager last asked for — materialized once the count says non-empty. */
   private pendingBase: Mesh | null = null;
+  /** Optional SECOND clone (cross-dissolve ring): a different LoD mesh bound to the SAME instance buffers,
+   *  so the impostor and full mesh render together over the transition ring. Null outside the ring. */
+  private secondaryMesh: Mesh | null = null;
+  private pendingSecondary: Mesh | null = null;
   private buffersFreed = false;
   /** Vertical bounds of the patch's terrain (sampled by the builder) for the culling box. */
   private readonly yMin: number;
@@ -82,61 +86,72 @@ export class GpuScatterPatch implements IPatch {
       return;
     }
     if (this.baseMesh) { this.applyCount(); }
-    else if (this.pendingBase) { this.materialize(this.pendingBase); }
+    else if (this.pendingBase) {
+      this.baseMesh = this.makeClone(this.pendingBase);
+      if (this.pendingSecondary) { this.secondaryMesh = this.makeClone(this.pendingSecondary); }
+    }
   }
 
   private applyCount(): void {
-    if (!this.baseMesh) { return; }
-    (this.baseMesh as unknown as { _thinInstanceDataStorage: { instancesCount: number } })
-      ._thinInstanceDataStorage.instancesCount = Math.max(0, this.count);
+    const n = Math.max(0, this.count);
+    for (const m of [this.baseMesh, this.secondaryMesh]) {
+      if (m) { (m as unknown as { _thinInstanceDataStorage: { instancesCount: number } })._thinInstanceDataStorage.instancesCount = n; }
+    }
   }
 
   clearInstances(): void {
-    if (this.baseMesh === null) { return; }
-    this.baseMesh.dispose();
-    this.baseMesh = null;
+    if (this.baseMesh) { this.baseMesh.dispose(); this.baseMesh = null; }
+    if (this.secondaryMesh) { this.secondaryMesh.dispose(); this.secondaryMesh = null; }
   }
 
   /** LoD swaps re-call this with the other base mesh — the GPU buffers (and count) persist and are
    *  simply rebound onto the new clone, so a swap costs no dispatch and no readback. Before the
    *  count readback lands (count < 0) this only RECORDS the base mesh; known-empty patches
    *  (count 0, buffers freed) never materialize at all. */
-  createInstances(baseMesh: TransformNode, _fraction = 1): void {
+  createInstances(baseMesh: TransformNode, _fraction = 1, secondary?: TransformNode): void {
     this.clearInstances();
     if (!(baseMesh instanceof Mesh)) {
       throw new Error('GpuScatterPatch requires a Mesh base.');
     }
     this.pendingBase = baseMesh;
-    if (this.count > 0 && !this.buffersFreed) { this.materialize(baseMesh); }
+    this.pendingSecondary = (secondary instanceof Mesh) ? secondary : null;
+    if (this.count > 0 && !this.buffersFreed) {
+      this.baseMesh = this.makeClone(baseMesh);
+      if (this.pendingSecondary) { this.secondaryMesh = this.makeClone(this.pendingSecondary); }
+    }
   }
 
-  private materialize(base: Mesh): void {
-    this.baseMesh = base.clone(base.name + '_gpatch');
-    this.baseMesh.makeGeometryUnique();
-    this.baseMesh.isVisible = true;
+  /** Clone a base LoD mesh and bind it to this patch's compute-written instance buffers. Both the primary
+   *  and the cross-dissolve secondary go through here, sharing the SAME mats/cols buffers. */
+  private makeClone(base: Mesh): Mesh {
+    const mesh = base.clone(base.name + '_gpatch');
+    mesh.makeGeometryUnique();
+    mesh.isVisible = true;
 
     // Bootstrap the thin-instance plumbing (renderer flags, instanced state), then point the
     // world0..3 + color kinds at the compute-written buffers.
-    this.baseMesh.thinInstanceSetBuffer('matrix', GpuScatterPatch.BOOTSTRAP, 16, true);
+    mesh.thinInstanceSetBuffer('matrix', GpuScatterPatch.BOOTSTRAP, 16, true);
     for (let i = 0; i < 4; i++) {
-      this.baseMesh.setVerticesBuffer(this.matsBuf.createVertexBuffer('world' + i, i * 4, 4));
+      mesh.setVerticesBuffer(this.matsBuf.createVertexBuffer('world' + i, i * 4, 4));
     }
     if (this.withColor) {
-      this.baseMesh.setVerticesBuffer(this.colsBuf.createVertexBuffer('color', 0, 4));
+      mesh.setVerticesBuffer(this.colsBuf.createVertexBuffer('color', 0, 4));
     }
-    this.applyCount();
+    (mesh as unknown as { _thinInstanceDataStorage: { instancesCount: number } })
+      ._thinInstanceDataStorage.instancesCount = Math.max(0, this.count);
 
     // Instances sit at world positions inside the patch square while the clone stays at the origin —
     // give the mesh the patch's real world AABB so frustum culling works (CPU can't derive it from
     // GPU-resident matrices; ThinInstancePatch's refreshBoundingInfo equivalent).
     const p = this.position, h = this.halfExtent;
-    this.baseMesh.setBoundingInfo(new BoundingInfo(
+    mesh.setBoundingInfo(new BoundingInfo(
       new Vector3(p.x - h, this.yMin, p.z - h),
       new Vector3(p.x + h, this.yMax, p.z + h),
     ));
-    this.baseMesh.isPickable = false;
-    this.baseMesh.doNotSyncBoundingInfo = true;
-    this.baseMesh.freezeWorldMatrix();
+    mesh.isPickable = false;
+    mesh.doNotSyncBoundingInfo = true;
+    mesh.freezeWorldMatrix();
+    return mesh;
   }
 
   /** Drop the GPU buffers of a confirmed-empty (or disposed) patch. Idempotent. */
@@ -157,6 +172,7 @@ export class GpuScatterPatch implements IPatch {
   dispose(): void {
     this.clearInstances();
     this.pendingBase = null;
+    this.pendingSecondary = null;
     this.freeBuffers();
   }
 }

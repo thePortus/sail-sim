@@ -167,6 +167,52 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glfw3webgpu)
 
+# ── Dear ImGui (immediate-mode UI: login screen, HUD) ───────────────────────
+# ImGui ships only sources (no CMakeLists), so we compile it ourselves as a
+# static lib from the core + the GLFW and WebGPU backends. v1.90.9 targets the
+# classic (pre-WGPUStringView) webgpu.h that matches wgpu-native v0.19.
+FetchContent_Declare(
+  imgui
+  GIT_REPOSITORY https://github.com/ocornut/imgui
+  GIT_TAG        v1.90.9
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  do_not_configure
+)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+  "${imgui_SOURCE_DIR}/imgui.cpp"
+  "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+  "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+  "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+  "${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
+  "${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp"
+)
+target_include_directories(imgui PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+target_link_libraries(imgui PUBLIC glfw webgpu)
+# Tell the WebGPU backend which webgpu.h flavour we build against.
+target_compile_definitions(imgui PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_WGPU)
+target_compile_options(imgui PRIVATE -w)   # third-party; don't fail our warnings
+
+# ── cpp-httplib (header-only HTTP client for the auth REST calls) ────────────
+FetchContent_Declare(
+  httplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib
+  GIT_TAG        v0.16.3
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  do_not_configure
+)
+FetchContent_MakeAvailable(httplib)
+
+# ── nlohmann/json (header-only JSON parse/serialise) ────────────────────────
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json
+  GIT_TAG        v3.11.3
+  GIT_SHALLOW    ON
+)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Embed each WGSL file as a C header at configure time — single source of truth
 # is the .wgsl file. Uses a raw string literal so no escaping is needed;
 # reconfigure after editing a .wgsl.
@@ -187,6 +233,7 @@ add_executable(sailsim_native
   src/gltf_mesh.cpp
   src/ktx2.cpp
   src/ocean_fft.cpp
+  src/net_auth.cpp
   src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
@@ -199,13 +246,14 @@ set_source_files_properties(src/ktx2.cpp
 target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
 
 target_include_directories(sailsim_native PRIVATE
-  "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder" "${stb_SOURCE_DIR}")
+  "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder" "${stb_SOURCE_DIR}"
+  "${httplib_SOURCE_DIR}")
 get_filename_component(SAILSIM_SHIP_MODEL_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
 target_compile_definitions(sailsim_native PRIVATE
   SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
   SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}")
-target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm)
+target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on
 # the backend (e.g. wgpuDeviceTick vs wgpuDevicePoll). It is set on the `webgpu`

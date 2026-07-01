@@ -45,6 +45,7 @@ public:
 
   ConnState state() const;
   std::string myId() const;
+  std::string ownedShip() const;   // our vessel slug from the server "wallet" message
 
   void sendUpdate(const PlayerUpdate& u, uint32_t seq);   // fire-and-forget
 

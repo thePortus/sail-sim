@@ -21,8 +21,17 @@ sky + ship) complete the water. **Arrow keys / WASD** steer and trim sail; a cha
 and the ocean grid follows the ship so it sails freely. The hull's heave and tilt are driven by the
 **real FFT surface** — each frame the cascade displacement textures are read back to the CPU and
 sampled at the ship's position (summed cascades for height, central differences for the normal), so
-the ship rides the very waves it's floating in. Screenshots via `SAILSIM_SHOT=out.png`. Windows/D3D12 and the game
-systems (combat, economy, multiplayer, UI) are the road ahead.
+the ship rides the very waves it's floating in. Screenshots via `SAILSIM_SHOT=out.png`.
+
+You **sign in and sail online.** A **Dear ImGui** UI (Inter + Cinzel fonts) provides the login /
+register screen and in-game HUD; auth is the server's JWT flow (`/user/login`, `/user/register`,
+`/user/me`), with an optional **remembered session**. Gameplay runs over a **WebSocket** to the server
+(`mp::Client`, IXWebSocket): it adopts your **server-authoritative vessel** from the `wallet` message
+(pinnace / sloop / brig / merchantman — not assumed), streams your pose at ~10 Hz, and renders **every
+remote player's ship** at their real position, each hull drawn from its own `vesselSlug`. Vessels are
+loaded lazily by slug and drawn as instances of shared geometry via **dynamic uniform offsets** — one
+draw per ship, so per-ship animation (cannons, masts) can be layered on later. Windows/D3D12 and the
+deeper game systems (combat, economy, chat) are the road ahead.
 
 ## What this builds
 

@@ -16,6 +16,7 @@ struct Client::Impl {
   mutable std::mutex mtx;
   std::atomic<ConnState> conn{ ConnState::Idle };
   std::string myId;
+  std::string ownedShip;
   std::map<std::string, RemotePlayer> players;
   WaveState wave;
 
@@ -57,6 +58,8 @@ struct Client::Impl {
       wave.windSpeed   = msg.value("windSpeed", 0.0f);
       wave.beaufort    = msg.value("beaufort", 0);
       wave.t           = msg.value("t", 0.0f);
+    } else if (type == "wallet") {
+      ownedShip = msg.value("ship", ownedShip);   // server-authoritative owned hull
     }
     // combat / chat / economy message types are handled as game systems land.
   }
@@ -91,6 +94,7 @@ void Client::connect(const std::string& host, int port, const std::string& token
     }
   });
   p_->ws.disableAutomaticReconnection();
+  p_->ws.setPingInterval(2);   // protocol-level keepalive (server auto-pongs)
   p_->ws.start();
 }
 
@@ -107,6 +111,11 @@ ConnState Client::state() const { return p_->conn.load(); }
 std::string Client::myId() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->myId;
+}
+
+std::string Client::ownedShip() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->ownedShip;
 }
 
 void Client::sendUpdate(const PlayerUpdate& u, uint32_t seq) {

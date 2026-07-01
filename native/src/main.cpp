@@ -28,6 +28,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <future>
 #include <chrono>
 #include <thread>
@@ -151,6 +152,10 @@ struct MeshUniforms {
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
 // pipeline, buffers, decoded textures, and one bind group per texture; draws as a
 // sequence of submeshes, each selecting its material's base-colour texture.
+// How many ships (you + remote players) one vessel mesh can draw per frame via
+// dynamic uniform offsets. Each instance uses one aligned MeshUniforms slot.
+static constexpr uint32_t kMaxShipInstances = 64;
+
 struct Mesh {
   WGPURenderPipeline           pipeline;
   WGPUBuffer                   vbuf, ibuf, uniformBuf;
@@ -160,6 +165,11 @@ struct Mesh {
   std::vector<WGPUTextureView> views;        // aligned with textures
   std::vector<WGPUBindGroup>   bindGroups;   // one per submesh
   std::vector<Submesh>         submeshes;
+  uint32_t                     uniformStride = 0;   // bytes between per-ship uniform slots
+  // Placement, computed at load from the model's bounds (see loadVessel).
+  float     shipScale = 1.0f;
+  float     draft = 0.0f;
+  glm::vec3 keelCenter = glm::vec3(0.0f);
 };
 
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, const MeshData& data) {
@@ -178,8 +188,12 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   mesh.ibuf = wgpuDeviceCreateBuffer(device, &ibd);
   wgpuQueueWriteBuffer(queue, mesh.ibuf, 0, data.indices.data(), ibd.size);
 
+  // One uniform slot per ship instance, at a 256-byte-aligned stride so each can be
+  // selected by a dynamic bind-group offset (min offset alignment is 256).
+  mesh.uniformStride = (uint32_t)((sizeof(MeshUniforms) + 255u) & ~size_t(255u));
   WGPUBufferDescriptor ubd = {};
-  ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; ubd.size = sizeof(MeshUniforms);
+  ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+  ubd.size = (uint64_t)mesh.uniformStride * kMaxShipInstances;
   mesh.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
@@ -193,6 +207,7 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   WGPUBindGroupLayoutEntry ble[5] = {};
   ble[0].binding = 0; ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   ble[0].buffer.type = WGPUBufferBindingType_Uniform;
+  ble[0].buffer.hasDynamicOffset = true;   // select the per-ship slot at draw time
   for (int i = 1; i <= 3; ++i) {
     ble[i].binding = (uint32_t)i; ble[i].visibility = WGPUShaderStage_Fragment;
     ble[i].texture.sampleType = WGPUTextureSampleType_Float;
@@ -306,6 +321,42 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
 
   wgpuBindGroupLayoutRelease(bgl);
   return mesh;
+}
+
+// Load a vessel GLB and derive its on-water placement — a uniform scale to a
+// consistent size, the keel origin (X/Z centred, lowest point to y=0), and a
+// beam-based draught so the hull sits low in the water. Falls back to a cube.
+static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt, const std::string& path) {
+  MeshData data = loadGltfMesh(path.c_str());
+  if (!data.ok) data = makeCubeMesh();
+  glm::vec3 bbMin(data.bbMin[0], data.bbMin[1], data.bbMin[2]);
+  glm::vec3 bbMax(data.bbMax[0], data.bbMax[1], data.bbMax[2]);
+  glm::vec3 center = 0.5f * (bbMin + bbMax);
+  glm::vec3 extent = bbMax - bbMin;
+  float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
+  float fit = (maxExtent > 1e-6f) ? (2.0f / maxExtent) : 1.0f;
+  Mesh mesh = createMesh(device, queue, fmt, data);
+  mesh.shipScale  = fit * 3.0f;
+  mesh.keelCenter = glm::vec3(center.x, bbMin.y, center.z);
+  mesh.draft      = 0.53f * std::min(extent.x, extent.z) * mesh.shipScale;   // see JS floatDraft
+  return mesh;
+}
+
+// Vessel slug -> GLB path (mirrors server/controllers/vessels.controller.js). The
+// ship GLBs sit beside the baked SAILSIM_SHIP_MODEL (…/server/assets/geometry/).
+static std::string geometryDir() {
+  std::string m = SAILSIM_SHIP_MODEL;
+  size_t slash = m.find_last_of('/');
+  return slash == std::string::npos ? std::string(".") : m.substr(0, slash);
+}
+static std::string glbForSlug(const std::string& slug) {
+  std::string file =
+      slug == "sloop"       ? "bermuda_sloop_rigged.glb" :
+      slug == "brig"        ? "brig.glb" :
+      slug == "merchantman" ? "merchantman.glb" :
+      slug == "pinnace"     ? "pinnace.glb" :
+                              "pinnace.glb";   // starter hull is the safe fallback
+  return geometryDir() + "/" + file;
 }
 
 // Ocean camera uniform (shared by the ocean surface).
@@ -741,38 +792,26 @@ int main(int argc, char** argv) {
   std::printf("[spike] surface configured: %dx%d format=%d — entering render loop\n",
               fbWidth, fbHeight, (int)surfaceFormat);
 
-  // Phase 1: load the model — explicit arg, else the ship, else the rock, else a cube.
-  MeshData meshData;
-  if (modelArg) {
-    meshData = loadGltfMesh(modelArg);
-  } else {
-    meshData = loadGltfMesh(SAILSIM_SHIP_MODEL);                    // default: the merchantman
-    if (!meshData.ok) meshData = loadGltfMesh(SAILSIM_ASSET_DIR "/rock_e.glb");
+  // Vessels are loaded lazily by slug and cached — you and remote players share a
+  // hull's geometry (one copy), each drawn as its own instance. The owned hull is
+  // server-authoritative (arrives in the "wallet" message); a command-line/env
+  // model override (SAILSIM_MODEL / argv[1]) forces a specific GLB for testing.
+  std::map<std::string, Mesh> vessels;
+  auto vesselFor = [&](const std::string& slug) -> Mesh& {
+    auto it = vessels.find(slug);
+    if (it != vessels.end()) return it->second;
+    std::string path = glbForSlug(slug);
+    std::printf("[vessel] loading '%s' <- %s\n", slug.c_str(), path.c_str());
+    auto res = vessels.emplace(slug, loadVessel(device, queue, surfaceFormat, path));
+    return res.first->second;
+  };
+  std::string ownVesselSlug;
+  const bool ownVesselForced = (modelArg != nullptr);
+  if (ownVesselForced) {
+    vessels.emplace("__cli", loadVessel(device, queue, surfaceFormat, modelArg));
+    ownVesselSlug = "__cli";
   }
-  if (!meshData.ok) {
-    std::printf("[spike] no model loaded — falling back to a cube\n");
-    meshData = makeCubeMesh();
-  }
-  // Centre the model at the origin and scale it to a consistent on-screen size,
-  // so any asset frames nicely regardless of its authored units.
-  glm::vec3 bbMin(meshData.bbMin[0], meshData.bbMin[1], meshData.bbMin[2]);
-  glm::vec3 bbMax(meshData.bbMax[0], meshData.bbMax[1], meshData.bbMax[2]);
-  glm::vec3 center = 0.5f * (bbMin + bbMax);
-  glm::vec3 extent = bbMax - bbMin;
-  float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
-  float fit = (maxExtent > 1e-6f) ? (2.0f / maxExtent) : 1.0f;
-  const float shipScale = fit * 3.0f;
-  // Place by the keel (X/Z centred, lowest point to y=0), not the bbox centre —
-  // otherwise a tall-masted hull's centre sits up in the rigging and the hull
-  // sinks. Draft is beam-based so it's robust to mast height.
-  const glm::vec3 keelCenter(center.x, bbMin.y, center.z);
-  // Draught mirrors the JS vessels: the merchantman is the heaviest hull (weight 6500,
-  // floatDraft -3.8 m on a 7.2 m beam ~= 0.53*beam), so it sits deep and low in the
-  // water rather than riding on top. Beam-based, robust to the model's authored scale.
-  const float beam = std::min(extent.x, extent.z) * shipScale;
-  const float draft = 0.53f * beam;
 
-  Mesh mesh = createMesh(device, queue, surfaceFormat, meshData);
   Ocean ocean = createOcean(device, queue, surfaceFormat);
   Sky sky = createSky(device, surfaceFormat);
 
@@ -1130,23 +1169,47 @@ int main(int argc, char** argv) {
     glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 
-    // Ship world transform (used by BOTH the reflection and main passes): at its
-    // sailed position, heave to the wave surface, tilt to its normal, yaw to heading.
-    // Surface normal from central differences of the FFT height field (~2 m step).
-    const float e = 2.0f;
-    float hgx = fftHeight(shipX + e, shipZ) - fftHeight(shipX - e, shipZ);
-    float hgz = fftHeight(shipX, shipZ + e) - fftHeight(shipX, shipZ - e);
-    glm::vec3 up = glm::normalize(glm::vec3(-hgx / (2.0f * e), 1.0f, -hgz / (2.0f * e)));
-    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, shipY - draft, shipZ));
-    glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
-    float axisLen = glm::length(axis);
-    if (axisLen > 1e-5f) {
-      float tiltAngle = std::asin(glm::clamp(axisLen, 0.0f, 1.0f));
-      model = model * glm::rotate(glm::mat4(1.0f), tiltAngle, axis / axisLen);
+    // Our hull is server-authoritative — adopt the slug from the "wallet" message
+    // (unless a CLI/env model override forced one).
+    if (!ownVesselForced) {
+      std::string s = mpClient.ownedShip();
+      if (!s.empty()) ownVesselSlug = s;
     }
-    model = glm::rotate(model, shipHeading + kBowYaw, glm::vec3(0, 1, 0));
-    model = glm::scale(model, glm::vec3(shipScale));
-    model = glm::translate(model, -keelCenter);
+
+    // Place a ship on the wave field: heave to the surface, tilt to its normal
+    // (central differences of the FFT height, ~2 m step), yaw to heading, then
+    // scale + keel-align per that hull.
+    auto shipModel = [&](float x, float z, float heading, const Mesh& m) {
+      float y = fftHeight(x, z);
+      const float ee = 2.0f;
+      float gx = fftHeight(x + ee, z) - fftHeight(x - ee, z);
+      float gz = fftHeight(x, z + ee) - fftHeight(x, z - ee);
+      glm::vec3 up = glm::normalize(glm::vec3(-gx / (2.0f * ee), 1.0f, -gz / (2.0f * ee)));
+      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(x, y - m.draft, z));
+      glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
+      float axisLen = glm::length(axis);
+      if (axisLen > 1e-5f)
+        mm = mm * glm::rotate(glm::mat4(1.0f), std::asin(glm::clamp(axisLen, 0.0f, 1.0f)), axis / axisLen);
+      mm = glm::rotate(mm, heading + kBowYaw, glm::vec3(0, 1, 0));
+      mm = glm::scale(mm, glm::vec3(m.shipScale));
+      mm = glm::translate(mm, -m.keelCenter);
+      return mm;
+    };
+
+    // Draw list: our ship first (so it takes reflection slot 0), then remote players.
+    struct ShipInst { Mesh* mesh; glm::mat4 model; };
+    std::vector<ShipInst> ships;
+    Mesh* ownMesh = nullptr;
+    if (sailing && !ownVesselSlug.empty()) {
+      ownMesh = &vesselFor(ownVesselSlug);
+      ships.push_back({ ownMesh, shipModel(shipX, shipZ, shipHeading, *ownMesh) });
+    }
+    if (sailing) {
+      for (const mp::RemotePlayer& rp : mpClient.players()) {
+        Mesh& rmv = vesselFor(rp.vesselSlug.empty() ? "pinnace" : rp.vesselSlug);
+        ships.push_back({ &rmv, shipModel(rp.x, rp.z, rp.heading, rmv) });
+      }
+    }
 
     const glm::vec3 sun(0.5f, 1.0f, 0.4f);
 
@@ -1159,8 +1222,10 @@ int main(int argc, char** argv) {
       glm::vec3 reflEye(eye.x, -eye.y, eye.z);
       SkyUniform rs{ glm::inverse(reflVP), glm::vec4(reflEye, 1.0f), glm::vec4(sun, 0.0f) };
       wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
-      MeshUniforms rm{ reflVP * model, model, glm::vec4(reflEye, 1.0f) };
-      wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &rm, sizeof(rm));
+      if (ownMesh) {
+        MeshUniforms rm{ reflVP * ships[0].model, ships[0].model, glm::vec4(reflEye, 1.0f) };
+        wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
+      }
 
       WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
       WGPURenderPassColorAttachment rc = {};
@@ -1174,12 +1239,15 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderSetPipeline(rp, sky.pipeline);
       wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
       wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-      wgpuRenderPassEncoderSetPipeline(rp, mesh.pipeline);
-      wgpuRenderPassEncoderSetVertexBuffer(rp, 0, mesh.vbuf, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetIndexBuffer(rp, mesh.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-      for (size_t i = 0; i < mesh.submeshes.size(); ++i) {
-        wgpuRenderPassEncoderSetBindGroup(rp, 0, mesh.bindGroups[i], 0, nullptr);
-        wgpuRenderPassEncoderDrawIndexed(rp, mesh.submeshes[i].indexCount, 1, mesh.submeshes[i].indexOffset, 0, 0);
+      if (ownMesh) {
+        uint32_t zeroOff = 0;
+        wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
+        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(rp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
+          wgpuRenderPassEncoderSetBindGroup(rp, 0, ownMesh->bindGroups[i], 1, &zeroOff);
+          wgpuRenderPassEncoderDrawIndexed(rp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
+        }
       }
       wgpuRenderPassEncoderEnd(rp);
       wgpuRenderPassEncoderRelease(rp);
@@ -1196,8 +1264,19 @@ int main(int argc, char** argv) {
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f) };
     wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));
-    MeshUniforms u{ viewProj * model, model, glm::vec4(eye, 1.0f) };
-    wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &u, sizeof(u));
+    // Every ship's uniforms into its vessel's dynamic-offset slots (same per-mesh
+    // ordering as the draw loop below, so slot indices line up).
+    {
+      std::map<Mesh*, uint32_t> slot;
+      for (const ShipInst& s : ships) {
+        uint32_t idx = slot[s.mesh];
+        if (idx >= kMaxShipInstances) continue;
+        MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f) };
+        wgpuQueueWriteBuffer(queue, s.mesh->uniformBuf,
+                             (uint64_t)idx * s.mesh->uniformStride, &mu, sizeof(mu));
+        slot[s.mesh] = idx + 1;
+      }
+    }
 
     WGPUSurfaceTexture surfaceTex;
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
@@ -1261,14 +1340,24 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderSetIndexBuffer(pass, ocean.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderDrawIndexed(pass, ocean.indexCount, 1, 0, 0, 0);
 
-    // Ship.
-    wgpuRenderPassEncoderSetPipeline(pass, mesh.pipeline);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, mesh.vbuf, 0, WGPU_WHOLE_SIZE);
-    wgpuRenderPassEncoderSetIndexBuffer(pass, mesh.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-    for (size_t i = 0; i < mesh.submeshes.size(); ++i) {
-      const Submesh& sm = mesh.submeshes[i];
-      wgpuRenderPassEncoderSetBindGroup(pass, 0, mesh.bindGroups[i], 0, nullptr);
-      wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+    // Ships: one draw per instance, each selecting its uniform slot via dynamic offset.
+    {
+      std::map<Mesh*, uint32_t> slot;
+      for (const ShipInst& s : ships) {
+        Mesh* m = s.mesh;
+        uint32_t idx = slot[m];
+        if (idx >= kMaxShipInstances) continue;
+        uint32_t dynOff = idx * m->uniformStride;
+        wgpuRenderPassEncoderSetPipeline(pass, m->pipeline);
+        wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        for (size_t i = 0; i < m->submeshes.size(); ++i) {
+          const Submesh& sm = m->submeshes[i];
+          wgpuRenderPassEncoderSetBindGroup(pass, 0, m->bindGroups[i], 1, &dynOff);
+          wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+        }
+        slot[m] = idx + 1;
+      }
     }
     }  // end if (sailing) scene draws
     // Dear ImGui overlay (login / HUD) draws last, over the scene.
@@ -1319,15 +1408,18 @@ int main(int argc, char** argv) {
   wgpuBufferRelease(ocean.ibuf);
   wgpuBufferRelease(ocean.uniformBuf);
   wgpuShaderModuleRelease(ocean.module);
-  wgpuRenderPipelineRelease(mesh.pipeline);
-  for (WGPUBindGroup bg : mesh.bindGroups) wgpuBindGroupRelease(bg);
-  for (WGPUTextureView v : mesh.views) wgpuTextureViewRelease(v);
-  for (WGPUTexture t : mesh.textures) wgpuTextureRelease(t);
-  wgpuSamplerRelease(mesh.sampler);
-  wgpuBufferRelease(mesh.vbuf);
-  wgpuBufferRelease(mesh.ibuf);
-  wgpuBufferRelease(mesh.uniformBuf);
-  wgpuShaderModuleRelease(mesh.module);
+  for (auto& kv : vessels) {
+    Mesh& m = kv.second;
+    wgpuRenderPipelineRelease(m.pipeline);
+    for (WGPUBindGroup bg : m.bindGroups) wgpuBindGroupRelease(bg);
+    for (WGPUTextureView v : m.views) wgpuTextureViewRelease(v);
+    for (WGPUTexture t : m.textures) wgpuTextureRelease(t);
+    wgpuSamplerRelease(m.sampler);
+    wgpuBufferRelease(m.vbuf);
+    wgpuBufferRelease(m.ibuf);
+    wgpuBufferRelease(m.uniformBuf);
+    wgpuShaderModuleRelease(m.module);
+  }
   ImGui_ImplWGPU_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();

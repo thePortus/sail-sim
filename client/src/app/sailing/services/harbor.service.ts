@@ -68,6 +68,23 @@ export class HarborService {
   private _townShadowDisc: Mesh | null = null;
   private _townShadowMat: StandardMaterial | null = null;
   private _blobTownId: string | null = null;        // which streamed town currently owns the blobs
+  // REAL building shadows (default): the CLOSEST streamed (mesh, not impostor) town casts into the sun's CSG — its
+  // ground (square/roads) + the terrain RECEIVE, so the town throws directional shadows. To keep it CHEAP the caster
+  // is NOT the real (high-poly, multi-submesh) buildings — that tanked FPS (each ×3 cascades) — but a single merged
+  // BOX PROXY: one axis-aligned box per building (its bounding box), all in ONE ~80-vertex mesh = 1 caster, 1 draw
+  // per cascade for the whole town. The proxy is invisible to the CAMERA via a layerMask outside the camera's mask
+  // (the shadow map has an explicit renderList so it skips the layerMask check — verified in ObjectRenderer), yet
+  // still casts. Just ONE town at a time. Opt-out `ignis_town_shadows='0'` → fall back to the fake blob discs.
+  private readonly townRealShadows = (() => { try { return localStorage.getItem('ignis_town_shadows') !== '0'; } catch { return true; } })();
+  private static readonly SHADOW_PROXY_MASK = 0x10000000;   // bit 28 — outside the default camera mask 0x0FFFFFFF
+  // The real proxy shadow is discarded by the CSG past ~150 m (shadowMaxZ); beyond this the nearest town falls back
+  // to the cheap fake blob discs so its shadows continue out to the full mesh range with NO scene-wide shadow cost.
+  // Biased a little inside the ~150 m cull (camera-vs-ship slack) so the two overlap briefly rather than leaving a
+  // gap where the shadow vanishes on the hand-off. Tunable.
+  private static readonly SHADOW_FAR2 = 120 * 120;
+  private _shadowTownId: string | null = null;       // which streamed town currently casts real shadows
+  private _townShadowProxy: Mesh | null = null;      // its merged box-proxy caster (invisible; sun CSG only)
+  private _townShadowProxyMat: StandardMaterial | null = null;   // shared opaque depth material for the proxy
   private _blobSunAcc = 1;                            // throttles the night-fade alpha recompute
   private readonly _blobQ = Quaternion.Identity();   // identity — the plugin orients the disc in local space
   private readonly _blobPos = new Vector3();
@@ -268,7 +285,7 @@ export class HarborService {
    *  real meshes are resident (townNodes) are candidates — so blobs never show under the distant LOD impostors. */
   private updateTownBlobs(): void {
     const scene = this.sceneService.scene;
-    if (!scene || !HarborService.TOWN_BLOBS) return;
+    if (!scene) return;
     const p = this.vesselService.getPosition();
     let nearestId: string | null = null, best = Infinity;
     for (const h of this.harbors) {
@@ -276,11 +293,95 @@ export class HarborService {
       const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
       if (d2 < best) { best = d2; nearestId = h.id; }
     }
-    // No change AND already built → nothing to do.
-    if (nearestId === this._blobTownId && (nearestId === null || this._townShadowDisc?.isVisible)) return;
-    this._blobTownId = nearestId;
-    if (nearestId) { this.ensureTownShadowAssets(scene); this.buildTownBlobsFor(nearestId); }
+    // Real shadows (default): the nearest streamed town casts a real proxy shadow NEAR (the CSG discards it past
+    // ~150 m), and the cheap fake blob discs fill the FAR band so shadows continue to the full mesh range with no
+    // scene-wide shadow cost. Both run; the distance split (SHADOW_FAR2) keeps them from doubling up much.
+    if (this.townRealShadows && this.sceneService.shadowGenerator) {
+      this.updateTownRealShadows(nearestId);
+      const farTown = (HarborService.TOWN_BLOBS && nearestId && best > HarborService.SHADOW_FAR2) ? nearestId : null;
+      this.setBlobTown(scene, farTown);
+      return;
+    }
+    if (!HarborService.TOWN_BLOBS) return;
+    this.setBlobTown(scene, nearestId);   // blobs-everywhere fallback (real shadows opted out)
+  }
+
+  /** (Re)build the fake blob discs for `blobTown` (or clear when null), skipping the rebuild when unchanged. */
+  private setBlobTown(scene: Scene, blobTown: string | null): void {
+    if (blobTown === this._blobTownId && (blobTown === null || this._townShadowDisc?.isVisible)) return;
+    this._blobTownId = blobTown;
+    if (blobTown) { this.ensureTownShadowAssets(scene); this.buildTownBlobsFor(blobTown); }
     else { this.clearTownBlobs(); }
+  }
+
+  /** Build a cheap box-proxy caster for the nearest streamed town (and unwind the previous town's). Gated so it
+   *  auto-drops past the shadow-distance cull — a resident but far town costs nothing. One town at a time. */
+  private updateTownRealShadows(nearestId: string | null): void {
+    if (nearestId === this._shadowTownId) return;
+    this.detachTownShadowCasters();
+    this._shadowTownId = nearestId;
+    if (!nearestId) return;
+    const node = this.townNodes.get(nearestId);
+    if (!node) { this._shadowTownId = null; return; }
+    const proxy = this.buildTownShadowProxy(node, nearestId);
+    if (proxy) { this._townShadowProxy = proxy; this.sceneService.addGatedShadowCaster(proxy); }
+  }
+
+  /** Pull this town's proxy back out of the sun CSG + dispose it (nearest-town change, eviction, or teardown). */
+  private detachTownShadowCasters(): void {
+    if (this._townShadowProxy) {
+      this.sceneService.removeGatedShadowCaster(this._townShadowProxy);
+      this._townShadowProxy.dispose();
+      this._townShadowProxy = null;
+    }
+    this._shadowTownId = null;
+  }
+
+  /** One merged mesh = an axis-aligned box per building (its world bounding box). Invisible to the camera (layerMask
+   *  outside the camera's mask) but cast into the shadow map — so the whole town is a single low-poly shadow caster
+   *  instead of dozens of high-poly building submeshes ×3 cascades. Verts are built RELATIVE to the town centre and
+   *  the mesh is anchored there, so `absolutePosition` is the town (the gated-caster cull measures the right
+   *  distance) — a mesh at the origin with world-baked verts would be culled whenever the player nears the town. */
+  private buildTownShadowProxy(node: TransformNode, townId: string): Mesh | null {
+    const scene = this.sceneService.scene;
+    if (!scene) return null;
+    // Pass 1: collect each building's world AABB + the town's overall bounds (→ anchor centre).
+    const boxes: { mnx: number; mny: number; mnz: number; mxx: number; mxy: number; mxz: number }[] = [];
+    let lox = Infinity, loz = Infinity, hix = -Infinity, hiz = -Infinity;
+    for (const bp of node.getChildTransformNodes(true)) {
+      if (!bp.name.startsWith('b_')) continue;                       // building parents only (not the ground)
+      const bb = bp.getHierarchyBoundingVectors(true);               // world-space AABB of this building
+      const mn = bb.min, mx = bb.max;
+      if (!(mx.x > mn.x && mx.y > mn.y && mx.z > mn.z)) continue;
+      boxes.push({ mnx: mn.x, mny: mn.y, mnz: mn.z, mxx: mx.x, mxy: mx.y, mxz: mx.z });
+      lox = Math.min(lox, mn.x); loz = Math.min(loz, mn.z); hix = Math.max(hix, mx.x); hiz = Math.max(hiz, mx.z);
+    }
+    if (!boxes.length) return null;
+    const ax = (lox + hix) * 0.5, az = (loz + hiz) * 0.5;            // town-centre anchor (Y stays 0 — verts carry it)
+    const pos: number[] = [], idx: number[] = [];
+    // Box faces (winding irrelevant to the depth-only shadow pass; a closed convex box silhouettes either way).
+    const FACES = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0];
+    let base = 0;
+    for (const b of boxes) {
+      const x0 = b.mnx - ax, x1 = b.mxx - ax, z0 = b.mnz - az, z1 = b.mxz - az, y0 = b.mny, y1 = b.mxy;
+      pos.push(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1,       // bottom 0-3
+               x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1);      // top 4-7
+      for (const v of FACES) idx.push(base + v);
+      base += 8;
+    }
+    const vd = new VertexData();
+    vd.positions = pos; vd.indices = idx;
+    const mesh = new Mesh(`town_shadow_proxy_${townId}`, scene);
+    vd.applyToMesh(mesh, false);
+    mesh.position.set(ax, 0, az);                        // anchor at the town → correct absolutePosition for the cull
+    if (!this._townShadowProxyMat) {                     // shared opaque material (never seen; depth only)
+      this._townShadowProxyMat = new StandardMaterial('town_shadow_proxy_mat', scene);
+      this._townShadowProxyMat.disableLighting = true;
+    }
+    mesh.material = this._townShadowProxyMat;
+    mesh.layerMask = HarborService.SHADOW_PROXY_MASK;   // invisible to the camera; the shadow map ignores the mask
+    mesh.isPickable = false;
+    return mesh;
   }
 
   /** Thin-instance one soft blob under each building of the given (streamed) town, sized to its measured footprint. */
@@ -350,6 +451,9 @@ export class HarborService {
 
     const disc = MeshBuilder.CreateGround('town_shadow_disc', { width: 1, height: 1 }, scene);
     disc.material = mat;
+    disc.renderingGroupId = 2;                            // world layer — else (default group 0) it draws BEFORE the
+                                                          // group-2 terrain and is painted over → invisible (the bug
+                                                          // that made the town blobs never show); mirrors the scatter blobs.
     disc.isPickable = false;
     disc.isVisible = false;
     disc.alwaysSelectAsActiveMesh = true;                // thin-instance AABB isn't tracked → never frustum-cull the template
@@ -457,6 +561,8 @@ export class HarborService {
       if (d2 < build2) {
         inRange.push({ h, d2 });
       } else if (d2 > drop2 && this.townNodes.has(h.id)) {
+        // Unwind real shadow casters BEFORE disposing this town's meshes (else disposed meshes linger in the CSG).
+        if (this._shadowTownId === h.id) this.detachTownShadowCasters();
         // dispose meshes only, NOT materials/textures: they're shared (cloneMaterials=false) via the
         // asset-cache container and reused by every other town that streams the same GLB. Disposing them
         // here would leave later towns with null materials (white). The container owns them (clearCache).
@@ -681,7 +787,7 @@ export class HarborService {
       const mesh = new Mesh(`roads_${h.id}`, scene);
       vd.applyToMesh(mesh);
       mesh.material = this.roadMat; mesh.parent = root; mesh.renderingGroupId = 2;
-      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+      mesh.isPickable = false; mesh.receiveShadows = this.townRealShadows; mesh.freezeWorldMatrix();
     }
 
     // ── Cobblestone square (on the flat pad; sampled corners + 3 cm above the roads where they meet) ──
@@ -699,7 +805,7 @@ export class HarborService {
       const mesh = new Mesh(`square_${h.id}`, scene);
       vd.applyToMesh(mesh);
       mesh.material = this.squareMat; mesh.parent = root; mesh.renderingGroupId = 2;
-      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+      mesh.isPickable = false; mesh.receiveShadows = this.townRealShadows; mesh.freezeWorldMatrix();
     }
   }
 
@@ -870,6 +976,7 @@ export class HarborService {
     // The scene teardown disposes these meshes; null our refs + clear caches so a fresh session
     // rebuilds piers (and re-measures the per-variant offsets) cleanly.
     if (this.tickObs) { this.sceneService.scene?.onBeforeRenderObservable.remove(this.tickObs); this.tickObs = null; }
+    this.detachTownShadowCasters();   // pull town buildings out of the sun CSG
     this.squareLight?.dispose();
     this.squareLight = null;
     this.skyEnv = null;   // owned by the procedural sky; just drop our reference
@@ -878,6 +985,7 @@ export class HarborService {
     this.townLoading.clear();
     this._townShadowDisc?.dispose();   this._townShadowDisc = null;   // own disc + thin-instance buffer
     this._townShadowMat?.dispose(false, true); this._townShadowMat = null;   // own material + gradient texture
+    this._townShadowProxyMat?.dispose(); this._townShadowProxyMat = null;    // shared box-proxy depth material
     this._blobTownId = null;
     for (const { plane } of this.townLabels.values()) plane.dispose(false, true);   // own texture+material
     this.townLabels.clear();

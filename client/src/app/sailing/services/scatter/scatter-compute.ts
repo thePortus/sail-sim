@@ -298,7 +298,9 @@ const RES: f32 = 24.0;
   let sx = base * (0.85 + hash2(vec2f(px * 7.7, pz * 1.3)) * 0.35);
   let sy = base * (0.60 + hash2(vec2f(px * 1.3, pz * 7.7)) * 0.40);
   let sz = base * (0.85 + hash2(vec2f(px * 3.7, pz * 9.1)) * 0.35);
-  if (shadow) { emitShadow(px, y, pz, max(sx, sz) * 1.15); return; }
+  // Disc floor (0.8 m) so small rocks still throw a visible skirt, proportional x1.3 for boulders (KEEP IN
+  // SYNC with scatter.service buildRocks). The old flat x1.15 tucked the disc under the rock → looked shadowless.
+  if (shadow) { emitShadow(px, y, pz, max(0.8, max(sx, sz) * 1.3)); return; }
 
   let q = qYawPitchRoll(
     hash2(vec2f(px * 1.11 + 4.0, pz * 1.07 - 4.0)) * TAU,

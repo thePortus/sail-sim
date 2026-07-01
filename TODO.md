@@ -2,17 +2,13 @@
 
 # General or Current TODO Items
 
-* rocks needs shadow
-* towns needs shadow
 * blur or smooth the wake creation
 * make server/assets mounted/shared drive, so it can preserve past volumes-down
-* crew/deck furniture shadows
 * error in water occlusion on brig for NPCs/other vessels that doesn't affect player. Keel line is visible. this was something we corrected earlier on the player's vessel
 * put merchantman ahead of brig in shipwright list
 * make ships names match nationality (no salted cod for spanish for example. Don't stereotype in naming, just use names in that language)
 * long summer day?
-* frigate, galleon, barque, junk
-* LOD imposters for other vessel's crews
+* frigate, galleon, barque, junkå
 * forts and taking towns
 * swordfighting, surrender & capture
 * fleets with prize crews to take them over
@@ -23,7 +19,6 @@
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
 * pirate fame: as a mechanism to allow you access to best ships... and larger fleet to have more ships following and aiding you
-* town forts... capturing towns
 * update profile page and update password page (and 404 page with a funny 404)
 * make trading and ship buying server-side secure
 * crew eat rations,,, start to desert at ports if no rations for awhile and leaving with still no rations... slowly desert

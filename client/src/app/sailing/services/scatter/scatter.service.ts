@@ -1617,7 +1617,10 @@ export class ScatterService {
           base * (0.85 + hash2(px * 7.7, pz * 1.3) * 0.35),
           base * (0.60 + hash2(px * 1.3, pz * 7.7) * 0.40),
           base * (0.85 + hash2(px * 3.7, pz * 9.1) * 0.35));
-        if (shadow) { this.composeShadow(matTmp, kept, px, y, pz, Math.max(scaleV.x, scaleV.z) * 1.15); kept++; continue; }
+        // Shadow disc: a floor (0.8 m) so even small rocks throw a visible skirt (the old flat ×1.15 tucked the
+        // disc entirely under the rock → looked shadowless), proportional ×1.3 for the boulders. Sun-stretched by
+        // the ShadowBlobPlugin so it elongates away from the light.
+        if (shadow) { this.composeShadow(matTmp, kept, px, y, pz, Math.max(0.8, Math.max(scaleV.x, scaleV.z) * 1.3)); kept++; continue; }
         posV.set(px, y - base * 0.1, pz);                  // settle slightly into the sand
         Quaternion.RotationYawPitchRollToRef(
           hash2(px * 1.11 + 4, pz * 1.07 - 4) * Math.PI * 2,

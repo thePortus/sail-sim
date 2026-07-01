@@ -227,26 +227,36 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean_surface.wgsl"    OCEAN_SURFACE_WGSL    "${WGSL_GEN_DIR}/ocean_surface_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.wgsl"              SKY_WGSL              "${WGSL_GEN_DIR}/sky_wgsl.h")
 
-# ── UI font ──────────────────────────────────────────────────────────────────
-# Download the font at configure time (kept out of git, re-fetchable) and embed
-# it into the binary as a byte array, so the .app ships self-contained with no
-# runtime font file to locate. Swap SAILSIM_FONT_URL to use a different font;
-# a proprietary font can use the same path but must NOT be redistributed in the
-# built binary — ship it as a bundle resource loaded at runtime instead.
-set(SAILSIM_FONT_URL
-    "https://github.com/JetBrains/JetBrainsMono/raw/v2.304/fonts/ttf/JetBrainsMono-Regular.ttf"
-    CACHE STRING "URL of the TTF to embed as the UI font")
-set(SAILSIM_FONT_TTF "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIFont.ttf")
-if (NOT EXISTS "${SAILSIM_FONT_TTF}")
-  message(STATUS "Downloading UI font: ${SAILSIM_FONT_URL}")
-  file(DOWNLOAD "${SAILSIM_FONT_URL}" "${SAILSIM_FONT_TTF}" STATUS _font_dl TLS_VERIFY ON)
-  list(GET _font_dl 0 _font_rc)
-  if (NOT _font_rc EQUAL 0)
-    file(REMOVE "${SAILSIM_FONT_TTF}")
-    list(GET _font_dl 1 _font_err)
-    message(FATAL_ERROR "UI font download failed: ${_font_err}")
+# ── UI fonts ─────────────────────────────────────────────────────────────────
+# Two fonts, downloaded at configure time (kept out of git, re-fetchable) and
+# embedded into the binary as byte arrays, so the .app ships self-contained with
+# no runtime font file to locate:
+#   body  — Inter  (clean proportional sans) for all UI text
+#   title — Cinzel (Roman-inscription serif caps) for headings / the login screen
+# Swap either via -DSAILSIM_FONT_*_URL. A proprietary font can use the same path
+# but must NOT be redistributed in the built binary — ship it as a bundle
+# resource loaded at runtime instead.
+set(SAILSIM_FONT_BODY_URL
+    "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz,wght%5D.ttf"
+    CACHE STRING "URL of the TTF to embed as the body UI font")
+set(SAILSIM_FONT_TITLE_URL
+    "https://github.com/google/fonts/raw/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf"
+    CACHE STRING "URL of the TTF to embed as the title UI font")
+
+function(fetch_font URL DEST)
+  if (NOT EXISTS "${DEST}")
+    message(STATUS "Downloading UI font: ${URL}")
+    file(DOWNLOAD "${URL}" "${DEST}" STATUS _dl TLS_VERIFY ON)
+    list(GET _dl 0 _rc)
+    if (NOT _rc EQUAL 0)
+      file(REMOVE "${DEST}")
+      list(GET _dl 1 _err)
+      message(FATAL_ERROR "UI font download failed: ${_err}")
+    endif()
   endif()
-endif()
+endfunction()
+fetch_font("${SAILSIM_FONT_BODY_URL}"  "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIBody.ttf")
+fetch_font("${SAILSIM_FONT_TITLE_URL}" "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UITitle.ttf")
 
 # Emit a header with the TTF bytes as a C array (newline every 20 bytes so no
 # single line is absurdly long for MSVC).
@@ -257,7 +267,8 @@ function(embed_binary SRC VARNAME OUT)
   file(WRITE "${OUT}"
     "#pragma once\ninline const unsigned char ${VARNAME}[] = {\n${_bytes}\n};\ninline const unsigned int ${VARNAME}_SIZE = sizeof(${VARNAME});\n")
 endfunction()
-embed_binary("${SAILSIM_FONT_TTF}" UI_FONT_TTF "${WGSL_GEN_DIR}/ui_font.h")
+embed_binary("${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIBody.ttf"  UI_FONT_BODY  "${WGSL_GEN_DIR}/ui_font_body.h")
+embed_binary("${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UITitle.ttf" UI_FONT_TITLE "${WGSL_GEN_DIR}/ui_font_title.h")
 
 add_executable(sailsim_native
   src/main.cpp

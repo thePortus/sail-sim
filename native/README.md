@@ -111,15 +111,17 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` is required with CMake 4.x: some fetched subprojects declare a
 `cmake_minimum_required` below 3.5, which CMake 4 rejects without this shim.
 
-## UI font
+## UI fonts
 
-The UI uses **JetBrains Mono** (Apache-2.0). It is **downloaded at configure time** (from
-`SAILSIM_FONT_URL`) into `assets/fonts/UIFont.ttf` — which is **git-ignored, never committed** — and
-then **embedded into the binary** as a byte array (`build/gen/ui_font.h`), so the app ships
-self-contained with no runtime font file to locate. To use a different font, override the URL:
+The UI pairs two OFL fonts: **Inter** for body text and **Cinzel** (Roman-inscription serif caps)
+for titles / the login screen. Both are **downloaded at configure time** into
+`assets/fonts/UIBody.ttf` and `UITitle.ttf` — which are **git-ignored, never committed** — and then
+**embedded into the binary** as byte arrays (`build/gen/ui_font_*.h`), so the app ships
+self-contained with no runtime font file to locate. To use different fonts, override the URLs:
 
 ```sh
-cmake -B build -DSAILSIM_FONT_URL="https://…/YourMono-Regular.ttf"
+cmake -B build -DSAILSIM_FONT_BODY_URL="https://…/YourSans.ttf" \
+               -DSAILSIM_FONT_TITLE_URL="https://…/YourDisplay.ttf"
 ```
 
 > A **proprietary / license-restricted** font can be dropped in via the same mechanism, but must not

@@ -325,6 +325,12 @@ export class ScatterService {
     });
   }
 
+  /** PERF-ISOLATION debug switch: `localStorage.ignis_no_<key>='1'` skips that scatter component (grass / trees /
+   *  props / farimp / scatshadow) at build time. For profiling which part of scatter costs the frame; harmless off. */
+  private dbgOff(key: string): boolean {
+    try { return localStorage.getItem('ignis_no_' + key) === '1'; } catch { return false; }
+  }
+
   /** Build every scatter layer (grass + the authored-GLB groups). Called once by init(), and again by
    *  reloadAssets() after a /reloadassets version bump so edited GLBs re-stream live. */
   private async buildLayers(scene: Scene): Promise<void> {
@@ -333,26 +339,34 @@ export class ScatterService {
     // `scatter_` so the ocean refraction RTT's exclusion predicate skips foliage.)
     // Re-enabled: the updated clump models are fuller (60–90 blades, wider footprint) so far fewer
     // instances fill a field, and the scatter bottleneck that forced this off has since been resolved.
-    if (ScatterService.GRASS_ENABLED) { await this.registerGrass(scene); }
+    // PERF-ISOLATION debug flags (localStorage `ignis_no_<x>='1'` → skip that scatter component, reload). Lets us
+    // split the scatter cost: grass / trees (palms+beeches) / props (rocks+driftwood) / farimp / scatshadow.
+    if (ScatterService.GRASS_ENABLED && !this.dbgOff('grass')) { await this.registerGrass(scene); }
 
     // Authored-GLB groups (streamed from the server, cached): beach rocks (5 shapes, size pebble→
     // boulder + tint), driftwood (5 shapes, twig→log + tint), forest beeches (A/B/C, two-channel
     // wind), beach palms (A/B/C, wind sway). Each falls back to its primitive if a GLB fails.
-    await this.registerRocks(scene);
-    await this.registerDriftwood(scene);
-    await this.registerBeeches(scene);
-    await this.registerPalms(scene);
+    if (!this.dbgOff('props')) {
+      await this.registerRocks(scene);
+      await this.registerDriftwood(scene);
+    }
+    if (!this.dbgOff('trees')) {
+      await this.registerBeeches(scene);
+      await this.registerPalms(scene);
+    }
     // Static far-impostor layers — built AFTER both tree types register so BOTH beechImpostors AND
     // palmImpostors are populated (the coast atlas mixes them; building inside registerBeeches left
     // palmImpostors empty → all coast trees fell back to beeches).
-    this.buildFarForest(scene);   // distant forested hillsides
-    this.buildFarCoast(scene);    // the shore strip the forest layer skips (beach palms + low beeches)
+    if (!this.dbgOff('trees') && !this.dbgOff('farimp')) {
+      this.buildFarForest(scene);   // distant forested hillsides
+      this.buildFarCoast(scene);    // the shore strip the forest layer skips (beach palms + low beeches)
+    }
     this.setupSinkDebug();   // console tuner: __palmSink()/__treeSink()
 
     // Cheap fake shadows: a flat dark blob under each static land asset, near-ring only. Skipped on
     // Potato (no scatter) and via ?noshadows. Must come AFTER the asset layers so the asset placement
     // exists to mirror.
-    if (this.enabled && ScatterService.SHADOWS_ENABLED && !location.search.includes('noshadows')) {
+    if (this.enabled && ScatterService.SHADOWS_ENABLED && !location.search.includes('noshadows') && !this.dbgOff('scatshadow')) {
       this.registerShadows(scene);
     }
   }
@@ -406,10 +420,12 @@ export class ScatterService {
 
   // ── Land grass (authored clump GLBs) ────────────────────────────────────────
 
+  // 2 clumps (was 3): each variant is its own draw per patch, and grass covers the most patches — trimming one
+  // is the biggest single draw cut with negligible visual change (jitter + LOD carry it). Kept medium + tall.
+  // ⚠️ CPU auto-adjusts via NCLUMPS = GRASS_CLUMPS.length; the WGSL `dealtAway(px,pz,2.0)` in GRASS_WGSL must match.
   private static readonly GRASS_CLUMPS = [
     { file: 'grass_a.glb', lod: 'grass_a_lod.glb' },   // medium tussock
     { file: 'grass_b.glb', lod: 'grass_b_lod.glb' },   // tall sparse
-    { file: 'grass_c.glb', lod: 'grass_c_lod.glb' },   // short bushy
   ];
 
   /** Per-instance grass tints (multiply the base→tip gradient albedo): lush → green → yellow-green →
@@ -574,9 +590,11 @@ export class ScatterService {
 
   // ── Beach palms (authored GLB variants) ─────────────────────────────────────
 
+  // 2 variants (was 3): one draw per variant per patch; kept the two most distinct silhouettes (medium-lean +
+  // short-stout), dropped tall-slim (~medium-lean + jitter). ⚠️ CPU buildPalms `*2` + WGSL PALMS `dealtAway(…,2.0)`
+  // + palmImpostors (auto via .length) must match this count.
   private static readonly PALM_VARIANTS = [
     { file: 'palm_a.glb', impostor: 'impostor_a.png', height: 8.0 },   // medium, slight lean
-    { file: 'palm_b.glb', impostor: 'impostor_b.png', height: 9.6 },   // tall, slim
     { file: 'palm_c.glb', impostor: 'impostor_c.png', height: 6.6 },   // short, stout, full crown
   ];
 
@@ -620,9 +638,10 @@ export class ScatterService {
 
   // ── Forest beeches (authored GLB variants) ──────────────────────────────────
 
+  // 2 variants (was 3): one draw per variant per patch; kept medium-broad + short-very-broad (most distinct),
+  // dropped taller-fuller. ⚠️ CPU buildTrees `*2` + WGSL TREES `dealtAway(…,2.0)` + beechImpostors (auto) must match.
   private static readonly BEECH_VARIANTS = [
     { file: 'beech_a.glb', impostor: 'beech_impostor_a.png', w: 17.07, h: 11.27 },   // medium broad
-    { file: 'beech_b.glb', impostor: 'beech_impostor_b.png', w: 19.31, h: 13.30 },   // taller, fuller
     { file: 'beech_c.glb', impostor: 'beech_impostor_c.png', w: 14.98, h: 10.63 },   // short, very broad
   ];
 
@@ -1610,6 +1629,12 @@ export class ScatterService {
     const t = ScatterService.QUALITY[Math.max(0, Math.min(4, q))];
     this.enabled = t.enabled;
     this.densityMul = t.density;
+    // PERF-ISOLATION: `ignis_scatter_density` overrides the density WITHOUT touching RADIUS (patch/draw count stays
+    // the same, only instance COUNT changes) — a clean vertex-cost vs draw-call-cost discriminator. Also a real knob.
+    try {
+      const d = parseFloat(localStorage.getItem('ignis_scatter_density') ?? '');
+      if (Number.isFinite(d) && d >= 0) { this.densityMul = d; }
+    } catch { /* no localStorage */ }
     this.RADIUS = Math.max(1, t.radius);
     this.shadowRing = Math.min(this.RADIUS, 3);   // blobs only near the camera (~120 m)
     // Grass dissolves at its OWN (smaller) ring cap, not the global draw radius — so the cheap-LoD grass
@@ -1860,7 +1885,7 @@ export class ScatterService {
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to one variant (variant < 0 → keep all; primitive fallback).
-        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 2) !== variant) { continue; }
         if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
         y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)
@@ -1908,7 +1933,7 @@ export class ScatterService {
         if (hash2(px * 3.1 + 1.7, pz * 2.9 - 3.3) > dens) { continue; }
 
         // Deal each accepted candidate to exactly one variant (so the 3 sub-layers don't stack).
-        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 3) !== variant) { continue; }
+        if (variant >= 0 && Math.floor(hash2(px * 0.71 + 50, pz * 0.67 - 50) * 2) !== variant) { continue; }
         if (this.nearShoreline(px, pz, 7)) { continue; }   // keep ~7 m back from the water/shallows (no surf trees)
 
         y = getY(px, pz);                  // accurate height for placement (shadow blob + trunk)

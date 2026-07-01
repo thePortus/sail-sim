@@ -2,6 +2,7 @@
 
 # General or Current TODO Items
 
+* flashing and or z fighting on white part of brig hull
 * blur or smooth the wake creation
 * make server/assets mounted/shared drive, so it can preserve past volumes-down
 * error in water occlusion on brig for NPCs/other vessels that doesn't affect player. Keel line is visible. this was something we corrected earlier on the player's vessel

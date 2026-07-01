@@ -258,7 +258,7 @@ fn emitClump(px: f32, pz: f32, y: f32) -> bool {
   let beachDens = beachRegion * coreD * beachBand * 0.85;
   let density = max(forestDens, beachDens) * alt * (1.0 - slope * 0.7) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > density) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
 
   if (!emitClump(px, pz, y)) { return; }
   let blades = u32(3.0 + coreD * (BURST - 3.0));
@@ -367,7 +367,7 @@ const RES: f32 = 16.0;
   let dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
     * (1.0 - slope * 0.8) * 0.18 * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
   if (nearShore(px, pz, 7.0)) { return; }
 
   let s = 0.9 + hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0)) * 0.22;
@@ -390,7 +390,7 @@ const RES: f32 = 14.0;
   let stand = fbm2(vec2f(px / 28.0 + 60.0, pz / 28.0 - 40.0));
   let dens = smoothstep(0.48, 0.80, stand) * (1.0 - slope * 0.6) * 0.95 * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
   if (nearShore(px, pz, 7.0)) { return; }
 
   let s = 0.92 + hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0)) * 0.16;

@@ -259,8 +259,20 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
 struct OceanCamera {
   glm::mat4 viewProj;
   glm::vec4 eye;      // xyz camera position
-  glm::vec4 params;   // x = time (s)
+  glm::vec4 params;   // xyz = cascade tile sizes
+  glm::vec4 screen;   // xy = framebuffer size (px)
 };
+
+// A colour render target (planar reflection).
+static WGPUTexture makeColorRTT(WGPUDevice device, uint32_t w, uint32_t h, WGPUTextureFormat fmt) {
+  WGPUTextureDescriptor td = {};
+  td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+  td.dimension = WGPUTextureDimension_2D;
+  td.size = { w, h, 1 };
+  td.format = fmt;
+  td.mipLevelCount = 1; td.sampleCount = 1;
+  return wgpuDeviceCreateTexture(device, &td);
+}
 
 // FFT ocean surface: a large grid displaced/shaded by sampling the compute
 // cascade's textures. Its bind group (which references per-frame ping-ponged
@@ -350,8 +362,28 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   frag.module = o.module; frag.entryPoint = "fs_main";
   frag.targetCount = 1; frag.targets = &target;
 
+  // Explicit bind group layout (auto-layout misrouted binding 11): uniform (0),
+  // 9 cascade textures (1-9), sampler (10), reflection (11). All float/filtering.
+  WGPUBindGroupLayoutEntry be[12] = {};
+  be[0].binding = 0; be[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+  be[0].buffer.type = WGPUBufferBindingType_Uniform;
+  for (int i = 1; i <= 9; ++i) {
+    be[i].binding = (uint32_t)i; be[i].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+    be[i].texture.sampleType = WGPUTextureSampleType_Float;
+    be[i].texture.viewDimension = WGPUTextureViewDimension_2D;
+  }
+  be[10].binding = 10; be[10].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+  be[10].sampler.type = WGPUSamplerBindingType_Filtering;
+  be[11].binding = 11; be[11].visibility = WGPUShaderStage_Fragment;
+  be[11].texture.sampleType = WGPUTextureSampleType_Float;
+  be[11].texture.viewDimension = WGPUTextureViewDimension_2D;
+  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 12; bld.entries = be;
+  o.bgl = wgpuDeviceCreateBindGroupLayout(device, &bld);
+  WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &o.bgl;
+  WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
+
   WGPURenderPipelineDescriptor rpd = {};
-  rpd.layout = nullptr;   // auto layout — inferred from the shader (uniform + 3 textures + sampler)
+  rpd.layout = pl;
   rpd.vertex.module = o.module; rpd.vertex.entryPoint = "vs_main";
   rpd.vertex.bufferCount = 1; rpd.vertex.buffers = &vbl;
   rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
@@ -361,7 +393,7 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu;
   rpd.fragment = &frag;
   o.pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
-  o.bgl = wgpuRenderPipelineGetBindGroupLayout(o.pipeline, 0);
+  wgpuPipelineLayoutRelease(pl);
   return o;
 }
 
@@ -642,8 +674,13 @@ int main(int argc, char** argv) {
   uint32_t curW = (uint32_t)fbWidth, curH = (uint32_t)fbHeight;
   WGPUTexture depthTex = makeDepthTexture(device, curW, curH);
   WGPUTextureView depthView = wgpuTextureCreateView(depthTex, nullptr);
+  // Planar reflection target (colour + its own depth).
+  WGPUTexture reflTex = makeColorRTT(device, curW, curH, surfaceFormat);
+  WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
+  WGPUTexture reflDepth = makeDepthTexture(device, curW, curH);
+  WGPUTextureView reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
 
-  // 6. Render loop: draw the Gerstner ocean, then the ship floating on it.
+  // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
     if (maxFrames > 0 && frame >= maxFrames) break;
@@ -660,6 +697,12 @@ int main(int argc, char** argv) {
       wgpuTextureRelease(depthTex);
       depthTex = makeDepthTexture(device, curW, curH);
       depthView = wgpuTextureCreateView(depthTex, nullptr);
+      wgpuTextureViewRelease(reflView);   wgpuTextureRelease(reflTex);
+      wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
+      reflTex = makeColorRTT(device, curW, curH, surfaceFormat);
+      reflView = wgpuTextureCreateView(reflTex, nullptr);
+      reflDepth = makeDepthTexture(device, curW, curH);
+      reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
     }
 
     // Camera: slow orbit looking at the floating ship near the origin.
@@ -671,19 +714,13 @@ int main(int argc, char** argv) {
     glm::mat4 proj  = glm::perspective(glm::radians(50.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 
-    // Advance all cascades; uniform carries the three tile sizes.
+    // Advance all cascades.
     c0.update(t, 1.0f / 60.0f);
     c1.update(t, 1.0f / 60.0f);
     c2.update(t, 1.0f / 60.0f);
-    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
-                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), 0.0f) };
-    wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
 
-    SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(0.5f, 1.0f, 0.4f, 0.0f) };
-    wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));
-
-    // Float the ship on the wave field: heave to the surface height, tilt to the
-    // surface normal (pitch + roll), plus a slow yaw. Sampled at the origin.
+    // Ship world transform (used by BOTH the reflection and main passes): heave to
+    // the wave surface, tilt to its normal, slow yaw, scaled + keel-centred.
     float waveY = oceanHeight(0.0f, 0.0f, t);
     glm::vec3 up = oceanNormal(0.0f, 0.0f, t);
     glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, waveY - draft, 0.0f));
@@ -693,9 +730,58 @@ int main(int argc, char** argv) {
       float tiltAngle = std::asin(glm::clamp(axisLen, 0.0f, 1.0f));
       model = model * glm::rotate(glm::mat4(1.0f), tiltAngle, axis / axisLen);
     }
-    model = glm::rotate(model, t * 0.05f, glm::vec3(0, 1, 0));   // slow yaw
+    model = glm::rotate(model, t * 0.05f, glm::vec3(0, 1, 0));
     model = glm::scale(model, glm::vec3(shipScale));
-    model = glm::translate(model, -keelCenter);                 // keel to origin
+    model = glm::translate(model, -keelCenter);
+
+    const glm::vec3 sun(0.5f, 1.0f, 0.4f);
+
+    // ── Reflection pass: sky + ship through a mirror camera (reflected across y=0),
+    //    rendered into reflView. Queue-ordered uniform writes let one buffer serve
+    //    both passes. ──
+    {
+      glm::mat4 mirror = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, -1.0f, 1.0f));
+      glm::mat4 reflVP = proj * viewM * mirror;
+      glm::vec3 reflEye(eye.x, -eye.y, eye.z);
+      SkyUniform rs{ glm::inverse(reflVP), glm::vec4(reflEye, 1.0f), glm::vec4(sun, 0.0f) };
+      wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
+      MeshUniforms rm{ reflVP * model, model, glm::vec4(reflEye, 1.0f) };
+      wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &rm, sizeof(rm));
+
+      WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
+      WGPURenderPassColorAttachment rc = {};
+      rc.view = reflView; rc.loadOp = WGPULoadOp_Clear; rc.storeOp = WGPUStoreOp_Store;
+      rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
+      WGPURenderPassDepthStencilAttachment rd = {};
+      rd.view = reflDepthView; rd.depthLoadOp = WGPULoadOp_Clear; rd.depthStoreOp = WGPUStoreOp_Store; rd.depthClearValue = 1.0f;
+      WGPURenderPassDescriptor rp_desc = {};
+      rp_desc.colorAttachmentCount = 1; rp_desc.colorAttachments = &rc; rp_desc.depthStencilAttachment = &rd;
+      WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(renc, &rp_desc);
+      wgpuRenderPassEncoderSetPipeline(rp, sky.pipeline);
+      wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
+      wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+      wgpuRenderPassEncoderSetPipeline(rp, mesh.pipeline);
+      wgpuRenderPassEncoderSetVertexBuffer(rp, 0, mesh.vbuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(rp, mesh.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+      for (size_t i = 0; i < mesh.submeshes.size(); ++i) {
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, mesh.bindGroups[i], 0, nullptr);
+        wgpuRenderPassEncoderDrawIndexed(rp, mesh.submeshes[i].indexCount, 1, mesh.submeshes[i].indexOffset, 0, 0);
+      }
+      wgpuRenderPassEncoderEnd(rp);
+      wgpuRenderPassEncoderRelease(rp);
+      WGPUCommandBuffer rcmd = wgpuCommandEncoderFinish(renc, nullptr);
+      wgpuQueueSubmit(queue, 1, &rcmd);
+      wgpuCommandBufferRelease(rcmd);
+      wgpuCommandEncoderRelease(renc);
+    }
+
+    // ── Main-pass uniforms ──
+    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
+                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), 0.0f),
+                    glm::vec4((float)curW, (float)curH, 0.0f, 0.0f) };
+    wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
+    SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f) };
+    wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));
     MeshUniforms u{ viewProj * model, model, glm::vec4(eye, 1.0f) };
     wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &u, sizeof(u));
 
@@ -734,7 +820,7 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
 
     // Ocean surface — bind group references this frame's (ping-ponged) cascade textures.
-    WGPUBindGroupEntry oe[11] = {};
+    WGPUBindGroupEntry oe[12] = {};
     oe[0].binding = 0;  oe[0].buffer = ocean.uniformBuf; oe[0].size = sizeof(OceanCamera);
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
@@ -746,8 +832,9 @@ int main(int argc, char** argv) {
     oe[8].binding = 8;  oe[8].textureView  = c2.derivatives();
     oe[9].binding = 9;  oe[9].textureView  = c2.turbulence();
     oe[10].binding = 10; oe[10].sampler = ocean.sampler;
+    oe[11].binding = 11; oe[11].textureView = reflView;
     WGPUBindGroupDescriptor obd = {};
-    obd.layout = ocean.bgl; obd.entryCount = 11; obd.entries = oe;
+    obd.layout = ocean.bgl; obd.entryCount = 12; obd.entries = oe;
     WGPUBindGroup oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);
@@ -799,6 +886,8 @@ int main(int argc, char** argv) {
   // 7. Teardown
   wgpuTextureViewRelease(depthView);
   wgpuTextureRelease(depthTex);
+  wgpuTextureViewRelease(reflView);      wgpuTextureRelease(reflTex);
+  wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
   wgpuRenderPipelineRelease(sky.pipeline);
   wgpuBindGroupRelease(sky.bindGroup);
   wgpuBufferRelease(sky.uniformBuf);

@@ -110,7 +110,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     let ambient = vec3<f32>(0.18) * albedo;
     var color = ambient + Lo;
-    color = color / (color + vec3<f32>(1.0));       // Reinhard tonemap
-    color = pow(color, vec3<f32>(1.0 / 2.2));        // gamma
+    color = color / (color + vec3<f32>(1.0));       // Reinhard tonemap (sRGB target does gamma)
     return vec4<f32>(color, 1.0);
 }

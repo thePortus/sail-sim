@@ -6,8 +6,10 @@ struct Camera {
     viewProj : mat4x4<f32>,
     eye      : vec4<f32>,   // xyz camera position
     params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile)
+    screen   : vec4<f32>,   // xy = framebuffer size (px)
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
+@group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
 @group(0) @binding(1)  var disp0  : texture_2d<f32>;
 @group(0) @binding(2)  var deriv0 : texture_2d<f32>;
 @group(0) @binding(3)  var turb0  : texture_2d<f32>;
@@ -22,7 +24,7 @@ struct Camera {
 // Material constants (from ocean-material.ts).
 const _Color       = vec3<f32>(0.015, 0.090, 0.130);
 const _SkyColor    = vec3<f32>(0.45, 0.62, 0.82);
-const _ReflStrength = 0.9;
+const _ReflStrength = 0.35;
 const _SSSColor    = vec3<f32>(0.1541919, 0.8857628, 0.990566);
 const _SSSStrength = 0.205;
 const _SSSBase     = -0.261;
@@ -93,7 +95,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     var fresnel = clamp(1.0 - dot(N, V), 0.0, 1.0);
     fresnel = pow5(fresnel);
     var waterCol = color * (1.0 - fresnel);
-    waterCol += _SkyColor * fresnel * _ReflStrength;
+    // Planar reflection (sky + ship), rippled by the surface normal, at grazing angles.
+    let reflUV = clamp(in.position.xy / cam.screen.xy + slope * 0.12, vec2<f32>(0.001), vec2<f32>(0.999));
+    let reflColor = textureSample(reflTex, samp, reflUV).rgb;
+    waterCol += reflColor * fresnel * _ReflStrength;
 
     // Sun glint.
     let Hs = normalize(V + L);
@@ -101,8 +106,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     // Composite foam (lit white) over water.
     let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0));
-    var outColor = mix(waterCol, foamLit, jacobian);
-
-    outColor = pow(outColor, vec3<f32>(1.0 / 2.2));
+    let outColor = mix(waterCol, foamLit, jacobian);   // sRGB target does gamma
     return vec4<f32>(outColor, 1.0);
 }

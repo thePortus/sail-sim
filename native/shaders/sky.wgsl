@@ -29,14 +29,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let dir = normalize(world - u.eye.xyz);
 
     let t = clamp(dir.y, 0.0, 1.0);
-    let horizon = vec3<f32>(0.80, 0.86, 0.92);
-    let zenith  = vec3<f32>(0.20, 0.42, 0.72);
-    var col = mix(horizon, zenith, pow(t, 0.45));
+    let horizon = vec3<f32>(0.55, 0.68, 0.82);
+    let zenith  = vec3<f32>(0.11, 0.30, 0.60);
+    var col = mix(horizon, zenith, pow(t, 0.42));
 
     let sd = max(dot(dir, normalize(u.sun.xyz)), 0.0);
     col += vec3<f32>(1.0, 0.95, 0.85) * pow(sd, 1400.0) * 2.0;    // sun disk
     col += vec3<f32>(1.0, 0.90, 0.75) * pow(sd, 12.0) * 0.12;     // sun glow
-
-    col = pow(col, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(col, 1.0);
+    return vec4<f32>(col, 1.0);   // sRGB target does gamma
 }

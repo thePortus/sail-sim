@@ -17,14 +17,13 @@ Real FFT ocean, sailing physics, and Windows/D3D12 are next.
 
 ## What this builds
 
-`sailsim_native` opens a 1280×720 window, clears it to sea-blue, and draws a spinning depth-tested
-glTF model with metallic-roughness PBR shading and its KTX2 base-colour textures (default: the
-vendored `assets/rock_e.glb`, which is untextured) using a real WebGPU device. Pass a path to draw
-any `.glb` — the merchantman shows the textured multi-material path:
+`sailsim_native` opens a 1280×720 window and draws a textured, PBR-lit glTF ship floating on a
+Gerstner-wave ocean. With no argument it loads the merchantman (falling back to the vendored
+`assets/rock_e.glb`, then a cube, if that path isn't present). Pass a path to draw any `.glb`:
 
 ```sh
-./build/bin/sailsim_native                                   # default rock
-./build/bin/sailsim_native ../server/assets/geometry/merchantman.glb   # a ship hull
+./build/bin/sailsim_native                                   # default: the merchantman
+./build/bin/sailsim_native assets/rock_e.glb                 # the vendored rock
 SAILSIM_MODEL=/path/to/model.glb ./build/bin/sailsim_native  # or via env
 ```
 

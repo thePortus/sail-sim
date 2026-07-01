@@ -382,10 +382,8 @@ int main(int argc, char** argv) {
   // Flush per line so `[spike] …` progress shows even when piped or killed.
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-  // Model to draw: argv[1] > $SAILSIM_MODEL > the vendored default asset.
-  std::string modelPath = (argc > 1) ? argv[1]
-                        : (std::getenv("SAILSIM_MODEL") ? std::getenv("SAILSIM_MODEL")
-                                                        : std::string(SAILSIM_ASSET_DIR) + "/rock_e.glb");
+  // Model to draw: argv[1] > $SAILSIM_MODEL > the ship (default) > rock > cube.
+  const char* modelArg = (argc > 1) ? argv[1] : std::getenv("SAILSIM_MODEL");
 
   // Optional headless cap: render N frames then exit cleanly (for CI / smoke tests).
   const char* maxFramesEnv = std::getenv("SAILSIM_MAX_FRAMES");
@@ -502,10 +500,16 @@ int main(int argc, char** argv) {
   std::printf("[spike] surface configured: %dx%d format=%d — entering render loop\n",
               fbWidth, fbHeight, (int)surfaceFormat);
 
-  // Phase 1: load the model (fall back to a cube), then build its pipeline.
-  MeshData meshData = loadGltfMesh(modelPath.c_str());
+  // Phase 1: load the model — explicit arg, else the ship, else the rock, else a cube.
+  MeshData meshData;
+  if (modelArg) {
+    meshData = loadGltfMesh(modelArg);
+  } else {
+    meshData = loadGltfMesh(SAILSIM_SHIP_MODEL);                    // default: the merchantman
+    if (!meshData.ok) meshData = loadGltfMesh(SAILSIM_ASSET_DIR "/rock_e.glb");
+  }
   if (!meshData.ok) {
-    std::printf("[spike] could not load '%s' — falling back to a cube\n", modelPath.c_str());
+    std::printf("[spike] no model loaded — falling back to a cube\n");
     meshData = makeCubeMesh();
   }
   // Centre the model at the origin and scale it to a consistent on-screen size,

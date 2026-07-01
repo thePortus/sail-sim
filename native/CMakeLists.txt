@@ -187,7 +187,11 @@ target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
 
 target_include_directories(sailsim_native PRIVATE
   "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder")
-target_compile_definitions(sailsim_native PRIVATE SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+get_filename_component(SAILSIM_SHIP_MODEL_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
+target_compile_definitions(sailsim_native PRIVATE
+  SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
+  SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}")
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on

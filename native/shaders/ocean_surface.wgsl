@@ -49,6 +49,7 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
     disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
     disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
+    disp = disp * cam.params.w;   // wind-driven wave amplitude (Beaufort)
 
     let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
@@ -71,8 +72,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     var derivatives = textureSample(deriv0, samp, uv0);
     derivatives += textureSample(deriv1, samp, uv1);
     derivatives += textureSample(deriv2, samp, uv2);
-    let slope = vec2<f32>(derivatives.x / (1.0 + derivatives.z),
-                          derivatives.y / (1.0 + derivatives.w));
+    let slope = vec2<f32>(derivatives.x * cam.params.w / (1.0 + derivatives.z),
+                          derivatives.y * cam.params.w / (1.0 + derivatives.w));
     let N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 
     let V = normalize(cam.eye.xyz - in.worldPos);

@@ -1111,6 +1111,9 @@ int main(int argc, char** argv) {
   SeaFar seaFar = createSeaFar(device, queue, surfaceFormat);
   Clouds clouds = createClouds(device, queue, surfaceFormat);
   glm::vec2 cloudDrift(0.0f);   // accumulated wind drift (metres), integrated per frame
+  // Weather state, eased toward Beaufort-driven targets each frame (mirrors the
+  // client's cloud.service): cloudiness/storminess shape the clouds, seaAmp the swell.
+  float cloudiness = 0.25f, storminess = 0.0f, seaAmp = 1.0f;
 
   // FFT ocean — 3 cascades (250 / 17 / 5 m tiles) with split cutoff bands so they
   // don't double-count wavelengths. 256² each. Prime one frame + sanity-check.
@@ -1457,13 +1460,26 @@ int main(int argc, char** argv) {
       c2.readbackDisplacement();
     }
 
-    // Water height at a world (x,z) = summed vertical displacement of all cascades.
+    // Weather: ease cloudiness/storminess/sea amplitude toward Beaufort-driven
+    // targets (server wave_state). Sea amplitude scales the FFT swell + buoyancy.
+    {
+      mp::WaveState wv = mpClient.wave();
+      float beau = wv.valid ? (float)wv.beaufort : 3.0f;
+      if (const char* bo = std::getenv("SAILSIM_BEAUFORT")) beau = (float)std::atof(bo);   // debug override
+      float targetCloud = glm::clamp(0.18f + beau * 0.080f, 0.0f, 0.97f);
+      float targetStorm = glm::clamp((beau - 4.0f) / 6.0f, 0.0f, 1.0f);
+      cloudiness += (targetCloud - cloudiness) * glm::min(1.0f, dt * 0.70f);
+      storminess += (targetStorm - storminess) * glm::min(1.0f, dt * 0.55f);
+      seaAmp      = glm::clamp(0.45f + beau * 0.19f, 0.45f, 2.2f);   // Beaufort 3 ~= 1.0
+    }
+
+    // Water height at a world (x,z) = summed vertical displacement, wind-scaled.
     auto fftHeight = [&](float x, float z) {
       float dx, dy, dz, h = 0.0f;
       c0.sampleDisplacement(x, z, dx, dy, dz); h += dy;
       c1.sampleDisplacement(x, z, dx, dy, dz); h += dy;
       c2.sampleDisplacement(x, z, dx, dy, dz); h += dy;
-      return h;
+      return h * seaAmp;
     };
 
     // Camera input: hold LMB + drag to orbit, wheel to zoom.
@@ -1585,7 +1601,7 @@ int main(int argc, char** argv) {
 
     // ── Main-pass uniforms ──
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
-                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), 0.0f),
+                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), seaAmp),
                     glm::vec4((float)curW, (float)curH, shipX, shipZ) };   // zw = ocean origin (follows ship)
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f) };
@@ -1610,7 +1626,11 @@ int main(int argc, char** argv) {
       cloudDrift += glm::vec2(std::sin(windRad), std::cos(windRad)) * (windSpeed * 0.08f * dt);
       glm::vec3 sd = glm::normalize(sun);
       float el = glm::max(0.0f, sd.y);
-      const float cov = 0.3f, ctype = 0.4f;   // fair-weather cumulus (Beaufort response is next)
+      // Coverage/type/base from the eased weather state (client's cloud.service model).
+      float cov = std::pow(cloudiness, 1.8f);
+      float ctype = 0.40f + storminess * 0.55f;
+      float cloudBase = 900.0f - storminess * 220.0f;
+      float cloudTop = cloudBase + (600.0f + storminess * 700.0f);
       float sunBright = 0.05f + 1.7f * el;
       glm::vec3 sunCol(sunBright, sunBright * (0.52f + 0.48f * el), sunBright * (0.34f + 0.62f * el));
       float stormDim = glm::max(0.08f, 1.0f - glm::max(0.0f, cov - 0.45f) * 1.5f);
@@ -1618,7 +1638,7 @@ int main(int argc, char** argv) {
       glm::vec3 grndC(stormDim * (0.05f + 0.16f * el), stormDim * (0.07f + 0.20f * el), stormDim * (0.09f + 0.26f * el));
       CloudU cu{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sd, 0.0f),
                  glm::vec4(sunCol, 0.0f), glm::vec4(skyC, 0.0f), glm::vec4(grndC, 0.0f),
-                 glm::vec4(900.0f, 1500.0f, cov, ctype),
+                 glm::vec4(cloudBase, cloudTop, cov, ctype),
                  glm::vec4(t, cloudDrift.x, cloudDrift.y, 120000.0f) };
       wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cu, sizeof(cu));
     }

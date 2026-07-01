@@ -89,7 +89,11 @@ export class OceanFFTMaterial {
     // isn't culled from above by reversed winding. (Revisit once handedness is confirmed.)
     mat.backFaceCulling = false;
 
-    const color = new Vector3(0.011126082368383245, 0.05637409755197975, 0.09868919754109445);
+    // Deep-water base colour (beauty pass 3, Phase C water look): richer tropical SAPPHIRE — blue lifted
+    // (deeper, less muddy) with the teal undertone kept, a hair brighter overall so open water reads vivid
+    // rather than near-black. (was 0.01113, 0.05637, 0.09869.) The sea is most of the screen, so this is the
+    // single highest-impact knob; push B up / G down for more Pacific-blue, up G for more Caribbean-teal.
+    const color = new Vector3(0.01200, 0.05850, 0.11700);
 
     mat.AddUniform('_Color', 'vec3', color);
     mat.AddUniform('_MaxGloss', 'float', 0.91);
@@ -97,7 +101,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_LOD_scale', 'float', 7.13);
 
     mat.AddUniform('_FoamColor', 'vec3', new Vector3(1, 1, 1));
-    mat.AddUniform('_FoamScale', 'float', 2.6);   // whitecap contrast (between demo 2.4 and 2.8)
+    mat.AddUniform('_FoamScale', 'float', 2.78);   // whitecap contrast — nudged up (was 2.6) for slightly crisper, whiter caps
     mat.AddUniform('_ContactFoam', 'float', 0);   // contact foam kept off; the depth tex is used only for the hull-reveal cutoff
     mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
     mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
@@ -105,7 +109,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_Choppiness', 'float', 0.3);   // sea state 0..1 — trims foam in heavy seas
 
     mat.AddUniform('_SSSColor', 'vec3', new Vector3(0.1541919, 0.8857628, 0.990566));
-    mat.AddUniform('_SSSStrength', 'float', 0.205);   // back-lit glow (between demo 0.15 and 0.26)
+    mat.AddUniform('_SSSStrength', 'float', 0.255);   // back-lit turquoise wave-glow — up from 0.205 (the tropical signature: sun-through-the-crest)
     mat.AddUniform('_SSSBase', 'float', -0.261);
     mat.AddUniform('_SSSScale', 'float', 4.7);
 

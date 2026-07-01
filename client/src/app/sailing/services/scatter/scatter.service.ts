@@ -162,6 +162,21 @@ export class ScatterService {
   private observer: Observer<Scene> | null = null;
   private _palmTime = 0;   // palm wind clock (advanced each frame from the weather wind)
 
+  // ── Terrain-occlusion culling (perf) ──────────────────────────────────────────────────────────────────
+  // Hide scatter patches whose line-of-sight from the camera is blocked by a ridge (the island itself is the
+  // big occluder near land). CPU raymarch against the heightfield — reuses terrainService sampling, no GPU
+  // occlusion queries (WebGPU support + per-patch query overhead make those a poor fit here). THROTTLED
+  // round-robin (a slice of patches per frame) so the per-frame cost is bounded, and CONSERVATIVE (aims the
+  // ray at the patch's tree-tops + a margin, only culls when a ridge clearly hides even those) so it never
+  // blinks out visible scatter. Opt-out ignis_scatter_occlusion='0'.
+  private occlusionEnabled = (() => { try { return localStorage.getItem('ignis_scatter_occlusion') !== '0'; } catch { return true; } })();
+  private _occlCursor = 0;                 // round-robin index into the flattened patch list
+  private readonly _occlScratch: IPatch[] = [];   // reused per-frame gather buffer (no per-frame allocation)
+  private static readonly OCCL_PER_FRAME = 28;    // patches raymarched per frame (rest keep prior state)
+  private static readonly OCCL_NEAR = 95;         // m — patches closer than this are never culled
+  private static readonly OCCL_TOP = 13;          // m — tree/rock clearance added above the patch terrain top
+  private static readonly OCCL_MARGIN = 2.5;      // m — ridge must exceed the sightline by this to cull
+
   // Fake-shadow blobs (shared flat disc + dark decal material, thin-instanced under each land asset).
   private _shadowDisc: Mesh | null = null;
   private _shadowMat: StandardMaterial | null = null;
@@ -322,6 +337,7 @@ export class ScatterService {
           if (l.manager.drainQueue(1) > 0) { commitBudget--; drainedAny = true; }
         }
       }
+      this.updateOcclusion();   // hide patches a ridge blocks from the camera (throttled round-robin raymarch)
     });
   }
 
@@ -329,6 +345,50 @@ export class ScatterService {
    *  props / farimp / scatshadow) at build time. For profiling which part of scatter costs the frame; harmless off. */
   private dbgOff(key: string): boolean {
     try { return localStorage.getItem('ignis_no_' + key) === '1'; } catch { return false; }
+  }
+
+  /** Per-frame terrain-occlusion cull (throttled). Gather all live patches, raymarch a round-robin SLICE of
+   *  them from the camera against the heightfield, and hide the ones a ridge blocks. Bounded cost: at most
+   *  OCCL_PER_FRAME patches × ~20 cheap getElevationFast samples each. */
+  private updateOcclusion(): void {
+    if (!this.occlusionEnabled) { return; }
+    const cam = this.sceneService.camera;
+    if (!cam) { return; }
+    const patches = this._occlScratch;
+    patches.length = 0;
+    for (const l of this.layers) {
+      for (const p of l.patches.values()) { if (p) { patches.push(p); } }
+    }
+    const total = patches.length;
+    if (total === 0) { return; }
+    const cp = cam.position;
+    const K = Math.min(ScatterService.OCCL_PER_FRAME, total);
+    for (let k = 0; k < K; k++) {
+      const p = patches[(this._occlCursor + k) % total];
+      p.setCulled(this.terrainOccludesPatch(cp.x, cp.y, cp.z, p.getPosition()));
+    }
+    this._occlCursor = (this._occlCursor + K) % total;
+  }
+
+  /** True if terrain rises above the camera→patch sightline (the patch is hidden behind a ridge). Conservative:
+   *  aims at the patch's tree-tops (+OCCL_TOP) and stops short of the patch so its own hill can't self-occlude. */
+  private terrainOccludesPatch(cx: number, cy: number, cz: number, target: Vector3): boolean {
+    const dx = target.x - cx, dz = target.z - cz;
+    const distSq = dx * dx + dz * dz;
+    const near = ScatterService.OCCL_NEAR;
+    if (distSq < near * near) { return false; }              // near patches always visible
+    const dist = Math.sqrt(distSq);
+    const inv = 1 / dist;
+    const ux = dx * inv, uz = dz * inv;
+    const tg = this.terrainService;
+    const targetY = tg.getElevationFast(target.x, target.z) + ScatterService.OCCL_TOP;
+    const stop = dist * 0.88;                                 // stop short of the patch itself
+    const margin = ScatterService.OCCL_MARGIN;
+    for (let d = 30; d < stop; d += 12 + d * 0.03) {
+      const rayY = cy + (targetY - cy) * (d * inv);           // sightline height at distance d
+      if (tg.getElevationFast(cx + ux * d, cz + uz * d) > rayY + margin) { return true; }
+    }
+    return false;
   }
 
   /** Build every scatter layer (grass + the authored-GLB groups). Called once by init(), and again by

@@ -12,6 +12,8 @@ export class ThinInstancePatch implements IPatch {
   private baseMesh: Mesh | null = null;
   /** Optional SECOND clone (cross-dissolve ring) sharing this patch's matrix/colour buffers — see IPatch. */
   private secondaryMesh: Mesh | null = null;
+  /** Terrain-occlusion state (see setCulled); re-applied to any freshly-cloned mesh in makeClone. */
+  private culled = false;
   private readonly position: Vector3;
   readonly matrixBuffer: Float32Array;
   /** Optional per-instance colour buffer (N × 4 RGBA) — e.g. rock colour variation. */
@@ -67,7 +69,16 @@ export class ThinInstancePatch implements IPatch {
     mesh.isPickable = false;
     mesh.doNotSyncBoundingInfo = true;
     mesh.freezeWorldMatrix();
+    if (this.culled) { mesh.setEnabled(false); }   // re-materialized while occluded → stay hidden until re-tested
     return mesh;
+  }
+
+  setCulled(occluded: boolean): void {
+    if (occluded === this.culled) { return; }
+    this.culled = occluded;
+    const on = !occluded;
+    if (this.baseMesh) { this.baseMesh.setEnabled(on); }
+    if (this.secondaryMesh) { this.secondaryMesh.setEnabled(on); }
   }
 
   getNbInstances(): number {

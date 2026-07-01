@@ -19,5 +19,8 @@ export interface IPatch {
   createInstances(baseMesh: TransformNode, fraction?: number, secondary?: TransformNode): void;
   getNbInstances(): number;
   getPosition(): Vector3;
+  /** Terrain-occlusion cull: hide/show this patch's draw mesh(es) when a ridge blocks line-of-sight from the
+   *  camera. The flag is remembered so a later LoD-swap re-clone materializes in the correct enabled state. */
+  setCulled(occluded: boolean): void;
   dispose(): void;
 }

@@ -44,6 +44,8 @@ export class GpuScatterPatch implements IPatch {
   private secondaryMesh: Mesh | null = null;
   private pendingSecondary: Mesh | null = null;
   private buffersFreed = false;
+  /** Terrain-occlusion state (see setCulled); re-applied to any freshly-cloned mesh in makeClone. */
+  private culled = false;
   /** Vertical bounds of the patch's terrain (sampled by the builder) for the culling box. */
   private readonly yMin: number;
   private readonly yMax: number;
@@ -151,7 +153,16 @@ export class GpuScatterPatch implements IPatch {
     mesh.isPickable = false;
     mesh.doNotSyncBoundingInfo = true;
     mesh.freezeWorldMatrix();
+    if (this.culled) { mesh.setEnabled(false); }   // re-materialized while occluded → stay hidden until re-tested
     return mesh;
+  }
+
+  setCulled(occluded: boolean): void {
+    if (occluded === this.culled) { return; }
+    this.culled = occluded;
+    const on = !occluded;
+    if (this.baseMesh) { this.baseMesh.setEnabled(on); }
+    if (this.secondaryMesh) { this.secondaryMesh.setEnabled(on); }
   }
 
   /** Drop the GPU buffers of a confirmed-empty (or disposed) patch. Idempotent. */

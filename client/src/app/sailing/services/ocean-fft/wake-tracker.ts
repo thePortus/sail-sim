@@ -49,14 +49,30 @@ export class WakeTracker {
       while (drop < tr.count && tr.path[drop * 4 + 2] > WAKE_LIFE) { drop++; }
       if (drop > 0) { tr.path.copyWithin(0, drop * 4, tr.count * 4); tr.count -= drop; }
 
-      const dx = b.x - tr.lastX, dz = b.z - tr.lastZ;
-      if (Math.abs(b.speed) > 0.2 && dx * dx + dz * dz >= WAKE_STEP * WAKE_STEP) {
-        if (tr.count >= WAKE_POINTS) { tr.path.copyWithin(0, 4, WAKE_POINTS * 4); tr.count = WAKE_POINTS - 1; }
-        const idx = tr.count * 4;
-        // 4th channel = speed at the moment this point was laid (abs(m/s)×4), so the wake's
-        // strength/width can reflect how fast the ship was HERE, not its current speed.
-        tr.path[idx] = b.x; tr.path[idx + 1] = b.z; tr.path[idx + 2] = 0; tr.path[idx + 3] = b.speed;
-        tr.count++; tr.lastX = b.x; tr.lastZ = b.z;
+      if (Math.abs(b.speed) > 0.2) {
+        if (tr.count === 0) {
+          // Seed the first point (which also serves as the initial live head).
+          tr.path[0] = b.x; tr.path[1] = b.z; tr.path[2] = 0; tr.path[3] = b.speed;
+          tr.count = 1; tr.lastX = b.x; tr.lastZ = b.z;
+        } else {
+          // LIVE HEAD: the LAST point continuously tracks the ship every frame, so the wake TIP grows
+          // smoothly toward the stern instead of the polyline jumping forward a whole WAKE_STEP each time a
+          // point commits (the "chunky laydown"). Held at age 0 — it's the freshly-churned water at the stern.
+          // (An age-based strength fade-in was tried instead and FLASHED: bestAge is the nearest-segment age,
+          //  which snaps between a new faint segment and an old full one as the ship lays points.)
+          const head = (tr.count - 1) * 4;
+          // 4th channel = speed at laydown (abs(m/s)×4) → the wake's strength/width reflects the speed HERE.
+          tr.path[head] = b.x; tr.path[head + 1] = b.z; tr.path[head + 2] = 0; tr.path[head + 3] = b.speed;
+          // COMMIT: once the head is a full WAKE_STEP from the last committed point, freeze it (it stays and
+          // begins aging) and start a NEW live head at the same spot that the ship then drags forward.
+          const dx = b.x - tr.lastX, dz = b.z - tr.lastZ;
+          if (dx * dx + dz * dz >= WAKE_STEP * WAKE_STEP) {
+            if (tr.count >= WAKE_POINTS) { tr.path.copyWithin(0, 4, WAKE_POINTS * 4); tr.count = WAKE_POINTS - 1; }
+            const idx = tr.count * 4;
+            tr.path[idx] = b.x; tr.path[idx + 1] = b.z; tr.path[idx + 2] = 0; tr.path[idx + 3] = b.speed;
+            tr.count++; tr.lastX = b.x; tr.lastZ = b.z;
+          }
+        }
       }
     }
     // Forget ships that left.

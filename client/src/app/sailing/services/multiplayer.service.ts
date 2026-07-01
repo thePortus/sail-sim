@@ -683,6 +683,7 @@ export class MultiplayerService {
         // A remote ship was sunk → capsize it (its per-zone damage drives which way it rolls/settles).
         const e = this.players.get(String(msg.victimId));
         if (e && !e.sinking) { e.sinking = true; e.sinkElapsed = 0; }
+        if (String(msg.shooterId) === this.myId) this.vesselService.crewCheer();   // (P4) WE sank them → crew cheer
       }
 
     } else if (msg.type === 'combat_repair') {

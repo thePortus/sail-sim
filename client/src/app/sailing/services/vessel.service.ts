@@ -218,6 +218,7 @@ export class VesselService {
     this.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
     this.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
     this.addShakeTrauma(0.85);   // taking a hit: a big, ringing shake (~2-3 swings)
+    this.crewHandle?.reactToHit(side);   // deck crew stagger/lurch with the impact (P4)
   }
 
   addCannonRecoil(side: 'port' | 'stbd'): void {
@@ -246,6 +247,11 @@ export class VesselService {
   /** A gun on `side` just fired → the deck crew at that side's gun stations work harder for a beat (crew P3). */
   crewGunWork(side: 'port' | 'stbd'): void {
     this.crewHandle?.emphasizeGun(side);
+    this.crewHandle?.reactToFire(side);   // (P4) crew not working that gun flinch at the blast — AFTER emphasizeGun
+  }
+  /** (P4) We sank an enemy → the deck crew cheer. */
+  crewCheer(): void {
+    this.crewHandle?.reactCheer();
   }
   /** True once a side has finished running out (safe to fire). */
   isGunReady(side: 'port' | 'stbd'): boolean {
@@ -949,6 +955,7 @@ export class VesselService {
     this.sinking    = true;
     this.sinkStartT = this.simTime;
     this.speed      = 0;
+    this.crewHandle?.crewPanic(0.85, 30);   // (P4) she's going down → the deck crew break and cower
   }
 
   /** End the sink (on repair / refloat): the hull eases back up to normal buoyancy. */

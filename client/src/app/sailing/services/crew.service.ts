@@ -43,6 +43,26 @@ const GLANCE_CHANCE   = 0.02;  // per-second chance a stationed crew breaks off 
 // incoming ramps up over this window. Weights sum to 1 so the blended pose stays normalized.
 const CLIP_BLEND_S    = 0.22;  // s — clip cross-fade time
 
+// ── Reactions (P4): crew flinch/stagger/brace + facial reactions to combat & the swell ───────────────────────
+// No dedicated flinch/stagger CLIPS exist yet (they fall back to Idle), so phase-1 reactions are driven on the
+// two channels we DO have: an additive HOLDER pose (a quick duck / sideways lurch, same wrapper the sway uses)
+// + FACIAL morphs (wince = Frown+BrowsUp+squint). Dedicated Mixamo clips can replace the pose approximation later.
+const FLINCH_FIRE   = 0.6;    // flinch level a (non-gun) crew takes when a gun fires near them
+const FLINCH_DECAY  = 0.42;   // s for a flinch to fade
+const FLINCH_DUCK_P = 0.20;   // rad forward pitch (duck the head) at full flinch
+const FLINCH_DUCK_Y = 0.045;  // m drop (crouch) at full flinch
+const STAGGER_DECAY = 0.85;   // s for a hit-stagger to fade
+const STAGGER_ROLL  = 0.26;   // rad sideways lurch (away from the impact) at full stagger
+const STAGGER_PITCH = 0.10;   // rad forward jolt at full stagger
+const STAGGER_DUCK_Y = 0.05;  // m drop at full stagger
+const HEEL_TENSE_LO = 0.085;  // rad heel where crew start to look tense (brace face)
+const HEEL_TENSE_HI = 0.32;   // rad heel for a full tense/worried face
+// One-shot reaction CLIPS (P4): real Mixamo clips that override the work loop for a beat, then resume.
+const HIT_CLIP_CHANCE  = 0.5;  // fraction of crew that play the full React_Hit recoil on a hit (rest just lurch via the pose)
+const HIT_REACT_DUR    = 1.0;  // s the hit-recoil clip holds before resuming the station clip
+const REACT_COOLDOWN   = 3.0;  // s min between a member's one-shot reaction clips (no recoil-spam in a long battle)
+const POINT_GLANCE_CHANCE = 0.3;  // fraction of "glance about" breaks that become a point-at-the-horizon (React_Point)
+
 // ── Environmental grip IK (crew realism v2, track A1+A2) ─────────────────────────────────────────────────────
 // Make working hands actually REACH their station instead of miming in the air. Post-clip 2-bone arm IK
 // (UpperArm→Forearm→Hand) plants each Hand on a grip point in front of the station, and the GLB's `Grip` shape
@@ -387,6 +407,14 @@ interface CrewMember {
   stationClip: string;      // the looping work clip for the current station (to resume after a glance)
   workBurst: number;        // >0 → working harder (e.g. the gun crew right after a broadside); decays
   glanceT: number;          // >0 → briefly broke off work to glance about (Lookout), then resumes
+  // Reactions (P4): transient combat startles, decaying 1→0 over their own window. Drive an additive duck/lurch
+  // pose + a facial wince; the dominant one wins each frame.
+  flinch: number;           // 0..1 — quick duck/wince at a nearby gun blast
+  stagger: number;          // 0..1 — bigger lurch when the ship takes a hit
+  staggerDir: number;       // ±1 — which way the hit lurches them (away from the struck side)
+  reactT: number;           // >0 while a one-shot reaction CLIP (React_Hit/Point/Cheer) overrides the work loop
+  reactCD: number;          // cooldown (s) before the next one-shot reaction clip — prevents recoil-spam
+  panicT: number;           // >0 while morale is BROKEN — cowering (React_Panic looped), abandoned the work loop
   // Environmental grip IK (track A). Built lazily the first time the member is near the camera.
   skeleton: Skeleton | null;   // this member's cloned 24-joint rig (arm bones live here)
   bodyMesh: AbstractMesh | null; // the skinned 'Human' mesh (BoneIKController world-space anchor)
@@ -491,11 +519,18 @@ export class CrewHandle {
 
     this.applyVariants(glbRoot, rng);
 
-    // Facial morph targets (Blink/BrowsUp/Frown/Smile) live on the body mesh.
+    // Facial expression morph targets live on the body/face mesh — new Mixamo crew = 'CrewM', old pirate = 'Human'.
+    // Find it by the morph targets themselves (robust to the mesh-name suffix) rather than a hard-coded name.
     let face: CrewFace | null = null;
     const human = glbRoot.getChildMeshes(false)
       .find((mesh) => mesh.name === 'Human' || mesh.name.endsWith('.Human')) as Mesh | undefined;
-    const mgr = human?.morphTargetManager;
+    const faceMesh = glbRoot.getChildMeshes(false).find((mesh) => {
+      const tm = (mesh as Mesh).morphTargetManager;
+      if (!tm) { return false; }
+      for (let t = 0; t < tm.numTargets; t++) { const n = tm.getTarget(t).name; if (n === 'BrowsUp' || n === 'Blink') { return true; } }
+      return false;
+    }) as Mesh | undefined;
+    const mgr = (faceMesh ?? human)?.morphTargetManager;
     // BoneIKController needs a skinned mesh to resolve bone world transforms. Old pirate crew = 'Human';
     // the new Mixamo crew's skinned body is 'Crew' (else fall back to any skinned mesh under this member).
     const ikBody: AbstractMesh | undefined = this.useNew
@@ -511,8 +546,8 @@ export class CrewHandle {
       face = {
         targets, nextBlink: 1 + rng() * 4, blinkT: 0,
         exprTimer: 5 + rng() * 20,
-        cur: { BrowsUp: 0, Frown: 0, Smile: 0 },
-        tgt: { BrowsUp: 0, Frown: 0, Smile: 0 },
+        cur: { BrowsUp: 0, Frown: 0, Smile: 0, MouthOpen: 0 },
+        tgt: { BrowsUp: 0, Frown: 0, Smile: 0, MouthOpen: 0 },
       };
       // Idle hands rest gently curled (set once; tickFace only touches Blink/expressions, so it persists).
       const relax = targets.get('Relaxed');
@@ -537,6 +572,7 @@ export class CrewHandle {
       detail, lodFar: false,
       swayPhase: rng() * Math.PI * 2, swayFreq: 0.7 + rng() * 0.5, stationPos: new Vector3(),
       stationClip: 'Idle', workBurst: 0, glanceT: 0,
+      flinch: 0, stagger: 0, staggerDir: 1, reactT: 0, reactCD: 0, panicT: 0,
       skeleton: skeletons.find((s) => s && s.bones?.length) ?? skeletons[0] ?? null,
       bodyMesh: ikBody ?? null, ik: null, ikActive: false, ikGrip: 0,
     };
@@ -831,6 +867,53 @@ export class CrewHandle {
     }
   }
 
+  /** A gun fired (P4) → crew NOT working that piece flinch/duck at the blast (the gun crew on `side` are already
+   *  heaving via emphasizeGun, so skip anyone mid-burst). Call AFTER emphasizeGun so the firing crew are exempt. */
+  reactToFire(_side: 'port' | 'stbd'): void {
+    for (const m of this.members) {
+      if (m.state !== 'station' && m.state !== 'walk') continue;
+      if (m.workBurst > 0) continue;                 // the gun crew working the piece don't flinch at their own shot
+      m.flinch = Math.max(m.flinch, FLINCH_FIRE);
+    }
+  }
+
+  /** The ship took a hit on `side` (P4) → every hand staggers (face wince + a lurch AWAY from the struck side,
+   *  matching the hull's own hit-shudder sense: port hit → lurch to starboard). A random ~half also play the full
+   *  React_Hit recoil CLIP (cooldown-gated) so the deck reacts as a mix of recoils + lurches, not a robotic unison. */
+  reactToHit(side: 'port' | 'stbd'): void {
+    const dir = side === 'port' ? 1 : -1;
+    for (const m of this.members) {
+      if (m.state === 'dead' || m.state === 'reserve') continue;
+      m.stagger = 1; m.staggerDir = dir;
+      if (m.state === 'station' && m.reactCD <= 0 && m.rng() < HIT_CLIP_CHANCE) this.playReact(m, 'React_Hit', HIT_REACT_DUR);
+    }
+  }
+
+  /** Crew celebrate (P4) — a victory cheer on the idle/stationed hands. Call on a kill / battle won. */
+  reactCheer(): void {
+    for (const m of this.members) {
+      if (m.state === 'station' && m.reactCD <= 0 && m.rng() < 0.7) this.playReact(m, 'React_Cheer', 2.2);
+    }
+  }
+
+  /** Morale BREAKS (P4) — a fraction `frac` of the stationed hands panic and cower (React_Panic, looped) for `dur`
+   *  s, abandoning their work. Call on the ship sinking or heavy casualties. Refreshable (re-call to extend). */
+  crewPanic(frac: number, dur: number): void {
+    for (const m of this.members) {
+      if (m.state !== 'station' || !m.clips.has('React_Panic')) continue;
+      if (m.panicT > 0) { m.panicT = Math.max(m.panicT, dur); continue; }   // already panicking → just extend
+      if (m.rng() < frac) { m.panicT = dur; this.play(m, 'React_Panic', true); }
+    }
+  }
+
+  /** Play a one-shot reaction clip that overrides the work loop for `dur` s, then resume the station clip. No-op if
+   *  the asset lacks the clip (older crew) — the additive pose still handles the body. */
+  private playReact(m: CrewMember, clip: string, dur: number): void {
+    if (m.state !== 'station' || !m.clips.has(clip)) return;
+    m.reactT = dur; m.reactCD = REACT_COOLDOWN;
+    this.play(m, clip, false);
+  }
+
   /** Mark one (random alive) crew member as a casualty: stagger, fall, stay down. */
   killOne(): boolean {
     const alive = this.members.filter((m) => m.state !== 'dead' && m.state !== 'reserve');
@@ -901,8 +984,11 @@ export class CrewHandle {
       return;
     }
     let alive = this.aliveCount;
+    const start = alive;
     while (alive > t) { if (!this.killOne()) break; alive--; }
     while (alive < t) { if (!this.reviveOne()) break; alive++; }
+    // Heavy casualties (P4): when losses drop the crew to a skeleton, some of the survivors' morale breaks.
+    if (t < start && t <= Math.max(3, Math.floor(this.members.length * 0.4))) this.crewPanic(0.3, 6);
   }
   private firstFill = true;
 
@@ -1110,7 +1196,6 @@ export class CrewHandle {
       f.nextBlink -= dt;
       if (f.nextBlink <= 0) { f.blinkT = 0.18; f.nextBlink = 2.5 + m.rng() * 5; }
     }
-    set('Blink', blink);
     // Expression drift: mostly neutral, occasionally a mild brow/smile/frown.
     f.exprTimer -= dt;
     if (f.exprTimer <= 0) {
@@ -1124,8 +1209,17 @@ export class CrewHandle {
     }
     for (const k of Object.keys(f.cur)) {
       f.cur[k] += (f.tgt[k] - f.cur[k]) * Math.min(1, dt * 2.5);
-      set(k, f.cur[k]);
     }
+    // Reaction overlay (P4): a WINCE on flinch/stagger (brows up + frown + squint) and a TENSE brow as she heels
+    // hard in a rough sea — max'd over the idle drift so a reaction always reads, then relaxes back as it decays.
+    const react = Math.max(m.flinch, m.stagger);
+    const scared = m.panicT > 0 ? 1 : 0;                                           // morale broken → a held terror face
+    const tense = Math.min(1, Math.max(0, (Math.abs(this.shipHeel) - HEEL_TENSE_LO) / (HEEL_TENSE_HI - HEEL_TENSE_LO)));
+    set('Blink',    Math.max(blink, react * 0.5));                                 // squint under the blast/jolt
+    set('BrowsUp',  Math.max(f.cur['BrowsUp'], react * 0.40, tense * 0.22, scared * 0.55));
+    set('Frown',    Math.max(f.cur['Frown'],   react * 0.45, tense * 0.18, scared * 0.5));
+    set('Smile',    (react > 0.05 || scared) ? 0 : f.cur['Smile']);                // no grinning mid-flinch/panic
+    set('MouthOpen', Math.max(react * 0.35, scared * 0.7));                        // a gasp on a jolt; a wide terror mouth in panic
   }
 
   // ── environmental grip IK (track A1+A2) ──────────────────────────────────────
@@ -1410,6 +1504,13 @@ export class CrewHandle {
         roll  += Math.sin(this.clock * m.swayFreq + m.swayPhase) * IDLE_LEAN_AMP * this.railDamp(m);
         pitch += Math.sin(this.clock * m.swayFreq * 0.7 + m.swayPhase * 1.7) * IDLE_PITCH_AMP;
       }
+      // Reactions (P4): decay the transient startles, then add their duck (flinch) / sideways lurch (stagger) to
+      // the brace pose. The face wince is driven in tickFace from the same flinch/stagger levels.
+      if (m.flinch > 0)  m.flinch  = Math.max(0, m.flinch  - dt / FLINCH_DECAY);
+      if (m.stagger > 0) m.stagger = Math.max(0, m.stagger - dt / STAGGER_DECAY);
+      // The lurch pose is for crew NOT playing the recoil CLIP (reactT>0) — the clip poses their body itself.
+      pitch += FLINCH_DUCK_P * m.flinch + (m.reactT > 0 ? 0 : STAGGER_PITCH * m.stagger);
+      roll  += m.reactT > 0 ? 0 : STAGGER_ROLL * m.stagger * m.staggerDir;
       roll  = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, roll));
       pitch = Math.max(-BRACE_MAX, Math.min(BRACE_MAX, pitch));
       const qYaw = Quaternion.RotationAxis(Vector3.Up(), m.yaw);
@@ -1421,36 +1522,51 @@ export class CrewHandle {
       const rd = this.railDamp(m);
       m.holder.position.x = m.stationPos.x + (Math.sin(this.clock * m.swayFreq + m.swayPhase) * SWAY_AMP + this.shipHeel * HEEL_SHIFT) * rd;
       m.holder.position.z = m.stationPos.z + Math.cos(this.clock * m.swayFreq * 0.8 + m.swayPhase) * SWAY_AMP * 0.6;
-      m.holder.position.y = m.stationPos.y + Math.sin(this.clock * 0.9 + m.swayPhase) * IDLE_BOB;
+      m.holder.position.y = m.stationPos.y + Math.sin(this.clock * 0.9 + m.swayPhase) * IDLE_BOB
+        - (FLINCH_DUCK_Y * m.flinch + (m.reactT > 0 ? 0 : STAGGER_DUCK_Y * m.stagger));   // crouch under the blast / jolt down on a hit
 
       // Gun-fire loading (P3): right after their broadside, gun crew break from manning the piece into a heave/load
       // motion (emphasizeGun set workBurst on fire), then settle back to hands-on-the-gun. While loading, the clip
       // drives the arms (tickIK suppresses the gun grip-IK on workBurst>0) so the motion reads as real work.
-      if (m.workBurst > 0) {
-        m.workBurst = Math.max(0, m.workBurst - dt);
-        if (m.stationId?.startsWith('gun_') && m.glanceT <= 0) {
-          const loading = m.workBurst > 0;
-          this.play(m, loading ? GUN_LOAD_CLIP : m.stationClip, true);   // heave while loading → resume manning
-          m.yawTarget = m.stationYaw + (loading ? LOAD_YAW_OFFSET : 0);   // angle the body so the diagonal pull faces the gun
+      // One-shot reaction CLIP (P4): a recoil (React_Hit) / point / cheer overrides the work loop for its window,
+      // then resumes the station clip. While it plays, the work-burst + glance logic below is suspended.
+      if (m.reactCD > 0) m.reactCD = Math.max(0, m.reactCD - dt);
+      if (m.panicT > 0) {
+        m.panicT -= dt;                                  // morale broken: cowering (React_Panic loops); back to work when it lifts
+        if (m.panicT <= 0) this.play(m, m.stationClip, true);
+      } else if (m.reactT > 0) {
+        m.reactT -= dt;
+        if (m.reactT <= 0) this.play(m, m.stationClip, true);
+      } else {
+        if (m.workBurst > 0) {
+          m.workBurst = Math.max(0, m.workBurst - dt);
+          if (m.stationId?.startsWith('gun_') && m.glanceT <= 0) {
+            const loading = m.workBurst > 0;
+            this.play(m, loading ? GUN_LOAD_CLIP : m.stationClip, true);   // heave while loading → resume manning
+            m.yawTarget = m.stationYaw + (loading ? LOAD_YAW_OFFSET : 0);   // angle the body so the diagonal pull faces the gun
+          }
         }
-      }
-      // Glance (P3): occasionally break off the work loop to look about (Lookout), then resume the station clip.
-      if (m.glanceT > 0) {
-        m.glanceT -= dt;
-        if (m.glanceT <= 0) this.play(m, m.stationClip, true);
-      } else if (m.workBurst <= 0 && m.dwell > 5 && m.clips.has('Lookout') && m.rng() < GLANCE_CHANCE * dt) {
-        m.glanceT = 2 + m.rng() * 2.5;
-        this.play(m, 'Lookout', true);
-      }
-      if (m.glanceT <= 0 && m.current) {   // frantic loading right after the shot, decaying
-        m.current.speedRatio = m.animSpeed * (1 + WORK_BURST_GAIN * (m.workBurst / WORK_BURST_DUR));
+        // Glance (P3): occasionally break off to look about (Lookout) — and sometimes POINT at the horizon (React_Point,
+        // a lookout calling a sail). Resume the station clip when it ends.
+        if (m.glanceT > 0) {
+          m.glanceT -= dt;
+          if (m.glanceT <= 0) this.play(m, m.stationClip, true);
+        } else if (m.workBurst <= 0 && m.dwell > 5 && m.clips.has('Lookout') && m.rng() < GLANCE_CHANCE * dt) {
+          const point = m.clips.has('React_Point') && m.rng() < POINT_GLANCE_CHANCE;
+          m.glanceT = point ? 4.5 : 2 + m.rng() * 2.5;
+          this.play(m, point ? 'React_Point' : 'Lookout', !point);   // the point gesture plays once; Lookout loops
+        }
+        if (m.glanceT <= 0 && m.current) {   // frantic loading right after the shot, decaying
+          m.current.speedRatio = m.animSpeed * (1 + WORK_BURST_GAIN * (m.workBurst / WORK_BURST_DUR));
+        }
       }
     }
 
     // Environmental grip IK (track A): plant working hands on the station + close the fingers. Runs every frame
     // for near (player-deck) members; internally a no-op when far / not at a work station. Animations are already
-    // evaluated by the time onBeforeRender fires, so this cleanly overrides the arm pose post-clip.
-    this.tickIK(m, dt);
+    // evaluated by the time onBeforeRender fires, so this cleanly overrides the arm pose post-clip. Suspended while
+    // a reaction clip plays (P4) — the recoil/point/cheer needs its own arms, not the gun grip.
+    if (m.reactT <= 0 && m.panicT <= 0) this.tickIK(m, dt);
 
     switch (m.state) {
       case 'station': {

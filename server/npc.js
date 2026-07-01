@@ -30,16 +30,29 @@ const DEG = Math.PI / 180;
 // WARSHIP, NOT a trade ship — it is deliberately ABSENT here so it only ever sails as a convoy ESCORT
 // (spawnConvoy hard-codes 'brig'), a PIRATE (PIRATE_SLUGS), or a navy HUNTER (makeHunter). Duplicates set the odds.
 const MERCHANT_SLUGS = ['merchantman', 'merchantman', 'merchantman', 'merchantman', 'sloop', 'sloop', 'pinnace'];
-const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
-  'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
-  'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',
-  'Industry', 'Diligence', 'Amity', 'Concord', 'Providence', 'Swift Return', 'Golden Hind', 'Silver Fox',
-  'Morning Star', 'Evening Tide', 'Brittania', 'Saint Elmo', 'Notre Dame', 'La Belle', 'Esperanza',
-  'Buena Ventura', 'Santa Lucia', 'Maria Galante', 'Zeelandia', 'Vrijheid', 'Goede Hoop', 'Batavia',
-  'Cinnamon', 'Nutmeg Lass', 'Pepperpot', 'Sugar Isle', 'Molasses', 'Tobacco Maid', 'Cotton Bale',
-  'Rum Runner', 'Salt Cod', 'Whitehaven', 'Bristol Maid', 'Liverpool Belle', 'Plymouth Hope',
-  'Sea Wren', 'Kittiwake', 'Fulmar', 'Shearwater', 'Guillemot', 'Mary Rose', 'Jolly Trader',
-  'Honest Penny', 'Fair Wind', 'Sea Sprite', 'Nimble', 'Patient Jane', 'Bonny Kate', 'Adventure'];
+// Ship names by NATION — every faction-owned vessel (merchant OR navy hunter) is named in its own nation's
+// language, so a Spanish ship reads as Spanish, a Dutch ship as Dutch, etc. Authentic period ship / saint /
+// place / virtue names (NOT thematic stereotypes). Pirates fly no flag and keep their own captain-names below.
+const SHIP_NAMES = {
+  english: ['Endeavour', 'Resolution', 'Adventure', 'Industry', 'Diligence', 'Amity', 'Concord', 'Providence',
+    'Prosperity', 'Sovereign', 'Defiance', 'Triumph', 'Victory', 'Albion', 'Britannia', 'Halcyon', 'Swiftsure',
+    'Vanguard', 'Bellona', 'Argonaut', 'Kingfisher', 'Swallow', 'Pelican', 'Bristol', 'Plymouth', 'Falmouth',
+    'Dover', 'Mary Rose', 'Golden Hind', 'Bonaventure', 'Repulse', 'Warspite'],
+  french: ['Espérance', 'Belle Poule', 'Hermione', 'Fleur de Lys', 'Aigle', 'Soleil Royal', 'Redoutable',
+    'Intrépide', 'Gloire', 'Renommée', 'Marianne', 'Notre-Dame', 'Saint-Michel', 'Sainte-Anne', 'Superbe',
+    'Fortune', 'Aurore', 'Triomphant', 'Bourbon', 'Bretagne', 'Normandie', 'Provence', 'Duguay-Trouin',
+    'Vaillant', 'Bon Espoir', 'Deux Frères', 'Flore', 'Vénus', 'Nantaise', 'Toulonnaise'],
+  spanish: ['Esperanza', 'Buenaventura', 'Santa Lucía', 'Santa María', 'San Felipe', 'San Ildefonso',
+    'Concepción', 'Trinidad', 'Santísima', 'Rayo', 'Glorioso', 'Neptuno', 'San Juan', 'El Fénix', 'Andalucía',
+    'Sevilla', 'Cádiz', 'San José', 'Montañés', 'Argonauta', 'Santa Ana', 'Vencedor', 'La Perla', 'Golondrina',
+    'Estrella', 'Nuestra Señora', 'Bahama', 'Reina', 'Princesa', 'San Nicolás'],
+  dutch: ['Zeelandia', 'Vrijheid', 'Goede Hoop', 'Batavia', 'Eendracht', 'Zeven Provinciën', 'Amsterdam',
+    'Rotterdam', 'Zeehond', 'Prins Willem', 'Gouden Leeuw', 'Zeearend', 'Meermin', 'Witte Leeuw', 'Middelburg',
+    'Fortuyn', 'Hollandia', 'Utrecht', 'Gelderland', 'Zeewolf', 'Duyfken', 'Halve Maen', 'Nachtegaal',
+    'Standvastigheid', 'Vrede', 'Wapen van Hoorn', 'Dolphijn', 'Neptunus', 'Concordia', 'Zeeridder'],
+};
+/** A ship name in the given nation's language (defaults to English for a null/unknown faction). */
+function shipName(faction) { return pick(SHIP_NAMES[faction] || SHIP_NAMES.english); }
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
 const AVOID_R = 140;         // world units: NPC↔NPC separation radius
 // Interest management — a client only RECEIVES (and so only renders) the nearest few merchants. Distant ships
@@ -138,8 +151,8 @@ function targetPirates(townCount) { return Math.max(3, Math.min(8, Math.round(to
 // from the nearest faction town — launched to hunt that specific pirate down. The threshold delay gives a PLAYER
 // first crack at the bounty; the hunter is built to WIN (a brig, veteran skill, a shade faster than the pirate).
 // When its quarry is dead (or gone) it sails back to its home port and vanishes — one hunter per pirate.
-const HUNTER_NAMES = ['Vengeance', 'Retribution', 'Intrepid', 'Vigilant', 'Defiance', 'Sentinel', 'Avenger',
-  'Indomitable', 'Relentless', 'Dauntless', 'Tempest', 'Valiant', 'Conqueror', 'Fury', 'Implacable', 'Resolute'];
+// Navy hunters are named by their launching town's NATION (shipName(town.faction)) — same per-nation pools as
+// the merchants, so a French hunter reads French, a Spanish one Spanish, etc. (was a flat English martial list).
 const PIRATE_SEED_GOLD = 200;      // a pirate spawns with this small purse; its bounty + plundered gold grow as it raids
 const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a navy hunter (players get first crack)
 // Respawn cooldown: when a pirate is sunk it does NOT refill instantly — a replacement is scheduled 5–10 min later
@@ -1049,7 +1062,7 @@ function makeMerchant(players, town, faction, slug, convoy, skill, combatRole) {
     state: {
       x: sx, z: sz, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
-      vesselName: 'Merchant ' + pick(MERCHANT_NAMES), vesselSlug: slug, callsign: '',
+      vesselName: 'Merchant ' + shipName(faction), vesselSlug: slug, callsign: '',
     },
     authPose: { x: sx, z: sz, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),
@@ -1225,7 +1238,7 @@ function makeHunter(players, town, pirate) {
     state: {
       x: sx, z: sz, heading: Math.random() * 360, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
-      vesselName: pick(HUNTER_NAMES), vesselSlug: slug, callsign: '',
+      vesselName: shipName(town.faction), vesselSlug: slug, callsign: '',
     },
     authPose: { x: sx, z: sz, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),

@@ -1090,6 +1090,22 @@ export class SceneService {
       // pass; keep shafts driven by sun vs clouds/terrain only.
       const ocean = this.scene.getMeshByName('ocean_lod0');
       if (ocean) gr.excludedMeshes = [ocean];
+      // Restrict the god-ray OCCLUDER pass to the big opaque silhouettes (terrain/islands, ship hulls, sails).
+      // EXCLUDE the ocean + all THIN-INSTANCED foliage/crew/impostors and small FX billboards: Babylon's VLS
+      // pass can't bind the GPU-scatter/impostor meshes' manually-set instance vertex buffers → a "vertex buffer
+      // slot N not set" GPUValidationError burst (invalid-pipeline self-heal storm) at sunset when the pass runs.
+      // They don't meaningfully occlude light shafts anyway, and dropping the hundreds of foliage draws from this
+      // extra pass is a perf win. renderListPredicate (unlike excludedMeshes) covers the DYNAMICALLY-created
+      // scatter/impostor meshes too. Keeps terrain/hulls/sails as occluders (regular meshes, VLS-safe).
+      const grPass = gr.getPass();
+      if (grPass) {
+        grPass.renderListPredicate = (m) => {
+          if (m === ocean) { return false; }
+          if ((m as { hasThinInstances?: boolean }).hasThinInstances === true) { return false; }
+          const n = m.name || '';
+          return !/scatter|_gpatch|_patch|grass|crew|impostor|nameplate|_label|flag|blob|billboard|shadow_disc|_fx|foam|splash|muzzle|smoke|_bird|_fish|dolphin|rain/i.test(n);
+        };
+      }
       this.godRays = gr;
       // Perf probe: detach/attach the whole radial-blur pass (exposure=0 still runs it). Prime
       // daytime suspect — only active while the sun is up, matching the day/night FPS gap.

@@ -2,9 +2,9 @@
 
 # General or Current TODO Items
 
-* put merchantman ahead of brig in shipwright list
-* make ships names match nationality (no salted cod for spanish for example. Don't stereotype in naming, just use names in that language)
+
 * long summer day?
+* Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words, so server filters unless user has option turned off (enabled by default)
 * frigate, galleon, barque, junkå
 * forts and taking towns
 * more tree varieties, flora.... regional/island differences
@@ -27,7 +27,6 @@
 * add forts to town that will fire when super hostile
 * Plan to make towns or areas "different"... things to see, special marvels... missions?
 * server optimization pass
-* Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words
 * add damage from collisions and aground
 * clouds don't seem to meet water at horizon.. not for spherical world?
 * tidal pull?

@@ -13,11 +13,14 @@ vertex displacement + water shading) and **floats the ship on it** using the sam
 CPU (`src/wave.hpp`) to heave + tilt the hull; **plus** the ocean-FFT `INITIAL_SPECTRUM` WGSL running
 natively with a verified GPU→CPU readback (matches a CPU oracle to ~4e-6). Verified on Metal (Apple
 M3 Pro): the 90k-vertex merchantman, 14 textures across 39 submeshes, floating on the sea, 0 errors.
-The ocean surface is now driven by the **real FFT wave simulation** (the client's ocean-fft compute
-chain ported to native WebGPU): JONSWAP spectrum → conjugate → per-frame time evolution → 4× inverse
-FFT → merge into displacement/derivatives/turbulence, sampled by the surface shader (single 256²
-cascade). The ship still rides the analytic Gerstner field (`wave.hpp`), as the client does.
-Multi-cascade + reflections, sailing physics, and Windows/D3D12 are next.
+You **sail a textured ship on the real FFT ocean.** The client's ocean-fft compute chain is ported
+to native WebGPU (JONSWAP → conjugate → time evolution → 4× IFFT → merge), run as **3 cascades**
+(250/17/5 m) and shaded with the client's ocean-material math (derivative normals, turbulence foam,
+subsurface scatter, Fresnel). A **procedural sky** and a **planar reflection** (mirror-camera RTT of
+sky + ship) complete the water. **Arrow keys / WASD** steer and trim sail; a chase camera follows,
+and the ocean grid follows the ship so it sails freely. The hull rides the analytic Gerstner field
+(`wave.hpp`) as the client does. Screenshots via `SAILSIM_SHOT=out.png`. Windows/D3D12 and the game
+systems (combat, economy, multiplayer, UI) are the road ahead.
 
 ## What this builds
 

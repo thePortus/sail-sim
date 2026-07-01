@@ -42,18 +42,19 @@ struct VSOut {
 
 @vertex
 fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
-    let uv0 = inXZ / cam.params.x;
-    let uv1 = inXZ / cam.params.y;
-    let uv2 = inXZ / cam.params.z;
+    let world = inXZ + cam.screen.zw;   // grid follows the ship (cam.screen.zw = ocean origin)
+    let uv0 = world / cam.params.x;
+    let uv1 = world / cam.params.y;
+    let uv2 = world / cam.params.z;
     var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
     disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
     disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
 
-    let p = vec3<f32>(inXZ.x + disp.x, disp.y, inXZ.y + disp.z);
+    let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
     out.position = cam.viewProj * vec4<f32>(p, 1.0);
     out.worldPos = p;
-    out.worldUV = inXZ;
+    out.worldUV = world;
     out.height = disp.y;
     return out;
 }

@@ -680,6 +680,9 @@ int main(int argc, char** argv) {
   WGPUTexture reflDepth = makeDepthTexture(device, curW, curH);
   WGPUTextureView reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
 
+  // Sailing state — arrow keys / WASD steer and trim sail; the ship sails the sea.
+  float shipX = 0.0f, shipZ = 0.0f, shipHeading = 0.0f, shipSpeed = 0.0f, sail = 0.35f;
+
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -705,13 +708,31 @@ int main(int argc, char** argv) {
       reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
     }
 
-    // Camera: slow orbit looking at the floating ship near the origin.
     float aspect = (float)curW / (float)curH;
     float t = (float)frame * (1.0f / 60.0f);
-    float orbit = t * 0.08f;
-    glm::vec3 eye(std::cos(orbit) * 7.0f, 3.2f, std::sin(orbit) * 7.0f);
-    glm::mat4 viewM = glm::lookAt(eye, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(0, 1, 0));
-    glm::mat4 proj  = glm::perspective(glm::radians(50.0f), aspect, 0.1f, 2000.0f);
+    const float dt = 1.0f / 60.0f;
+
+    // Input: turn (A/D or ←/→), trim sail (W/S or ↑/↓).
+    auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
+    float turn = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1.0f : 0.0f) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1.0f : 0.0f);
+    float trim = (down(GLFW_KEY_W, GLFW_KEY_UP)    ? 1.0f : 0.0f) - (down(GLFW_KEY_S, GLFW_KEY_DOWN) ? 1.0f : 0.0f);
+
+    // Simple sailing model: sail 0..1 sets target speed; heading turns (more rudder
+    // authority with way on); speed eases toward the target.
+    sail = glm::clamp(sail + trim * 0.4f * dt, 0.0f, 1.0f);
+    shipHeading += turn * 0.7f * dt * (0.4f + 0.6f * glm::clamp(shipSpeed / 6.0f, 0.0f, 1.0f));
+    float targetSpeed = sail * 9.0f;
+    shipSpeed += (targetSpeed - shipSpeed) * 0.6f * dt;
+    glm::vec3 fwd(std::sin(shipHeading), 0.0f, std::cos(shipHeading));
+    shipX += fwd.x * shipSpeed * dt;
+    shipZ += fwd.z * shipSpeed * dt;
+
+    // Chase camera: behind + above the ship, looking just ahead of it.
+    float shipY = oceanHeight(shipX, shipZ, t);
+    glm::vec3 shipPos(shipX, shipY, shipZ);
+    glm::vec3 eye = shipPos - fwd * 13.0f + glm::vec3(0.0f, 6.0f, 0.0f);
+    glm::mat4 viewM = glm::lookAt(eye, shipPos + fwd * 3.0f + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0, 1, 0));
+    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 
     // Advance all cascades.
@@ -719,18 +740,17 @@ int main(int argc, char** argv) {
     c1.update(t, 1.0f / 60.0f);
     c2.update(t, 1.0f / 60.0f);
 
-    // Ship world transform (used by BOTH the reflection and main passes): heave to
-    // the wave surface, tilt to its normal, slow yaw, scaled + keel-centred.
-    float waveY = oceanHeight(0.0f, 0.0f, t);
-    glm::vec3 up = oceanNormal(0.0f, 0.0f, t);
-    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, waveY - draft, 0.0f));
+    // Ship world transform (used by BOTH the reflection and main passes): at its
+    // sailed position, heave to the wave surface, tilt to its normal, yaw to heading.
+    glm::vec3 up = oceanNormal(shipX, shipZ, t);
+    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, shipY - draft, shipZ));
     glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
     float axisLen = glm::length(axis);
     if (axisLen > 1e-5f) {
       float tiltAngle = std::asin(glm::clamp(axisLen, 0.0f, 1.0f));
       model = model * glm::rotate(glm::mat4(1.0f), tiltAngle, axis / axisLen);
     }
-    model = glm::rotate(model, t * 0.05f, glm::vec3(0, 1, 0));
+    model = glm::rotate(model, shipHeading, glm::vec3(0, 1, 0));
     model = glm::scale(model, glm::vec3(shipScale));
     model = glm::translate(model, -keelCenter);
 
@@ -778,7 +798,7 @@ int main(int argc, char** argv) {
     // ── Main-pass uniforms ──
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
                     glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), 0.0f),
-                    glm::vec4((float)curW, (float)curH, 0.0f, 0.0f) };
+                    glm::vec4((float)curW, (float)curH, shipX, shipZ) };   // zw = ocean origin (follows ship)
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f) };
     wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));

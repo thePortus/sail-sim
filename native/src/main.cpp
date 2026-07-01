@@ -11,6 +11,9 @@
 // only spots likely to need a one-line reconcile — see native/README.md.
 
 #include <webgpu/webgpu.h>
+#if defined(WEBGPU_BACKEND_WGPU)
+#include <webgpu/wgpu.h>   // wgpu-native extensions (e.g. wgpuDevicePoll)
+#endif
 #include <glfw3webgpu.h>
 #include <GLFW/glfw3.h>
 
@@ -61,6 +64,14 @@ static const char* backendTypeName(WGPUBackendType t) {
 }
 
 int main() {
+  // Flush per line so `[spike] …` progress shows even when piped or killed.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+  // Optional headless cap: render N frames then exit cleanly (for CI / smoke tests).
+  const char* maxFramesEnv = std::getenv("SAILSIM_MAX_FRAMES");
+  const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
+  long frame = 0;
+
   if (!glfwInit()) {
     std::fprintf(stderr, "[spike] glfwInit failed\n");
     return EXIT_FAILURE;
@@ -93,13 +104,14 @@ int main() {
   WGPUAdapter adapter = requestAdapterSync(instance, &adapterOpts);
   if (!adapter) return EXIT_FAILURE;
 
-  // Report which native backend Dawn selected — the visible proof of the thesis.
-  WGPUAdapterInfo adapterInfo = {};
-  wgpuAdapterGetInfo(adapter, &adapterInfo);
+  // Report which native backend was selected — the visible proof of the thesis.
+  // wgpuAdapterGetProperties is present in both wgpu-native and Dawn 6512.
+  WGPUAdapterProperties adapterProps = {};
+  wgpuAdapterGetProperties(adapter, &adapterProps);
   std::printf("[spike] adapter: backend=%s  vendor=%s  device=%s\n",
-              backendTypeName(adapterInfo.backendType),
-              adapterInfo.vendor ? adapterInfo.vendor : "?",
-              adapterInfo.device ? adapterInfo.device : "?");
+              backendTypeName(adapterProps.backendType),
+              adapterProps.vendorName ? adapterProps.vendorName : "?",
+              adapterProps.name ? adapterProps.name : "?");
 
   // 4. Device + queue
   WGPUDeviceDescriptor deviceDesc = {};
@@ -141,6 +153,8 @@ int main() {
   // 6. Clear-colour render loop (a calm sea-blue, because of course)
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
+    if (maxFrames > 0 && frame >= maxFrames) break;
+    ++frame;
 
     WGPUSurfaceTexture surfaceTex;
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
@@ -156,7 +170,8 @@ int main() {
     colorAttachment.loadOp = WGPULoadOp_Clear;
     colorAttachment.storeOp = WGPUStoreOp_Store;
     colorAttachment.clearValue = WGPUColor{0.10, 0.32, 0.45, 1.0};
-    colorAttachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;  // remove if your header predates this field
+    // (Newer webgpu.h adds colorAttachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED here;
+    //  wgpu-native v0.19 has no such field — zero-init leaves it correctly unset.)
 
     WGPURenderPassDescriptor passDesc = {};
     passDesc.colorAttachmentCount = 1;
@@ -186,6 +201,8 @@ int main() {
     wgpuDevicePoll(device, false, nullptr);
 #endif
   }
+
+  std::printf("[spike] render loop exited after %ld frames — tearing down cleanly\n", frame);
 
   // 7. Teardown
   wgpuQueueRelease(queue);

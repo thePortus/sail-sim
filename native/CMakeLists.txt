@@ -36,23 +36,37 @@ FetchContent_Declare(
   GIT_SHALLOW    ON
 )
 
-# ── WebGPU via Dawn ──────────────────────────────────────────────────────────
+# ── WebGPU backend ───────────────────────────────────────────────────────────
 # Élie Michel's WebGPU-distribution exposes a single `webgpu` CMake target and a
-# consistent webgpu.h C API across backends. The `dawn` branch bundles Google's
-# Dawn (the same implementation Chrome ships), compiling to D3D12 / Metal / Vulkan.
+# consistent webgpu.h C API regardless of which implementation backs it — so our
+# code and (crucially) our WGSL are identical across backends.
 #
-# NOTE: this pins a moving branch. If the first configure fails on the GIT_TAG,
-# the upstream branch names are typically one of: `dawn`, `main`, `wgpu`. See
-# https://github.com/eliemichel/WebGPU-distribution and README.md "Troubleshooting".
+#   SAILSIM_WEBGPU_BACKEND = WGPU  → wgpu-native, prebuilt (default; fast, robust)
+#                          = DAWN  → Google's Dawn, built from source
 #
-# vcpkg alternative (if you prefer a package manager): add `dawn` to a
-# vcpkg.json manifest and replace this block + the glfw3webgpu block with
-# `find_package(dawn CONFIG REQUIRED)`. It is heavier to get green on both OSes,
-# which is why the spike defaults to FetchContent.
+# Why WGPU is the spike default: both implement WebGPU and run WGSL natively on
+# Metal / D3D12 / Vulkan, so the "our WGSL ports 1:1" thesis is validated either
+# way. But building Dawn from source through CMake 4.x on Apple Silicon currently
+# trips over its vendored fuzzers (libprotobuf-mutator) and an abseil `-msse4.1`
+# flag on arm64 — a build-config rabbit hole that proves nothing extra. wgpu is a
+# prebuilt binary: it links in seconds. The production backend choice (Dawn vs
+# wgpu) stays open — see PORTING.md — and DAWN here keeps that path wired up.
+set(SAILSIM_WEBGPU_BACKEND "WGPU" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
+
+if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
+  # Dawn, from source. NOTE: on Apple Silicon this still needs DAWN_BUILD_TESTS
+  # disabled at the distribution level and the abseil arm64 flag issue resolved.
+  set(WEBGPU_DIST_TAG "dawn-6512")
+else()
+  # wgpu-native, prebuilt. v0.19.4.1 ships the classic-callback webgpu.h that
+  # src/main.cpp targets, with the modern surface API.
+  set(WEBGPU_DIST_TAG "wgpu-static-v0.19.4.1")
+endif()
+
 FetchContent_Declare(
   webgpu
   GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
-  GIT_TAG        dawn
+  GIT_TAG        ${WEBGPU_DIST_TAG}
   GIT_SHALLOW    ON
 )
 

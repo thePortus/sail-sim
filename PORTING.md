@@ -177,11 +177,18 @@ Tasks:
 Estimated spike: **~3–4 weeks**. Deliverable: a written go/no-go with the validation diff and any
 WGSL changes Dawn required.
 
-**Scaffold:** tasks 1–2 (device bringup + clear-colour loop) are scaffolded in
-[`native/`](native/) — CMake + FetchContent (Dawn via WebGPU-distribution, GLFW, glfw3webgpu) and a
-commented `src/main.cpp`. Tasks 3–4 (the compute + readback) have a concrete binding-level recipe in
-[`native/shaders/README.md`](native/shaders/README.md). See [`native/README.md`](native/README.md)
-to build.
+**Scaffold — tasks 1–2 done and verified.** [`native/`](native/) builds and runs: a WebGPU device
+bringup + clear-colour render loop, confirmed on macOS (`backend=Metal`, Apple M3 Pro, renders and
+exits cleanly). CMake + FetchContent (GLFW, glfw3webgpu, WebGPU distribution) with a backend toggle.
+
+One course-correction worth recording: the spike currently runs on **wgpu-native (prebuilt)**, not
+Dawn. Building Dawn from source on Apple Silicon through CMake 4.x trips over its vendored fuzzers
+(`libprotobuf-mutator`) and an abseil `-msse4.1` flag on arm64 — a build-config problem, not a code
+one. wgpu-native implements the same `webgpu.h` and runs the same WGSL, so it proves the Phase 0
+thesis identically; the production Dawn-vs-wgpu choice stays open (the `DAWN` toggle keeps that path
+wired). Tasks 3–4 (compute + readback) have a binding-level recipe in
+[`native/shaders/README.md`](native/shaders/README.md); build steps in
+[`native/README.md`](native/README.md).
 
 ---
 

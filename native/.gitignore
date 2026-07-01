@@ -1,7 +1,10 @@
-# CMake build output (includes the fetched + built Dawn — large)
+# CMake build output (includes the fetched WebGPU backend — large)
 build/
 out/
 cmake-build-*/
+
+# transient configure/compile logs
+build-*.log
 
 # IDE
 .vs/

@@ -81,10 +81,12 @@ static WGPUTexture makeDepthTexture(WGPUDevice device, uint32_t w, uint32_t h) {
   return wgpuDeviceCreateTexture(device, &td);
 }
 
-// Uniforms uploaded per frame: clip-space matrix + model matrix (for normals).
+// Uniforms uploaded per frame: clip matrix, model matrix (for normals + world
+// position), and the camera position (for the PBR view vector).
 struct MeshUniforms {
   glm::mat4 mvp;
   glm::mat4 model;
+  glm::vec4 eye;
 };
 
 // Phase 1: a depth-tested mesh (glTF-loaded or the fallback cube). Everything a
@@ -122,10 +124,10 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   smd.nextInChain = &wgsl.chain;
   WGPUShaderModule module = wgpuDeviceCreateShaderModule(device, &smd);
 
-  // uniforms @group(0) @binding(0), visible to the vertex stage
+  // uniforms @group(0) @binding(0) — vertex reads matrices, fragment reads eye
   WGPUBindGroupLayoutEntry bgle = {};
   bgle.binding = 0;
-  bgle.visibility = WGPUShaderStage_Vertex;
+  bgle.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   bgle.buffer.type = WGPUBufferBindingType_Uniform;
   WGPUBindGroupLayoutDescriptor bgld = {};
   bgld.entryCount = 1; bgld.entries = &bgle;
@@ -141,13 +143,15 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &bgl;
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 
-  WGPUVertexAttribute attrs[2] = {};
+  WGPUVertexAttribute attrs[4] = {};
   attrs[0].format = WGPUVertexFormat_Float32x3; attrs[0].offset = 0;                 attrs[0].shaderLocation = 0; // position
   attrs[1].format = WGPUVertexFormat_Float32x3; attrs[1].offset = 3 * sizeof(float); attrs[1].shaderLocation = 1; // normal
+  attrs[2].format = WGPUVertexFormat_Float32x3; attrs[2].offset = 6 * sizeof(float); attrs[2].shaderLocation = 2; // albedo
+  attrs[3].format = WGPUVertexFormat_Float32x2; attrs[3].offset = 9 * sizeof(float); attrs[3].shaderLocation = 3; // metallic, roughness
   WGPUVertexBufferLayout vbl = {};
-  vbl.arrayStride = 6 * sizeof(float);
+  vbl.arrayStride = kFloatsPerVertex * sizeof(float);
   vbl.stepMode = WGPUVertexStepMode_Vertex;
-  vbl.attributeCount = 2; vbl.attributes = attrs;
+  vbl.attributeCount = 4; vbl.attributes = attrs;
 
   WGPUDepthStencilState ds = {};
   ds.format = kDepthFormat;
@@ -367,9 +371,10 @@ int main(int argc, char** argv) {
     glm::mat4 model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 1, 0));
     model = glm::scale(model, glm::vec3(fit));
     model = glm::translate(model, -center);
-    glm::mat4 viewM = glm::lookAt(glm::vec3(2.4f, 1.7f, 2.8f), glm::vec3(0.0f), glm::vec3(0, 1, 0));
+    glm::vec3 eye(2.4f, 1.7f, 2.8f);
+    glm::mat4 viewM = glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0, 1, 0));
     glm::mat4 proj  = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
-    MeshUniforms u{ proj * viewM * model, model };
+    MeshUniforms u{ proj * viewM * model, model, glm::vec4(eye, 1.0f) };
     wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &u, sizeof(u));
 
     WGPUSurfaceTexture surfaceTex;

@@ -3,8 +3,11 @@
 #include <cstdint>
 #include <vector>
 
+// Interleaved vertex layout: position.xyz, normal.xyz, albedo.rgb, metallic, roughness.
+constexpr int kFloatsPerVertex = 11;
+
 struct MeshData {
-  std::vector<float>    vertices;   // interleaved: position.xyz, normal.xyz
+  std::vector<float>    vertices;   // kFloatsPerVertex floats per vertex
   std::vector<uint32_t> indices;
   float bbMin[3] = { 0, 0, 0 };
   float bbMax[3] = { 0, 0, 0 };

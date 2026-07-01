@@ -13,7 +13,11 @@ vertex displacement + water shading) and **floats the ship on it** using the sam
 CPU (`src/wave.hpp`) to heave + tilt the hull; **plus** the ocean-FFT `INITIAL_SPECTRUM` WGSL running
 natively with a verified GPU→CPU readback (matches a CPU oracle to ~4e-6). Verified on Metal (Apple
 M3 Pro): the 90k-vertex merchantman, 14 textures across 39 submeshes, floating on the sea, 0 errors.
-Real FFT ocean, sailing physics, and Windows/D3D12 are next.
+The ocean surface is now driven by the **real FFT wave simulation** (the client's ocean-fft compute
+chain ported to native WebGPU): JONSWAP spectrum → conjugate → per-frame time evolution → 4× inverse
+FFT → merge into displacement/derivatives/turbulence, sampled by the surface shader (single 256²
+cascade). The ship still rides the analytic Gerstner field (`wave.hpp`), as the client does.
+Multi-cascade + reflections, sailing physics, and Windows/D3D12 are next.
 
 ## What this builds
 
@@ -130,12 +134,14 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
    from screen-space derivatives, no TANGENT needed) and per-texel metallic/roughness.
 7. ~~Ship on the ocean.~~ **Done** — `shaders/ocean.wgsl` (Gerstner surface) + `src/wave.hpp` (shared
    CPU wave field); the ship heaves + tilts on the waves. `createOcean()` in `src/main.cpp`.
-8. **Real FFT ocean (Phase 2).** Port the rest of the FFT chain (`CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`,
-   the butterfly `FFT_*` passes, `WAVES_MERGER`) on top of the readback harness in `src/fft_test.cpp`,
-   and drive the ocean surface + buoyancy from the FFT displacement instead of the analytic Gerstner set.
-9. **Sailing physics + input.** Port the client's force-based vessel model so the ship sails under
-   control (Phase 3 of PORTING.md).
-10. **Windows/D3D12** — build + verify on Windows, wire a CI matrix.
+8. ~~Real FFT ocean (Phase 2).~~ **Done (single cascade)** — `src/ocean_fft.*` ports the full compute
+   chain (`CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, butterfly `FFT_*`, `WAVES_MERGER`); the surface
+   samples its displacement/derivatives/turbulence (`shaders/ocean_surface.wgsl`).
+9. **Multi-cascade ocean + reflections.** Add the 2nd/3rd cascades (17 m, 5 m tiles) summed in the
+   surface shader to kill tiling, then planar reflection/refraction. Optionally drive buoyancy from an
+   FFT displacement readback instead of Gerstner.
+10. **Sailing physics + input.** Port the client's force-based vessel model so the ship sails under control.
+11. **Windows/D3D12** — build + verify on Windows, wire a CI matrix.
 
 ## Layout
 
@@ -145,9 +151,11 @@ native/
   src/main.cpp        device bringup + render loop (clear + camera + depth + glTF mesh); FFT test on startup
   src/gltf_mesh.*     cgltf .glb loader — positions, normals, UVs, material factors, per-material submeshes
   src/ktx2.*          Basis Universal transcoder wrapper: KTX2 (KHR_texture_basisu) -> RGBA
-  src/wave.hpp        analytic Gerstner wave field (CPU) — shared with ocean.wgsl for ship buoyancy
+  src/wave.hpp        analytic Gerstner wave field (CPU) — ship buoyancy heave/tilt
+  src/ocean_fft.*     FFT ocean compute cascade (spectrum -> IFFT -> displacement/derivatives/turbulence)
+  src/ocean_fft_wgsl.hpp  the FFT compute kernels (verbatim from the client)
   src/fft_test.*      ocean-FFT INITIAL_SPECTRUM compute + CPU-oracle readback verification
-  shaders/            WGSL: initial_spectrum.wgsl, mesh.wgsl (textured PBR), ocean.wgsl (Gerstner); embedded
+  shaders/            WGSL: initial_spectrum, mesh (textured PBR), ocean_surface (FFT ocean); embedded
   assets/             vendored sample model (rock_e.glb) used as the default
   README.md           this file
 ```

@@ -168,13 +168,14 @@ function(embed_wgsl SRC VARNAME OUT)
 endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
-embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean.wgsl"            OCEAN_WGSL            "${WGSL_GEN_DIR}/ocean_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean_surface.wgsl"    OCEAN_SURFACE_WGSL    "${WGSL_GEN_DIR}/ocean_surface_wgsl.h")
 
 add_executable(sailsim_native
   src/main.cpp
   src/fft_test.cpp
   src/gltf_mesh.cpp
   src/ktx2.cpp
+  src/ocean_fft.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
 

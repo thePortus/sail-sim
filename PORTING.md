@@ -190,9 +190,11 @@ M3 Pro). That readback is the real proof the WGSL ports 1:1: the shader compiled
 only host-side plumbing was written.
 
 Phase 1 has since grown into a textured, PBR-lit glTF ship (base-colour + normal + metallic-roughness
-KTX2 maps via the Basis transcoder, per-material submeshes) floating on an animated Gerstner-wave
-ocean (WGSL surface displacement + a shared CPU wave field for hull heave/tilt). Next: drive the
-ocean from the full FFT chain, then sailing physics + input.
+KTX2 maps via the Basis transcoder, per-material submeshes) floating on the **real FFT ocean**: the
+client's ocean-fft compute chain (JONSWAP spectrum → conjugate → time evolution → 4× inverse FFT →
+merge) is ported verbatim to native WebGPU (`src/ocean_fft.*`, single 256² cascade), and the surface
+samples its displacement/derivatives/turbulence. The hull rides the analytic Gerstner field, as the
+client does. Next: multi-cascade + reflections, then sailing physics + input.
 
 Course-corrections recorded for the record:
 - **Backend is wgpu-native (official prebuilt), not Dawn.** Building Dawn from source on Apple

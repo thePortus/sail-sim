@@ -59,6 +59,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cgltf)
 
+# ── Basis Universal transcoder (decodes KTX2 / KHR_texture_basisu) ───────────
+# We only need the transcoder (one .cpp), not the encoder/tools — SOURCE_SUBDIR
+# skips its CMakeLists. BASISD_SUPPORT_KTX2_ZSTD=0 drops the zstd dependency
+# (our textures use Basis ETC1S/UASTC supercompression, not zstd).
+FetchContent_Declare(
+  basisu
+  GIT_REPOSITORY https://github.com/BinomialLLC/basis_universal
+  GIT_TAG        v1_60
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  do_not_configure
+)
+FetchContent_MakeAvailable(basisu)
+
 # ── WebGPU backend ───────────────────────────────────────────────────────────
 # Both wgpu-native and Dawn implement the same webgpu.h C API and run the same
 # WGSL natively on Metal / D3D12 / Vulkan — so our code and our WGSL are identical
@@ -160,9 +173,19 @@ add_executable(sailsim_native
   src/main.cpp
   src/fft_test.cpp
   src/gltf_mesh.cpp
+  src/ktx2.cpp
+  "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
 
-target_include_directories(sailsim_native PRIVATE "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}")
+# The Basis transcoder TU is third-party; don't fail it on our -Werror-ish flags.
+set_source_files_properties("${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
+  PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(src/ktx2.cpp
+  PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=0")
+target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
+
+target_include_directories(sailsim_native PRIVATE
+  "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder")
 target_compile_definitions(sailsim_native PRIVATE SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm)
 

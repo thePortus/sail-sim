@@ -89,69 +89,75 @@ struct MeshUniforms {
   glm::vec4 eye;
 };
 
-// Phase 1: a depth-tested mesh (glTF-loaded or the fallback cube). Everything a
-// mesh draw needs — vertex + index buffers, a camera bind group, a depth-stencil
-// pipeline state — in one place.
+// A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
+// pipeline, buffers, decoded textures, and one bind group per texture; draws as a
+// sequence of submeshes, each selecting its material's base-colour texture.
 struct Mesh {
-  WGPURenderPipeline pipeline;
-  WGPUBuffer         vbuf, ibuf, uniformBuf;
-  WGPUBindGroup      bindGroup;
-  WGPUShaderModule   module;
-  uint32_t           indexCount;
+  WGPURenderPipeline           pipeline;
+  WGPUBuffer                   vbuf, ibuf, uniformBuf;
+  WGPUShaderModule             module;
+  WGPUSampler                  sampler;
+  std::vector<WGPUTexture>     textures;     // real textures, then a 1x1 white fallback
+  std::vector<WGPUTextureView> views;        // aligned with textures
+  std::vector<WGPUBindGroup>   bindGroups;   // aligned with views
+  int                          whiteIndex = 0;
+  std::vector<Submesh>         submeshes;
 };
 
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, const MeshData& data) {
+  Mesh mesh;
+  mesh.submeshes = data.submeshes;
+
   WGPUBufferDescriptor vbd = {};
   vbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
   vbd.size = data.vertices.size() * sizeof(float);
-  WGPUBuffer vbuf = wgpuDeviceCreateBuffer(device, &vbd);
-  wgpuQueueWriteBuffer(queue, vbuf, 0, data.vertices.data(), vbd.size);
+  mesh.vbuf = wgpuDeviceCreateBuffer(device, &vbd);
+  wgpuQueueWriteBuffer(queue, mesh.vbuf, 0, data.vertices.data(), vbd.size);
 
   WGPUBufferDescriptor ibd = {};
   ibd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
   ibd.size = data.indices.size() * sizeof(uint32_t);
-  WGPUBuffer ibuf = wgpuDeviceCreateBuffer(device, &ibd);
-  wgpuQueueWriteBuffer(queue, ibuf, 0, data.indices.data(), ibd.size);
+  mesh.ibuf = wgpuDeviceCreateBuffer(device, &ibd);
+  wgpuQueueWriteBuffer(queue, mesh.ibuf, 0, data.indices.data(), ibd.size);
 
   WGPUBufferDescriptor ubd = {};
   ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; ubd.size = sizeof(MeshUniforms);
-  WGPUBuffer uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
+  mesh.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
   wgsl.code = MESH_WGSL;
   WGPUShaderModuleDescriptor smd = {};
   smd.nextInChain = &wgsl.chain;
-  WGPUShaderModule module = wgpuDeviceCreateShaderModule(device, &smd);
+  mesh.module = wgpuDeviceCreateShaderModule(device, &smd);
 
-  // uniforms @group(0) @binding(0) — vertex reads matrices, fragment reads eye
-  WGPUBindGroupLayoutEntry bgle = {};
-  bgle.binding = 0;
-  bgle.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
-  bgle.buffer.type = WGPUBufferBindingType_Uniform;
+  // bind group layout: uniform (b0), base-colour texture (b1), sampler (b2)
+  WGPUBindGroupLayoutEntry ble[3] = {};
+  ble[0].binding = 0; ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+  ble[0].buffer.type = WGPUBufferBindingType_Uniform;
+  ble[1].binding = 1; ble[1].visibility = WGPUShaderStage_Fragment;
+  ble[1].texture.sampleType = WGPUTextureSampleType_Float;
+  ble[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+  ble[2].binding = 2; ble[2].visibility = WGPUShaderStage_Fragment;
+  ble[2].sampler.type = WGPUSamplerBindingType_Filtering;
   WGPUBindGroupLayoutDescriptor bgld = {};
-  bgld.entryCount = 1; bgld.entries = &bgle;
+  bgld.entryCount = 3; bgld.entries = ble;
   WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
-
-  WGPUBindGroupEntry bge = {};
-  bge.binding = 0; bge.buffer = uniformBuf; bge.size = sizeof(MeshUniforms);
-  WGPUBindGroupDescriptor bgd = {};
-  bgd.layout = bgl; bgd.entryCount = 1; bgd.entries = &bge;
-  WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
 
   WGPUPipelineLayoutDescriptor pld = {};
   pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &bgl;
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 
-  WGPUVertexAttribute attrs[4] = {};
-  attrs[0].format = WGPUVertexFormat_Float32x3; attrs[0].offset = 0;                 attrs[0].shaderLocation = 0; // position
-  attrs[1].format = WGPUVertexFormat_Float32x3; attrs[1].offset = 3 * sizeof(float); attrs[1].shaderLocation = 1; // normal
-  attrs[2].format = WGPUVertexFormat_Float32x3; attrs[2].offset = 6 * sizeof(float); attrs[2].shaderLocation = 2; // albedo
-  attrs[3].format = WGPUVertexFormat_Float32x2; attrs[3].offset = 9 * sizeof(float); attrs[3].shaderLocation = 3; // metallic, roughness
+  WGPUVertexAttribute attrs[5] = {};
+  attrs[0].format = WGPUVertexFormat_Float32x3; attrs[0].offset = 0;                  attrs[0].shaderLocation = 0; // position
+  attrs[1].format = WGPUVertexFormat_Float32x3; attrs[1].offset = 3  * sizeof(float); attrs[1].shaderLocation = 1; // normal
+  attrs[2].format = WGPUVertexFormat_Float32x2; attrs[2].offset = 6  * sizeof(float); attrs[2].shaderLocation = 2; // uv
+  attrs[3].format = WGPUVertexFormat_Float32x3; attrs[3].offset = 8  * sizeof(float); attrs[3].shaderLocation = 3; // albedo
+  attrs[4].format = WGPUVertexFormat_Float32x2; attrs[4].offset = 11 * sizeof(float); attrs[4].shaderLocation = 4; // metallic, roughness
   WGPUVertexBufferLayout vbl = {};
   vbl.arrayStride = kFloatsPerVertex * sizeof(float);
   vbl.stepMode = WGPUVertexStepMode_Vertex;
-  vbl.attributeCount = 4; vbl.attributes = attrs;
+  vbl.attributeCount = 5; vbl.attributes = attrs;
 
   WGPUDepthStencilState ds = {};
   ds.format = kDepthFormat;
@@ -168,12 +174,12 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   target.format = colorFormat;
   target.writeMask = WGPUColorWriteMask_All;
   WGPUFragmentState frag = {};
-  frag.module = module; frag.entryPoint = "fs_main";
+  frag.module = mesh.module; frag.entryPoint = "fs_main";
   frag.targetCount = 1; frag.targets = &target;
 
   WGPURenderPipelineDescriptor rpd = {};
   rpd.layout = pl;
-  rpd.vertex.module = module;
+  rpd.vertex.module = mesh.module;
   rpd.vertex.entryPoint = "vs_main";
   rpd.vertex.bufferCount = 1; rpd.vertex.buffers = &vbl;
   rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
@@ -183,11 +189,54 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   rpd.multisample.count = 1;
   rpd.multisample.mask = 0xFFFFFFFFu;
   rpd.fragment = &frag;
-  WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
-
+  mesh.pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
   wgpuPipelineLayoutRelease(pl);
+
+  // linear, repeating sampler
+  WGPUSamplerDescriptor sd = {};
+  sd.addressModeU = WGPUAddressMode_Repeat;
+  sd.addressModeV = WGPUAddressMode_Repeat;
+  sd.addressModeW = WGPUAddressMode_Repeat;
+  sd.magFilter = WGPUFilterMode_Linear;
+  sd.minFilter = WGPUFilterMode_Linear;
+  sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+  sd.lodMinClamp = 0.0f; sd.lodMaxClamp = 1.0f; sd.maxAnisotropy = 1;
+  mesh.sampler = wgpuDeviceCreateSampler(device, &sd);
+
+  // upload decoded base-colour textures (sRGB), then a 1x1 white fallback
+  auto uploadTexture = [&](uint32_t w, uint32_t h, const uint8_t* rgba) {
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    td.dimension = WGPUTextureDimension_2D;
+    td.size = { w, h, 1 };
+    td.format = WGPUTextureFormat_RGBA8UnormSrgb;
+    td.mipLevelCount = 1; td.sampleCount = 1;
+    WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
+    WGPUImageCopyTexture dst = {}; dst.texture = tex; dst.aspect = WGPUTextureAspect_All;
+    WGPUTextureDataLayout layout = {}; layout.bytesPerRow = w * 4; layout.rowsPerImage = h;
+    WGPUExtent3D ext = { w, h, 1 };
+    wgpuQueueWriteTexture(queue, &dst, rgba, (size_t)w * h * 4, &layout, &ext);
+    mesh.textures.push_back(tex);
+    mesh.views.push_back(wgpuTextureCreateView(tex, nullptr));
+  };
+  for (const TextureData& t : data.textures) uploadTexture((uint32_t)t.width, (uint32_t)t.height, t.rgba.data());
+  const uint8_t white[4] = { 255, 255, 255, 255 };
+  mesh.whiteIndex = (int)mesh.views.size();
+  uploadTexture(1, 1, white);
+
+  // one bind group per texture view (uniform + view + shared sampler)
+  for (WGPUTextureView view : mesh.views) {
+    WGPUBindGroupEntry bge[3] = {};
+    bge[0].binding = 0; bge[0].buffer = mesh.uniformBuf; bge[0].size = sizeof(MeshUniforms);
+    bge[1].binding = 1; bge[1].textureView = view;
+    bge[2].binding = 2; bge[2].sampler = mesh.sampler;
+    WGPUBindGroupDescriptor bgd = {};
+    bgd.layout = bgl; bgd.entryCount = 3; bgd.entries = bge;
+    mesh.bindGroups.push_back(wgpuDeviceCreateBindGroup(device, &bgd));
+  }
+
   wgpuBindGroupLayoutRelease(bgl);
-  return { pipeline, vbuf, ibuf, uniformBuf, bindGroup, module, (uint32_t)data.indices.size() };
+  return mesh;
 }
 
 static const char* backendTypeName(WGPUBackendType t) {
@@ -407,10 +456,13 @@ int main(int argc, char** argv) {
 
     WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
     wgpuRenderPassEncoderSetPipeline(pass, mesh.pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, mesh.bindGroup, 0, nullptr);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, mesh.vbuf, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderSetIndexBuffer(pass, mesh.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-    wgpuRenderPassEncoderDrawIndexed(pass, mesh.indexCount, 1, 0, 0, 0);
+    for (const Submesh& sm : mesh.submeshes) {
+      int ti = (sm.textureIndex >= 0) ? sm.textureIndex : mesh.whiteIndex;
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, mesh.bindGroups[ti], 0, nullptr);
+      wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+    }
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
 
@@ -440,7 +492,10 @@ int main(int argc, char** argv) {
   wgpuTextureViewRelease(depthView);
   wgpuTextureRelease(depthTex);
   wgpuRenderPipelineRelease(mesh.pipeline);
-  wgpuBindGroupRelease(mesh.bindGroup);
+  for (WGPUBindGroup bg : mesh.bindGroups) wgpuBindGroupRelease(bg);
+  for (WGPUTextureView v : mesh.views) wgpuTextureViewRelease(v);
+  for (WGPUTexture t : mesh.textures) wgpuTextureRelease(t);
+  wgpuSamplerRelease(mesh.sampler);
   wgpuBufferRelease(mesh.vbuf);
   wgpuBufferRelease(mesh.ibuf);
   wgpuBufferRelease(mesh.uniformBuf);

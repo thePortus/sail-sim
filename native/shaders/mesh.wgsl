@@ -9,6 +9,8 @@ struct Uniforms {
     eye   : vec4<f32>,      // world-space camera position (xyz)
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
+@group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
+@group(0) @binding(2) var baseColorSamp : sampler;
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -16,19 +18,22 @@ struct VSOut {
     @location(1)       normal   : vec3<f32>,
     @location(2)       albedo   : vec3<f32>,
     @location(3)       mr       : vec2<f32>,   // metallic, roughness
+    @location(4)       uv       : vec2<f32>,
 };
 
 @vertex
 fn vs_main(@location(0) inPos    : vec3<f32>,
            @location(1) inNormal : vec3<f32>,
-           @location(2) inAlbedo : vec3<f32>,
-           @location(3) inMR     : vec2<f32>) -> VSOut {
+           @location(2) inUV     : vec2<f32>,
+           @location(3) inAlbedo : vec3<f32>,
+           @location(4) inMR     : vec2<f32>) -> VSOut {
     var out : VSOut;
     out.position = u.mvp * vec4<f32>(inPos, 1.0);
     out.worldPos = (u.model * vec4<f32>(inPos, 1.0)).xyz;
     out.normal   = normalize((u.model * vec4<f32>(inNormal, 0.0)).xyz);
     out.albedo   = inAlbedo;
     out.mr       = inMR;
+    out.uv       = inUV;
     return out;
 }
 
@@ -59,7 +64,8 @@ fn fresnelSchlick(cosT : f32, F0 : vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
-    let albedo = in.albedo;
+    let texel = textureSample(baseColorTex, baseColorSamp, in.uv);
+    let albedo = in.albedo * texel.rgb;     // material factor × base-colour map
     let metallic = clamp(in.mr.x, 0.0, 1.0);
     let roughness = clamp(in.mr.y, 0.05, 1.0);
 

@@ -5,19 +5,20 @@ This replaces the Angular/Babylon.js browser client; the Node server and all ass
 See [`../PORTING.md`](../PORTING.md) for the full plan.
 
 Current status: **Phase 0 complete on macOS; Phase 1 in progress.** WebGPU device bringup; a render
-loop that loads a **glTF/GLB mesh** (via `cgltf`) with its **PBR materials** (base-colour, metallic,
-roughness factors) and draws it spinning, depth-tested, with **metallic-roughness Cook-Torrance
-shading** — camera (MVP) uniform, per-vertex material, vertex/index buffers, depth buffer, resize
-handling, model auto-centre/scale; **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively
-with a verified GPU→CPU readback (matches a CPU oracle to ~4e-6). Verified on Metal (Apple M3 Pro),
-from a 70-vertex rock to the 90k-vertex, multi-material merchantman hull. Image textures (KTX2) and
-Windows/D3D12 are next.
+loop that loads a **glTF/GLB mesh** (via `cgltf`) with its **PBR materials and KTX2/Basis base-colour
+textures** (decoded with the Basis Universal transcoder), split into per-material submeshes, and
+draws it spinning, depth-tested, with **metallic-roughness Cook-Torrance shading** — camera (MVP)
+uniform, per-material texture bind groups, depth buffer, resize handling, model auto-centre/scale;
+**and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
+(matches a CPU oracle to ~4e-6). Verified on Metal (Apple M3 Pro): the 90k-vertex merchantman renders
+with its 7 textures across 39 submeshes. Normal/ORM maps and Windows/D3D12 are next.
 
 ## What this builds
 
 `sailsim_native` opens a 1280×720 window, clears it to sea-blue, and draws a spinning depth-tested
-glTF model with metallic-roughness PBR shading (default: the vendored `assets/rock_e.glb`) using a
-real WebGPU device. Pass a path to draw any `.glb`:
+glTF model with metallic-roughness PBR shading and its KTX2 base-colour textures (default: the
+vendored `assets/rock_e.glb`, which is untextured) using a real WebGPU device. Pass a path to draw
+any `.glb` — the merchantman shows the textured multi-material path:
 
 ```sh
 ./build/bin/sailsim_native                                   # default rock
@@ -123,10 +124,12 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
    with directional shading. Verified from a 70-vert rock to the 90k-vert merchantman.
 5. ~~PBR materials + shading.~~ **Done** — `mesh.wgsl` does metallic-roughness Cook-Torrance; the
    loader reads per-primitive base-colour/metallic/roughness factors (per-vertex).
-6. **Image textures (KTX2).** The models' base-colour/normal/ORM maps are Basis-supercompressed KTX2
-   (`KHR_texture_basisu`). Add libktx/Basis, extract + transcode, add a sampler + UV attribute (models
-   have `TEXCOORD_0`), and modulate the PBR inputs. Then one ship on the ocean. §7.
-7. **Rest of the FFT chain (Phase 2).** Port `CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, the butterfly
+6. ~~Base-colour KTX2 textures.~~ **Done** — `src/ktx2.*` (Basis transcoder) decodes the
+   `KHR_texture_basisu` maps; the loader splits per-material submeshes with per-texture bind groups.
+7. **Normal + ORM maps.** Same extraction path for the normal and occlusion-roughness-metallic
+   textures; feed them into the PBR fragment (tangent-space normals, per-texel metallic/roughness).
+   Then one ship on the ocean surface — tie the render path to the FFT work. §7.
+8. **Rest of the FFT chain (Phase 2).** Port `CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, the butterfly
    `FFT_*` passes and `WAVES_MERGER` on top of the readback harness already in `src/fft_test.cpp`.
 
 ## Layout
@@ -135,9 +138,10 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 native/
   CMakeLists.txt      FetchContent deps + backend toggle + WGSL embed + the target
   src/main.cpp        device bringup + render loop (clear + camera + depth + glTF mesh); FFT test on startup
-  src/gltf_mesh.*     cgltf-based .glb loader (positions, normals, PBR material factors) + cube fallback
+  src/gltf_mesh.*     cgltf .glb loader — positions, normals, UVs, material factors, per-material submeshes
+  src/ktx2.*          Basis Universal transcoder wrapper: KTX2 (KHR_texture_basisu) -> RGBA
   src/fft_test.*      ocean-FFT INITIAL_SPECTRUM compute + CPU-oracle readback verification
-  shaders/            WGSL: initial_spectrum.wgsl (from the client) + mesh.wgsl (PBR); embedded at build time
+  shaders/            WGSL: initial_spectrum.wgsl (from the client) + mesh.wgsl (textured PBR); embedded
   assets/             vendored sample model (rock_e.glb) used as the default
   README.md           this file
 ```

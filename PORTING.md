@@ -179,11 +179,12 @@ WGSL changes Dawn required.
 
 **Phase 0 done on macOS (all criteria 1–5); Phase 1 underway** (Windows/D3D12 pending a Windows
 machine). [`native/`](native/) builds and runs: WebGPU device bringup, a render loop that loads a
-glTF/GLB mesh (cgltf) with its PBR material factors and draws it spinning, depth-tested, with
-metallic-roughness Cook-Torrance shading (MVP camera uniform + per-vertex material +
-vertex/index/depth buffers + resize handling, via glm) — verified from a 70-vert rock to the
-90k-vert, multi-material merchantman hull — **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running
-natively with a verified GPU→CPU readback
+glTF/GLB mesh (cgltf) with its PBR materials and KTX2/Basis base-colour textures (decoded via the
+Basis Universal transcoder), split into per-material submeshes, and draws it spinning, depth-tested,
+with metallic-roughness Cook-Torrance shading (MVP + per-material texture bind groups + depth buffer
++ resize handling, via glm) — verified with the 90k-vert merchantman rendering its 7 textures across
+39 submeshes — **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified
+GPU→CPU readback
 — the output matches a CPU reimplementation of the formula to **max abs err 3.8e-6** on Metal (Apple
 M3 Pro). That readback is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified;
 only host-side plumbing was written.

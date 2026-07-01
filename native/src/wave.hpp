@@ -15,11 +15,13 @@ struct GerstnerWave {
   float steepness;    // 0..1 horizontal pinch (visual only; CPU uses vertical sum)
 };
 
-inline constexpr GerstnerWave kWaves[4] = {
+inline constexpr GerstnerWave kWaves[6] = {
   { 1.0f,  0.0f, 60.0f, 0.60f, 0.55f },
   { 0.7f,  0.7f, 31.0f, 0.32f, 0.55f },
   {-0.6f,  0.8f, 18.0f, 0.16f, 0.45f },
   { 0.2f, -1.0f,  9.0f, 0.08f, 0.35f },
+  {-0.8f, -0.4f,  5.5f, 0.05f, 0.30f },
+  { 0.5f,  0.9f,  3.2f, 0.03f, 0.25f },
 };
 inline constexpr float kGravity = 9.81f;
 

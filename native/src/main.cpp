@@ -520,6 +520,12 @@ int main(int argc, char** argv) {
   glm::vec3 extent = bbMax - bbMin;
   float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
   float fit = (maxExtent > 1e-6f) ? (2.0f / maxExtent) : 1.0f;
+  const float shipScale = fit * 3.0f;
+  // Place by the keel (X/Z centred, lowest point to y=0), not the bbox centre —
+  // otherwise a tall-masted hull's centre sits up in the rigging and the hull
+  // sinks. Draft is beam-based so it's robust to mast height.
+  const glm::vec3 keelCenter(center.x, bbMin.y, center.z);
+  const float draft = 0.22f * std::min(extent.x, extent.z) * shipScale;
 
   Mesh mesh = createMesh(device, queue, surfaceFormat, meshData);
   Ocean ocean = createOcean(device, queue, surfaceFormat);
@@ -563,7 +569,7 @@ int main(int argc, char** argv) {
     // surface normal (pitch + roll), plus a slow yaw. Sampled at the origin.
     float waveY = oceanHeight(0.0f, 0.0f, t);
     glm::vec3 up = oceanNormal(0.0f, 0.0f, t);
-    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, waveY, 0.0f));
+    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, waveY - draft, 0.0f));
     glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
     float axisLen = glm::length(axis);
     if (axisLen > 1e-5f) {
@@ -571,8 +577,8 @@ int main(int argc, char** argv) {
       model = model * glm::rotate(glm::mat4(1.0f), tiltAngle, axis / axisLen);
     }
     model = glm::rotate(model, t * 0.05f, glm::vec3(0, 1, 0));   // slow yaw
-    model = glm::scale(model, glm::vec3(fit * 3.0f));            // ship a bit larger than 1 unit
-    model = glm::translate(model, -center);
+    model = glm::scale(model, glm::vec3(shipScale));
+    model = glm::translate(model, -keelCenter);                 // keel to origin
     MeshUniforms u{ viewProj * model, model, glm::vec4(eye, 1.0f) };
     wgpuQueueWriteBuffer(queue, mesh.uniformBuf, 0, &u, sizeof(u));
 

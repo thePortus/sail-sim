@@ -294,6 +294,7 @@ add_executable(sailsim_native
   src/net_auth.cpp
   src/net_mp.cpp
   src/session.cpp
+  src/terrain.cpp
   src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )

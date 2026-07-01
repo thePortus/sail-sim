@@ -74,6 +74,10 @@ static void onDeviceError(WGPUErrorType type, char const* message, void*) {
                (int)type, message ? message : "(no message)");
 }
 
+// Mouse-wheel accumulator (GLFW only delivers scroll via callback, not polling).
+static double g_scrollAccum = 0.0;
+static void onScroll(GLFWwindow*, double, double yoff) { g_scrollAccum += yoff; }
+
 static const WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
 
 // A framebuffer-sized depth texture, recreated on resize.
@@ -568,6 +572,7 @@ int main(int argc, char** argv) {
     glfwTerminate();
     return EXIT_FAILURE;
   }
+  glfwSetScrollCallback(window, onScroll);   // mouse-wheel zoom
 
   // 1. Instance
   WGPUInstanceDescriptor instanceDesc = {};
@@ -656,7 +661,11 @@ int main(int argc, char** argv) {
   // otherwise a tall-masted hull's centre sits up in the rigging and the hull
   // sinks. Draft is beam-based so it's robust to mast height.
   const glm::vec3 keelCenter(center.x, bbMin.y, center.z);
-  const float draft = 0.22f * std::min(extent.x, extent.z) * shipScale;
+  // Draught mirrors the JS vessels: the merchantman is the heaviest hull (weight 6500,
+  // floatDraft -3.8 m on a 7.2 m beam ~= 0.53*beam), so it sits deep and low in the
+  // water rather than riding on top. Beam-based, robust to the model's authored scale.
+  const float beam = std::min(extent.x, extent.z) * shipScale;
+  const float draft = 0.53f * beam;
 
   Mesh mesh = createMesh(device, queue, surfaceFormat, meshData);
   Ocean ocean = createOcean(device, queue, surfaceFormat);
@@ -698,6 +707,13 @@ int main(int argc, char** argv) {
   // makes tall waves look gelatinous ("jelly") because they move slower than their
   // steepness implies. 0.6 is the compromise — a calmer swell that still flows.
   const float kWaveSpeed = 0.6f;
+
+  // Orbit camera: chase behind the ship by default; hold LMB + drag to orbit, wheel to
+  // zoom. camYawOffset is relative to the heading (0 = directly astern), so the camera
+  // keeps chasing as the ship turns while any drag offset is preserved.
+  float camYawOffset = 0.0f, camPitch = 0.43f, camDist = 14.3f;
+  double lastMouseX = 0.0, lastMouseY = 0.0;
+  glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
@@ -762,11 +778,28 @@ int main(int argc, char** argv) {
       return h;
     };
 
-    // Chase camera: behind + above the ship, looking just ahead of it.
+    // Camera input: hold LMB + drag to orbit, wheel to zoom.
+    double mx = 0.0, my = 0.0;
+    glfwGetCursorPos(window, &mx, &my);
+    double mdx = mx - lastMouseX, mdy = my - lastMouseY;
+    lastMouseX = mx; lastMouseY = my;
+    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+      camYawOffset -= (float)mdx * 0.005f;   // drag right -> orbit right
+      camPitch     -= (float)mdy * 0.005f;   // drag up    -> look from higher
+      camPitch = glm::clamp(camPitch, 0.05f, 1.45f);
+    }
+    if (g_scrollAccum != 0.0) {
+      camDist *= std::pow(0.9f, (float)g_scrollAccum);   // wheel up -> zoom in
+      camDist = glm::clamp(camDist, 4.0f, 80.0f);
+      g_scrollAccum = 0.0;
+    }
+
+    // Orbit camera: astern of the ship (offset by camYawOffset), pitched up, at camDist.
     float shipY = fftHeight(shipX, shipZ);
     glm::vec3 shipPos(shipX, shipY, shipZ);
-    glm::vec3 eye = shipPos - fwd * 13.0f + glm::vec3(0.0f, 6.0f, 0.0f);
-    glm::mat4 viewM = glm::lookAt(eye, shipPos + fwd * 3.0f + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0, 1, 0));
+    glm::vec3 back = glm::normalize(glm::vec3(glm::rotate(glm::mat4(1.0f), camYawOffset, glm::vec3(0, 1, 0)) * glm::vec4(-fwd, 0.0f)));
+    glm::vec3 eye = shipPos + back * (camDist * std::cos(camPitch)) + glm::vec3(0.0f, camDist * std::sin(camPitch), 0.0f);
+    glm::mat4 viewM = glm::lookAt(eye, shipPos + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0, 1, 0));
     glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 

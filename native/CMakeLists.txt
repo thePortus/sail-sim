@@ -213,6 +213,21 @@ FetchContent_Declare(
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
+# ── IXWebSocket (raw WebSocket client for gameplay) ──────────────────────────
+# TLS off for now (dev server is ws://localhost); for the wss:// production
+# endpoint, rebuild with -DUSE_TLS=ON (SecureTransport on macOS, OpenSSL/mbedTLS
+# elsewhere). zlib off to avoid the dependency (permessage-deflate is optional).
+FetchContent_Declare(
+  ixwebsocket
+  GIT_REPOSITORY https://github.com/machinezone/IXWebSocket
+  GIT_TAG        v11.4.5
+  GIT_SHALLOW    ON
+)
+set(USE_TLS OFF CACHE BOOL "" FORCE)
+set(USE_ZLIB OFF CACHE BOOL "" FORCE)
+set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(ixwebsocket)
+
 # Embed each WGSL file as a C header at configure time — single source of truth
 # is the .wgsl file. Uses a raw string literal so no escaping is needed;
 # reconfigure after editing a .wgsl.
@@ -277,6 +292,7 @@ add_executable(sailsim_native
   src/ktx2.cpp
   src/ocean_fft.cpp
   src/net_auth.cpp
+  src/net_mp.cpp
   src/session.cpp
   src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
@@ -297,7 +313,7 @@ get_filename_component(SAILSIM_SHIP_MODEL_PATH
 target_compile_definitions(sailsim_native PRIVATE
   SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
   SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}")
-target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json)
+target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json ixwebsocket)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on
 # the backend (e.g. wgpuDeviceTick vs wgpuDevicePoll). It is set on the `webgpu`

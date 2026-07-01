@@ -27,8 +27,10 @@
 #include <glm/gtc/constants.hpp>
 
 #include <string>
+#include <vector>
 #include <future>
 #include <chrono>
+#include <thread>
 #include <cstring>
 
 #include "stb_image_write.h"
@@ -42,6 +44,7 @@
 #include "fft_test.hpp"
 #include "gltf_mesh.hpp"
 #include "net_auth.hpp"
+#include "net_mp.hpp"
 #include "ocean_fft.hpp"
 #include "session.hpp"
 #include "wave.hpp"
@@ -594,6 +597,38 @@ int main(int argc, char** argv) {
     return r.ok ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
+  // Headless WebSocket gameplay test: login, open the socket, exchange a few
+  // messages, report what came back. SAILSIM_WS_TEST=1 (+ SAILSIM_AUTH_USER/_PASS).
+  if (std::getenv("SAILSIM_WS_TEST")) {
+    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
+    const char* portEnv = std::getenv("SAILSIM_PORT");
+    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const char* u = std::getenv("SAILSIM_AUTH_USER");
+    const char* p = std::getenv("SAILSIM_AUTH_PASS");
+    net::AuthResult lr = net::login(host, port, u ? u : "native_probe_01", p ? p : "testpass123");
+    if (!lr.ok) { std::printf("[ws-test] login failed: %s\n", lr.error.c_str()); return EXIT_FAILURE; }
+
+    mp::Client c;
+    c.connect(host, port, lr.token);
+    for (int i = 0; i < 60 && c.state() == mp::ConnState::Connecting; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));   // await open (<=3s)
+
+    if (c.state() == mp::ConnState::Open) {
+      mp::PlayerUpdate pu; pu.x = 10; pu.z = 20; pu.heading = 1.0f; pu.speed = 3.0f;
+      pu.sailState = "full"; pu.vesselName = "Merchantman"; pu.vesselSlug = "merchantman";
+      pu.callsign = lr.callsign;
+      c.sendUpdate(pu, 0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1200));   // let snapshot/wave arrive
+    }
+    mp::WaveState wv = c.wave();
+    std::printf("[ws-test] state=%d myId=%s players=%d wave.valid=%d wind=%.1f beaufort=%d\n",
+                (int)c.state(), c.myId().c_str(), (int)c.players().size(),
+                (int)wv.valid, wv.windSpeed, wv.beaufort);
+    bool ok = (c.state() == mp::ConnState::Open);
+    c.close();
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
 #if defined(WEBGPU_BACKEND_WGPU)
   // Surface wgpu-native's internal logs (including WGSL compile errors).
   wgpuSetLogLevel(WGPULogLevel_Warn);
@@ -822,6 +857,12 @@ int main(int argc, char** argv) {
   std::string uiError, authToken, authCallsign, authUsername, authRole;
   std::future<net::AuthResult> authFuture;
 
+  // Multiplayer: connected on entering Sailing, closed on logout. Our pose is
+  // sent ~10 Hz; remote players/wind arrive on the client's own thread.
+  mp::Client mpClient;
+  uint32_t netSeq = 0;
+  bool mpConnected = false;
+
   // "Remember me": if a saved session exists, validate its token via /user/me and,
   // if still good, drop the player straight into the game. A 401 clears it.
   session::Saved saved;
@@ -883,6 +924,8 @@ int main(int argc, char** argv) {
         uiError.clear();
         std::memset(uiPass, 0, sizeof(uiPass));
         if (uiRemember) session::save({ authToken, authUsername, authCallsign, authRole });
+        mpClient.connect(kHost, kPort, authToken);   // open the gameplay socket
+        mpConnected = true;
         appState = AppState::Sailing;
       } else {
         // A rejected token (401/403) clears the remembered session; a mere
@@ -961,20 +1004,62 @@ int main(int argc, char** argv) {
       ImGui::End();
     }
 
-    // In-game HUD: callsign + logout.
+    // A dropped/expired gameplay token (ws close 4401) forces re-login.
+    if (appState == AppState::Sailing && mpClient.state() == mp::ConnState::AuthFailed) {
+      mpClient.close(); mpConnected = false;
+      session::clear();
+      authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
+      uiError = "Session expired - please sign in again.";
+      appState = AppState::Login;
+    }
+
+    // In-game HUD: identity, connection, nearby players, wind.
     if (appState == AppState::Sailing) {
+      const mp::ConnState cs = mpClient.state();
+      std::vector<mp::RemotePlayer> others = mpClient.players();
+      mp::WaveState wv = mpClient.wave();
+
       ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       ImGui::Text("Callsign: %s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
       ImGui::Text("Speed: %.1f kn", shipSpeed);
+
+      const char* connLabel =
+          cs == mp::ConnState::Open       ? "connected" :
+          cs == mp::ConnState::Connecting ? "connecting..." :
+          cs == mp::ConnState::AuthFailed ? "auth failed" : "offline";
+      const ImVec4 connCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f)
+                                                       : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
+      ImGui::TextColored(connCol, "Server: %s", connLabel);
+      if (wv.valid) ImGui::Text("Wind: %.0f kn  Beaufort %d", wv.windSpeed, wv.beaufort);
+
+      ImGui::Separator();
+      ImGui::Text("Players nearby: %d", (int)others.size());
+      for (const mp::RemotePlayer& rp : others) {
+        const char* who = !rp.callsign.empty() ? rp.callsign.c_str() : rp.id.c_str();
+        ImGui::BulletText("%s  (%.0f, %.0f)", who, rp.x, rp.z);
+      }
+
+      ImGui::Separator();
       if (ImGui::Button("Log out")) {
+        mpClient.close(); mpConnected = false;
         session::clear();   // forget the remembered session
         authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
         uiError.clear();
         appState = AppState::Login;
       }
       ImGui::End();
+
+      // Broadcast our pose ~10 Hz.
+      if (cs == mp::ConnState::Open && (frame % 6) == 0) {
+        const char* sailState = sail > 0.66f ? "full" : (sail > 0.33f ? "half" : "furled");
+        mp::PlayerUpdate pu;
+        pu.x = shipX; pu.z = shipZ; pu.heading = shipHeading; pu.speed = shipSpeed;
+        pu.sailState = sailState; pu.vesselName = "Merchantman"; pu.vesselSlug = "merchantman";
+        pu.callsign = authCallsign;
+        mpClient.sendUpdate(pu, netSeq++);
+      }
     }
     ImGui::Render();
 

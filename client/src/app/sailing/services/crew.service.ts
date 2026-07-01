@@ -6,6 +6,7 @@ import {
 } from '@babylonjs/core';
 import { Settings } from '../../app.settings';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { CrewImpostorLayer } from './crew-impostor';
 
 // ── Ship-motion presence (crew realism P1) ───────────────────────────────────────────────────────────────────
 const BRACE_FACTOR = 0.55;   // crew counter-lean this fraction of the deck slope (0 = ride flat with the deck,
@@ -310,6 +311,8 @@ interface CrewFace {
 
 interface CrewMember {
   holder: TransformNode;          // wrapper we move/yaw (GLB root stays untouched inside)
+  body: TransformNode;            // the instantiated GLB subtree (all the visible meshes) — hidden when impostored
+  impostor: boolean;              // true while represented by the shared billboard (real meshes hidden), P5 track C
   clips: Map<string, AnimationGroup>;
   current: Nullable<AnimationGroup>;
   prev: Nullable<AnimationGroup>;  // outgoing clip mid cross-fade (weight ramping to 0), else null
@@ -386,6 +389,13 @@ export class CrewHandle {
   // animation (skeleton skipped). Opt out with localStorage ignis_crew_lod='0'.
   private readonly lod = typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_lod') !== '0';
   private _frame = 0;
+  // Distant-crew billboard impostor (P5 track C): beyond the freeze distance a member's real skinned meshes hide and
+  // it renders as one thin instance of a shared camera-facing sailor sprite — one draw call + no skeleton for ALL of
+  // this ship's distant crew. Requires LOD on (impostor engages exactly at the freeze boundary). Opt-out
+  // `localStorage.ignis_crew_impostor='0'`. Built lazily on the first member to go distant (most decks never do).
+  private readonly impostorOn = this.lod
+    && (typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_impostor') !== '0');
+  private impostors: CrewImpostorLayer | null = null;
   private readonly texCache = new Map<string, Texture>();
   private readonly clonedMats: PBRMaterial[] = [];
   private skinIdx = 0;   // walks SKIN_ORDER so a full crew shows the whole tone range, not random-clustered light
@@ -502,7 +512,8 @@ export class CrewHandle {
     const detail = glbRoot.getChildMeshes(false).filter((me) => DETAIL.test(baseName(me)));
 
     const member: CrewMember = {
-      holder, clips, current: null, prev: null, blend: 1, face, state: 'station', stationId: null,
+      holder, body: glbRoot, impostor: false,
+      clips, current: null, prev: null, blend: 1, face, state: 'station', stationId: null,
       wpId: Object.keys(this.layout.waypoints)[0], dwell: 2 + rng() * 6,
       legs: [], legT: 0, legFrom: new Vector3(), yaw: 0, yawTarget: 0, stationYaw: 0,
       climb: null, animSpeed: 0.92 + rng() * 0.16, rng,
@@ -793,7 +804,25 @@ export class CrewHandle {
       this.shipPitch = Math.asin(Math.max(-1, Math.min(1, fwd.y / (fwd.length() || 1))));
       this._frame++;   // drives the far-crew half-rate tick (crew LOD, P5)
       for (const m of this.members) this.tick(m, dt);
+      this.syncImpostors();
     });
+  }
+
+  /** Track C: gather this ship's distant (impostored) crew into the shared billboard, one instance each, facing the
+   *  camera. Cheap — only members past the freeze distance participate, and most decks have none. */
+  private syncImpostors(): void {
+    if (!this.impostorOn) return;
+    const cam = this.scene.activeCamera;
+    if (!cam) return;
+    if (!this.impostors) this.impostors = new CrewImpostorLayer(this.scene, Math.max(1, this.members.length));
+    const cp = cam.globalPosition;
+    this.impostors.begin();
+    for (const m of this.members) {
+      if (!m.impostor) continue;                       // only the frozen-and-swapped (never dead/reserve)
+      const p = m.holder.getAbsolutePosition();
+      this.impostors.push(p.x, p.y, p.z, cp.x, cp.z);
+    }
+    this.impostors.commit();
   }
 
   /** A broadside just fired on `side` — make the gun crews on that side work harder for a beat (P3). Gun station
@@ -887,6 +916,10 @@ export class CrewHandle {
     mm._climb = null;
     this.releaseStation(m);
     m.state = 'dead'; m.legs = []; m.climb = null;
+    // If it died while impostored (frozen + billboard), restore the real meshes + unfreeze so the fall animates and
+    // a distant corpse reads as fallen, not a standing sprite. (Track C never impostors the dead.)
+    if (m.impostor) { m.impostor = false; m.body.setEnabled(true); }
+    if (m.frozen) { m.frozen = false; }
     const death = this.play(m, 'Death', false);
     death?.onAnimationGroupEndObservable.addOnce(() => {
       if (!this.disposed && m.state === 'dead') this.play(m, 'Dead', true);
@@ -955,6 +988,7 @@ export class CrewHandle {
     if (this.disposed) return;
     this.disposed = true;
     if (this.observer) { this.scene.onBeforeRenderObservable.remove(this.observer); this.observer = null; }
+    this.impostors?.dispose(); this.impostors = null;   // shared billboard mesh/material/sprite (track C)
     if (this.shadowCasters.length) {   // pull crew out of the shadow map before their subtree disposes
       const sg = this.scene.getLightByName('sun')?.getShadowGenerator() as ShadowGenerator | null;
       if (sg) for (const me of this.shadowCasters) sg.removeShadowCaster(me, true);
@@ -1448,10 +1482,19 @@ export class CrewHandle {
     if (this.lod) {
       const d = m.lodDist;
       // FREEZE: very-distant crew pause their animation → Babylon stops evaluating the skeleton (the real CPU cost).
-      if (d > CrewHandle.FREEZE_FAR_M) { if (!m.frozen) { m.frozen = true; m.current?.pause(); m.prev?.pause(); } return; }
+      // IMPOSTOR (track C): at the same boundary, swap the real skinned meshes for the shared billboard — but not for
+      // the dead (a dead sailor lies down; a standing sprite would be wrong), so they keep their real fallen pose.
+      if (d > CrewHandle.FREEZE_FAR_M) {
+        if (!m.frozen) {
+          m.frozen = true; m.current?.pause(); m.prev?.pause();
+          if (this.impostorOn && m.state !== 'dead') { m.impostor = true; m.body.setEnabled(false); }
+        }
+        return;
+      }
       if (m.frozen) {
         if (d > CrewHandle.FREEZE_NEAR_M) return;                          // stay frozen (hysteresis band)
         m.frozen = false; m.prev = null; m.blend = 1;
+        if (m.impostor) { m.impostor = false; m.body.setEnabled(true); }  // back to the real skinned meshes
         m.current?.play(m.current.loopAnimation);                          // resume (restart-from-0 is invisible this far off)
       }
       // THROTTLE: far (other-ship) crew update pose/logic at HALF rate — imperceptible past 40 m, ~halves the JS cost.

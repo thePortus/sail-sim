@@ -72,6 +72,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(basisu)
 
+# ── stb (single-header PNG writer for headless screenshots) ──────────────────
+FetchContent_Declare(
+  stb
+  GIT_REPOSITORY https://github.com/nothings/stb
+  GIT_TAG        master
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  do_not_configure
+)
+FetchContent_MakeAvailable(stb)
+
 # ── WebGPU backend ───────────────────────────────────────────────────────────
 # Both wgpu-native and Dawn implement the same webgpu.h C API and run the same
 # WGSL natively on Metal / D3D12 / Vulkan — so our code and our WGSL are identical
@@ -176,6 +186,7 @@ add_executable(sailsim_native
   src/gltf_mesh.cpp
   src/ktx2.cpp
   src/ocean_fft.cpp
+  src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
 
@@ -187,7 +198,7 @@ set_source_files_properties(src/ktx2.cpp
 target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
 
 target_include_directories(sailsim_native PRIVATE
-  "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder")
+  "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder" "${stb_SOURCE_DIR}")
 get_filename_component(SAILSIM_SHIP_MODEL_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
 target_compile_definitions(sailsim_native PRIVATE

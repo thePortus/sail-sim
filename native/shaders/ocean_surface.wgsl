@@ -1,58 +1,108 @@
-// FFT ocean surface: samples the displacement / derivatives / turbulence textures
-// produced by the compute cascade (src/ocean_fft.cpp) and shades the water.
+// FFT ocean surface — 3 cascades summed (250/17/5 m tiles), shaded with the
+// client's ocean-material math: derivative-map normals, Jacobian/turbulence foam,
+// subsurface-scatter glow on wave backs, Fresnel sky reflection.
 
 struct Camera {
     viewProj : mat4x4<f32>,
     eye      : vec4<f32>,   // xyz camera position
-    params   : vec4<f32>,   // x = lengthScale (metres per tile)
+    params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile)
 };
-@group(0) @binding(0) var<uniform> cam : Camera;
-@group(0) @binding(1) var dispTex  : texture_2d<f32>;
-@group(0) @binding(2) var derivTex : texture_2d<f32>;
-@group(0) @binding(3) var turbTex  : texture_2d<f32>;
-@group(0) @binding(4) var texSamp  : sampler;
+@group(0) @binding(0)  var<uniform> cam : Camera;
+@group(0) @binding(1)  var disp0  : texture_2d<f32>;
+@group(0) @binding(2)  var deriv0 : texture_2d<f32>;
+@group(0) @binding(3)  var turb0  : texture_2d<f32>;
+@group(0) @binding(4)  var disp1  : texture_2d<f32>;
+@group(0) @binding(5)  var deriv1 : texture_2d<f32>;
+@group(0) @binding(6)  var turb1  : texture_2d<f32>;
+@group(0) @binding(7)  var disp2  : texture_2d<f32>;
+@group(0) @binding(8)  var deriv2 : texture_2d<f32>;
+@group(0) @binding(9)  var turb2  : texture_2d<f32>;
+@group(0) @binding(10) var samp   : sampler;
+
+// Material constants (from ocean-material.ts).
+const _Color       = vec3<f32>(0.015, 0.090, 0.130);
+const _SkyColor    = vec3<f32>(0.45, 0.62, 0.82);
+const _ReflStrength = 0.9;
+const _SSSColor    = vec3<f32>(0.1541919, 0.8857628, 0.990566);
+const _SSSStrength = 0.205;
+const _SSSBase     = -0.261;
+const _SSSScale    = 4.7;
+const _FoamScale   = 2.6;
+const _FoamBias    = 2.80;   // LOD2 (3 cascades)
+const _Choppiness  = 0.3;
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
     @location(0)       worldPos : vec3<f32>,
-    @location(1)       uv       : vec2<f32>,
+    @location(1)       worldUV  : vec2<f32>,   // undisplaced grid xz (for texture sampling)
+    @location(2)       height   : f32,          // summed displacement.y (for SSS)
 };
 
 @vertex
 fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
-    let uv = inXZ / cam.params.x;
-    let disp = textureSampleLevel(dispTex, texSamp, uv, 0.0).xyz;
+    let uv0 = inXZ / cam.params.x;
+    let uv1 = inXZ / cam.params.y;
+    let uv2 = inXZ / cam.params.z;
+    var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
+    disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
+    disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
+
     let p = vec3<f32>(inXZ.x + disp.x, disp.y, inXZ.y + disp.z);
     var out : VSOut;
     out.position = cam.viewProj * vec4<f32>(p, 1.0);
     out.worldPos = p;
-    out.uv = uv;
+    out.worldUV = inXZ;
+    out.height = disp.y;
     return out;
 }
 
+fn pow5(x : f32) -> f32 { let x2 = x * x; return x2 * x2 * x; }
+
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
-    let slope = textureSample(derivTex, texSamp, in.uv).xy;   // dy/dx, dy/dz
-    let N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-    let V = normalize(cam.eye.xyz - in.worldPos);
-    let L = normalize(vec3<f32>(0.5, 1.0, 0.4));
+    let uv0 = in.worldUV / cam.params.x;
+    let uv1 = in.worldUV / cam.params.y;
+    let uv2 = in.worldUV / cam.params.z;
 
-    let deep    = vec3<f32>(0.010, 0.055, 0.090);
-    let shallow = vec3<f32>(0.06, 0.26, 0.32);
-    let sky     = vec3<f32>(0.52, 0.70, 0.86);
-    let facing = clamp(dot(N, V), 0.0, 1.0);
-    let fres = 0.02 + 0.98 * pow(1.0 - facing, 5.0);
-    var color = mix(mix(deep, shallow, facing), sky, fres);
+    // Normal from summed derivative maps.
+    var derivatives = textureSample(deriv0, samp, uv0);
+    derivatives += textureSample(deriv1, samp, uv1);
+    derivatives += textureSample(deriv2, samp, uv2);
+    let slope = vec2<f32>(derivatives.x / (1.0 + derivatives.z),
+                          derivatives.y / (1.0 + derivatives.w));
+    let N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+
+    let V = normalize(cam.eye.xyz - in.worldPos);
+    let L = normalize(vec3<f32>(0.5, 1.0, 0.4));   // sun
+
+    // Foam from summed turbulence (Jacobian): folds/breaks read white.
+    let foamChop = 1.0 - _Choppiness * 0.32;
+    var jacobian = textureSample(turb0, samp, uv0).x
+                 + textureSample(turb1, samp, uv1).x
+                 + textureSample(turb2, samp, uv2).x;
+    jacobian = min(1.0, max(0.0, (-jacobian + _FoamBias * foamChop) * _FoamScale));
+
+    // Subsurface scattering — back-lit turquoise glow on wave backs, sun-gated.
+    let sunUp = smoothstep(0.0, 0.12, L.y);
+    let H = normalize(-N + L);
+    let viewDotH = pow5(clamp(dot(V, -H), 0.0, 1.0)) * 30.0 * _SSSStrength * sunUp;
+    let sssW = max(in.height - _SSSBase, 0.0) / _SSSScale;
+    let color = clamp(_Color + _SSSColor * viewDotH * sssW, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Fresnel sky reflection.
+    var fresnel = clamp(1.0 - dot(N, V), 0.0, 1.0);
+    fresnel = pow5(fresnel);
+    var waterCol = color * (1.0 - fresnel);
+    waterCol += _SkyColor * fresnel * _ReflStrength;
 
     // Sun glint.
-    let H = normalize(V + L);
-    color += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, H), 0.0), 300.0) * 1.5;
+    let Hs = normalize(V + L);
+    waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2;
 
-    // Foam where the surface folds (turbulence / Jacobian is low).
-    let turb = textureSample(turbTex, texSamp, in.uv).x;
-    let foam = clamp((0.5 - turb) * 1.2, 0.0, 1.0);
-    color = mix(color, vec3<f32>(0.92, 0.96, 0.99), foam);
+    // Composite foam (lit white) over water.
+    let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0));
+    var outColor = mix(waterCol, foamLit, jacobian);
 
-    color = pow(color, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(color, 1.0);
+    outColor = pow(outColor, vec3<f32>(1.0 / 2.2));
+    return vec4<f32>(outColor, 1.0);
 }

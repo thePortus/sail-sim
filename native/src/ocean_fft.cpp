@@ -103,7 +103,8 @@ WGPUBindGroup OceanFFT::bg(WGPUBindGroupLayout bgl, const std::vector<WGPUBindGr
   return g;
 }
 
-OceanFFT::OceanFFT(WGPUDevice device, WGPUQueue queue, uint32_t size, float lengthScale)
+OceanFFT::OceanFFT(WGPUDevice device, WGPUQueue queue, uint32_t size, float lengthScale,
+                   float cutoffLow, float cutoffHigh)
     : _device(device), _queue(queue), _size(size), _lengthScale(lengthScale) {
   _logSize = (uint32_t)std::log2((double)size);
 
@@ -187,7 +188,7 @@ OceanFFT::OceanFFT(WGPUDevice device, WGPUQueue queue, uint32_t size, float leng
 
   // params + JONSWAP spectrum (single cascade: length 250, wide cutoff band)
   struct { uint32_t Size; float LengthScale, CutoffHigh, CutoffLow, Gravity, Depth; } P{
-    size, lengthScale, 9999.0f, 0.0001f, 9.81f, 500.0f };
+    size, lengthScale, cutoffHigh, cutoffLow, 9.81f, 500.0f };
   wgpuQueueWriteBuffer(queue, _params, 0, &P, sizeof(P));
 
   const float g = 9.81f;

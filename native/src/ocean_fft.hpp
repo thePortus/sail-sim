@@ -9,7 +9,8 @@
 
 class OceanFFT {
 public:
-  OceanFFT(WGPUDevice device, WGPUQueue queue, uint32_t size, float lengthScale);
+  OceanFFT(WGPUDevice device, WGPUQueue queue, uint32_t size, float lengthScale,
+           float cutoffLow, float cutoffHigh);
 
   void initSpectrum();                       // once (spectrum + conjugate + twiddles)
   void update(float time, float deltaTime);  // per frame (evolve + IFFT + merge)

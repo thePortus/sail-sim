@@ -27,6 +27,8 @@
 
 #include <string>
 
+#include "stb_image_write.h"
+
 #include "fft_test.hpp"
 #include "gltf_mesh.hpp"
 #include "ocean_fft.hpp"
@@ -374,6 +376,51 @@ static const char* backendTypeName(WGPUBackendType t) {
   }
 }
 
+// Copy the just-rendered swapchain texture to the CPU and write a PNG (BGRA->RGBA).
+static void captureSurface(WGPUDevice device, WGPUQueue queue, WGPUTexture tex,
+                           uint32_t w, uint32_t h, const char* path) {
+  const uint32_t rowBytes = ((w * 4) + 255u) & ~255u;   // 256-aligned for copyTextureToBuffer
+  const size_t bufSize = (size_t)rowBytes * h;
+  WGPUBufferDescriptor bd = {};
+  bd.size = bufSize; bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+  WGPUBuffer rb = wgpuDeviceCreateBuffer(device, &bd);
+
+  WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
+  WGPUImageCopyTexture src = {}; src.texture = tex; src.aspect = WGPUTextureAspect_All;
+  WGPUImageCopyBuffer dst = {}; dst.buffer = rb; dst.layout.bytesPerRow = rowBytes; dst.layout.rowsPerImage = h;
+  WGPUExtent3D ext = { w, h, 1 };
+  wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+  WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+  wgpuQueueSubmit(queue, 1, &cmd);
+  wgpuCommandBufferRelease(cmd);
+  wgpuCommandEncoderRelease(enc);
+
+  struct St { bool done; } st{ false };
+  wgpuBufferMapAsync(rb, WGPUMapMode_Read, 0, bufSize,
+    [](WGPUBufferMapAsyncStatus, void* ud) { ((St*)ud)->done = true; }, &st);
+  while (!st.done) {
+#if defined(WEBGPU_BACKEND_WGPU)
+    wgpuDevicePoll(device, true, nullptr);
+#endif
+  }
+  const uint8_t* mapped = (const uint8_t*)wgpuBufferGetConstMappedRange(rb, 0, bufSize);
+  std::vector<uint8_t> rgba((size_t)w * h * 4);
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* srcRow = mapped + (size_t)y * rowBytes;
+    uint8_t* dstRow = rgba.data() + (size_t)y * w * 4;
+    for (uint32_t x = 0; x < w; ++x) {
+      dstRow[x * 4 + 0] = srcRow[x * 4 + 2];   // R <- B
+      dstRow[x * 4 + 1] = srcRow[x * 4 + 1];   // G
+      dstRow[x * 4 + 2] = srcRow[x * 4 + 0];   // B <- R
+      dstRow[x * 4 + 3] = srcRow[x * 4 + 3];   // A
+    }
+  }
+  wgpuBufferUnmap(rb);
+  wgpuBufferRelease(rb);
+  int ok = stbi_write_png(path, (int)w, (int)h, 4, rgba.data(), (int)w * 4);
+  std::printf("[spike] screenshot %s -> %s\n", ok ? "wrote" : "FAILED", path);
+}
+
 int main(int argc, char** argv) {
   // Flush per line so `[spike] …` progress shows even when piped or killed.
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -385,6 +432,11 @@ int main(int argc, char** argv) {
   const char* maxFramesEnv = std::getenv("SAILSIM_MAX_FRAMES");
   const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
   long frame = 0;
+
+  // Headless screenshot: SAILSIM_SHOT=out.png renders to a chosen frame (default
+  // 240, so the FFT/foam has settled), writes a PNG, and exits.
+  const char* shotPath = std::getenv("SAILSIM_SHOT");
+  const long shotFrame = shotPath ? (maxFramesEnv ? maxFrames : 240) : -1;
 
 #if defined(WEBGPU_BACKEND_WGPU)
   // Surface wgpu-native's internal logs (including WGSL compile errors).
@@ -491,6 +543,7 @@ int main(int argc, char** argv) {
   surfaceConfig.height = (uint32_t)fbHeight;
   surfaceConfig.presentMode = WGPUPresentMode_Fifo;   // vsync
   surfaceConfig.alphaMode = WGPUCompositeAlphaMode_Auto;
+  if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
   wgpuSurfaceConfigure(surface, &surfaceConfig);
 
   std::printf("[spike] surface configured: %dx%d format=%d — entering render loop\n",
@@ -526,11 +579,15 @@ int main(int argc, char** argv) {
   Mesh mesh = createMesh(device, queue, surfaceFormat, meshData);
   Ocean ocean = createOcean(device, queue, surfaceFormat);
 
-  // FFT ocean cascade (compute). 256² grid, 250 m tile. Prime one frame + sanity-check.
-  OceanFFT oceanFft(device, queue, 256, 250.0f);
-  oceanFft.initSpectrum();
-  oceanFft.update(0.0f, 1.0f / 60.0f);
-  oceanFft.sanityCheck();
+  // FFT ocean — 3 cascades (250 / 17 / 5 m tiles) with split cutoff bands so they
+  // don't double-count wavelengths. 256² each. Prime one frame + sanity-check.
+  const float B1 = 6.2831853f / 17.0f * 6.0f;
+  const float B2 = 6.2831853f / 5.0f  * 6.0f;
+  OceanFFT c0(device, queue, 256, 250.0f, 0.0001f, B1);
+  OceanFFT c1(device, queue, 256, 17.0f,  B1,      B2);
+  OceanFFT c2(device, queue, 256, 5.0f,   B2,      9999.0f);
+  for (OceanFFT* c : { &c0, &c1, &c2 }) { c->initSpectrum(); c->update(0.0f, 1.0f / 60.0f); }
+  c0.sanityCheck();
 
   uint32_t curW = (uint32_t)fbWidth, curH = (uint32_t)fbHeight;
   WGPUTexture depthTex = makeDepthTexture(device, curW, curH);
@@ -564,9 +621,12 @@ int main(int argc, char** argv) {
     glm::mat4 proj  = glm::perspective(glm::radians(50.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 
-    // Advance the FFT ocean and update its surface uniform (params.x = tile size).
-    oceanFft.update(t, 1.0f / 60.0f);
-    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(oceanFft.lengthScale(), 0, 0, 0) };
+    // Advance all cascades; uniform carries the three tile sizes.
+    c0.update(t, 1.0f / 60.0f);
+    c1.update(t, 1.0f / 60.0f);
+    c2.update(t, 1.0f / 60.0f);
+    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
+                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), 0.0f) };
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
 
     // Float the ship on the wave field: heave to the surface height, tilt to the
@@ -615,15 +675,21 @@ int main(int argc, char** argv) {
     passDesc.depthStencilAttachment = &depthAttachment;
 
     WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
-    // Ocean surface — bind group references this frame's (ping-ponged) FFT textures.
-    WGPUBindGroupEntry oe[5] = {};
-    oe[0].binding = 0; oe[0].buffer = ocean.uniformBuf; oe[0].size = sizeof(OceanCamera);
-    oe[1].binding = 1; oe[1].textureView = oceanFft.displacement();
-    oe[2].binding = 2; oe[2].textureView = oceanFft.derivatives();
-    oe[3].binding = 3; oe[3].textureView = oceanFft.turbulence();
-    oe[4].binding = 4; oe[4].sampler = ocean.sampler;
+    // Ocean surface — bind group references this frame's (ping-ponged) cascade textures.
+    WGPUBindGroupEntry oe[11] = {};
+    oe[0].binding = 0;  oe[0].buffer = ocean.uniformBuf; oe[0].size = sizeof(OceanCamera);
+    oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
+    oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
+    oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
+    oe[4].binding = 4;  oe[4].textureView  = c1.displacement();
+    oe[5].binding = 5;  oe[5].textureView  = c1.derivatives();
+    oe[6].binding = 6;  oe[6].textureView  = c1.turbulence();
+    oe[7].binding = 7;  oe[7].textureView  = c2.displacement();
+    oe[8].binding = 8;  oe[8].textureView  = c2.derivatives();
+    oe[9].binding = 9;  oe[9].textureView  = c2.turbulence();
+    oe[10].binding = 10; oe[10].sampler = ocean.sampler;
     WGPUBindGroupDescriptor obd = {};
-    obd.layout = ocean.bgl; obd.entryCount = 5; obd.entries = oe;
+    obd.layout = ocean.bgl; obd.entryCount = 11; obd.entries = oe;
     WGPUBindGroup oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);
@@ -647,6 +713,11 @@ int main(int argc, char** argv) {
     WGPUCommandBufferDescriptor cmdDesc = {};
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &cmdDesc);
     wgpuQueueSubmit(queue, 1, &cmd);
+
+    if (shotPath && frame == shotFrame) {
+      captureSurface(device, queue, surfaceTex.texture, curW, curH, shotPath);
+      glfwSetWindowShouldClose(window, GLFW_TRUE);
+    }
 
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);

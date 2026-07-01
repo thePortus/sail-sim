@@ -1767,7 +1767,7 @@ export class SceneService {
   // SQUARED, so a small scale drop is a quadratic fill-rate win. Drives a dynamic multiplier on top
   // of the user's render-scale toward a frame-time budget (à la UE Dynamic Resolution). Opt-in;
   // off → factor pinned at 1.0 (no behaviour change). Persisted.
-  private _adaptiveRes = (localStorage.getItem('ignis_adaptive_res') ?? '0') === '1';
+  private _adaptiveRes = (localStorage.getItem('ignis_adaptive_res') ?? '1') !== '0';   // ON by default (opt-out '0')
   private _adaptiveFactor = 1;
   private _adaptiveTargetMs = (() => {
     const v = parseFloat(localStorage.getItem('ignis_adaptive_target_ms') ?? '33.3');
@@ -1775,7 +1775,9 @@ export class SceneService {
   })();
   private _adaptiveAccumMs = 0;
   private _adaptiveAccumN = 0;
-  private static readonly ADAPTIVE_MIN = 0.6;   // never drop below 60% of the user's scale
+  private static readonly ADAPTIVE_MIN = 0.5;   // headroom: allow down to 50% of the user's scale under heavy load
+  private static readonly ADAPTIVE_WINDOW_MS = 400;   // evaluate ~2.5×/s, FPS-INDEPENDENT (a frame-count window spans
+                                                      // more real time exactly when FPS is low = slow to react when it matters most)
 
   isAdaptiveResolution(): boolean { return this._adaptiveRes; }
   setAdaptiveResolution(on: boolean): void {
@@ -1795,15 +1797,22 @@ export class SceneService {
     if (!this._adaptiveRes) return;
     this._adaptiveAccumMs += dtMs;
     this._adaptiveAccumN++;
-    if (this._adaptiveAccumN < 30) return;   // ~0.5 s window
+    if (this._adaptiveAccumMs < SceneService.ADAPTIVE_WINDOW_MS) return;   // fixed ~0.4 s of real time
     const avg = this._adaptiveAccumMs / this._adaptiveAccumN;
     this._adaptiveAccumMs = 0;
     this._adaptiveAccumN = 0;
 
     const t = this._adaptiveTargetMs;
     let f = this._adaptiveFactor;
-    if (avg > t * 1.10) { f -= 0.05; }            // over budget → shed pixels
-    else if (avg < t * 0.85) { f += 0.04; }       // headroom → restore quality (slower than the drop)
+    if (avg > t * 1.05) {
+      // Over budget → shed pixels PROPORTIONALLY to how far over (0.03 just-over … 0.14 way-over), so a big
+      // load (sailing into a dense coast) sheds fast and holds the target instead of crawling down 0.05/step.
+      f -= Math.min(0.14, Math.max(0.03, (avg / t - 1.0) * 0.30));
+    } else if (avg < t * 0.80) {
+      // Clear headroom → restore quality GENTLY (well slower than the drop, wider dead-zone) so it never
+      // pumps back into overload and oscillates — the resolution creeps up, snaps down.
+      f += 0.02;
+    }
     f = Math.max(SceneService.ADAPTIVE_MIN, Math.min(1, f));
     if (Math.abs(f - this._adaptiveFactor) > 0.001) {
       this._adaptiveFactor = f;

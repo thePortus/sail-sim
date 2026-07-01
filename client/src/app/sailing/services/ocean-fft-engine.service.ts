@@ -44,6 +44,13 @@ export class OceanFFTEngine {
   private _lastChop = -1;
   private _choppiness = 0.3;   // latest sea-state 0..1 (drives foam trim in the material)
 
+  // Temporal FFT LOD: advance the wave sim at 30 Hz (every other frame) instead of once per render frame.
+  // Ocean waves move slowly, so the surface looks the same, but it halves the per-frame 3-cascade FFT compute
+  // AND the per-frame height readback stall. Offset to ODD frames so it never stacks on the even-frame
+  // refraction RTT. Opt-out `ignis_fft_fullrate='1'` (restore 60 Hz sim).
+  private _fftFrame = 0;
+  private readonly _fftHalfRate = (() => { try { return localStorage.getItem('ignis_fft_fullrate') !== '1'; } catch { return true; } })();
+
   /** Latest sea choppiness (0..1) from the weather system. */
   get choppiness(): number { return this._choppiness; }
 
@@ -204,6 +211,10 @@ export class OceanFFTEngine {
 
   private _tick(): void {
     if (!this._generator) { return; }
+    // Temporal FFT LOD: at 30 Hz, only advance the sim (+ read height back) on ODD frames — halves the FFT
+    // compute + readback stall, offset off the even-frame refraction RTT. The displacement textures simply
+    // hold for the skipped render frame (imperceptible for slow ocean waves). ignis_fft_fullrate='1' → 60 Hz.
+    if (this._fftHalfRate && ((this._fftFrame++ & 1) === 0)) { return; }
     try {
       this._generator.update(performance.now() / 1000);
       // Perf A/B: localStorage.ignis_no_fft_readback='1' skips the per-frame height readback (buoyancy

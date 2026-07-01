@@ -36,56 +36,108 @@ FetchContent_Declare(
   GIT_SHALLOW    ON
 )
 
+FetchContent_MakeAvailable(glfw)
+
 # ── WebGPU backend ───────────────────────────────────────────────────────────
-# Élie Michel's WebGPU-distribution exposes a single `webgpu` CMake target and a
-# consistent webgpu.h C API regardless of which implementation backs it — so our
-# code and (crucially) our WGSL are identical across backends.
+# Both wgpu-native and Dawn implement the same webgpu.h C API and run the same
+# WGSL natively on Metal / D3D12 / Vulkan — so our code and our WGSL are identical
+# across backends.
 #
-#   SAILSIM_WEBGPU_BACKEND = WGPU  → wgpu-native, prebuilt (default; fast, robust)
+#   SAILSIM_WEBGPU_BACKEND = WGPU  → wgpu-native official prebuilt (default)
 #                          = DAWN  → Google's Dawn, built from source
 #
-# Why WGPU is the spike default: both implement WebGPU and run WGSL natively on
-# Metal / D3D12 / Vulkan, so the "our WGSL ports 1:1" thesis is validated either
-# way. But building Dawn from source through CMake 4.x on Apple Silicon currently
-# trips over its vendored fuzzers (libprotobuf-mutator) and an abseil `-msse4.1`
-# flag on arm64 — a build-config rabbit hole that proves nothing extra. wgpu is a
-# prebuilt binary: it links in seconds. The production backend choice (Dawn vs
-# wgpu) stays open — see PORTING.md — and DAWN here keeps that path wired up.
+# We fetch wgpu-native's OFFICIAL release zip directly (header + lib from the same
+# build) rather than a third-party redistribution — a redistribution we tried
+# (eliemichel/WebGPU-distribution wgpu-static-v0.19.4.1) shipped a webgpu.h whose
+# enum values were out of sync with the lib it bundled, which silently corrupts
+# texture formats. Fetching upstream guarantees header/lib agreement.
 set(SAILSIM_WEBGPU_BACKEND "WGPU" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
 
 if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
-  # Dawn, from source. NOTE: on Apple Silicon this still needs DAWN_BUILD_TESTS
-  # disabled at the distribution level and the abseil arm64 flag issue resolved.
-  set(WEBGPU_DIST_TAG "dawn-6512")
+  # Dawn, from source, via Élie Michel's distribution. NOTE: on Apple Silicon this
+  # still needs its vendored fuzzers (libprotobuf-mutator) disabled and an abseil
+  # `-msse4.1`-on-arm64 issue resolved — see PORTING.md. Kept wired for later.
+  FetchContent_Declare(webgpu
+    GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
+    GIT_TAG        dawn-6512
+    GIT_SHALLOW    ON)
+  FetchContent_MakeAvailable(webgpu)
 else()
-  # wgpu-native, prebuilt. v0.19.4.1 ships the classic-callback webgpu.h that
-  # src/main.cpp targets, with the modern surface API.
-  set(WEBGPU_DIST_TAG "wgpu-static-v0.19.4.1")
+  # wgpu-native official prebuilt release. Classic-callback webgpu.h (matches
+  # src/main.cpp) with the modern surface API.
+  set(WGPU_VER "v0.19.4.1")
+  if (WIN32)
+    set(WGPU_ZIP "wgpu-windows-x86_64-msvc-release.zip")
+  elseif (APPLE)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+      set(WGPU_ZIP "wgpu-macos-aarch64-release.zip")
+    else()
+      set(WGPU_ZIP "wgpu-macos-x86_64-release.zip")
+    endif()
+  else()
+    set(WGPU_ZIP "wgpu-linux-x86_64-release.zip")
+  endif()
+  FetchContent_Declare(wgpu_native
+    URL "https://github.com/gfx-rs/wgpu-native/releases/download/${WGPU_VER}/${WGPU_ZIP}")
+  FetchContent_MakeAvailable(wgpu_native)
+
+  # The zip lays webgpu.h / wgpu.h at its root; arrange a `webgpu/` subdir so
+  # `#include <webgpu/webgpu.h>` resolves (matches how glfw3webgpu includes it).
+  set(WGPU_INC "${CMAKE_BINARY_DIR}/gen/wgpu-include")
+  file(MAKE_DIRECTORY "${WGPU_INC}/webgpu")
+  file(COPY "${wgpu_native_SOURCE_DIR}/webgpu.h" "${wgpu_native_SOURCE_DIR}/wgpu.h"
+       DESTINATION "${WGPU_INC}/webgpu")
+
+  add_library(webgpu INTERFACE)
+  target_include_directories(webgpu INTERFACE "${WGPU_INC}")
+  target_compile_definitions(webgpu INTERFACE WEBGPU_BACKEND_WGPU)
+  if (WIN32)
+    # Static wgpu-native on Windows needs these system libs. If linking the static
+    # lib is troublesome, switch to wgpu_native.dll + wgpu_native.dll.lib and copy
+    # the DLL next to the exe.
+    target_link_libraries(webgpu INTERFACE
+      "${wgpu_native_SOURCE_DIR}/wgpu_native.lib"
+      d3dcompiler ws2_32 userenv bcrypt ntdll opengl32 dxgi d3d12 propsys runtimeobject)
+  elseif (APPLE)
+    target_link_libraries(webgpu INTERFACE
+      "${wgpu_native_SOURCE_DIR}/libwgpu_native.a"
+      "-framework Metal" "-framework MetalKit" "-framework Foundation"
+      "-framework QuartzCore" "-framework CoreGraphics" "-framework IOKit" "-framework IOSurface")
+  else()
+    target_link_libraries(webgpu INTERFACE
+      "${wgpu_native_SOURCE_DIR}/libwgpu_native.a" dl pthread m)
+  endif()
+  # No-op on the static build; kept so the call site in this file stays valid.
+  function(target_copy_webgpu_binaries Target)
+  endfunction()
 endif()
 
-FetchContent_Declare(
-  webgpu
-  GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
-  GIT_TAG        ${WEBGPU_DIST_TAG}
-  GIT_SHALLOW    ON
-)
-
 # ── glfw3webgpu (creates the WGPUSurface from a GLFWwindow, per-OS) ──────────
-# This is the piece that hides the Win32 HWND / Cocoa CAMetalLayer / X11
-# differences behind one call: glfwGetWGPUSurface(instance, window).
+# Hides the Win32 HWND / Cocoa CAMetalLayer / X11 differences behind one call:
+# glfwGetWGPUSurface(instance, window). Links the `webgpu` target defined above.
 FetchContent_Declare(
   glfw3webgpu
   GIT_REPOSITORY https://github.com/eliemichel/glfw3webgpu
   GIT_TAG        v1.2.0
   GIT_SHALLOW    ON
 )
+FetchContent_MakeAvailable(glfw3webgpu)
 
-FetchContent_MakeAvailable(glfw webgpu glfw3webgpu)
+# Embed the WGSL as a C header at configure time — single source of truth is the
+# .wgsl file (itself a verbatim copy of the client shader). Uses a raw string
+# literal so no escaping is needed; reconfigure after editing the .wgsl.
+set(WGSL_GEN_DIR "${CMAKE_BINARY_DIR}/gen")
+file(MAKE_DIRECTORY "${WGSL_GEN_DIR}")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL_SRC)
+file(WRITE "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h"
+  "#pragma once\ninline const char* INITIAL_SPECTRUM_WGSL = R\"WGSL(\n${INITIAL_SPECTRUM_WGSL_SRC})WGSL\";\n")
 
 add_executable(sailsim_native
   src/main.cpp
+  src/fft_test.cpp
 )
 
+target_include_directories(sailsim_native PRIVATE "${WGSL_GEN_DIR}")
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on

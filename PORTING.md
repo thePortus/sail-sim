@@ -177,18 +177,25 @@ Tasks:
 Estimated spike: **~3–4 weeks**. Deliverable: a written go/no-go with the validation diff and any
 WGSL changes Dawn required.
 
-**Scaffold — tasks 1–2 done and verified.** [`native/`](native/) builds and runs: a WebGPU device
-bringup + clear-colour render loop, confirmed on macOS (`backend=Metal`, Apple M3 Pro, renders and
-exits cleanly). CMake + FetchContent (GLFW, glfw3webgpu, WebGPU distribution) with a backend toggle.
+**Spike done on macOS — all Phase 0 criteria 1–5 met** (Windows/D3D12 pending a Windows machine).
+[`native/`](native/) builds and runs: WebGPU device bringup + clear-colour render loop **and** the
+ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback — the output
+matches a CPU reimplementation of the formula to **max abs err 3.8e-6** on Metal (Apple M3 Pro). This
+is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified; only host-side
+plumbing was written.
 
-One course-correction worth recording: the spike currently runs on **wgpu-native (prebuilt)**, not
-Dawn. Building Dawn from source on Apple Silicon through CMake 4.x trips over its vendored fuzzers
-(`libprotobuf-mutator`) and an abseil `-msse4.1` flag on arm64 — a build-config problem, not a code
-one. wgpu-native implements the same `webgpu.h` and runs the same WGSL, so it proves the Phase 0
-thesis identically; the production Dawn-vs-wgpu choice stays open (the `DAWN` toggle keeps that path
-wired). Tasks 3–4 (compute + readback) have a binding-level recipe in
-[`native/shaders/README.md`](native/shaders/README.md); build steps in
-[`native/README.md`](native/README.md).
+Course-corrections recorded for the record:
+- **Backend is wgpu-native (official prebuilt), not Dawn.** Building Dawn from source on Apple
+  Silicon through CMake 4.x trips over its vendored fuzzers (`libprotobuf-mutator`) and an abseil
+  `-msse4.1` flag on arm64 — a build-config problem, not a code one. wgpu-native implements the same
+  `webgpu.h` and runs the same WGSL, so it proves the thesis identically; the production Dawn-vs-wgpu
+  choice stays open (a `SAILSIM_WEBGPU_BACKEND=DAWN` toggle keeps that path wired).
+- **Fetch WebGPU from upstream, not a redistribution.** A third-party redistribution shipped a
+  `webgpu.h` whose texture-format enums disagreed with the lib it bundled (silent format corruption);
+  we now fetch wgpu-native's official release zip so header and lib always match.
+
+Build steps in [`native/README.md`](native/README.md); the FFT binding layout in
+[`native/shaders/README.md`](native/shaders/README.md).
 
 ---
 

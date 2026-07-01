@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "fft_test.hpp"
+
 // ── async request helpers (resolve synchronously on Dawn/wgpu in this distribution) ──
 
 static WGPUAdapter requestAdapterSync(WGPUInstance instance, const WGPURequestAdapterOptions* options) {
@@ -51,6 +53,11 @@ static WGPUDevice requestDeviceSync(WGPUAdapter adapter, const WGPUDeviceDescrip
   return result.device;
 }
 
+static void onDeviceError(WGPUErrorType type, char const* message, void*) {
+  std::fprintf(stderr, "[spike] uncaptured device error (%d): %s\n",
+               (int)type, message ? message : "(no message)");
+}
+
 static const char* backendTypeName(WGPUBackendType t) {
   switch (t) {
     case WGPUBackendType_D3D11:  return "D3D11";
@@ -71,6 +78,41 @@ int main() {
   const char* maxFramesEnv = std::getenv("SAILSIM_MAX_FRAMES");
   const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
   long frame = 0;
+
+#if defined(WEBGPU_BACKEND_WGPU)
+  // Surface wgpu-native's internal logs (including WGSL compile errors).
+  wgpuSetLogLevel(WGPULogLevel_Warn);
+  wgpuSetLogCallback([](WGPULogLevel level, char const* msg, void*) {
+    std::fprintf(stderr, "[wgpu] (%d) %s\n", (int)level, msg ? msg : "");
+  }, nullptr);
+#endif
+
+  // Headless compute-only mode: run the ocean-FFT readback test with no window,
+  // then exit 0/1. Ideal for CI or a quick Windows/D3D12 check.
+  if (std::getenv("SAILSIM_FFT_ONLY")) {
+    WGPUInstanceDescriptor instDesc = {};
+    WGPUInstance inst = wgpuCreateInstance(&instDesc);
+    WGPURequestAdapterOptions ao = {};
+    ao.powerPreference = WGPUPowerPreference_HighPerformance;
+    WGPUAdapter ad = requestAdapterSync(inst, &ao);
+    if (!ad) return EXIT_FAILURE;
+    WGPUAdapterProperties props = {};
+    wgpuAdapterGetProperties(ad, &props);
+    std::printf("[spike] headless FFT test — backend=%s device=%s\n",
+                backendTypeName(props.backendType), props.name ? props.name : "?");
+    WGPUDeviceDescriptor dd = {};
+    dd.label = "sailsim-device";
+    WGPUDevice dev = requestDeviceSync(ad, &dd);
+    if (!dev) return EXIT_FAILURE;
+    wgpuDeviceSetUncapturedErrorCallback(dev, onDeviceError, nullptr);
+    WGPUQueue q = wgpuDeviceGetQueue(dev);
+    const bool ok = runInitialSpectrumTest(dev, q);
+    wgpuQueueRelease(q);
+    wgpuDeviceRelease(dev);
+    wgpuAdapterRelease(ad);
+    wgpuInstanceRelease(inst);
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   if (!glfwInit()) {
     std::fprintf(stderr, "[spike] glfwInit failed\n");
@@ -119,15 +161,12 @@ int main() {
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);
   if (!device) return EXIT_FAILURE;
 
-  wgpuDeviceSetUncapturedErrorCallback(
-    device,
-    [](WGPUErrorType type, char const* message, void*) {
-      std::fprintf(stderr, "[spike] uncaptured device error (%d): %s\n",
-                   (int)type, message ? message : "(no message)");
-    },
-    nullptr);
+  wgpuDeviceSetUncapturedErrorCallback(device, onDeviceError, nullptr);
 
   WGPUQueue queue = wgpuDeviceGetQueue(device);
+
+  // Phase 0 criteria 3-5: prove the ocean-FFT WGSL runs natively and reads back.
+  runInitialSpectrumTest(device, queue);
 
   // 5. Configure the surface (swapchain)
   WGPUSurfaceCapabilities caps = {};

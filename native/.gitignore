@@ -1,0 +1,10 @@
+# CMake build output (includes the fetched + built Dawn — large)
+build/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user

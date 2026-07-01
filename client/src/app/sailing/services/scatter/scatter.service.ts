@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import {
-  Color3, DynamicTexture, Material, Matrix, Mesh, MeshBuilder, Observer, Quaternion, Scene,
+  Color3, DynamicTexture, Material, Matrix, Mesh, MeshBuilder, Observer, PBRMaterial, Quaternion, Scene,
   StandardMaterial, Texture, Vector3,
 } from '@babylonjs/core';
 import { SceneService } from '../scene.service';
@@ -204,6 +204,10 @@ export class ScatterService {
     return Number.isFinite(q) ? Math.max(0, Math.min(4, q)) : 3;
   })();
   private RADIUS = 8;                   // patch rings (set from quality); edge dissolved by the fade plugin
+  // Foliage MID-LoD swap (palms/beeches): past this the full mesh hard-swaps to a cheaper clone with the NORMAL
+  // MAP dropped (normal detail is invisible at range; this cuts per-fragment cost across the overdraw-heavy mid
+  // band without shrinking the view distance). Full mesh keeps crisp normals within this. See makeGlbLayer3.
+  private static readonly MID_LOD_M = 100;
   // Per-instance draw-radius fade band for the camera-following TREES (palms/beeches) — wider than grass's, so
   // their impostors dissolve at the patch-cull edge (no pop). Set from RADIUS in applyQualityParams; passed BY
   // REFERENCE to each tree impostor's GrassFadePlugin so quality changes flow through live.
@@ -589,6 +593,9 @@ export class ScatterService {
       }
       this.groundToBase(full);
       this.recenterTrunkXZ(full, ScatterService.PALM_TRUNK_Y);   // bake the off-centre + raised trunk base to the origin (both paths)
+      // Build the MID LoD from the CLEAN material — BEFORE the wind plugin is attached to full.material, because
+      // Babylon's material.clone() chokes trying to copy a custom MaterialPlugin. Each copy gets its own wind.
+      const mid = this.makeMidLod(full, `scatter_palm_${v}_mid`, (m) => new PalmWindPlugin(m));   // normal-map-free mid LoD
       new PalmWindPlugin(full.material);
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -604,8 +611,8 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
       this.palmImpostors.push({ tex, w: cfg.height * 0.85, h: cfg.height, pad });   // reused by the static far-coast layer
 
-      this.attachNearLod(full, imp);
-      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v), true);   // full-detail radius + cross-dissolve
+      this.attachNearLod(mid, imp);   // the ring near-side is the MID mesh now (full only <MID_LOD_M)
+      const layer = this.makeGlbLayer3(full, mid, imp, 260, (cx, cz) => this.buildPalms(cx, cz, v));
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('palms', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -632,6 +639,9 @@ export class ScatterService {
       }
       this.groundToBase(full);
       this.recenterTrunkXZ(full);   // (also) put the beech trunk over the origin if its GLB origin is off-axis
+      // MID LoD from the CLEAN material — BEFORE the wind plugin is on full.material (material.clone() can't copy a
+      // custom MaterialPlugin). Each copy gets its own wind instance.
+      const mid = this.makeMidLod(full, `scatter_beech_${v}_mid`, (m) => new TreeWindPlugin(m, { flutter: true }));   // normal-map-free mid LoD
       new TreeWindPlugin(full.material, { flutter: true });   // leaf shimmer; default canopy band 1.5→8 m
       this.sceneService.excludeFromGlow(full);
       this.sceneService.excludeFromPrePass(full.material);
@@ -645,9 +655,9 @@ export class ScatterService {
       if (imp.material) { this.sceneService.excludeFromPrePass(imp.material); }
       this.beechImpostors.push({ tex, w: cfg.w, h: cfg.h, pad });   // reused by the static far-forest layer
 
-      this.attachNearLod(full, imp);
-      // Beeches are ~2× the palm's tris, but use the SAME full-detail radius as palms (260 m) per request.
-      const layer = this.makeGlbLayer(full, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v), true);   // full-detail radius + cross-dissolve
+      this.attachNearLod(mid, imp);   // the ring near-side is the MID mesh now (full only <MID_LOD_M)
+      // Beeches use the SAME full-detail radius as palms (260 m); the cheaper mid mesh covers ~100–260 m.
+      const layer = this.makeGlbLayer3(full, mid, imp, 260, (cx, cz) => this.buildTrees(cx, cz, v));
       if (this.gpuScatterEnabled()) { layer.buildGpu = (cx, cz) => this.buildScatterGpu('trees', cx, cz, v); }
       this.layers.push(layer);
     }
@@ -909,6 +919,63 @@ export class ScatterService {
     return { mat: full.material as Material, manager, patches: new Map(), build, baseMeshes: [imp, full] };
   }
 
+  /** A cheaper MID-LoD base for a foliage layer: SHARES the full mesh's geometry (clone) and albedo/rough textures
+   *  (material clone = ref copy) but DROPS the normal map — the mid-band per-fragment win, since normal detail is
+   *  invisible past ~100 m and foliage overdraws heavily. The `attachWind` callback adds this layer's wind plugin to
+   *  the mid material so it sways in lockstep with the near trees. ⚠️ MUST be called BEFORE the wind plugin is added
+   *  to `full.material` — Babylon's `material.clone()` throws trying to copy a custom MaterialPlugin (the "becalmed"
+   *  startup crash). Hidden template (inherits full's isVisible=false). No new geometry/texture VRAM. */
+  private makeMidLod(full: Mesh, name: string, attachWind: (m: PBRMaterial) => void): Mesh {
+    const mid = full.clone(name)!;
+    const mat = (full.material as PBRMaterial).clone(`${name}_mat`)!;
+    mat.unfreeze();                                // in case clone() carried the source's frozen state (would drop the edit)
+    mat.bumpTexture = null;                        // ← the cheapening: no per-fragment normal sample + tangent math
+    attachWind(mat);
+    this.sceneService.excludeFromPrePass(mat);
+    mat.freeze();
+    mid.material = mat;
+    mid.isVisible = false;
+    this.sceneService.excludeFromGlow(mid);
+    return mid;
+  }
+
+  /** 3-tier GLB layer (foliage): full mesh (crisp normals) NEAR → cheaper normal-map-free MID mesh across the mid
+   *  band → crossed-quad impostor FAR, with the existing dither cross-dissolve on the MID↔impostor ring. The
+   *  full→mid swap is HARD (identical silhouette + position → no visible pop). Legacy (`ignis_lod_dissolve='0'`):
+   *  a plain full→mid→impostor hard-swap, per-instance NearFade on the mid/impostor. */
+  private makeGlbLayer3(full: Mesh, mid: Mesh, imp: Mesh, near: number,
+                        build: (cx: number, cz: number) => PatchData): Layer {
+    const camDist = (patch: IPatch): number => {
+      const c = this.sceneService.camera;
+      return c ? Vector3.Distance(patch.getPosition(), c.position) : Infinity;
+    };
+    const midM = ScatterService.MID_LOD_M;
+    let manager: PatchManager;
+    if (this.lodDissolve) {
+      const band = NearFadePlugin.params.band;
+      // Levels: 3 full (<midM) · 2 mid (midM…near−band) · 1 mid+impostor cross-dissolve ring · 0 impostor (>near+band).
+      manager = new PatchManager([imp, mid, full], (patch) => {
+        const d = camDist(patch);
+        if (d < midM) { return 3; }
+        if (d < near - band) { return 2; }
+        if (d > near + band) { return 0; }
+        return 1;
+      }, [1, 1, 1], (patch, level) => {
+        if (level === 3) { patch.createInstances(full); }
+        else if (level === 2) { patch.createInstances(mid); }
+        else if (level === 1) { patch.createInstances(imp, 1, mid); }   // ring: impostor dithers in over the solid mid
+        else { patch.createInstances(imp); }
+      });
+    } else {
+      manager = new PatchManager([imp, mid, full], (patch) => {
+        const d = camDist(patch);
+        return d < midM ? 2 : (d < near ? 1 : 0);   // full / mid / impostor hard swap (default single-mesh materialize)
+      }, [1, 1, 1]);
+    }
+    manager.setLodUpdateCadence(this.MAX_BUILDS_PER_FRAME);
+    return { mat: full.material as Material, manager, patches: new Map(), build, baseMeshes: [imp, mid, full] };
+  }
+
   // ── Fake shadow blobs (cheap cast-shadow decals for the static land assets) ──
 
   /** Build the shared shadow decal (a flat soft-edged dark disc) and register one near-ring shadow
@@ -1047,12 +1114,14 @@ export class ScatterService {
 
   // ── Beach rocks (authored geometry-only GLB shapes) ─────────────────────────
 
+  // 3 shapes (was 5): trimmed to cut per-patch draw calls — each shape is a separate scatter layer = a draw per
+  // patch, and per-instance scale/rotation/tint jitter already gives plenty of variety. Kept the most
+  // silhouette-distinct (boulder / angular / slab); dropped chunky (~boulder) + pebble (~small-jitter boulder).
+  // ⚠️ COUNT MUST MATCH the WGSL `dealtAway(px, pz, 3.0)` in scatter-compute.ts ROCKS_WGSL (GPU variant bucketing).
   private static readonly ROCK_SHAPES = [
     { file: 'rock_a.glb', lod: 'rock_a_lod.glb' },   // rounded boulder
     { file: 'rock_b.glb', lod: 'rock_b_lod.glb' },   // angular faceted
     { file: 'rock_c.glb', lod: 'rock_c_lod.glb' },   // flat slab
-    { file: 'rock_d.glb', lod: 'rock_d_lod.glb' },   // chunky
-    { file: 'rock_e.glb', lod: 'rock_e_lod.glb' },   // small pebble
   ];
 
   /** Three CC0 photoreal PBR stone sets (KTX2: albedo + OpenGL normal + roughness). The 5 rock SHAPES are
@@ -1108,12 +1177,13 @@ export class ScatterService {
 
   // ── Beach driftwood (authored geometry-only GLB shapes) ─────────────────────
 
+  // 3 shapes (was 5): trimmed to cut per-patch draw calls (one layer/draw per shape); scale/rotation/tint jitter
+  // keeps the variety. Kept branch / log / root; dropped plank + twig (least common tide-line reads).
+  // ⚠️ COUNT MUST MATCH the WGSL `dealtAway(px, pz, 3.0)` in scatter-compute.ts DRIFT_WGSL.
   private static readonly DRIFT_SHAPES = [
     { file: 'drift_a.glb', lod: 'drift_a_lod.glb' },   // gnarled branch (fork)
     { file: 'drift_b.glb', lod: 'drift_b_lod.glb' },   // worn log
     { file: 'drift_c.glb', lod: 'drift_c_lod.glb' },   // forked root chunk
-    { file: 'drift_d.glb', lod: 'drift_d_lod.glb' },   // flat weathered plank
-    { file: 'drift_e.glb', lod: 'drift_e_lod.glb' },   // small twig
   ];
 
   /** Driftwood IS weathered tree wood — so it reuses the SAME bark PBR sets as the palm + beech (KTX2),

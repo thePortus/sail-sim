@@ -289,7 +289,7 @@ const RES: f32 = 24.0;
   let bandMul = 0.45 + 0.55 * beach + 0.6 * upland;
   let dens = (0.004 + 0.085 * smoothstep(0.60, 0.82, clump)) * bandMul * (1.0 - slope * 0.4) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 5.0)) { return; }
+  if (dealtAway(px, pz, 3.0)) { return; }
 
   let r = hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0));
   var base = 0.25 + hash2(vec2f(px * 6.1 + 9.0, pz * 6.1 - 9.0)) * 0.4;
@@ -330,7 +330,7 @@ const RES: f32 = 20.0;
   let clump = fbm2(vec2f(px / 16.0 + 40.0, pz / 16.0 - 22.0));
   let dens = (0.004 + 0.07 * smoothstep(0.60, 0.82, clump)) * (1.0 - slope * 0.4) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 5.0)) { return; }
+  if (dealtAway(px, pz, 3.0)) { return; }
 
   let r = hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0));
   var s = 0.45 + hash2(vec2f(px * 6.1 + 9.0, pz * 6.1 - 9.0)) * 0.25;

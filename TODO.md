@@ -10,6 +10,7 @@
 * long summer day?
 * frigate, galleon, barque, junkå
 * forts and taking towns
+* more tree varieties, flora.... regional/island differences
 * swordfighting, surrender & capture
 * fleets with prize crews to take them over
 * dancing

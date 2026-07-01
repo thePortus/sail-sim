@@ -241,6 +241,8 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_S
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean_surface.wgsl"    OCEAN_SURFACE_WGSL    "${WGSL_GEN_DIR}/ocean_surface_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.wgsl"              SKY_WGSL              "${WGSL_GEN_DIR}/sky_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain.wgsl"          TERRAIN_WGSL          "${WGSL_GEN_DIR}/terrain_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sea_far.wgsl"          SEA_FAR_WGSL          "${WGSL_GEN_DIR}/sea_far_wgsl.h")
 
 # ── UI fonts ─────────────────────────────────────────────────────────────────
 # Two fonts, downloaded at configure time (kept out of git, re-fetchable) and

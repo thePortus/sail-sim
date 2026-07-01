@@ -1228,8 +1228,21 @@ export class SceneService {
 
   // Returns a unit vector pointing FROM the scene origin TOWARD the sun.
   private computeSunDir(): Vector3 {
-    // Smooth sine arc: h=6 sunrise, h=12 noon, h=18 sunset.
-    const elev  = Math.sin(((this.gameHours - 6) / 12) * Math.PI); // -1..1
+    // Long SUMMER day: the sun is up from DAY_START to DAY_END (16 h daylight / 8 h night) on a broad, high
+    // arc, instead of a symmetric 12/12. Elevation is a sine over the (asymmetric) day + night spans, so it's
+    // smooth and CONTINUOUS at sunrise/sunset (both cross the horizon at 0), peaks +1 at midday (~13:00) and
+    // dips −1 in the middle of the shorter night. Widen/narrow the DAY_START…DAY_END gap to lengthen/shorten
+    // the day. (Golden hour, fog, sky etc. all key off the elevation `dir.y`, so they follow automatically.)
+    const DAY_START = 5.0, DAY_END = 21.0;   // sunrise / sunset hour
+    const gh = this.gameHours;
+    let elev;
+    if (gh >= DAY_START && gh <= DAY_END) {
+      elev = Math.sin(Math.PI * (gh - DAY_START) / (DAY_END - DAY_START));       // 0 → +1 → 0 across the long day
+    } else {
+      const nightLen = 24 - (DAY_END - DAY_START);
+      const nh = gh < DAY_START ? (gh + 24 - DAY_END) : (gh - DAY_END);          // hours since sunset (0..nightLen)
+      elev = -Math.sin(Math.PI * nh / nightLen);                                 // 0 → −1 → 0 across the short night
+    }
     const az    = (this.gameHours / 24) * Math.PI * 2 - Math.PI;   // azimuth
     const horiz = Math.sqrt(Math.max(0, 1 - elev * elev));          // horizontal component
     // World cardinal convention (see models/index.ts, vessel.service): +X = East, -X = West.

@@ -255,15 +255,12 @@ export class HarborService {
     return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
   }
 
-  /** 0 in daylight → 1 after dark (full night 19:00–05:00, ramped across dusk/dawn). Drives the warm
-   *  pier + square pool lights so they glow at night and switch off when the sun would wash them out. */
+  /** 0 in daylight → 1 after dark. Drives the warm pier + square pool lights so they glow at night and switch
+   *  off when the sun would wash them out. Keyed on the SUN'S ELEVATION (not a fixed clock) so it follows the
+   *  actual day length — including the long summer day — instead of a hardcoded symmetric sunrise/sunset. */
   private nightFactor(): number {
-    const t = this.sceneService.gameTime();
-    let nf = 0;
-    if (t < 5 || t >= 19) nf = 1;
-    else if (t < 7) nf = (7 - t) / 2;
-    else if (t > 17) nf = (t - 17) / 2;
-    return Math.max(0, Math.min(1, nf));
+    const y = this.sceneService.getSunDirection().y;      // −1 midnight … +1 noon
+    return Math.max(0, Math.min(1, (0.12 - y) / 0.22));   // sun ≥ +0.12 → 0 (daylight); ≤ −0.10 → 1 (full night)
   }
 
   /** Per-frame: keep the pool light on the nearest pier + dockable town (every frame), and stream

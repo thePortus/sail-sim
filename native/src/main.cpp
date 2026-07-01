@@ -669,7 +669,15 @@ int main(int argc, char** argv) {
   OceanFFT c0(device, queue, 256, 250.0f, 0.0001f, B1);
   OceanFFT c1(device, queue, 256, 17.0f,  B1,      B2);
   OceanFFT c2(device, queue, 256, 5.0f,   B2,      9999.0f);
-  for (OceanFFT* c : { &c0, &c1, &c2 }) { c->initSpectrum(); c->update(0.0f, 1.0f / 60.0f); }
+  for (OceanFFT* c : { &c0, &c1, &c2 }) c->initSpectrum();
+  // Pre-warm the sim: the turbulence/foam field accumulates only ~0.008/frame in the
+  // merger, so it climbs from 0 (which reads as a full-surface whiteout in the foam
+  // term) over a few hundred frames. Advance it here so the FIRST visible frame is at
+  // steady state — foam on the crests, not the whole sea. ~5 s of sim, runs in a blink.
+  for (int i = 0; i < 300; ++i) {
+    float wt = (float)i * (1.0f / 60.0f);
+    for (OceanFFT* c : { &c0, &c1, &c2 }) c->update(wt, 1.0f / 60.0f);
+  }
   c0.sanityCheck();
 
   uint32_t curW = (uint32_t)fbWidth, curH = (uint32_t)fbHeight;

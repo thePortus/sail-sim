@@ -362,3 +362,79 @@ bool OceanFFT::sanityCheck() {
   std::printf("[ocean-fft] displacement sanity: %s\n", nonZero ? "non-zero (waves present)" : "ALL ZERO");
   return nonZero;
 }
+
+// IEEE half -> float, for decoding the rgba16float displacement on the CPU.
+static float halfToFloat(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp  = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) { f = sign; }                       // +/- zero
+    else {                                             // subnormal -> normalize
+      exp = 1;
+      while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+      mant &= 0x3FFu;
+      f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1F) {                            // inf / nan
+    f = sign | 0x7F800000u | (mant << 13);
+  } else {                                             // normal
+    f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float out; std::memcpy(&out, &f, 4); return out;
+}
+
+void OceanFFT::readbackDisplacement() {
+  const size_t bytes = (size_t)_size * _size * 8;   // rgba16float
+  if (!_readback)
+    _readback = makeBuffer(_device, bytes, WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead);
+
+  WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(_device, nullptr);
+  WGPUImageCopyTexture src = {}; src.texture = _displacement; src.aspect = WGPUTextureAspect_All;
+  WGPUImageCopyBuffer dst = {}; dst.buffer = _readback;
+  dst.layout.bytesPerRow = _size * 8; dst.layout.rowsPerImage = _size;
+  WGPUExtent3D ext = { _size, _size, 1 };
+  wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+  WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+  wgpuQueueSubmit(_queue, 1, &cmd);
+  wgpuCommandBufferRelease(cmd);
+  wgpuCommandEncoderRelease(enc);
+
+  struct S { bool done; } st{ false };
+  wgpuBufferMapAsync(_readback, WGPUMapMode_Read, 0, bytes,
+    [](WGPUBufferMapAsyncStatus, void* ud) { ((S*)ud)->done = true; }, &st);
+  while (!st.done) {
+#if defined(WEBGPU_BACKEND_WGPU)
+    wgpuDevicePoll(_device, true, nullptr);
+#endif
+  }
+  const uint16_t* p = (const uint16_t*)wgpuBufferGetConstMappedRange(_readback, 0, bytes);
+  const size_t n = (size_t)_size * _size * 4;
+  if (_dispCPU.size() != n) _dispCPU.resize(n);
+  for (size_t i = 0; i < n; ++i) _dispCPU[i] = halfToFloat(p[i]);
+  wgpuBufferUnmap(_readback);
+}
+
+void OceanFFT::sampleDisplacement(float worldX, float worldZ, float& dx, float& dy, float& dz) const {
+  dx = dy = dz = 0.0f;
+  if (_dispCPU.empty()) return;
+  const int S = (int)_size;
+  // World -> tile UV (the tile repeats), then to a texel-centre coordinate.
+  float u = worldX / _lengthScale, v = worldZ / _lengthScale;
+  u -= std::floor(u); v -= std::floor(v);
+  float fx = u * S - 0.5f, fz = v * S - 0.5f;
+  int x0 = (int)std::floor(fx), z0 = (int)std::floor(fz);
+  float tx = fx - (float)x0, tz = fz - (float)z0;
+  auto texel = [&](int x, int z, int c) -> float {
+    x = ((x % S) + S) % S; z = ((z % S) + S) % S;     // wrap (tile is periodic)
+    return _dispCPU[((size_t)z * S + x) * 4 + (size_t)c];
+  };
+  float out[3];
+  for (int c = 0; c < 3; ++c) {
+    float a = texel(x0, z0, c)     * (1.0f - tx) + texel(x0 + 1, z0, c)     * tx;
+    float b = texel(x0, z0 + 1, c) * (1.0f - tx) + texel(x0 + 1, z0 + 1, c) * tx;
+    out[c] = a * (1.0f - tz) + b * tz;
+  }
+  dx = out[0]; dy = out[1]; dz = out[2];
+}

@@ -18,8 +18,10 @@ to native WebGPU (JONSWAP → conjugate → time evolution → 4× IFFT → merg
 (250/17/5 m) and shaded with the client's ocean-material math (derivative normals, turbulence foam,
 subsurface scatter, Fresnel). A **procedural sky** and a **planar reflection** (mirror-camera RTT of
 sky + ship) complete the water. **Arrow keys / WASD** steer and trim sail; a chase camera follows,
-and the ocean grid follows the ship so it sails freely. The hull rides the analytic Gerstner field
-(`wave.hpp`) as the client does. Screenshots via `SAILSIM_SHOT=out.png`. Windows/D3D12 and the game
+and the ocean grid follows the ship so it sails freely. The hull's heave and tilt are driven by the
+**real FFT surface** — each frame the cascade displacement textures are read back to the CPU and
+sampled at the ship's position (summed cascades for height, central differences for the normal), so
+the ship rides the very waves it's floating in. Screenshots via `SAILSIM_SHOT=out.png`. Windows/D3D12 and the game
 systems (combat, economy, multiplayer, UI) are the road ahead.
 
 ## What this builds

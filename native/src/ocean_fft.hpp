@@ -23,6 +23,12 @@ public:
   // Read a few displacement texels back; true if finite and not all-zero.
   bool sanityCheck();
 
+  // CPU-side buoyancy: copy this cascade's displacement texture back and bilinearly
+  // sample the wave-displacement vector at a world (x,z). readbackDisplacement() must
+  // run after update() each frame it's needed; sampleDisplacement() reads the cache.
+  void readbackDisplacement();
+  void sampleDisplacement(float worldX, float worldZ, float& dx, float& dy, float& dz) const;
+
 private:
   WGPUDevice _device;
   WGPUQueue  _queue;
@@ -54,6 +60,10 @@ private:
 
   // transient bind groups created during a frame; released after submit
   std::vector<WGPUBindGroup> _transient;
+
+  // persistent displacement readback for CPU buoyancy
+  WGPUBuffer _readback = nullptr;
+  std::vector<float> _dispCPU;   // _size*_size*4 floats, decoded from rgba16f
 
   void ifft2d(WGPUComputePassEncoder pass, WGPUTexture input, WGPUTextureView inputView);
   WGPUBindGroup bg(WGPUBindGroupLayout bgl, const std::vector<WGPUBindGroupEntry>& entries);

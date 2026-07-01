@@ -694,9 +694,10 @@ int main(int argc, char** argv) {
   // The merchantman's model-space forward axis is +X, but travel (fwd) is +Z, so
   // yaw the hull by -90° to line the bow up with the direction of sailing.
   const float kBowYaw = -glm::half_pi<float>();
-  // Slow the wave animation: the FFT/Gerstner fields evolve in real seconds, which
-  // reads as a too-fast chop. Scale sim time to a calmer oceanic swell.
-  const float kWaveSpeed = 0.45f;
+  // Scale the wave-sim clock. Real-time (1.0) reads as too-fast chop; too slow (~0.45)
+  // makes tall waves look gelatinous ("jelly") because they move slower than their
+  // steepness implies. 0.6 is the compromise — a calmer swell that still flows.
+  const float kWaveSpeed = 0.6f;
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
@@ -743,22 +744,39 @@ int main(int argc, char** argv) {
     shipX += fwd.x * shipSpeed * dt;
     shipZ += fwd.z * shipSpeed * dt;
 
+    // Advance all cascades, then read their displacement back so buoyancy is driven
+    // by the REAL FFT surface (not the analytic Gerstner field).
+    c0.update(waveT, 1.0f / 60.0f);
+    c1.update(waveT, 1.0f / 60.0f);
+    c2.update(waveT, 1.0f / 60.0f);
+    c0.readbackDisplacement();
+    c1.readbackDisplacement();
+    c2.readbackDisplacement();
+
+    // Water height at a world (x,z) = summed vertical displacement of all cascades.
+    auto fftHeight = [&](float x, float z) {
+      float dx, dy, dz, h = 0.0f;
+      c0.sampleDisplacement(x, z, dx, dy, dz); h += dy;
+      c1.sampleDisplacement(x, z, dx, dy, dz); h += dy;
+      c2.sampleDisplacement(x, z, dx, dy, dz); h += dy;
+      return h;
+    };
+
     // Chase camera: behind + above the ship, looking just ahead of it.
-    float shipY = oceanHeight(shipX, shipZ, waveT);
+    float shipY = fftHeight(shipX, shipZ);
     glm::vec3 shipPos(shipX, shipY, shipZ);
     glm::vec3 eye = shipPos - fwd * 13.0f + glm::vec3(0.0f, 6.0f, 0.0f);
     glm::mat4 viewM = glm::lookAt(eye, shipPos + fwd * 3.0f + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0, 1, 0));
     glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 0.1f, 2000.0f);
     glm::mat4 viewProj = proj * viewM;
 
-    // Advance all cascades.
-    c0.update(waveT, 1.0f / 60.0f);
-    c1.update(waveT, 1.0f / 60.0f);
-    c2.update(waveT, 1.0f / 60.0f);
-
     // Ship world transform (used by BOTH the reflection and main passes): at its
     // sailed position, heave to the wave surface, tilt to its normal, yaw to heading.
-    glm::vec3 up = oceanNormal(shipX, shipZ, waveT);
+    // Surface normal from central differences of the FFT height field (~2 m step).
+    const float e = 2.0f;
+    float hgx = fftHeight(shipX + e, shipZ) - fftHeight(shipX - e, shipZ);
+    float hgz = fftHeight(shipX, shipZ + e) - fftHeight(shipX, shipZ - e);
+    glm::vec3 up = glm::normalize(glm::vec3(-hgx / (2.0f * e), 1.0f, -hgz / (2.0f * e)));
     glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, shipY - draft, shipZ));
     glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
     float axisLen = glm::length(axis);

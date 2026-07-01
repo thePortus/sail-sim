@@ -31,7 +31,7 @@ float Saw(float b, float t) { return S(0., b, t) * S(1., b, t); }
 vec2 DropLayer2(vec2 uv, float t) {
   vec2 UV = uv;
   uv.y += t * 0.75;
-  vec2 a = vec2(6., 1.);
+  vec2 a = vec2(3.2, 1.);   // trailing-drop column density (was 6.) — spaced out so drops don't cluster
   vec2 grid = a * 2.;
   vec2 id = floor(uv * grid);
   float colShift = N(id.x);
@@ -65,7 +65,7 @@ vec2 DropLayer2(vec2 uv, float t) {
 }
 
 float StaticDrops(vec2 uv, float t) {
-  uv *= 40.;
+  uv *= 18.;   // static-drop grid density (was 40.) — much coarser = ~80% fewer, well-spaced speckle drops
   vec2 id = floor(uv);
   uv = fract(uv) - .5;
   vec3 n = N13(id.x * 107.45 + id.y * 3543.654);
@@ -97,7 +97,7 @@ void main(void) {
   // but leaves full pour (rain ≈ 1) unchanged. A fade envelope avoids a pop when the pass attaches near 0.
   float fade = S(0.0, 0.08, rainAmount);
   float rd = pow(rainAmount, 0.55) * (1.0 - 0.2 * rainAmount);
-  float staticDrops = S(-.5, 1.0, rd) * 1.3 * fade;   // *1.3 (was *2.0) keeps the heavy pour de-cluttered
+  float staticDrops = S(-.5, 1.0, rd) * 0.7 * fade;   // *0.7 (was *1.3, orig *2.0) — far fewer speckle drops, de-cluttered
   float layer1 = S(.25, .75, rd) * fade;
   float layer2 = S(.0, .5, rd) * fade;
 

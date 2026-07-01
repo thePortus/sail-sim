@@ -672,6 +672,13 @@ export class VesselService {
       som.shadowColor = new Color3(0, 0, 0);
       som.alpha = 0.62;           // shader outputs (1−shadow)·alpha → this is the shadow darkness (was full-black)
       som.fogEnabled = false;
+      // Depth bias toward the camera so the catcher wins the test over its opaque twin on EVERY orientation. The
+      // +0.03 Y-lift below only separates HORIZONTAL faces (deck); on the VERTICAL bulwark/hull the twin stays
+      // coincident → the catcher z-fights and its shadow darkening STROBES (worst on the bright WHITE paint, where
+      // the flicker is most visible). zOffset (polygon offset, orientation-independent) is what kills the vertical fight.
+      // (Restores the -4 documented in [[crew-deck-shadows]] that had been dropped in favour of the Y-lift-only; the
+      // Y-lift handles the deck, zOffset handles the vertical faces — need BOTH.)
+      som.zOffset = -4;
       this.shadowCatcherMat = som;
     }
     const catcher = (mesh as Mesh).clone(`${mesh.name}_shadowcatch`, mesh.parent as Node, true);

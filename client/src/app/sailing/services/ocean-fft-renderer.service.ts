@@ -92,6 +92,7 @@ export class OceanFFTRenderer {
         return { data: buf, count: n };
       },
       getSunDir: () => this.sceneService.getSunDirection(),
+      getSunOcclusion: () => this.sceneService.getSunOcclusion(),
       getTime: () => performance.now() / 1000 - this._startTime,
       getFishStartle: () => this.oceanService.getFishStartle(),
     });

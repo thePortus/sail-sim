@@ -7,7 +7,7 @@ import {
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
   SceneInstrumentation, EngineInstrumentation,
-  VolumetricLightScatteringPostProcess,
+  VolumetricLightScatteringPostProcess, ColorCurves,
 } from '@babylonjs/core';
 // Register the STANDALONE .ktx/.ktx2 texture loader. Without this, `new Texture('foo.ktx2')` fails (the
 // glTF loader only wires KTX2 for GLB-embedded textures) — which is why the scatter rock/driftwood .ktx2
@@ -259,6 +259,7 @@ export class SceneService {
   private readonly PIPELINE_EPS = 0.02;   // raised from 0.005 — updates every ~2 s during transition
   private _cachedExposure = 1.0;
   private _cachedContrast = 1.10;
+  private _cachedSaturation = 999;   // storm-mood grade: colorCurves.globalSaturation, drained as it storms
   private _cachedBloomW   = 0.40;   // bloomWeight cache (setter fires per-call with no guard)
   private _cachedBloomThreshold = 0.62;
   private _cachedBloomEnabled = true;
@@ -577,7 +578,8 @@ export class SceneService {
     // Per-cascade map resolution is driven by the user's Shadow-quality level (0/1 → 512, 2 → 1024, 3 → 2048) so
     // higher tiers get crisp, non-shimmering deck/crew shadows. Read the saved level at construction.
     const shLevel = (() => { try { return parseInt(localStorage.getItem('shadow-quality') ?? '2', 10); } catch { return 2; } })();
-    const csg = new CascadedShadowGenerator(this.shadowMapSize(shLevel), this.sun);
+    const shadowMapPx = this.shadowMapSize(shLevel);
+    const csg = new CascadedShadowGenerator(shadowMapPx, this.sun);
     csg.numCascades        = 3;                              // render/clear; fine at the
     // NOTE: filteringQuality and sun.shadowEnabled both produce a broken shadow
     // shader on this WebGPU path (scene renders black). Leave filtering at the
@@ -587,8 +589,7 @@ export class SceneService {
     csg.shadowMaxZ         = 200;    // shadows discarded beyond 200 u (was 400): distant
                                      // terrain skips all shadow work, and the 3 cascades
                                      // pack into a tighter range → sharper near shadows.
-    csg.bias               = 0.001;
-    csg.normalBias         = 0.02;
+    this.applyShadowBias(csg, shadowMapPx);   // texel-size-scaled bias — kills the low-res self-shadow acne STROBE
     csg.darkness           = 0.05;   // 0 = fully opaque shadow, 1 = invisible
     csg.transparencyShadow = true;   // sails/flag cloth casts transparent shadows
     // Render the shadow map EVERY frame. (An earlier every-other-frame throttle made
@@ -988,8 +989,25 @@ export class SceneService {
     this.pipeline.imageProcessing.toneMappingType          = 2;     // ACES filmic
     this.pipeline.imageProcessing.vignetteEnabled          = true;
     this.pipeline.imageProcessing.vignetteWeight           = 0.40;   // was 0.60 — lighter; corners read too dark
-    this.pipeline.imageProcessing.contrast                 = 1.10;
+    this.pipeline.imageProcessing.contrast                 = 1.15;
     this.pipeline.imageProcessing.exposure                 = 1.0;
+    // Cinematic COLOR GRADE (beauty pass 1) — a subtle teal-orange filmic look baked into the existing image-
+    // processing shader (NO extra pass, ~free): warm the highlights toward the tropical golden sun, cool the
+    // shadows toward sea/sky teal, and lift overall saturation a touch (the CC0-photoreal assets carry it). Kept
+    // gentle so it grades rather than over-processes. Opt-out `localStorage.ignis_colorgrade='0'`.
+    if (typeof localStorage === 'undefined' || localStorage.getItem('ignis_colorgrade') !== '0') {
+      const cc = new ColorCurves();
+      cc.globalSaturation     = 22;    // richer overall colour (was 12 — read too subtle)
+      cc.highlightsHue        = 42;    // push highlights toward warm gold (sun/sand/sails)
+      cc.highlightsDensity    = 34;    // strength of that warm push (was 18)
+      cc.highlightsSaturation = 14;
+      cc.midtonesSaturation   = 12;
+      cc.shadowsHue           = 220;   // push shadows toward cool teal (sea/sky ambient)
+      cc.shadowsDensity       = 30;    // was 16
+      cc.shadowsSaturation    = 12;
+      this.pipeline.imageProcessing.colorCurves        = cc;
+      this.pipeline.imageProcessing.colorCurvesEnabled = true;
+    }
 
     // FXAA / MSAA — applied LAST so that all the property setters above (each of
     // which triggers an internal _buildPipeline() call in Babylon.js) have already
@@ -1114,6 +1132,13 @@ export class SceneService {
   /** Returns a unit vector pointing FROM the scene origin TOWARD the sun. */
   getSunDirection(): Vector3 { return this.computeSunDir(); }
 
+  /** Sun visibility 0..1 (terrain × cloud occlusion) — the ocean multiplies its reflected sun-GLINT by this so the
+   *  streak vanishes when the sun is behind an island (terrain drives sunOcclusionT → 0) or a thick cloud. The cloud
+   *  transmittance only bottoms out ~0.8 for the heaviest cloud, so a linear use barely dimmed the glint under cloud
+   *  (terrain worked, cloud didn't — user report); CUBE it so thick cloud (0.8³≈0.51) noticeably kills the glint
+   *  while clear sky (1³=1) is a perfect no-op. Ocean-glint only — the god-rays/sun-disc keep the raw sunCloudT. */
+  getSunOcclusion(): number { return this.sunOcclusionT * this.sunCloudT * this.sunCloudT * this.sunCloudT; }
+
   /** The sky's sun colour (hue) for clouds/fog to match, or null. Driven by the day/night curve
    *  (sun.diffuse: warm at the horizon, white at noon). Consumers use it as a HUE (magnitude is
    *  theirs) so they match the sky's temperature. Named "...Atmosphere..." for the cloud/fog
@@ -1211,11 +1236,19 @@ export class SceneService {
     const above   = Math.max(0, h);     // 0..1 above horizon
     const isNight = h < -0.05;
     // Spikes near horizon for sunrise/sunset colour effects
-    const horizon = Math.max(0, 1 - Math.abs(h) / 0.22);
+    // Golden-hour proximity 0..1. WIDTH ±0.32 (longer, more cinematic dawn/dusk). SMOOTHSTEP-eased so the amber/bloom/
+    // exposure fade IN gradually near the edges instead of switching on abruptly — softens the "sudden amber hue" pop
+    // (gentle onset, full drama held near the horizon). Drives everything golden-hour: warm ambient, bloom, exposure,
+    // contrast, sky, fog, god-rays — so they all ramp together coherently.
+    const horizonLin = Math.max(0, 1 - Math.abs(h) / 0.32);
+    const horizon = horizonLin * horizonLin * (3 - 2 * horizonLin);
 
     // ── SkyMaterial ───────────────────────────────────────────────────────────
     this.skyCloudiness += (this.targetSkyCloudiness - this.skyCloudiness) * Math.min(1, dt * 0.35);
     const cloud = this.skyCloudiness;
+    // Storm intensity (0 clear/light → 1 heavy storm). Hoisted here so the STORM-MOOD grade (below) and the fog
+    // (further down) share it. Drives: desaturate + darken + cool the image as the weather turns brooding.
+    const stormDark = Math.max(0, (cloud - 0.45) / 0.45);   // ramps in earlier & faster
 
     // The Preetham SkyMaterial is only driven when the procedural sky is NOT active (i.e. the
     // WebGL fallback). On WebGPU the procedural sky renders and the Preetham dome is disabled.
@@ -1359,10 +1392,10 @@ export class SceneService {
         // Daytime base raised 1.0 → 1.35 to match the reference atmosphere look (its 1.5, minus a
         // little since the sun=π change already brightens). horizon term softened so golden hour
         // doesn't blow out on top of the brighter base.
-        : Math.max(0.6, 1.35 + horizon * 0.22 - cloud * 0.18 - nightBlend * 0.70);
+        : Math.max(0.55, 1.35 + horizon * 0.22 - cloud * 0.18 - stormDark * 0.18 - nightBlend * 0.70);   // storms darken further (brooding)
       const newContrast = isNight
         ? 1.06
-        : Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05);
+        : Math.max(1.0, 1.08 + horizon * 0.12 - cloud * 0.05 + stormDark * 0.12);   // storms gain contrast (moody punch)
       if (Math.abs(newExposure - this._cachedExposure) > this.PIPELINE_EPS) {
         this.pipeline.imageProcessing.exposure = newExposure;
         this._cachedExposure = newExposure;
@@ -1370,6 +1403,18 @@ export class SceneService {
       if (Math.abs(newContrast - this._cachedContrast) > this.PIPELINE_EPS) {
         this.pipeline.imageProcessing.contrast = newContrast;
         this._cachedContrast = newContrast;
+      }
+      // STORM MOOD: drain the colour as the weather turns brooding. The golden grade sits at +22 global saturation
+      // in clear weather; a full storm pulls it down to ~−12 (steely, near-monochrome). Throttled with a coarse
+      // step (rebuilding the colour-curve LUT isn't free) — the storm ramps over seconds, so ~1-unit steps are ample.
+      const cc = this.pipeline.imageProcessing.colorCurves;
+      if (cc && this.pipeline.imageProcessing.colorCurvesEnabled) {
+        const newSat = 22 - stormDark * 34;
+        if (Math.abs(newSat - this._cachedSaturation) > 1.0) {
+          cc.globalSaturation = newSat;
+          this.pipeline.imageProcessing.colorCurves = cc;   // reassign so the pipeline recomputes the LUT
+          this._cachedSaturation = newSat;
+        }
       }
     }
 
@@ -1385,10 +1430,13 @@ export class SceneService {
     // mid-afternoon; the horizon ramp (sunUp) keeps it 0 below the horizon (no night floor leak).
     const sunUp = Math.max(0, Math.min(1, above / 0.18));
     this.sun.intensity = sunUp * (0.85 + 0.95 * sunUp) * (1 - cloud * 0.55);   // peak ~1.80 (was ~1.25)
+    // MOOD (beauty pass 2): the sun is a WARM key — golden at the horizon, warm DAYLIGHT (not sterile pure white)
+    // at noon. Held the blue back (~0.82 at noon vs the old 0.95) so midday sunlight reads ~4800K natural-warm; the
+    // cool ambient fill below is the complement → dimensional warm-key/cool-shadow lighting. (was g .28+.67, b .05+.90)
     this.sun.diffuse   = new Color3(
       1.0,
-      Math.min(1, 0.28 + above * 0.67),   // warm orange at horizon → white at noon
-      Math.min(1, 0.05 + above * 0.90),   // nearly no blue near horizon
+      Math.min(1, 0.22 + above * 0.71),   // DEEP AMBER at the horizon (golden hour) → warm daylight (~0.93) at noon (was .30+.63)
+      Math.min(1, 0.04 + above * 0.78),   // near-zero blue at the horizon (rich amber) → ~0.82 at noon (was .06+.76)
     );
     this.sun.specular = this.sun.diffuse;
 
@@ -1411,10 +1459,10 @@ export class SceneService {
     // Lerp between standard daylight ambient and warm golden-hour tones.
     const dayAmbient  = isNight
       ? new Color3(0.30, 0.38, 0.52)   // brighter blue — was (0.20, 0.25, 0.35)
-      : new Color3(0.52 + above * 0.38, 0.58 + above * 0.32, 0.84 + above * 0.16);
-    const warmAmbient = new Color3(1.0, 0.68, 0.30);
+      : new Color3(0.44 + above * 0.34, 0.56 + above * 0.32, 0.86 + above * 0.16);   // MOOD: cooler blue fill (~0.78,0.88,1.0 noon) so shadows read cool vs the warm sun (was .52+.38, .58+.32, .84+.16)
+    const warmAmbient = new Color3(1.0, 0.58, 0.22);   // DEEPER amber golden-hour fill for drama (was 1.0,0.68,0.30)
     // Restrict warm amber fill to daytime golden hour only.
-    const warmMix = h > 0 ? horizon * 0.60 : 0;
+    const warmMix = h > 0 ? horizon * 0.85 : 0;   // STRONGER blend toward the warm amber fill at golden hour (was 0.60)
     this.ambient.diffuse     = Color3.Lerp(dayAmbient, warmAmbient, warmMix);
     this.ambient.groundColor = isNight
       ? new Color3(0.09, 0.12, 0.22)   // was (0.05, 0.07, 0.14) — raised for visibility
@@ -1445,7 +1493,7 @@ export class SceneService {
     // Daytime overcast: bright grey under light cloud, but a thick storm (cloud
     // near 1) should read DARK and moody — otherwise the fog washes distant
     // islands brighter than the storm sky behind them.
-    const stormDark = Math.max(0, (cloud - 0.45) / 0.45);   // ramps in earlier & faster
+    // (stormDark hoisted up near `cloud` so the image-processing grade can share it)
     const overcastDay = Color3.Lerp(
       new Color3(0.58, 0.63, 0.70),   // light overcast: bright grey
       new Color3(0.19, 0.22, 0.27),   // full storm: dark, matches the moody sky
@@ -1483,6 +1531,16 @@ export class SceneService {
 
     this.scene.fogColor   = fog;
     this.scene.clearColor = new Color4(fog.r * 0.20, fog.g * 0.20, fog.b * 0.30, 1);
+    // STORM FOG: thicken the (already overcast-tinted) fog as the weather turns heavy so the horizon closes in and
+    // the rain reads as a real squall — but MODERATE ("not too much"): base × up to 3× only at a full storm. Fog
+    // density was previously static (0.000035); this is the only per-frame driver. EXP2 → still gentle at clear.
+    // ── ATMOSPHERE (beauty pass 3): layered fog density for depth ──────────────────────────────────────────────
+    //  • base AERIAL PERSPECTIVE (0.00005, up from 0.000035) — distant islands fade into atmosphere for depth/scale,
+    //    while near objects stay crisp (EXP2 short-range falloff). The fog COLOUR already hue-matches the sky.
+    //  • GOLDEN-HOUR MIST (+horizon·0.00004) — a touch more haze at dawn/dusk so the warm low sun reads as a glowy,
+    //    misty horizon (horizon is smoothstep-eased, so it ramps in gently with the rest of golden hour).
+    //  • STORM (+stormDark·0.00022) — heavy weather closes the horizon in (additive, was the ×3 no-op).
+    this.scene.fogDensity = 0.00005 + horizon * 0.00004 + stormDark * 0.00022;
   }
 
   /**
@@ -1493,7 +1551,11 @@ export class SceneService {
    */
   private marchTerrainBlock(dir: Vector3): boolean {
     if (!this.camera || !this.terrainHeightSampler) return false;
-    if (dir.y < 0.02) return false;                 // pointing at/below horizon → nothing above
+    if (dir.y < 0.002) return false;                // only bail when the sun is essentially ON/below the horizon.
+    // (Was 0.02 — that skipped the raymarch whenever the sun was within ~1° of the horizon, i.e. EXACTLY when it
+    //  sits behind a horizon mountain; the near-flat ray then never got a chance to hit the peak, so the sun stayed
+    //  "unoccluded" and its reflection kept blazing on the water. The ray only rises ~cam.y+dir.y·d, so a low sun
+    //  marches along near the surface and correctly catches an island between the camera and the sun.)
 
     const cam = this.camera.position;
     const MAX_DIST   = 30_000;   // how far to look for blocking terrain
@@ -1764,11 +1826,22 @@ export class SceneService {
     return level <= 1 ? 512 : level === 2 ? 1024 : 2048;
   }
 
+  /** Shadow bias scaled to TEXEL size. A lower-res map has coarser texels → more depth-quantisation error → the
+   *  deck shadows show self-shadow ACNE that STROBES (the map re-renders every frame with the animated crew/ship,
+   *  flipping the acne on/off). The 0.001/0.02 values are tuned for 2048 (scale 1); 1024→2×, 512→4× — so every
+   *  tier is acne-free without forcing High (which costs GPU). Confirmed: at 2048 there was no strobe, 1024/512 had it. */
+  private applyShadowBias(csg: CascadedShadowGenerator, mapSize: number): void {
+    const s = 2048 / Math.max(1, mapSize);
+    csg.bias = 0.001 * s;
+    csg.normalBias = 0.02 * s;
+  }
+
   setShadowMapQuality(level: number): void {
     if (!this.shadowGenerator) return;
     const csg = this.shadowGenerator as CascadedShadowGenerator;
     const size = this.shadowMapSize(level);
     if (csg.mapSize !== size) { try { csg.mapSize = size; } catch { /* resize unsupported mid-frame — applies on next reload */ } }
+    this.applyShadowBias(csg, size);   // re-scale bias to the new texel size (else lower tiers strobe with acne)
     // Do NOT toggle sun.shadowEnabled — flipping it recompiles every receiver shader
     // and blanks the scene on WebGPU. Vary only cascade count + refresh rate, which
     // recompile to a valid shadow shader and render fine. Level 0 = cheapest (1

@@ -533,6 +533,10 @@ export class CrewHandle {
       if (sg) {
         for (const me of glbRoot.getChildMeshes(false)) {
           if (!/Crew|base|Shirt|Breeches|Boots|Coat|Vest|Cap|Tricorn|Bandana/i.test(me.name)) continue;
+          // Never frustum-cull the caster: a SKINNED mesh's stored (rest-pose) bounding box doesn't track the
+          // animated vertices, so the shadow-map render culls it on some frames → the crew's shadow BLINKS on/off.
+          // These crew are always on the player's near deck, so always-active is free and keeps the shadow stable.
+          me.alwaysSelectAsActiveMesh = true;
           sg.addShadowCaster(me, true); this.shadowCasters.push(me);
         }
       }

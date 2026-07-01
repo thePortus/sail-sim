@@ -123,14 +123,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glfw3webgpu)
 
-# Embed the WGSL as a C header at configure time — single source of truth is the
-# .wgsl file (itself a verbatim copy of the client shader). Uses a raw string
-# literal so no escaping is needed; reconfigure after editing the .wgsl.
+# Embed each WGSL file as a C header at configure time — single source of truth
+# is the .wgsl file. Uses a raw string literal so no escaping is needed;
+# reconfigure after editing a .wgsl.
 set(WGSL_GEN_DIR "${CMAKE_BINARY_DIR}/gen")
 file(MAKE_DIRECTORY "${WGSL_GEN_DIR}")
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL_SRC)
-file(WRITE "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h"
-  "#pragma once\ninline const char* INITIAL_SPECTRUM_WGSL = R\"WGSL(\n${INITIAL_SPECTRUM_WGSL_SRC})WGSL\";\n")
+function(embed_wgsl SRC VARNAME OUT)
+  file(READ "${SRC}" _wgsl_src)
+  file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
+endfunction()
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.wgsl"         TRIANGLE_WGSL         "${WGSL_GEN_DIR}/triangle_wgsl.h")
 
 add_executable(sailsim_native
   src/main.cpp

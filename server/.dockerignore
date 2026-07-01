@@ -1,1 +1,18 @@
 node_modules
+
+# Generated assets — mirror .gitignore. These are baked by the RUNTIME pipeline (docker exec … npm run
+# terrain / download:terrain-tiles / build:biome) and now live on the ./server/assets bind mount, so there is
+# no reason to COPY them into the image (they'd bloat it by hundreds of MB and be shadowed by the mount at
+# runtime anyway). Committed assets (geometry/, music/, maps/) are deliberately NOT excluded, so the image
+# still has the fleet + audio + base maps even if it's ever run WITHOUT the bind mount. Paths are relative to
+# the server/ build context.
+assets/terrain/
+assets/geometry/terrain/biome/
+assets/maps/sources/
+assets/sky/
+assets/geometry/scatter/cc0/
+assets/scatter-src/
+assets/ship-wood-src/
+
+# Editor/OS cruft
+**/.DS_Store

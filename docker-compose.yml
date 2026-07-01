@@ -22,6 +22,15 @@ services:
     restart: unless-stopped
     ports:
       - 9080:8080
+    volumes:
+      # Persist the generated assets across `docker compose down`/rebuilds. server/assets holds BOTH committed
+      # files (geometry/, music/, maps/) AND the expensive gitignored generated ones (terrain tiles, biome KTX2,
+      # baked navgrids, sky textures, *-src/) that the runtime pipeline (`docker exec … npm run terrain` etc.)
+      # writes. Without this they live only in the container's writable layer and are lost on every teardown,
+      # forcing a full re-bake. Bind-mounting the host repo dir makes it the single source of truth: the
+      # container sees whatever is already generated on the host, and new bakes persist back to the host.
+      # (Safe to overlay — the Dockerfile builds NO assets at image-build time; they're all runtime-generated.)
+      - ./server/assets:/server/assets
     environment:
       - DB_HOST=mysqldb
       - DB_USER=root

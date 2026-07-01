@@ -30,9 +30,9 @@ MeshData loadGltfMesh(const char* path) {
     return out;
   }
 
-  // Decode each KTX2 base-colour texture once, deduped by cgltf pointer.
+  // Decode each KTX2 texture once, deduped by cgltf pointer.
   std::vector<const cgltf_texture*> texPtrs;
-  auto getTexIndex = [&](const cgltf_texture* tex) -> int {
+  auto getTexIndex = [&](const cgltf_texture* tex, bool srgb) -> int {
     if (!tex) return -1;
     for (size_t i = 0; i < texPtrs.size(); ++i)
       if (texPtrs[i] == tex) return (int)i;
@@ -41,6 +41,7 @@ MeshData loadGltfMesh(const char* path) {
     const cgltf_buffer_view* bv = img->buffer_view;
     const uint8_t* bytes = (const uint8_t*)bv->buffer->data + bv->offset;
     TextureData td;
+    td.srgb = srgb;
     if (!decodeKtx2ToRGBA(bytes, bv->size, td.width, td.height, td.rgba)) return -1;
     out.textures.push_back(std::move(td));
     texPtrs.push_back(tex);
@@ -64,18 +65,22 @@ MeshData loadGltfMesh(const char* path) {
       }
       if (!pos) continue;
 
-      // Per-primitive material: base colour + metallic/roughness factors + base-colour texture.
+      // Per-primitive material: factors + base-colour / normal / metallic-roughness maps.
       float albedo[3] = { 0.8f, 0.8f, 0.8f };
       float metallic = 0.0f, roughness = 0.7f;
-      int textureIndex = -1;
-      if (prim.material && prim.material->has_pbr_metallic_roughness) {
-        const cgltf_pbr_metallic_roughness& mr = prim.material->pbr_metallic_roughness;
-        albedo[0] = mr.base_color_factor[0];
-        albedo[1] = mr.base_color_factor[1];
-        albedo[2] = mr.base_color_factor[2];
-        metallic = mr.metallic_factor;
-        roughness = mr.roughness_factor;
-        textureIndex = getTexIndex(mr.base_color_texture.texture);
+      int baseColorTex = -1, normalTex = -1, metalRoughTex = -1;
+      if (prim.material) {
+        if (prim.material->has_pbr_metallic_roughness) {
+          const cgltf_pbr_metallic_roughness& mr = prim.material->pbr_metallic_roughness;
+          albedo[0] = mr.base_color_factor[0];
+          albedo[1] = mr.base_color_factor[1];
+          albedo[2] = mr.base_color_factor[2];
+          metallic = mr.metallic_factor;
+          roughness = mr.roughness_factor;
+          baseColorTex  = getTexIndex(mr.base_color_texture.texture, true);
+          metalRoughTex = getTexIndex(mr.metallic_roughness_texture.texture, false);
+        }
+        normalTex = getTexIndex(prim.material->normal_texture.texture, false);
       }
 
       const cgltf_size base = out.vertices.size() / kFloatsPerVertex;
@@ -104,7 +109,8 @@ MeshData loadGltfMesh(const char* path) {
         for (cgltf_size i = 0; i < vcount; ++i)
           out.indices.push_back((uint32_t)(base + i));
       }
-      out.submeshes.push_back({ indexOffset, (uint32_t)out.indices.size() - indexOffset, textureIndex });
+      out.submeshes.push_back({ indexOffset, (uint32_t)out.indices.size() - indexOffset,
+                                baseColorTex, normalTex, metalRoughTex });
     }
   }
 
@@ -144,7 +150,7 @@ MeshData makeCubeMesh() {
     uint32_t quad[6] = { b, b + 1, b + 2, b, b + 2, b + 3 };
     m.indices.insert(m.indices.end(), quad, quad + 6);
   }
-  m.submeshes.push_back({ 0, (uint32_t)m.indices.size(), -1 });   // no texture
+  m.submeshes.push_back({ 0, (uint32_t)m.indices.size(), -1, -1, -1 });   // untextured
   m.bbMin[0] = m.bbMin[1] = m.bbMin[2] = -0.5f;
   m.bbMax[0] = m.bbMax[1] = m.bbMax[2] =  0.5f;
   m.ok = true;

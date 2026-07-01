@@ -1,7 +1,6 @@
-// Phase 1: metallic-roughness PBR (Cook-Torrance) with one directional light.
-// Per-vertex material (albedo + metallic + roughness) comes from the glTF
-// material factors, so a multi-material model shows its distinct surfaces. Image
-// textures modulate these next.
+// Phase 1: textured metallic-roughness PBR. Base-colour, normal, and
+// metallic-roughness maps come from the glTF material (KTX2). Tangent frame is
+// derived from screen-space derivatives (no TANGENT attribute needed).
 
 struct Uniforms {
     mvp   : mat4x4<f32>,
@@ -10,14 +9,16 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
-@group(0) @binding(2) var baseColorSamp : sampler;
+@group(0) @binding(2) var normalTex     : texture_2d<f32>;
+@group(0) @binding(3) var metalRoughTex : texture_2d<f32>;
+@group(0) @binding(4) var texSamp       : sampler;
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
     @location(0)       worldPos : vec3<f32>,
     @location(1)       normal   : vec3<f32>,
     @location(2)       albedo   : vec3<f32>,
-    @location(3)       mr       : vec2<f32>,   // metallic, roughness
+    @location(3)       mr       : vec2<f32>,   // metallic, roughness factors
     @location(4)       uv       : vec2<f32>,
 };
 
@@ -38,6 +39,21 @@ fn vs_main(@location(0) inPos    : vec3<f32>,
 }
 
 const PI : f32 = 3.14159265359;
+
+// Cotangent frame from screen-space derivatives (Christian Schüler). Perturbs the
+// geometric normal N by a tangent-space normal-map sample without vertex tangents.
+fn perturbNormal(N : vec3<f32>, worldPos : vec3<f32>, uv : vec2<f32>, texN : vec3<f32>) -> vec3<f32> {
+    let dp1 = dpdx(worldPos);
+    let dp2 = dpdy(worldPos);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, N);
+    let dp1perp = cross(N, dp1);
+    let T = dp2perp * duv1.x + dp1perp * duv2.x;
+    let B = dp2perp * duv1.y + dp1perp * duv2.y;
+    let invmax = inverseSqrt(max(dot(T, T), dot(B, B)));
+    return normalize(mat3x3<f32>(T * invmax, B * invmax, N) * texN);
+}
 
 fn distributionGGX(N : vec3<f32>, H : vec3<f32>, rough : f32) -> f32 {
     let a = rough * rough;
@@ -64,18 +80,21 @@ fn fresnelSchlick(cosT : f32, F0 : vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(baseColorTex, baseColorSamp, in.uv);
-    let albedo = in.albedo * texel.rgb;     // material factor × base-colour map
-    let metallic = clamp(in.mr.x, 0.0, 1.0);
-    let roughness = clamp(in.mr.y, 0.05, 1.0);
+    let albedo = in.albedo * textureSample(baseColorTex, texSamp, in.uv).rgb;
+    let mrTex = textureSample(metalRoughTex, texSamp, in.uv);   // glTF: G=rough, B=metal
+    let metallic = clamp(in.mr.x * mrTex.b, 0.0, 1.0);
+    let roughness = clamp(in.mr.y * mrTex.g, 0.05, 1.0);
 
-    let N = normalize(in.normal);
+    let Ngeom = normalize(in.normal);
+    let texN = normalize(textureSample(normalTex, texSamp, in.uv).xyz * 2.0 - vec3<f32>(1.0));
+    let N = perturbNormal(Ngeom, in.worldPos, in.uv, texN);
+
     let V = normalize(u.eye.xyz - in.worldPos);
     let L = normalize(vec3<f32>(0.5, 1.0, 0.4));   // sun
     let H = normalize(V + L);
 
     let F0 = mix(vec3<f32>(0.04), albedo, metallic);
-    let radiance = vec3<f32>(3.0);                 // sun intensity
+    let radiance = vec3<f32>(3.0);
 
     let NDF = distributionGGX(N, H, roughness);
     let G = geometrySmith(N, V, L, roughness);

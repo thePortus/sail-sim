@@ -97,10 +97,9 @@ struct Mesh {
   WGPUBuffer                   vbuf, ibuf, uniformBuf;
   WGPUShaderModule             module;
   WGPUSampler                  sampler;
-  std::vector<WGPUTexture>     textures;     // real textures, then a 1x1 white fallback
+  std::vector<WGPUTexture>     textures;     // decoded maps + 1x1 white + flat-normal defaults
   std::vector<WGPUTextureView> views;        // aligned with textures
-  std::vector<WGPUBindGroup>   bindGroups;   // aligned with views
-  int                          whiteIndex = 0;
+  std::vector<WGPUBindGroup>   bindGroups;   // one per submesh
   std::vector<Submesh>         submeshes;
 };
 
@@ -131,17 +130,19 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   smd.nextInChain = &wgsl.chain;
   mesh.module = wgpuDeviceCreateShaderModule(device, &smd);
 
-  // bind group layout: uniform (b0), base-colour texture (b1), sampler (b2)
-  WGPUBindGroupLayoutEntry ble[3] = {};
+  // bind group layout: uniform (b0), base/normal/metal-rough textures (b1-3), sampler (b4)
+  WGPUBindGroupLayoutEntry ble[5] = {};
   ble[0].binding = 0; ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   ble[0].buffer.type = WGPUBufferBindingType_Uniform;
-  ble[1].binding = 1; ble[1].visibility = WGPUShaderStage_Fragment;
-  ble[1].texture.sampleType = WGPUTextureSampleType_Float;
-  ble[1].texture.viewDimension = WGPUTextureViewDimension_2D;
-  ble[2].binding = 2; ble[2].visibility = WGPUShaderStage_Fragment;
-  ble[2].sampler.type = WGPUSamplerBindingType_Filtering;
+  for (int i = 1; i <= 3; ++i) {
+    ble[i].binding = (uint32_t)i; ble[i].visibility = WGPUShaderStage_Fragment;
+    ble[i].texture.sampleType = WGPUTextureSampleType_Float;
+    ble[i].texture.viewDimension = WGPUTextureViewDimension_2D;
+  }
+  ble[4].binding = 4; ble[4].visibility = WGPUShaderStage_Fragment;
+  ble[4].sampler.type = WGPUSamplerBindingType_Filtering;
   WGPUBindGroupLayoutDescriptor bgld = {};
-  bgld.entryCount = 3; bgld.entries = ble;
+  bgld.entryCount = 5; bgld.entries = ble;
   WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
 
   WGPUPipelineLayoutDescriptor pld = {};
@@ -203,13 +204,14 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   sd.lodMinClamp = 0.0f; sd.lodMaxClamp = 1.0f; sd.maxAnisotropy = 1;
   mesh.sampler = wgpuDeviceCreateSampler(device, &sd);
 
-  // upload decoded base-colour textures (sRGB), then a 1x1 white fallback
-  auto uploadTexture = [&](uint32_t w, uint32_t h, const uint8_t* rgba) {
+  // Upload decoded textures (sRGB for base colour, linear for normal/metal-rough),
+  // then two neutral defaults: white and a flat (0,0,1) normal.
+  auto uploadTexture = [&](uint32_t w, uint32_t h, const uint8_t* rgba, bool srgb) {
     WGPUTextureDescriptor td = {};
     td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
     td.dimension = WGPUTextureDimension_2D;
     td.size = { w, h, 1 };
-    td.format = WGPUTextureFormat_RGBA8UnormSrgb;
+    td.format = srgb ? WGPUTextureFormat_RGBA8UnormSrgb : WGPUTextureFormat_RGBA8Unorm;
     td.mipLevelCount = 1; td.sampleCount = 1;
     WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
     WGPUImageCopyTexture dst = {}; dst.texture = tex; dst.aspect = WGPUTextureAspect_All;
@@ -218,20 +220,28 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     wgpuQueueWriteTexture(queue, &dst, rgba, (size_t)w * h * 4, &layout, &ext);
     mesh.textures.push_back(tex);
     mesh.views.push_back(wgpuTextureCreateView(tex, nullptr));
+    return (int)mesh.views.size() - 1;
   };
-  for (const TextureData& t : data.textures) uploadTexture((uint32_t)t.width, (uint32_t)t.height, t.rgba.data());
-  const uint8_t white[4] = { 255, 255, 255, 255 };
-  mesh.whiteIndex = (int)mesh.views.size();
-  uploadTexture(1, 1, white);
+  for (const TextureData& t : data.textures)
+    uploadTexture((uint32_t)t.width, (uint32_t)t.height, t.rgba.data(), t.srgb);
+  const uint8_t white[4]      = { 255, 255, 255, 255 };
+  const uint8_t flatNormal[4] = { 128, 128, 255, 255 };   // tangent-space (0,0,1)
+  const int whiteIndex      = uploadTexture(1, 1, white, false);
+  const int flatNormalIndex = uploadTexture(1, 1, flatNormal, false);
 
-  // one bind group per texture view (uniform + view + shared sampler)
-  for (WGPUTextureView view : mesh.views) {
-    WGPUBindGroupEntry bge[3] = {};
+  // One bind group per submesh: uniform + its base/normal/metal-rough views (or defaults).
+  for (const Submesh& sm : mesh.submeshes) {
+    WGPUTextureView baseView   = mesh.views[sm.baseColor  >= 0 ? sm.baseColor  : whiteIndex];
+    WGPUTextureView normalView = mesh.views[sm.normal     >= 0 ? sm.normal     : flatNormalIndex];
+    WGPUTextureView mrView     = mesh.views[sm.metalRough >= 0 ? sm.metalRough : whiteIndex];
+    WGPUBindGroupEntry bge[5] = {};
     bge[0].binding = 0; bge[0].buffer = mesh.uniformBuf; bge[0].size = sizeof(MeshUniforms);
-    bge[1].binding = 1; bge[1].textureView = view;
-    bge[2].binding = 2; bge[2].sampler = mesh.sampler;
+    bge[1].binding = 1; bge[1].textureView = baseView;
+    bge[2].binding = 2; bge[2].textureView = normalView;
+    bge[3].binding = 3; bge[3].textureView = mrView;
+    bge[4].binding = 4; bge[4].sampler = mesh.sampler;
     WGPUBindGroupDescriptor bgd = {};
-    bgd.layout = bgl; bgd.entryCount = 3; bgd.entries = bge;
+    bgd.layout = bgl; bgd.entryCount = 5; bgd.entries = bge;
     mesh.bindGroups.push_back(wgpuDeviceCreateBindGroup(device, &bgd));
   }
 
@@ -458,9 +468,9 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderSetPipeline(pass, mesh.pipeline);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, mesh.vbuf, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderSetIndexBuffer(pass, mesh.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-    for (const Submesh& sm : mesh.submeshes) {
-      int ti = (sm.textureIndex >= 0) ? sm.textureIndex : mesh.whiteIndex;
-      wgpuRenderPassEncoderSetBindGroup(pass, 0, mesh.bindGroups[ti], 0, nullptr);
+    for (size_t i = 0; i < mesh.submeshes.size(); ++i) {
+      const Submesh& sm = mesh.submeshes[i];
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, mesh.bindGroups[i], 0, nullptr);
       wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
     }
     wgpuRenderPassEncoderEnd(pass);

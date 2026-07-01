@@ -11,7 +11,7 @@ draws it spinning, depth-tested, with **metallic-roughness Cook-Torrance shading
 uniform, per-material texture bind groups, depth buffer, resize handling, model auto-centre/scale;
 **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
 (matches a CPU oracle to ~4e-6). Verified on Metal (Apple M3 Pro): the 90k-vertex merchantman renders
-with its 7 textures across 39 submeshes. Normal/ORM maps and Windows/D3D12 are next.
+with its base-colour, normal, and metallic-roughness maps (14 textures) across 39 submeshes. Windows/D3D12 and rendering the ship on the ocean are next.
 
 ## What this builds
 
@@ -124,11 +124,11 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
    with directional shading. Verified from a 70-vert rock to the 90k-vert merchantman.
 5. ~~PBR materials + shading.~~ **Done** — `mesh.wgsl` does metallic-roughness Cook-Torrance; the
    loader reads per-primitive base-colour/metallic/roughness factors (per-vertex).
-6. ~~Base-colour KTX2 textures.~~ **Done** — `src/ktx2.*` (Basis transcoder) decodes the
-   `KHR_texture_basisu` maps; the loader splits per-material submeshes with per-texture bind groups.
-7. **Normal + ORM maps.** Same extraction path for the normal and occlusion-roughness-metallic
-   textures; feed them into the PBR fragment (tangent-space normals, per-texel metallic/roughness).
-   Then one ship on the ocean surface — tie the render path to the FFT work. §7.
+6. ~~KTX2 textures (base-colour, normal, metallic-roughness).~~ **Done** — `src/ktx2.*` (Basis
+   transcoder) decodes all three map types; the fragment does tangent-space normal mapping (frame
+   from screen-space derivatives, no TANGENT needed) and per-texel metallic/roughness.
+7. **Ship on the ocean.** Tie the mesh renderer to the FFT work — render the ocean surface and float
+   the ship on it. The "it's becoming the game" moment. §7.
 8. **Rest of the FFT chain (Phase 2).** Port `CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, the butterfly
    `FFT_*` passes and `WAVES_MERGER` on top of the readback harness already in `src/fft_test.cpp`.
 

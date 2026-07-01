@@ -22,21 +22,17 @@ const IDLE_BOB       = 0.013;  // m vertical breathing bob
 // (Track A's IK will later modulate hands toward the 'Grip' morph at rope/cannon stations.)
 const HAND_RELAX = 0.8;
 // Locomotion (P2): scale the Walk clip's playback to the actual ground speed so the FEET PLANT instead of
-// skating. STRIDE_SCALE matches the clip's authored stride to walk_speed_mps — tune live via
-// localStorage.ignis_crew_stride if a footskate remains. TURN_SLOW slows forward progress while turning sharply
-// so they rotate INTO a corner rather than sliding through it.
-const STRIDE_SCALE = (() => {
-  try { const v = parseFloat(localStorage.getItem('ignis_crew_stride') || ''); return Number.isFinite(v) && v > 0 ? v : 1.0; }
-  catch { return 1.0; }
-})();
+// skating. STRIDE_SCALE matches the clip's authored stride to walk_speed_mps — calibrated to 1.0 (no footskate).
+// TURN_SLOW slows forward progress while turning sharply so they rotate INTO a corner rather than sliding through it.
+const STRIDE_SCALE = 1.0;
 // Life + combat sync (P3).
 const WORK_BURST_DUR  = 2.6;   // s a gun crew breaks into a loading/heave motion after their broadside fires
 const WORK_BURST_GAIN = 1.1;   // peak extra work-clip speed (×) at the moment of firing
 const GUN_LOAD_CLIP   = 'Work_Cannon';   // the heave/run-out clip a gun crew plays while reloading after a shot
 // The haul clip pulls ~51° to the character's RIGHT (measured: hands go more lateral than forward), so a gun crew
 // facing their gun would heave toward the bow. While loading, yaw the body by this so the diagonal pull lines up
-// with the gun. Tunable (degrees) via localStorage.ignis_crew_load_yaw.
-const LOAD_YAW_OFFSET = (() => { try { const v = parseFloat(localStorage.getItem('ignis_crew_load_yaw') || ''); return ((Number.isFinite(v) ? v : -51) * Math.PI) / 180; } catch { return (-51 * Math.PI) / 180; } })();
+// with the gun. Calibrated to -51° (measured from the clip).
+const LOAD_YAW_OFFSET = (-51 * Math.PI) / 180;
 const GLANCE_CHANCE   = 0.02;  // per-second chance a stationed crew breaks off to glance about
 // Cross-fade between clips (P3.2): instead of hard-cutting one clip to the next (which snaps mid-pose when a
 // member changes activity — walk→work, work→glance, sit→stand), ramp the outgoing clip's weight down while the
@@ -70,61 +66,53 @@ const FLEE_SPEED_MUL  = 1.8;   // ×walk speed while fleeing (a frantic scramble
 // (UpperArm→Forearm→Hand) plants each Hand on a grip point in front of the station, and the GLB's `Grip` shape
 // key closes the fingers (fading the idle `Relaxed` curl). PLAYER-DECK ONLY: gated to crew near the camera
 // (which only the player's own ship ever is) — remote/NPC crew keep the canned clips, so the cost stays tiny.
-// Opt-out `localStorage.ignis_crew_ik='0'`; the geometry knobs below are all live-tunable for one calibration pass.
+// Master opt-out `localStorage.ignis_crew_ik='0'` (the one surviving user knob — the per-station toggles and
+// geometry values below are calibrated and baked). Turning this off falls back to the canned Mixamo work clips.
 const IK_ENABLED   = (() => { try { return (localStorage.getItem('ignis_crew_ik') ?? '1') !== '0'; } catch { return true; } })();
-// ARM-GRIP IK is OFF by default: without real gun/tackle geometry at the grip point the hands just clasp in mid-air
-// in a stiff, identical pose across the whole gun crew (reads "wrong" up close) — and the canned Mixamo work clips
-// (Pulling A Rope) already curl the hands naturally. Opt back IN with `localStorage.ignis_crew_armik='1'` once the
-// grip points are tied to real geometry + the mixamo elbow bend axis is calibrated. (Foot-plant IK stays on.)
-const ARM_GRIP_ENABLED = (() => { try { return localStorage.getItem('ignis_crew_armik') === '1'; } catch { return false; } })();
-// Build + run IK for crew within this of the camera (tunable: a sailing camera often sits >16 m off the deck, so
-// the IK could silently never activate — widen via localStorage.ignis_crew_ik_gate if so).
-const IK_GATE_NEAR = (() => { try { const v = parseFloat(localStorage.getItem('ignis_crew_ik_gate') || ''); return Number.isFinite(v) && v > 0 ? v : 28; } catch { return 28; } })();
+// ARM-GRIP IK is BAKED OFF: without real gun/tackle geometry at the grip point the hands just clasp in mid-air in a
+// stiff, identical pose across the whole gun crew (reads "wrong" up close) — and the canned Mixamo work clips
+// (Pulling A Rope) already curl the hands naturally. Left as a const (not deleted) so it can be re-enabled once the
+// grip points are tied to real geometry. (Foot-plant IK, HELM/GUN/ROPE grips stay on via IK_ENABLED.)
+const ARM_GRIP_ENABLED = false;
+// Build + run IK for crew within this of the camera (only the player's own ship is ever this near).
+const IK_GATE_NEAR = 28;
 const IK_GATE_FAR  = IK_GATE_NEAR + 6;   // tear down beyond this (hysteresis band avoids edge flap)
 const GRIP_W       = 0.85;  // `Grip` morph influence while a hand is working a station
 const GRIP_EASE    = 5.0;   // per-second ease rate for the Grip↔Relaxed hand blend
 const IK_SLERP     = 0.35;  // BoneIKController slerp — eases toward the solution so a slightly-off calib drifts, not snaps
 // Elbow bend axis + pole angle — CALIBRATED via the headless-Babylon harness (see [[crew-ik-calibration]]): for
 // the mixamorig arm, local Y is along the bone, X is the reaching hinge, and poleAngle 270° puts the elbow
-// down+back (verified: hands reach the wheel, elbows below the shoulder). Live-override `ignis_crew_ik_bend`/`_pole`.
-const IK_BEND = (() => {
-  try { const p = (localStorage.getItem('ignis_crew_ik_bend') || '').split(',').map(Number);
-        if (p.length === 3 && p.every(Number.isFinite)) return new Vector3(p[0], p[1], p[2]); } catch { /* */ }
-  return new Vector3(1, 0, 0);
-})();
-const IK_POLE = (() => { try { const v = parseFloat(localStorage.getItem('ignis_crew_ik_pole') || ''); return Number.isFinite(v) ? v : (270 * Math.PI) / 180; } catch { return (270 * Math.PI) / 180; } })();
+// down+back (verified: hands reach the wheel, elbows below the shoulder). Baked.
+const IK_BEND = new Vector3(1, 0, 0);
+const IK_POLE = (270 * Math.PI) / 180;
 // Hands-on-the-WHEEL IK (real-gear placement): the helmsman grips the ship's actual wheel (located from its B_Wheel
-// bone), hands on the rim at ~10 & 2 o'clock. Default ON; opt-out `ignis_crew_helmik=0`. Rim radius live-tunable.
-const HELM_IK_ENABLED = (() => { try { return (localStorage.getItem('ignis_crew_helmik') ?? '1') !== '0'; } catch { return true; } })();
-const HELM_RIM_R = (() => { try { const v = parseFloat(localStorage.getItem('ignis_crew_helm_rim') || ''); return Number.isFinite(v) && v > 0 ? v : 0.66; } catch { return 0.66; } })();   // merchantman wheel measured 0.66
+// bone), hands on the rim at ~10 & 2 o'clock. Folded into the master IK toggle; rim radius measured on the merchantman.
+const HELM_IK_ENABLED = IK_ENABLED;
+const HELM_RIM_R = 0.66;   // merchantman wheel measured 0.66
 // Hands-on-the-GUN IK: a gun crew mans their cannon — hands rest on the barrel. The gun sits at ~waist height, so
 // it's a STANDING "manning the piece" pose (arm-only IK can't crouch). Station-relative offsets, valid because the
-// gun stations are aligned ABAFT the real cannon breech. Default ON; opt-out `ignis_crew_gunik=0`.
-const GUN_IK_ENABLED = (() => { try { return (localStorage.getItem('ignis_crew_gunik') ?? '1') !== '0'; } catch { return true; } })();
+// gun stations are aligned ABAFT the real cannon breech. Folded into the master IK toggle.
+const GUN_IK_ENABLED = IK_ENABLED;
 const GUN_GRIP = { fwd: 0.40, up: 1.05, spread: 0.14 };   // barrel-top grip in the station frame (headless-verified reach)
 // Hands-on-the-FIFE-RAIL IK: rope crew tend the running rigging belayed at the mast-base fife rails — hands on the
 // rail/pins, a standing "tending the lines" pose (same shape as the gun grip). Stations aligned facing the rail.
-const ROPE_IK_ENABLED = (() => { try { return (localStorage.getItem('ignis_crew_ropeik') ?? '1') !== '0'; } catch { return true; } })();
+const ROPE_IK_ENABLED = IK_ENABLED;
 const ROPE_GRIP = { fwd: 0.40, up: 1.00, spread: 0.20 };   // fife-rail grip, hands spread along the rail
 // ── Foot-plant IK (crew realism v2, P3.2) ────────────────────────────────────────────────────────────────────
 // Standing crew on a heeling deck: the brace/idle-lean rotates the WHOLE body about its centreline, lifting the
 // outboard foot off the deck and sinking the inboard one (the clips are authored on FLAT ground). A 2-bone leg IK
 // (UpLeg→Leg→Foot) snaps each ankle back to the deck plane under its current x,z so the feet stay planted while the
 // torso rides the swell. It's a SMALL correction (the ankle lands on target regardless of bend axis), so calibration
-// risk is low. Player-deck only (same near gate as the arms); opt-out `localStorage.ignis_crew_footik='0'`.
-// DEFAULT OFF: the 2-bone leg IK works, but the mixamorig shin bone's local bend axis isn't known offline, so the
-// knees bend in the wrong plane ("weird knee bends", user-confirmed in both axis-sign guesses). Until the bend axis
-// is calibrated from the runtime [CrewFootIK] log (opt in via ignis_crew_footik=1), keep canned-clip legs — they
-// have no weird bends and the foot float on a heeling deck is small. Re-enable once `ignis_crew_footik_bend` is set.
-const FOOT_IK_ENABLED = (() => { try { return localStorage.getItem('ignis_crew_footik') === '1'; } catch { return false; } })();
+// risk is low. Player-deck only (same near gate as the arms).
+// BAKED OFF: the 2-bone leg IK works, but the mixamorig shin bone's local bend axis isn't known offline, so the
+// knees bend in the wrong plane ("weird knee bends", user-confirmed in both axis-sign guesses). The canned-clip legs
+// have no weird bends and the foot float on a heeling deck is small. Left as a const (not deleted) so it can be
+// re-enabled once the bend axis is calibrated from the runtime [CrewFootIK] log.
+const FOOT_IK_ENABLED = false;
 const FOOT_ANKLE_UP   = 0.10;   // m the ankle bone rides above the deck plane (so the sole rests ON the deck)
 const FOOT_KNEE_FWD   = 0.45;   // m the knee pole sits ahead of the ankle (knees bend forward, not back)
 const FOOT_KNEE_UP    = 0.45;   // m the knee pole sits above the ankle
-const FOOT_BEND = (() => {
-  try { const p = (localStorage.getItem('ignis_crew_footik_bend') || '').split(',').map(Number);
-        if (p.length === 3 && p.every(Number.isFinite)) return new Vector3(p[0], p[1], p[2]); } catch { /* */ }
-  return new Vector3(-1, 0, 0);   // knees bend FORWARD (the +X default bent them backward)
-})();
+const FOOT_BEND = new Vector3(-1, 0, 0);   // knees bend FORWARD (the +X default bent them backward)
 // Grip-point geometry per work clip, in the member's station frame (fwd = along heading, up = +Y, lat = half-spread
 // to each hand). Ship-FIXED (computed from the authored station pos+heading), so hands stay on the work while the
 // body micro-sways around them. Cannon = both hands low-forward on the carriage; Ropes = hand-over-hand haul.
@@ -198,9 +186,9 @@ export class CrewService {
     if (!layoutFile) return null;
     // The new Mixamo crew (crew_spike.glb — faces/skins/beards/hair/clothing variety + the full lifecycle) is now
     // the DEFAULT. It flows through the same lifecycle as the legacy pirate crew (placement, deck-snap, walking,
-    // sway/brace, dwell), only the GLB + variant/kit scheme differ. Opt OUT to the legacy pirate crew with
-    // `localStorage.ignis_crew_spiketest='0'`.
-    const useNew = typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_spiketest') !== '0';
+    // sway/brace, dwell), only the GLB + variant/kit scheme differ. Opt IN to the legacy pirate crew with
+    // `localStorage.ignis_crew_legacy='1'`.
+    const useNew = typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_legacy') !== '1';
     const glb = useNew ? 'crew_spike.glb' : CrewService.GLB;
     try {
       const layout = await this.loadLayout(layoutFile);
@@ -220,67 +208,6 @@ export class CrewService {
       return handle;
     } catch (err) {
       console.warn('[Crew] attach failed for', slug, err);
-      return null;
-    }
-  }
-
-  /**
-   * P0 spike load test for the new Mixamo pipeline GLB (`crew_spike.glb`). NOT part of the real crew
-   * path — gated behind `localStorage.ignis_crew_spiketest`. Drops up to two test sailors on the first
-   * couple of station spots (one Walk, one Idle) so we can confirm the GLB loads, skins, and animates
-   * on the actual deck. Returns null (no handle); clear the flag to restore the normal crew.
-   */
-  private async spikeTest(slug: string, shipGlbRoot: TransformNode, scene: Scene): Promise<CrewHandle | null> {
-    try {
-      const layoutFile = CrewService.LAYOUTS[slug];
-      const layout = layoutFile ? await this.loadLayout(layoutFile) : null;
-      if (shipGlbRoot.isDisposed() || !layout) return null;
-      // Seeded kit palettes — albedoColor multiplies the neutral linen albedo (~0.8). Per-crew RNG picks
-      // each garment's colour + whether a coat/bandana is worn, so the deck reads as a mixed crew, not clones.
-      const SHIRT = [[0.86, 0.80, 0.66], [0.92, 0.92, 0.86], [0.36, 0.46, 0.60], [0.60, 0.15, 0.11], [0.74, 0.62, 0.44]];
-      const COAT  = [[0.24, 0.13, 0.08], [0.07, 0.09, 0.18], [0.05, 0.05, 0.06], [0.34, 0.10, 0.08], [0.09, 0.17, 0.11]];
-      const BREE  = [[0.24, 0.17, 0.11], [0.15, 0.10, 0.06], [0.26, 0.26, 0.28], [0.06, 0.06, 0.07], [0.10, 0.12, 0.20]];
-      const SASH  = [[0.60, 0.09, 0.07], [0.66, 0.54, 0.11], [0.16, 0.26, 0.52], [0.11, 0.34, 0.14], [0.05, 0.05, 0.06]];
-      const BAND  = [[0.60, 0.09, 0.07], [0.16, 0.26, 0.52], [0.05, 0.05, 0.06], [0.22, 0.14, 0.09]];
-      const BOOT  = [[0.16, 0.09, 0.05], [0.10, 0.06, 0.04], [0.05, 0.04, 0.035], [0.22, 0.12, 0.06]];   // leather: brown / dark brown / near-black / chestnut
-      const N = Math.min(layout.stations.length, 16);
-      for (let i = 0; i < N; i++) {
-        const rigged = await this.assetCache.instantiateRigged('crew_spike.glb', scene, shipGlbRoot, false);
-        if (!rigged || shipGlbRoot.isDisposed()) break;
-        const st = layout.stations[i];
-        rigged.root.position = new Vector3(st.pos[0], st.pos[1], st.pos[2]);
-        rigged.root.rotationQuaternion = Quaternion.RotationYawPitchRoll((st.heading_deg * Math.PI) / 180, 0, 0);
-        const rng = mulberry32((i * 0x9e3779b9 + 0x12345) >>> 0);
-        const meshes = rigged.root.getChildMeshes(false);
-        const findMesh = (kw: string) => meshes.find((m) => new RegExp(kw, 'i').test(m.name));
-        const pick = <T>(a: T[]): T => a[Math.floor(rng() * a.length)];
-        // zOffset = polygon depth bias. In Babylon, MORE-NEGATIVE renders IN FRONT. Layer the garments
-        // (shirt above body, coat above shirt, sash above coat) so an outer piece always wins the depth
-        // test over the one beneath → no garment-through-garment z-fight.
-        const tintMesh = (kw: string, rgb: number[], zoff = 0) => {
-          const mesh = findMesh(kw);
-          if (mesh && mesh.material instanceof PBRMaterial) {
-            const mat = mesh.material.clone(`${mesh.material.name}_${i}`);
-            mat.albedoColor = new Color3(rgb[0], rgb[1], rgb[2]);
-            mat.zOffset = zoff;
-            mesh.material = mat;
-          }
-        };
-        tintMesh('Shirt', pick(SHIRT), -1);
-        tintMesh('Breeches', pick(BREE), -1);
-        tintMesh('Sash', pick(SASH), -4);
-        tintMesh('Boots', pick(BOOT), -1);
-        if (rng() < 0.6) tintMesh('Coat', pick(COAT), -3); else findMesh('Coat')?.setEnabled(false);
-        if (rng() < 0.72) tintMesh('Bandana', pick(BAND), -2); else findMesh('Bandana')?.setEnabled(false);
-        const groups = rigged.entries.animationGroups;
-        const grp = groups.find((g) => g.name.replace(/\.\d{3,}$/, '') === 'Idle') ?? groups[0];
-        for (const g of groups) g.stop();
-        if (grp) { grp.start(true); grp.goToFrame(Math.floor(rng() * 200)); }
-        if (i === 0) console.log('[CrewSpike] varied crew — meshes:', meshes.map((m) => m.name));
-      }
-      return null;
-    } catch (err) {
-      console.warn('[CrewSpike] load test failed', err);
       return null;
     }
   }
@@ -401,6 +328,9 @@ interface CrewMember {
   rng: () => number;
   detail: AbstractMesh[];   // tiny parts (buckles/eyes/laces/…) culled when the member is far
   lodFar: boolean;          // true while the detail meshes are hidden (distance LOD)
+  lodDist: number;          // camera distance this frame (computed once, shared by all the LOD gates)
+  frozen: boolean;          // true while VERY distant → animation paused (skeleton skipped), tick skipped
+  lodPhase: number;         // 0/1 — staggers the far-crew half-rate tick so they don't all update the same frame
   // Ship-motion presence (P1): a desynced idle sway + the station anchor it sways around.
   swayPhase: number;
   swayFreq: number;
@@ -452,6 +382,10 @@ export class CrewHandle {
   private readonly adjacency = new Map<string, { to: string; kind: string }[]>();
   private readonly walkSpeed: number;
   private disposed = false;
+  // Crew LOD/perf (P5): far crew tick at half-rate + skip the (invisible) face; VERY distant crew freeze their
+  // animation (skeleton skipped). Opt out with localStorage ignis_crew_lod='0'.
+  private readonly lod = typeof localStorage === 'undefined' || localStorage.getItem('ignis_crew_lod') !== '0';
+  private _frame = 0;
   private readonly texCache = new Map<string, Texture>();
   private readonly clonedMats: PBRMaterial[] = [];
   private skinIdx = 0;   // walks SKIN_ORDER so a full crew shows the whole tone range, not random-clustered light
@@ -572,7 +506,7 @@ export class CrewHandle {
       wpId: Object.keys(this.layout.waypoints)[0], dwell: 2 + rng() * 6,
       legs: [], legT: 0, legFrom: new Vector3(), yaw: 0, yawTarget: 0, stationYaw: 0,
       climb: null, animSpeed: 0.92 + rng() * 0.16, rng,
-      detail, lodFar: false,
+      detail, lodFar: false, lodDist: 0, frozen: false, lodPhase: this.members.length & 1,
       swayPhase: rng() * Math.PI * 2, swayFreq: 0.7 + rng() * 0.5, stationPos: new Vector3(),
       stationClip: 'Idle', workBurst: 0, glanceT: 0,
       flinch: 0, stagger: 0, staggerDir: 1, reactT: 0, reactCD: 0, panicT: 0, fleeing: false,
@@ -857,6 +791,7 @@ export class CrewHandle {
       const fwd = Vector3.TransformNormal(Vector3.Forward(), wm);
       this.shipHeel  = Math.asin(Math.max(-1, Math.min(1, right.y / (right.length() || 1))));
       this.shipPitch = Math.asin(Math.max(-1, Math.min(1, fwd.y / (fwd.length() || 1))));
+      this._frame++;   // drives the far-crew half-rate tick (crew LOD, P5)
       for (const m of this.members) this.tick(m, dt);
     });
   }
@@ -1050,16 +985,16 @@ export class CrewHandle {
     this.members = [];
   }
 
-  private static readonly LOD_FAR_M = 40;    // beyond this distance, cull the member's detail meshes
+  private static readonly LOD_FAR_M = 40;    // beyond this distance, cull the member's detail meshes + tick at half-rate + skip the face
   private static readonly LOD_NEAR_M = 32;   // re-show within this (hysteresis band avoids edge flicker)
+  private static readonly FREEZE_FAR_M = 150;   // beyond this, PAUSE the animation (skeleton skipped) — motion is invisible this far off
+  private static readonly FREEZE_NEAR_M = 130;  // resume within this (hysteresis)
 
   /** Distance LOD: hide the sub-pixel detail meshes (buckles/eyes/laces/…) when this member is far
    *  from the camera — i.e. crew on other ships. Near crew (your own deck) keep every part. */
   private tickLod(m: CrewMember): void {
     if (!m.detail.length) return;
-    const cam = this.scene.activeCamera;
-    if (!cam) return;
-    const d = Vector3.Distance(cam.globalPosition, m.holder.getAbsolutePosition());
+    const d = m.lodDist;   // already computed in tick() this frame
     if (!m.lodFar && d > CrewHandle.LOD_FAR_M) {
       m.lodFar = true;
       for (const me of m.detail) me.setEnabled(false);
@@ -1506,8 +1441,24 @@ export class CrewHandle {
   // ── per-member state machine ────────────────────────────────────────────────
   private tick(m: CrewMember, dt: number): void {
     if (m.state === 'reserve') return;   // unrecruited reserve: hidden, no animation/logic
+    // ── Crew LOD (P5) ── distance (computed ONCE, reused by tickLod) drives three throttles, cheapest saving first.
+    const cam = this.scene.activeCamera;
+    if (cam) { m.lodDist = Vector3.Distance(cam.globalPosition, m.holder.getAbsolutePosition()); }
+    const near = m.lodDist < CrewHandle.LOD_FAR_M;
+    if (this.lod) {
+      const d = m.lodDist;
+      // FREEZE: very-distant crew pause their animation → Babylon stops evaluating the skeleton (the real CPU cost).
+      if (d > CrewHandle.FREEZE_FAR_M) { if (!m.frozen) { m.frozen = true; m.current?.pause(); m.prev?.pause(); } return; }
+      if (m.frozen) {
+        if (d > CrewHandle.FREEZE_NEAR_M) return;                          // stay frozen (hysteresis band)
+        m.frozen = false; m.prev = null; m.blend = 1;
+        m.current?.play(m.current.loopAnimation);                          // resume (restart-from-0 is invisible this far off)
+      }
+      // THROTTLE: far (other-ship) crew update pose/logic at HALF rate — imperceptible past 40 m, ~halves the JS cost.
+      if (!near) { if ((this._frame + m.lodPhase) & 1) return; dt *= 2; }  // ×2 dt keeps decays/dwell wall-clock-correct
+    }
     this.tickBlend(m, dt);
-    this.tickFace(m, dt);
+    if (near || !this.lod) { this.tickFace(m, dt); }   // faces are sub-pixel past ~40 m — skip the morph churn for far crew
     this.tickLod(m);
     // Smooth yaw toward target everywhere except while dead, then BRACE against the deck slope: counter-lean the
     // heel/pitch so the crew ride the swell instead of standing rigidly perpendicular to a heeled deck. Composed

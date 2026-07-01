@@ -532,6 +532,29 @@ int main(int argc, char** argv) {
   const char* shotPath = std::getenv("SAILSIM_SHOT");
   const long shotFrame = shotPath ? (maxFramesEnv ? maxFrames : 240) : -1;
 
+  // Headless auth round-trip test: exercises net_auth against the live server with
+  // no window. SAILSIM_AUTH_TEST=login|register, SAILSIM_AUTH_USER / _PASS / _CALLSIGN.
+  // With no user set it posts a bogus login to verify connectivity + error parsing.
+  if (const char* authMode = std::getenv("SAILSIM_AUTH_TEST")) {
+    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
+    const char* portEnv = std::getenv("SAILSIM_PORT");
+    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const char* u  = std::getenv("SAILSIM_AUTH_USER");
+    const char* p  = std::getenv("SAILSIM_AUTH_PASS");
+    const char* cs = std::getenv("SAILSIM_AUTH_CALLSIGN");
+    std::string user = u ? u : "no_such_user_probe";
+    std::string pass = p ? p : "definitely_wrong_password";
+    net::AuthResult r = (std::string(authMode) == "register")
+      ? net::registerUser(host, port, user, cs ? cs : user, pass)
+      : net::login(host, port, user, pass);
+    std::printf("[auth-test] %s %s:%d user=%s -> ok=%d status=%d\n",
+                authMode, host, port, user.c_str(), (int)r.ok, r.status);
+    if (r.ok) std::printf("[auth-test] callsign=%s role=%s token=%.16s...\n",
+                          r.callsign.c_str(), r.role.c_str(), r.token.c_str());
+    else      std::printf("[auth-test] error=\"%s\"\n", r.error.c_str());
+    return r.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
 #if defined(WEBGPU_BACKEND_WGPU)
   // Surface wgpu-native's internal logs (including WGSL compile errors).
   wgpuSetLogLevel(WGPULogLevel_Warn);

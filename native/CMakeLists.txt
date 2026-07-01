@@ -244,6 +244,7 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.wgsl"              SKY_WGSL 
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain.wgsl"          TERRAIN_WGSL          "${WGSL_GEN_DIR}/terrain_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sea_far.wgsl"          SEA_FAR_WGSL          "${WGSL_GEN_DIR}/sea_far_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds.wgsl"           CLOUDS_WGSL           "${WGSL_GEN_DIR}/clouds_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds_denoise.wgsl"   CLOUDS_DENOISE_WGSL   "${WGSL_GEN_DIR}/clouds_denoise_wgsl.h")
 
 # ── UI fonts ─────────────────────────────────────────────────────────────────
 # Two fonts, downloaded at configure time (kept out of git, re-fetchable) and

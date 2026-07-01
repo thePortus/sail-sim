@@ -62,6 +62,8 @@ const HIT_CLIP_CHANCE  = 0.5;  // fraction of crew that play the full React_Hit 
 const HIT_REACT_DUR    = 1.0;  // s the hit-recoil clip holds before resuming the station clip
 const REACT_COOLDOWN   = 3.0;  // s min between a member's one-shot reaction clips (no recoil-spam in a long battle)
 const POINT_GLANCE_CHANCE = 0.3;  // fraction of "glance about" breaks that become a point-at-the-horizon (React_Point)
+const FLEE_FRAC       = 0.6;   // of the crew whose morale breaks, this fraction SCRAMBLE across the deck; the rest cower in place
+const FLEE_SPEED_MUL  = 1.8;   // ×walk speed while fleeing (a frantic scramble; the Walk clip is sped to match so feet still plant)
 
 // ── Environmental grip IK (crew realism v2, track A1+A2) ─────────────────────────────────────────────────────
 // Make working hands actually REACH their station instead of miming in the air. Post-clip 2-bone arm IK
@@ -414,7 +416,8 @@ interface CrewMember {
   staggerDir: number;       // ±1 — which way the hit lurches them (away from the struck side)
   reactT: number;           // >0 while a one-shot reaction CLIP (React_Hit/Point/Cheer) overrides the work loop
   reactCD: number;          // cooldown (s) before the next one-shot reaction clip — prevents recoil-spam
-  panicT: number;           // >0 while morale is BROKEN — cowering (React_Panic looped), abandoned the work loop
+  panicT: number;           // >0 while morale is BROKEN — cowering (React_Panic looped) or FLEEING, abandoned the work loop
+  fleeing: boolean;         // true while panicking AND scrambling across the deck (walk state) rather than cowering in place
   // Environmental grip IK (track A). Built lazily the first time the member is near the camera.
   skeleton: Skeleton | null;   // this member's cloned 24-joint rig (arm bones live here)
   bodyMesh: AbstractMesh | null; // the skinned 'Human' mesh (BoneIKController world-space anchor)
@@ -572,7 +575,7 @@ export class CrewHandle {
       detail, lodFar: false,
       swayPhase: rng() * Math.PI * 2, swayFreq: 0.7 + rng() * 0.5, stationPos: new Vector3(),
       stationClip: 'Idle', workBurst: 0, glanceT: 0,
-      flinch: 0, stagger: 0, staggerDir: 1, reactT: 0, reactCD: 0, panicT: 0,
+      flinch: 0, stagger: 0, staggerDir: 1, reactT: 0, reactCD: 0, panicT: 0, fleeing: false,
       skeleton: skeletons.find((s) => s && s.bones?.length) ?? skeletons[0] ?? null,
       bodyMesh: ikBody ?? null, ik: null, ikActive: false, ikGrip: 0,
     };
@@ -900,10 +903,29 @@ export class CrewHandle {
    *  s, abandoning their work. Call on the ship sinking or heavy casualties. Refreshable (re-call to extend). */
   crewPanic(frac: number, dur: number): void {
     for (const m of this.members) {
-      if (m.state !== 'station' || !m.clips.has('React_Panic')) continue;
+      if ((m.state !== 'station' && m.state !== 'walk') || !m.clips.has('React_Panic')) continue;
       if (m.panicT > 0) { m.panicT = Math.max(m.panicT, dur); continue; }   // already panicking → just extend
-      if (m.rng() < frac) { m.panicT = dur; this.play(m, 'React_Panic', true); }
+      if (m.rng() >= frac) continue;
+      m.panicT = dur;
+      if (m.rng() < FLEE_FRAC && Object.keys(this.layout.waypoints).length > 1) { this.startFlee(m); }
+      else { this.play(m, 'React_Panic', true); }   // freeze and cower in place at the station
     }
+  }
+
+  /** Send a panicking member scrambling to a random waypoint at a run; on arrival they pick another (or recover if
+   *  the panic has lifted — handled in finishWalk). */
+  private startFlee(m: CrewMember): void {
+    const wp = this.randomFleeWp(m);
+    if (!wp) { this.play(m, 'React_Panic', true); return; }   // no graph to flee across → cower instead
+    m.fleeing = true;
+    this.beginWalk(m, wp, null);   // state → 'walk'; the fleeing flag speeds it up + loops it in finishWalk
+  }
+
+  private randomFleeWp(m: CrewMember): string | null {
+    const ids = Object.keys(this.layout.waypoints);
+    if (!ids.length) return null;
+    for (let i = 0; i < 5; i++) { const id = ids[Math.floor(m.rng() * ids.length)]; if (id !== m.wpId) return id; }
+    return ids[Math.floor(m.rng() * ids.length)];
   }
 
   /** Play a one-shot reaction clip that overrides the work loop for `dur` s, then resume the station clip. No-op if
@@ -1605,10 +1627,11 @@ export class CrewHandle {
   private playLeg(m: CrewMember, kind: string): void {
     const ladder = kind === 'ladder';
     const g = this.play(m, ladder ? 'Climb' : 'Walk', true);
-    if (g && !ladder) g.speedRatio = m.animSpeed * Math.max(0.35, this.legSpeed(kind) / this.walkSpeed) * STRIDE_SCALE;
+    if (g && !ladder) g.speedRatio = m.animSpeed * Math.max(0.35, this.legSpeed(kind) / this.walkSpeed) * STRIDE_SCALE * (m.fleeing ? FLEE_SPEED_MUL : 1);
   }
 
   private tickWalk(m: CrewMember, dt: number): void {
+    if (m.fleeing && m.panicT > 0) m.panicT = Math.max(0, m.panicT - dt);   // (P4) panic decays while scrambling
     const leg = m.legs[0];
     if (!leg) { this.finishWalk(m); return; }
     const span = Vector3.Distance(m.legFrom, leg.to);
@@ -1620,7 +1643,7 @@ export class CrewHandle {
     while (err > Math.PI) err -= 2 * Math.PI;
     while (err < -Math.PI) err += 2 * Math.PI;
     const turnSlow = Math.max(0.25, Math.cos(Math.min(Math.abs(err), Math.PI / 2)));   // 1 aligned → 0.25 at ≥90°
-    const speed = this.legSpeed(leg.kind) * turnSlow;
+    const speed = this.legSpeed(leg.kind) * turnSlow * (m.fleeing ? FLEE_SPEED_MUL : 1);
     m.legT = span > 1e-4 ? Math.min(1, m.legT + (speed * dt) / span) : 1;
     Vector3.LerpToRef(m.legFrom, leg.to, m.legT, m.holder.position);
     if (leg.kind === 'step_over') {
@@ -1638,6 +1661,15 @@ export class CrewHandle {
 
   private finishWalk(m: CrewMember): void {
     this.walkers.delete(m);   // free the walkways
+    // Panic flee (P4): while morale is still broken, keep scrambling to another random spot; once it lifts, return
+    // to a post (or idle if none is free).
+    if (m.fleeing) {
+      if (m.panicT > 0) { this.startFlee(m); return; }
+      m.fleeing = false;
+      const st = this.pickStation(m);
+      if (st) { this.arriveAt(m, st, false); return; }
+      m.state = 'station'; m.dwell = 3; this.play(m, 'Idle', true); return;
+    }
     const target = (m as CrewMember & { _target?: CrewStation | null })._target;
     const climb = (m as CrewMember & { _climb?: CrewClimb | null })._climb;
     if (climb) {
@@ -1709,6 +1741,7 @@ export class CrewHandle {
     m.stationId = st.id;
     m.wpId = st.wp;
     m.state = 'station';
+    m.fleeing = false;   // settled at a post → no longer fleeing (P4)
     m.stationPos.set(st.pos[0], st.pos[1], st.pos[2]);   // sway anchor (P1)
     // Plant the feet on the real deck, clear of furniture — EXCEPT seats, which intentionally sit ON a
     // thwart/bench (the open-deck search would shove a rower off his thwart onto the sole).

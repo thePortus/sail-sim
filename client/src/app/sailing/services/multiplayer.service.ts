@@ -653,6 +653,7 @@ export class MultiplayerService {
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
                           String(msg.id), +msg.seq || 0,
                           msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
+      this.players.get(String(msg.id))?.crew?.reactToFire('port');   // (P4) that ship's crew flinch at their own blast (side unused)
 
     } else if (msg.type === 'combat_hit') {
       // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)
@@ -683,7 +684,9 @@ export class MultiplayerService {
         // A remote ship was sunk → capsize it (its per-zone damage drives which way it rolls/settles).
         const e = this.players.get(String(msg.victimId));
         if (e && !e.sinking) { e.sinking = true; e.sinkElapsed = 0; }
-        if (String(msg.shooterId) === this.myId) this.vesselService.crewCheer();   // (P4) WE sank them → crew cheer
+        e?.crew?.crewPanic(0.85, 30);   // (P4) the sinking ship's crew break and cower
+        if (String(msg.shooterId) === this.myId) this.vesselService.crewCheer();   // (P4) WE sank them → our crew cheer
+        else this.players.get(String(msg.shooterId))?.crew?.reactCheer();          // …else the victor's own crew cheer
       }
 
     } else if (msg.type === 'combat_repair') {
@@ -1243,6 +1246,7 @@ export class MultiplayerService {
     const dir = side === 'port' ? 1 : -1;
     e.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
     e.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
+    e.crew?.reactToHit(side);   // (P4) that ship's own deck crew stagger with the hit
   }
 
   /** Shortest-arc difference a→b for angles in radians. */

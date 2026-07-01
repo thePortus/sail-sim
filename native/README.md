@@ -4,14 +4,16 @@ Native, compilable client for Windows and macOS, built on **C++20 + WebGPU**.
 This replaces the Angular/Babylon.js browser client; the Node server and all assets are unchanged.
 See [`../PORTING.md`](../PORTING.md) for the full plan.
 
-Current status: **Phase 0 complete on macOS; Phase 1 in progress.** WebGPU device bringup; a render
-loop that loads a **glTF/GLB mesh** (via `cgltf`) with its **PBR materials and KTX2/Basis base-colour
-textures** (decoded with the Basis Universal transcoder), split into per-material submeshes, and
-draws it spinning, depth-tested, with **metallic-roughness Cook-Torrance shading** — camera (MVP)
-uniform, per-material texture bind groups, depth buffer, resize handling, model auto-centre/scale;
-**and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
-(matches a CPU oracle to ~4e-6). Verified on Metal (Apple M3 Pro): the 90k-vertex merchantman renders
-with its base-colour, normal, and metallic-roughness maps (14 textures) across 39 submeshes. Windows/D3D12 and rendering the ship on the ocean are next.
+Current status: **Phase 0 complete on macOS; Phase 1 in progress.** A textured, PBR-lit glTF ship
+floats on an animated Gerstner-wave ocean. The render loop: loads a **glTF/GLB mesh** (`cgltf`) with
+its **PBR materials and KTX2/Basis textures** (base-colour, normal, metallic-roughness — decoded by
+the Basis Universal transcoder), split into per-material submeshes, drawn with **metallic-roughness
+Cook-Torrance shading** and tangent-space normal mapping; renders a **Gerstner ocean surface** (WGSL
+vertex displacement + water shading) and **floats the ship on it** using the same wave field on the
+CPU (`src/wave.hpp`) to heave + tilt the hull; **plus** the ocean-FFT `INITIAL_SPECTRUM` WGSL running
+natively with a verified GPU→CPU readback (matches a CPU oracle to ~4e-6). Verified on Metal (Apple
+M3 Pro): the 90k-vertex merchantman, 14 textures across 39 submeshes, floating on the sea, 0 errors.
+Real FFT ocean, sailing physics, and Windows/D3D12 are next.
 
 ## What this builds
 
@@ -127,10 +129,14 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 6. ~~KTX2 textures (base-colour, normal, metallic-roughness).~~ **Done** — `src/ktx2.*` (Basis
    transcoder) decodes all three map types; the fragment does tangent-space normal mapping (frame
    from screen-space derivatives, no TANGENT needed) and per-texel metallic/roughness.
-7. **Ship on the ocean.** Tie the mesh renderer to the FFT work — render the ocean surface and float
-   the ship on it. The "it's becoming the game" moment. §7.
-8. **Rest of the FFT chain (Phase 2).** Port `CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, the butterfly
-   `FFT_*` passes and `WAVES_MERGER` on top of the readback harness already in `src/fft_test.cpp`.
+7. ~~Ship on the ocean.~~ **Done** — `shaders/ocean.wgsl` (Gerstner surface) + `src/wave.hpp` (shared
+   CPU wave field); the ship heaves + tilts on the waves. `createOcean()` in `src/main.cpp`.
+8. **Real FFT ocean (Phase 2).** Port the rest of the FFT chain (`CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`,
+   the butterfly `FFT_*` passes, `WAVES_MERGER`) on top of the readback harness in `src/fft_test.cpp`,
+   and drive the ocean surface + buoyancy from the FFT displacement instead of the analytic Gerstner set.
+9. **Sailing physics + input.** Port the client's force-based vessel model so the ship sails under
+   control (Phase 3 of PORTING.md).
+10. **Windows/D3D12** — build + verify on Windows, wire a CI matrix.
 
 ## Layout
 
@@ -140,8 +146,9 @@ native/
   src/main.cpp        device bringup + render loop (clear + camera + depth + glTF mesh); FFT test on startup
   src/gltf_mesh.*     cgltf .glb loader — positions, normals, UVs, material factors, per-material submeshes
   src/ktx2.*          Basis Universal transcoder wrapper: KTX2 (KHR_texture_basisu) -> RGBA
+  src/wave.hpp        analytic Gerstner wave field (CPU) — shared with ocean.wgsl for ship buoyancy
   src/fft_test.*      ocean-FFT INITIAL_SPECTRUM compute + CPU-oracle readback verification
-  shaders/            WGSL: initial_spectrum.wgsl (from the client) + mesh.wgsl (textured PBR); embedded
+  shaders/            WGSL: initial_spectrum.wgsl, mesh.wgsl (textured PBR), ocean.wgsl (Gerstner); embedded
   assets/             vendored sample model (rock_e.glb) used as the default
   README.md           this file
 ```

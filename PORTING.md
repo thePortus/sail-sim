@@ -189,6 +189,11 @@ GPU→CPU readback
 M3 Pro). That readback is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified;
 only host-side plumbing was written.
 
+Phase 1 has since grown into a textured, PBR-lit glTF ship (base-colour + normal + metallic-roughness
+KTX2 maps via the Basis transcoder, per-material submeshes) floating on an animated Gerstner-wave
+ocean (WGSL surface displacement + a shared CPU wave field for hull heave/tilt). Next: drive the
+ocean from the full FFT chain, then sailing physics + input.
+
 Course-corrections recorded for the record:
 - **Backend is wgpu-native (official prebuilt), not Dawn.** Building Dawn from source on Apple
   Silicon through CMake 4.x trips over its vendored fuzzers (`libprotobuf-mutator`) and an abseil

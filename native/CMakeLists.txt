@@ -227,6 +227,38 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean_surface.wgsl"    OCEAN_SURFACE_WGSL    "${WGSL_GEN_DIR}/ocean_surface_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.wgsl"              SKY_WGSL              "${WGSL_GEN_DIR}/sky_wgsl.h")
 
+# ── UI font ──────────────────────────────────────────────────────────────────
+# Download the font at configure time (kept out of git, re-fetchable) and embed
+# it into the binary as a byte array, so the .app ships self-contained with no
+# runtime font file to locate. Swap SAILSIM_FONT_URL to use a different font;
+# a proprietary font can use the same path but must NOT be redistributed in the
+# built binary — ship it as a bundle resource loaded at runtime instead.
+set(SAILSIM_FONT_URL
+    "https://github.com/JetBrains/JetBrainsMono/raw/v2.304/fonts/ttf/JetBrainsMono-Regular.ttf"
+    CACHE STRING "URL of the TTF to embed as the UI font")
+set(SAILSIM_FONT_TTF "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIFont.ttf")
+if (NOT EXISTS "${SAILSIM_FONT_TTF}")
+  message(STATUS "Downloading UI font: ${SAILSIM_FONT_URL}")
+  file(DOWNLOAD "${SAILSIM_FONT_URL}" "${SAILSIM_FONT_TTF}" STATUS _font_dl TLS_VERIFY ON)
+  list(GET _font_dl 0 _font_rc)
+  if (NOT _font_rc EQUAL 0)
+    file(REMOVE "${SAILSIM_FONT_TTF}")
+    list(GET _font_dl 1 _font_err)
+    message(FATAL_ERROR "UI font download failed: ${_font_err}")
+  endif()
+endif()
+
+# Emit a header with the TTF bytes as a C array (newline every 20 bytes so no
+# single line is absurdly long for MSVC).
+function(embed_binary SRC VARNAME OUT)
+  file(READ "${SRC}" _hex HEX)
+  string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+  string(REGEX REPLACE "((0x..,){20})" "\\1\n" _bytes "${_bytes}")
+  file(WRITE "${OUT}"
+    "#pragma once\ninline const unsigned char ${VARNAME}[] = {\n${_bytes}\n};\ninline const unsigned int ${VARNAME}_SIZE = sizeof(${VARNAME});\n")
+endfunction()
+embed_binary("${SAILSIM_FONT_TTF}" UI_FONT_TTF "${WGSL_GEN_DIR}/ui_font.h")
+
 add_executable(sailsim_native
   src/main.cpp
   src/fft_test.cpp
@@ -270,4 +302,20 @@ if (MSVC)
   target_compile_options(sailsim_native PRIVATE /W4)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ── macOS: package as a .app bundle ──────────────────────────────────────────
+# Off by default so the dev/CI loop keeps running ./build/bin/sailsim_native.
+# Turn on with -DSAILSIM_MACOS_BUNDLE=ON to get build/bin/sailsim_native.app —
+# a proper Cocoa app with an Info.plist (Retina-capable, dock name, bundle id).
+option(SAILSIM_MACOS_BUNDLE "Build a macOS .app bundle instead of a bare executable" OFF)
+if (APPLE AND SAILSIM_MACOS_BUNDLE)
+  set_target_properties(sailsim_native PROPERTIES
+    MACOSX_BUNDLE ON
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
+    MACOSX_BUNDLE_BUNDLE_NAME "Sail-Sim"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "us.theport.sailsim"
+    MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
+    MACOSX_BUNDLE_COPYRIGHT "© thePortus")
 endif()

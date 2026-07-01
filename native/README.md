@@ -111,6 +111,39 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` is required with CMake 4.x: some fetched subprojects declare a
 `cmake_minimum_required` below 3.5, which CMake 4 rejects without this shim.
 
+## UI font
+
+The UI uses **JetBrains Mono** (Apache-2.0). It is **downloaded at configure time** (from
+`SAILSIM_FONT_URL`) into `assets/fonts/UIFont.ttf` — which is **git-ignored, never committed** — and
+then **embedded into the binary** as a byte array (`build/gen/ui_font.h`), so the app ships
+self-contained with no runtime font file to locate. To use a different font, override the URL:
+
+```sh
+cmake -B build -DSAILSIM_FONT_URL="https://…/YourMono-Regular.ttf"
+```
+
+> A **proprietary / license-restricted** font can be dropped in via the same mechanism, but must not
+> be redistributed inside the compiled binary — for those, ship the TTF as a bundle **resource** and
+> load it at runtime instead of embedding. The download-and-gitignore flow already keeps it out of
+> the repo.
+
+## Packaging a macOS `.app`
+
+By default the build produces a bare Unix executable (`build/bin/sailsim_native`) so the dev/CI loop
+stays simple. To build a proper Cocoa **application bundle** instead:
+
+```sh
+cmake -B build -DSAILSIM_MACOS_BUNDLE=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build --config Release -j
+open build/bin/sailsim_native.app
+```
+
+This produces `sailsim_native.app` with an `Info.plist` (from `cmake/Info.plist.in`) carrying the
+bundle id (`us.theport.sailsim`), display name, version, and — importantly — `NSHighResolutionCapable`
+so it renders at native Retina resolution. An app icon (`.icns`) can be added later via
+`MACOSX_BUNDLE_ICON_FILE`. (Assets are still referenced by baked absolute paths for now; a
+distributable build would copy them into `Contents/Resources`.)
+
 ## Troubleshooting
 
 - **CMake 4.x: "Compatibility with CMake < 3.5 has been removed".** Add

@@ -179,6 +179,7 @@ endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ocean_surface.wgsl"    OCEAN_SURFACE_WGSL    "${WGSL_GEN_DIR}/ocean_surface_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.wgsl"              SKY_WGSL              "${WGSL_GEN_DIR}/sky_wgsl.h")
 
 add_executable(sailsim_native
   src/main.cpp

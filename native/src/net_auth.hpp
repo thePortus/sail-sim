@@ -28,4 +28,9 @@ AuthResult login(const std::string& host, int port,
 AuthResult registerUser(const std::string& host, int port, const std::string& username,
                         const std::string& callsign, const std::string& password);
 
+// GET /user/me with `Authorization: Bearer <token>` — validates a stored token.
+// ok on 200 (echoes the token back; note /user/me returns no callsign). A 401
+// means the token was rejected/expired, so the caller should drop it.
+AuthResult me(const std::string& host, int port, const std::string& token);
+
 } // namespace net

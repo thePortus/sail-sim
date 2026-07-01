@@ -178,9 +178,11 @@ Estimated spike: **~3–4 weeks**. Deliverable: a written go/no-go with the vali
 WGSL changes Dawn required.
 
 **Phase 0 done on macOS (all criteria 1–5); Phase 1 underway** (Windows/D3D12 pending a Windows
-machine). [`native/`](native/) builds and runs: WebGPU device bringup, a render loop that draws a
-spinning depth-tested cube (MVP camera uniform + vertex/index/depth buffers + resize handling, via
-glm), **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
+machine). [`native/`](native/) builds and runs: WebGPU device bringup, a render loop that loads a
+glTF/GLB mesh (cgltf) and draws it spinning, depth-tested, directionally shaded (MVP camera uniform +
+vertex/index/depth buffers + resize handling, via glm) — verified from a 70-vert rock to the
+90k-vert merchantman hull — **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a
+verified GPU→CPU readback
 — the output matches a CPU reimplementation of the formula to **max abs err 3.8e-6** on Metal (Apple
 M3 Pro). That readback is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified;
 only host-side plumbing was written.

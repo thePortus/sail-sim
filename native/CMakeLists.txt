@@ -47,6 +47,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
+# ── cgltf (single-header glTF/GLB loader) ───────────────────────────────────
+# SOURCE_SUBDIR points at a non-existent dir so MakeAvailable only downloads the
+# header (cgltf's own CMakeLists builds test exes we don't want).
+FetchContent_Declare(
+  cgltf
+  GIT_REPOSITORY https://github.com/jkuhlmann/cgltf
+  GIT_TAG        v1.14
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  do_not_configure
+)
+FetchContent_MakeAvailable(cgltf)
+
 # ── WebGPU backend ───────────────────────────────────────────────────────────
 # Both wgpu-native and Dawn implement the same webgpu.h C API and run the same
 # WGSL natively on Metal / D3D12 / Vulkan — so our code and our WGSL are identical
@@ -142,14 +154,16 @@ function(embed_wgsl SRC VARNAME OUT)
   file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
 endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
-embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.wgsl"             CUBE_WGSL             "${WGSL_GEN_DIR}/cube_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
 
 add_executable(sailsim_native
   src/main.cpp
   src/fft_test.cpp
+  src/gltf_mesh.cpp
 )
 
-target_include_directories(sailsim_native PRIVATE "${WGSL_GEN_DIR}")
+target_include_directories(sailsim_native PRIVATE "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}")
+target_compile_definitions(sailsim_native PRIVATE SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on

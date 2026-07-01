@@ -8,7 +8,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
+import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
@@ -1832,8 +1832,16 @@ export class MultiplayerService {
     const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
     const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
     if (useStencil) {
-      const hull = vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
-      if (hull && buildHullStencilProxy(hull, entry.root, scene)) {
+      const rig = rigForSlug(slug);
+      // MIRROR the local vessel's applyHullCut gate (was missing here → the remote brig showed its keel):
+      //  (1) DECKED, deep-draft hulls (brig, merchantman — rig.oceanMask===false) SKIP the proxy entirely —
+      //      masking their big underwater hull REVEALS the keel through the sea. Override ignis_oceanmask_<slug>.
+      //  (2) otherwise clamp the proxy at the hull-local DECK level (maskFloorFor) so it masks only the open
+      //      deck, never the sea in front of the submerged hull — an UNCLAMPED whole-hull proxy revealed the keel.
+      const omo = (typeof localStorage !== 'undefined') ? localStorage.getItem('ignis_oceanmask_' + slug) : null;
+      const oceanMask = omo === 'on' ? true : omo === 'off' ? false : (rig.oceanMask !== false);
+      const hull = oceanMask ? vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0) : null;
+      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig))) {
         this.oceanService.setHullStencilMask(true);
       }
     }

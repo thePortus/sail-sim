@@ -177,12 +177,13 @@ Tasks:
 Estimated spike: **~3–4 weeks**. Deliverable: a written go/no-go with the validation diff and any
 WGSL changes Dawn required.
 
-**Spike done on macOS — all Phase 0 criteria 1–5 met** (Windows/D3D12 pending a Windows machine).
-[`native/`](native/) builds and runs: WebGPU device bringup + clear-colour render loop **and** the
-ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback — the output
-matches a CPU reimplementation of the formula to **max abs err 3.8e-6** on Metal (Apple M3 Pro). This
-is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified; only host-side
-plumbing was written.
+**Phase 0 done on macOS (all criteria 1–5); Phase 1 underway** (Windows/D3D12 pending a Windows
+machine). [`native/`](native/) builds and runs: WebGPU device bringup, a render loop that draws a
+spinning depth-tested cube (MVP camera uniform + vertex/index/depth buffers + resize handling, via
+glm), **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
+— the output matches a CPU reimplementation of the formula to **max abs err 3.8e-6** on Metal (Apple
+M3 Pro). That readback is the real proof the WGSL ports 1:1: the shader compiled and ran unmodified;
+only host-side plumbing was written.
 
 Course-corrections recorded for the record:
 - **Backend is wgpu-native (official prebuilt), not Dawn.** Building Dawn from source on Apple

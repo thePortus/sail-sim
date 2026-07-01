@@ -4,17 +4,18 @@ Native, compilable client for Windows and macOS, built on **C++20 + WebGPU**.
 This replaces the Angular/Babylon.js browser client; the Node server and all assets are unchanged.
 See [`../PORTING.md`](../PORTING.md) for the full plan.
 
-Current status: **Phase 0 complete on macOS; Phase 1 started.** WebGPU device bringup, a render loop
-that clears to sea-blue and draws a first triangle through a real render pipeline + vertex buffer,
+Current status: **Phase 0 complete on macOS; Phase 1 in progress.** WebGPU device bringup; a render
+loop that clears to sea-blue and draws a **spinning, depth-tested 3D cube** through a real render
+pipeline (MVP camera uniform + vertex/index buffers + depth buffer, with window-resize handling);
 **and** the ocean-FFT `INITIAL_SPECTRUM` WGSL running natively with a verified GPU→CPU readback
 (matches a CPU oracle to ~4e-6). Verified on Metal (Apple M3 Pro). Windows/D3D12 pending a Windows
 machine.
 
 ## What this builds
 
-`sailsim_native` opens a 1280×720 window, clears it to sea-blue, and draws a vertex-coloured triangle
-every frame using a real WebGPU device. On launch it prints the resolved native backend, e.g. (actual
-output on this machine):
+`sailsim_native` opens a 1280×720 window, clears it to sea-blue, and draws a spinning depth-tested
+cube every frame using a real WebGPU device. On launch it prints the resolved native backend, e.g.
+(actual output on this machine):
 
 ```
 [spike] adapter: backend=Metal  vendor=  device=Apple M3 Pro
@@ -105,10 +106,10 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 2. **Windows/D3D12.** Build on a Windows machine to confirm `backend=D3D12` and that the FFT test
    passes there too. The CMake WGPU path already selects the Windows zip; the static-lib system-lib
    list in `CMakeLists.txt` may need a tweak (noted inline). Then wire a GitHub Actions matrix.
-3. ~~First draw (Phase 1).~~ **Done** — `shaders/triangle.wgsl` + `createTriangle()` in
-   `src/main.cpp` draw a vertex-coloured triangle through a real render pipeline.
-4. **Phase 1 proper.** A camera (uniform buffer + MVP), a depth buffer, then glTF mesh loading +
-   PBR + cascaded shadows — one ship on a plane. See `../PORTING.md` §7.
+3. ~~First draw + camera + depth (Phase 1).~~ **Done** — `shaders/cube.wgsl` + `createCube()` in
+   `src/main.cpp` draw a spinning depth-tested cube through an MVP camera uniform.
+4. **glTF meshes.** Pull in `cgltf`, load one of the client's `.glb` models, and draw its real
+   vertices — the first "wow." Then PBR materials + cascaded shadows — one ship on a plane. §7.
 5. **Rest of the FFT chain (Phase 2).** Port `CONJUGATE`, `TIME_DEPENDENT_SPECTRUM`, the butterfly
    `FFT_*` passes and `WAVES_MERGER` on top of the readback harness already in `src/fft_test.cpp`.
 
@@ -117,8 +118,8 @@ SAILSIM_MAX_FRAMES=120 ./build/bin/sailsim_native
 ```
 native/
   CMakeLists.txt      FetchContent deps + backend toggle + WGSL embed + the target
-  src/main.cpp        device bringup + render loop (clear + triangle); runs the FFT test on startup
+  src/main.cpp        device bringup + render loop (clear + camera + depth cube); runs FFT test on startup
   src/fft_test.*      ocean-FFT INITIAL_SPECTRUM compute + CPU-oracle readback verification
-  shaders/            WGSL: initial_spectrum.wgsl (from the client) + triangle.wgsl; embedded at build time
+  shaders/            WGSL: initial_spectrum.wgsl (from the client) + cube.wgsl; embedded at build time
   README.md           this file
 ```

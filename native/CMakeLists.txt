@@ -38,6 +38,15 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(glfw)
 
+# ── glm (header-only math: matrices, vectors) ───────────────────────────────
+FetchContent_Declare(
+  glm
+  GIT_REPOSITORY https://github.com/g-truc/glm
+  GIT_TAG        1.0.1
+  GIT_SHALLOW    ON
+)
+FetchContent_MakeAvailable(glm)
+
 # ── WebGPU backend ───────────────────────────────────────────────────────────
 # Both wgpu-native and Dawn implement the same webgpu.h C API and run the same
 # WGSL natively on Metal / D3D12 / Vulkan — so our code and our WGSL are identical
@@ -133,7 +142,7 @@ function(embed_wgsl SRC VARNAME OUT)
   file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
 endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
-embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.wgsl"         TRIANGLE_WGSL         "${WGSL_GEN_DIR}/triangle_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/cube.wgsl"             CUBE_WGSL             "${WGSL_GEN_DIR}/cube_wgsl.h")
 
 add_executable(sailsim_native
   src/main.cpp
@@ -141,7 +150,7 @@ add_executable(sailsim_native
 )
 
 target_include_directories(sailsim_native PRIVATE "${WGSL_GEN_DIR}")
-target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu)
+target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on
 # the backend (e.g. wgpuDeviceTick vs wgpuDevicePoll). It is set on the `webgpu`

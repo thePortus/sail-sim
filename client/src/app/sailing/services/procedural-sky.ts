@@ -31,6 +31,7 @@ const SKY_BAKE_WGSL = `
 varying vUV: vec2f;
 
 uniform uSunDir: vec3f;   // unit vector FROM origin TOWARD the sun (scene space)
+uniform uGlow: f32;       // 1 = horizon sea-mist band + near-sun scattering glow ON, 0 = off (ignis_horizon_glow)
 
 const M_PI:   f32 = 3.1415926535;
 const HR:     f32 = 8000.0;        // Rayleigh scale height
@@ -174,6 +175,23 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
     let upDark = smoothstep(0.03, 0.45, D.y) * dusk;
     color = color * (1.0 - upDark * 0.88);
 
+    // ── Golden-hour horizon glow + sea-mist band (beauty pass 3, atmosphere finish) ──────────────────────
+    // goldenLow: strong at dawn/dusk (sun low but up), 0 at high noon (warmF→0) AND 0 at deep night (sunUp→0),
+    // so neither effect leaks into midday or the dark night sky. Both scale by uGlow (opt-out).
+    let sunUp     = smoothstep(-0.10, 0.08, Ds.y);      // 1 sun above horizon → 0 well below (night)
+    let goldenLow = warmF * sunUp * uniforms.uGlow;
+    // (A) Near-sun scattering AUREOLE — a soft warm halo around the low sun (the sky brightens toward the sun
+    //     at sunset). Falls off with angular distance (pow); additive, ACES-tonemapped downstream. KNOB: 0.9.
+    let sunMu   = max(dot(D, Ds), 0.0);
+    let aureole = pow(sunMu, 6.0);
+    color = color + vec3f(1.0, 0.52, 0.22) * (aureole * goldenLow * 0.9);
+    // (B) SEA-MIST BAND — a pale, low-saturation haze concentrated right at the horizon line (|D.y| small),
+    //     cool by day-edge, warming toward amber at full sunset. Reads as low-lying mist over the sea at golden
+    //     hour and lifts the waterline behind distant islands. KNOBS: 0.14 band width, 0.38 max opacity.
+    let mistBand = smoothstep(0.14, 0.0, abs(D.y));
+    let mistCol  = mix(vec3f(0.62, 0.66, 0.74), vec3f(0.96, 0.74, 0.52), warmF);
+    color = mix(color, mistCol, mistBand * goldenLow * 0.38);
+
     fragmentOutputs.color = vec4f(color, 1.0);
 }
 `;
@@ -241,6 +259,9 @@ export class ProceduralSky {
     this.lut.gammaSpace = false;                            // contents are LINEAR HDR radiance
     // Seed a daytime sun so the very first bake (which can fire before the first tick) isn't black.
     this.lut.setVector3('uSunDir', new Vector3(0.3, 0.7, 0.3).normalize());
+    // Golden-hour horizon glow + sea-mist band: on by default, opt out with ignis_horizon_glow='0'.
+    // Static 0/1 (re-applied on every re-bake by the ProceduralTexture), read once at construction.
+    this.lut.setFloat('uGlow', localStorage.getItem('ignis_horizon_glow') === '0' ? 0.0 : 1.0);
 
     this.lut.onGeneratedObservable.addOnce(() => {
       console.info('[ProceduralSky] LUT baked OK');

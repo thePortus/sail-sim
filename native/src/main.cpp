@@ -24,6 +24,7 @@
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE   // WebGPU clip-space Z is [0,1], like D3D/Metal
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/constants.hpp>
 
 #include <string>
 
@@ -682,6 +683,9 @@ int main(int argc, char** argv) {
 
   // Sailing state — arrow keys / WASD steer and trim sail; the ship sails the sea.
   float shipX = 0.0f, shipZ = 0.0f, shipHeading = 0.0f, shipSpeed = 0.0f, sail = 0.35f;
+  // The merchantman's model-space forward axis is +X, but travel (fwd) is +Z, so
+  // yaw the hull by -90° to line the bow up with the direction of sailing.
+  const float kBowYaw = -glm::half_pi<float>();
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
@@ -750,7 +754,7 @@ int main(int argc, char** argv) {
       float tiltAngle = std::asin(glm::clamp(axisLen, 0.0f, 1.0f));
       model = model * glm::rotate(glm::mat4(1.0f), tiltAngle, axis / axisLen);
     }
-    model = glm::rotate(model, shipHeading, glm::vec3(0, 1, 0));
+    model = glm::rotate(model, shipHeading + kBowYaw, glm::vec3(0, 1, 0));
     model = glm::scale(model, glm::vec3(shipScale));
     model = glm::translate(model, -keelCenter);
 

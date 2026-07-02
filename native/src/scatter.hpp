@@ -33,9 +33,13 @@ public:
   // Placement needs the world heightfield; call once terrain has loaded.
   void setTerrain(const terrain::Terrain* terr);
 
-  // Stream patches around the ship + advance the animal paths.
+  // The player's boat, as the wildlife behaviours see it (bow-riding dolphins,
+  // wake-following gulls, hull-fleeing fish, raft startle).
+  struct ShipInfo { float x = 0, z = 0, headingRad = 0, speedMps = 0; bool anchored = false; };
+
+  // Stream patches around the ship + advance the wildlife (exact client ports).
   void update(WGPUDevice device, WGPUQueue queue, float dt, double timeSec,
-              float shipX, float shipZ);
+              const ShipInfo& ship, float storminess);
 
   // Draw everything (called inside the main pass, after terrain, before ocean).
   void draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& viewProj,

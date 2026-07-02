@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
+#include <random>
 #include <vector>
 
 #include <glm/gtc/constants.hpp>
@@ -44,25 +46,22 @@ static float sstep(float a, float b, float x) {
   float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
   return t * t * (3.0f - 2.0f * t);
 }
+static float angDiff(float b, float a) {
+  float d = std::fmod(b - a, TAU);
+  if (d > glm::pi<float>()) d -= TAU; else if (d < -glm::pi<float>()) d += TAU;
+  return d;
+}
 
-// One instance: rows of the 3x4 world transform + tint + animation phase.
+// One instance: rows of the 3x4 world transform + tint + per-instance energy
+// (the animal animation amplitude; static props leave it 1).
 struct Inst {
-  float r0[4], r1[4], r2[4];   // rotation*scale columns as row-vectors, .w = translation
-  float tintPhase[4];          // rgb tint multiplier, w = per-instance phase
+  float r0[4], r1[4], r2[4];
+  float tintE[4];
 };
 static_assert(sizeof(Inst) == 16 * sizeof(float), "instance layout");
 
-// Compose rows from yaw/pitch/roll + per-axis scale + translation (kernel composeMat).
-static Inst compose(float yaw, float pitch, float roll, float sx, float sy, float sz,
-                    float px, float y, float pz, glm::vec3 tint, float phase) {
-  glm::vec4 qy(0, std::sin(yaw * 0.5f), 0, std::cos(yaw * 0.5f));
-  glm::vec4 qx(std::sin(pitch * 0.5f), 0, 0, std::cos(pitch * 0.5f));
-  glm::vec4 qz(0, 0, std::sin(roll * 0.5f), std::cos(roll * 0.5f));
-  auto qmul = [](glm::vec4 a, glm::vec4 b) {
-    glm::vec3 v = a.w * glm::vec3(b) + b.w * glm::vec3(a) + glm::cross(glm::vec3(a), glm::vec3(b));
-    return glm::vec4(v, a.w * b.w - glm::dot(glm::vec3(a), glm::vec3(b)));
-  };
-  glm::vec4 q = qmul(qy, qmul(qx, qz));
+static Inst composeQ(glm::vec4 q, float sx, float sy, float sz,
+                     float px, float y, float pz, glm::vec3 tint, float energy) {
   float x = q.x, yy = q.y, z = q.z, w = q.w;
   glm::vec3 c0 = glm::vec3(1 - 2 * (yy * yy + z * z), 2 * (x * yy + w * z), 2 * (x * z - w * yy)) * sx;
   glm::vec3 c1 = glm::vec3(2 * (x * yy - w * z), 1 - 2 * (x * x + z * z), 2 * (yy * z + w * x)) * sy;
@@ -71,18 +70,44 @@ static Inst compose(float yaw, float pitch, float roll, float sx, float sy, floa
   i.r0[0] = c0.x; i.r0[1] = c1.x; i.r0[2] = c2.x; i.r0[3] = px;
   i.r1[0] = c0.y; i.r1[1] = c1.y; i.r1[2] = c2.y; i.r1[3] = y;
   i.r2[0] = c0.z; i.r2[1] = c1.z; i.r2[2] = c2.z; i.r2[3] = pz;
-  i.tintPhase[0] = tint.r; i.tintPhase[1] = tint.g; i.tintPhase[2] = tint.b;
-  i.tintPhase[3] = phase;
+  i.tintE[0] = tint.r; i.tintE[1] = tint.g; i.tintE[2] = tint.b; i.tintE[3] = energy;
   return i;
 }
+static glm::vec4 qAxis(glm::vec3 ax, float ang) {
+  float s = std::sin(ang * 0.5f);
+  return glm::vec4(ax * s, std::cos(ang * 0.5f));
+}
+static glm::vec4 qmul(glm::vec4 a, glm::vec4 b) {
+  glm::vec3 v = a.w * glm::vec3(b) + b.w * glm::vec3(a) + glm::cross(glm::vec3(a), glm::vec3(b));
+  return glm::vec4(v, a.w * b.w - glm::dot(glm::vec3(a), glm::vec3(b)));
+}
+// Babylon YawPitchRoll: yaw about Y, pitch about X, roll about Z (kernels + dolphins/fish).
+static Inst compose(float yaw, float pitch, float roll, float sx, float sy, float sz,
+                    float px, float y, float pz, glm::vec3 tint, float energy) {
+  glm::vec4 q = qmul(qAxis({0, 1, 0}, yaw), qmul(qAxis({1, 0, 0}, pitch), qAxis({0, 0, 1}, roll)));
+  return composeQ(q, sx, sy, sz, px, y, pz, tint, energy);
+}
+// Bird frame (bird.service writeBird): yaw(Y) ∘ pitch(Z, span axis) ∘ roll(X, nose axis).
+static Inst composeBird(float yaw, float pitch, float roll, float s,
+                        float px, float y, float pz, glm::vec3 tint, float energy) {
+  glm::vec4 q = qmul(qAxis({0, 1, 0}, yaw), qmul(qAxis({0, 0, 1}, pitch), qAxis({1, 0, 0}, roll)));
+  return composeQ(q, s, s, s, px, y, pz, tint, energy);
+}
 
-// ── GPU plumbing ──────────────────────────────────────────────────────────────
+// ── Shader ────────────────────────────────────────────────────────────────────
+// anim: x time, y mode, z wind amp, w alpha cutoff.
+// lod:  x near, y band, z fadeMode (0 none / 1 full shrink-out / 2 impostor grow-in),
+//       w dither-cull start (0 = off; band is 60 m).
+// Animal modes (anim.y): 3 bird flap, 4 dolphin swim, 5 fish swim — exact ports of
+// the client's vertex plugins; phase derives from the instance's world translation
+// just like the plugins' world3-based phase. Instance tintE.w = energy.
 static const char* kWGSL = R"WGSL(
 struct U {
   viewProj : mat4x4<f32>,
   eye      : vec4<f32>,
-  sun      : vec4<f32>,   // xyz light dir; w = daylight
-  anim     : vec4<f32>,   // x time, y mode, z wind amp, w alpha cutoff
+  sun      : vec4<f32>,
+  anim     : vec4<f32>,
+  lod      : vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var tex  : texture_2d<f32>;
@@ -101,24 +126,49 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
            @location(2) inUV : vec2<f32>, @location(3) inAlb : vec3<f32>,
            @location(4) inMR : vec2<f32>,
            @location(5) r0 : vec4<f32>, @location(6) r1 : vec4<f32>,
-           @location(7) r2 : vec4<f32>, @location(8) tintPhase : vec4<f32>) -> VSOut {
+           @location(7) r2 : vec4<f32>, @location(8) tintE : vec4<f32>) -> VSOut {
   var p = inPos;
   let mode = u.anim.y;
   let t = u.anim.x;
-  let phase = tintPhase.w;
-  // Animal animation in LOCAL space (bird wing flap hinged along |x|; dolphin
-  // body undulation; fish tail wiggle) — ports of the client's vertex plugins.
-  if (mode > 2.5 && mode < 3.5) { p.y += sin(t * 9.0 + phase) * max(abs(p.x) - 0.10, 0.0) * 0.55; }
-  if (mode > 3.5 && mode < 4.5) { p.y += sin(t * 4.5 + phase + p.x * 0.9) * 0.10 * max(abs(p.x), 0.3); }
-  if (mode > 4.5) { p.z += sin(t * 7.0 + phase + p.x * 2.5) * 0.06; }
+  let E = tintE.w;
+  if (mode > 2.5 && mode < 3.5) {
+    // BirdFlapPlugin: wingtips (|z| span) beat, body bobs gently, world-pos phase.
+    let bWf  = smoothstep(0.10, 0.70, abs(p.z));
+    let bBob = 1.0 - smoothstep(0.05, 0.25, abs(p.z));
+    let bPh = (r0.w + r2.w) * 1.7;
+    let bF = sin(3.2 * t + bPh);
+    p.y += bF * (bWf * 0.26 * E + bBob * 0.05);
+  }
+  if (mode > 3.5 && mode < 4.5) {
+    // DolphinSwimPlugin: tail pump travelling wave along -x.
+    let dPump = 1.0 - smoothstep(-0.9, 0.3, p.x);
+    let dPh = (r0.w + r2.w) * 0.6;
+    let dW = 2.4 * t * (0.7 + 0.6 * E) - p.x * 2.2 + dPh;
+    p.y += sin(dW) * dPump * 0.10 * (0.4 + 0.85 * E);
+  }
+  if (mode > 4.5) {
+    // FishSwimPlugin: lateral tail sway travelling wave.
+    let fSway = 1.0 - smoothstep(-0.45, 0.25, p.x);
+    let fPh = (r0.w + r2.w) * 0.7;
+    let fW = 3.2 * t * (0.8 + 0.5 * E) - p.x * 3.4 + fPh;
+    p.z += sin(fW) * fSway * 0.13 * (0.5 + 0.7 * E);
+  }
+  // LoD cross-dissolve (NearFadePlugin port): the full mesh stays 1 inside `near`
+  // and shrinks out over [near, near+band]; the impostor is 1 outside and shrinks
+  // over [near-band, near] — around `near` BOTH are full-size (they overlap).
+  let dCam = distance(vec2<f32>(r0.w, r2.w), vec2<f32>(u.eye.x, u.eye.z));
+  var f = 1.0;
+  if (u.lod.z > 0.5 && u.lod.z < 1.5) { f = 1.0 - smoothstep(u.lod.x, u.lod.x + u.lod.y, dCam); }
+  if (u.lod.z > 1.5) { f = smoothstep(u.lod.x - u.lod.y, u.lod.x, dCam); }
+  p = p * f;
   var wp = vec3<f32>(dot(vec3<f32>(r0.x, r0.y, r0.z), p) + r0.w,
                      dot(vec3<f32>(r1.x, r1.y, r1.z), p) + r1.w,
                      dot(vec3<f32>(r2.x, r2.y, r2.z), p) + r2.w);
-  // Wind sway (palms mode 1, beeches mode 2): the crown leans, roots stay put.
+  // Wind sway (palms mode 1, beeches mode 2).
   if (mode > 0.5 && mode < 2.5) {
     let h = max(wp.y - r1.w, 0.0);
     let amp = select(0.020, 0.045, mode < 1.5) * u.anim.z;
-    let b = sin(t * select(1.6, 1.1, mode < 1.5) + phase) * amp * h * h * 0.06;
+    let b = sin(t * select(1.6, 1.1, mode < 1.5) + (r0.w + r2.w) * 0.05) * amp * h * h * 0.06;
     wp.x += b; wp.z += b * 0.6;
   }
   var o : VSOut;
@@ -128,7 +178,7 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
                                  dot(vec3<f32>(r1.x, r1.y, r1.z), inNrm),
                                  dot(vec3<f32>(r2.x, r2.y, r2.z), inNrm)));
   o.uv = inUV;
-  o.tint = inAlb * vec3<f32>(tintPhase.x, tintPhase.y, tintPhase.z);
+  o.tint = inAlb * vec3<f32>(tintE.x, tintE.y, tintE.z);
   return o;
 }
 
@@ -136,10 +186,18 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let c = textureSample(tex, samp, in.uv);
   if (u.anim.w > 0.0 && c.a < u.anim.w) { discard; }
+  // Screen-door dissolve at the patch-cull edge (LodDitherPlugin port): dithered
+  // out over [cullStart, cullStart+60] by interleaved-gradient noise.
+  if (u.lod.w > 0.0) {
+    let dd = distance(in.worldPos.xz, u.eye.xz);
+    let fade = 1.0 - smoothstep(u.lod.w, u.lod.w + 60.0, dd);
+    let ign = fract(52.9829189 * fract(dot(in.position.xy, vec2<f32>(0.06711056, 0.00583715))));
+    if (fade < ign) { discard; }
+  }
   var col = c.rgb * in.tint;
   let L = normalize(u.sun.xyz);
   var N = normalize(in.normal);
-  if (dot(N, u.eye.xyz - in.worldPos) < 0.0) { N = -N; }   // double-sided fronds
+  if (dot(N, u.eye.xyz - in.worldPos) < 0.0) { N = -N; }
   let diff = max(dot(N, L), 0.0);
   col = col * (0.38 + 0.62 * diff);
   let dayK = u.sun.w;
@@ -148,20 +206,58 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 }
 )WGSL";
 
-struct Variant {
+// One drawable mesh + its instance buffer + texture bind group.
+struct DrawSet {
   WGPUBuffer vbuf = nullptr, ibuf = nullptr, instBuf = nullptr;
   uint32_t indexCount = 0, instCap = 0, instCount = 0;
   WGPUBindGroup bind = nullptr;
 };
 
-// A scatter layer: one placement kernel + N mesh variants + an animation mode.
 struct Layer {
-  std::vector<Variant> variants;
-  WGPUBuffer ubuf = nullptr;
+  std::vector<DrawSet> full;     // per variant: the full GLB mesh
+  std::vector<DrawSet> lod;      // per variant: rock/drift low-poly LOD or tree cross-impostor ("" = none)
+  bool impostor = false;         // lod = billboard impostors (cross-dissolve) vs plain LOD meshes
+  WGPUBuffer ubufFull = nullptr, ubufLod = nullptr;
   float mode = 0, alphaCut = 0;
-  int res = 0;                                 // kernel candidates per patch edge
-  std::map<std::pair<int, int>, std::vector<std::vector<Inst>>> patches;   // patch -> per-variant
+  int res = 0;
+  std::map<std::pair<int, int>, std::vector<std::vector<Inst>>> patches;
   bool dirty = false;
+};
+
+// ── Wildlife state (ports of bird.service / dolphin.service / fish-school.service) ──
+struct BirdMember {
+  float ox, oz; int flyVariant; float scale; glm::vec3 tint; float yaw;
+  bool restWingsOut; float restTimer;
+  bool airborne;
+  float px, py, pz, hdg, spd, vy, bank;
+  float radBias, altBias;
+  float flapE; bool gliding; float glideTimer;
+  bool onFinal; float flare;
+  int dipState; float dipTimer, dipCooldown;
+};
+enum class FlockState { RESTING, TAKEOFF, FLYING, LANDING };
+struct Flock {
+  FlockState state; float stateTimer, dwell;
+  float cx, cz, cy, anchorX, anchorZ, cruiseAlt, wanderR;
+  float gx, gy, gz, goalAlt, wTx, wTz, wanderTimer;
+  float driftX, driftZ, nearShipDist;
+  bool following; float followTimer, followCooldown;
+  std::vector<BirdMember> members;
+};
+struct Dolphin {
+  float x, z, y, theta, targetTheta, speed, targetSpeed, baseY;
+  float depthPhase, depthRate, depthAmp, retarget, effort;
+  int group; float bank; int bowSlot; bool breaching; float breachVy;
+  float scale, homeX, homeZ; glm::vec3 tint;
+};
+struct FishM {
+  float x, z, y, theta, targetTheta, speed, targetSpeed, baseY;
+  float depthPhase, depthRate, depthAmp, retarget, effort, bank;
+};
+struct FishSchool {
+  int species; float homeX, homeZ, scl;
+  bool boiling; float boilT;
+  std::vector<FishM> fish;
 };
 
 struct System::Impl {
@@ -174,23 +270,64 @@ struct System::Impl {
   const terrain::Terrain* terr = nullptr;
   bool ready = false;
 
-  Layer palms, trees, rocks, drift;            // static, patch-streamed
-  Layer birds, dolphins, fish;                 // living, CPU-pathed
-  int lastPX = INT32_MIN, lastPZ = INT32_MIN;  // patch origin of the last stream
+  Layer palms, trees, rocks, drift;
+  Layer birdsL, dolphinsL, fishL;   // wildlife draw sets (full[] only; instances per frame)
+  int lastPX = INT32_MIN, lastPZ = INT32_MIN;
+  float flushX = 1e9f, flushZ = 1e9f;   // camera pos of the last visible-set flush
 
-  static constexpr float PATCH = 40.0f;        // metres (client)
-  static constexpr int   RINGS = 8;            // patch radius (client quality default)
+  static constexpr float PATCH = 40.0f;
+  static constexpr int   RINGS = 8;
+  static constexpr float LOD_SPLIT = 120.0f;     // rocks/drift: full mesh inside, low-poly LOD beyond
+  static constexpr float NEAR_FADE = 260.0f;     // trees: full <-> impostor cross-dissolve centre (client)
+  static constexpr float NEAR_BAND = 55.0f;
+  static constexpr float TREE_CULL = 280.0f;     // dither out to nothing by 340 (client treeFade)
 
-  // ── Animal state ──
-  struct Bird { float cx, cz, r, alt, w, ph; };
-  std::vector<Bird> birdStates;
-  struct Pod { float cx, cz, heading; float ph[5]; int n; };
-  Pod pod{};
-  struct School { float cx, cz, r, w, y; int n; float ph; };
-  std::vector<School> schools;
-  double animSeed = 0;
+  std::minstd_rand rng{ 12345 };
+  float frand() { return (float)rng() / (float)std::minstd_rand::max(); }
+
+  // Wildlife (client constants).
+  std::vector<Flock> flocks;
+  float spawnTimer = 0;
+  static constexpr int   MAX_FLOCKS = 4;         // quality High
+  static constexpr float SPAWN_INTERVAL = 1.2f;
+  static constexpr float SPAWN_MIN = 60, SPAWN_MAX = 160, DESPAWN = 240, LAND_PROXIMITY = 250;
+  static constexpr float SEA_Y = 0.25f, GROUND_CLEARANCE = 9, TAKEOFF_TIME = 2.6f, LAND_TIME = 3.4f;
+  static constexpr float STARTLE_RADIUS = 65, IMMINENT_RADIUS = 26;
+  static constexpr float CRUISE_SPD = 8.5f, MIN_SPD = 5.5f, ACCEL = 5.0f, TURN_RATE = 0.85f;
+  static constexpr float MAX_BANK = 0.62f, BANK_EASE = 3.0f, CLIMB_RATE = 2.8f, VACCEL = 3.5f, PITCH_GAIN = 1.0f;
+  static constexpr float NEIGH_R = 12, SEP_R = 4.5f, W_GOAL = 0.85f, W_ALI = 0.5f, W_COH = 0.35f, W_SEP = 1.7f, VSEP = 1.3f;
+  static constexpr float FLARE_ALT = 7, LAND_SPD = 4.5f, FLARE_PITCH = 0.55f;
+  static constexpr float FOLLOW_TRIGGER = 75, FOLLOW_DROP = 150, FOLLOW_TRAIL = 22, FOLLOW_ALT = 14,
+                         FOLLOW_WANDER = 14, FOLLOW_MIN_SPD = 1.0f;
+  static constexpr float DIP_SKIM_H = 0.8f, DIP_RATE = 0.015f, DIP_RATE_FOLLOW = 0.07f, DIP_DIVE_RATE = 6.5f;
+  static constexpr float kBirdAmp[4] = { 1.0f, 0.4f, 1.0f, 0.5f };   // per-variant flap scale
+
+  std::vector<Dolphin> pod;
+  bool dolActive = false;
+  static constexpr float D_DEPTH_MIN = 2.0f, D_DEPTH_MAX = 22, D_LEASH = 42;
+  static constexpr int   D_PODS = 2;
+  static constexpr float D_SURFACE_CLEAR = 1.0f, D_SEABED_CLEAR = 0.7f;
+  static constexpr float D_SEP_R = 6, D_W_WANDER = 0.5f, D_W_COH = 0.5f, D_W_ALI = 0.55f, D_W_SEP = 1.8f;
+  static constexpr float D_TURN = 1.7f, D_BANK_K = 0.55f, D_MAX_BANK = 0.6f, D_BANK_EASE = 3.0f;
+  static constexpr float BOWRIDE_SPEED_MIN = 1.4f, BOW_AHEAD = 8, BOW_SPACING = 4, BOW_SIDE = 2.6f,
+                         BOWRIDE_RANGE = 30, BOWRIDE_DEPTH = -0.9f;
+  static constexpr int   MAX_RIDERS = 6, MAX_BREACH = 2;
+  static constexpr float BREACH_CHANCE = 0.05f, BREACH_VY0 = 7.5f, BREACH_G = 13, BREACH_REENTRY = -1.2f,
+                         BREACH_MIN_DEPTH = 3;
+  static constexpr float D_UPRIGHT = glm::half_pi<float>();
+  static constexpr float D_FACE = glm::pi<float>();
+
+  std::vector<FishSchool> schools;
+  bool fishActive = false;
+  static constexpr float F_LEASH = 36, F_SURFACE_CLEAR = 1.2f, F_SEABED_CLEAR = 0.6f;
+  static constexpr float F_SEP_R = 1.4f, F_W_WANDER = 0.35f, F_W_COH = 0.9f, F_W_ALI = 0.7f, F_W_SEP = 1.6f;
+  static constexpr float F_TURN = 2.6f, F_BANK_K = 0.3f, F_MAX_BANK = 0.5f, F_BANK_EASE = 4.0f;
+  static constexpr float HULL_FLEE_R = 12, HULL_FLEE_W = 3.5f, THREAT_R = 16, THREAT_FLEE_W = 4.5f,
+                         BOLT_SPEED = 4.5f, BOIL_DEPTH = -0.7f;
+  static constexpr int   NSPECIES = 4;
 
   float ground(float x, float z) const { return terr ? terr->elevation(x, z) : -1000.0f; }
+  bool isLand(float x, float z) const { return ground(x, z) > 0.02f; }
   float slope(float x, float z) const {
     const float e = 2.0f;
     float gx = ground(x + e, z) - ground(x - e, z);
@@ -207,27 +344,22 @@ struct System::Impl {
     }
     return false;
   }
+  bool nearLand(float x, float z) const {
+    const float radii[3] = { LAND_PROXIMITY * 0.35f, LAND_PROXIMITY * 0.7f, LAND_PROXIMITY };
+    for (float r : radii)
+      for (int k = 0; k < 6; ++k) {
+        float a = ((float)k / 6.0f) * TAU;
+        if (isLand(x + std::cos(a) * r, z + std::sin(a) * r)) return true;
+      }
+    return false;
+  }
 };
-using Impl = System::Impl;   // free helpers below refer to the nested type
+using Impl = System::Impl;
 
 System::System() : p_(std::make_unique<Impl>()) {}
 System::~System() = default;
 
-// Upload a mesh variant's vertex/index buffers.
-static void uploadVariantMesh(Impl* p, Variant& v, const MeshData& md) {
-  WGPUBufferDescriptor vbd = {};
-  vbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-  vbd.size = md.vertices.size() * sizeof(float);
-  v.vbuf = wgpuDeviceCreateBuffer(p->device, &vbd);
-  wgpuQueueWriteBuffer(p->queue, v.vbuf, 0, md.vertices.data(), vbd.size);
-  WGPUBufferDescriptor ibd = {};
-  ibd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
-  ibd.size = md.indices.size() * sizeof(uint32_t);
-  v.ibuf = wgpuDeviceCreateBuffer(p->device, &ibd);
-  wgpuQueueWriteBuffer(p->queue, v.ibuf, 0, md.indices.data(), ibd.size);
-  v.indexCount = (uint32_t)md.indices.size();
-}
-
+// ── GPU helpers ───────────────────────────────────────────────────────────────
 static WGPUTextureView makeTexView(Impl* p, int w, int h, const uint8_t* rgba, bool srgb) {
   WGPUTextureDescriptor td = {};
   td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
@@ -242,16 +374,17 @@ static WGPUTextureView makeTexView(Impl* p, int w, int h, const uint8_t* rgba, b
   wgpuQueueWriteTexture(p->queue, &dst, rgba, (size_t)w * h * 4, &dl, &ext);
   return wgpuTextureCreateView(tex, nullptr);
 }
-
-static WGPUTextureView loadPngView(Impl* p, const std::string& path) {
-  int w = 0, h = 0, c = 0;
-  unsigned char* px = stbi_load(path.c_str(), &w, &h, &c, 4);
-  if (!px) return nullptr;
-  WGPUTextureView v = makeTexView(p, w, h, px, true);
+struct PngData { int w = 0, h = 0; std::vector<uint8_t> rgba; bool ok = false; };
+static PngData loadPng(const std::string& path) {
+  PngData out;
+  int c = 0;
+  unsigned char* px = stbi_load(path.c_str(), &out.w, &out.h, &c, 4);
+  if (!px) return out;
+  out.rgba.assign(px, px + (size_t)out.w * out.h * 4);
   stbi_image_free(px);
-  return v;
+  out.ok = true;
+  return out;
 }
-
 static WGPUTextureView loadKtx2View(Impl* p, const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return nullptr;
@@ -260,14 +393,61 @@ static WGPUTextureView loadKtx2View(Impl* p, const std::string& path) {
   if (!decodeKtx2ToRGBA(bytes.data(), bytes.size(), w, h, rgba)) return nullptr;
   return makeTexView(p, w, h, rgba.data(), true);
 }
+// Fraction of the image height that is transparent below the content.
+static float bottomPad(const PngData& img) {
+  for (int y = img.h - 1; y >= 0; --y) {
+    const uint8_t* row = img.rgba.data() + (size_t)y * img.w * 4;
+    for (int x = 0; x < img.w; ++x)
+      if (row[x * 4 + 3] >= 16) return (float)(img.h - 1 - y) / (float)img.h;
+  }
+  return 0.0f;
+}
 
-static void buildVariantBind(Impl* p, Layer& l, Variant& v, WGPUTextureView tex) {
+static void makeDrawSet(Impl* p, DrawSet& d, const MeshData& md, WGPUBuffer ubuf,
+                        WGPUTextureView tex, uint32_t instCap) {
+  WGPUBufferDescriptor vbd = {};
+  vbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+  vbd.size = md.vertices.size() * sizeof(float);
+  d.vbuf = wgpuDeviceCreateBuffer(p->device, &vbd);
+  wgpuQueueWriteBuffer(p->queue, d.vbuf, 0, md.vertices.data(), vbd.size);
+  WGPUBufferDescriptor ibd = {};
+  ibd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+  ibd.size = md.indices.size() * sizeof(uint32_t);
+  d.ibuf = wgpuDeviceCreateBuffer(p->device, &ibd);
+  wgpuQueueWriteBuffer(p->queue, d.ibuf, 0, md.indices.data(), ibd.size);
+  d.indexCount = (uint32_t)md.indices.size();
+  d.instCap = instCap;
+  WGPUBufferDescriptor xbd = {};
+  xbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+  xbd.size = (uint64_t)instCap * sizeof(Inst);
+  d.instBuf = wgpuDeviceCreateBuffer(p->device, &xbd);
   WGPUBindGroupEntry be[3] = {};
-  be[0].binding = 0; be[0].buffer = l.ubuf; be[0].size = sizeof(glm::mat4) + 3 * sizeof(glm::vec4);
+  be[0].binding = 0; be[0].buffer = ubuf; be[0].size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);
   be[1].binding = 1; be[1].textureView = tex ? tex : p->whiteView;
   be[2].binding = 2; be[2].sampler = p->samp;
   WGPUBindGroupDescriptor bgd = {}; bgd.layout = p->bgl; bgd.entryCount = 3; bgd.entries = be;
-  v.bind = wgpuDeviceCreateBindGroup(p->device, &bgd);
+  d.bind = wgpuDeviceCreateBindGroup(p->device, &bgd);
+}
+
+// Three-quad cross billboard (createCrossImpostor port): quads at 0/60/120 deg,
+// base at local y=0 (image bottom padding removed), normals up.
+static MeshData makeCrossMesh(float width, float height, float basePad) {
+  MeshData m;
+  float y0 = -basePad * height, y1 = height - basePad * height;
+  for (int k = 0; k < 3; ++k) {
+    float a = (float)k / 3.0f * glm::pi<float>();
+    float cx = std::cos(a) * width * 0.5f, cz = std::sin(a) * width * 0.5f;
+    uint32_t base = (uint32_t)(m.vertices.size() / kFloatsPerVertex);
+    auto push = [&](float x, float y, float z, float uu, float vv) {
+      float v[kFloatsPerVertex] = { x, y, z, 0, 1, 0, uu, vv, 1, 1, 1, 0, 0.9f };
+      m.vertices.insert(m.vertices.end(), v, v + kFloatsPerVertex);
+    };
+    push(-cx, y0, -cz, 0, 1); push(cx, y0, cz, 1, 1);
+    push(cx, y1, cz, 1, 0);  push(-cx, y1, -cz, 0, 0);
+    m.indices.insert(m.indices.end(), { base, base + 1, base + 2, base, base + 2, base + 3 });
+  }
+  m.ok = true;
+  return m;
 }
 
 bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat,
@@ -275,7 +455,6 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   Impl* p = p_.get();
   p->device = device; p->queue = queue;
 
-  // ── Pipeline ──
   WGPUShaderModuleWGSLDescriptor wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
   wgsl.code = kWGSL;
@@ -331,7 +510,7 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   rpd.vertex.module = module; rpd.vertex.entryPoint = "vs_main";
   rpd.vertex.bufferCount = 2; rpd.vertex.buffers = vbls;
   rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
-  rpd.primitive.cullMode = WGPUCullMode_None;   // fronds/wings are double-sided
+  rpd.primitive.cullMode = WGPUCullMode_None;
   rpd.depthStencil = &ds; rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu;
   rpd.fragment = &frag;
   p->pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
@@ -346,99 +525,142 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   const uint8_t white[4] = { 255, 255, 255, 255 };
   p->whiteView = makeTexView(p, 1, 1, white, true);
 
-  // ── Load a layer's variants: GLB meshes + a texture policy ──
-  auto initLayer = [&](Layer& l, float mode, float alphaCut, int res,
-                       const std::vector<std::string>& glbs,
-                       const std::vector<std::string>& texPaths,   // per variant ("" = embedded/white)
-                       uint32_t instCap) -> bool {
-    l.mode = mode; l.alphaCut = alphaCut; l.res = res;
+  auto makeUbuf = [&]() {
     WGPUBufferDescriptor ubd = {};
     ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-    ubd.size = sizeof(glm::mat4) + 3 * sizeof(glm::vec4);
-    l.ubuf = wgpuDeviceCreateBuffer(device, &ubd);
-    for (size_t i = 0; i < glbs.size(); ++i) {
-      MeshData md = loadGltfMesh((dir + "/" + glbs[i]).c_str());
-      if (!md.ok) { std::printf("[scatter] missing %s\n", glbs[i].c_str()); continue; }
-      Variant v;
-      uploadVariantMesh(p, v, md);
-      v.instCap = instCap;
-      WGPUBufferDescriptor ibd2 = {};
-      ibd2.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-      ibd2.size = (uint64_t)instCap * sizeof(Inst);
-      v.instBuf = wgpuDeviceCreateBuffer(device, &ibd2);
-      // Texture: explicit path (png/ktx2) > first embedded sRGB map > white.
-      WGPUTextureView tv = nullptr;
-      if (i < texPaths.size() && !texPaths[i].empty()) {
-        const std::string& tp = texPaths[i];
-        tv = tp.size() > 5 && tp.substr(tp.size() - 5) == ".ktx2" ? loadKtx2View(p, tp) : loadPngView(p, tp);
-      } else {
-        for (size_t t = 0; t < md.textures.size(); ++t)
-          if (md.textures[t].srgb) {
-            tv = makeTexView(p, md.textures[t].width, md.textures[t].height, md.textures[t].rgba.data(), true);
-            break;
-          }
-      }
-      buildVariantBind(p, l, v, tv);
-      l.variants.push_back(v);
-    }
-    return !l.variants.empty();
+    ubd.size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);
+    return wgpuDeviceCreateBuffer(device, &ubd);
+  };
+  auto embeddedTex = [&](const MeshData& md) -> WGPUTextureView {
+    for (const auto& t : md.textures)
+      if (t.srgb) return makeTexView(p, t.width, t.height, t.rgba.data(), true);
+    return nullptr;
   };
 
   const std::string T = dir + "/textures/";
   bool ok = true;
-  ok &= initLayer(p->palms, 1, 0.5f, 14, { "palm_a.glb", "palm_b.glb", "palm_c.glb" }, {}, 4000);
-  ok &= initLayer(p->trees, 2, 0.5f, 16, { "beech_a.glb", "beech_b.glb", "beech_c.glb" }, {}, 4000);
-  ok &= initLayer(p->rocks, 0, 0.0f, 24,
-                  { "rock_a.glb", "rock_b.glb", "rock_c.glb", "rock_d.glb", "rock_e.glb" },
-                  { T + "rock_04_albedo.ktx2", T + "rock_05_albedo.ktx2", T + "rock_cracked_albedo.ktx2",
-                    T + "rock_04_albedo.ktx2", T + "rock_05_albedo.ktx2" }, 6000);
-  ok &= initLayer(p->drift, 0, 0.0f, 20,
-                  { "drift_a.glb", "drift_b.glb", "drift_c.glb", "drift_d.glb", "drift_e.glb" },
-                  { T + "drift_albedo.png", T + "drift_albedo.png", T + "drift_albedo.png",
-                    T + "drift_albedo.png", T + "drift_albedo.png" }, 3000);
-  ok &= initLayer(p->birds, 3, 0.5f, 0, { "bird_a.glb", "bird_b.glb", "bird_c.glb" },
-                  { T + "bird_atlas.png", T + "bird_atlas.png", T + "bird_atlas.png" }, 64);
-  ok &= initLayer(p->dolphins, 4, 0.0f, 0, { "dolphin_a.glb", "dolphin_b.glb", "dolphin_c.glb" },
-                  { T + "dolphin_atlas.png", T + "dolphin_atlas.png", T + "dolphin_atlas.png" }, 16);
-  ok &= initLayer(p->fish, 5, 0.5f, 0, { "fish_a.glb", "fish_b.glb" },
-                  { T + "fish_atlas.png", T + "fish_atlas.png" }, 128);
+
+  // ── Static layers: full GLB + (LOD glb | cross-impostor) per variant ──
+  struct StaticCfg {
+    Layer* l; float mode, alphaCut; int res; uint32_t cap;
+    std::vector<std::string> glbs, lodGlbs, texPaths, impPngs;
+  };
+  StaticCfg cfgs[] = {
+    { &p->palms, 1, 0.5f, 14, 4000, { "palm_a.glb", "palm_b.glb", "palm_c.glb" }, {}, {},
+      { T + "impostor_a.png", T + "impostor_b.png", T + "impostor_c.png" } },
+    { &p->trees, 2, 0.5f, 16, 4000, { "beech_a.glb", "beech_b.glb", "beech_c.glb" }, {}, {},
+      { T + "beech_impostor_a.png", T + "beech_impostor_b.png", T + "beech_impostor_c.png" } },
+    { &p->rocks, 0, 0.0f, 24, 6000,
+      { "rock_a.glb", "rock_b.glb", "rock_c.glb", "rock_d.glb", "rock_e.glb" },
+      { "rock_a_lod.glb", "rock_b_lod.glb", "rock_c_lod.glb", "rock_d_lod.glb", "rock_e_lod.glb" },
+      { T + "rock_04_albedo.ktx2", T + "rock_05_albedo.ktx2", T + "rock_cracked_albedo.ktx2",
+        T + "rock_04_albedo.ktx2", T + "rock_05_albedo.ktx2" }, {} },
+    { &p->drift, 0, 0.0f, 20, 3000,
+      { "drift_a.glb", "drift_b.glb", "drift_c.glb", "drift_d.glb", "drift_e.glb" },
+      { "drift_a_lod.glb", "drift_b_lod.glb", "drift_c_lod.glb", "drift_d_lod.glb", "drift_e_lod.glb" },
+      { T + "drift_albedo.png", T + "drift_albedo.png", T + "drift_albedo.png",
+        T + "drift_albedo.png", T + "drift_albedo.png" }, {} },
+  };
+  for (auto& c : cfgs) {
+    Layer& l = *c.l;
+    l.mode = c.mode; l.alphaCut = c.alphaCut; l.res = c.res;
+    l.impostor = !c.impPngs.empty();
+    l.ubufFull = makeUbuf(); l.ubufLod = makeUbuf();
+    for (size_t i = 0; i < c.glbs.size(); ++i) {
+      MeshData md = loadGltfMesh((dir + "/" + c.glbs[i]).c_str());
+      if (!md.ok) { std::printf("[scatter] missing %s\n", c.glbs[i].c_str()); continue; }
+      WGPUTextureView tv = nullptr;
+      if (i < c.texPaths.size() && !c.texPaths[i].empty()) {
+        const std::string& tp = c.texPaths[i];
+        if (tp.size() > 5 && tp.substr(tp.size() - 5) == ".ktx2") tv = loadKtx2View(p, tp);
+        else { PngData png = loadPng(tp); if (png.ok) tv = makeTexView(p, png.w, png.h, png.rgba.data(), true); }
+      } else tv = embeddedTex(md);
+      DrawSet dsF; makeDrawSet(p, dsF, md, l.ubufFull, tv, c.cap);
+      l.full.push_back(dsF);
+      if (!c.lodGlbs.empty()) {                              // plain low-poly LOD mesh
+        MeshData ml = loadGltfMesh((dir + "/" + c.lodGlbs[i]).c_str());
+        DrawSet dsL;
+        if (ml.ok) { makeDrawSet(p, dsL, ml, l.ubufLod, tv, c.cap); }
+        l.lod.push_back(dsL);
+      } else if (l.impostor) {                               // cross-billboard impostor
+        PngData png = loadPng(c.impPngs[i]);
+        float h = md.bbMax[1] - md.bbMin[1];
+        MeshData cross = makeCrossMesh(h, h, png.ok ? bottomPad(png) : 0.0f);
+        WGPUTextureView iv = png.ok ? makeTexView(p, png.w, png.h, png.rgba.data(), true) : nullptr;
+        DrawSet dsI; makeDrawSet(p, dsI, cross, l.ubufLod, iv, c.cap);
+        l.lod.push_back(dsI);
+      }
+    }
+    ok = ok && !l.full.empty();
+  }
+
+  // ── Wildlife draw sets ──
+  auto initAnimal = [&](Layer& l, float mode, float alphaCut,
+                        const std::vector<std::string>& glbs,
+                        const std::string& atlasPng, uint32_t cap) -> bool {
+    l.mode = mode; l.alphaCut = alphaCut;
+    l.ubufFull = makeUbuf();
+    PngData png = loadPng(atlasPng);
+    WGPUTextureView tv = png.ok ? makeTexView(p, png.w, png.h, png.rgba.data(), true) : nullptr;
+    for (const std::string& g : glbs) {
+      MeshData md = loadGltfMesh((dir + "/" + g).c_str());
+      if (!md.ok) { std::printf("[scatter] missing %s\n", g.c_str()); l.full.push_back({}); continue; }
+      DrawSet dsA; makeDrawSet(p, dsA, md, l.ubufFull, tv, cap);
+      l.full.push_back(dsA);
+    }
+    return !l.full.empty();
+  };
+  ok &= initAnimal(p->birdsL, 3, 0.5f,
+                   { "bird_a.glb", "bird_b.glb", "bird_c.glb", "bird_d.glb" }, T + "bird_atlas.png", 220);
+  ok &= initAnimal(p->dolphinsL, 4, 0.0f,
+                   { "dolphin_a.glb", "dolphin_b.glb", "dolphin_c.glb" }, T + "dolphin_atlas.png", 32);
+  // Fish: 4 species = UV-row-remapped clones of the two bodies (fish-school.service SPECIES).
+  {
+    Layer& l = p->fishL;
+    l.mode = 5; l.alphaCut = 0.5f;
+    l.ubufFull = makeUbuf();
+    PngData png = loadPng(T + "fish_atlas.png");
+    WGPUTextureView tv = png.ok ? makeTexView(p, png.w, png.h, png.rgba.data(), true) : nullptr;
+    MeshData bodyA = loadGltfMesh((dir + "/fish_a.glb").c_str());
+    MeshData bodyB = loadGltfMesh((dir + "/fish_b.glb").c_str());
+    const struct { int row; char body; } SPECIES[4] = { {0,'a'}, {1,'b'}, {2,'b'}, {3,'a'} };
+    for (int s = 0; s < 4; ++s) {
+      const MeshData& src = SPECIES[s].body == 'a' ? bodyA : bodyB;
+      if (!src.ok) { l.full.push_back({}); continue; }
+      MeshData md = src;
+      float rowH = 1.0f / (float)Impl::NSPECIES;
+      for (size_t v = 0; v + kFloatsPerVertex <= md.vertices.size(); v += kFloatsPerVertex)
+        md.vertices[v + 7] = md.vertices[v + 7] * rowH + (float)SPECIES[s].row * rowH;
+      DrawSet dsF; makeDrawSet(p, dsF, md, l.ubufFull, tv, 64);
+      l.full.push_back(dsF);
+    }
+    ok &= !l.full.empty();
+  }
 
   p->ready = ok;
-  std::printf("[scatter] %s (palms %zu, trees %zu, rocks %zu, drift %zu, birds %zu, dolphins %zu, fish %zu)\n",
+  std::printf("[scatter] %s (palms %zu+%zu, trees %zu+%zu, rocks %zu+%zu, drift %zu+%zu, birds %zu, dolphins %zu, fish %zu)\n",
               ok ? "ready" : "INCOMPLETE",
-              p->palms.variants.size(), p->trees.variants.size(), p->rocks.variants.size(),
-              p->drift.variants.size(), p->birds.variants.size(), p->dolphins.variants.size(),
-              p->fish.variants.size());
+              p->palms.full.size(), p->palms.lod.size(), p->trees.full.size(), p->trees.lod.size(),
+              p->rocks.full.size(), p->rocks.lod.size(), p->drift.full.size(), p->drift.lod.size(),
+              p->birdsL.full.size(), p->dolphinsL.full.size(), p->fishL.full.size());
   return ok;
 }
 
 void System::setTerrain(const terrain::Terrain* terr) { p_->terr = terr; }
 
-// ── Placement kernels: CPU twins of ROCKS/DRIFT/TREES/PALMS_WGSL ─────────────
-static void placePatch(Impl* p, Layer& l, int pxi, int pzi,
-                       void (*kernel)(Impl*, Layer&, float, float, std::vector<std::vector<Inst>>&)) {
-  auto key = std::make_pair(pxi, pzi);
-  if (l.patches.count(key)) return;
-  std::vector<std::vector<Inst>> per(l.variants.size());
-  float cx = ((float)pxi + 0.5f) * Impl::PATCH, cz = ((float)pzi + 0.5f) * Impl::PATCH;
-  for (int gz = 0; gz < l.res; ++gz)
-    for (int gx = 0; gx < l.res; ++gx) {
-      float cell = Impl::PATCH / (float)l.res;
-      float wx = cx + ((float)gx + hash2(cx + gx * 12.9f, cz + gz * 78.2f)) * cell - Impl::PATCH * 0.5f;
-      float wz = cz + ((float)gz + hash2(cx + gx * 39.3f + 7.1f, cz + gz * 11.7f - 3.3f)) * cell - Impl::PATCH * 0.5f;
-      kernel(p, l, wx, wz, per);
-    }
-  l.patches.emplace(key, std::move(per));
-  l.dirty = true;
+// ── Placement kernels (unchanged CPU twins) ───────────────────────────────────
+static int variantOf(size_t n, float px, float pz) {
+  return (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * (float)n) % (int)n;
 }
+static const glm::vec3 kRockTints[6] = {
+  { 1.00f, 1.00f, 1.00f }, { 0.92f, 0.90f, 0.87f }, { 0.87f, 0.89f, 0.93f },
+  { 1.00f, 0.97f, 0.92f }, { 0.91f, 0.93f, 0.90f }, { 0.96f, 0.96f, 0.99f } };
+static const glm::vec3 kDriftTints[6] = {
+  { 1.00f, 1.00f, 1.02f }, { 1.02f, 1.00f, 0.96f }, { 0.96f, 0.93f, 0.88f },
+  { 0.90f, 0.86f, 0.80f }, { 0.97f, 0.94f, 0.88f }, { 0.86f, 0.88f, 0.90f } };
 
-// Variant index for a candidate (the kernels' dealtAway spreads variants).
-static int variantOf(const Layer& l, float px, float pz) {
-  return (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * (float)l.variants.size())
-         % (int)l.variants.size();
-}
-
-static void palmKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::vector<Inst>>& out) {
+typedef void (*Kernel)(Impl*, size_t, float, float, std::vector<std::vector<Inst>>&);
+static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
   float y = p->ground(px, pz);
   if (y < 0.6f || y > 45.0f) return;
   float sl = p->slope(px, pz);
@@ -449,11 +671,9 @@ static void palmKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::v
   if (p->nearShore(px, pz, 7.0f)) return;
   float s = 0.92f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.16f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
-  out[variantOf(l, px, pz)].push_back(
-      compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), hash2(px, pz) * TAU));
+  out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
 }
-
-static void treeKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
   float y = p->ground(px, pz);
   if (y < 0.6f || y > 80.0f) return;
   float sl = p->slope(px, pz);
@@ -465,18 +685,9 @@ static void treeKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::v
   if (p->nearShore(px, pz, 7.0f)) return;
   float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
-  out[variantOf(l, px, pz)].push_back(
-      compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), hash2(px, pz) * TAU));
+  out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
 }
-
-static const glm::vec3 kRockTints[6] = {
-  { 1.00f, 1.00f, 1.00f }, { 0.92f, 0.90f, 0.87f }, { 0.87f, 0.89f, 0.93f },
-  { 1.00f, 0.97f, 0.92f }, { 0.91f, 0.93f, 0.90f }, { 0.96f, 0.96f, 0.99f } };
-static const glm::vec3 kDriftTints[6] = {
-  { 1.00f, 1.00f, 1.02f }, { 1.02f, 1.00f, 0.96f }, { 0.96f, 0.93f, 0.88f },
-  { 0.90f, 0.86f, 0.80f }, { 0.97f, 0.94f, 0.88f }, { 0.86f, 0.88f, 0.90f } };
-
-static void rockKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
   float y = p->ground(px, pz);
   if (y < 0.25f || y > 150.0f) return;
   float sl = p->slope(px, pz);
@@ -498,11 +709,10 @@ static void rockKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::v
   float pitch = (hash2(px * 2.3f, pz * 5.1f) - 0.5f) * 0.5f;
   float roll = (hash2(px * 5.1f, pz * 2.3f) - 0.5f) * 0.5f;
   int ti = (int)(hash2(px * 0.9f - 11.0f, pz * 0.9f + 11.0f) * 6.0f) % 6;
-  out[variantOf(l, px, pz)].push_back(
-      compose(yaw, pitch, roll, sx, sy, sz, px, y - base * 0.1f, pz, kRockTints[ti], 0));
+  out[variantOf(nv, px, pz)].push_back(
+      compose(yaw, pitch, roll, sx, sy, sz, px, y - base * 0.1f, pz, kRockTints[ti], 1.0f));
 }
-
-static void driftKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void driftKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
   float y = p->ground(px, pz);
   if (y < 0.25f || y > 7.0f) return;
   float sl = p->slope(px, pz);
@@ -518,35 +728,583 @@ static void driftKernel(Impl* p, Layer& l, float px, float pz, std::vector<std::
   float pitch = (hash2(px * 2.3f, pz * 5.1f) - 0.5f) * 0.3f;
   float roll = (hash2(px * 5.1f, pz * 2.3f) - 0.5f) * 0.3f;
   int ti = (int)(hash2(px * 0.9f - 11.0f, pz * 0.9f + 11.0f) * 6.0f) % 6;
-  out[variantOf(l, px, pz)].push_back(
-      compose(yaw, pitch, roll, s, s, s, px, y - 0.03f, pz, kDriftTints[ti], 0));
+  out[variantOf(nv, px, pz)].push_back(
+      compose(yaw, pitch, roll, s, s, s, px, y - 0.03f, pz, kDriftTints[ti], 1.0f));
 }
 
-// Rebuild a layer's concatenated per-variant instance buffers from its patches.
-static void flushLayer(Impl* p, Layer& l) {
-  if (!l.dirty) return;
-  l.dirty = false;
-  std::vector<std::vector<Inst>> all(l.variants.size());
-  for (const auto& [k, per] : l.patches)
-    for (size_t v = 0; v < per.size() && v < all.size(); ++v)
-      all[v].insert(all[v].end(), per[v].begin(), per[v].end());
-  for (size_t v = 0; v < l.variants.size(); ++v) {
-    Variant& var = l.variants[v];
-    var.instCount = std::min((uint32_t)all[v].size(), var.instCap);
-    if (var.instCount)
-      wgpuQueueWriteBuffer(p->queue, var.instBuf, 0, all[v].data(), (uint64_t)var.instCount * sizeof(Inst));
+static void placePatch(Impl* p, Layer& l, int pxi, int pzi, Kernel k) {
+  auto key = std::make_pair(pxi, pzi);
+  if (l.patches.count(key)) return;
+  std::vector<std::vector<Inst>> per(l.full.size());
+  float cx = ((float)pxi + 0.5f) * Impl::PATCH, cz = ((float)pzi + 0.5f) * Impl::PATCH;
+  for (int gz = 0; gz < l.res; ++gz)
+    for (int gx = 0; gx < l.res; ++gx) {
+      float cell = Impl::PATCH / (float)l.res;
+      float wx = cx + ((float)gx + hash2(cx + gx * 12.9f, cz + gz * 78.2f)) * cell - Impl::PATCH * 0.5f;
+      float wz = cz + ((float)gz + hash2(cx + gx * 39.3f + 7.1f, cz + gz * 11.7f - 3.3f)) * cell - Impl::PATCH * 0.5f;
+      k(p, l.full.size(), wx, wz, per);
+    }
+  l.patches.emplace(key, std::move(per));
+  l.dirty = true;
+}
+
+// ── Wildlife updates: exact behaviour ports ───────────────────────────────────
+static void updateBirds(Impl* p, float dt, float camX, float camZ,
+                        const System::ShipInfo& ship, float storminess) {
+  bool welcome = storminess < 0.35f;
+
+  for (int i = (int)p->flocks.size() - 1; i >= 0; --i) {
+    Flock& f = p->flocks[(size_t)i];
+    if (std::hypot(f.cx - camX, f.cz - camZ) > Impl::DESPAWN)
+      p->flocks.erase(p->flocks.begin() + i);
+  }
+  if (welcome) {
+    p->spawnTimer += dt;
+    if ((int)p->flocks.size() < Impl::MAX_FLOCKS && p->spawnTimer >= Impl::SPAWN_INTERVAL) {
+      p->spawnTimer = 0;
+      // findCoastalSpot: water within the spawn ring with land nearby.
+      for (int tr = 0; tr < 8; ++tr) {
+        float ang = p->frand() * TAU;
+        float r = Impl::SPAWN_MIN + p->frand() * (Impl::SPAWN_MAX - Impl::SPAWN_MIN);
+        float x = camX + std::cos(ang) * r, z = camZ + std::sin(ang) * r;
+        if (p->isLand(x, z) || !p->nearLand(x, z)) continue;
+        // makeFlock
+        Flock f{};
+        int count = 7 + (int)(p->frand() * 11);
+        float spread = 8 + p->frand() * 12;
+        for (int b = 0; b < count; ++b) {
+          BirdMember m{};
+          m.ox = (p->frand() - 0.5f) * 2 * spread; m.oz = (p->frand() - 0.5f) * 2 * spread;
+          m.flyVariant = p->frand() < 0.35f ? 1 : 0;
+          m.scale = 0.85f + p->frand() * 0.45f;
+          const glm::vec3 tints[4] = { {1, 1, 1}, {0.88f, 0.90f, 0.94f}, {0.82f, 0.74f, 0.62f}, {0.66f, 0.70f, 0.76f} };
+          m.tint = tints[(int)(p->frand() * 4) & 3];
+          m.yaw = p->frand() * TAU;
+          m.restTimer = 3 + p->frand() * 16;
+          m.px = x; m.py = Impl::SEA_Y; m.pz = z; m.hdg = p->frand() * TAU;
+          m.radBias = 0.6f + p->frand() * 0.8f; m.altBias = (p->frand() - 0.5f) * 12;
+          m.flapE = 0.6f; m.dipCooldown = p->frand() * 10;
+          f.members.push_back(m);
+        }
+        float drift = 0.12f + p->frand() * 0.22f, dang = p->frand() * TAU;
+        bool airborne = p->frand() < 0.35f;
+        f.cruiseAlt = 22 + p->frand() * 22;
+        f.state = airborne ? FlockState::FLYING : FlockState::RESTING;
+        f.dwell = airborne ? 14 + p->frand() * 18 : 4 + p->frand() * 16;
+        f.cx = x; f.cz = z; f.cy = Impl::SEA_Y; f.anchorX = x; f.anchorZ = z;
+        f.wanderR = 16 + p->frand() * 26;
+        f.gx = x; f.gz = z; f.gy = airborne ? f.cruiseAlt : Impl::SEA_Y;
+        f.goalAlt = f.gy; f.wTx = x; f.wTz = z;
+        f.driftX = std::cos(dang) * drift; f.driftZ = std::sin(dang) * drift;
+        f.nearShipDist = -1;
+        if (airborne)
+          for (BirdMember& m : f.members) {
+            m.airborne = true;
+            m.px = f.gx + m.ox; m.py = f.cruiseAlt + m.altBias * 0.5f; m.pz = f.gz + m.oz;
+            m.hdg = p->frand() * TAU; m.spd = Impl::CRUISE_SPD;
+          }
+        p->flocks.push_back(std::move(f));
+        break;
+      }
+    }
+  }
+
+  bool shipUnderway = !ship.anchored && std::fabs(ship.speedMps) > Impl::FOLLOW_MIN_SPD && welcome;
+
+  auto beginTakeoff = [&](Flock& f) {
+    f.state = FlockState::TAKEOFF; f.stateTimer = 0;
+    f.anchorX = f.cx; f.anchorZ = f.cz;
+    f.gx = f.cx; f.gz = f.cz; f.goalAlt = Impl::SEA_Y;
+    f.wTx = f.cx; f.wTz = f.cz; f.wanderTimer = 0;
+    for (BirdMember& m : f.members) {
+      m.airborne = true;
+      m.px = f.cx + m.ox; m.py = Impl::SEA_Y; m.pz = f.cz + m.oz;
+      m.hdg = std::atan2(m.px - f.cx, m.pz - f.cz) + (p->frand() - 0.5f) * 0.6f;
+      m.spd = Impl::MIN_SPD; m.vy = Impl::CLIMB_RATE * 0.7f; m.bank = 0;
+    }
+  };
+  auto updateGoal = [&](Flock& f) {
+    if ((f.wanderTimer -= dt) <= 0) {
+      float ang = p->frand() * TAU, r = f.wanderR * (0.3f + p->frand() * 0.7f);
+      f.wTx = f.anchorX + std::cos(ang) * r; f.wTz = f.anchorZ + std::sin(ang) * r;
+      f.wanderTimer = 4 + p->frand() * 5;
+    }
+    float k = std::min(1.0f, dt * 0.3f);
+    f.gx += (f.wTx - f.gx) * k; f.gz += (f.wTz - f.gz) * k; f.gy = f.goalAlt;
+    f.cx = f.gx; f.cz = f.gz; f.cy = f.goalAlt;
+  };
+  auto steerBird = [&](Flock& f, BirdMember& m) {
+    const float NEIGH2 = Impl::NEIGH_R * Impl::NEIGH_R, SEP2 = Impl::SEP_R * Impl::SEP_R;
+    float sepX = 0, sepZ = 0, sepY = 0, aliX = 0, aliZ = 0, cohX = 0, cohZ = 0; int cohN = 0;
+    for (const BirdMember& o : f.members) {
+      if (&o == &m || !o.airborne) continue;
+      float ddx = m.px - o.px, ddz = m.pz - o.pz, d2 = ddx * ddx + ddz * ddz;
+      if (d2 > NEIGH2) continue;
+      aliX += std::sin(o.hdg); aliZ += std::cos(o.hdg);
+      cohX += o.px; cohZ += o.pz; ++cohN;
+      if (d2 < SEP2) {
+        float d = std::sqrt(d2); if (d < 1e-3f) d = 1e-3f;
+        float w = 1 - d / Impl::SEP_R;
+        sepX += (ddx / d) * w; sepZ += (ddz / d) * w;
+        float ddy = m.py - o.py;
+        if (std::fabs(ddy) < 2.5f) sepY += (ddy >= 0 ? 1.0f : -1.0f) * (1 - std::fabs(ddy) / 2.5f) * w;
+      }
+    }
+    float dirX = f.gx - m.px, dirZ = f.gz - m.pz;
+    float gl = std::hypot(dirX, dirZ); if (gl < 1e-6f) gl = 1;
+    dirX = dirX / gl * Impl::W_GOAL; dirZ = dirZ / gl * Impl::W_GOAL;
+    if (cohN > 0) {
+      float al = std::hypot(aliX, aliZ); if (al < 1e-6f) al = 1;
+      dirX += aliX / al * Impl::W_ALI; dirZ += aliZ / al * Impl::W_ALI;
+      float cx2 = cohX / cohN - m.px, cz2 = cohZ / cohN - m.pz;
+      float cl = std::hypot(cx2, cz2); if (cl < 1e-6f) cl = 1;
+      dirX += cx2 / cl * Impl::W_COH; dirZ += cz2 / cl * Impl::W_COH;
+    }
+    dirX += sepX * Impl::W_SEP; dirZ += sepZ * Impl::W_SEP;
+    float ty = (m.dipState == 1 || m.dipState == 2) ? Impl::SEA_Y + Impl::DIP_SKIM_H
+                                                    : f.gy + m.altBias * 0.5f;
+    float desired = std::atan2(dirX, dirZ);
+    float dh = angDiff(desired, m.hdg);
+    float maxTurn = Impl::TURN_RATE * dt;
+    float turn = std::clamp(dh, -maxTurn, maxTurn);
+    m.hdg += turn;
+    float yawRate = dt > 1e-4f ? turn / dt : 0;
+    float targetSpd = (ty - m.py) > 1.5f ? Impl::CRUISE_SPD * 0.85f : Impl::CRUISE_SPD;
+    m.spd += std::clamp(targetSpd - m.spd, -Impl::ACCEL * dt, Impl::ACCEL * dt);
+    if (m.spd < Impl::MIN_SPD) m.spd = Impl::MIN_SPD;
+    m.px += std::sin(m.hdg) * m.spd * dt;
+    m.pz += std::cos(m.hdg) * m.spd * dt;
+    float diveMax = m.dipState == 1 ? Impl::DIP_DIVE_RATE : Impl::CLIMB_RATE;
+    float targetVy = std::clamp((ty - m.py) * 0.8f + sepY * Impl::VSEP, -diveMax, Impl::CLIMB_RATE);
+    m.vy += std::clamp(targetVy - m.vy, -Impl::VACCEL * dt, Impl::VACCEL * dt);
+    m.py += m.vy * dt;
+    float groundY = p->ground(m.px, m.pz);
+    if (groundY > 0.5f) {
+      float floorY = groundY + Impl::GROUND_CLEARANCE;
+      if (m.py < floorY) { m.py = floorY; if (m.vy < 0) m.vy = 0; }
+    }
+    float targetBank = std::clamp(yawRate / Impl::TURN_RATE * Impl::MAX_BANK, -Impl::MAX_BANK, Impl::MAX_BANK);
+    m.bank += (targetBank - m.bank) * std::min(1.0f, dt * Impl::BANK_EASE);
+    float eTarget = std::clamp(0.5f + m.vy * 0.18f, 0.08f, 1.0f);
+    m.flapE += (eTarget - m.flapE) * std::min(1.0f, dt * 2.5f);
+    bool wantGlide = m.vy < -0.8f;
+    if (wantGlide != m.gliding) {
+      if ((m.glideTimer -= dt) <= 0) { m.gliding = wantGlide; m.glideTimer = 1.5f + p->frand() * 1.5f; }
+    } else m.glideTimer = 1.5f + p->frand() * 1.5f;
+  };
+  auto updateDip = [&](Flock& f, BirdMember& m) {
+    if (m.dipState == 0) {
+      if (m.dipCooldown > 0) { m.dipCooldown -= dt; return; }
+      float rate = f.following ? Impl::DIP_RATE_FOLLOW : Impl::DIP_RATE;
+      if (m.py > Impl::FLARE_ALT + 3 && p->frand() < rate * dt) { m.dipState = 1; m.dipTimer = 6; }
+      return;
+    }
+    m.dipTimer -= dt;
+    if (m.dipState == 1) {
+      if (m.py <= Impl::SEA_Y + Impl::DIP_SKIM_H + 0.5f || m.dipTimer <= 0) { m.dipState = 2; m.dipTimer = 0.3f + p->frand() * 0.5f; }
+    } else if (m.dipState == 2) {
+      if (m.dipTimer <= 0) { m.dipState = 3; m.dipTimer = 6; }
+    } else if (m.py >= f.goalAlt - 4 || m.dipTimer <= 0) {
+      m.dipState = 0; m.dipCooldown = 6 + p->frand() * 12;
+    }
+  };
+  auto flyMembers = [&](Flock& f, bool landing) {
+    for (BirdMember& m : f.members) {
+      if (!m.airborne) continue;
+      if (landing) m.dipState = 0; else updateDip(f, m);
+      steerBird(f, m);
+      bool onFinal = landing && m.py < Impl::FLARE_ALT;
+      m.onFinal = onFinal;
+      if (onFinal) {
+        if (m.spd > Impl::LAND_SPD) m.spd = std::max(Impl::LAND_SPD, m.spd - Impl::ACCEL * 2 * dt);
+        float f01 = std::clamp(1 - (m.py - Impl::SEA_Y) / (Impl::FLARE_ALT - Impl::SEA_Y), 0.0f, 1.0f);
+        m.flare += (f01 - m.flare) * std::min(1.0f, dt * 4);
+        if (m.py <= Impl::SEA_Y + 0.8f && m.vy <= 0.3f) {   // settleMember
+          m.airborne = false; m.py = Impl::SEA_Y;
+          m.ox = m.px - f.anchorX; m.oz = m.pz - f.anchorZ;
+          m.yaw = std::atan2(std::cos(m.hdg), -std::sin(m.hdg));
+          m.bank = 0; m.vy = 0; m.onFinal = false; m.flare = 0; m.dipState = 0;
+          m.restWingsOut = false; m.restTimer = 2 + p->frand() * 6;
+        }
+      } else if (m.flare > 0.001f) m.flare += (0 - m.flare) * std::min(1.0f, dt * 3);
+    }
+  };
+
+  for (Flock& f : p->flocks) {
+    // Follow (B6).
+    if (f.following) {
+      f.followTimer -= dt;
+      float dShip = shipUnderway ? std::hypot(ship.x - f.cx, ship.z - f.cz) : 1e9f;
+      if (!shipUnderway || dShip > Impl::FOLLOW_DROP || f.followTimer <= 0) {
+        f.following = false;
+        f.followCooldown = 8 + p->frand() * 10;
+        f.anchorX = f.gx; f.anchorZ = f.gz;
+        f.wanderR = 16 + p->frand() * 26;
+        if (f.state == FlockState::FLYING) f.dwell = std::min(f.dwell, f.stateTimer + 6 + p->frand() * 6);
+      } else {
+        f.anchorX = ship.x - std::sin(ship.headingRad) * Impl::FOLLOW_TRAIL;
+        f.anchorZ = ship.z - std::cos(ship.headingRad) * Impl::FOLLOW_TRAIL;
+        f.cruiseAlt = Impl::FOLLOW_ALT; f.wanderR = Impl::FOLLOW_WANDER;
+      }
+    } else {
+      if (f.followCooldown > 0) f.followCooldown -= dt;
+      if (f.state == FlockState::FLYING && f.followCooldown <= 0 && shipUnderway &&
+          std::hypot(ship.x - f.cx, ship.z - f.cz) < Impl::FOLLOW_TRIGGER) {
+        f.following = true;
+        f.followTimer = 18 + p->frand() * 22;
+        f.cruiseAlt = Impl::FOLLOW_ALT; f.wanderR = Impl::FOLLOW_WANDER;
+      }
+    }
+    if (!welcome) {   // departFlock: fly off in worsening weather
+      if (f.state == FlockState::RESTING) beginTakeoff(f);
+      float ax = f.anchorX - camX, az = f.anchorZ - camZ;
+      float d = std::hypot(ax, az); if (d < 1e-3f) d = 1;
+      float departSpeed = 4 + storminess * 8;
+      f.anchorX += ax / d * departSpeed * dt;
+      f.anchorZ += az / d * departSpeed * dt;
+      f.cruiseAlt = std::min(70.0f, f.cruiseAlt + dt * 4);
+    }
+    // State machine (advanceFlock).
+    f.stateTimer += dt;
+    float climb = f.cruiseAlt - Impl::SEA_Y;
+    switch (f.state) {
+      case FlockState::RESTING:
+        f.cx += f.driftX * dt; f.cz += f.driftZ * dt;
+        f.anchorX = f.cx; f.anchorZ = f.cz; f.cy = Impl::SEA_Y; f.goalAlt = Impl::SEA_Y;
+        if (f.stateTimer >= f.dwell) beginTakeoff(f);
+        break;
+      case FlockState::TAKEOFF:
+        f.goalAlt = std::min(f.cruiseAlt, f.goalAlt + climb / Impl::TAKEOFF_TIME * dt);
+        updateGoal(f); flyMembers(f, false);
+        if (f.goalAlt >= f.cruiseAlt - 0.5f) { f.state = FlockState::FLYING; f.stateTimer = 0; f.dwell = 14 + p->frand() * 18; }
+        break;
+      case FlockState::FLYING:
+        f.goalAlt = f.cruiseAlt;
+        updateGoal(f); flyMembers(f, false);
+        if (f.stateTimer >= f.dwell && !f.following) { f.state = FlockState::LANDING; f.stateTimer = 0; f.wanderTimer = 1e9f; }
+        break;
+      case FlockState::LANDING: {
+        f.wTx = f.anchorX; f.wTz = f.anchorZ;
+        f.goalAlt = std::max(Impl::SEA_Y, f.goalAlt - climb / Impl::LAND_TIME * dt);
+        updateGoal(f); flyMembers(f, true);
+        bool anyAir = false;
+        for (const BirdMember& m : f.members) if (m.airborne) { anyAir = true; break; }
+        if (!anyAir) {
+          f.state = FlockState::RESTING; f.stateTimer = 0; f.dwell = 9 + p->frand() * 14;
+          f.cx = f.anchorX; f.cz = f.anchorZ; f.nearShipDist = -1;
+        }
+        break;
+      }
+    }
+    // Ship-approach startle (resting rafts only; own ship).
+    if (f.state == FlockState::RESTING) {
+      float minD = std::hypot(ship.x - f.cx, ship.z - f.cz);
+      if (f.nearShipDist < 0) f.nearShipDist = minD;
+      else {
+        bool closing = minD < f.nearShipDist - 0.3f;
+        f.nearShipDist = minD;
+        if (minD < Impl::IMMINENT_RADIUS || (closing && minD < Impl::STARTLE_RADIUS)) beginTakeoff(f);
+      }
+    }
+    // Rest stretch poses.
+    if (f.state == FlockState::RESTING)
+      for (BirdMember& m : f.members) {
+        m.restTimer -= dt;
+        if (m.restTimer > 0) continue;
+        if (m.restWingsOut) { m.restWingsOut = false; m.restTimer = 6 + p->frand() * 16; }
+        else if (p->frand() < 0.5f) { m.restWingsOut = true; m.restTimer = 1.5f + p->frand() * 4; }
+        else m.restTimer = 4 + p->frand() * 10;
+      }
   }
 }
 
-void System::update(WGPUDevice, WGPUQueue, float dt, double timeSec, float shipX, float shipZ) {
+static void updateDolphins(Impl* p, float dt, float t, const System::ShipInfo& ship) {
+  float bx = ship.x, bz = ship.z;
+  float depth = -p->ground(bx, bz);
+  bool inShallows = depth >= Impl::D_DEPTH_MIN && depth <= Impl::D_DEPTH_MAX;
+  if (inShallows && !p->dolActive) {   // spawn two pods
+    p->pod.clear();
+    float baseAng = p->frand() * TAU;
+    for (int g = 0; g < Impl::D_PODS; ++g) {
+      float gAng = baseAng + (float)g * TAU / Impl::D_PODS + (p->frand() - 0.5f) * 0.8f;
+      float gDist = 16 + p->frand() * 22;
+      float homeX = std::cos(gAng) * gDist, homeZ = std::sin(gAng) * gDist;
+      int members = 5 + (int)(p->frand() * 4);
+      const glm::vec3 tints[4] = { {1, 1, 1}, {0.82f, 0.86f, 0.94f}, {0.70f, 0.76f, 0.86f}, {0.92f, 0.95f, 1.0f} };
+      for (int i = 0; i < members; ++i) {
+        float ang = p->frand() * TAU, r = 4 + p->frand() * 16;
+        Dolphin d{};
+        d.x = bx + homeX + std::cos(ang) * r; d.z = bz + homeZ + std::sin(ang) * r;
+        d.y = -(2 + p->frand() * 4);
+        d.theta = p->frand() * TAU; d.targetTheta = p->frand() * TAU;
+        d.speed = 2 + p->frand() * 2; d.targetSpeed = 2 + p->frand() * 2;
+        d.baseY = -(1.5f + p->frand() * 5);
+        d.depthPhase = p->frand() * TAU; d.depthRate = 0.1f + p->frand() * 0.25f;
+        d.depthAmp = 0.8f + p->frand() * 2.0f;
+        d.retarget = p->frand() * 2; d.effort = 0.4f;
+        d.group = g; d.bowSlot = -1;
+        d.scale = 0.9f + p->frand() * 0.4f;
+        d.homeX = homeX; d.homeZ = homeZ;
+        d.tint = tints[(int)(p->frand() * 4) & 3];
+        p->pod.push_back(d);
+      }
+    }
+    p->dolActive = true;
+  } else if (!inShallows && p->dolActive) {
+    p->pod.clear(); p->dolActive = false;
+  }
+  if (!p->dolActive) return;
+
+  float boatSpeed = std::fabs(ship.speedMps);
+  float fwdx = std::sin(ship.headingRad), fwdz = std::cos(ship.headingRad);
+  float rgtx = fwdz, rgtz = -fwdx;
+  float bowX = bx + fwdx * Impl::BOW_AHEAD, bowZ = bz + fwdz * Impl::BOW_AHEAD;
+  bool wantRiders = boatSpeed > Impl::BOWRIDE_SPEED_MIN;
+  bool taken[Impl::MAX_RIDERS] = {};
+  for (Dolphin& d : p->pod) {
+    if (d.bowSlot < 0) continue;
+    bool tooFar = std::hypot(d.x - bx, d.z - bz) > Impl::BOWRIDE_RANGE * 1.7f;
+    if (!wantRiders || tooFar) d.bowSlot = -1; else taken[d.bowSlot] = true;
+  }
+  if (wantRiders)
+    for (Dolphin& d : p->pod) {
+      if (d.bowSlot >= 0) continue;
+      if (std::hypot(d.x - bowX, d.z - bowZ) > Impl::BOWRIDE_RANGE) continue;
+      int slot = -1;
+      for (int k = 0; k < Impl::MAX_RIDERS; ++k) if (!taken[k]) { slot = k; break; }
+      if (slot < 0) break;
+      taken[slot] = true; d.bowSlot = slot;
+    }
+
+  const int G = Impl::D_PODS;
+  float gcx[2] = {}, gcz[2] = {}, ghx[2] = {}, ghz[2] = {};
+  int gct[2] = {};
+  int breachCount = 0;
+  for (const Dolphin& d : p->pod) {
+    gcx[d.group] += d.x; gcz[d.group] += d.z;
+    ghx[d.group] += std::cos(d.theta); ghz[d.group] += std::sin(d.theta);
+    gct[d.group]++;
+    if (d.breaching) ++breachCount;
+  }
+  for (int g = 0; g < G; ++g) if (gct[g] > 0) { gcx[g] /= gct[g]; gcz[g] /= gct[g]; }
+
+  for (Dolphin& d : p->pod) {
+    int g = d.group;
+    d.retarget -= dt;
+    if (d.retarget <= 0) {
+      d.retarget = 1.2f + p->frand() * 3.0f;
+      d.targetTheta = d.theta + (p->frand() - 0.5f) * 1.6f;
+      d.targetSpeed = 2.0f + p->frand() * 2.6f;
+      if (p->frand() < 0.22f) d.targetSpeed = 5.5f + p->frand() * 2.5f;
+      d.baseY = -(1.5f + p->frand() * 5);
+    }
+    float sx = std::cos(d.targetTheta) * Impl::D_W_WANDER;
+    float sz = std::sin(d.targetTheta) * Impl::D_W_WANDER;
+    float ccx = gcx[g] - d.x, ccz = gcz[g] - d.z;
+    float cd = std::hypot(ccx, ccz); if (cd < 1e-6f) cd = 1;
+    sx += ccx / cd * Impl::D_W_COH; sz += ccz / cd * Impl::D_W_COH;
+    float ah = std::hypot(ghx[g], ghz[g]); if (ah < 1e-6f) ah = 1;
+    sx += ghx[g] / ah * Impl::D_W_ALI; sz += ghz[g] / ah * Impl::D_W_ALI;
+    for (const Dolphin& o : p->pod) {
+      if (&o == &d || o.group != g) continue;
+      float ox = d.x - o.x, oz = d.z - o.z, od2 = ox * ox + oz * oz;
+      if (od2 > 1e-4f && od2 < Impl::D_SEP_R * Impl::D_SEP_R) {
+        float inv = 1.0f / std::sqrt(od2);
+        sx += ox * inv * inv * Impl::D_W_SEP * Impl::D_SEP_R;
+        sz += oz * inv * inv * Impl::D_W_SEP * Impl::D_SEP_R;
+      }
+    }
+    float dxB = (bx + d.homeX) - d.x, dzB = (bz + d.homeZ) - d.z;
+    float distB = std::hypot(dxB, dzB);
+    if (distB > Impl::D_LEASH) { sx += dxB / distB * 2.5f; sz += dzB / distB * 2.5f; }
+    bool riding = false;
+    if (d.bowSlot >= 0) {
+      int rank = d.bowSlot / 2;
+      float side = (d.bowSlot % 2 == 0) ? 1.0f : -1.0f;
+      float tx = bowX + fwdx * (rank * Impl::BOW_SPACING) + rgtx * (side * Impl::BOW_SIDE);
+      float tz = bowZ + fwdz * (rank * Impl::BOW_SPACING) + rgtz * (side * Impl::BOW_SIDE);
+      sx = tx - d.x; sz = tz - d.z;
+      d.targetSpeed = std::max(boatSpeed + 0.6f, 3.0f);
+      d.baseY = Impl::BOWRIDE_DEPTH;
+      riding = true;
+    }
+    const float la = 7;
+    float aheadDepth = -p->ground(d.x + std::cos(d.theta) * la, d.z + std::sin(d.theta) * la);
+    bool avoiding = aheadDepth < Impl::D_DEPTH_MIN;
+    if (avoiding) { sx = dxB; sz = dzB; d.targetSpeed = std::min(d.targetSpeed, 2.5f); }
+
+    float desired = std::atan2(sz, sx);
+    float maxTurn = Impl::D_TURN * dt * (avoiding ? 2.2f : riding ? 2.0f : 1.0f);
+    float turn = std::clamp(angDiff(desired, d.theta), -maxTurn, maxTurn);
+    d.theta += turn;
+    float bankTarget = std::clamp(-(turn / std::max(1e-4f, dt)) * Impl::D_BANK_K, -Impl::D_MAX_BANK, Impl::D_MAX_BANK);
+    d.bank += (bankTarget - d.bank) * std::min(1.0f, dt * Impl::D_BANK_EASE);
+    d.speed += (d.targetSpeed - d.speed) * std::min(1.0f, dt * 1.5f);
+    d.x += std::cos(d.theta) * d.speed * dt;
+    d.z += std::sin(d.theta) * d.speed * dt;
+
+    float sb = p->ground(d.x, d.z);
+    if (d.breaching) {
+      d.breachVy -= Impl::BREACH_G * dt;
+      d.y += d.breachVy * dt;
+      if (d.y <= Impl::BREACH_REENTRY && d.breachVy < 0) d.breaching = false;
+    } else {
+      float yTarget = d.baseY + std::sin(t * d.depthRate + d.depthPhase) * d.depthAmp;
+      float lo = sb + Impl::D_SEABED_CLEAR, hi = -Impl::D_SURFACE_CLEAR;
+      yTarget = hi < lo ? (lo + hi) * 0.5f : std::clamp(yTarget, lo, hi);
+      d.y += (yTarget - d.y) * std::min(1.0f, dt * 1.5f);
+      if (!avoiding && d.bowSlot < 0 && d.speed > 2.2f && sb < -Impl::BREACH_MIN_DEPTH &&
+          breachCount < Impl::MAX_BREACH && p->frand() < Impl::BREACH_CHANCE * dt) {
+        d.breaching = true; d.breachVy = Impl::BREACH_VY0; d.targetSpeed = 6; ++breachCount;
+      }
+    }
+    float effortTarget = std::clamp((d.speed - 1.2f) / 6.0f, 0.15f, 1.0f);
+    d.effort += (effortTarget - d.effort) * std::min(1.0f, dt * 4);
+  }
+}
+
+static void updateFish(Impl* p, float dt, float t, const System::ShipInfo& ship) {
+  float bx = ship.x, bz = ship.z;
+  float depth = -p->ground(bx, bz);
+  bool inShallows = depth >= Impl::D_DEPTH_MIN && depth <= Impl::D_DEPTH_MAX;
+  if (inShallows && !p->fishActive) {
+    p->schools.clear();
+    float baseAng = p->frand() * TAU;
+    for (int s = 0; s < Impl::NSPECIES; ++s) {
+      FishSchool sc{};
+      sc.species = s;
+      float gAng = baseAng + (float)s * TAU / Impl::NSPECIES + (p->frand() - 0.5f) * 0.7f;
+      float gDist = 14 + p->frand() * 20;
+      sc.homeX = std::cos(gAng) * gDist; sc.homeZ = std::sin(gAng) * gDist;
+      int members = 14 + (int)(p->frand() * 12);
+      sc.scl = 0.32f + p->frand() * 0.22f;
+      sc.boilT = 3 + p->frand() * 5;
+      for (int i = 0; i < members; ++i) {
+        float ang = p->frand() * TAU, r = 1 + p->frand() * 4;
+        FishM f{};
+        f.x = bx + sc.homeX + std::cos(ang) * r; f.z = bz + sc.homeZ + std::sin(ang) * r;
+        f.y = -(2 + p->frand() * 3);
+        f.theta = p->frand() * TAU; f.targetTheta = p->frand() * TAU;
+        f.speed = 1.2f + p->frand() * 1.2f; f.targetSpeed = f.speed;
+        f.baseY = -(1.2f + p->frand() * 4);
+        f.depthPhase = p->frand() * TAU; f.depthRate = 0.15f + p->frand() * 0.3f;
+        f.depthAmp = 0.5f + p->frand() * 1.4f;
+        f.retarget = p->frand() * 2; f.effort = 0.4f;
+        sc.fish.push_back(f);
+      }
+      p->schools.push_back(std::move(sc));
+    }
+    p->fishActive = true;
+  } else if (!inShallows && p->fishActive) {
+    p->schools.clear(); p->fishActive = false;
+  }
+  if (!p->fishActive) return;
+
+  // Dolphin pod centres = predators.
+  float pcx[2] = {}, pcz[2] = {}; int pct[2] = {};
+  for (const Dolphin& d : p->pod) { pcx[d.group] += d.x; pcz[d.group] += d.z; pct[d.group]++; }
+
+  for (FishSchool& sc : p->schools) {
+    float cx = 0, cz = 0, hx = 0, hz = 0;
+    for (const FishM& f : sc.fish) { cx += f.x; cz += f.z; hx += std::cos(f.theta); hz += std::sin(f.theta); }
+    int n = (int)sc.fish.size(); cx /= n; cz /= n;
+    float thx = 0, thz = 0, thd = 1e9f;
+    for (int g = 0; g < 2; ++g) {
+      if (!pct[g]) continue;
+      float px2 = pcx[g] / pct[g], pz2 = pcz[g] / pct[g];
+      float d = std::hypot(cx - px2, cz - pz2);
+      if (d < thd) { thd = d; thx = px2; thz = pz2; }
+    }
+    float alarm = thd < Impl::THREAT_R ? (1 - thd / Impl::THREAT_R) : 0;
+    sc.boilT -= dt;
+    if (sc.boilT <= 0) {
+      sc.boiling = p->frand() < 0.18f;
+      sc.boilT = sc.boiling ? 2 + p->frand() * 3 : 4 + p->frand() * 6;
+    }
+    bool boil = sc.boiling || alarm > 0.25f;
+    for (int i = 0; i < n; ++i) {
+      FishM& f = sc.fish[i];
+      f.retarget -= dt;
+      if (f.retarget <= 0) {
+        f.retarget = 1.0f + p->frand() * 2.4f;
+        f.targetTheta = f.theta + (p->frand() - 0.5f) * 1.4f;
+        f.targetSpeed = 1.4f + p->frand() * 1.6f;
+        if (p->frand() < 0.15f) f.targetSpeed = 3.2f + p->frand() * 1.8f;
+        f.baseY = -(1.2f + p->frand() * 4);
+      }
+      float sx = std::cos(f.targetTheta) * Impl::F_W_WANDER;
+      float sz = std::sin(f.targetTheta) * Impl::F_W_WANDER;
+      float ccx = cx - f.x, ccz = cz - f.z;
+      float cd = std::hypot(ccx, ccz); if (cd < 1e-6f) cd = 1;
+      sx += ccx / cd * Impl::F_W_COH; sz += ccz / cd * Impl::F_W_COH;
+      float ah = std::hypot(hx, hz); if (ah < 1e-6f) ah = 1;
+      sx += hx / ah * Impl::F_W_ALI; sz += hz / ah * Impl::F_W_ALI;
+      for (int j = 0; j < n; ++j) {
+        if (j == i) continue;
+        const FishM& o = sc.fish[j];
+        float ox = f.x - o.x, oz = f.z - o.z, od2 = ox * ox + oz * oz;
+        if (od2 > 1e-4f && od2 < Impl::F_SEP_R * Impl::F_SEP_R) {
+          float inv = 1.0f / std::sqrt(od2);
+          sx += ox * inv * inv * Impl::F_W_SEP * Impl::F_SEP_R;
+          sz += oz * inv * inv * Impl::F_W_SEP * Impl::F_SEP_R;
+        }
+      }
+      float dxB = (bx + sc.homeX) - f.x, dzB = (bz + sc.homeZ) - f.z;
+      float distB = std::hypot(dxB, dzB);
+      if (distB > Impl::F_LEASH) { sx += dxB / distB * 2.2f; sz += dzB / distB * 2.2f; }
+      float hdx = f.x - bx, hdz = f.z - bz;
+      float hd = std::hypot(hdx, hdz); if (hd < 1e-6f) hd = 1;
+      if (hd < Impl::HULL_FLEE_R) {
+        float w = (1 - hd / Impl::HULL_FLEE_R) * Impl::HULL_FLEE_W;
+        sx += hdx / hd * w; sz += hdz / hd * w;
+        f.targetSpeed = std::max(f.targetSpeed, Impl::BOLT_SPEED * 0.7f);
+      }
+      if (alarm > 0) {
+        float tdx = f.x - thx, tdz = f.z - thz;
+        float td = std::hypot(tdx, tdz); if (td < 1e-6f) td = 1;
+        sx += tdx / td * Impl::THREAT_FLEE_W * alarm;
+        sz += tdz / td * Impl::THREAT_FLEE_W * alarm;
+        sx += ccx / cd * Impl::F_W_COH * alarm * 1.6f;
+        sz += ccz / cd * Impl::F_W_COH * alarm * 1.6f;
+        f.targetSpeed = std::max(f.targetSpeed, Impl::BOLT_SPEED);
+      }
+      const float la = 6;
+      float aheadDepth = -p->ground(f.x + std::cos(f.theta) * la, f.z + std::sin(f.theta) * la);
+      bool avoiding = aheadDepth < Impl::D_DEPTH_MIN;
+      if (avoiding) { sx = dxB; sz = dzB; f.targetSpeed = std::min(f.targetSpeed, 1.6f); }
+      float desired = std::atan2(sz, sx);
+      float maxTurn = Impl::F_TURN * dt * (avoiding ? 2.0f : 1.0f);
+      float turn = std::clamp(angDiff(desired, f.theta), -maxTurn, maxTurn);
+      f.theta += turn;
+      float bankTarget = std::clamp(-(turn / std::max(1e-4f, dt)) * Impl::F_BANK_K, -Impl::F_MAX_BANK, Impl::F_MAX_BANK);
+      f.bank += (bankTarget - f.bank) * std::min(1.0f, dt * Impl::F_BANK_EASE);
+      f.speed += (f.targetSpeed - f.speed) * std::min(1.0f, dt * 1.8f);
+      f.x += std::cos(f.theta) * f.speed * dt;
+      f.z += std::sin(f.theta) * f.speed * dt;
+      float sb = p->ground(f.x, f.z);
+      float depthBase = boil ? std::max(f.baseY, Impl::BOIL_DEPTH) : f.baseY;
+      float yTarget = depthBase + std::sin(t * f.depthRate + f.depthPhase) * f.depthAmp * (boil ? 1.5f : 1.0f);
+      float lo = sb + Impl::F_SEABED_CLEAR, hi = -Impl::F_SURFACE_CLEAR;
+      yTarget = hi < lo ? (lo + hi) * 0.5f : std::clamp(yTarget, lo, hi);
+      f.y += (yTarget - f.y) * std::min(1.0f, dt * 1.8f);
+      float effortTarget = std::clamp((f.speed - 1.0f) / 3.5f, 0.2f, 1.0f);
+      f.effort += (effortTarget - f.effort) * std::min(1.0f, dt * 5);
+    }
+  }
+}
+
+void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
+                    const ShipInfo& ship, float storminess) {
   Impl* p = p_.get();
   if (!p->ready || !p->terr) return;
+  float dt = std::min(0.05f, dtIn);
+  float t = (float)timeSec;
 
-  // ── Static layers: stream patches around the ship (incremental, drop far). ──
-  int px = (int)std::floor(shipX / Impl::PATCH), pz = (int)std::floor(shipZ / Impl::PATCH);
+  // ── Static layers: stream patches (kernels), incremental + far-drop. ──
+  int px = (int)std::floor(ship.x / Impl::PATCH), pz = (int)std::floor(ship.z / Impl::PATCH);
   if (px != p->lastPX || pz != p->lastPZ) {
     p->lastPX = px; p->lastPZ = pz;
-    struct { Layer* l; void (*k)(Impl*, Layer&, float, float, std::vector<std::vector<Inst>>&); } layers[] = {
+    struct { Layer* l; Kernel k; } layers[] = {
       { &p->palms, palmKernel }, { &p->trees, treeKernel },
       { &p->rocks, rockKernel }, { &p->drift, driftKernel },
     };
@@ -554,150 +1312,197 @@ void System::update(WGPUDevice, WGPUQueue, float dt, double timeSec, float shipX
       for (int dz = -Impl::RINGS; dz <= Impl::RINGS; ++dz)
         for (int dx = -Impl::RINGS; dx <= Impl::RINGS; ++dx)
           placePatch(p, *L.l, px + dx, pz + dz, L.k);
-      // Drop patches beyond the ring (+1 hysteresis).
       for (auto it = L.l->patches.begin(); it != L.l->patches.end();) {
         if (std::abs(it->first.first - px) > Impl::RINGS + 1 ||
             std::abs(it->first.second - pz) > Impl::RINGS + 1) {
           it = L.l->patches.erase(it); L.l->dirty = true;
         } else ++it;
       }
-      flushLayer(p, *L.l);
     }
   }
 
-  // ── Living layers ──
-  float t = (float)timeSec;
-  // Seagull flocks: 3 flocks circling coastal anchors near the ship; re-anchor
-  // when the ship sails far away.
-  if (p->birdStates.empty()) {
-    for (int f = 0; f < 3; ++f)
-      for (int b = 0; b < 5; ++b)
-        p->birdStates.push_back({ shipX + 100.0f * (f - 1), shipZ + 80.0f * (f - 1),
-                                  18.0f + 8.0f * b, 16.0f + 7.0f * f + 1.5f * b,
-                                  0.45f + 0.06f * b, (float)b * 1.7f + (float)f * 2.9f });
-  }
-  std::vector<std::vector<Inst>> birdInst(p->birds.variants.size());
-  for (size_t i = 0; i < p->birdStates.size(); ++i) {
-    Impl::Bird& b = p->birdStates[i];
-    float dShip = std::hypot(b.cx - shipX, b.cz - shipZ);
-    if (dShip > 900.0f) {   // drifted out of view: re-anchor near the ship
-      b.cx = shipX + (hash2((float)i * 3.1f, t) - 0.5f) * 500.0f;
-      b.cz = shipZ + (hash2(t, (float)i * 7.7f) - 0.5f) * 500.0f;
-    }
-    float a = t * b.w + b.ph;
-    float x = b.cx + std::cos(a) * b.r, z = b.cz + std::sin(a) * b.r;
-    float y = b.alt + std::sin(t * 0.7f + b.ph) * 2.0f;
-    float yaw = -a - glm::half_pi<float>();   // tangent heading (bird bow +Z-ish)
-    if (!p->birds.variants.empty())
-      birdInst[i % p->birds.variants.size()].push_back(
-          compose(yaw, 0, 0.18f, 1, 1, 1, x, y, z, glm::vec3(1.0f), b.ph));
-  }
-  for (size_t v = 0; v < p->birds.variants.size(); ++v) {
-    Variant& var = p->birds.variants[v];
-    var.instCount = std::min((uint32_t)birdInst[v].size(), var.instCap);
-    if (var.instCount)
-      wgpuQueueWriteBuffer(p->queue, var.instBuf, 0, birdInst[v].data(), (uint64_t)var.instCount * sizeof(Inst));
-  }
+  // ── Wildlife (exact client behaviour). ──
+  updateBirds(p, dt, ship.x, ship.z, ship, storminess);
+  updateDolphins(p, dt, t, ship);
+  updateFish(p, dt, t, ship);
 
-  // Dolphin pod: porpoising arcs alongside the ship over deep water.
-  if (p->pod.n == 0) {
-    p->pod.n = 4;
-    for (int i = 0; i < p->pod.n; ++i) p->pod.ph[i] = (float)i * 1.9f;
-    p->pod.cx = shipX + 60; p->pod.cz = shipZ;
+  // Write animal instances.
+  auto writeSets = [&](Layer& l, const std::vector<std::vector<Inst>>& per) {
+    for (size_t v = 0; v < l.full.size(); ++v) {
+      DrawSet& dset = l.full[v];
+      if (!dset.instBuf) continue;
+      dset.instCount = std::min((uint32_t)per[v].size(), dset.instCap);
+      if (dset.instCount)
+        wgpuQueueWriteBuffer(p->queue, dset.instBuf, 0, per[v].data(), (uint64_t)dset.instCount * sizeof(Inst));
+    }
+  };
+  {
+    std::vector<std::vector<Inst>> per(p->birdsL.full.size());
+    for (const Flock& f : p->flocks)
+      for (const BirdMember& m : f.members) {
+        int v; float wx, wy, wz, energy = 1;
+        Inst inst;
+        if (m.airborne) {
+          v = m.onFinal ? 3 : (m.gliding ? 1 : 0);
+          energy = m.onFinal ? 0.5f : (m.gliding ? 0.12f : m.flapE);
+          wx = m.px; wy = m.py; wz = m.pz;
+          float vx = std::sin(m.hdg), vz = std::cos(m.hdg);
+          float yaw = std::atan2(vz, -vx);
+          float pitch = std::clamp(std::atan2(m.vy, std::max(m.spd, 1.0f)) * Impl::PITCH_GAIN
+                                   + m.flare * Impl::FLARE_PITCH, -0.5f, 0.7f);
+          inst = composeBird(yaw, pitch, m.bank, m.scale, wx, wy, wz, m.tint,
+                             energy * Impl::kBirdAmp[v]);
+        } else {
+          v = m.restWingsOut ? m.flyVariant : 2;
+          wx = f.cx + m.ox; wy = Impl::SEA_Y; wz = f.cz + m.oz;
+          inst = composeBird(m.yaw, 0, 0, m.scale, wx, wy, wz, m.tint, Impl::kBirdAmp[v]);
+        }
+        if (v >= (int)per.size() || !p->birdsL.full[(size_t)v].vbuf) v = 0;
+        if (per[(size_t)v].size() < 220) per[(size_t)v].push_back(inst);
+      }
+    writeSets(p->birdsL, per);
   }
   {
-    // The pod idles in slow circles ~80 m off the ship, re-homing when left behind.
-    float dShip = std::hypot(p->pod.cx - shipX, p->pod.cz - shipZ);
-    if (dShip > 700.0f) { p->pod.cx = shipX + 90; p->pod.cz = shipZ + 40; }
-    p->pod.heading = t * 0.22f;
-    std::vector<std::vector<Inst>> podInst(p->dolphins.variants.size());
-    for (int i = 0; i < p->pod.n; ++i) {
-      float a = p->pod.heading + (float)i * 0.35f;
-      float R = 34.0f + 5.0f * (float)i;
-      float x = p->pod.cx + std::cos(a) * R, z = p->pod.cz + std::sin(a) * R;
-      if (p->ground(x, z) > -6.0f) continue;   // dolphins keep to deep water
-      float leap = std::sin(t * 1.4f + p->pod.ph[i]);
-      float y = -0.7f + 1.5f * std::max(0.0f, leap);            // porpoise arc through the surface
-      float pitch = -std::cos(t * 1.4f + p->pod.ph[i]) * 0.55f * (leap > -0.2f ? 1.0f : 0.2f);
-      float yaw = -a - glm::half_pi<float>();
-      if (!p->dolphins.variants.empty())
-        podInst[i % p->dolphins.variants.size()].push_back(
-            compose(yaw, pitch, 0, 1, 1, 1, x, y, z, glm::vec3(1.0f), p->pod.ph[i]));
+    std::vector<std::vector<Inst>> per(p->dolphinsL.full.size());
+    for (const Dolphin& d : p->pod) {
+      int mi = !d.breaching ? 0 : (d.breachVy > 0 ? 1 : 2);
+      if (mi >= (int)per.size() || !p->dolphinsL.full[(size_t)mi].vbuf) mi = 0;
+      float leapPitch = d.breaching ? std::atan2(d.breachVy, std::max(2.0f, d.speed)) : 0.0f;
+      float yaw = -d.theta + Impl::D_FACE;
+      per[(size_t)mi].push_back(compose(yaw, Impl::D_UPRIGHT + leapPitch, d.bank,
+                                        d.scale, d.scale, d.scale, d.x, d.y, d.z, d.tint, d.effort));
     }
-    for (size_t v = 0; v < p->dolphins.variants.size(); ++v) {
-      Variant& var = p->dolphins.variants[v];
-      var.instCount = std::min((uint32_t)podInst[v].size(), var.instCap);
-      if (var.instCount)
-        wgpuQueueWriteBuffer(p->queue, var.instBuf, 0, podInst[v].data(), (uint64_t)var.instCount * sizeof(Inst));
+    writeSets(p->dolphinsL, per);
+  }
+  {
+    std::vector<std::vector<Inst>> per(p->fishL.full.size());
+    for (const FishSchool& sc : p->schools) {
+      if (sc.species >= (int)per.size() || !p->fishL.full[(size_t)sc.species].vbuf) continue;
+      for (const FishM& f : sc.fish)
+        per[(size_t)sc.species].push_back(compose(-f.theta, 0, f.bank,
+                                                  sc.scl, sc.scl, sc.scl, f.x, f.y, f.z,
+                                                  glm::vec3(1.0f), f.effort));
     }
+    writeSets(p->fishL, per);
   }
-
-  // Fish schools: tight circling rings just under the surface of the shallows —
-  // visible through the transparent water.
-  if (p->schools.empty()) {
-    for (int i = 0; i < 3; ++i)
-      p->schools.push_back({ shipX, shipZ, 3.5f + (float)i, 0.9f - 0.15f * (float)i, -1.3f, 10, (float)i * 2.3f });
-  }
-  std::vector<std::vector<Inst>> fishInst(p->fish.variants.size());
-  for (size_t si = 0; si < p->schools.size(); ++si) {
-    Impl::School& sc = p->schools[si];
-    float dShip = std::hypot(sc.cx - shipX, sc.cz - shipZ);
-    // Schools live where the water is 2-9 m deep; re-seed nearby when out of range.
-    float g = p->ground(sc.cx, sc.cz);
-    if (dShip > 400.0f || g > -1.5f || g < -12.0f) {
-      bool found = false;
-      for (int tries = 0; tries < 24 && !found; ++tries) {
-        float ax = shipX + (hash2((float)tries * 3.7f + (float)si, t) - 0.5f) * 320.0f;
-        float az = shipZ + (hash2(t + (float)si * 13.7f, (float)tries * 9.1f) - 0.5f) * 320.0f;
-        float ag = p->ground(ax, az);
-        if (ag < -2.0f && ag > -9.0f) { sc.cx = ax; sc.cz = az; found = true; }
-      }
-      if (!found) continue;
-    }
-    for (int i = 0; i < sc.n; ++i) {
-      float a = t * sc.w + sc.ph + (float)i * (TAU / (float)sc.n);
-      float x = sc.cx + std::cos(a) * sc.r, z = sc.cz + std::sin(a) * sc.r;
-      float yaw = -a - glm::half_pi<float>();
-      if (!p->fish.variants.empty())
-        fishInst[i % p->fish.variants.size()].push_back(
-            compose(yaw, 0, 0, 0.8f, 0.8f, 0.8f, x, sc.y + 0.15f * std::sin(a * 3.0f), z,
-                    glm::vec3(1.0f), sc.ph + (float)i));
-    }
-  }
-  for (size_t v = 0; v < p->fish.variants.size(); ++v) {
-    Variant& var = p->fish.variants[v];
-    var.instCount = std::min((uint32_t)fishInst[v].size(), var.instCap);
-    if (var.instCount)
-      wgpuQueueWriteBuffer(p->queue, var.instBuf, 0, fishInst[v].data(), (uint64_t)var.instCount * sizeof(Inst));
-  }
-  (void)dt;
 }
 
+// ── Draw: frustum-culled patch flush + per-set draws ──────────────────────────
 void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& viewProj,
                   const glm::vec3& eye, const glm::vec3& lightDir, float dayK,
                   double timeSec, float windAmp) {
   Impl* p = p_.get();
   if (!p->ready) return;
-  struct LU { glm::mat4 vp; glm::vec4 eye, sun, anim; };
-  Layer* layers[] = { &p->palms, &p->trees, &p->rocks, &p->drift, &p->birds, &p->dolphins, &p->fish };
-  bool bound = false;
-  for (Layer* l : layers) {
-    uint32_t total = 0;
-    for (const Variant& v : l->variants) total += v.instCount;
-    if (!total) continue;
-    LU u{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(lightDir, dayK),
-          glm::vec4((float)timeSec, l->mode, windAmp, l->alphaCut) };
-    wgpuQueueWriteBuffer(queue, l->ubuf, 0, &u, sizeof(u));
-    if (!bound) { wgpuRenderPassEncoderSetPipeline(pass, p->pipeline); bound = true; }
-    for (const Variant& v : l->variants) {
-      if (!v.instCount) continue;
-      wgpuRenderPassEncoderSetBindGroup(pass, 0, v.bind, 0, nullptr);
-      wgpuRenderPassEncoderSetVertexBuffer(pass, 0, v.vbuf, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetVertexBuffer(pass, 1, v.instBuf, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetIndexBuffer(pass, v.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderDrawIndexed(pass, v.indexCount, v.instCount, 0, 0, 0);
+
+  // Re-flush the static instance buffers when the camera has moved (or patches
+  // changed): each 40 m patch AABB is tested against the view frustum, so props
+  // behind the camera cost nothing (client patch culling).
+  bool anyDirty = p->palms.dirty || p->trees.dirty || p->rocks.dirty || p->drift.dirty;
+  float moved = std::hypot(eye.x - p->flushX, eye.z - p->flushZ);
+  static glm::mat4 lastVP(0.0f);
+  bool camChanged = moved > 3.0f || viewProj != lastVP;
+  if (anyDirty || camChanged) {
+    lastVP = viewProj; p->flushX = eye.x; p->flushZ = eye.z;
+    // Gribb-Hartmann frustum planes in world space.
+    glm::vec4 rows[4];
+    for (int r = 0; r < 4; ++r)
+      rows[r] = glm::vec4(viewProj[0][r], viewProj[1][r], viewProj[2][r], viewProj[3][r]);
+    glm::vec4 planes[5] = {
+      rows[3] + rows[0], rows[3] - rows[0],   // left, right
+      rows[3] + rows[1], rows[3] - rows[1],   // bottom, top
+      rows[3] + rows[2],                       // near
+    };
+    auto patchVisible = [&](int pxi, int pzi) {
+      float x0 = (float)pxi * Impl::PATCH, z0 = (float)pzi * Impl::PATCH;
+      glm::vec3 c(x0 + Impl::PATCH * 0.5f, 20.0f, z0 + Impl::PATCH * 0.5f);
+      glm::vec3 e2(Impl::PATCH * 0.5f, 35.0f, Impl::PATCH * 0.5f);   // generous Y for tall palms
+      for (const glm::vec4& pl : planes) {
+        float d = pl.x * c.x + pl.y * c.y + pl.z * c.z + pl.w;
+        float r = std::fabs(pl.x) * e2.x + std::fabs(pl.y) * e2.y + std::fabs(pl.z) * e2.z;
+        if (d + r < 0) return false;
+      }
+      return true;
+    };
+    Layer* statics[] = { &p->palms, &p->trees, &p->rocks, &p->drift };
+    for (Layer* l : statics) {
+      l->dirty = false;
+      size_t nv = l->full.size();
+      std::vector<std::vector<Inst>> fullBin(nv), lodBin(nv);
+      for (const auto& [key, per] : l->patches) {
+        if (!patchVisible(key.first, key.second)) continue;
+        float cx = ((float)key.first + 0.5f) * Impl::PATCH;
+        float cz = ((float)key.second + 0.5f) * Impl::PATCH;
+        float pd = std::hypot(cx - eye.x, cz - eye.z);
+        for (size_t v = 0; v < nv && v < per.size(); ++v) {
+          if (l->impostor) {
+            // Trees: dual-render the cross-dissolve ring (both bins; the shader
+            // scale-collapses each on its own side of NEAR_FADE).
+            if (pd < Impl::NEAR_FADE + Impl::NEAR_BAND + Impl::PATCH)
+              fullBin[v].insert(fullBin[v].end(), per[v].begin(), per[v].end());
+            if (!l->lod.empty() && pd > Impl::NEAR_FADE - Impl::NEAR_BAND - Impl::PATCH)
+              lodBin[v].insert(lodBin[v].end(), per[v].begin(), per[v].end());
+          } else {
+            // Rocks/drift: full mesh near, low-poly LOD beyond.
+            bool nearP = pd <= Impl::LOD_SPLIT;
+            auto& bin = (nearP || l->lod.empty() || !l->lod[v].vbuf) ? fullBin[v] : lodBin[v];
+            bin.insert(bin.end(), per[v].begin(), per[v].end());
+          }
+        }
+      }
+      for (size_t v = 0; v < nv; ++v) {
+        DrawSet& df = l->full[v];
+        df.instCount = std::min((uint32_t)fullBin[v].size(), df.instCap);
+        if (df.instCount)
+          wgpuQueueWriteBuffer(queue, df.instBuf, 0, fullBin[v].data(), (uint64_t)df.instCount * sizeof(Inst));
+        if (v < l->lod.size() && l->lod[v].vbuf) {
+          DrawSet& dl = l->lod[v];
+          dl.instCount = std::min((uint32_t)lodBin[v].size(), dl.instCap);
+          if (dl.instCount)
+            wgpuQueueWriteBuffer(queue, dl.instBuf, 0, lodBin[v].data(), (uint64_t)dl.instCount * sizeof(Inst));
+        }
+      }
     }
   }
+
+  struct LU { glm::mat4 vp; glm::vec4 eye, sun, anim, lod; };
+  auto drawSets = [&](Layer& l, bool lodSets, const glm::vec4& lodU) {
+    std::vector<DrawSet>& sets = lodSets ? l.lod : l.full;
+    WGPUBuffer ubuf = lodSets ? l.ubufLod : l.ubufFull;
+    uint32_t total = 0;
+    for (const DrawSet& d : sets) total += d.instCount;
+    if (!total || !ubuf) return;
+    float mode = (lodSets && l.impostor) ? 0.0f : l.mode;   // impostor crosses don't sway
+    float aCut = (lodSets && l.impostor) ? 0.4f : l.alphaCut;
+    LU u{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(lightDir, dayK),
+          glm::vec4((float)timeSec, mode, windAmp, aCut), lodU };
+    wgpuQueueWriteBuffer(queue, ubuf, 0, &u, sizeof(u));
+    wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
+    for (const DrawSet& d : sets) {
+      if (!d.instCount || !d.vbuf) continue;
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, d.bind, 0, nullptr);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 0, d.vbuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 1, d.instBuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(pass, d.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderDrawIndexed(pass, d.indexCount, d.instCount, 0, 0, 0);
+    }
+  };
+
+  const glm::vec4 noLod(0.0f);
+  // Trees/palms: full mesh shrinks out at NEAR_FADE; impostor grows in there and
+  // dithers out at the patch edge (client NearFade + LodDither).
+  glm::vec4 fullFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 1.0f, 0.0f);
+  glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 2.0f, Impl::TREE_CULL);
+  drawSets(p->palms, false, fullFade);
+  drawSets(p->palms, true, impFade);
+  drawSets(p->trees, false, fullFade);
+  drawSets(p->trees, true, impFade);
+  drawSets(p->rocks, false, noLod);
+  drawSets(p->rocks, true, noLod);
+  drawSets(p->drift, false, noLod);
+  drawSets(p->drift, true, noLod);
+  drawSets(p->birdsL, false, noLod);
+  drawSets(p->dolphinsL, false, noLod);
+  drawSets(p->fishL, false, noLod);
 }
 
 } // namespace scatter

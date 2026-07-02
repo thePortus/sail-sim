@@ -3819,7 +3819,17 @@ int main(int argc, char** argv) {
     glm::vec4 oceanScreen((float)curW, (float)curH, shipX, shipZ);   // zw = ocean origin
     // Near grid: full displacement, no discard. Far ring: flat (vertexAmp 0), but
     // discards the centre so the detailed near grid shows there.
-    if (sailing) scatterSys.update(device, queue, dt, (double)t, shipX, shipZ);
+    if (sailing) {
+      // Wildlife inputs: the boat (m/s) + storminess 0..1 (rain/storm sky + gale
+      // wind drive the gulls off, mirroring the client's weather gate).
+      mp::WaveState swv0 = mpClient.wave();
+      float cl = swv0.valid ? swv0.cloudiness : 0.25f;
+      float wet = cl > 0.94f ? 1.0f : cl > 0.82f ? 0.7f : cl > 0.68f ? 0.2f : 0.0f;
+      float gale = std::max(0.0f, ((swv0.valid ? swv0.windSpeed : 8.0f) - 20.0f) / 8.0f);
+      scatter::System::ShipInfo si{ vessel.x, vessel.z, vessel.heading,
+                                    vessel.speed * 0.514f, vessel.anchored };
+      scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)));
+    }
     const glm::vec4 oceanSun(lightDir, dayK);
     // Coastal shallows: hand the ocean the terrain heightfield bounds (see-depth
     // 10 m, the client's _SeeDepth) once the field is resident.

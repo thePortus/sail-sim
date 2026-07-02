@@ -7,6 +7,7 @@ struct Uniforms {
     model : mat4x4<f32>,
     eye   : vec4<f32>,      // world-space camera position (xyz)
     sun   : vec4<f32>,      // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
+    misc  : vec4<f32>,      // x = hull-local mask floor Y (used by the stencil stamp, not here)
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;

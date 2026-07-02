@@ -6,6 +6,7 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <map>
 #include <utility>
 
 MeshData loadGltfMesh(const char* path) {
@@ -47,6 +48,15 @@ MeshData loadGltfMesh(const char* path) {
     texPtrs.push_back(tex);
     return (int)out.textures.size() - 1;
   };
+
+  // Mesh -> scene-node name (the semantic name: 'Sloop_Hull', 'B_Mast_Main'...).
+  // Vessels are authored with meaningful NODE names while the mesh names can be
+  // arbitrary ('Aft_Cabinet', 'Hull.001'), so prefer the node's.
+  std::map<const cgltf_mesh*, const char*> meshNode;
+  for (cgltf_size ni = 0; ni < data->nodes_count; ++ni) {
+    const cgltf_node& nd = data->nodes[ni];
+    if (nd.mesh && nd.name && meshNode.find(nd.mesh) == meshNode.end()) meshNode[nd.mesh] = nd.name;
+  }
 
   for (cgltf_size mi = 0; mi < data->meshes_count; ++mi) {
     const cgltf_mesh& mesh = data->meshes[mi];
@@ -109,8 +119,11 @@ MeshData loadGltfMesh(const char* path) {
         for (cgltf_size i = 0; i < vcount; ++i)
           out.indices.push_back((uint32_t)(base + i));
       }
+      auto nodeIt = meshNode.find(&mesh);
+      const char* smName = nodeIt != meshNode.end() ? nodeIt->second : mesh.name;
       out.submeshes.push_back({ indexOffset, (uint32_t)out.indices.size() - indexOffset,
-                                baseColorTex, normalTex, metalRoughTex });
+                                baseColorTex, normalTex, metalRoughTex,
+                                smName ? std::string(smName) : std::string() });
     }
   }
 

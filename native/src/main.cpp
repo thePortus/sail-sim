@@ -140,7 +140,11 @@ static void styleSailSim() {
   c[ImGuiCol_Separator]       = ImVec4(0.20f, 0.26f, 0.32f, 0.70f);
 }
 
-static const WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
+// Depth + stencil: the stencil plane carries the hull water mask (the ship's real
+// hull geometry is stamped ref=1 before the ocean draws; the ocean rejects those
+// pixels, so the sea never washes over an open deck — the client's WebGPU scheme).
+static const WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24PlusStencil8;
+static const uint32_t kHullStencilRef = 1;
 
 // A framebuffer-sized depth texture, recreated on resize.
 static WGPUTexture makeDepthTexture(WGPUDevice device, uint32_t w, uint32_t h) {
@@ -160,7 +164,8 @@ struct MeshUniforms {
   glm::mat4 mvp;
   glm::mat4 model;
   glm::vec4 eye;
-  glm::vec4 sun;   // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
+  glm::vec4 sun;    // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
+  glm::vec4 misc;   // x = hull-local mask floor Y (stencil clamp; big negative = whole hull)
 };
 
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
@@ -185,23 +190,123 @@ struct Mesh {
   float     draft = 0.0f;
   float     bowYaw = 0.0f;              // radians: aligns the model's bow with +Z travel
   glm::vec3 keelCenter = glm::vec3(0.0f);
+  // Hull water mask (stencil): the hull submeshes stamped into the stencil plane
+  // before the ocean draws (client's buildHullStencilProxy scheme).
+  WGPUBindGroup stencilBind = nullptr;               // uniformBuf-only bind group (dynamic offset)
+  std::vector<std::pair<uint32_t, uint32_t>> hullRanges;   // (indexOffset, indexCount) of /hull/i submeshes
+  bool  oceanMask = true;               // per-vessel opt-out (brig: freeboard does the job)
+  float maskFloorY = -1.0e9f;           // hull-local clamp: mask only the deck above this (merchantman)
 };
 
 // Per-vessel model quirks, mirroring the client's VESSEL_RIGS (vessel-controller.ts):
 // baseYawDeg re-aims a hull whose authored bow isn't +Z (only the merchantman, +X),
-// and hullHalfLen sizes each hull to its real length so vessels differ in scale.
-struct VesselSpec { float baseYawDeg; float hullHalfLen; };
+// hullHalfLen sizes each hull to its real length, floatDraft is the client-tuned
+// keel depth (metres below the waterline; <0 = derive from the model's own origin,
+// authored at the waterline), and the ocean-mask fields mirror the client's
+// per-rig stencil config: open or low-freeboard decks get the hull stencil, the
+// brig opts out (its tuned freeboard clears the crests and a stencil would reveal
+// the keel through the sea), the merchantman clamps the mask at deck level.
+struct VesselSpec {
+  float baseYawDeg; float hullHalfLen;
+  float floatDraft;                     // keel depth (m); < 0 -> derive from model origin
+  bool  oceanMask; float maskFloorY;    // stencil on/off + hull-local deck clamp
+};
 static VesselSpec vesselSpecFor(const std::string& slug) {
-  if (slug == "merchantman") return { 90.0f, 15.0f };
-  if (slug == "brig")        return { 0.0f, 12.0f };
-  if (slug == "sloop")       return { 0.0f,  7.0f };
-  if (slug == "pinnace")     return { 0.0f,  4.1f };
-  return { 0.0f, 7.0f };   // default (sloop-sized)
+  if (slug == "merchantman") return { 90.0f, 15.0f, 3.8f, true, 6.5f };
+  if (slug == "brig")        return { 0.0f, 12.0f, 2.0f, false, -1.0e9f };
+  if (slug == "sloop")       return { 0.0f,  7.0f, -1.0f, true, -1.0e9f };
+  if (slug == "pinnace")     return { 0.0f,  4.1f, 0.5f, true, -1.0e9f };
+  return { 0.0f, 7.0f, -1.0f, true, -1.0e9f };   // default (sloop-sized)
+}
+
+// Hull-stencil stamp: a depth/stencil-only pipeline (no fragment stage, no colour
+// writes) that draws a vessel's hull submeshes into the stencil plane with ref=1.
+// Depth compare ALWAYS stamps the whole silhouette; the ocean then rejects those
+// pixels (compare NotEqual), masking the sea out of the deck/cockpit exactly like
+// the client's buildHullStencilProxy. misc.x clamps hull-local Y so deep hulls
+// mask only above deck level (never revealing the submerged keel through the sea).
+struct HullStencil { WGPUShaderModule module = nullptr; WGPURenderPipeline pipeline = nullptr; WGPUBindGroupLayout bgl = nullptr; };
+static HullStencil& hullStencil(WGPUDevice device, WGPUTextureFormat colorFormat) {
+  static HullStencil hs;
+  if (hs.pipeline) return hs;
+  // The fragment stage exists only because wgpu validates the pipeline's colour
+  // targets against the pass's attachments — writeMask 0 means it never paints.
+  static const char* kSrc = R"WGSL(
+struct U {
+  mvp   : mat4x4<f32>,
+  model : mat4x4<f32>,
+  eye   : vec4<f32>,
+  sun   : vec4<f32>,
+  misc  : vec4<f32>,   // x = hull-local mask floor Y
+};
+@group(0) @binding(0) var<uniform> u : U;
+@vertex
+fn vs_main(@location(0) inPos : vec3<f32>) -> @builtin(position) vec4<f32> {
+  var p = inPos;
+  p.y = max(p.y, u.misc.x);   // clamp below-deck geometry up to the mask floor
+  return u.mvp * vec4<f32>(p, 1.0);
+}
+@fragment
+fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
+)WGSL";
+  WGPUShaderModuleWGSLDescriptor wgsl = {};
+  wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
+  wgsl.code = kSrc;
+  WGPUShaderModuleDescriptor smd = {}; smd.nextInChain = &wgsl.chain;
+  hs.module = wgpuDeviceCreateShaderModule(device, &smd);
+
+  WGPUBindGroupLayoutEntry ble = {};
+  ble.binding = 0; ble.visibility = WGPUShaderStage_Vertex;
+  ble.buffer.type = WGPUBufferBindingType_Uniform;
+  ble.buffer.hasDynamicOffset = true;
+  ble.buffer.minBindingSize = sizeof(MeshUniforms);
+  WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 1; bgld.entries = &ble;
+  hs.bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
+  WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &hs.bgl;
+  WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
+
+  WGPUVertexAttribute attr = {}; attr.format = WGPUVertexFormat_Float32x3; attr.offset = 0; attr.shaderLocation = 0;
+  WGPUVertexBufferLayout vbl = {}; vbl.arrayStride = kFloatsPerVertex * sizeof(float); vbl.attributeCount = 1; vbl.attributes = &attr;
+
+  WGPUDepthStencilState ds = {};
+  ds.format = kDepthFormat;
+  ds.depthWriteEnabled = false;
+  ds.depthCompare = WGPUCompareFunction_Always;   // stamp the whole silhouette regardless of depth
+  ds.stencilFront.compare = WGPUCompareFunction_Always;
+  ds.stencilFront.failOp = WGPUStencilOperation_Keep;
+  ds.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
+  ds.stencilFront.passOp = WGPUStencilOperation_Replace;
+  ds.stencilBack = ds.stencilFront;
+  ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
+
+  WGPURenderPipelineDescriptor rpd = {};
+  rpd.layout = pl;
+  rpd.vertex.module = hs.module; rpd.vertex.entryPoint = "vs_main";
+  rpd.vertex.bufferCount = 1; rpd.vertex.buffers = &vbl;
+  rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+  rpd.primitive.cullMode = WGPUCullMode_None;   // interior far wall / floor stamp the cockpit too
+  WGPUColorTargetState target = {};
+  target.format = colorFormat;
+  target.writeMask = 0;                         // stencil-only: never paints a pixel
+  WGPUFragmentState frag = {};
+  frag.module = hs.module; frag.entryPoint = "fs_main"; frag.targetCount = 1; frag.targets = &target;
+  rpd.depthStencil = &ds;
+  rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu;
+  rpd.fragment = &frag;
+  hs.pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
+  wgpuPipelineLayoutRelease(pl);
+  return hs;
 }
 
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, const MeshData& data) {
   Mesh mesh;
   mesh.submeshes = data.submeshes;
+  // Hull submeshes (by node name, matching the client's /hull/i) for the water mask.
+  for (const Submesh& sm : data.submeshes) {
+    std::string n = sm.name;
+    for (char& c : n) c = (char)std::tolower((unsigned char)c);
+    if (n.find("hull") != std::string::npos) mesh.hullRanges.push_back({ sm.indexOffset, sm.indexCount });
+  }
 
   WGPUBufferDescriptor vbd = {};
   vbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
@@ -222,6 +327,15 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
   ubd.size = (uint64_t)mesh.uniformStride * kMaxShipInstances;
   mesh.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
+
+  // Water-mask stencil bind group: same per-instance uniform slots, stencil BGL.
+  {
+    HullStencil& hs = hullStencil(device, colorFormat);
+    WGPUBindGroupEntry sbe = {};
+    sbe.binding = 0; sbe.buffer = mesh.uniformBuf; sbe.size = sizeof(MeshUniforms);
+    WGPUBindGroupDescriptor sbd = {}; sbd.layout = hs.bgl; sbd.entryCount = 1; sbd.entries = &sbe;
+    mesh.stencilBind = wgpuDeviceCreateBindGroup(device, &sbd);
+  }
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
@@ -367,10 +481,22 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
   Mesh mesh = createMesh(device, queue, fmt, data);
   mesh.shipScale  = (horiz > 1e-6f) ? (2.0f * spec.hullHalfLen / horiz) : 1.0f;
   mesh.keelCenter = glm::vec3(center.x, bbMin.y, center.z);
-  mesh.draft      = 0.53f * std::min(extent.x, extent.z) * mesh.shipScale;
+  // Keel depth below the waterline: the client's tuned per-vessel floatDraft
+  // (pinnace 0.5, brig 2.0, merchantman 3.8). Vessels authored with the origin AT
+  // the waterline (sloop) derive it from the model instead (spec.floatDraft < 0).
+  // The old 53%-of-beam heuristic sank the big hulls ~1.5 m too deep — decks awash.
+  mesh.draft      = spec.floatDraft >= 0.0f ? spec.floatDraft
+                                            : std::max(0.0f, -bbMin.y * mesh.shipScale);
   // Client baseYawDeg is a +Y rotation in Babylon; our WebGPU frame needs the
   // opposite sign (merchantman: client +90° -> our -90°, which aimed it correctly).
   mesh.bowYaw     = -glm::radians(spec.baseYawDeg);
+  mesh.oceanMask  = spec.oceanMask && !mesh.hullRanges.empty();
+  // Mask floor: explicit per-vessel deck clamp (merchantman) or derived just above
+  // the hull-local waterline. A whole-hull stamp cuts a crater into the sea around
+  // the boat (the submerged silhouette rejects the water in front of it, showing
+  // the sky through the hole); clamping keeps the mask to the above-water hull.
+  mesh.maskFloorY = spec.maskFloorY > -1.0e8f ? spec.maskFloorY
+                  : bbMin.y + (mesh.draft + 0.3f) / std::max(mesh.shipScale, 1e-6f);
   return mesh;
 }
 
@@ -575,12 +701,14 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   ds.format = kDepthFormat;
   ds.depthWriteEnabled = true;
   ds.depthCompare = WGPUCompareFunction_Less;
-  ds.stencilFront.compare = WGPUCompareFunction_Always;
+  // Hull water mask: reject pixels the hull stencil stamped (ref written = 1, pass
+  // reference = kHullStencilRef) so the sea never draws over an open deck.
+  ds.stencilFront.compare = WGPUCompareFunction_NotEqual;
   ds.stencilFront.failOp = WGPUStencilOperation_Keep;
   ds.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
   ds.stencilFront.passOp = WGPUStencilOperation_Keep;
   ds.stencilBack = ds.stencilFront;
-  ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
+  ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0;   // test only, never write
 
   WGPUColorTargetState target = {};
   target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All;
@@ -2705,7 +2833,7 @@ int main(int argc, char** argv) {
       wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
       if (ownMesh) {
         MeshUniforms rm{ reflVP * ships[0].model, ships[0].model, glm::vec4(reflEye, 1.0f),
-                         glm::vec4(lightDir, dayK) };
+                         glm::vec4(lightDir, dayK), glm::vec4(ownMesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
         wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
       }
 
@@ -2715,6 +2843,7 @@ int main(int argc, char** argv) {
       rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
       WGPURenderPassDepthStencilAttachment rd = {};
       rd.view = reflDepthView; rd.depthLoadOp = WGPULoadOp_Clear; rd.depthStoreOp = WGPUStoreOp_Store; rd.depthClearValue = 1.0f;
+      rd.stencilLoadOp = WGPULoadOp_Clear; rd.stencilStoreOp = WGPUStoreOp_Discard;   // stencil unused here (format has it)
       WGPURenderPassDescriptor rp_desc = {};
       rp_desc.colorAttachmentCount = 1; rp_desc.colorAttachments = &rc; rp_desc.depthStencilAttachment = &rd;
       WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(renc, &rp_desc);
@@ -2830,7 +2959,7 @@ int main(int argc, char** argv) {
         uint32_t idx = slot[s.mesh];
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
-                         glm::vec4(lightDir, dayK) };
+                         glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
         wgpuQueueWriteBuffer(queue, s.mesh->uniformBuf,
                              (uint64_t)idx * s.mesh->uniformStride, &mu, sizeof(mu));
         slot[s.mesh] = idx + 1;
@@ -2860,6 +2989,8 @@ int main(int argc, char** argv) {
     depthAttachment.view = depthView;
     depthAttachment.depthLoadOp = WGPULoadOp_Clear;
     depthAttachment.depthStoreOp = WGPUStoreOp_Store;
+    depthAttachment.stencilLoadOp = WGPULoadOp_Clear;    // hull mask stamped + consumed in this pass
+    depthAttachment.stencilStoreOp = WGPUStoreOp_Store;  // format carries stencil; later passes reload it
     depthAttachment.depthClearValue = 1.0f;
 
     WGPURenderPassDescriptor passDesc = {};
@@ -2883,6 +3014,33 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderSetIndexBuffer(pass, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderDrawIndexed(pass, terrainR.indexCount, 1, 0, 0, 0);
     }
+    // Hull water mask: stamp every masked vessel's hull into the stencil plane
+    // BEFORE the ocean draws (same per-instance uniform slots as the ship draws
+    // below, so the stamp rides the exact buoyancy/heel transform). The ocean's
+    // stencil test (NotEqual ref) then rejects those pixels — no sea on the deck.
+    {
+      HullStencil& hs = hullStencil(device, surfaceFormat);
+      bool stencilBound = false;
+      std::map<Mesh*, uint32_t> slot;
+      for (const ShipInst& s : ships) {
+        Mesh* m = s.mesh;
+        uint32_t idx = slot[m];
+        if (idx >= kMaxShipInstances) continue;
+        slot[m] = idx + 1;                       // keep slot numbering aligned with the draw loop
+        if (!m->oceanMask || m->hullRanges.empty()) continue;
+        if (!stencilBound) { wgpuRenderPassEncoderSetPipeline(pass, hs.pipeline); stencilBound = true; }
+        uint32_t dynOff = idx * m->uniformStride;
+        wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetBindGroup(pass, 0, m->stencilBind, 1, &dynOff);
+        wgpuRenderPassEncoderSetStencilReference(pass, kHullStencilRef);
+        for (const auto& r : m->hullRanges)
+          wgpuRenderPassEncoderDrawIndexed(pass, r.second, 1, r.first, 0, 0);
+      }
+    }
+    // The ocean tests against the stamped ref; ships after it ignore the reference
+    // (their stencil compare is Always).
+    wgpuRenderPassEncoderSetStencilReference(pass, kHullStencilRef);
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
@@ -2948,6 +3106,7 @@ int main(int argc, char** argv) {
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDepthStencilAttachment da = {};
       da.view = depthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
+      da.stencilLoadOp = WGPULoadOp_Load; da.stencilStoreOp = WGPUStoreOp_Store;   // untouched pass-through
       WGPURenderPassDescriptor gpd = {};
       gpd.colorAttachmentCount = 1; gpd.colorAttachments = &ca; gpd.depthStencilAttachment = &da;
       WGPURenderPassEncoder gp = wgpuCommandEncoderBeginRenderPass(encoder, &gpd);
@@ -2968,6 +3127,7 @@ int main(int argc, char** argv) {
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
       WGPURenderPassDepthStencilAttachment da = {};
       da.view = depthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
+      da.stencilLoadOp = WGPULoadOp_Load; da.stencilStoreOp = WGPUStoreOp_Store;   // untouched pass-through
       WGPURenderPassDescriptor cpd = {};
       cpd.colorAttachmentCount = 1; cpd.colorAttachments = &ca; cpd.depthStencilAttachment = &da;
       WGPURenderPassEncoder cp = wgpuCommandEncoderBeginRenderPass(encoder, &cpd);
@@ -2985,6 +3145,7 @@ int main(int argc, char** argv) {
       ca.view = view; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDepthStencilAttachment da = {};
       da.view = depthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
+      da.stencilLoadOp = WGPULoadOp_Load; da.stencilStoreOp = WGPUStoreOp_Store;   // untouched pass-through
       WGPURenderPassDescriptor fpd = {};
       fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca; fpd.depthStencilAttachment = &da;
       WGPURenderPassEncoder fp = wgpuCommandEncoderBeginRenderPass(encoder, &fpd);

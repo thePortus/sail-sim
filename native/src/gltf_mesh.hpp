@@ -1,6 +1,7 @@
 // Minimal glTF/GLB mesh loader (positions + normals + indices) for Phase 1.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Interleaved vertex: position.xyz, normal.xyz, uv, albedo.rgb, metallic, roughness.
@@ -22,6 +23,7 @@ struct Submesh {
   int      baseColor = -1;   // sRGB albedo map
   int      normal = -1;      // tangent-space normal map (linear)
   int      metalRough = -1;  // glTF metallic-roughness map: G=rough, B=metal (linear)
+  std::string name;          // source glTF mesh name (finds the hull for the water mask)
 };
 
 struct MeshData {

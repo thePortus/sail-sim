@@ -158,9 +158,10 @@ fn biomeColor(h : f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
-  // Only land above the waterline draws; the sea covers the seabed, so shallow
-  // reef flats read as water, not exposed green land.
-  if (in.elev < 0.2) { discard; }
+  // The seabed DRAWS now (no waterline cull): the ocean surface above is
+  // alpha-blended by true depth, so submerged sand shows through the shallows.
+  // Underwater fragments get absorption shading below so reef flats read as
+  // drowned sand, never as exposed green land.
 
   let wp = in.worldPos;
   let e = (u.bounds.y - u.bounds.x) / u.misc.x;   // ~one texel in metres
@@ -277,6 +278,14 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   let diff = max(dot(N, L), 0.0);
   col = col * (0.32 + 0.68 * diff);
+  // Underwater: pull the biome colour toward drowned sand and absorb light by
+  // depth (red dies first) so the seabed seen through the water reads natural.
+  if (in.elev < 0.2) {
+    let dz = max(0.0, -in.elev);
+    col = mix(col, vec3<f32>(0.50, 0.46, 0.36) * (0.32 + 0.68 * diff), 0.65);
+    col = col * exp(-dz * vec3<f32>(0.14, 0.085, 0.05));
+    col = col + vec3<f32>(0.004, 0.018, 0.026) * (1.0 - exp(-dz * 0.25));
+  }
   // Day/night (u.sun.w = daylight): dim + cool the land toward a moonlit night.
   let dayK = u.sun.w;
   col = col * mix(0.13, 1.0, dayK) * mix(vec3<f32>(0.48, 0.58, 0.82), vec3<f32>(1.0), dayK);

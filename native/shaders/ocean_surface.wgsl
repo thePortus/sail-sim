@@ -124,7 +124,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     var reveal = 0.0;
     var shallow = 0.0;
     var shoal = 0.0;
-    var sandCol = vec3<f32>(0.0);
     if (cam.tmisc.z > 0.5) {
         let dz = max(0.0, -tSampleH(in.worldUV.x, in.worldUV.y));
         // Visibility falls off with view distance (scattering through the column):
@@ -136,18 +135,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         shallow = (1.0 - smoothstep(0.0, seeD * 2.2, dz)) * distFade;
         shoal   = smoothstep(seeD, seeD * 1.8, dz)
                 * (1.0 - smoothstep(seeD * 1.8, seeD * 3.5, dz)) * distFade * (1.0 - reveal);
-        // Seabed sand, depth-shaded (no refraction RTT natively — a warm sand tone
-        // falling off with depth reads the same), day-gated like the client's.
-        sandCol = vec3<f32>(0.60, 0.55, 0.42) * (0.35 + 0.65 * exp(-dz / 6.0))
-                * (0.08 + 0.92 * cam.sun.w);
     }
 
     // Fresnel sky reflection.
     var fresnel = clamp(1.0 - dot(N, V), 0.0, 1.0);
     fresnel = pow5(fresnel);
     var waterCol = color * (1.0 - fresnel);
-    // Revealed seabed replaces the deep-water body colour in the shallows.
-    waterCol = mix(waterCol, sandCol, reveal * 0.9);
     // Shoal water-column tint just beyond the clear-view depth (sun-gated).
     waterCol = mix(waterCol, vec3<f32>(0.10, 0.48, 0.50) * (1.0 - fresnel), shoal * 0.30 * cam.sun.w);
     // Kill the mirror glint across the shallows — transparent water over sand
@@ -172,5 +165,9 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let bright = mix(0.10, 1.0, dayK);
     let tint   = mix(vec3<f32>(0.42, 0.54, 0.82), vec3<f32>(1.0), dayK);
     outColor = outColor * bright * tint;
-    return vec4<f32>(outColor, 1.0);
+    // REAL transparency over the shallows: the seabed terrain rendered beneath
+    // (underwater-shaded, and later any submerged scatter props) shows through.
+    // Foam stays opaque — breakers read solid white even over sand.
+    let alpha = clamp(1.0 - reveal * 0.95 + jacobian, 0.05, 1.0);
+    return vec4<f32>(outColor, alpha);
 }

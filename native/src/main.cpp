@@ -719,8 +719,18 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   ds.stencilBack = ds.stencilFront;
   ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0;   // test only, never write
 
+  // Alpha-blended: the shallows output alpha < 1 so the real seabed (terrain
+  // rendered beneath, underwater-shaded) shows through the surface.
+  WGPUBlendState oblend = {};
+  oblend.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+  oblend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+  oblend.color.operation = WGPUBlendOperation_Add;
+  oblend.alpha.srcFactor = WGPUBlendFactor_One;
+  oblend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+  oblend.alpha.operation = WGPUBlendOperation_Add;
   WGPUColorTargetState target = {};
   target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All;
+  target.blend = &oblend;
   WGPUFragmentState frag = {};
   frag.module = o.module; frag.entryPoint = "fs_main";
   frag.targetCount = 1; frag.targets = &target;
@@ -3456,7 +3466,22 @@ int main(int argc, char** argv) {
       float windFromDeg = wv.valid ? wv.windBearing : 270.0f;
       float windKn      = wv.valid ? wv.windSpeed  : 8.0f;
       float seaRough    = glm::clamp((wv.valid ? (float)wv.beaufort : 3.0f) / 8.0f, 0.0f, 1.0f);
+      float preX = vessel.x, preZ = vessel.z;   // for the land-collision revert
       sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale);
+      // Hull-vs-land collision (client hullHitsLand): sample the hull CENTRELINE
+      // from centre toward the moving end (bow ahead / stern astern), plus the
+      // centre itself, so the bow halts at the shoreline instead of burying
+      // half a hull-length into the island before the centre reaches land.
+      if (terr.loaded()) {
+        float dirSign = vessel.speed >= 0.0f ? 1.0f : -1.0f;
+        float fx = std::sin(vessel.heading) * dirSign, fz = std::cos(vessel.heading) * dirSign;
+        bool hit = terr.isLand(vessel.x, vessel.z);
+        for (int i = 1; !hit && i <= 4; ++i) {
+          float d = vrig.hullHalfLen * (float)i / 4.0f;
+          hit = terr.isLand(vessel.x + fx * d, vessel.z + fz * d);
+        }
+        if (hit) { vessel.x = preX; vessel.z = preZ; vessel.speed = 0.0f; }
+      }
       shipX = vessel.x; shipZ = vessel.z; shipHeading = vessel.heading; shipSpeed = vessel.speed;
     }
     glm::vec3 fwd(std::sin(shipHeading), 0.0f, std::cos(shipHeading));

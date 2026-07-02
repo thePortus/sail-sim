@@ -18,6 +18,19 @@ struct RemotePlayer {
   std::string id;
   float x = 0, z = 0, heading = 0, speed = 0;
   std::string callsign, vesselName, vesselSlug, sailState;
+  bool npc = false;          // NPC merchant / pirate / hunter (hidden from the map for non-staff)
+  std::string role;          // merchant | pirate | hunter (NPCs only)
+};
+
+// Minimap intel (npc.js broadcasts): lane hotspots for everyone; the full
+// merchant/pirate fleets arrive for staff accounts only.
+struct LaneHotspot { float x = 0, z = 0, w = 0; };
+struct MapShip    { float x = 0, z = 0; };
+struct MapPirate  {
+  float x = 0, z = 0;
+  bool hunter = false;
+  std::string name, faction, slug;
+  int bounty = 0, kills = 0;
 };
 
 // Latest weather tick (server "wave_state").
@@ -63,6 +76,9 @@ struct TownState {
   std::string ship, shipName;
   bool cannonUpgrade = false, armorUpgrade = false;
   int crew = 0, maxCrew = 0;
+  std::string hintTownId;                       // market demand hint target (map SELL-HERE beacon)
+  std::string rumorShipId;                      // tavern rumour merchant (map TARGET mark)
+  std::string pirateShipId;                     // tavern pirate report (map HUNT mark)
   std::string recruitStatus;                    // last recruit_result line ("" = none yet)
   std::string rumorText, rumorStatus;           // composed rumour sentence / failure note
   PirateReportInfo pirate;
@@ -95,6 +111,9 @@ public:
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   WaveState wave() const;
+  std::vector<LaneHotspot> lanes() const;      // busiest shipping-lane hotspots (all players)
+  std::vector<MapShip> merchantsAll() const;   // staff-only full merchant fleet (else empty)
+  std::vector<MapPirate> piratesAll() const;   // staff-only pirates + hunters (else empty)
 
   // ── Town economy (dock menu) — fire-and-forget sends; replies land in town(). ──
   TownState town() const;

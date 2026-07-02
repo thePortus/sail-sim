@@ -529,6 +529,8 @@ struct OceanCamera {
   glm::vec4 screen;   // xy = framebuffer size (px); zw = ocean origin (ship)
   glm::vec4 lod;      // x = vertex displacement amp; y = inner discard radius
   glm::vec4 sun;      // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
+  glm::vec4 tbounds;  // terrain heightfield world bounds: minX, maxX, minZ, maxZ
+  glm::vec4 tmisc;    // x,y = heightfield texel size; z = field ready; w = see-depth (m)
 };
 
 // A colour render target (planar reflection).
@@ -609,6 +611,9 @@ struct Ocean {
   WGPUSampler         sampler;
   WGPUBindGroupLayout bgl;
   uint32_t            indexCount;
+  // 1x1 deep-water placeholder for the terrain heightfield slot until it loads.
+  WGPUTexture         placeTex = nullptr;
+  WGPUTextureView     placeView = nullptr;
   // Coarse, geometrically-flat FAR ring: same ocean shader (wave normals, foam,
   // reflection) so the real ocean look reaches the horizon without displacement
   // aliasing. Its own uniform (displacement amp 0, inner discard radius set).
@@ -721,8 +726,9 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   frag.targetCount = 1; frag.targets = &target;
 
   // Explicit bind group layout (auto-layout misrouted binding 11): uniform (0),
-  // 9 cascade textures (1-9), sampler (10), reflection (11). All float/filtering.
-  WGPUBindGroupLayoutEntry be[12] = {};
+  // 9 cascade textures (1-9), sampler (10), reflection (11), terrain height (12,
+  // R32F unfilterable — drives the coastal-shallows transparency).
+  WGPUBindGroupLayoutEntry be[13] = {};
   be[0].binding = 0; be[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   be[0].buffer.type = WGPUBufferBindingType_Uniform;
   for (int i = 1; i <= 9; ++i) {
@@ -735,8 +741,25 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   be[11].binding = 11; be[11].visibility = WGPUShaderStage_Fragment;
   be[11].texture.sampleType = WGPUTextureSampleType_Float;
   be[11].texture.viewDimension = WGPUTextureViewDimension_2D;
-  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 12; bld.entries = be;
+  be[12].binding = 12; be[12].visibility = WGPUShaderStage_Fragment;
+  be[12].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;   // R32F heightfield
+  be[12].texture.viewDimension = WGPUTextureViewDimension_2D;
+  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 13; bld.entries = be;
   o.bgl = wgpuDeviceCreateBindGroupLayout(device, &bld);
+  // Deep-water placeholder heightfield (-1000 m) until the real one arrives.
+  {
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    td.dimension = WGPUTextureDimension_2D; td.size = { 1, 1, 1 };
+    td.format = WGPUTextureFormat_R32Float; td.mipLevelCount = 1; td.sampleCount = 1;
+    o.placeTex = wgpuDeviceCreateTexture(device, &td);
+    float deep = -1000.0f;
+    WGPUImageCopyTexture dst = {}; dst.texture = o.placeTex; dst.aspect = WGPUTextureAspect_All;
+    WGPUTextureDataLayout dl = {}; dl.bytesPerRow = 4; dl.rowsPerImage = 1;
+    WGPUExtent3D ext = { 1, 1, 1 };
+    wgpuQueueWriteTexture(queue, &dst, &deep, 4, &dl, &ext);
+    o.placeView = wgpuTextureCreateView(o.placeTex, nullptr);
+  }
   WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &o.bgl;
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 
@@ -1978,7 +2001,9 @@ int main(int argc, char** argv) {
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &c, 4);
     std::pair<WGPUTextureView, ImVec2> out{ nullptr, ImVec2(0, 0) };
     if (px) {
-      WGPUTexture t = makeSampledRGBA(device, queue, (uint32_t)w, (uint32_t)h, px, true);
+      // LINEAR format — the ImGui backend gamma-corrects sRGB targets in-shader;
+      // an sRGB texture here would be linearised twice and render far too dark.
+      WGPUTexture t = makeSampledRGBA(device, queue, (uint32_t)w, (uint32_t)h, px, false);
       out = { wgpuTextureCreateView(t, nullptr), ImVec2((float)w, (float)h) };
       stbi_image_free(px);
     } else {
@@ -2242,7 +2267,9 @@ int main(int argc, char** argv) {
               px[o] = r; px[o + 1] = g; px[o + 2] = b; px[o + 3] = 255;
             }
           }
-          mapTex = makeSampledRGBA(device, queue, MR, MR, px.data(), true);
+          // LINEAR format: imgui_impl_wgpu gamma-corrects in-shader for sRGB targets,
+          // so an sRGB texture would be linearised twice and render far too dark.
+          mapTex = makeSampledRGBA(device, queue, MR, MR, px.data(), false);
           mapView = wgpuTextureCreateView(mapTex, nullptr);
         }
         if (!tm.harbors.empty()) {
@@ -2567,8 +2594,64 @@ int main(int argc, char** argv) {
             }
           }
 
+          // Shipping-lane hotspots — shown to EVERY player: where the NPC fleet is
+          // concentrated right now (soft teal zone + pulsing ring, client scheme).
+          {
+            float lanePulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 1.45f);
+            for (const mp::LaneHotspot& ln : mpClient.lanes()) {
+              ImVec2 lp(wx(ln.x), wz(ln.z));
+              float worldR = 1600.0f + 1500.0f * ln.w;
+              float rPx = std::max(6.0f, worldR / visW * S);
+              // Radial glow approximated with concentric fills.
+              int glowA = (int)(255.0f * (0.10f + 0.12f * ln.w));
+              mdl->AddCircleFilled(lp, rPx, IM_COL32(70, 220, 200, glowA / 3));
+              mdl->AddCircleFilled(lp, rPx * 0.62f, IM_COL32(70, 220, 200, glowA / 2));
+              mdl->AddCircleFilled(lp, rPx * 0.30f, IM_COL32(70, 220, 200, glowA));
+              int ringA = (int)(255.0f * (0.28f + 0.35f * lanePulse * ln.w));
+              mdl->AddCircle(lp, rPx * (0.9f + 0.06f * lanePulse), IM_COL32(120, 235, 215, ringA), 0, 1.4f);
+              if (expanded && ln.w >= 0.6f) {
+                const char* lbl = "ships sighted";
+                ImVec2 ts = ImGui::CalcTextSize(lbl);
+                mdl->AddText(ImVec2(lp.x - ts.x * 0.5f, lp.y - rPx - ts.y - 3.0f),
+                             IM_COL32(155, 245, 225, 235), lbl);
+              }
+            }
+          }
+          // Staff-only fleet feeds (empty vectors for regular players): merchants as
+          // cyan diamonds, pirates blood-red with a skull dot, hunters steel.
+          auto diamond = [&](ImVec2 c2, float sz2, ImU32 fill, ImU32 line) {
+            ImVec2 pts[4] = { ImVec2(c2.x, c2.y - sz2), ImVec2(c2.x + sz2, c2.y),
+                              ImVec2(c2.x, c2.y + sz2), ImVec2(c2.x - sz2, c2.y) };
+            mdl->AddConvexPolyFilled(pts, 4, fill);
+            mdl->AddPolyline(pts, 4, line, ImDrawFlags_Closed, 1.4f);
+          };
+          {
+            float ds2 = expanded ? 6.0f : 5.0f;
+            for (const mp::MapShip& m : mpClient.merchantsAll())
+              diamond(ImVec2(wx(m.x), wz(m.z)), ds2, IM_COL32(34, 227, 208, 255), IM_COL32(255, 255, 255, 230));
+            for (const mp::MapPirate& pr : mpClient.piratesAll()) {
+              ImVec2 pp(wx(pr.x), wz(pr.z));
+              if (pr.hunter) diamond(pp, ds2, IM_COL32(207, 217, 230, 255), IM_COL32(51, 80, 110, 255));
+              else {
+                diamond(pp, ds2, IM_COL32(200, 30, 42, 255), IM_COL32(0, 0, 0, 217));
+                mdl->AddCircleFilled(pp, std::max(1.0f, ds2 * 0.32f), IM_COL32(0, 0, 0, 210));
+              }
+              if (expanded && hovered) {
+                float dd = std::hypot(io.MousePos.x - pp.x, io.MousePos.y - pp.y);
+                if (dd < 8.0f) {
+                  ImGui::BeginTooltip();
+                  if (pr.hunter) { ImGui::Text("%s", pr.name.c_str()); ImGui::TextDisabled("%s Navy - Pirate Hunter", pr.faction.c_str()); }
+                  else { ImGui::Text("%s", pr.name.c_str()); ImGui::TextDisabled("Pirate - Bounty %dg, sunk %d", pr.bounty, pr.kills); }
+                  ImGui::EndTooltip();
+                }
+              }
+            }
+          }
           // Other players: orange dots (+ callsign labels on the expanded chart).
+          // NPC ships are skipped — merchants are map-hidden for regular players
+          // (staff see the fleet feed above); rumour/report marks handle the rest.
           for (const mp::RemotePlayer& rp : mpClient.players()) {
+            if (rp.npc) continue;
             ImVec2 pp(wx(rp.x), wz(rp.z));
             if (pp.x < p0.x || pp.x > p0.x + S || pp.y < p0.y || pp.y > p0.y + S) continue;
             mdl->AddCircleFilled(pp, 3.0f, IM_COL32(255, 120, 80, 220));
@@ -2577,6 +2660,46 @@ int main(int argc, char** argv) {
               for (char& ch : cs) ch = (char)std::toupper((unsigned char)ch);
               ImVec2 ts = ImGui::CalcTextSize(cs.c_str());
               mdl->AddText(ImVec2(pp.x - ts.x * 0.5f, pp.y - ts.y - 5.0f), IM_COL32(255, 170, 120, 230), cs.c_str());
+            }
+          }
+          // Bold dark-outlined tag over a marker (SELL HERE / TARGET / HUNT beacons).
+          auto tagLabel = [&](const std::string& text, ImVec2 pp, ImU32 fill) {
+            ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+            ImVec2 tp(pp.x - ts.x * 0.5f, pp.y);
+            mdl->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 220), text.c_str());
+            mdl->AddText(tp, fill, text.c_str());
+          };
+          mp::TownState mts = mpClient.town();
+          float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 9.0f);
+          // SELL-HERE beacon: the town the trade hint points at (both map sizes).
+          if (!mts.hintTownId.empty()) {
+            for (const terrain::Harbor& hb2 : tm.harbors) {
+              if (hb2.id != mts.hintTownId) continue;
+              ImVec2 hp2(wx(hb2.x), wz(hb2.z));
+              mdl->AddCircle(hp2, 8.0f + pulse * 5.0f,
+                             IM_COL32(245, 205, 90, (int)(255 * (0.45f + 0.5f * pulse))), 0, 2.0f);
+              mdl->AddCircleFilled(hp2, expanded ? 4.0f : 3.5f, IM_COL32(255, 210, 74, 255));
+              tagLabel(expanded ? ("SELL HERE - " + hb2.name) : "SELL HERE",
+                       ImVec2(hp2.x, hp2.y - (expanded ? 26.0f : 20.0f)), IM_COL32(255, 231, 154, 255));
+              break;
+            }
+          }
+          // Tavern marks: the rumoured merchant (gold TARGET) and the reported
+          // pirate (red HUNT), looked up live among the streamed ships by id.
+          if (!mts.rumorShipId.empty() || !mts.pirateShipId.empty()) {
+            for (const mp::RemotePlayer& rp : mpClient.players()) {
+              bool isRumor = rp.id == mts.rumorShipId;
+              bool isPirate = rp.id == mts.pirateShipId;
+              if (!isRumor && !isPirate) continue;
+              ImVec2 pp(wx(rp.x), wz(rp.z));
+              float sz3 = expanded ? 7.0f : 6.0f;
+              ImU32 ring = isPirate ? IM_COL32(230, 60, 40, (int)(255 * (0.45f + 0.5f * pulse)))
+                                    : IM_COL32(245, 205, 90, (int)(255 * (0.40f + 0.5f * pulse)));
+              mdl->AddCircle(pp, sz3 + 4.0f + pulse * 4.0f, ring, 0, 2.0f);
+              diamond(pp, sz3, isPirate ? IM_COL32(226, 58, 42, 255) : IM_COL32(255, 210, 74, 255),
+                      isPirate ? IM_COL32(20, 0, 0, 230) : IM_COL32(60, 40, 0, 217));
+              tagLabel(isPirate ? "HUNT" : "TARGET", ImVec2(pp.x, pp.y - sz3 - (expanded ? 22.0f : 18.0f)),
+                       isPirate ? IM_COL32(255, 154, 138, 255) : IM_COL32(255, 231, 154, 255));
             }
           }
 
@@ -3666,11 +3789,19 @@ int main(int argc, char** argv) {
     // Near grid: full displacement, no discard. Far ring: flat (vertexAmp 0), but
     // discards the centre so the detailed near grid shows there.
     const glm::vec4 oceanSun(lightDir, dayK);
+    // Coastal shallows: hand the ocean the terrain heightfield bounds (see-depth
+    // 10 m, the client's _SeeDepth) once the field is resident.
+    glm::vec4 oceanTB(0.0f), oceanTM(1.0f, 1.0f, 0.0f, 10.0f);
+    if (terrainR.ready && terr.loaded()) {
+      const terrain::Manifest& otm = terr.manifest();
+      oceanTB = glm::vec4((float)otm.minX, (float)otm.maxX, (float)otm.minZ, (float)otm.maxZ);
+      oceanTM = glm::vec4((float)otm.width, (float)otm.height, 1.0f, 10.0f);
+    }
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
-                    glm::vec4(seaAmp, 0.0f, 0.0f, 0.0f), oceanSun };
+                    glm::vec4(seaAmp, 0.0f, 0.0f, 0.0f), oceanSun, oceanTB, oceanTM };
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
-                       glm::vec4(0.0f, 1400.0f, 0.0f, 0.0f), oceanSun };
+                       glm::vec4(0.0f, 1400.0f, 0.0f, 0.0f), oceanSun, oceanTB, oceanTM };
     wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
                     skyMoon, skyParams };
@@ -3868,7 +3999,7 @@ int main(int argc, char** argv) {
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
-    WGPUBindGroupEntry oe[12] = {};
+    WGPUBindGroupEntry oe[13] = {};
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
     oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
@@ -3880,11 +4011,13 @@ int main(int argc, char** argv) {
     oe[9].binding = 9;  oe[9].textureView  = c2.turbulence();
     oe[10].binding = 10; oe[10].sampler = ocean.sampler;
     oe[11].binding = 11; oe[11].textureView = reflView;
+    oe[12].binding = 12; oe[12].textureView = (terrainR.ready && terrainR.heightView)
+                                            ? terrainR.heightView : ocean.placeView;
     oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
-    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 12; obdF.entries = oe;
+    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 13; obdF.entries = oe;
     oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
     oe[0].buffer = ocean.uniformBuf;
-    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 12; obd.entries = oe;
+    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 13; obd.entries = oe;
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);

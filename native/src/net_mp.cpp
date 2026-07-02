@@ -21,6 +21,9 @@ struct Client::Impl {
   WaveState wave;
   std::vector<ChatMessage> chatIn;   // drained by the render loop each frame
   TownState townSt;                  // wallet/crew/market/dock-menu replies
+  std::vector<LaneHotspot> lanes;
+  std::vector<MapShip> allMerchants;
+  std::vector<MapPirate> allPirates;
 
   static RemotePlayer parsePlayer(const json& j) {
     RemotePlayer r;
@@ -33,6 +36,8 @@ struct Client::Impl {
     r.vesselName = j.value("vesselName", std::string());
     r.vesselSlug = j.value("vesselSlug", std::string());
     r.sailState  = j.value("sailState", std::string());
+    r.npc        = j.value("npc", false);
+    r.role       = j.value("role", std::string());
     return r;
   }
 
@@ -103,6 +108,7 @@ struct Client::Impl {
         townSt.rumorText = "A " + slug + (from.empty() ? "" : " out of " + from)
                          + " is bound for " + (to.empty() ? "parts unknown" : to) + ".";
         townSt.rumorStatus.clear();
+        townSt.rumorShipId = msg.value("shipId", std::string());
       } else {
         townSt.rumorText.clear();
         std::string r = msg.value("reason", std::string());
@@ -112,6 +118,7 @@ struct Client::Impl {
     } else if (type == "pirate_report_result") {
       townSt.pirate.valid = true;
       townSt.pirate.ok = msg.value("ok", false);
+      if (townSt.pirate.ok) townSt.pirateShipId = msg.value("shipId", std::string());
       townSt.pirate.reason = msg.value("reason", std::string());
       townSt.pirate.name = msg.value("name", std::string());
       townSt.pirate.slug = msg.value("slug", std::string());
@@ -137,6 +144,7 @@ struct Client::Impl {
         townSt.market.hintText = "Best buyer for " + h.value("goodId", std::string("goods"))
                                + ": " + h.value("townName", h.value("townId", std::string("?")))
                                + " (pays " + std::to_string(h.value("bid", 0)) + "g)";
+        townSt.hintTownId = h.value("townId", std::string());
       } else townSt.market.hintText.clear();
       townSt.gold = msg.value("gold", townSt.gold);
       townSt.capacity = msg.value("capacity", townSt.capacity);
@@ -173,6 +181,33 @@ struct Client::Impl {
       townSt.shipStatus = r == "already_owned" ? "Already fitted on this hull."
                         : r == "no_gold" ? "Not enough gold."
                         : "No upgrade (" + r + ").";
+    } else if (type == "shipping_lanes") {
+      lanes.clear();
+      if (msg.contains("hotspots") && msg["hotspots"].is_array())
+        for (const auto& h : msg["hotspots"]) {
+          LaneHotspot lh;
+          lh.x = h.value("x", 0.0f); lh.z = h.value("z", 0.0f);
+          lh.w = std::min(1.0f, std::max(0.0f, h.value("w", 0.0f)));
+          lanes.push_back(lh);
+        }
+    } else if (type == "all_merchants") {
+      allMerchants.clear();
+      if (msg.contains("ships") && msg["ships"].is_array())
+        for (const auto& m : msg["ships"])
+          allMerchants.push_back({ m.value("x", 0.0f), m.value("z", 0.0f) });
+    } else if (type == "all_pirates") {
+      allPirates.clear();
+      if (msg.contains("ships") && msg["ships"].is_array())
+        for (const auto& m : msg["ships"]) {
+          MapPirate mp;
+          mp.x = m.value("x", 0.0f); mp.z = m.value("z", 0.0f);
+          mp.hunter = m.value("role", std::string()) == "hunter";
+          mp.name = m.value("name", std::string());
+          if (m.contains("faction") && m["faction"].is_string()) mp.faction = m["faction"].get<std::string>();
+          mp.slug = m.value("slug", std::string());
+          mp.bounty = m.value("bounty", 0); mp.kills = m.value("kills", 0);
+          allPirates.push_back(std::move(mp));
+        }
     } else if (type == "reputation_changed") {
       if (msg.contains("factionRep") && msg["factionRep"].is_object())
         for (auto& [k, v] : msg["factionRep"].items()) if (v.is_number()) townSt.factionRep[k] = v.get<float>();
@@ -280,6 +315,19 @@ std::vector<RemotePlayer> Client::players() const {
 WaveState Client::wave() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->wave;
+}
+
+std::vector<LaneHotspot> Client::lanes() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->lanes;
+}
+std::vector<MapShip> Client::merchantsAll() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->allMerchants;
+}
+std::vector<MapPirate> Client::piratesAll() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->allPirates;
 }
 
 // ── Town economy sends (fire-and-forget; server replies update townSt) ────────

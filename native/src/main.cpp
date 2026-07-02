@@ -171,11 +171,24 @@ struct Mesh {
   std::vector<WGPUBindGroup>   bindGroups;   // one per submesh
   std::vector<Submesh>         submeshes;
   uint32_t                     uniformStride = 0;   // bytes between per-ship uniform slots
-  // Placement, computed at load from the model's bounds (see loadVessel).
+  // Placement, computed at load from the model's bounds + per-vessel spec (loadVessel).
   float     shipScale = 1.0f;
   float     draft = 0.0f;
+  float     bowYaw = 0.0f;              // radians: aligns the model's bow with +Z travel
   glm::vec3 keelCenter = glm::vec3(0.0f);
 };
+
+// Per-vessel model quirks, mirroring the client's VESSEL_RIGS (vessel-controller.ts):
+// baseYawDeg re-aims a hull whose authored bow isn't +Z (only the merchantman, +X),
+// and hullHalfLen sizes each hull to its real length so vessels differ in scale.
+struct VesselSpec { float baseYawDeg; float hullHalfLen; };
+static VesselSpec vesselSpecFor(const std::string& slug) {
+  if (slug == "merchantman") return { 90.0f, 15.0f };
+  if (slug == "brig")        return { 0.0f, 12.0f };
+  if (slug == "sloop")       return { 0.0f,  7.0f };
+  if (slug == "pinnace")     return { 0.0f,  4.1f };
+  return { 0.0f, 7.0f };   // default (sloop-sized)
+}
 
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, const MeshData& data) {
   Mesh mesh;
@@ -328,22 +341,27 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   return mesh;
 }
 
-// Load a vessel GLB and derive its on-water placement — a uniform scale to a
-// consistent size, the keel origin (X/Z centred, lowest point to y=0), and a
-// beam-based draught so the hull sits low in the water. Falls back to a cube.
-static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt, const std::string& path) {
+// Load a vessel GLB and derive its on-water placement from the per-vessel spec:
+// scale to the hull's real length (so vessels differ in size), the keel origin
+// (X/Z centred, lowest point to y=0), a beam-based draught, and the bow-yaw that
+// aligns the model's authored forward axis with +Z travel. Falls back to a cube.
+static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt,
+                       const std::string& path, const std::string& slug) {
   MeshData data = loadGltfMesh(path.c_str());
   if (!data.ok) data = makeCubeMesh();
   glm::vec3 bbMin(data.bbMin[0], data.bbMin[1], data.bbMin[2]);
   glm::vec3 bbMax(data.bbMax[0], data.bbMax[1], data.bbMax[2]);
   glm::vec3 center = 0.5f * (bbMin + bbMax);
   glm::vec3 extent = bbMax - bbMin;
-  float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
-  float fit = (maxExtent > 1e-6f) ? (2.0f / maxExtent) : 1.0f;
+  VesselSpec spec = vesselSpecFor(slug);
+  float horiz = std::max(extent.x, extent.z);   // hull length runs along the longer axis
   Mesh mesh = createMesh(device, queue, fmt, data);
-  mesh.shipScale  = fit * 3.0f;
+  mesh.shipScale  = (horiz > 1e-6f) ? (2.0f * spec.hullHalfLen / horiz) : 1.0f;
   mesh.keelCenter = glm::vec3(center.x, bbMin.y, center.z);
-  mesh.draft      = 0.53f * std::min(extent.x, extent.z) * mesh.shipScale;   // see JS floatDraft
+  mesh.draft      = 0.53f * std::min(extent.x, extent.z) * mesh.shipScale;
+  // Client baseYawDeg is a +Y rotation in Babylon; our WebGPU frame needs the
+  // opposite sign (merchantman: client +90° -> our -90°, which aimed it correctly).
+  mesh.bowYaw     = -glm::radians(spec.baseYawDeg);
   return mesh;
 }
 
@@ -1131,14 +1149,21 @@ int main(int argc, char** argv) {
     if (it != vessels.end()) return it->second;
     std::string path = glbForSlug(slug);
     std::printf("[vessel] loading '%s' <- %s\n", slug.c_str(), path.c_str());
-    auto res = vessels.emplace(slug, loadVessel(device, queue, surfaceFormat, path));
+    auto res = vessels.emplace(slug, loadVessel(device, queue, surfaceFormat, path, slug));
     return res.first->second;
   };
   std::string ownVesselSlug;
   const bool ownVesselForced = (modelArg != nullptr);
   if (ownVesselForced) {
-    vessels.emplace("__cli", loadVessel(device, queue, surfaceFormat, modelArg));
-    ownVesselSlug = "__cli";
+    // Infer the vessel slug from the override filename so it uses the real spec
+    // (orientation/scale), else fall back to a neutral "__cli" default.
+    std::string mp = modelArg, cliSlug = "__cli";
+    if (mp.find("merchantman") != std::string::npos)      cliSlug = "merchantman";
+    else if (mp.find("brig") != std::string::npos)        cliSlug = "brig";
+    else if (mp.find("pinnace") != std::string::npos)     cliSlug = "pinnace";
+    else if (mp.find("sloop") != std::string::npos || mp.find("bermuda") != std::string::npos) cliSlug = "sloop";
+    vessels.emplace(cliSlug, loadVessel(device, queue, surfaceFormat, modelArg, cliSlug));
+    ownVesselSlug = cliSlug;
   }
 
   Ocean ocean = createOcean(device, queue, surfaceFormat);
@@ -1193,9 +1218,10 @@ int main(int argc, char** argv) {
 
   // Sailing state — arrow keys / WASD steer and trim sail; the ship sails the sea.
   float shipX = 0.0f, shipZ = 0.0f, shipHeading = 0.0f, shipSpeed = 0.0f, sail = 0.35f;
-  // The merchantman's model-space forward axis is +X, but travel (fwd) is +Z, so
-  // yaw the hull by -90° to line the bow up with the direction of sailing.
-  const float kBowYaw = -glm::half_pi<float>();
+  // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
+  // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
+  // match server combat-constants.js) so distances feel right at realistic knots.
+  const float kTravelScale = 3.0f;
   // Scale the wave-sim clock. Real-time (1.0) reads as too-fast chop; too slow (~0.45)
   // makes tall waves look gelatinous ("jelly") because they move slower than their
   // steepness implies. 0.6 is the compromise — a calmer swell that still flows.
@@ -1205,6 +1231,7 @@ int main(int argc, char** argv) {
   // zoom. camYawOffset is relative to the heading (0 = directly astern), so the camera
   // keeps chasing as the ship turns while any drag offset is preserved.
   float camYawOffset = 0.0f, camPitch = 0.43f, camDist = 14.3f;
+  bool  camFramed = false;   // set the default chase distance from the vessel size once
   double lastMouseX = 0.0, lastMouseY = 0.0;
   glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
 
@@ -1497,8 +1524,8 @@ int main(int argc, char** argv) {
       float targetSpeed = sail * 9.0f;
       shipSpeed += (targetSpeed - shipSpeed) * 0.6f * dt;
       fwd = glm::vec3(std::sin(shipHeading), 0.0f, std::cos(shipHeading));
-      shipX += fwd.x * shipSpeed * dt;
-      shipZ += fwd.z * shipSpeed * dt;
+      shipX += fwd.x * shipSpeed * dt * kTravelScale;
+      shipZ += fwd.z * shipSpeed * dt * kTravelScale;
     }
 
     // Advance all cascades, then read their displacement back so buoyancy is driven
@@ -1571,6 +1598,12 @@ int main(int argc, char** argv) {
       std::string s = mpClient.ownedShip();
       if (!s.empty()) ownVesselSlug = s;
     }
+    // Frame the chase camera to the vessel's real length (set once) — big hulls
+    // (24-30 m) need the camera much farther back than the small ones (~8 m).
+    if (!camFramed && !ownVesselSlug.empty()) {
+      camDist = 2.0f * vesselSpecFor(ownVesselSlug).hullHalfLen * 1.9f;
+      camFramed = true;
+    }
 
     // Place a ship on the wave field: heave to the surface, tilt to its normal
     // (central differences of the FFT height, ~2 m step), yaw to heading, then
@@ -1586,7 +1619,7 @@ int main(int argc, char** argv) {
       float axisLen = glm::length(axis);
       if (axisLen > 1e-5f)
         mm = mm * glm::rotate(glm::mat4(1.0f), std::asin(glm::clamp(axisLen, 0.0f, 1.0f)), axis / axisLen);
-      mm = glm::rotate(mm, heading + kBowYaw, glm::vec3(0, 1, 0));
+      mm = glm::rotate(mm, heading + m.bowYaw, glm::vec3(0, 1, 0));
       mm = glm::scale(mm, glm::vec3(m.shipScale));
       mm = glm::translate(mm, -m.keelCenter);
       return mm;

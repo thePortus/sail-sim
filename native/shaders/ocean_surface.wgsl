@@ -5,8 +5,9 @@
 struct Camera {
     viewProj : mat4x4<f32>,
     eye      : vec4<f32>,   // xyz camera position
-    params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile)
-    screen   : vec4<f32>,   // xy = framebuffer size (px)
+    params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile); w = slope (wave-normal) amp
+    screen   : vec4<f32>,   // xy = framebuffer size (px); zw = ocean origin (ship)
+    lod      : vec4<f32>,   // x = vertex displacement amp; y = inner discard radius (far ring)
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
@@ -49,7 +50,7 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
     disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
     disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
-    disp = disp * cam.params.w;   // wind-driven wave amplitude (Beaufort)
+    disp = disp * cam.lod.x;   // vertex displacement amp (0 on the flat far ring)
 
     let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
@@ -64,6 +65,8 @@ fn pow5(x : f32) -> f32 { let x2 = x * x; return x2 * x2 * x; }
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
+    // Far ring leaves the centre to the detailed near grid (cam.lod.y = 0 on near).
+    if (distance(in.worldUV, cam.screen.zw) < cam.lod.y) { discard; }
     let uv0 = in.worldUV / cam.params.x;
     let uv1 = in.worldUV / cam.params.y;
     let uv2 = in.worldUV / cam.params.z;

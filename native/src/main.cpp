@@ -386,8 +386,9 @@ static std::string glbForSlug(const std::string& slug) {
 struct OceanCamera {
   glm::mat4 viewProj;
   glm::vec4 eye;      // xyz camera position
-  glm::vec4 params;   // xyz = cascade tile sizes
-  glm::vec4 screen;   // xy = framebuffer size (px)
+  glm::vec4 params;   // xyz = cascade tile sizes; w = slope (wave-normal) amp
+  glm::vec4 screen;   // xy = framebuffer size (px); zw = ocean origin (ship)
+  glm::vec4 lod;      // x = vertex displacement amp; y = inner discard radius
 };
 
 // A colour render target (planar reflection).
@@ -411,6 +412,11 @@ struct Ocean {
   WGPUSampler         sampler;
   WGPUBindGroupLayout bgl;
   uint32_t            indexCount;
+  // Coarse, geometrically-flat FAR ring: same ocean shader (wave normals, foam,
+  // reflection) so the real ocean look reaches the horizon without displacement
+  // aliasing. Its own uniform (displacement amp 0, inner discard radius set).
+  WGPUBuffer          farVbuf, farIbuf, farUniformBuf;
+  uint32_t            farIndexCount;
 };
 
 static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat) {
@@ -447,6 +453,31 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   WGPUBufferDescriptor ubd = {};
   ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; ubd.size = sizeof(OceanCamera);
   o.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
+
+  // Coarse, flat FAR ring (+/-20 km, ~200 m cells). Flat, so cell size doesn't
+  // alias; the fragment still samples the FFT normal/foam per pixel.
+  {
+    const int fN = 200; const float fhalf = 20000.0f;
+    std::vector<float> fv; std::vector<uint32_t> fi;
+    fv.reserve((size_t)(fN + 1) * (fN + 1) * 2);
+    for (int j = 0; j <= fN; ++j)
+      for (int i = 0; i <= fN; ++i) {
+        fv.push_back(-fhalf + (float)i / fN * 2.0f * fhalf);
+        fv.push_back(-fhalf + (float)j / fN * 2.0f * fhalf);
+      }
+    for (int j = 0; j < fN; ++j)
+      for (int i = 0; i < fN; ++i) {
+        uint32_t a = (uint32_t)(j * (fN + 1) + i), b = a + 1, c = a + (fN + 1), d = c + 1;
+        fi.insert(fi.end(), { a, c, b, b, c, d });
+      }
+    o.farIndexCount = (uint32_t)fi.size();
+    WGPUBufferDescriptor fvbd = {}; fvbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst; fvbd.size = fv.size() * sizeof(float);
+    o.farVbuf = wgpuDeviceCreateBuffer(device, &fvbd); wgpuQueueWriteBuffer(queue, o.farVbuf, 0, fv.data(), fvbd.size);
+    WGPUBufferDescriptor fibd = {}; fibd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst; fibd.size = fi.size() * sizeof(uint32_t);
+    o.farIbuf = wgpuDeviceCreateBuffer(device, &fibd); wgpuQueueWriteBuffer(queue, o.farIbuf, 0, fi.data(), fibd.size);
+    WGPUBufferDescriptor fubd = {}; fubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; fubd.size = sizeof(OceanCamera);
+    o.farUniformBuf = wgpuDeviceCreateBuffer(device, &fubd);
+  }
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
@@ -1170,7 +1201,6 @@ int main(int argc, char** argv) {
   Ocean ocean = createOcean(device, queue, surfaceFormat);
   Sky sky = createSky(device, surfaceFormat);
   TerrainRender terrainR = createTerrainRender(device, queue, surfaceFormat);
-  SeaFar seaFar = createSeaFar(device, queue, surfaceFormat);
   Clouds clouds = createClouds(device, queue, surfaceFormat);
   glm::vec2 cloudDrift(0.0f);   // accumulated wind drift (metres), integrated per frame
   // Weather state, eased toward Beaufort-driven targets each frame (mirrors the
@@ -1689,10 +1719,16 @@ int main(int argc, char** argv) {
     }
 
     // ── Main-pass uniforms ──
-    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f),
-                    glm::vec4(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), seaAmp),
-                    glm::vec4((float)curW, (float)curH, shipX, shipZ) };   // zw = ocean origin (follows ship)
+    glm::vec4 oceanParams(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), seaAmp);
+    glm::vec4 oceanScreen((float)curW, (float)curH, shipX, shipZ);   // zw = ocean origin
+    // Near grid: full displacement, no discard. Far ring: flat (vertexAmp 0), but
+    // discards the centre so the detailed near grid shows there.
+    OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
+                    glm::vec4(seaAmp, 0.0f, 0.0f, 0.0f) };
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
+    OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
+                       glm::vec4(0.0f, 1400.0f, 0.0f, 0.0f) };
+    wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f) };
     wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));
     if (terrainR.ready) {
@@ -1703,9 +1739,6 @@ int main(int argc, char** argv) {
                    glm::vec4(sun, 0.0f) };
       wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));
     }
-    SeaFarU sfu{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
-                 glm::vec4(shipX, shipZ, 1450.0f, 0.0f) };   // cutout matches the FFT patch
-    wgpuQueueWriteBuffer(queue, seaFar.uniformBuf, 0, &sfu, sizeof(sfu));
     // Clouds: integrate wind drift, derive time-of-day light, write uniforms. The
     // sun/sky/ground colour model + coverage/type mirror the client's cloud plugin.
     {
@@ -1776,7 +1809,7 @@ int main(int argc, char** argv) {
     passDesc.depthStencilAttachment = &depthAttachment;
 
     WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
-    WGPUBindGroup oceanBG = nullptr;   // created below only when the scene draws
+    WGPUBindGroup oceanBG = nullptr, oceanBGfar = nullptr;   // created below when the scene draws
     if (sailing) {
     // Sky first (background; doesn't write depth).
     wgpuRenderPassEncoderSetPipeline(pass, sky.pipeline);
@@ -1791,15 +1824,10 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderSetIndexBuffer(pass, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderDrawIndexed(pass, terrainR.indexCount, 1, 0, 0, 0);
     }
-    // Far sea (flat distant water; discards the FFT-patch centre near the ship).
-    wgpuRenderPassEncoderSetPipeline(pass, seaFar.pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, seaFar.bindGroup, 0, nullptr);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, seaFar.vbuf, 0, WGPU_WHOLE_SIZE);
-    wgpuRenderPassEncoderDraw(pass, 6, 1, 0, 0);
-
-    // Ocean surface — bind group references this frame's (ping-ponged) cascade textures.
+    // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
+    // bind groups differ only in the uniform buffer: near = displaced detail; far =
+    // geometrically flat but fully wave-shaded, reaching the horizon without alias.
     WGPUBindGroupEntry oe[12] = {};
-    oe[0].binding = 0;  oe[0].buffer = ocean.uniformBuf; oe[0].size = sizeof(OceanCamera);
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
     oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
@@ -1811,11 +1839,19 @@ int main(int argc, char** argv) {
     oe[9].binding = 9;  oe[9].textureView  = c2.turbulence();
     oe[10].binding = 10; oe[10].sampler = ocean.sampler;
     oe[11].binding = 11; oe[11].textureView = reflView;
-    WGPUBindGroupDescriptor obd = {};
-    obd.layout = ocean.bgl; obd.entryCount = 12; obd.entries = oe;
+    oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
+    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 12; obdF.entries = oe;
+    oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
+    oe[0].buffer = ocean.uniformBuf;
+    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 12; obd.entries = oe;
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);
+    // Far ring first (fills to the horizon), then the detailed near grid over it.
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, oceanBGfar, 0, nullptr);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, ocean.farVbuf, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderSetIndexBuffer(pass, ocean.farIbuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderDrawIndexed(pass, ocean.farIndexCount, 1, 0, 0, 0);
     wgpuRenderPassEncoderSetBindGroup(pass, 0, oceanBG, 0, nullptr);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, ocean.vbuf, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderSetIndexBuffer(pass, ocean.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
@@ -1897,6 +1933,7 @@ int main(int argc, char** argv) {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);
     if (oceanBG) wgpuBindGroupRelease(oceanBG);
+    if (oceanBGfar) wgpuBindGroupRelease(oceanBGfar);
     wgpuTextureViewRelease(view);
 
 #ifndef __EMSCRIPTEN__

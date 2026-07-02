@@ -34,6 +34,7 @@ fn sampleH(wx : f32, wz : f32) -> f32 {
 struct VSOut {
   @builtin(position) position : vec4<f32>,
   @location(0)       worldPos : vec3<f32>,
+  @location(1)       elev     : f32,   // raw (uncurved) elevation for colour + waterline cull
 };
 
 @vertex
@@ -45,6 +46,7 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
   let cd = vec2<f32>(wx, wz) - u.eye.xz;
   var o : VSOut;
   o.worldPos = vec3<f32>(wx, y - dot(cd, cd) / (2.0 * 2000000.0), wz);
+  o.elev     = y;
   o.position = u.viewProj * vec4<f32>(o.worldPos, 1.0);
   return o;
 }
@@ -64,6 +66,10 @@ fn biomeColor(h : f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
+  // Only land above the waterline draws; the sea (FFT ocean / far sea) covers the
+  // seabed, so shallow reef flats read as water, not exposed green land.
+  if (in.elev < 0.2) { discard; }
+
   let wx = in.worldPos.x; let wz = in.worldPos.z;
   let e = (u.bounds.y - u.bounds.x) / u.misc.x;   // ~one texel in metres
   let hl = sampleH(wx - e, wz); let hr = sampleH(wx + e, wz);
@@ -72,10 +78,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let L = normalize(u.sun.xyz);
   let diff = max(dot(N, L), 0.0);
 
-  var col = biomeColor(in.worldPos.y);
-  // Below the waterline the land is submerged seabed — darken/tint it so exposed
-  // shallows read as underwater rather than beach.
-  col = mix(col * vec3<f32>(0.45, 0.58, 0.68), col, smoothstep(-2.0, 0.4, in.worldPos.y));
+  var col = biomeColor(in.elev);   // colour by real elevation, not the curved Y
+  col = mix(col * vec3<f32>(0.72, 0.68, 0.55), col, smoothstep(0.2, 1.5, in.elev));  // wet sand at the shore
   col = col * (0.32 + 0.68 * diff);
   return vec4<f32>(col, 1.0);   // sRGB target does gamma
 }

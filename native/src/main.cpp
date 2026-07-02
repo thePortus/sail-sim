@@ -415,8 +415,9 @@ struct Ocean {
 
 static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat) {
   // Grid of XZ positions centred on the origin; the shader displaces + normals it.
-  const int   N = 256;
-  const float half = 300.0f;
+  const int   N = 600;
+  const float half = 1500.0f;   // detailed FFT ocean out to +/-1.5 km (was 300 m — its
+                                // square edge was visible up close); flat far-sea beyond
   std::vector<float> gv;    gv.reserve((size_t)(N + 1) * (N + 1) * 2);
   std::vector<uint32_t> gi; gi.reserve((size_t)N * N * 6);
   for (int j = 0; j <= N; ++j)
@@ -1604,6 +1605,7 @@ int main(int argc, char** argv) {
       camDist = 2.0f * vesselSpecFor(ownVesselSlug).hullHalfLen * 1.9f;
       camFramed = true;
     }
+    if (const char* cd = std::getenv("SAILSIM_CAMDIST")) camDist = (float)std::atof(cd);   // debug zoom
 
     // Place a ship on the wave field: heave to the surface, tilt to its normal
     // (central differences of the FFT height, ~2 m step), yaw to heading, then
@@ -1702,7 +1704,7 @@ int main(int argc, char** argv) {
       wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));
     }
     SeaFarU sfu{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
-                 glm::vec4(shipX, shipZ, 290.0f, 0.0f) };
+                 glm::vec4(shipX, shipZ, 1450.0f, 0.0f) };   // cutout matches the FFT patch
     wgpuQueueWriteBuffer(queue, seaFar.uniformBuf, 0, &sfu, sizeof(sfu));
     // Clouds: integrate wind drift, derive time-of-day light, write uniforms. The
     // sun/sky/ground colour model + coverage/type mirror the client's cloud plugin.

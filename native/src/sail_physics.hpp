@@ -26,7 +26,14 @@ struct Rig {
 };
 
 inline Rig rigForSlug(const std::string& s) {
+  // Base = the SLOOP rig — also the fallback for "sloop" and any unknown slug, so
+  // the polar is never empty. The other vessels override it below.
   Rig r;
+  r.polar = {{32,0.46f},{45,0.64f},{60,0.80f},{90,0.93f},{120,1.00f},{150,0.82f},{180,0.66f}};
+  r.forceK = 0.26f; r.trimForgive = 1.0f; r.leewayK = 1.0f;
+  r.weight = 2800; r.maxSpeed = 9.0f; r.accelRate = 0.22f; r.minTackAngle = 32; r.sailAreaFactor = 0.40f;
+  r.hullHalfLen = 7.0f; r.hullHalfBeam = 2.2f;   // pitchScale/heaveTau default to the generic sloop feel
+
   if (s == "pinnace") {
     r.polar = {{34,0.42f},{55,0.62f},{80,0.82f},{100,0.92f},{125,0.97f},{150,0.90f},{180,0.80f}};
     r.forceK = 0.26f; r.trimForgive = 1.25f; r.leewayK = 1.4f;
@@ -42,12 +49,8 @@ inline Rig rigForSlug(const std::string& s) {
     r.forceK = 1.18f; r.trimForgive = 1.15f; r.leewayK = 0.85f;
     r.weight = 6500; r.maxSpeed = 8.6f; r.accelRate = 0.12f; r.minTackAngle = 52; r.sailAreaFactor = 0.50f;
     r.hullHalfLen = 15.0f; r.hullHalfBeam = 3.6f; r.pitchScale = 0.06f; r.heaveTau = 1.1f; r.tiltTau = 0.65f;
-  } else {   // sloop (default)
-    r.polar = {{32,0.46f},{45,0.64f},{60,0.80f},{90,0.93f},{120,1.00f},{150,0.82f},{180,0.66f}};
-    r.forceK = 0.26f; r.trimForgive = 1.0f; r.leewayK = 1.0f;
-    r.weight = 2800; r.maxSpeed = 9.0f; r.accelRate = 0.22f; r.minTackAngle = 32; r.sailAreaFactor = 0.40f;
-    r.hullHalfLen = 7.0f; r.hullHalfBeam = 2.2f;
   }
+  // else: sloop — the base rig set above (matches VESSEL_RIGS 'sloop').
   return r;
 }
 

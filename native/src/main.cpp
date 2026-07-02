@@ -1507,36 +1507,81 @@ int main(int argc, char** argv) {
       std::vector<mp::RemotePlayer> others = mpClient.players();
       mp::WaveState wv = mpClient.wave();
 
+      // Wind relative to the bow (0 = wind on the nose), and point of sail.
+      float headingDeg = glm::degrees(shipHeading);
+      float windFromDeg = wv.valid ? wv.windBearing : 270.0f;
+      float rel = std::fmod(windFromDeg - headingDeg + 360.0f, 360.0f);   // wind FROM, bow-relative
+      float windAngle = rel > 180.0f ? 360.0f - rel : rel;               // 0..180 off the wind
+      const char* pos = windAngle < 32 ? "In Irons" : windAngle < 45 ? "Close Hauled"
+                      : windAngle < 60 ? "Close Reach" : windAngle < 90 ? "Beam Reach"
+                      : windAngle < 145 ? "Broad Reach" : windAngle < 165 ? "Running" : "Dead Downwind";
+
+      // ── Top-left: wind gauge + readouts ──
       ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-      ImGui::Text("Callsign: %s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
-      ImGui::Text("Speed: %.1f kn", shipSpeed);
+      ImGui::Text("%s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
 
-      const char* connLabel =
-          cs == mp::ConnState::Open       ? "connected" :
-          cs == mp::ConnState::Connecting ? "connecting..." :
-          cs == mp::ConnState::AuthFailed ? "auth failed" : "offline";
-      const ImVec4 connCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f)
-                                                       : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
-      ImGui::TextColored(connCol, "Server: %s", connLabel);
-      if (wv.valid) ImGui::Text("Wind: %.0f kn  Beaufort %d", wv.windSpeed, wv.beaufort);
+      // Wind gauge: bow points up; the arrow shows where the wind blows FROM, and a
+      // red wedge marks the no-go zone (+/- the rig's min tack angle around the eye).
+      const float G = 132.0f;
+      ImVec2 p0 = ImGui::GetCursorScreenPos();
+      ImGui::Dummy(ImVec2(G, G));
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      ImVec2 c(p0.x + G * 0.5f, p0.y + G * 0.5f);
+      float R = G * 0.5f - 6.0f;
+      auto dirAt = [&](float deg) {
+        float r = glm::radians(deg);
+        return ImVec2(c.x + R * std::sin(r), c.y - R * std::cos(r));
+      };
+      // No-go wedge around the wind eye.
+      { std::vector<ImVec2> w; w.push_back(c);
+        for (float a = rel - vrig.minTackAngle; a <= rel + vrig.minTackAngle; a += 5.0f) w.push_back(dirAt(a));
+        w.push_back(dirAt(rel + vrig.minTackAngle));
+        dl->AddConvexPolyFilled(w.data(), (int)w.size(), IM_COL32(210, 70, 60, 70)); }
+      dl->AddCircleFilled(c, R, IM_COL32(20, 34, 48, 160));
+      dl->AddCircle(c, R, IM_COL32(150, 180, 205, 200), 48, 1.5f);
+      // Wind arrow: rim (FROM) -> toward centre (the way it blows).
+      ImVec2 wt = dirAt(rel), wh(c.x + (wt.x - c.x) * 0.30f, c.y + (wt.y - c.y) * 0.30f);
+      dl->AddLine(wt, wh, IM_COL32(90, 180, 240, 255), 3.0f);
+      { ImVec2 d(wh.x - wt.x, wh.y - wt.y); float l = std::hypot(d.x, d.y); if (l > 1e-3f) { d.x /= l; d.y /= l; }
+        ImVec2 n(-d.y, d.x);
+        dl->AddTriangleFilled(wh, ImVec2(wh.x - d.x*10 + n.x*6, wh.y - d.y*10 + n.y*6),
+                              ImVec2(wh.x - d.x*10 - n.x*6, wh.y - d.y*10 - n.y*6), IM_COL32(90, 180, 240, 255)); }
+      // Ship (bow up).
+      dl->AddTriangleFilled(ImVec2(c.x, c.y - 15), ImVec2(c.x - 9, c.y + 11), ImVec2(c.x + 9, c.y + 11), IM_COL32(235, 235, 240, 255));
 
-      ImGui::Separator();
-      ImGui::Text("Players nearby: %d", (int)others.size());
-      for (const mp::RemotePlayer& rp : others) {
-        const char* who = !rp.callsign.empty() ? rp.callsign.c_str() : rp.id.c_str();
-        ImGui::BulletText("%s  (%.0f, %.0f)", who, rp.x, rp.z);
-      }
+      if (wv.valid) ImGui::Text("Wind %.0f kn  (B%d)", wv.windSpeed, wv.beaufort);
+      ImGui::Text("Speed %.1f kn", shipSpeed);
+      ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.95f, 1.0f), "%s", pos);
 
+      const char* connLabel = cs == mp::ConnState::Open ? "connected" : cs == mp::ConnState::Connecting ? "connecting..."
+                            : cs == mp::ConnState::AuthFailed ? "auth failed" : "offline";
+      const ImVec4 connCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f) : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
+      ImGui::TextColored(connCol, "Server: %s  (%d nearby)", connLabel, (int)others.size());
       ImGui::Separator();
       if (ImGui::Button("Log out")) {
         mpClient.close(); mpConnected = false;
-        session::clear();   // forget the remembered session
+        session::clear();
         authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
         uiError.clear();
         appState = AppState::Login;
       }
+      ImGui::End();
+
+      // ── Top-right: sail status ──
+      const char* sailLabel = vessel.anchored ? "ANCHORED"
+                            : vessel.sailState == 2 ? "FULL SAIL" : vessel.sailState == 1 ? "REDUCED SAIL" : "SAILS FURLED";
+      const ImVec4 sailCol = vessel.anchored ? ImVec4(0.90f, 0.65f, 0.35f, 1.0f)
+                           : vessel.sailState == 2 ? ImVec4(0.50f, 0.85f, 0.55f, 1.0f)
+                           : vessel.sailState == 1 ? ImVec4(0.90f, 0.82f, 0.45f, 1.0f) : ImVec4(0.65f, 0.68f, 0.72f, 1.0f);
+      ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 12), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+      ImGui::Begin("sailhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+      ImGui::PushFont(fontTitle);
+      ImGui::TextColored(sailCol, "%s", sailLabel);
+      ImGui::PopFont();
+      ImGui::TextDisabled("W / S  sail    P  anchor");
       ImGui::End();
 
       // Broadcast our pose ~10 Hz. Heading is sent in DEGREES (server/client convention).

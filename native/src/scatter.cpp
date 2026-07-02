@@ -146,20 +146,34 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
     let dW = 2.4 * t * (0.7 + 0.6 * E) - p.x * 2.2 + dPh;
     p.y += sin(dW) * dPump * 0.10 * (0.4 + 0.85 * E);
   }
-  if (mode > 4.5) {
+  if (mode > 4.5 && mode < 5.5) {
     // FishSwimPlugin: lateral tail sway travelling wave.
     let fSway = 1.0 - smoothstep(-0.45, 0.25, p.x);
     let fPh = (r0.w + r2.w) * 0.7;
     let fW = 3.2 * t * (0.8 + 0.5 * E) - p.x * 3.4 + fPh;
     p.z += sin(fW) * fSway * 0.13 * (0.5 + 0.7 * E);
   }
+  if (mode > 5.5) {
+    // ShadowBlobPlugin: stretch the unit disc away from the sun; the sun-side
+    // edge (along = -0.5) stays anchored under the trunk. lod = (dirX, dirZ, stretch).
+    let sDir = vec2<f32>(u.lod.x, u.lod.y);
+    let sLocal = vec2<f32>(p.x, p.z);
+    let sAlong = dot(sLocal, sDir);
+    let sPerp = sLocal - sAlong * sDir;
+    let sNew = sAlong * u.lod.z + (u.lod.z - 1.0) * 0.5;
+    p.x = sPerp.x + sNew * sDir.x;
+    p.z = sPerp.y + sNew * sDir.y;
+  }
+  let isBlob = mode > 5.5;
   // LoD cross-dissolve (NearFadePlugin port): the full mesh stays 1 inside `near`
   // and shrinks out over [near, near+band]; the impostor is 1 outside and shrinks
   // over [near-band, near] — around `near` BOTH are full-size (they overlap).
   let dCam = distance(vec2<f32>(r0.w, r2.w), vec2<f32>(u.eye.x, u.eye.z));
   var f = 1.0;
-  if (u.lod.z > 0.5 && u.lod.z < 1.5) { f = 1.0 - smoothstep(u.lod.x, u.lod.x + u.lod.y, dCam); }
-  if (u.lod.z > 1.5) { f = smoothstep(u.lod.x - u.lod.y, u.lod.x, dCam); }
+  if (!isBlob) {
+    if (u.lod.z > 0.5 && u.lod.z < 1.5) { f = 1.0 - smoothstep(u.lod.x, u.lod.x + u.lod.y, dCam); }
+    if (u.lod.z > 1.5) { f = smoothstep(u.lod.x - u.lod.y, u.lod.x, dCam); }
+  }
   p = p * f;
   var wp = vec3<f32>(dot(vec3<f32>(r0.x, r0.y, r0.z), p) + r0.w,
                      dot(vec3<f32>(r1.x, r1.y, r1.z), p) + r1.w,
@@ -185,6 +199,12 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let c = textureSample(tex, samp, in.uv);
+  // Shadow blobs: a dark, cool, unlit decal — the dappled texture's alpha times
+  // the global sun-elevation alpha (anim.w repurposed as blob opacity).
+  if (u.anim.y > 5.5) {
+    let a = c.a * u.anim.w;
+    return vec4<f32>(vec3<f32>(0.02, 0.03, 0.05), a);
+  }
   if (u.anim.w > 0.0 && c.a < u.anim.w) { discard; }
   // Screen-door dissolve at the patch-cull edge (LodDitherPlugin port): dithered
   // out over [cullStart, cullStart+60] by interleaved-gradient noise.
@@ -213,6 +233,10 @@ struct DrawSet {
   WGPUBindGroup bind = nullptr;
 };
 
+struct PatchData {
+  std::vector<std::vector<Inst>> per;   // per-variant prop instances
+  std::vector<Inst> blobs;              // flat shadow-blob discs under the props
+};
 struct Layer {
   std::vector<DrawSet> full;     // per variant: the full GLB mesh
   std::vector<DrawSet> lod;      // per variant: rock/drift low-poly LOD or tree cross-impostor ("" = none)
@@ -220,7 +244,8 @@ struct Layer {
   WGPUBuffer ubufFull = nullptr, ubufLod = nullptr;
   float mode = 0, alphaCut = 0;
   int res = 0;
-  std::map<std::pair<int, int>, std::vector<std::vector<Inst>>> patches;
+  int maxRing = 8;               // patch radius (grass uses the client's short 4-ring range)
+  std::map<std::pair<int, int>, PatchData> patches;
   bool dirty = false;
 };
 
@@ -270,8 +295,14 @@ struct System::Impl {
   const terrain::Terrain* terr = nullptr;
   bool ready = false;
 
-  Layer palms, trees, rocks, drift;
+  Layer palms, trees, rocks, drift, grass;
   Layer birdsL, dolphinsL, fishL;   // wildlife draw sets (full[] only; instances per frame)
+  Layer reedsL, weedsL;             // shoreline reeds + underwater seaweed (stand/clump services)
+  // Shadow blobs: one blended draw over all layers' discs (dappled texture,
+  // sun-stretched in the shader). Separate pipeline: alpha blend, no depth write.
+  WGPURenderPipeline blobPipeline = nullptr;
+  WGPUBuffer blobUbuf = nullptr;
+  DrawSet blobSet;
   int lastPX = INT32_MIN, lastPZ = INT32_MIN;
   float flushX = 1e9f, flushZ = 1e9f;   // camera pos of the last visible-set flush
 
@@ -281,6 +312,19 @@ struct System::Impl {
   static constexpr float NEAR_FADE = 260.0f;     // trees: full <-> impostor cross-dissolve centre (client)
   static constexpr float NEAR_BAND = 55.0f;
   static constexpr float TREE_CULL = 280.0f;     // dither out to nothing by 340 (client treeFade)
+  static constexpr int   GRASS_RING = 4;         // grass only within 4 patch rings (client)
+  static constexpr float GRASS_NEAR = 30.0f;     // full clump mesh within this of the patch centre
+  static constexpr int   SHADOW_RING = 3;        // blobs only near the camera (~120 m, client)
+
+  // ── Reed stands + seaweed clumps (reed.service / seaweed.service ports) ──
+  struct Sprout { float x, z, y, rotY, scale; int variant; glm::vec3 tint; };
+  struct Stand { float cx, cz; std::vector<Sprout> items; };
+  std::vector<Stand> reedStands, weedClumps;
+  float bedAcc = 0; bool bedDirty = false;
+  static constexpr float REED_ELEV_MAX = 0.3f, REED_ELEV_MIN = -1.8f, REED_CULL = 95;
+  static constexpr float REED_SPAWN_MIN = 10, REED_SPAWN_MAX = 85; static constexpr int MAX_STANDS = 14;
+  static constexpr float WEED_DEPTH_MIN = 2.5f, WEED_DEPTH_MAX = 18, WEED_CULL = 100;
+  static constexpr float WEED_SPAWN_MIN = 8, WEED_SPAWN_MAX = 88; static constexpr int MAX_CLUMPS = 16;
 
   std::minstd_rand rng{ 12345 };
   float frand() { return (float)rng() / (float)std::minstd_rand::max(); }
@@ -540,6 +584,24 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   const std::string T = dir + "/textures/";
   bool ok = true;
 
+  // Loads a set of GLBs sharing one atlas texture into a layer's full[] sets.
+  auto initAnimalFwd = [&](Impl* pi, Layer& l, float mode, float alphaCut,
+                           const std::vector<std::string>& glbs,
+                           const std::string& atlasPng, uint32_t cap,
+                           const std::string& adir) -> bool {
+    l.mode = mode; l.alphaCut = alphaCut;
+    l.ubufFull = makeUbuf();
+    PngData png = loadPng(atlasPng);
+    WGPUTextureView tv = png.ok ? makeTexView(pi, png.w, png.h, png.rgba.data(), true) : nullptr;
+    for (const std::string& g : glbs) {
+      MeshData md = loadGltfMesh((adir + "/" + g).c_str());
+      if (!md.ok) { std::printf("[scatter] missing %s\n", g.c_str()); l.full.push_back({}); continue; }
+      DrawSet dsA; makeDrawSet(pi, dsA, md, l.ubufFull, tv, cap);
+      l.full.push_back(dsA);
+    }
+    return !l.full.empty();
+  };
+
   // ── Static layers: full GLB + (LOD glb | cross-impostor) per variant ──
   struct StaticCfg {
     Layer* l; float mode, alphaCut; int res; uint32_t cap;
@@ -560,6 +622,10 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
       { "drift_a_lod.glb", "drift_b_lod.glb", "drift_c_lod.glb", "drift_d_lod.glb", "drift_e_lod.glb" },
       { T + "drift_albedo.png", T + "drift_albedo.png", T + "drift_albedo.png",
         T + "drift_albedo.png", T + "drift_albedo.png" }, {} },
+    { &p->grass, 0, 0.4f, 28, 12000,
+      { "grass_a.glb", "grass_b.glb" },
+      { "grass_a_lod.glb", "grass_b_lod.glb" },
+      { T + "grass_albedo.png", T + "grass_albedo.png" }, {} },
   };
   for (auto& c : cfgs) {
     Layer& l = *c.l;
@@ -594,26 +660,93 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
     ok = ok && !l.full.empty();
   }
 
-  // ── Wildlife draw sets ──
-  auto initAnimal = [&](Layer& l, float mode, float alphaCut,
-                        const std::vector<std::string>& glbs,
-                        const std::string& atlasPng, uint32_t cap) -> bool {
-    l.mode = mode; l.alphaCut = alphaCut;
-    l.ubufFull = makeUbuf();
-    PngData png = loadPng(atlasPng);
-    WGPUTextureView tv = png.ok ? makeTexView(p, png.w, png.h, png.rgba.data(), true) : nullptr;
-    for (const std::string& g : glbs) {
-      MeshData md = loadGltfMesh((dir + "/" + g).c_str());
-      if (!md.ok) { std::printf("[scatter] missing %s\n", g.c_str()); l.full.push_back({}); continue; }
-      DrawSet dsA; makeDrawSet(p, dsA, md, l.ubufFull, tv, cap);
-      l.full.push_back(dsA);
+  p->grass.maxRing = Impl::GRASS_RING;   // client GRASS_RING: no grass past ~180 m
+
+  // ── Shadow blobs: blended decal pipeline + the dappled canopy disc ──
+  {
+    // Second pipeline: same shaders, alpha blend, depth test but NO depth write.
+    WGPUBlendState bl = {};
+    bl.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+    bl.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    bl.color.operation = WGPUBlendOperation_Add;
+    bl.alpha.srcFactor = WGPUBlendFactor_One;
+    bl.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    bl.alpha.operation = WGPUBlendOperation_Add;
+    WGPUColorTargetState bt = {}; bt.format = colorFormat; bt.writeMask = WGPUColorWriteMask_All; bt.blend = &bl;
+    WGPUFragmentState bf = {}; bf.module = module; bf.entryPoint = "fs_main"; bf.targetCount = 1; bf.targets = &bt;
+    WGPUDepthStencilState bds = ds;
+    bds.depthWriteEnabled = false;
+    WGPUPipelineLayoutDescriptor bpld = {}; bpld.bindGroupLayoutCount = 1; bpld.bindGroupLayouts = &p->bgl;
+    WGPUPipelineLayout bpl = wgpuDeviceCreatePipelineLayout(device, &bpld);
+    WGPURenderPipelineDescriptor brpd = rpd;
+    brpd.layout = bpl; brpd.depthStencil = &bds; brpd.fragment = &bf;
+    p->blobPipeline = wgpuDeviceCreateRenderPipeline(device, &brpd);
+    wgpuPipelineLayoutRelease(bpl);
+
+    // Dappled canopy shadow texture (registerShadows port): wavy-edged radial
+    // gradient + radial frond streaks + punched light gaps. Alpha-only mask.
+    const int S = 256; const float c2 = S / 2.0f, R = S / 2.0f - 6.0f;
+    std::vector<uint8_t> tex((size_t)S * S * 4, 255);
+    uint32_t seed = 0x9e3779b9u;
+    auto rnd = [&]() { seed = (seed * 1103515245u + 12345u) & 0x7fffffffu; return (float)seed / (float)0x7fffffff; };
+    struct Spoke { float ang, len, w, a; };
+    std::vector<Spoke> spokes;
+    for (int i = 0; i < 16; ++i)
+      spokes.push_back({ (float)i / 16.0f * TAU + (rnd() - 0.5f) * 0.25f,
+                         R * (0.7f + rnd() * 0.45f), 3 + rnd() * 5, 0.10f + rnd() * 0.10f });
+    struct Punch { float x, y, r, a; };
+    std::vector<Punch> punches;
+    for (int i = 0; i < 60; ++i) {
+      float a = rnd() * TAU, rr = rnd() * R * 0.92f;
+      punches.push_back({ c2 + std::cos(a) * rr, c2 + std::sin(a) * rr, 2 + rnd() * 6, 0.12f + rnd() * 0.26f });
     }
-    return !l.full.empty();
-  };
-  ok &= initAnimal(p->birdsL, 3, 0.5f,
-                   { "bird_a.glb", "bird_b.glb", "bird_c.glb", "bird_d.glb" }, T + "bird_atlas.png", 220);
-  ok &= initAnimal(p->dolphinsL, 4, 0.0f,
-                   { "dolphin_a.glb", "dolphin_b.glb", "dolphin_c.glb" }, T + "dolphin_atlas.png", 32);
+    for (int y = 0; y < S; ++y)
+      for (int x = 0; x < S; ++x) {
+        float dx = x - c2, dy = y - c2;
+        float r = std::hypot(dx, dy), ang = std::atan2(dy, dx);
+        float wavyR = R * (0.80f + 0.18f * std::sin(ang * 5) + 0.06f * std::sin(ang * 11 + 1.3f));
+        float t01 = std::clamp(r / R, 0.0f, 1.0f);
+        float g = t01 < 0.55f ? 0.82f + (0.52f - 0.82f) * (t01 / 0.55f)
+                : t01 < 0.85f ? 0.52f + (0.16f - 0.52f) * ((t01 - 0.55f) / 0.30f)
+                              : 0.16f * (1.0f - (t01 - 0.85f) / 0.15f);
+        float alpha = r <= wavyR ? std::max(0.0f, g) : 0.0f;
+        for (const Spoke& sp : spokes) {
+          float along = dx * std::cos(sp.ang) + dy * std::sin(sp.ang);
+          float perp = std::fabs(-dx * std::sin(sp.ang) + dy * std::cos(sp.ang));
+          if (along > 0 && along < sp.len && perp < sp.w * 0.5f) alpha += sp.a;
+        }
+        for (const Punch& pu : punches) {
+          if (std::hypot(x - pu.x, y - pu.y) < pu.r) alpha *= (1.0f - pu.a);
+        }
+        tex[((size_t)y * S + x) * 4 + 3] = (uint8_t)(std::clamp(alpha, 0.0f, 1.0f) * 255.0f);
+      }
+    WGPUTextureView dappleView = makeTexView(p, S, S, tex.data(), false);
+
+    // Unit ground quad in XZ (local x,z in [-0.5, 0.5], y = 0), uv 0..1.
+    MeshData quad;
+    auto pushV = [&](float x, float z, float uu, float vv) {
+      float v[kFloatsPerVertex] = { x, 0, z, 0, 1, 0, uu, vv, 1, 1, 1, 0, 0.9f };
+      quad.vertices.insert(quad.vertices.end(), v, v + kFloatsPerVertex);
+    };
+    pushV(-0.5f, -0.5f, 0, 0); pushV(0.5f, -0.5f, 1, 0);
+    pushV(0.5f, 0.5f, 1, 1);  pushV(-0.5f, 0.5f, 0, 1);
+    quad.indices = { 0, 1, 2, 0, 2, 3 };
+    quad.ok = true;
+    p->blobUbuf = makeUbuf();
+    makeDrawSet(p, p->blobSet, quad, p->blobUbuf, dappleView, 20000);
+  }
+
+  // ── Shoreline reeds + underwater seaweed (LOD-only meshes, alpha atlas) ──
+  ok &= initAnimalFwd(p, p->reedsL, 0, 0.4f,
+                      { "reed_a_lod.glb", "reed_b_lod.glb", "reed_c_lod.glb" }, T + "reeds_atlas.png", 384, dir);
+  ok &= initAnimalFwd(p, p->weedsL, 0, 0.0f,
+                      { "seaweed_a_lod.glb", "seaweed_b_lod.glb", "seaweed_c_lod.glb" }, T + "seaweed_albedo.png", 384, dir);
+
+  // ── Wildlife draw sets ──
+  ok &= initAnimalFwd(p, p->birdsL, 3, 0.5f,
+                      { "bird_a.glb", "bird_b.glb", "bird_c.glb", "bird_d.glb" }, T + "bird_atlas.png", 220, dir);
+  ok &= initAnimalFwd(p, p->dolphinsL, 4, 0.0f,
+                      { "dolphin_a.glb", "dolphin_b.glb", "dolphin_c.glb" }, T + "dolphin_atlas.png", 32, dir);
   // Fish: 4 species = UV-row-remapped clones of the two bodies (fish-school.service SPECIES).
   {
     Layer& l = p->fishL;
@@ -659,8 +792,18 @@ static const glm::vec3 kDriftTints[6] = {
   { 1.00f, 1.00f, 1.02f }, { 1.02f, 1.00f, 0.96f }, { 0.96f, 0.93f, 0.88f },
   { 0.90f, 0.86f, 0.80f }, { 0.97f, 0.94f, 0.88f }, { 0.86f, 0.88f, 0.90f } };
 
-typedef void (*Kernel)(Impl*, size_t, float, float, std::vector<std::vector<Inst>>&);
-static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
+typedef void (*Kernel)(Impl*, size_t, float, float, std::vector<std::vector<Inst>>&, std::vector<Inst>&);
+// A flat disc instance under a prop (unit XZ quad scaled to d = radius * 2).
+static Inst blobInst(float px, float groundY, float pz, float radius) {
+  Inst i{};
+  float d = radius * 2.0f;
+  i.r0[0] = d; i.r0[3] = px;
+  i.r1[1] = 1; i.r1[3] = groundY + 0.06f;
+  i.r2[2] = d; i.r2[3] = pz;
+  i.tintE[0] = i.tintE[1] = i.tintE[2] = 1; i.tintE[3] = 1;
+  return i;
+}
+static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
   if (y < 0.6f || y > 45.0f) return;
   float sl = p->slope(px, pz);
@@ -672,8 +815,9 @@ static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float s = 0.92f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.16f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
+  blobs.push_back(blobInst(px, y, pz, s * 2.6f));
 }
-static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
   if (y < 0.6f || y > 80.0f) return;
   float sl = p->slope(px, pz);
@@ -686,8 +830,9 @@ static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
+  blobs.push_back(blobInst(px, y, pz, s * 4.2f));
 }
-static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
   if (y < 0.25f || y > 150.0f) return;
   float sl = p->slope(px, pz);
@@ -711,8 +856,9 @@ static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   int ti = (int)(hash2(px * 0.9f - 11.0f, pz * 0.9f + 11.0f) * 6.0f) % 6;
   out[variantOf(nv, px, pz)].push_back(
       compose(yaw, pitch, roll, sx, sy, sz, px, y - base * 0.1f, pz, kRockTints[ti], 1.0f));
+  blobs.push_back(blobInst(px, y, pz, std::max(0.8f, std::max(sx, sz) * 1.3f)));
 }
-static void driftKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out) {
+static void driftKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
   if (y < 0.25f || y > 7.0f) return;
   float sl = p->slope(px, pz);
@@ -730,21 +876,66 @@ static void driftKernel(Impl* p, size_t nv, float px, float pz, std::vector<std:
   int ti = (int)(hash2(px * 0.9f - 11.0f, pz * 0.9f + 11.0f) * 6.0f) % 6;
   out[variantOf(nv, px, pz)].push_back(
       compose(yaw, pitch, roll, s, s, s, px, y - 0.03f, pz, kDriftTints[ti], 1.0f));
+  blobs.push_back(blobInst(px, y, pz, s * 1.15f));
+}
+
+// Grass (GRASS_WGSL port): forest meadow floor + beach-band bush cores, each hit
+// emitting a burst of 3-6 blade clumps within a 0.9 m bush radius. No blobs.
+static const glm::vec3 kGrassTints[5] = {
+  { 0.88f, 1.00f, 0.78f }, { 1.00f, 1.00f, 0.72f }, { 1.05f, 0.92f, 0.55f },
+  { 1.12f, 0.84f, 0.42f }, { 1.15f, 0.95f, 0.55f } };
+static float step01(float a, float b, float x) { float t = sstep(a, b, x); return t * t * (3.0f - 2.0f * t); }
+static void grassEmit(Impl* p, size_t nv, float px, float pz, float y, std::vector<std::vector<Inst>>& out) {
+  float s = 0.7f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.9f;
+  float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
+  int ti = (int)(hash2(px * 0.9f - 11.0f, pz * 0.9f + 11.0f) * 5.0f) % 5;
+  out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.02f, pz, kGrassTints[ti], 1.0f));
+}
+static void grassKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>&) {
+  float y = p->ground(px, pz);
+  if (y < 0.6f) return;
+  float sl = p->slope(px, pz);
+  if (sl > 0.7f) return;
+  float region = fbm2(px / 45.0f + 120.0f, pz / 45.0f - 60.0f);
+  float bush = fbm2(px / 5.0f + 31.0f, pz / 5.0f + 17.0f);
+  float core = step01(0.50f, 0.78f, bush);
+  float coreD = core * core * core;
+  float alt = 1.0f - sstep(90.0f, 140.0f, y);
+  float forestRegion = step01(0.34f, 0.50f, region);
+  float forestCover = 0.55f + 0.45f * coreD;
+  float lowland = sstep(1.5f, 13.0f, y);
+  float forestDens = forestRegion * forestCover * lowland;
+  float beachBand = sstep(0.7f, 1.8f, y) * (1.0f - sstep(4.0f, 11.0f, y));
+  float beachRegion = step01(0.50f, 0.62f, region);
+  float beachDens = beachRegion * coreD * beachBand * 0.85f;
+  float density = std::max(forestDens, beachDens) * alt * (1.0f - sl * 0.7f);
+  if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > density) return;
+  grassEmit(p, nv, px, pz, y, out);
+  const float BURST = 6.0f, BUSH_R = 0.9f;
+  int blades = (int)(3.0f + coreD * (BURST - 3.0f));
+  for (int b = 1; b < blades; ++b) {
+    float fb = (float)b;
+    float ang = hash2(px * (3.1f + fb * 0.7f) + fb * 1.7f, pz * (2.3f + fb * 0.5f) - fb * 2.9f) * TAU;
+    float rad = std::sqrt(hash2(px * (5.7f + fb) + 3.0f, pz * (1.9f + fb) - 3.0f)) * BUSH_R;
+    float jx = px + std::cos(ang) * rad, jz = pz + std::sin(ang) * rad;
+    grassEmit(p, nv, jx, jz, p->ground(jx, jz), out);
+  }
 }
 
 static void placePatch(Impl* p, Layer& l, int pxi, int pzi, Kernel k) {
   auto key = std::make_pair(pxi, pzi);
   if (l.patches.count(key)) return;
-  std::vector<std::vector<Inst>> per(l.full.size());
+  PatchData pd;
+  pd.per.resize(l.full.size());
   float cx = ((float)pxi + 0.5f) * Impl::PATCH, cz = ((float)pzi + 0.5f) * Impl::PATCH;
   for (int gz = 0; gz < l.res; ++gz)
     for (int gx = 0; gx < l.res; ++gx) {
       float cell = Impl::PATCH / (float)l.res;
       float wx = cx + ((float)gx + hash2(cx + gx * 12.9f, cz + gz * 78.2f)) * cell - Impl::PATCH * 0.5f;
       float wz = cz + ((float)gz + hash2(cx + gx * 39.3f + 7.1f, cz + gz * 11.7f - 3.3f)) * cell - Impl::PATCH * 0.5f;
-      k(p, l.full.size(), wx, wz, per);
+      k(p, l.full.size(), wx, wz, pd.per, pd.blobs);
     }
-  l.patches.emplace(key, std::move(per));
+  l.patches.emplace(key, std::move(pd));
   l.dirty = true;
 }
 
@@ -1307,17 +1498,128 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
     struct { Layer* l; Kernel k; } layers[] = {
       { &p->palms, palmKernel }, { &p->trees, treeKernel },
       { &p->rocks, rockKernel }, { &p->drift, driftKernel },
+      { &p->grass, grassKernel },
     };
     for (auto& L : layers) {
-      for (int dz = -Impl::RINGS; dz <= Impl::RINGS; ++dz)
-        for (int dx = -Impl::RINGS; dx <= Impl::RINGS; ++dx)
+      int ring = L.l->maxRing;
+      for (int dz = -ring; dz <= ring; ++dz)
+        for (int dx = -ring; dx <= ring; ++dx)
           placePatch(p, *L.l, px + dx, pz + dz, L.k);
       for (auto it = L.l->patches.begin(); it != L.l->patches.end();) {
-        if (std::abs(it->first.first - px) > Impl::RINGS + 1 ||
-            std::abs(it->first.second - pz) > Impl::RINGS + 1) {
+        if (std::abs(it->first.first - px) > ring + 1 ||
+            std::abs(it->first.second - pz) > ring + 1) {
           it = L.l->patches.erase(it); L.l->dirty = true;
         } else ++it;
       }
+    }
+  }
+
+  // ── Shoreline reeds + underwater seaweed (reed/seaweed.service ports):
+  //    stands/clumps re-evaluated ~3x/s, seeded in noise-gated bunches near the
+  //    boat, recycled past the cull radius. Instances rebuilt only on change. ──
+  p->bedAcc += dt;
+  if (p->bedAcc >= 0.33f) {
+    p->bedAcc = 0;
+    auto noise1 = [](float x, float z) {
+      float v = std::sin(x * 12.9898f + z * 78.233f) * 43758.5453f;
+      return v - std::floor(v);
+    };
+    // Reeds: shoreline band (seabed elev in [-1.8, 0.3]).
+    for (int i = (int)p->reedStands.size() - 1; i >= 0; --i)
+      if (std::hypot(p->reedStands[(size_t)i].cx - ship.x, p->reedStands[(size_t)i].cz - ship.z) > Impl::REED_CULL) {
+        p->reedStands.erase(p->reedStands.begin() + i); p->bedDirty = true;
+      }
+    for (int sd = 0; sd < 2 && (int)p->reedStands.size() < Impl::MAX_STANDS; ++sd) {
+      for (int tr = 0; tr < 8; ++tr) {
+        float ang = p->frand() * TAU;
+        float r = Impl::REED_SPAWN_MIN + p->frand() * (Impl::REED_SPAWN_MAX - Impl::REED_SPAWN_MIN);
+        float x = ship.x + std::cos(ang) * r, z = ship.z + std::sin(ang) * r;
+        float elev = p->ground(x, z);
+        if (elev < Impl::REED_ELEV_MIN || elev > Impl::REED_ELEV_MAX) continue;
+        if (noise1(std::floor(x / 22.0f), std::floor(z / 22.0f)) < 0.5f) continue;
+        bool near = false;
+        for (const Impl::Stand& st : p->reedStands)
+          if (std::hypot(st.cx - x, st.cz - z) < 6) { near = true; break; }
+        if (near) continue;
+        Impl::Stand st{ x, z, {} };
+        int n = 6 + (int)(p->frand() * 9);
+        float radius = 1.2f + p->frand() * 1.6f;
+        const glm::vec3 tints[5] = { {0.85f, 1.0f, 0.72f}, {0.90f, 0.95f, 0.66f}, {0.95f, 0.92f, 0.55f},
+                                     {1.0f, 0.92f, 0.60f}, {0.92f, 0.90f, 0.60f} };
+        for (int k = 0; k < n; ++k) {
+          float a = p->frand() * TAU, rr = std::sqrt(p->frand()) * radius;
+          float wx = x + std::cos(a) * rr, wz = z + std::sin(a) * rr;
+          st.items.push_back({ wx, wz, p->ground(wx, wz), p->frand() * TAU,
+                               0.75f + p->frand() * 0.55f, (int)(p->frand() * 3) % 3,
+                               tints[(int)(p->frand() * 5) % 5] });
+        }
+        p->reedStands.push_back(std::move(st));
+        p->bedDirty = true;
+        break;
+      }
+    }
+    // Seaweed: shallows (water depth 2.5-18 m); cleared entirely off the shallows.
+    float bDepth = -p->ground(ship.x, ship.z);
+    bool overShallows = bDepth >= Impl::WEED_DEPTH_MIN - 1 && bDepth <= Impl::WEED_DEPTH_MAX + 4;
+    if (!overShallows) {
+      if (!p->weedClumps.empty()) { p->weedClumps.clear(); p->bedDirty = true; }
+    } else {
+      for (int i = (int)p->weedClumps.size() - 1; i >= 0; --i)
+        if (std::hypot(p->weedClumps[(size_t)i].cx - ship.x, p->weedClumps[(size_t)i].cz - ship.z) > Impl::WEED_CULL) {
+          p->weedClumps.erase(p->weedClumps.begin() + i); p->bedDirty = true;
+        }
+      for (int sd = 0; sd < 2 && (int)p->weedClumps.size() < Impl::MAX_CLUMPS; ++sd) {
+        for (int tr = 0; tr < 6; ++tr) {
+          float ang = p->frand() * TAU;
+          float r = Impl::WEED_SPAWN_MIN + p->frand() * (Impl::WEED_SPAWN_MAX - Impl::WEED_SPAWN_MIN);
+          float x = ship.x + std::cos(ang) * r, z = ship.z + std::sin(ang) * r;
+          float seabed = p->ground(x, z);
+          float depth = -seabed;
+          if (depth < Impl::WEED_DEPTH_MIN || depth > Impl::WEED_DEPTH_MAX) continue;
+          if (noise1(std::floor(x / 26.0f), std::floor(z / 26.0f)) < 0.55f) continue;
+          bool near = false;
+          for (const Impl::Stand& c : p->weedClumps)
+            if (std::hypot(c.cx - x, c.cz - z) < 6) { near = true; break; }
+          if (near) continue;
+          Impl::Stand cl{ x, z, {} };
+          int n = 8 + (int)(p->frand() * 11);
+          float radius = 1.1f + p->frand() * 1.3f;
+          const glm::vec3 tints[4] = { {0.62f, 0.74f, 0.42f}, {0.50f, 0.62f, 0.34f},
+                                       {0.70f, 0.58f, 0.34f}, {0.44f, 0.58f, 0.44f} };
+          for (int k = 0; k < n; ++k) {
+            float a = p->frand() * TAU, rr = std::sqrt(p->frand()) * radius;
+            float wx = x + std::cos(a) * rr, wz = z + std::sin(a) * rr;
+            cl.items.push_back({ wx, wz, p->ground(wx, wz), p->frand() * TAU,
+                                 0.6f + p->frand() * 0.7f, (int)(p->frand() * 3) % 3,
+                                 tints[(int)(p->frand() * 4) & 3] });
+          }
+          p->weedClumps.push_back(std::move(cl));
+          p->bedDirty = true;
+          break;
+        }
+      }
+    }
+    if (p->bedDirty) {
+      p->bedDirty = false;
+      auto rebuildBeds = [&](Layer& l, const std::vector<Impl::Stand>& stands) {
+        std::vector<std::vector<Inst>> per(l.full.size());
+        for (const Impl::Stand& st : stands)
+          for (const Impl::Sprout& w : st.items) {
+            int v = w.variant % (int)per.size();
+            if (!l.full[(size_t)v].vbuf) v = 0;
+            per[(size_t)v].push_back(compose(w.rotY, 0, 0, w.scale, w.scale, w.scale,
+                                             w.x, w.y, w.z, w.tint, 1.0f));
+          }
+        for (size_t v = 0; v < l.full.size(); ++v) {
+          DrawSet& dset = l.full[v];
+          if (!dset.instBuf) continue;
+          dset.instCount = std::min((uint32_t)per[v].size(), dset.instCap);
+          if (dset.instCount)
+            wgpuQueueWriteBuffer(p->queue, dset.instBuf, 0, per[v].data(), (uint64_t)dset.instCount * sizeof(Inst));
+        }
+      };
+      rebuildBeds(p->reedsL, p->reedStands);
+      rebuildBeds(p->weedsL, p->weedClumps);
     }
   }
 
@@ -1423,16 +1725,23 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
       }
       return true;
     };
-    Layer* statics[] = { &p->palms, &p->trees, &p->rocks, &p->drift };
+    Layer* statics[] = { &p->palms, &p->trees, &p->rocks, &p->drift, &p->grass };
+    std::vector<Inst> blobBin;
     for (Layer* l : statics) {
       l->dirty = false;
       size_t nv = l->full.size();
+      bool isGrass = l == &p->grass;
+      float lodSplit = isGrass ? Impl::GRASS_NEAR : Impl::LOD_SPLIT;
       std::vector<std::vector<Inst>> fullBin(nv), lodBin(nv);
-      for (const auto& [key, per] : l->patches) {
+      for (const auto& [key, pd2] : l->patches) {
         if (!patchVisible(key.first, key.second)) continue;
+        const auto& per = pd2.per;
         float cx = ((float)key.first + 0.5f) * Impl::PATCH;
         float cz = ((float)key.second + 0.5f) * Impl::PATCH;
         float pd = std::hypot(cx - eye.x, cz - eye.z);
+        // Shadow blobs only near the camera (client shadowRing ~3 patches).
+        if (!pd2.blobs.empty() && pd <= (Impl::SHADOW_RING + 0.5f) * Impl::PATCH)
+          blobBin.insert(blobBin.end(), pd2.blobs.begin(), pd2.blobs.end());
         for (size_t v = 0; v < nv && v < per.size(); ++v) {
           if (l->impostor) {
             // Trees: dual-render the cross-dissolve ring (both bins; the shader
@@ -1442,8 +1751,8 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
             if (!l->lod.empty() && pd > Impl::NEAR_FADE - Impl::NEAR_BAND - Impl::PATCH)
               lodBin[v].insert(lodBin[v].end(), per[v].begin(), per[v].end());
           } else {
-            // Rocks/drift: full mesh near, low-poly LOD beyond.
-            bool nearP = pd <= Impl::LOD_SPLIT;
+            // Rocks/drift/grass: full mesh near, low-poly LOD beyond.
+            bool nearP = pd <= lodSplit;
             auto& bin = (nearP || l->lod.empty() || !l->lod[v].vbuf) ? fullBin[v] : lodBin[v];
             bin.insert(bin.end(), per[v].begin(), per[v].end());
           }
@@ -1462,6 +1771,9 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
         }
       }
     }
+    p->blobSet.instCount = std::min((uint32_t)blobBin.size(), p->blobSet.instCap);
+    if (p->blobSet.instCount)
+      wgpuQueueWriteBuffer(queue, p->blobSet.instBuf, 0, blobBin.data(), (uint64_t)p->blobSet.instCount * sizeof(Inst));
   }
 
   struct LU { glm::mat4 vp; glm::vec4 eye, sun, anim, lod; };
@@ -1492,6 +1804,8 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   // dithers out at the patch edge (client NearFade + LodDither).
   glm::vec4 fullFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 1.0f, 0.0f);
   glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 2.0f, Impl::TREE_CULL);
+  // Grass: dithers out at the GrassFade edge ((ring+0.5)*40 = 180 m; band 60).
+  glm::vec4 grassFade(0.0f, 0.0f, 0.0f, (Impl::GRASS_RING + 0.5f) * Impl::PATCH - 60.0f);
   drawSets(p->palms, false, fullFade);
   drawSets(p->palms, true, impFade);
   drawSets(p->trees, false, fullFade);
@@ -1500,9 +1814,36 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   drawSets(p->rocks, true, noLod);
   drawSets(p->drift, false, noLod);
   drawSets(p->drift, true, noLod);
+  drawSets(p->grass, false, grassFade);
+  drawSets(p->grass, true, grassFade);
+  drawSets(p->reedsL, false, noLod);
+  drawSets(p->weedsL, false, noLod);
   drawSets(p->birdsL, false, noLod);
   drawSets(p->dolphinsL, false, noLod);
   drawSets(p->fishL, false, noLod);
+
+  // Shadow blobs last (blended decal over the terrain, before the ocean draws):
+  // stretched away from the sun, lengthening + fading as it lowers; gone at night.
+  if (p->blobSet.instCount && p->blobPipeline) {
+    // lightDir is the sun by day (dayK gates the moon out at night, matching the
+    // client's sun-elevation fade). stretch = 1/max(sun.y, 0.30), clamped 1..3.5.
+    float sunY = lightDir.y;
+    float stretch = std::clamp(1.0f / std::max(sunY, 0.30f), 1.0f, 3.5f);
+    float alpha = 0.62f * sstep(0.0f, 0.16f, sunY) * (1.0f - 0.06f * (stretch - 1.0f)) * dayK;
+    glm::vec2 sd(-lightDir.x, -lightDir.z);
+    float sl = glm::length(sd);
+    sd = sl > 1e-4f ? sd / sl : glm::vec2(0, 1);
+    LU u{ viewProj, glm::vec4(eye, 1.0f), glm::vec4(lightDir, dayK),
+          glm::vec4((float)timeSec, 6.0f, 0.0f, alpha),
+          glm::vec4(sd.x, sd.y, stretch, 0.0f) };
+    wgpuQueueWriteBuffer(queue, p->blobUbuf, 0, &u, sizeof(u));
+    wgpuRenderPassEncoderSetPipeline(pass, p->blobPipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, p->blobSet.bind, 0, nullptr);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, p->blobSet.vbuf, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 1, p->blobSet.instBuf, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderSetIndexBuffer(pass, p->blobSet.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+    wgpuRenderPassEncoderDrawIndexed(pass, p->blobSet.indexCount, p->blobSet.instCount, 0, 0, 0);
+  }
 }
 
 } // namespace scatter

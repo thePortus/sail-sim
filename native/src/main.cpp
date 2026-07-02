@@ -982,7 +982,7 @@ static WGPUShaderModule makeWGSL(WGPUDevice device, const char* code);   // defi
 // building, instanced per TYPE, band-faded in the mid-distance (real streamed
 // meshes own the near range; far cutoff ~5 km).
 
-struct ShipImpU { glm::mat4 viewProj; glm::vec4 center; glm::vec4 uv; glm::vec4 tint; glm::vec4 right; };
+struct ShipImpU { glm::mat4 viewProj; glm::vec4 center; glm::vec4 uv; glm::vec4 tint; glm::vec4 right; glm::vec4 haze; };
 struct ShipImpSlug {
   WGPUTexture tex = nullptr; WGPUTextureView view = nullptr; WGPUBindGroup bind = nullptr;
   float size = 0, centerY = 0, calib = 0; int n = 16, cols = 16;
@@ -994,7 +994,7 @@ struct ShipImpRender {
   std::map<std::string, ShipImpSlug> slugs;
 };
 
-struct TownImpU { glm::mat4 viewProj; glm::vec4 cam; glm::vec4 band; glm::vec4 quad; glm::vec4 tint; };
+struct TownImpU { glm::mat4 viewProj; glm::vec4 cam; glm::vec4 band; glm::vec4 quad; glm::vec4 tint; glm::vec4 haze; };
 struct TownImpType {
   WGPUTexture tex = nullptr; WGPUTextureView view = nullptr; WGPUBindGroup bind = nullptr;
   WGPUBuffer ubuf = nullptr, instBuf = nullptr; uint32_t count = 0;
@@ -1024,6 +1024,7 @@ struct U {
   uv       : vec4<f32>,   // x = cell0 u-offset; y = cell1 u-offset; z = blend; w = 1/cols
   tint     : vec4<f32>,   // rgb = day/night lighting multiply
   right    : vec4<f32>,   // xy = camera-right XZ (upright billboard basis)
+  haze     : vec4<f32>,   // rgb = horizon haze colour; w = haze amount at this ship
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var atlas : texture_2d<f32>;
@@ -1049,7 +1050,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let c1 = textureSample(atlas, samp, vec2<f32>(u.uv.y + in.uv.x * u.uv.w, in.uv.y));
   let c = mix(c0, c1, u.uv.z);
   if (c.a < 0.4) { discard; }
-  return vec4<f32>(c.rgb * u.tint.rgb, 1.0);
+  return vec4<f32>(mix(c.rgb * u.tint.rgb, u.haze.rgb, u.haze.w), 1.0);
 }
 )WGSL";
   r.module = makeWGSL(device, kSrc);
@@ -1122,11 +1123,12 @@ struct U {
   band     : vec4<f32>,   // nearStart, nearFull, farStart, farEnd (m)
   quad     : vec4<f32>,   // x = size (m); y = basePad fraction
   tint     : vec4<f32>,   // rgb = day/night lighting multiply
+  haze     : vec4<f32>,   // rgb = horizon haze colour (amount from cam distance)
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var tex  : texture_2d<f32>;
 @group(0) @binding(2) var samp : sampler;
-struct VSOut { @builtin(position) position : vec4<f32>, @location(0) uv : vec2<f32> };
+struct VSOut { @builtin(position) position : vec4<f32>, @location(0) uv : vec2<f32>, @location(1) haze : f32 };
 @vertex
 fn vs_main(@builtin(vertex_index) vi : u32, @location(0) inst : vec4<f32>) -> VSOut {
   var C = array<vec2<f32>, 6>(vec2<f32>(-0.5, 0.0), vec2<f32>(0.5, 0.0), vec2<f32>(-0.5, 1.0),
@@ -1142,13 +1144,14 @@ fn vs_main(@builtin(vertex_index) vi : u32, @location(0) inst : vec4<f32>) -> VS
   var o : VSOut;
   o.position = u.viewProj * vec4<f32>(world, 1.0);
   o.uv = vec2<f32>(c.x + 0.5, 1.0 - c.y);
+  o.haze = 1.0 - exp(-pow(d * 0.00009, 2.0));
   return o;
 }
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let c = textureSample(tex, samp, in.uv);
   if (c.a < 0.4) { discard; }
-  return vec4<f32>(c.rgb * u.tint.rgb, 1.0);
+  return vec4<f32>(mix(c.rgb * u.tint.rgb, u.haze.rgb, in.haze), 1.0);
 }
 )WGSL";
   r.module = makeWGSL(device, kSrc);
@@ -1292,6 +1295,11 @@ struct TerrainRender {
   WGPUTexture heightTex = nullptr; WGPUTextureView heightView = nullptr;
   WGPUBindGroup bindGroup = nullptr;
   uint32_t indexCount = 0; bool ready = false;
+  // Coarse FAR ring (+/-20 km, ~156 m cells): distant islands exist beyond the
+  // detailed +/-4 km grid, so far tree impostors never float on bare water.
+  WGPUBuffer farVbuf = nullptr, farIbuf = nullptr, farUniformBuf = nullptr;
+  WGPUBindGroup farBindGroup = nullptr;
+  uint32_t farIndexCount = 0;
   // Biome skinning (Angular terrain.service port): splat map + 5 diffuse tiles +
   // 3 normal tiles. All slots point at a 1x1 placeholder until the async fetch
   // lands (the shader gates on extra.y), then the bind group is rebuilt.
@@ -1330,6 +1338,10 @@ static void rebuildTerrainBind(WGPUDevice device, TerrainRender& t) {
   bge[14].binding = 14; bge[14].sampler = t.splatSamp;
   WGPUBindGroupDescriptor bgd = {}; bgd.layout = t.bgl; bgd.entryCount = 15; bgd.entries = bge;
   t.bindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
+  // Far ring shares every texture; only the uniform buffer differs.
+  if (t.farBindGroup) wgpuBindGroupRelease(t.farBindGroup);
+  bge[0].buffer = t.farUniformBuf;
+  t.farBindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
 }
 
 static WGPUShaderModule makeWGSL(WGPUDevice device, const char* code) {
@@ -1371,6 +1383,23 @@ static TerrainRender createTerrainRender(WGPUDevice device, WGPUQueue queue, WGP
   wgpuQueueWriteBuffer(queue, t.ibuf, 0, idx.data(), ibd.size);
   WGPUBufferDescriptor ubd = {}; ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
   ubd.size = sizeof(TerrainU); t.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
+  t.farUniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
+
+  // Coarse far ring: +/-20 km at 256 cells (~156 m) — silhouettes only; the
+  // fragment discards the centre square the detailed grid owns.
+  {
+    std::vector<float> fv; std::vector<uint32_t> fidx;
+    makeXZGrid(256, 20000.0f, fv, fidx);
+    t.farIndexCount = (uint32_t)fidx.size();
+    WGPUBufferDescriptor fvbd = {}; fvbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+    fvbd.size = fv.size() * sizeof(float);
+    t.farVbuf = wgpuDeviceCreateBuffer(device, &fvbd);
+    wgpuQueueWriteBuffer(queue, t.farVbuf, 0, fv.data(), fvbd.size);
+    WGPUBufferDescriptor fibd = {}; fibd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+    fibd.size = fidx.size() * sizeof(uint32_t);
+    t.farIbuf = wgpuDeviceCreateBuffer(device, &fibd);
+    wgpuQueueWriteBuffer(queue, t.farIbuf, 0, fidx.data(), fibd.size);
+  }
 
   t.module = makeWGSL(device, TERRAIN_WGSL);
 
@@ -3889,6 +3918,14 @@ int main(int argc, char** argv) {
                    glm::vec4(lightDir, dayK),   // land lit by sun (day) / moon (night); w = daylight
                    glm::vec4(terrainR.peakH, terrainR.hasBiome ? 1.0f : 0.0f, 0.0f, 0.0f) };
       wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));
+      // Far ring: its own cell snap (156 m) + a centre discard just inside the
+      // near grid's span (slop covers the two grids' differing snap origins).
+      const float fCell = 2.0f * 20000.0f / 256.0f;
+      TerrainU tf = tu;
+      tf.misc.z = std::floor(shipX / fCell) * fCell;
+      tf.misc.w = std::floor(shipZ / fCell) * fCell;
+      tf.extra.z = 3700.0f;
+      wgpuQueueWriteBuffer(queue, terrainR.farUniformBuf, 0, &tf, sizeof(tf));
     }
     // Clouds: integrate wind drift, derive time-of-day light, write uniforms. The
     // sun/sky/ground colour model + coverage/type mirror the client's cloud plugin.
@@ -3957,16 +3994,21 @@ int main(int argc, char** argv) {
         float f = (viewAz - ii.heading + sg.calib) / glm::two_pi<float>() * (float)sg.n;
         f = std::fmod(std::fmod(f, (float)sg.n) + (float)sg.n, (float)sg.n);
         int c0 = (int)f % sg.n; int c1 = (c0 + 1) % sg.n;
+        float hd = std::hypot(ii.x - eye.x, ii.z - eye.z);
+        float hAmt = 1.0f - std::exp(-std::pow(hd * 0.00009f, 2.0f));
+        glm::vec3 hCol = glm::mix(glm::vec3(0.10f, 0.12f, 0.16f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
         ShipImpU su{ viewProj,
                      glm::vec4(ii.x, fftHeight(ii.x, ii.z) + sg.centerY, ii.z, sg.size),
                      glm::vec4((float)c0 / sg.cols, (float)c1 / sg.cols, f - std::floor(f), 1.0f / sg.cols),
-                     glm::vec4(impTint, 0.0f), glm::vec4(r2, 0.0f, 0.0f) };
+                     glm::vec4(impTint, 0.0f), glm::vec4(r2, 0.0f, 0.0f), glm::vec4(hCol, hAmt) };
         wgpuQueueWriteBuffer(queue, shipImp.ubuf, (uint64_t)i * shipImp.stride, &su, sizeof(su));
       }
+      glm::vec3 hCol2 = glm::mix(glm::vec3(0.10f, 0.12f, 0.16f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
       for (TownImpType& tt : townImp.types) {
         TownImpU tu{ viewProj, glm::vec4(eye.x, eye.z, r2.x, r2.y),
                      glm::vec4(600.0f, 850.0f, 4200.0f, 5200.0f),   // client TownImpostorPlugin.band
-                     glm::vec4(tt.size, tt.basePad, 0.0f, 0.0f), glm::vec4(impTint, 0.0f) };
+                     glm::vec4(tt.size, tt.basePad, 0.0f, 0.0f), glm::vec4(impTint, 0.0f),
+                     glm::vec4(hCol2, 0.0f) };
         wgpuQueueWriteBuffer(queue, tt.ubuf, 0, &tu, sizeof(tu));
       }
     }
@@ -4011,9 +4053,13 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderSetBindGroup(pass, 0, sky.bindGroup, 0, nullptr);
     wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
 
-    // Terrain (islands) — displaced height grid, depth-tested against the water.
+    // Terrain (islands) — far silhouette ring first, then the detailed near grid.
     if (terrainR.ready) {
       wgpuRenderPassEncoderSetPipeline(pass, terrainR.pipeline);
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, terrainR.farBindGroup, 0, nullptr);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 0, terrainR.farVbuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(pass, terrainR.farIbuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderDrawIndexed(pass, terrainR.farIndexCount, 1, 0, 0, 0);
       wgpuRenderPassEncoderSetBindGroup(pass, 0, terrainR.bindGroup, 0, nullptr);
       wgpuRenderPassEncoderSetVertexBuffer(pass, 0, terrainR.vbuf, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderSetIndexBuffer(pass, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);

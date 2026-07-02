@@ -224,6 +224,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   col = col * (0.38 + 0.62 * diff);
   let dayK = u.sun.w;
   col = col * mix(0.13, 1.0, dayK) * mix(vec3<f32>(0.48, 0.58, 0.82), vec3<f32>(1.0), dayK);
+  // Aerial haze (ImpostorHazePlugin port) — far impostors recede with the terrain.
+  let hd = distance(u.eye.xyz, in.worldPos);
+  let haze = 1.0 - exp(-pow(hd * 0.00009, 2.0));
+  col = mix(col, mix(vec3<f32>(0.10, 0.12, 0.16), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
   return vec4<f32>(col, 1.0);
 }
 )WGSL";

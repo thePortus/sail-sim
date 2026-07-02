@@ -13,7 +13,8 @@ struct TU {
   bounds   : vec4<f32>,   // minX, maxX, minZ, maxZ (world metres)
   misc     : vec4<f32>,   // x,y = texW,texH ; z,w = origin (ship x,z)
   sun      : vec4<f32>,   // xyz light direction; w = daylight factor
-  extra    : vec4<f32>,   // x = peak elevation (m); y = biome textures ready
+  extra    : vec4<f32>,   // x = peak elevation (m); y = biome textures ready;
+                          // z = inner discard half-size (far ring; 0 = near grid)
 };
 @group(0) @binding(0)  var<uniform> u : TU;
 @group(0) @binding(1)  var heightTex : texture_2d<f32>;
@@ -158,6 +159,10 @@ fn biomeColor(h : f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
+  // Far ring: leave the centre square to the detailed near grid (extra.z = its
+  // half-size with slop for the differing origin snaps; 0 on the near grid).
+  if (u.extra.z > 0.0 &&
+      max(abs(in.worldPos.x - u.misc.z), abs(in.worldPos.z - u.misc.w)) < u.extra.z) { discard; }
   // The seabed DRAWS now (no waterline cull): the ocean surface above is
   // alpha-blended by true depth, so submerged sand shows through the shallows.
   // Underwater fragments get absorption shading below so reef flats read as
@@ -291,5 +296,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   // Day/night (u.sun.w = daylight): dim + cool the land toward a moonlit night.
   let dayK = u.sun.w;
   col = col * mix(0.13, 1.0, dayK) * mix(vec3<f32>(0.48, 0.58, 0.82), vec3<f32>(1.0), dayK);
+  // Aerial haze (client EXP2 fog): distant land recedes into the horizon colour.
+  let hazeD = distance(u.eye.xyz, in.worldPos);
+  let hazeAmt = 1.0 - exp(-pow(hazeD * 0.00009, 2.0));
+  let hazeCol = mix(vec3<f32>(0.10, 0.12, 0.16), vec3<f32>(0.66, 0.72, 0.80), dayK);
+  col = mix(col, hazeCol, hazeAmt);
   return vec4<f32>(col, 1.0);   // sRGB target does gamma
 }

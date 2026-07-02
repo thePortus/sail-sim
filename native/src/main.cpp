@@ -739,7 +739,7 @@ struct SeaFar { WGPURenderPipeline pipeline; WGPUShaderModule module; WGPUBuffer
 
 static SeaFar createSeaFar(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat) {
   SeaFar s;
-  const float B = 26000.0f;   // covers the +/-25 km world with margin
+  const float B = 50000.0f;   // flat sheet well past the far plane -> reaches the horizon
   const float verts[12] = { -B, -B,  B, -B,  B, B,  -B, -B,  B, B,  -B, B };
   WGPUBufferDescriptor vbd = {}; vbd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst; vbd.size = sizeof(verts);
   s.vbuf = wgpuDeviceCreateBuffer(device, &vbd); wgpuQueueWriteBuffer(queue, s.vbuf, 0, verts, sizeof(verts));
@@ -1590,7 +1590,7 @@ int main(int argc, char** argv) {
     glm::vec3 back = glm::normalize(glm::vec3(glm::rotate(glm::mat4(1.0f), camYawOffset, glm::vec3(0, 1, 0)) * glm::vec4(-fwd, 0.0f)));
     glm::vec3 eye = shipPos + back * (camDist * std::cos(camPitch)) + glm::vec3(0.0f, camDist * std::sin(camPitch), 0.0f);
     glm::mat4 viewM = glm::lookAt(eye, shipPos + glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0, 1, 0));
-    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 0.5f, 14000.0f);
+    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 2.0f, 40000.0f);
     glm::mat4 viewProj = proj * viewM;
 
     // Our hull is server-authoritative — adopt the slug from the "wallet" message

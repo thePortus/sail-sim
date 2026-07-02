@@ -41,8 +41,10 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
   let wx = inXZ.x + u.misc.z;   // grid follows the ship
   let wz = inXZ.y + u.misc.w;
   let y  = sampleH(wx, wz);
+  // Earth curvature (matches the sea/cloud R) so land recedes with the sea horizon.
+  let cd = vec2<f32>(wx, wz) - u.eye.xz;
   var o : VSOut;
-  o.worldPos = vec3<f32>(wx, y, wz);
+  o.worldPos = vec3<f32>(wx, y - dot(cd, cd) / (2.0 * 2000000.0), wz);
   o.position = u.viewProj * vec4<f32>(o.worldPos, 1.0);
   return o;
 }

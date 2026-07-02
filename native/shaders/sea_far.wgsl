@@ -16,11 +16,22 @@ struct VSOut {
   @location(0)       worldPos : vec3<f32>,
 };
 
+// Earth curvature (matches the cloud shell R): the sea bends down with distance
+// from the camera so it recedes to a curved horizon ~5 km out. Stable small-angle
+// form d^2/2R — avoids the float32 cancellation of R - sqrt(R^2 - d^2).
+fn curveDrop(pxz : vec2<f32>, eyexz : vec2<f32>) -> f32 {
+  let d = pxz - eyexz;
+  return dot(d, d) / (2.0 * 2000000.0);
+}
+
 @vertex
 fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
   var o : VSOut;
-  o.worldPos = vec3<f32>(inXZ.x, 0.0, inXZ.y);
-  o.position = u.viewProj * vec4<f32>(o.worldPos, 1.0);
+  // Recentre the sheet on the ship (origin.xy) so water always reaches the horizon.
+  var p = vec3<f32>(inXZ.x + u.origin.x, 0.0, inXZ.y + u.origin.y);
+  p.y = p.y - curveDrop(p.xz, u.eye.xz);
+  o.worldPos = p;
+  o.position = u.viewProj * vec4<f32>(p, 1.0);
   return o;
 }
 

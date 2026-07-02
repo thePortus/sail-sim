@@ -51,7 +51,11 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
     disp = disp * cam.params.w;   // wind-driven wave amplitude (Beaufort)
 
-    let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
+    var p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
+    // Earth curvature (R matches the cloud shell): the sea bends down with distance
+    // so it recedes to a curved horizon. Stable d^2/2R form.
+    let cd = p.xz - cam.eye.xz;
+    p.y = p.y - dot(cd, cd) / (2.0 * 2000000.0);
     var out : VSOut;
     out.position = cam.viewProj * vec4<f32>(p, 1.0);
     out.worldPos = p;

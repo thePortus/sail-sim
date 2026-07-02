@@ -3875,9 +3875,17 @@ int main(int argc, char** argv) {
     }
     if (terrainR.ready) {
       const terrain::Manifest& tm = terr.manifest();
+      // Snap the camera-following grid origin to whole grid cells: an unsnapped
+      // origin slides the vertices through the heightfield, so every vertex
+      // resamples a slightly different height each frame — the terrain visibly
+      // undulates/morphs while sailing (worst at the shoreline). Snapping keeps
+      // every vertex on the same world sample points as the grid recentres.
+      const float tCell = 2.0f * 4000.0f / 512.0f;   // grid span / resolution (createTerrainRender)
+      float tox = std::floor(shipX / tCell) * tCell;
+      float toz = std::floor(shipZ / tCell) * tCell;
       TerrainU tu{ viewProj, glm::vec4(eye, 1.0f),
                    glm::vec4((float)tm.minX, (float)tm.maxX, (float)tm.minZ, (float)tm.maxZ),
-                   glm::vec4((float)tm.width, (float)tm.height, shipX, shipZ),
+                   glm::vec4((float)tm.width, (float)tm.height, tox, toz),
                    glm::vec4(lightDir, dayK),   // land lit by sun (day) / moon (night); w = daylight
                    glm::vec4(terrainR.peakH, terrainR.hasBiome ? 1.0f : 0.0f, 0.0f, 0.0f) };
       wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));

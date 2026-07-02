@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <chrono>
+#include <future>
 #include <random>
 #include <vector>
 
@@ -298,6 +300,13 @@ struct System::Impl {
   Layer palms, trees, rocks, drift, grass;
   Layer birdsL, dolphinsL, fishL;   // wildlife draw sets (full[] only; instances per frame)
   Layer reedsL, weedsL;             // shoreline reeds + underwater seaweed (stand/clump services)
+  // Static FAR impostor layers (buildFarForest port): whole-map tree/palm
+  // billboards on every island's forested slopes and coasts, faded IN over
+  // 280-470 m (FarFadePlugin band) so distant islands read as treed. Built once
+  // off-thread from the heightfield when terrain lands.
+  Layer farTrees, farPalms;
+  std::future<std::pair<std::vector<std::vector<Inst>>, std::vector<std::vector<Inst>>>> farFuture;
+  bool farBuilt = false;
   // Shadow blobs: one blended draw over all layers' discs (dappled texture,
   // sun-stretched in the shader). Separate pipeline: alpha blend, no depth write.
   WGPURenderPipeline blobPipeline = nullptr;
@@ -736,6 +745,31 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
     makeDrawSet(p, p->blobSet, quad, p->blobUbuf, dappleView, 20000);
   }
 
+  // ── Far-forest / far-palm impostor layers: reuse the cross meshes + atlases;
+  //    instance buffers are filled once the off-thread heightfield walk lands. ──
+  {
+    struct FarCfg { Layer* l; const char* glb; std::vector<std::string> pngs; };
+    FarCfg fars[] = {
+      { &p->farTrees, "beech_a.glb",
+        { T + "beech_impostor_a.png", T + "beech_impostor_b.png", T + "beech_impostor_c.png" } },
+      { &p->farPalms, "palm_a.glb",
+        { T + "impostor_a.png", T + "impostor_b.png", T + "impostor_c.png" } },
+    };
+    for (auto& fc : fars) {
+      fc.l->mode = 0; fc.l->alphaCut = 0.4f;
+      fc.l->ubufFull = makeUbuf();
+      MeshData ref = loadGltfMesh((dir + "/" + std::string(fc.glb)).c_str());
+      float h = ref.ok ? (ref.bbMax[1] - ref.bbMin[1]) : 10.0f;
+      for (const std::string& png : fc.pngs) {
+        PngData img = loadPng(png);
+        MeshData cross = makeCrossMesh(h, h, img.ok ? bottomPad(img) : 0.0f);
+        WGPUTextureView iv = img.ok ? makeTexView(p, img.w, img.h, img.rgba.data(), true) : nullptr;
+        DrawSet dsF; makeDrawSet(p, dsF, cross, fc.l->ubufFull, iv, 220000);
+        fc.l->full.push_back(dsF);
+      }
+    }
+  }
+
   // ── Shoreline reeds + underwater seaweed (LOD-only meshes, alpha atlas) ──
   ok &= initAnimalFwd(p, p->reedsL, 0, 0.4f,
                       { "reed_a_lod.glb", "reed_b_lod.glb", "reed_c_lod.glb" }, T + "reeds_atlas.png", 384, dir);
@@ -779,7 +813,86 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   return ok;
 }
 
-void System::setTerrain(const terrain::Terrain* terr) { p_->terr = terr; }
+// Whole-map far-impostor walk (buildFarForest port): sample every heightfield
+// cell (jittered, stride-capped), gate by the client's dense far-forest recipe
+// (or the palm coast band), reservoir-cap the budget, and bin by variant.
+static std::pair<std::vector<std::vector<Inst>>, std::vector<std::vector<Inst>>>
+buildFarLayers(const terrain::Terrain* terr) {
+  std::pair<std::vector<std::vector<Inst>>, std::vector<std::vector<Inst>>> out;
+  out.first.resize(3); out.second.resize(3);
+  const terrain::Manifest& m = terr->manifest();
+  float spanX = (float)(m.maxX - m.minX), spanZ = (float)(m.maxZ - m.minZ);
+  int nx = std::max(2, m.width), nz = std::max(2, m.height);
+  int stride = std::max(1, (int)std::ceil(std::sqrt((double)nx * nz / 8000000.0)));
+  float peak = 1.0f;
+  for (float v : terr->field()) peak = std::max(peak, v);
+  float yLo = std::max(0.6f, 0.04f * peak), yHi = 0.74f * peak;
+  auto ground = [&](float x, float z) { return terr->elevation(x, z); };
+  auto slopeAt = [&](float x, float z) {
+    const float e = 3.0f;
+    float gx = ground(x + e, z) - ground(x - e, z);
+    float gz = ground(x, z + e) - ground(x, z - e);
+    return std::hypot(gx, gz) / (2.0f * e);
+  };
+  auto nearShoreline = [&](float x, float z, float d) {
+    for (int i = 0; i < 6; ++i) {
+      float a = (float)i / 6.0f * TAU;
+      if (ground(x + std::cos(a) * d, z + std::sin(a) * d) <= 0.4f) return true;
+    }
+    return false;
+  };
+  const int BUDGET_PER = 200000;   // per variant bin (600k total, the client's cap)
+  std::minstd_rand rng{ 777 };
+  for (int iz = 0; iz < nz; iz += stride)
+    for (int ix = 0; ix < nx; ix += stride) {
+      float jx = hash2(ix * 12.9f + iz, iz * 78.2f + ix), jz = hash2(ix * 39.3f + 7.1f, iz * 11.7f - 3.3f);
+      float px = (float)m.minX + ((ix + jx) / (float)(nx - 1)) * spanX;
+      float pz = (float)m.maxZ - ((iz + jz) / (float)(nz - 1)) * spanZ;
+      float y = ground(px, pz);
+      // ── FAR FOREST (beech impostors): the client's dense canopy recipe. ──
+      if (y >= yLo && y <= yHi) {
+        float sl = slopeAt(px, pz);
+        if (sl <= 0.6f) {
+          float stand = fbm2(px / 45.0f, pz / 45.0f), clearing = fbm2(px / 13.0f + 9.0f, pz / 13.0f - 4.0f);
+          float standC = sstep(0.28f, 0.62f, stand), clearC = sstep(0.18f, 0.52f, clearing);
+          float dens = (0.45f + 0.55f * standC) * clearC * (1.0f - sl * 0.35f);
+          if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) <= dens && !nearShoreline(px, pz, 6.0f)) {
+            int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));
+            if ((int)out.first[(size_t)v].size() < BUDGET_PER) {
+              float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
+              out.first[(size_t)v].push_back(
+                  compose(0, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
+            }
+          }
+        }
+      }
+      // ── FAR COAST PALMS: the near palm kernel's gates (so the far layer's groves
+      //    land where the near ring's real palms are — a clean handoff). ──
+      if (y >= 0.6f && y <= 45.0f) {
+        float sl = slopeAt(px, pz);
+        if (sl <= 0.5f) {
+          float stand = fbm2(px / 28.0f + 60.0f, pz / 28.0f - 40.0f);
+          float dens = sstep(0.48f, 0.80f, stand) * (1.0f - sl * 0.6f) * 0.95f;
+          if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) <= dens && !nearShoreline(px, pz, 7.0f)) {
+            int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));
+            if ((int)out.second[(size_t)v].size() < BUDGET_PER) {
+              float s = 0.92f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.16f;
+              out.second[(size_t)v].push_back(
+                  compose(0, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
+            }
+          }
+        }
+      }
+    }
+  (void)rng;
+  return out;
+}
+
+void System::setTerrain(const terrain::Terrain* terr) {
+  p_->terr = terr;
+  if (terr && !p_->farBuilt && !p_->farFuture.valid())
+    p_->farFuture = std::async(std::launch::async, [terr] { return buildFarLayers(terr); });
+}
 
 // ── Placement kernels (unchanged CPU twins) ───────────────────────────────────
 static int variantOf(size_t n, float px, float pz) {
@@ -1623,6 +1736,26 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
     }
   }
 
+  // Far impostor layers built? Upload once (static thereafter).
+  if (!p->farBuilt && p->farFuture.valid() &&
+      p->farFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    auto [beech, palm] = p->farFuture.get();
+    size_t total = 0;
+    auto uploadFar = [&](Layer& l, std::vector<std::vector<Inst>>& per) {
+      for (size_t v = 0; v < l.full.size() && v < per.size(); ++v) {
+        DrawSet& dset = l.full[v];
+        dset.instCount = std::min((uint32_t)per[v].size(), dset.instCap);
+        total += dset.instCount;
+        if (dset.instCount)
+          wgpuQueueWriteBuffer(p->queue, dset.instBuf, 0, per[v].data(), (uint64_t)dset.instCount * sizeof(Inst));
+      }
+    };
+    uploadFar(p->farTrees, beech);
+    uploadFar(p->farPalms, palm);
+    p->farBuilt = true;
+    std::printf("[scatter] far impostors: %zu billboards\n", total);
+  }
+
   // ── Wildlife (exact client behaviour). ──
   updateBirds(p, dt, ship.x, ship.z, ship, storminess);
   updateDolphins(p, dt, t, ship);
@@ -1816,6 +1949,11 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   drawSets(p->drift, true, noLod);
   drawSets(p->grass, false, grassFade);
   drawSets(p->grass, true, grassFade);
+  // Far island impostors: grow in over the FarFadePlugin band (280 -> full 470 m)
+  // as the near scatter ring hands off; distant coasts read as treed.
+  glm::vec4 farFade(470.0f, 190.0f, 2.0f, 0.0f);
+  drawSets(p->farTrees, false, farFade);
+  drawSets(p->farPalms, false, farFade);
   drawSets(p->reedsL, false, noLod);
   drawSets(p->weedsL, false, noLod);
   drawSets(p->birdsL, false, noLod);

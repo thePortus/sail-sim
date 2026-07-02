@@ -301,6 +301,7 @@ add_executable(sailsim_native
   src/net_mp.cpp
   src/session.cpp
   src/props_assets.cpp
+  src/scatter.cpp
   src/sky_assets.cpp
   src/terrain.cpp
   src/terrain_biome.cpp

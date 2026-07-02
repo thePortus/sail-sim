@@ -10,7 +10,14 @@
 
 namespace terrain {
 
-struct Harbor { std::string name, faction, tier; float x = 0, z = 0, heading = 0; };
+// One placed structure of a harbour town (asset = GLB/impostor basename).
+struct Building { std::string asset; float x = 0, z = 0, rotY = 0; };
+struct Harbor {
+  std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)
+  float x = 0, z = 0, heading = 0;
+  float padElev = 0;                          // town pad ground elevation (metres)
+  std::vector<Building> buildings;
+};
 struct Spawn  { float x = 0, z = 0, heading = 0; };
 
 struct Manifest {

@@ -46,7 +46,23 @@ bool Terrain::load(const std::string& host, int port) {
       hb.name    = h.value("name", std::string());
       hb.faction = h.value("faction", std::string());
       hb.tier    = h.value("tier", std::string());
+      hb.variant = h.value("variant", std::string());
       hb.x = h.value("x", 0.0f); hb.z = h.value("z", 0.0f); hb.heading = h.value("heading", 0.0f);
+      // Null-tolerant number read (a bare .value() throws type_error on null).
+      auto num = [](const json& o, const char* k, float dflt) -> float {
+        auto it = o.find(k);
+        return (it != o.end() && it->is_number()) ? it->get<float>() : dflt;
+      };
+      if (h.contains("pad") && h["pad"].is_object()) hb.padElev = num(h["pad"], "elev", 0.0f);
+      if (h.contains("buildings") && h["buildings"].is_array()) {
+        for (const auto& b : h["buildings"]) {
+          if (!b.is_object()) continue;
+          Building bd;
+          bd.asset = (b.contains("asset") && b["asset"].is_string()) ? b["asset"].get<std::string>() : std::string();
+          bd.x = num(b, "x", 0.0f); bd.z = num(b, "z", 0.0f); bd.rotY = num(b, "rotY", 0.0f);
+          if (!bd.asset.empty()) hb.buildings.push_back(bd);
+        }
+      }
       m_.harbors.push_back(hb);
     }
   }

@@ -46,6 +46,7 @@
 #include "gltf_mesh.hpp"
 #include "net_auth.hpp"
 #include "net_mp.hpp"
+#include "sail_physics.hpp"
 #include "ocean_fft.hpp"
 #include "session.hpp"
 #include "terrain.hpp"
@@ -1249,6 +1250,12 @@ int main(int argc, char** argv) {
 
   // Sailing state — arrow keys / WASD steer and trim sail; the ship sails the sea.
   float shipX = 0.0f, shipZ = 0.0f, shipHeading = 0.0f, shipSpeed = 0.0f, sail = 0.35f;
+  // Ported force-based sailing physics (sail_physics.hpp). shipX/Z/heading/speed
+  // mirror the vessel each frame for the camera/ocean/network.
+  sail::Vessel vessel;
+  sail::Rig    vrig = sail::rigForSlug("sloop");
+  bool prevRaise = false, prevLower = false, prevAnchor = false;
+  glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
   // match server combat-constants.js) so distances feel right at realistic knots.
@@ -1378,9 +1385,10 @@ int main(int argc, char** argv) {
           }
           float hr = glm::radians(best->heading);
           glm::vec3 seaward(std::sin(hr), 0.0f, -std::cos(hr));   // 0=N(-Z), 90=E(+X)
-          shipX = best->x + seaward.x * 700.0f;
-          shipZ = best->z + seaward.z * 700.0f;
-          shipHeading = hr + glm::pi<float>();   // bow toward the harbour
+          vessel.x = best->x + seaward.x * 700.0f;
+          vessel.z = best->z + seaward.z * 700.0f;
+          vessel.heading = hr + glm::pi<float>();   // bow toward the harbour
+          shipX = vessel.x; shipZ = vessel.z; shipHeading = vessel.heading;
           std::printf("[terrain] start near '%s' at (%.0f, %.0f)\n", best->name.c_str(), shipX, shipZ);
         }
       }
@@ -1531,33 +1539,46 @@ int main(int argc, char** argv) {
       }
       ImGui::End();
 
-      // Broadcast our pose ~10 Hz.
+      // Broadcast our pose ~10 Hz. Heading is sent in DEGREES (server/client convention).
       if (cs == mp::ConnState::Open && (frame % 6) == 0) {
-        const char* sailState = sail > 0.66f ? "full" : (sail > 0.33f ? "half" : "furled");
+        const char* sailState = vessel.anchored ? "anchor"
+                              : (vessel.sailState == 2 ? "full" : vessel.sailState == 1 ? "half" : "furled");
         mp::PlayerUpdate pu;
-        pu.x = shipX; pu.z = shipZ; pu.heading = shipHeading; pu.speed = shipSpeed;
-        pu.sailState = sailState; pu.vesselName = "Merchantman"; pu.vesselSlug = "merchantman";
+        pu.x = shipX; pu.z = shipZ; pu.heading = glm::degrees(shipHeading); pu.speed = shipSpeed;
+        pu.sailState = sailState;
+        pu.vesselName = ownVesselSlug; pu.vesselSlug = ownVesselSlug;
         pu.callsign = authCallsign;
         mpClient.sendUpdate(pu, netSeq++);
       }
     }
     ImGui::Render();
 
-    // Sailing input + physics — only while actually sailing and ImGui isn't typing.
-    // (sail 0..1 sets target speed; heading turns with rudder authority scaled by way.)
-    glm::vec3 fwd(std::sin(shipHeading), 0.0f, std::cos(shipHeading));
-    if (appState == AppState::Sailing && !io.WantCaptureKeyboard) {
+    // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /
+    // lower sail (furled -> half -> full); P = drop/weigh anchor.
+    if (appState == AppState::Sailing) {
       auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
-      float turn = (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1.0f : 0.0f) - (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1.0f : 0.0f);
-      float trim = (down(GLFW_KEY_W, GLFW_KEY_UP)    ? 1.0f : 0.0f) - (down(GLFW_KEY_S, GLFW_KEY_DOWN) ? 1.0f : 0.0f);
-      sail = glm::clamp(sail + trim * 0.4f * dt, 0.0f, 1.0f);
-      shipHeading += turn * 0.7f * dt * (0.4f + 0.6f * glm::clamp(shipSpeed / 6.0f, 0.0f, 1.0f));
-      float targetSpeed = sail * 9.0f;
-      shipSpeed += (targetSpeed - shipSpeed) * 0.6f * dt;
-      fwd = glm::vec3(std::sin(shipHeading), 0.0f, std::cos(shipHeading));
-      shipX += fwd.x * shipSpeed * dt * kTravelScale;
-      shipZ += fwd.z * shipSpeed * dt * kTravelScale;
+      int rudder = 0;
+      if (!io.WantCaptureKeyboard) {
+        rudder = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
+        bool raise = down(GLFW_KEY_W, GLFW_KEY_UP), lower = down(GLFW_KEY_S, GLFW_KEY_DOWN);
+        bool anchor = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+        if (raise && !prevRaise) vessel.sailState = std::min(2, vessel.sailState + 1);
+        if (lower && !prevLower) vessel.sailState = std::max(0, vessel.sailState - 1);
+        if (anchor && !prevAnchor) {
+          vessel.anchored = !vessel.anchored;
+          if (vessel.anchored) { vessel.anchorX = vessel.x; vessel.anchorZ = vessel.z; }
+        }
+        prevRaise = raise; prevLower = lower; prevAnchor = anchor;
+      }
+      vrig = sail::rigForSlug(ownVesselSlug.empty() ? "sloop" : ownVesselSlug);
+      mp::WaveState wv = mpClient.wave();
+      float windFromDeg = wv.valid ? wv.windBearing : 270.0f;
+      float windKn      = wv.valid ? wv.windSpeed  : 8.0f;
+      float seaRough    = glm::clamp((wv.valid ? (float)wv.beaufort : 3.0f) / 8.0f, 0.0f, 1.0f);
+      sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale);
+      shipX = vessel.x; shipZ = vessel.z; shipHeading = vessel.heading; shipSpeed = vessel.speed;
     }
+    glm::vec3 fwd(std::sin(shipHeading), 0.0f, std::cos(shipHeading));
 
     // Advance all cascades, then read their displacement back so buoyancy is driven
     // by the REAL FFT surface (not the analytic Gerstner field). Only while sailing —
@@ -1593,6 +1614,13 @@ int main(int argc, char** argv) {
       c2.sampleDisplacement(x, z, dx, dy, dz); h += dy;
       return h * seaAmp;
     };
+
+    // Buoyancy for the local hull (needs fftHeight): heave/pitch/roll from the
+    // 8-point wave sample, filtered per-vessel. Applied in ownShipModel below.
+    if (sailing) {
+      sail::Buoy b = sail::buoyancy(vessel, vrig, dt, [&](float x, float z) { return fftHeight(x, z); });
+      ownBuoy = glm::vec3(b.heave, b.pitchRad, b.rollRad);
+    }
 
     // Camera input: hold LMB + drag to orbit, wheel to zoom.
     double mx = 0.0, my = 0.0;
@@ -1657,18 +1685,31 @@ int main(int argc, char** argv) {
       return mm;
     };
 
+    // Our hull uses the ported buoyancy (heave + pitch/roll) and sailing heel,
+    // applied in the ship's own frame (yaw -> pitch -> roll -> model bow-yaw).
+    auto ownShipModel = [&](const Mesh& m) {
+      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, ownBuoy.x - m.draft, shipZ));
+      mm = glm::rotate(mm, shipHeading, glm::vec3(0, 1, 0));
+      mm = glm::rotate(mm, -ownBuoy.y, glm::vec3(1, 0, 0));                          // pitch (bow up on +)
+      mm = glm::rotate(mm, ownBuoy.z + glm::radians(vessel.heelDeg), glm::vec3(0, 0, 1));  // roll + heel
+      mm = glm::rotate(mm, m.bowYaw, glm::vec3(0, 1, 0));
+      mm = glm::scale(mm, glm::vec3(m.shipScale));
+      mm = glm::translate(mm, -m.keelCenter);
+      return mm;
+    };
+
     // Draw list: our ship first (so it takes reflection slot 0), then remote players.
     struct ShipInst { Mesh* mesh; glm::mat4 model; };
     std::vector<ShipInst> ships;
     Mesh* ownMesh = nullptr;
     if (sailing && !ownVesselSlug.empty()) {
       ownMesh = &vesselFor(ownVesselSlug);
-      ships.push_back({ ownMesh, shipModel(shipX, shipZ, shipHeading, *ownMesh) });
+      ships.push_back({ ownMesh, ownShipModel(*ownMesh) });
     }
     if (sailing) {
       for (const mp::RemotePlayer& rp : mpClient.players()) {
         Mesh& rmv = vesselFor(rp.vesselSlug.empty() ? "pinnace" : rp.vesselSlug);
-        ships.push_back({ &rmv, shipModel(rp.x, rp.z, rp.heading, rmv) });
+        ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv) });   // server heading is degrees
       }
     }
 

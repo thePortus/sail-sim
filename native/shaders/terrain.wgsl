@@ -278,13 +278,15 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   let diff = max(dot(N, L), 0.0);
   col = col * (0.32 + 0.68 * diff);
-  // Underwater: pull the biome colour toward drowned sand and absorb light by
-  // depth (red dies first) so the seabed seen through the water reads natural.
+  // Underwater: the client's exact seabed grade. Its refraction RTT rendered the
+  // seabed with normal shading, then the water shader multiplied it by
+  // (0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp) — a fixed sandy-dim grade, gated to
+  // fade the bottom to dark at night. sunUp is reconstructed from the daylight
+  // factor (dayK = clamp((sunEl + 0.10) / 0.20) -> sunEl = dayK * 0.2 - 0.1).
   if (in.elev < 0.2) {
-    let dz = max(0.0, -in.elev);
-    col = mix(col, vec3<f32>(0.50, 0.46, 0.36) * (0.32 + 0.68 * diff), 0.65);
-    col = col * exp(-dz * vec3<f32>(0.14, 0.085, 0.05));
-    col = col + vec3<f32>(0.004, 0.018, 0.026) * (1.0 - exp(-dz * 0.25));
+    let sunEl = u.sun.w * 0.2 - 0.1;
+    let sunUp = smoothstep(0.0, 0.12, sunEl);
+    col = col * vec3<f32>(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
   }
   // Day/night (u.sun.w = daylight): dim + cool the land toward a moonlit night.
   let dayK = u.sun.w;

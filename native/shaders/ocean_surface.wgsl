@@ -141,8 +141,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     var fresnel = clamp(1.0 - dot(N, V), 0.0, 1.0);
     fresnel = pow5(fresnel);
     var waterCol = color * (1.0 - fresnel);
-    // Shoal water-column tint just beyond the clear-view depth (sun-gated).
-    waterCol = mix(waterCol, vec3<f32>(0.10, 0.48, 0.50) * (1.0 - fresnel), shoal * 0.30 * cam.sun.w);
+    // Shoal water-column tint just beyond the clear-view depth (client: 0.10 * sunUp).
+    waterCol = mix(waterCol, vec3<f32>(0.10, 0.48, 0.50) * (1.0 - fresnel), shoal * 0.10 * sunUp);
     // Kill the mirror glint across the shallows — transparent water over sand
     // reads as wet sand, never mirroring the sky (client reflCut).
     let reflCut = clamp(1.0 - max(reveal, shallow) * 1.6, 0.0, 1.0);
@@ -165,9 +165,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let bright = mix(0.10, 1.0, dayK);
     let tint   = mix(vec3<f32>(0.42, 0.54, 0.82), vec3<f32>(1.0), dayK);
     outColor = outColor * bright * tint;
-    // REAL transparency over the shallows: the seabed terrain rendered beneath
-    // (underwater-shaded, and later any submerged scatter props) shows through.
-    // Foam stays opaque — breakers read solid white even over sand.
-    let alpha = clamp(1.0 - reveal * 0.95 + jacobian, 0.05, 1.0);
+    // REAL transparency over the shallows — the client's exact composite: it mixed
+    // the revealed seabed in at reveal * 0.9 (10% water colour always remains), so
+    // our alpha is 1 - reveal * 0.9. Foam stays opaque on top (composited last there
+    // too), so breakers read solid white even over sand.
+    let alpha = clamp(1.0 - reveal * 0.9 + jacobian, 0.0, 1.0);
     return vec4<f32>(outColor, alpha);
 }

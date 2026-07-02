@@ -94,4 +94,32 @@ Set fetchAll(const std::string& host, int port) {
   return s;
 }
 
+std::vector<VesselRow> fetchVessels(const std::string& host, int port) {
+  std::vector<VesselRow> out;
+  httplib::Client cli(host, port);
+  cli.set_connection_timeout(8, 0);
+  cli.set_read_timeout(15, 0);
+  auto res = cli.Get("/vessels");
+  if (!res || res->status != 200) { std::printf("[props] /vessels failed (%d)\n", res ? res->status : 0); return out; }
+  auto j = nlohmann::json::parse(res->body, nullptr, false);
+  if (j.is_discarded() || !j.is_array()) return out;
+  auto num = [](const nlohmann::json& o, const char* k, float dflt) -> float {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_number()) ? it->get<float>() : dflt;
+  };
+  for (const auto& v : j) {
+    if (!v.is_object()) continue;
+    VesselRow r;
+    r.slug = v.value("slug", std::string());
+    r.name = v.value("name", std::string());
+    r.description = v.value("description", std::string());
+    r.price = (int)num(v, "price", 0); r.cargo = (int)num(v, "cargo", 0);
+    r.guns = (int)num(v, "guns", 0); r.maxSpeed = num(v, "maxSpeed", 0);
+    r.cannonUpgradeCost = (int)num(v, "cannonUpgradeCost", 0);
+    r.armorUpgradeCost  = (int)num(v, "armorUpgradeCost", 0);
+    if (!r.slug.empty()) out.push_back(std::move(r));
+  }
+  return out;
+}
+
 } // namespace props

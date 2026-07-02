@@ -20,6 +20,7 @@ struct Client::Impl {
   std::map<std::string, RemotePlayer> players;
   WaveState wave;
   std::vector<ChatMessage> chatIn;   // drained by the render loop each frame
+  TownState townSt;                  // wallet/crew/market/dock-menu replies
 
   static RemotePlayer parsePlayer(const json& j) {
     RemotePlayer r;
@@ -64,6 +65,117 @@ struct Client::Impl {
       wave.overrideOn    = msg.value("override", false);
     } else if (type == "wallet") {
       ownedShip = msg.value("ship", ownedShip);   // server-authoritative owned hull
+      townSt.gold     = msg.value("gold", townSt.gold);
+      townSt.capacity = msg.value("capacity", townSt.capacity);
+      townSt.ship     = msg.value("ship", townSt.ship);
+      townSt.shipName = msg.value("shipName", townSt.shipName);
+      townSt.cannonUpgrade = msg.value("cannonUpgrade", townSt.cannonUpgrade);
+      townSt.armorUpgrade  = msg.value("armorUpgrade", townSt.armorUpgrade);
+      if (msg.contains("cargo") && msg["cargo"].is_object()) {
+        townSt.cargo.clear();
+        for (auto& [k, v] : msg["cargo"].items()) if (v.is_number()) townSt.cargo[k] = v.get<int>();
+      }
+      if (msg.contains("catalog") && msg["catalog"].is_object()) {
+        for (auto& [k, v] : msg["catalog"].items()) if (v.is_string()) townSt.catalog[k] = v.get<std::string>();
+      }
+      if (msg.contains("factionRep") && msg["factionRep"].is_object()) {
+        for (auto& [k, v] : msg["factionRep"].items()) if (v.is_number()) townSt.factionRep[k] = v.get<float>();
+      }
+    } else if (type == "crew_state") {
+      if (msg.value("playerId", std::string()) == myId) {
+        townSt.crew    = msg.value("crew", townSt.crew);
+        townSt.maxCrew = msg.value("maxCrew", townSt.maxCrew);
+      }
+    } else if (type == "recruit_result") {
+      if (msg.value("ok", false)) {
+        int charged = msg.value("charged", 0);
+        townSt.recruitStatus = charged > 0 ? "Signed a hand for " + std::to_string(charged) + "g."
+                                           : "A willing hand signs on for free.";
+      } else {
+        townSt.recruitStatus = "No luck: " + msg.value("reason", std::string("unknown"));
+      }
+    } else if (type == "rumor_result") {
+      if (msg.value("ok", false)) {
+        std::string slug = msg.value("slug", std::string("ship"));
+        std::string to = msg.value("to", std::string());
+        std::string from;
+        if (msg.contains("from") && msg["from"].is_string()) from = msg["from"].get<std::string>();
+        townSt.rumorText = "A " + slug + (from.empty() ? "" : " out of " + from)
+                         + " is bound for " + (to.empty() ? "parts unknown" : to) + ".";
+        townSt.rumorStatus.clear();
+      } else {
+        townSt.rumorText.clear();
+        std::string r = msg.value("reason", std::string());
+        townSt.rumorStatus = r == "no_rumours" ? "No talk of treasure ships tonight."
+                                               : "The talk dries up (" + r + ").";
+      }
+    } else if (type == "pirate_report_result") {
+      townSt.pirate.valid = true;
+      townSt.pirate.ok = msg.value("ok", false);
+      townSt.pirate.reason = msg.value("reason", std::string());
+      townSt.pirate.name = msg.value("name", std::string());
+      townSt.pirate.slug = msg.value("slug", std::string());
+      townSt.pirate.kills = msg.value("kills", 0);
+      townSt.pirate.bounty = msg.value("bounty", 0);
+      townSt.pirate.plunder = msg.value("plunder", 0);
+    } else if (type == "market_state") {
+      townSt.market.valid = true;
+      townSt.market.townId = msg.value("townId", std::string());
+      townSt.market.specialty = msg.value("specialty", std::string());
+      townSt.market.goods.clear();
+      if (msg.contains("goods") && msg["goods"].is_array()) {
+        for (const auto& g : msg["goods"]) {
+          MarketGood mg;
+          mg.id  = g.value("goodId", g.value("id", std::string()));
+          mg.ask = g.value("ask", 0);
+          mg.bid = g.value("bid", 0);
+          if (!mg.id.empty()) townSt.market.goods.push_back(mg);
+        }
+      }
+      if (msg.contains("hint") && msg["hint"].is_object()) {
+        const auto& h = msg["hint"];
+        townSt.market.hintText = "Best buyer for " + h.value("goodId", std::string("goods"))
+                               + ": " + h.value("townName", h.value("townId", std::string("?")))
+                               + " (pays " + std::to_string(h.value("bid", 0)) + "g)";
+      } else townSt.market.hintText.clear();
+      townSt.gold = msg.value("gold", townSt.gold);
+      townSt.capacity = msg.value("capacity", townSt.capacity);
+      if (msg.contains("cargo") && msg["cargo"].is_object()) {
+        townSt.cargo.clear();
+        for (auto& [k, v] : msg["cargo"].items()) if (v.is_number()) townSt.cargo[k] = v.get<int>();
+      }
+      townSt.tradeStatus.clear();
+    } else if (type == "trade_error") {
+      townSt.tradeStatus = msg.value("reason", std::string("rejected"));
+    } else if (type == "pardon_ok") {
+      townSt.pardonStatus = "Pardon granted: standing restored by "
+                          + std::to_string(msg.value("restored", 0)) + " for "
+                          + std::to_string(msg.value("cost", 0)) + "g.";
+    } else if (type == "pardon_error") {
+      std::string r = msg.value("reason", std::string());
+      townSt.pardonStatus = r == "not_needed" ? "Your standing needs no pardon."
+                          : r == "no_gold"    ? "You can't afford the fee."
+                          : "Petition refused (" + r + ").";
+    } else if (type == "ship_bought") {
+      townSt.shipStatus = "She's yours - " + msg.value("slug", std::string())
+                        + " for " + std::to_string(msg.value("cost", 0)) + "g.";
+    } else if (type == "ship_error") {
+      std::string r = msg.value("reason", std::string());
+      townSt.shipStatus = r == "no_gold" ? "Not enough gold."
+                        : r == "hold_too_small" ? "Your cargo won't fit her hold - sell down first."
+                        : r == "already_owned" ? "You already sail her."
+                        : "The shipwright refuses (" + r + ").";
+    } else if (type == "upgrade_bought") {
+      townSt.shipStatus = "Fitted: " + msg.value("kind", std::string()) + " upgrade for "
+                        + std::to_string(msg.value("cost", 0)) + "g.";
+    } else if (type == "upgrade_error") {
+      std::string r = msg.value("reason", std::string());
+      townSt.shipStatus = r == "already_owned" ? "Already fitted on this hull."
+                        : r == "no_gold" ? "Not enough gold."
+                        : "No upgrade (" + r + ").";
+    } else if (type == "reputation_changed") {
+      if (msg.contains("factionRep") && msg["factionRep"].is_object())
+        for (auto& [k, v] : msg["factionRep"].items()) if (v.is_number()) townSt.factionRep[k] = v.get<float>();
     } else if (type == "chat") {
       ChatMessage cm;
       cm.chatType = msg.value("chatType", std::string("global"));
@@ -168,6 +280,52 @@ std::vector<RemotePlayer> Client::players() const {
 WaveState Client::wave() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->wave;
+}
+
+// ── Town economy sends (fire-and-forget; server replies update townSt) ────────
+TownState Client::town() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->townSt;
+}
+void Client::recruitCrew() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "recruit_crew"}}.dump());
+}
+void Client::listenRumor() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "listen_rumor"}}.dump());
+}
+void Client::askPirates() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "pirate_report"}}.dump());
+}
+void Client::tradeOpen(const std::string& townId) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "trade_open"}, {"townId", townId}}.dump());
+}
+void Client::tradeBuy(const std::string& townId, const std::string& goodId, int qty) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "trade_buy"}, {"townId", townId}, {"goodId", goodId}, {"qty", qty}}.dump());
+}
+void Client::tradeSell(const std::string& townId, const std::string& goodId, int qty) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "trade_sell"}, {"townId", townId}, {"goodId", goodId}, {"qty", qty}}.dump());
+}
+void Client::petitionPardon(const std::string& townId) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "petition_pardon"}, {"townId", townId}}.dump());
+}
+void Client::buyShip(const std::string& slug) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "ship_buy"}, {"slug", slug}}.dump());
+}
+void Client::buyUpgrade(const std::string& kind) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "buy_upgrade"}, {"kind", kind}}.dump());
+}
+void Client::requestCombatReset() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "combat_reset"}}.dump());
 }
 
 } // namespace mp

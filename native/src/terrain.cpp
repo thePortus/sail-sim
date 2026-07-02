@@ -43,6 +43,7 @@ bool Terrain::load(const std::string& host, int port) {
   if (j.contains("harbors") && j["harbors"].is_array()) {
     for (const auto& h : j["harbors"]) {
       Harbor hb;
+      hb.id      = h.value("id", std::string());
       hb.name    = h.value("name", std::string());
       hb.faction = h.value("faction", std::string());
       hb.tier    = h.value("tier", std::string());

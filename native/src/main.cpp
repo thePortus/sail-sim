@@ -38,6 +38,7 @@
 #include <cstring>
 
 #include "stb_image_write.h"
+#include "stb_image.h"        // menu illustrations (client/public/images)
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -1958,6 +1959,35 @@ int main(int argc, char** argv) {
     return &res.first->second;
   };
 
+  // Docking + town menus (harbor.service port): dock range = distance from the
+  // hull to the pier deck edge, scaled by the hull's reach so a brig docks from
+  // farther out than a pinnace. tiedUp pins the boat; menus talk to the server
+  // through mpClient's town-economy protocol.
+  bool tiedUp = false;
+  int  dockIdx = -1, tiedIdx = -1;   // dockable harbor (this frame) / moored harbor
+  bool menuTavern = false, menuTrader = false, menuShipwright = false, menuGovernor = false;
+  std::future<std::vector<props::VesselRow>> swFuture;   // shipwright catalogue (REST /vessels)
+  std::vector<props::VesselRow> swShips; bool swRequested = false;
+  // Menu illustrations (the browser client's /images/*.png), lazily loaded from the repo.
+  std::map<std::string, std::pair<WGPUTextureView, ImVec2>> menuImgs;
+  auto menuImage = [&](const std::string& name) -> std::pair<WGPUTextureView, ImVec2> {
+    auto it = menuImgs.find(name);
+    if (it != menuImgs.end()) return it->second;
+    std::string path = geometryDir() + "/../../../client/public/images/" + name + ".png";
+    int w = 0, h = 0, c = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &c, 4);
+    std::pair<WGPUTextureView, ImVec2> out{ nullptr, ImVec2(0, 0) };
+    if (px) {
+      WGPUTexture t = makeSampledRGBA(device, queue, (uint32_t)w, (uint32_t)h, px, true);
+      out = { wgpuTextureCreateView(t, nullptr), ImVec2((float)w, (float)h) };
+      stbi_image_free(px);
+    } else {
+      std::printf("[town] menu image missing: %s\n", path.c_str());
+    }
+    menuImgs[name] = out;
+    return out;
+  };
+
   // Previous frame's camera (the HUD/label pass runs before this frame's camera
   // math; a one-frame lag on screen-projected labels is imperceptible).
   glm::mat4 lastViewProj(1.0f);
@@ -2703,6 +2733,323 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ── Docking + town menu (ports of harbor.service updateDockable + the
+      //    game.component dock menu and tavern/trader/shipwright/governor panels).
+      //    Dock range = distance from the hull to the pier deck edge, scaled by
+      //    hull reach (a brig's rail is alongside while its centre is a hull off).
+      {
+        dockIdx = -1;
+        if (terrainR.ready) {
+          const auto& hbs = terr.manifest().harbors;
+          int best = -1; float bestD = 1e30f;
+          for (size_t i = 0; i < hbs.size(); ++i) {
+            float d = std::hypot(hbs[i].x - vessel.x, hbs[i].z - vessel.z);
+            if (d < bestD) { bestD = d; best = (int)i; }
+          }
+          if (best >= 0 && bestD < 400.0f) {
+            const terrain::Harbor& hb = hbs[best];
+            float len = 14.3f, halfW = 1.6f;                      // PIER_DIMS straight
+            if (hb.variant == "l" || hb.variant == "t") { len = 11.0f; halfW = 6.5f; }
+            float hrr = glm::radians(hb.heading);
+            float fx = std::sin(hrr), fz = -std::cos(hrr);        // seaward (spawn convention)
+            float ax = hb.x, az = hb.z, bx = hb.x + fx * len, bz = hb.z + fz * len;
+            float ddx = bx - ax, ddz = bz - az, l2 = ddx * ddx + ddz * ddz;
+            float tt = l2 > 1e-6f ? ((vessel.x - ax) * ddx + (vessel.z - az) * ddz) / l2 : 0.0f;
+            tt = std::clamp(tt, 0.0f, 1.0f);
+            float segD = std::hypot(vessel.x - (ax + ddx * tt), vessel.z - (az + ddz * tt));
+            float reach = std::max(vrig.hullHalfLen, vrig.hullHalfBeam);
+            if (std::max(0.0f, segD - halfW) <= 12.0f + reach) dockIdx = best;
+          }
+        }
+        if (tiedUp && tiedIdx < 0) tiedUp = false;   // safety
+
+        // Screenshot-test hooks: SAILSIM_DOCK auto-moors when in range; SAILSIM_MENU
+        // opens one town door (tavern|trader|shipwright|governor).
+        if (!tiedUp && dockIdx >= 0 && std::getenv("SAILSIM_DOCK")) {
+          tiedUp = true; tiedIdx = dockIdx; vessel.speed = 0; vessel.yawRate = 0;
+        }
+        static bool menuEnvDone = false;
+        if (tiedUp && !menuEnvDone && terrainR.ready) {
+          if (const char* m = std::getenv("SAILSIM_MENU")) {
+            const std::string mm = m;
+            const terrain::Harbor& hb2 = terr.manifest().harbors[(size_t)tiedIdx];
+            if (mm == "tavern") menuTavern = true;
+            else if (mm == "trader") { menuTrader = true; mpClient.tradeOpen(hb2.id); }
+            else if (mm == "shipwright") {
+              menuShipwright = true;
+              if (!swRequested) {
+                swRequested = true;
+                swFuture = std::async(std::launch::async,
+                    [host = kHost, port = kPort] { return props::fetchVessels(host, port); });
+              }
+            } else if (mm == "governor") menuGovernor = true;
+          }
+          menuEnvDone = true;
+        }
+
+        // Shipwright catalogue arrives?
+        if (swFuture.valid() && swFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+          swShips = swFuture.get();
+
+        mp::TownState ts = mpClient.town();
+        auto factionCol2 = [](const std::string& f) -> ImVec4 {
+          if (f == "english") return ImVec4(0.80f, 0.17f, 0.17f, 1.0f);
+          if (f == "french")  return ImVec4(0.18f, 0.44f, 0.82f, 1.0f);
+          if (f == "spanish") return ImVec4(0.91f, 0.76f, 0.23f, 1.0f);
+          if (f == "dutch")   return ImVec4(0.88f, 0.48f, 0.16f, 1.0f);
+          return ImVec4(0.60f, 0.60f, 0.60f, 1.0f);
+        };
+        auto drawMenuImage = [&](const std::string& name) {
+          auto [view, sz] = menuImage(name);
+          if (view && sz.x > 1.0f) {
+            float w = 352.0f;
+            ImGui::Image((ImTextureID)view, ImVec2(w, w * sz.y / sz.x));
+          }
+        };
+        auto titleOf = [](const terrain::Harbor& hb) {
+          return hb.tier == "capital" ? "Governor's Mansion" : "Mayor's House";
+        };
+
+        // Dock prompt (bottom-centre) — shown when alongside a pier and not moored.
+        if (!tiedUp && dockIdx >= 0 && terrainR.ready) {
+          const terrain::Harbor& hb = terr.manifest().harbors[(size_t)dockIdx];
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 46.0f),
+                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          ImGui::Begin("dockprompt", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+          char lbl[128];
+          std::snprintf(lbl, sizeof(lbl), "Dock at %s", hb.name.c_str());
+          ImGui::PushFont(fontTitle);
+          if (ImGui::Button(lbl, ImVec2(0, 44))) {
+            tiedUp = true; tiedIdx = dockIdx;
+            vessel.speed = 0; vessel.yawRate = 0;
+            menuTavern = menuTrader = menuShipwright = menuGovernor = false;
+          }
+          ImGui::PopFont();
+          ImGui::End();
+        }
+
+        // Moored: the town menu (name, faction, description, the four doors, cast off).
+        if (tiedUp && tiedIdx >= 0 && terrainR.ready) {
+          const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 40.0f),
+                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_Always);
+          ImGui::Begin("dockmenu", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
+          ImGui::PushFont(fontTitle);
+          ImGui::TextColored(ImVec4(0.91f, 0.83f, 0.63f, 1.0f), "%s", hb.name.c_str());
+          ImGui::PopFont();
+          if (!hb.faction.empty()) {
+            std::string fn = hb.faction; fn[0] = (char)std::toupper((unsigned char)fn[0]);
+            ImGui::TextColored(factionCol2(hb.faction), "  %s %s", fn.c_str(),
+                               hb.tier == "capital" ? "Capital" : "Town");
+          }
+          ImGui::Spacing();
+          if (ImGui::Button("Trade Goods", ImVec2(-1, 0))) {
+            menuTrader = true; mpClient.tradeOpen(hb.id);
+          }
+          if (ImGui::Button("Shipwright", ImVec2(-1, 0))) {
+            menuShipwright = true;
+            if (!swRequested) {
+              swRequested = true;
+              swFuture = std::async(std::launch::async,
+                  [host = kHost, port = kPort] { return props::fetchVessels(host, port); });
+            }
+          }
+          if (ImGui::Button("Tavern", ImVec2(-1, 0))) menuTavern = true;
+          if (!hb.faction.empty() && ImGui::Button(titleOf(hb), ImVec2(-1, 0))) menuGovernor = true;
+          ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+          if (ImGui::Button("Cast Off", ImVec2(-1, 0))) {
+            tiedUp = false; tiedIdx = -1;
+            menuTavern = menuTrader = menuShipwright = menuGovernor = false;
+          }
+          ImGui::End();
+
+          // ── Tavern ──
+          if (menuTavern) {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_Always);
+            if (ImGui::Begin("Tavern", &menuTavern, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+              ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), "%d gold", ts.gold);
+              drawMenuImage("tavern");
+              ImGui::TextWrapped("Hands lost to grapeshot can be replaced here - a coin in the right palm finds willing sailors.");
+              ImGui::Spacing();
+              ImGui::Text("Crew"); ImGui::SameLine(0, 12);
+              ImGui::TextColored(ts.crew < ts.maxCrew ? ImVec4(0.94f, 0.78f, 0.41f, 1) : ImVec4(0.62f, 0.88f, 0.63f, 1),
+                                 "%d / %d", ts.crew, ts.maxCrew);
+              ImGui::BeginDisabled(ts.maxCrew > 0 && ts.crew >= ts.maxCrew);
+              if (ImGui::Button(ts.maxCrew > 0 && ts.crew >= ts.maxCrew ? "Crew is full" : "Hire a sailor  (50g)", ImVec2(-1, 0)))
+                mpClient.recruitCrew();
+              ImGui::EndDisabled();
+              if (!ts.recruitStatus.empty()) ImGui::TextWrapped("%s", ts.recruitStatus.c_str());
+              ImGui::Separator();
+              if (ImGui::Button("Listen for rumours", ImVec2(-1, 0))) mpClient.listenRumor();
+              if (!ts.rumorText.empty())   ImGui::TextWrapped("\"%s\"", ts.rumorText.c_str());
+              if (!ts.rumorStatus.empty()) ImGui::TextDisabled("%s", ts.rumorStatus.c_str());
+              ImGui::Separator();
+              if (ImGui::Button("Ask about pirate activity", ImVec2(-1, 0))) mpClient.askPirates();
+              if (ts.pirate.valid) {
+                if (ts.pirate.ok) {
+                  ImGui::TextWrapped("\"%s prowls these waters.\"",
+                                     ts.pirate.name.empty() ? "A black flag" : ts.pirate.name.c_str());
+                  ImGui::Text("Vessel: %s   Sunk: %d", ts.pirate.slug.c_str(), ts.pirate.kills);
+                  ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1), "Bounty: %dg%s", ts.pirate.bounty,
+                                     ts.pirate.plunder > 0 ? "  (+plunder)" : "");
+                  ImGui::TextDisabled("Marked in red on your map.");
+                } else {
+                  ImGui::TextDisabled("No word of pirates (%s).", ts.pirate.reason.c_str());
+                }
+              }
+              ImGui::Spacing();
+              if (ImGui::Button("Go Back to Town", ImVec2(-1, 0))) menuTavern = false;
+            }
+            ImGui::End();
+          }
+
+          // ── Trader ──
+          if (menuTrader) {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_Always);
+            if (ImGui::Begin("Trade Goods", &menuTrader, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+              int used = 0; for (const auto& kv : ts.cargo) used += kv.second;
+              ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), "%d gold", ts.gold);
+              ImGui::SameLine(0, 18);
+              ImGui::Text("Hold %d / %d", used, ts.capacity);
+              drawMenuImage("trader");
+              if (!ts.market.valid) {
+                ImGui::TextDisabled("The trader is drawing up quotes...");
+              } else {
+                if (!ts.market.specialty.empty())
+                  ImGui::TextDisabled("Specialty: %s", ts.market.specialty.c_str());
+                if (ImGui::BeginTable("goods", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                  ImGui::TableSetupColumn("Good", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+                  ImGui::TableSetupColumn("Ask");
+                  ImGui::TableSetupColumn("Bid");
+                  ImGui::TableSetupColumn("##buy");
+                  ImGui::TableSetupColumn("##sell");
+                  ImGui::TableHeadersRow();
+                  for (const mp::MarketGood& g : ts.market.goods) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    auto cit = ts.catalog.find(g.id);
+                    int held = 0; auto hit = ts.cargo.find(g.id); if (hit != ts.cargo.end()) held = hit->second;
+                    if (held > 0)
+                      ImGui::Text("%s  (x%d)", cit != ts.catalog.end() ? cit->second.c_str() : g.id.c_str(), held);
+                    else
+                      ImGui::Text("%s", cit != ts.catalog.end() ? cit->second.c_str() : g.id.c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%dg", g.ask);
+                    ImGui::TableNextColumn(); ImGui::Text("%dg", g.bid);
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(g.id.c_str());
+                    ImGui::BeginDisabled(ts.gold < g.ask || used >= ts.capacity);
+                    if (ImGui::SmallButton("Buy")) mpClient.tradeBuy(hb.id, g.id, 1);
+                    ImGui::EndDisabled();
+                    ImGui::TableNextColumn();
+                    ImGui::BeginDisabled(held <= 0);
+                    if (ImGui::SmallButton("Sell")) mpClient.tradeSell(hb.id, g.id, 1);
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                  }
+                  ImGui::EndTable();
+                }
+                if (!ts.market.hintText.empty()) ImGui::TextDisabled("%s", ts.market.hintText.c_str());
+                if (!ts.tradeStatus.empty())
+                  ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1), "Trade refused: %s", ts.tradeStatus.c_str());
+              }
+              ImGui::Spacing();
+              if (ImGui::Button("Go Back to Town", ImVec2(-1, 0))) menuTrader = false;
+            }
+            ImGui::End();
+          }
+
+          // ── Shipwright ──
+          if (menuShipwright) {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_Always);
+            if (ImGui::Begin("Shipwright", &menuShipwright, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+              ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), "%d gold", ts.gold);
+              drawMenuImage("shipwright");
+              // Hull repair (server validates; free when broke - "mercy repair").
+              if (ImGui::Button("Repair hull to full", ImVec2(-1, 0))) mpClient.requestCombatReset();
+              // Per-hull upgrades, costed from the catalogue row of the owned hull.
+              int cUp = 3000, aUp = 3000;
+              for (const auto& r : swShips) if (r.slug == ts.ship) { cUp = r.cannonUpgradeCost; aUp = r.armorUpgradeCost; }
+              ImGui::BeginDisabled(ts.cannonUpgrade);
+              char cu[64]; std::snprintf(cu, sizeof(cu), ts.cannonUpgrade ? "Heavier guns - fitted" : "Heavier guns  (%dg)", cUp);
+              if (ImGui::Button(cu, ImVec2(-1, 0))) mpClient.buyUpgrade("cannon");
+              ImGui::EndDisabled();
+              ImGui::BeginDisabled(ts.armorUpgrade);
+              char au[64]; std::snprintf(au, sizeof(au), ts.armorUpgrade ? "Reinforced hull - fitted" : "Reinforced hull  (%dg)", aUp);
+              if (ImGui::Button(au, ImVec2(-1, 0))) mpClient.buyUpgrade("armor");
+              ImGui::EndDisabled();
+              ImGui::Separator();
+              if (swShips.empty()) {
+                ImGui::TextDisabled("The yard's ledger is being fetched...");
+              } else if (ImGui::BeginTable("hulls", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Vessel", ImGuiTableColumnFlags_WidthStretch, 1.8f);
+                ImGui::TableSetupColumn("Price");
+                ImGui::TableSetupColumn("Hold");
+                ImGui::TableSetupColumn("Speed");
+                ImGui::TableSetupColumn("Guns");
+                ImGui::TableSetupColumn("##act");
+                ImGui::TableHeadersRow();
+                for (const auto& r : swShips) {
+                  ImGui::TableNextRow();
+                  ImGui::TableNextColumn(); ImGui::Text("%s", r.name.c_str());
+                  if (ImGui::IsItemHovered() && !r.description.empty()) ImGui::SetTooltip("%s", r.description.c_str());
+                  ImGui::TableNextColumn(); ImGui::Text("%dg", r.price);
+                  ImGui::TableNextColumn(); ImGui::Text("%d", r.cargo);
+                  ImGui::TableNextColumn(); ImGui::Text("%.0f kn", r.maxSpeed);
+                  ImGui::TableNextColumn(); ImGui::Text("%d", r.guns);
+                  ImGui::TableNextColumn();
+                  ImGui::PushID(r.slug.c_str());
+                  if (r.slug == ts.ship) ImGui::TextDisabled("OWNED");
+                  else if (ImGui::SmallButton("Buy")) mpClient.buyShip(r.slug);
+                  ImGui::PopID();
+                }
+                ImGui::EndTable();
+                ImGui::TextDisabled("Trade-in: half your current hull's value comes off the price.");
+              }
+              if (!ts.shipStatus.empty()) ImGui::TextWrapped("%s", ts.shipStatus.c_str());
+              ImGui::Spacing();
+              if (ImGui::Button("Go Back to Town", ImVec2(-1, 0))) menuShipwright = false;
+            }
+            ImGui::End();
+          }
+
+          // ── Governor's Mansion / Mayor's House ──
+          if (menuGovernor) {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_Always);
+            if (ImGui::Begin(titleOf(hb), &menuGovernor, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+              ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), "%d gold", ts.gold);
+              drawMenuImage(hb.tier == "capital" ? "governor" : "mayor");
+              std::string fn = hb.faction; if (!fn.empty()) fn[0] = (char)std::toupper((unsigned char)fn[0]);
+              float rep = 0.0f;
+              auto rit = ts.factionRep.find(hb.faction);
+              if (rit != ts.factionRep.end()) rep = rit->second;
+              ImGui::Text("Standing with %s:", fn.c_str()); ImGui::SameLine();
+              ImGui::TextColored(rep < 0 ? ImVec4(0.95f, 0.55f, 0.45f, 1) : ImVec4(0.62f, 0.88f, 0.63f, 1), "%+.0f", rep);
+              ImGui::TextWrapped(rep < 0
+                  ? "A donation to the crown's coffers can smooth over past... indiscretions."
+                  : "The crown has no quarrel with you, captain.");
+              ImGui::BeginDisabled(rep >= 0);
+              if (ImGui::Button("Petition for pardon", ImVec2(-1, 0))) mpClient.petitionPardon(hb.id);
+              ImGui::EndDisabled();
+              if (!ts.pardonStatus.empty()) ImGui::TextWrapped("%s", ts.pardonStatus.c_str());
+              ImGui::Spacing();
+              if (ImGui::Button("Go Back to Town", ImVec2(-1, 0))) menuGovernor = false;
+            }
+            ImGui::End();
+          }
+        }
+      }
+
       // ── Admin panel (backtick; admin/owner only) ──
       const bool backtick = glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS;
       if (backtick && !prevBacktick && isAdmin && !io.WantTextInput) {
@@ -2961,8 +3308,12 @@ int main(int argc, char** argv) {
     ImGui::Render();
 
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /
-    // lower sail (furled -> half -> full); P = drop/weigh anchor.
-    if (appState == AppState::Sailing) {
+    // lower sail (furled -> half -> full); P = drop/weigh anchor. While MOORED at
+    // a town the boat is pinned to the berth (no input, no drift) until cast off.
+    if (appState == AppState::Sailing && tiedUp) {
+      vessel.speed = 0.0f; vessel.yawRate = 0.0f;
+      shipSpeed = 0.0f;
+    } else if (appState == AppState::Sailing) {
       auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
       int rudder = 0;
       if (!io.WantCaptureKeyboard) {

@@ -42,6 +42,36 @@ struct PlayerUpdate {
   std::string sailState, vesselName, vesselSlug, callsign;
 };
 
+// ── Town economy (dock menu) state — mirrors the browser's MultiplayerService
+//    signals. All server-authoritative; we render whatever the last replies said.
+struct MarketGood { std::string id; int ask = 0, bid = 0; };
+struct Market {
+  bool valid = false;
+  std::string townId, specialty, hintText;
+  std::vector<MarketGood> goods;
+};
+struct PirateReportInfo {
+  bool valid = false, ok = false;
+  std::string reason, name, slug;
+  int kills = 0, bounty = 0, plunder = 0;
+};
+struct TownState {
+  int gold = 0, capacity = 0;
+  std::map<std::string, int> cargo;             // goodId -> qty held
+  std::map<std::string, std::string> catalog;   // goodId -> display name
+  std::map<std::string, float> factionRep;      // faction id -> standing
+  std::string ship, shipName;
+  bool cannonUpgrade = false, armorUpgrade = false;
+  int crew = 0, maxCrew = 0;
+  std::string recruitStatus;                    // last recruit_result line ("" = none yet)
+  std::string rumorText, rumorStatus;           // composed rumour sentence / failure note
+  PirateReportInfo pirate;
+  Market market;
+  std::string tradeStatus;                      // last trade_error reason ("" = ok)
+  std::string pardonStatus;                     // pardon_ok/pardon_error summary
+  std::string shipStatus;                       // ship_bought/ship_error/upgrade_* summary
+};
+
 class Client {
 public:
   Client();
@@ -65,6 +95,19 @@ public:
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   WaveState wave() const;
+
+  // ── Town economy (dock menu) — fire-and-forget sends; replies land in town(). ──
+  TownState town() const;
+  void recruitCrew();                          // tavern: hire one sailor
+  void listenRumor();                          // tavern: overhear a treasure-ship rumour
+  void askPirates();                           // tavern: ask about pirate activity
+  void tradeOpen(const std::string& townId);   // trader: request the market quote
+  void tradeBuy(const std::string& townId, const std::string& goodId, int qty);
+  void tradeSell(const std::string& townId, const std::string& goodId, int qty);
+  void petitionPardon(const std::string& townId);          // governor: buy back standing
+  void buyShip(const std::string& slug);                   // shipwright: replace the hull
+  void buyUpgrade(const std::string& kind);                // shipwright: 'cannon' | 'armor'
+  void requestCombatReset();                               // shipwright: hull repair
 
 private:
   struct Impl;

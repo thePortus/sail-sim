@@ -41,4 +41,13 @@ struct Set {
 
 Set fetchAll(const std::string& host, int port);
 
+// Shipwright catalogue (REST /vessels): the buyable hulls with prices + stats.
+struct VesselRow {
+  std::string slug, name, description;
+  int price = 0, cargo = 0, guns = 0;
+  float maxSpeed = 0;
+  int cannonUpgradeCost = 0, armorUpgradeCost = 0;
+};
+std::vector<VesselRow> fetchVessels(const std::string& host, int port);
+
 } // namespace props

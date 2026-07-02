@@ -8,6 +8,7 @@ struct Camera {
     params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile); w = slope (wave-normal) amp
     screen   : vec4<f32>,   // xy = framebuffer size (px); zw = ocean origin (ship)
     lod      : vec4<f32>,   // x = vertex displacement amp; y = inner discard radius (far ring)
+    sun      : vec4<f32>,   // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
@@ -80,7 +81,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 
     let V = normalize(cam.eye.xyz - in.worldPos);
-    let L = normalize(vec3<f32>(0.5, 1.0, 0.4));   // sun
+    let L = normalize(cam.sun.xyz);   // sun by day, moon by night
 
     // Foam from summed turbulence (Jacobian): folds/breaks read white.
     let foamChop = 1.0 - _Choppiness * 0.32;
@@ -111,6 +112,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     // Composite foam (lit white) over water.
     let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0));
-    let outColor = mix(waterCol, foamLit, jacobian);   // sRGB target does gamma
+    var outColor = mix(waterCol, foamLit, jacobian);   // sRGB target does gamma
+    // Day/night: darken and cool the sea toward night. The planar reflection (sky +
+    // ship in reflTex) is already dark at night, so this only crushes the deep-water
+    // body + glint; the surface still catches the moon and its reflection.
+    let dayK = cam.sun.w;
+    let bright = mix(0.10, 1.0, dayK);
+    let tint   = mix(vec3<f32>(0.42, 0.54, 0.82), vec3<f32>(1.0), dayK);
+    outColor = outColor * bright * tint;
     return vec4<f32>(outColor, 1.0);
 }

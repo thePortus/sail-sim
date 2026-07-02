@@ -19,6 +19,7 @@ struct Client::Impl {
   std::string ownedShip;
   std::map<std::string, RemotePlayer> players;
   WaveState wave;
+  std::vector<ChatMessage> chatIn;   // drained by the render loop each frame
 
   static RemotePlayer parsePlayer(const json& j) {
     RemotePlayer r;
@@ -58,10 +59,23 @@ struct Client::Impl {
       wave.windSpeed   = msg.value("windSpeed", 0.0f);
       wave.beaufort    = msg.value("beaufort", 0);
       wave.t           = msg.value("t", 0.0f);
+      wave.cloudiness    = msg.value("cloudiness", 0.25f);
+      wave.timeOffsetSec = msg.value("timeOffsetSec", 0.0f);
+      wave.overrideOn    = msg.value("override", false);
     } else if (type == "wallet") {
       ownedShip = msg.value("ship", ownedShip);   // server-authoritative owned hull
+    } else if (type == "chat") {
+      ChatMessage cm;
+      cm.chatType = msg.value("chatType", std::string("global"));
+      cm.from     = msg.value("from", std::string());
+      cm.to       = msg.value("to", std::string());
+      cm.text     = msg.value("text", std::string());
+      if (!cm.text.empty()) {
+        if (chatIn.size() >= 256) chatIn.erase(chatIn.begin());   // undrained backstop
+        chatIn.push_back(std::move(cm));
+      }
     }
-    // combat / chat / economy message types are handled as game systems land.
+    // combat / economy message types are handled as game systems land.
   }
 };
 
@@ -104,6 +118,7 @@ void Client::close() {
   std::lock_guard<std::mutex> lock(p_->mtx);
   p_->players.clear();
   p_->myId.clear();
+  p_->chatIn.clear();
 }
 
 ConnState Client::state() const { return p_->conn.load(); }
@@ -127,6 +142,19 @@ void Client::sendUpdate(const PlayerUpdate& u, uint32_t seq) {
     { "vesselSlug", u.vesselSlug }, { "callsign", u.callsign }, { "seq", seq },
   };
   p_->ws.send(j.dump());
+}
+
+void Client::sendChat(const std::string& text) {
+  if (p_->conn.load() != ConnState::Open || text.empty()) return;
+  json j = { { "type", "chat" }, { "text", text } };
+  p_->ws.send(j.dump());
+}
+
+std::vector<ChatMessage> Client::drainChat() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<ChatMessage> out;
+  out.swap(p_->chatIn);
+  return out;
 }
 
 std::vector<RemotePlayer> Client::players() const {

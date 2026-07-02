@@ -25,6 +25,15 @@ struct WaveState {
   bool valid = false;
   float windBearing = 0, windSpeed = 0, t = 0;
   int beaufort = 0;
+  float cloudiness = 0.25f;     // 0 clear -> 1 storm (drives the cloud layer)
+  float timeOffsetSec = 0;      // admin day/night clock shift (game-cycle seconds)
+  bool overrideOn = false;      // an admin weather override is pinning the state
+};
+
+// One chat line (server "chat"). chatType: global | dm | squadron | system.
+// DMs carry `to` (the target callsign) so the sender's echo can be routed.
+struct ChatMessage {
+  std::string chatType, from, to, text;
 };
 
 // Our outbound pose (server "update" from client).
@@ -48,6 +57,11 @@ public:
   std::string ownedShip() const;   // our vessel slug from the server "wallet" message
 
   void sendUpdate(const PlayerUpdate& u, uint32_t seq);   // fire-and-forget
+
+  // Chat: raw text goes to the server verbatim ({type:'chat', text}) — the server
+  // parses /commands itself. drainChat() hands back lines received since last call.
+  void sendChat(const std::string& text);
+  std::vector<ChatMessage> drainChat();
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   WaveState wave() const;

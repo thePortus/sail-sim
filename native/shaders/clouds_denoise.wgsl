@@ -37,8 +37,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     for (var y = -2; y <= 2; y = y + 1) {
       let uv = in.uv + vec2<f32>(f32(x), f32(y)) * px;
       let s = textureSampleLevel(cloudTex, cloudSamp, uv, 0.0);
-      let sw = exp(-f32(x * x + y * y) / 4.5);         // spatial gaussian (sigma ~1.5)
-      let rw = exp(-abs(vc_tone(s.rgb) - cl) * 10.0);  // range — edge-preserving in tone space
+      let sw = exp(-f32(x * x + y * y) / 2.6);         // tighter spatial gaussian (sigma ~1.1) — keeps billow detail crisp
+      let rw = exp(-abs(vc_tone(s.rgb) - cl) * 16.0);  // sharper range — more edge-preserving in tone space
       let w = sw * rw;
       sum = sum + s * w;
       wt = wt + w;

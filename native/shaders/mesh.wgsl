@@ -6,6 +6,7 @@ struct Uniforms {
     mvp   : mat4x4<f32>,
     model : mat4x4<f32>,
     eye   : vec4<f32>,      // world-space camera position (xyz)
+    sun   : vec4<f32>,      // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
@@ -90,11 +91,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let N = perturbNormal(Ngeom, in.worldPos, in.uv, texN);
 
     let V = normalize(u.eye.xyz - in.worldPos);
-    let L = normalize(vec3<f32>(0.5, 1.0, 0.4));   // sun
+    let L = normalize(u.sun.xyz);                  // sun by day, moon by night
     let H = normalize(V + L);
 
     let F0 = mix(vec3<f32>(0.04), albedo, metallic);
-    let radiance = vec3<f32>(3.0);
+    // Warm bright sunlight cross-fading to dim cool moonlight (u.sun.w = daylight).
+    let dayK = u.sun.w;
+    let radiance = mix(vec3<f32>(0.22, 0.27, 0.42), vec3<f32>(3.0), dayK);
 
     let NDF = distributionGGX(N, H, roughness);
     let G = geometrySmith(N, V, L, roughness);
@@ -108,7 +111,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let NdotL = max(dot(N, L), 0.0);
     let Lo = (kD * albedo / PI + specular) * radiance * NdotL;
 
-    let ambient = vec3<f32>(0.18) * albedo;
+    let ambient = mix(vec3<f32>(0.05, 0.06, 0.09), vec3<f32>(0.18), dayK) * albedo;
     var color = ambient + Lo;
     color = color / (color + vec3<f32>(1.0));       // Reinhard tonemap (sRGB target does gamma)
     return vec4<f32>(color, 1.0);

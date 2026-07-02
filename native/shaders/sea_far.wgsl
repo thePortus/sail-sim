@@ -37,12 +37,15 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let N = vec3<f32>(0.0, 1.0, 0.0);
   let L = normalize(u.sun.xyz);
 
+  // Match the FFT ocean's shading (ocean_surface.wgsl): deep water with a Fresnel
+  // sky reflection capped at _ReflStrength, NOT a full sky mix — otherwise the
+  // grazing horizon washes out to pale blue while the FFT patch stays dark.
   let deep = vec3<f32>(0.015, 0.090, 0.130);
   let sky  = vec3<f32>(0.45, 0.62, 0.82);
-  var fres = pow5(clamp(1.0 - dot(N, V), 0.0, 1.0));
-  var col = mix(deep, sky, clamp(fres, 0.0, 1.0));
+  let fres = pow5(clamp(1.0 - dot(N, V), 0.0, 1.0));
+  var col = deep * (1.0 - fres) + sky * fres * 0.35;
 
   let H = normalize(V + L);
-  col += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, H), 0.0), 200.0) * 0.8;
+  col += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, H), 0.0), 300.0) * 1.0;   // sun glint (matches ocean)
   return vec4<f32>(col, 1.0);   // sRGB target does gamma
 }

@@ -1836,7 +1836,9 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
       int mi = !d.breaching ? 0 : (d.breachVy > 0 ? 1 : 2);
       if (mi >= (int)per.size() || !p->dolphinsL.full[(size_t)mi].vbuf) mi = 0;
       float leapPitch = d.breaching ? std::atan2(d.breachVy, std::max(2.0f, d.speed)) : 0.0f;
-      float yaw = -d.theta + Impl::D_FACE;
+      // Babylon's glTF import bakes a 180-deg root flip into its LH scene; our
+      // raw loader doesn't, so the client's FACE_OFFSET(pi) cancels out here.
+      float yaw = -d.theta + Impl::D_FACE + glm::pi<float>();
       per[(size_t)mi].push_back(compose(yaw, Impl::D_UPRIGHT + leapPitch, d.bank,
                                         d.scale, d.scale, d.scale, d.x, d.y, d.z, d.tint, d.effort));
     }
@@ -1847,7 +1849,7 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
     for (const FishSchool& sc : p->schools) {
       if (sc.species >= (int)per.size() || !p->fishL.full[(size_t)sc.species].vbuf) continue;
       for (const FishM& f : sc.fish)
-        per[(size_t)sc.species].push_back(compose(-f.theta, 0, f.bank,
+        per[(size_t)sc.species].push_back(compose(-f.theta + glm::pi<float>(), 0, f.bank,
                                                   sc.scl, sc.scl, sc.scl, f.x, f.y, f.z,
                                                   glm::vec3(1.0f), f.effort));
     }

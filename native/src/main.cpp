@@ -2954,7 +2954,14 @@ int main(int argc, char** argv) {
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
-  float shudRoll = 0.0f, shudVel = 0.0f;           // damped hit/recoil oscillator (rad)
+  // Firing recoil + hit shudder (vessel.service): SEPARATE roll + lateral-sway
+  // spring-dampers, the hit set much heavier — the quick hull snap when guns go
+  // off. shudRoll/shudSway are the summed outputs the hull transform applies.
+  float recoilRoll = 0.0f, recoilRollVel = 0.0f;   // spring 7.2 / damp 5.8, cap 0.17 rad
+  float recoilSway = 0.0f, recoilSwayVel = 0.0f;   // spring 9.0 / damp 6.0, cap 0.95 m
+  float hitRollSp = 0.0f, hitRollVelSp = 0.0f;     // spring 8.5 / damp 4.6, cap 0.34 rad
+  float hitSwaySp = 0.0f, hitSwayVelSp = 0.0f;     // spring 8.5 / damp 4.6, cap 1.8 m
+  float shudRoll = 0.0f, shudSway = 0.0f;          // applied totals (rad, m)
   // Camera shake — the client's trauma model (vessel.service): firing adds 0.32
   // per shot, taking a hit 0.85; trauma decays 0.6/s. Applied as a ~2 Hz damped
   // positional swing (distance-compensated) + a faster rotational view jolt.
@@ -4721,7 +4728,11 @@ int main(int argc, char** argv) {
           audioSys.playCannon(1.0f);
           scatterSys.startleAt(fe.mwx, fe.mwz);   // the bang flushes nearby resting gulls
           firedThisFrame = true;
-          shudVel += (fe.side == 0 ? 0.22f : -0.22f);   // recoil rocks away from the firing side
+          // Recoil kick PER shot (client addCannonRecoil): heel + sideways lurch
+          // away from the firing side — the snappy part of the firing feel.
+          const float rdir = fe.side == 0 ? 1.0f : -1.0f;
+          recoilRollVel += rdir * 0.40f;
+          recoilSwayVel += rdir * 0.95f;
           if (camTrauma < 0.01f) camShakeTime = 0.0f;   // fresh shake swings from zero
           camTrauma = std::min(1.0f, camTrauma + 0.32f);   // per shot — a broadside stacks toward a big jolt
         }
@@ -4771,7 +4782,10 @@ int main(int argc, char** argv) {
           audioSys.playShipHit(std::max(0.0f, 1.0f - d / 800.0f));
           // Shudder + shake when WE are struck (roll kick toward the hit side).
           if (ie.hit.victimId == meId) {
-            shudVel += (ie.hit.side == "port" ? -1.0f : 1.0f) * 0.55f;
+            // Violent heel + lurch (client addHitShudder: 1.1 rad/s, 2.6 m/s).
+            const float hdir = ie.hit.side == "port" ? 1.0f : -1.0f;
+            hitRollVelSp += hdir * 1.1f;
+            hitSwayVelSp += hdir * 2.6f;
             if (camTrauma < 0.01f) camShakeTime = 0.0f;
             camTrauma = std::min(1.0f, camTrauma + 0.85f);   // taking a hit: a big, ringing shake
           }
@@ -4850,9 +4864,19 @@ int main(int argc, char** argv) {
       oceanFlashes.erase(std::remove_if(oceanFlashes.begin(), oceanFlashes.end(),
                                         [&](const OceanFlash& fl) { return fl.age > kFlashLife; }),
                          oceanFlashes.end());
-      // Hit shudder decay (damped oscillator) + camera shake decay.
-      shudVel += -shudRoll * 22.0f * dt - shudVel * 5.0f * dt;
-      shudRoll += shudVel * dt;
+      // Recoil + hit spring-dampers (client physicsStep, exact constants/caps),
+      // then the camera-trauma decay.
+      auto springStep = [&](float& x, float& v, float k, float c, float cap, float eps) {
+        v += (-k * x - c * v) * dt;
+        x = glm::clamp(x + v * dt, -cap, cap);
+        if (std::fabs(x) < eps && std::fabs(v) < eps) { x = 0; v = 0; }
+      };
+      springStep(recoilRoll, recoilRollVel, 7.2f, 5.8f, 0.17f, 0.0002f);
+      springStep(recoilSway, recoilSwayVel, 9.0f, 6.0f, 0.95f, 0.0005f);
+      springStep(hitRollSp, hitRollVelSp, 8.5f, 4.6f, 0.34f, 0.0002f);
+      springStep(hitSwaySp, hitSwayVelSp, 8.5f, 4.6f, 1.8f, 0.0005f);
+      shudRoll = recoilRoll + hitRollSp;
+      shudSway = recoilSway + hitSwaySp;
       camTrauma = std::max(0.0f, camTrauma - 0.6f * dt);   // slow decay: the shake rings ~1 s
       // Advance the effect fields (wind-drifted smoke).
       {
@@ -5263,7 +5287,12 @@ int main(int argc, char** argv) {
     // applied in the ship's own frame (yaw -> pitch -> roll -> model bow-yaw).
     auto ownShipModel = [&](const Mesh& m) {
       auto cp = combatPose(cpMeId, ownVesselSlug.empty() ? "pinnace" : ownVesselSlug);
-      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, ownBuoy.x - m.draft - cp.ydrop, shipZ));
+      // Recoil/hit sway lurches the hull along its beam (starboard) axis on top
+      // of the sim position (client: root.position = sim + sway * beamAxis).
+      const float swayX = shudSway * std::cos(shipHeading);
+      const float swayZ = -shudSway * std::sin(shipHeading);
+      glm::mat4 mm = glm::translate(glm::mat4(1.0f),
+                                    glm::vec3(shipX + swayX, ownBuoy.x - m.draft - cp.ydrop, shipZ + swayZ));
       mm = glm::rotate(mm, shipHeading, glm::vec3(0, 1, 0));
       mm = glm::rotate(mm, -ownBuoy.y + cp.pitch, glm::vec3(1, 0, 0));               // pitch (bow up on +)
       mm = glm::rotate(mm, ownBuoy.z + glm::radians(vessel.heelDeg) + cp.roll + shudRoll,

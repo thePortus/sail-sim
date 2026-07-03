@@ -56,6 +56,8 @@
 #include "net_admin.hpp"
 #include "net_auth.hpp"
 #include "net_mp.hpp"
+#include "combat.hpp"
+#include "combat_constants.hpp"
 #include "sail_physics.hpp"
 #include "ocean_fft.hpp"
 #include "session.hpp"
@@ -2720,6 +2722,14 @@ int main(int argc, char** argv) {
   // ImGui with town/player/ship markers, zoom + pan, and admin right-click teleport.
   WGPUTexture mapTex = nullptr; WGPUTextureView mapView = nullptr;
   bool  mapExpanded = std::getenv("SAILSIM_MAP") != nullptr, mapViewInit = false;   // env = open at start (screenshot tests)
+  // ── Combat (phase 0): server-authoritative damage state, sunk flow, jury-rig ──
+  std::map<std::string, mp::CombatShipState> combatBy;   // playerId -> zones/maxHp (self included)
+  std::map<std::string, double> remoteSunkAt;            // playerId -> sim time sunk (phase 3 wrecks)
+  bool   meSunk = false;      double meSunkAtT = 0;      // our sinking + card-reveal timer
+  std::string meSunkBy;
+  double mastRepairStartT = -1; float mastRepairArmedMs = 0;   // jury-rig progress bar
+  std::string salvageToast;  double salvageToastAtT = -100;    // "recovered X" line
+  bool  sentDebugChat = false;                           // SAILSIM_CHAT one-shot (testing)
   float mapZoom = 1.0f, mapVCX = 0.0f, mapVCZ = 0.0f;   // view centre (world) for zoom/pan
   float mapTpX = 0.0f, mapTpZ = 0.0f;                   // right-click teleport target
   bool moonReady = false, starsReady = false;
@@ -3392,6 +3402,113 @@ int main(int argc, char** argv) {
       ImGui::PopFont();
       ImGui::TextDisabled("W / S  sail    Q / E  trim    P  anchor");
       ImGui::End();
+
+      // ── Damage panel (top-right, under the sail status): its own window so the
+      //    main HUD never collides with the chat panel. ──
+      {
+        bool haveCombat = false;
+        { auto cbIt = combatBy.find(mpClient.myId());
+          haveCombat = cbIt != combatBy.end() && cbIt->second.valid && cbIt->second.zones.bow >= 0; }
+        if (haveCombat) {
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+          ImGui::Begin("damagehud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+      // ── Damage diagram (browser damage HUD): 5 hull zones coloured by the
+          //    server's authoritative combat_state severity. Appears once the server
+          //    has sent us any combat state (first hit / respawn / repair). ──
+          {
+            auto cbIt = combatBy.find(mpClient.myId());
+            if (cbIt != combatBy.end() && cbIt->second.valid && cbIt->second.zones.bow >= 0) {
+              const mp::CombatZones& z = cbIt->second.zones;
+              mp::CombatZones mx = cbIt->second.maxHp;
+              if (mx.bow < 0) {   // maxHp only rides the first combat_state; derive if missed
+                combat::Zones d = combat::zoneHpFor(ownVesselSlug, mpClient.town().armorUpgrade);
+                mx = { d.bow, d.stern, d.port, d.starboard, d.masts };
+              }
+              auto sevCol = [](float hp, float maxHp) {
+                switch (combat::severityFor(hp, maxHp)) {
+                  case combat::Severity::None:      return IM_COL32(72, 150, 92, 190);
+                  case combat::Severity::Green:     return IM_COL32(62, 196, 96, 215);
+                  case combat::Severity::Yellow:    return IM_COL32(238, 198, 62, 225);
+                  case combat::Severity::Red:       return IM_COL32(228, 70, 56, 240);
+                  default:                          return IM_COL32(52, 54, 62, 255);
+                }
+              };
+              ImGui::Spacing();
+              ImGui::TextDisabled("DAMAGE");
+              ImVec2 dp = ImGui::GetCursorScreenPos();
+              const float DW = 96.0f, DH = 128.0f;
+              ImGui::Dummy(ImVec2(DW, DH));
+              ImDrawList* ddl = ImGui::GetWindowDrawList();
+              const float dcx = dp.x + DW * 0.5f;
+              // Bow (triangle, top), port/starboard strips, masts (circle), stern (bottom).
+              ddl->AddTriangleFilled(ImVec2(dcx, dp.y), ImVec2(dp.x + 14, dp.y + 34),
+                                     ImVec2(dp.x + DW - 14, dp.y + 34), sevCol(z.bow, mx.bow));
+              ddl->AddRectFilled(ImVec2(dp.x + 14, dp.y + 37), ImVec2(dcx - 12, dp.y + DH - 26),
+                                 sevCol(z.port, mx.port), 3.0f);
+              ddl->AddRectFilled(ImVec2(dcx + 12, dp.y + 37), ImVec2(dp.x + DW - 14, dp.y + DH - 26),
+                                 sevCol(z.starboard, mx.starboard), 3.0f);
+              ddl->AddCircleFilled(ImVec2(dcx, dp.y + (37.0f + DH - 26.0f) * 0.5f), 10.0f,
+                                   sevCol(z.masts, mx.masts));
+              ddl->AddRectFilled(ImVec2(dp.x + 14, dp.y + DH - 23), ImVec2(dp.x + DW - 14, dp.y + DH),
+                                 sevCol(z.stern, mx.stern), 6.0f);
+              // Hover tooltips with the raw HP numbers.
+              struct ZoneBox { const char* name; float hp, mx; ImVec2 a, b; };
+              const ZoneBox boxes[] = {
+                { "Bow",       z.bow,       mx.bow,       ImVec2(dp.x + 14, dp.y),           ImVec2(dp.x + DW - 14, dp.y + 34) },
+                { "Port",      z.port,      mx.port,      ImVec2(dp.x + 14, dp.y + 37),      ImVec2(dcx - 12, dp.y + DH - 26) },
+                { "Starboard", z.starboard, mx.starboard, ImVec2(dcx + 12, dp.y + 37),       ImVec2(dp.x + DW - 14, dp.y + DH - 26) },
+                { "Masts",     z.masts,     mx.masts,     ImVec2(dcx - 10, dp.y + 59),       ImVec2(dcx + 10, dp.y + 79) },
+                { "Stern",     z.stern,     mx.stern,     ImVec2(dp.x + 14, dp.y + DH - 23), ImVec2(dp.x + DW - 14, dp.y + DH) },
+              };
+              for (const ZoneBox& b : boxes)
+                if (ImGui::IsMouseHoveringRect(b.a, b.b))
+                  ImGui::SetTooltip("%s  %.0f / %.0f", b.name, std::max(0.0f, b.hp), b.mx);
+              // Crew complement (grape attrition; reload/turn scale with it).
+              mp::TownState ts = mpClient.town();
+              if (ts.maxCrew > 0) ImGui::Text("Crew %d / %d", ts.crew, ts.maxCrew);
+              // Demasted: the server armed a jury-rig — show its progress.
+              if (mastRepairStartT >= 0 && mastRepairArmedMs > 0) {
+                float frac = glm::clamp((float)((t - mastRepairStartT) * 1000.0 / mastRepairArmedMs), 0.0f, 1.0f);
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "Jury-rigging mast...");
+                ImGui::ProgressBar(frac, ImVec2(150.0f, 10.0f), "");
+              }
+            }
+          }
+
+
+          ImGui::End();
+        }
+      }
+
+      // ── "You were sunk" card (combat_sunk for us): revealed after the capsize
+      //    animation window (kSinkRevealMs), offers the respawn teleport. ──
+      if (meSunk && (t - meSunkAtT) * 1000.0 >= combat::kSinkRevealMs) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.40f),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::Begin("sunkcard", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+        ImGui::PushFont(fontTitle);
+        ImGui::TextColored(ImVec4(0.92f, 0.30f, 0.24f, 1.0f), "YOU WERE SUNK");
+        ImGui::PopFont();
+        if (!meSunkBy.empty()) ImGui::Text("by %s", meSunkBy.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Return to harbour", ImVec2(220.0f, 0.0f))) {
+          mpClient.sendRespawn();   // server restores the hull + teleports via correction
+          meSunk = false;
+        }
+        ImGui::End();
+      }
+
+      // ── Salvage toast (bottom-centre, ~6 s). ──
+      if (!salvageToast.empty() && t - salvageToastAtT < 6.0) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 90.0f),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::Begin("salvagetoast", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+        ImGui::TextColored(ImVec4(0.85f, 0.78f, 0.45f, 1.0f), "%s", salvageToast.c_str());
+        ImGui::End();
+      }
 
       // ── World map (mirrors the browser's minimap.component): a small always-on
       //    minimap bottom-right; M or a click expands to a zoomable/pannable chart
@@ -4368,6 +4485,48 @@ int main(int argc, char** argv) {
         vessel.speed = corr.speed;
         if (vessel.anchored) { vessel.anchorX = vessel.x; vessel.anchorZ = vessel.z; }
         shipX = vessel.x; shipZ = vessel.z; shipHeading = vessel.heading; shipSpeed = vessel.speed;
+      }
+    }
+    // ── Combat protocol drains (phase 0): fold the server's authoritative combat
+    //    events into frame state. Shots/hits are consumed here so the queues stay
+    //    bounded; their FX consumers land in phases 1-3. ──
+    if (appState == AppState::Sailing) {
+      const std::string meId = mpClient.myId();
+      combatBy = mpClient.combatStates();
+      for (const mp::SunkEvent& e : mpClient.drainSunk()) {
+        if (e.victimId == meId) {
+          if (!meSunk) { meSunk = true; meSunkAtT = t; }
+          meSunkBy = !e.shooterName.empty() ? e.shooterName : e.shooterId;
+        } else {
+          remoteSunkAt[e.victimId] = t;
+        }
+      }
+      for (const std::string& pid : mpClient.drainRepaired()) {
+        remoteSunkAt.erase(pid);
+        if (pid == meId) meSunk = false;
+      }
+      // Phase 1/2 consume these for ball flight + impact FX; drained now so the
+      // inbox never grows unbounded.
+      (void)mpClient.drainShots();
+      (void)mpClient.drainHits();
+      // Jury-rig timer: arm the progress bar when the server arms the repair.
+      float mrMs = mpClient.mastRepairMs();
+      if (mrMs > 0.0f && mastRepairStartT < 0) { mastRepairStartT = t; mastRepairArmedMs = mrMs; }
+      if (mrMs <= 0.0f) mastRepairStartT = -1;
+      // Salvage pickup toast (crate rendering lands in phase 4; the protocol is live).
+      mp::SalvageCollected got = mpClient.consumeSalvageCollected();
+      if (got.valid) {
+        salvageToast = "Salvage recovered:";
+        if (got.gold > 0) salvageToast += " " + std::to_string(got.gold) + "g";
+        for (const auto& [good, qty] : got.goods)
+          salvageToast += " " + good + " x" + std::to_string(qty);
+        salvageToastAtT = t;
+      }
+      // Debug hook (headless tests): SAILSIM_CHAT sends one chat/command line —
+      // e.g. an admin "/mast 20" to exercise the damage HUD — once connected.
+      if (!sentDebugChat && mpClient.state() == mp::ConnState::Open) {
+        if (const char* dbg = std::getenv("SAILSIM_CHAT")) mpClient.sendChat(dbg);
+        sentDebugChat = true;
       }
     }
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /

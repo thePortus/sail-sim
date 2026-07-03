@@ -25,6 +25,25 @@ struct Client::Impl {
   std::vector<MapShip> allMerchants;
   std::vector<MapPirate> allPirates;
   Correction corr;
+  // ── Combat state (drained/read by the render loop) ──
+  std::vector<RemoteShot> shotsIn;
+  std::vector<CombatHit> hitsIn;
+  std::vector<SunkEvent> sunkIn;
+  std::vector<std::string> repairedIn;
+  std::map<std::string, CombatShipState> combat;
+  std::map<std::string, std::pair<int, int>> crewBy;   // playerId -> {crew, maxCrew}
+  float mastRepairMs = 0;                              // armed jury-rig duration (0 = none)
+  std::map<std::string, SalvageCrate> crates;
+  SalvageCollected salvaged;
+  RepairResult repairRes;
+
+  static void parseZones(const json& j, CombatZones& z) {
+    z.bow       = j.value("bow", z.bow);
+    z.stern     = j.value("stern", z.stern);
+    z.port      = j.value("port", z.port);
+    z.starboard = j.value("starboard", z.starboard);
+    z.masts     = j.value("masts", z.masts);
+  }
 
   static RemotePlayer parsePlayer(const json& j) {
     RemotePlayer r;
@@ -99,10 +118,88 @@ struct Client::Impl {
         for (auto& [k, v] : msg["factionRep"].items()) if (v.is_number()) townSt.factionRep[k] = v.get<float>();
       }
     } else if (type == "crew_state") {
-      if (msg.value("playerId", std::string()) == myId) {
+      const std::string pid = msg.value("playerId", std::string());
+      if (pid == myId) {
         townSt.crew    = msg.value("crew", townSt.crew);
         townSt.maxCrew = msg.value("maxCrew", townSt.maxCrew);
       }
+      if (!pid.empty())
+        crewBy[pid] = { msg.value("crew", 0), msg.value("maxCrew", 0) };
+    } else if (type == "cannon_shot") {
+      // Only broadcasts carry an id (our own sends are never echoed back).
+      RemoteShot s;
+      s.id = msg.value("id", std::string());
+      if (!s.id.empty() && s.id != myId) {
+        s.seq = msg.value("seq", 0);
+        s.ox = msg.value("ox", 0.0f); s.oy = msg.value("oy", 0.0f); s.oz = msg.value("oz", 0.0f);
+        s.vx = msg.value("vx", 0.0f); s.vy = msg.value("vy", 0.0f); s.vz = msg.value("vz", 0.0f);
+        s.shotType = msg.value("shotType", std::string("round"));
+        if (shotsIn.size() >= 256) shotsIn.erase(shotsIn.begin());
+        shotsIn.push_back(std::move(s));
+      }
+    } else if (type == "combat_hit") {
+      CombatHit h;
+      h.shooterId = msg.value("shooterId", std::string());
+      h.victimId  = msg.value("victimId", std::string());
+      h.seq       = msg.value("seq", 0);
+      h.zone      = msg.value("zone", std::string());
+      h.hx = msg.value("hx", 0.0f); h.hy = msg.value("hy", 0.0f); h.hz = msg.value("hz", 0.0f);
+      h.side      = msg.value("side", std::string());
+      h.tof       = msg.value("tof", 0.0f);
+      h.grape     = msg.value("grape", false);
+      if (hitsIn.size() >= 256) hitsIn.erase(hitsIn.begin());
+      hitsIn.push_back(std::move(h));
+    } else if (type == "combat_state") {
+      const std::string pid = msg.value("playerId", std::string());
+      if (!pid.empty()) {
+        CombatShipState& cs = combat[pid];
+        cs.valid = true;
+        if (msg.contains("zones") && msg["zones"].is_object()) parseZones(msg["zones"], cs.zones);
+        if (msg.contains("maxHp") && msg["maxHp"].is_object()) parseZones(msg["maxHp"], cs.maxHp);
+        // The armed jury-rig clears once our masts climb back above zero.
+        if (pid == myId && cs.zones.masts > 0.0f) mastRepairMs = 0;
+      }
+    } else if (type == "mast_repair") {
+      mastRepairMs = msg.value("ms", 60000.0f);
+    } else if (type == "combat_sunk") {
+      SunkEvent e;
+      e.victimId    = msg.value("victimId", std::string());
+      e.shooterId   = msg.value("shooterId", std::string());
+      e.shooterName = msg.value("shooterName", std::string());
+      if (sunkIn.size() >= 64) sunkIn.erase(sunkIn.begin());
+      sunkIn.push_back(std::move(e));
+    } else if (type == "combat_repair") {
+      std::string pid = msg.value("playerId", msg.value("id", std::string()));
+      if (!pid.empty()) {
+        if (repairedIn.size() >= 64) repairedIn.erase(repairedIn.begin());
+        repairedIn.push_back(std::move(pid));
+      }
+    } else if (type == "repair_result") {
+      repairRes.valid   = true;
+      repairRes.ok      = msg.value("ok", false);
+      repairRes.gold    = msg.value("gold", 0);
+      repairRes.charged = msg.value("charged", 0);
+      repairRes.mercy   = msg.value("mercy", false);
+      repairRes.free    = msg.value("free", false);
+      if (repairRes.ok) townSt.gold = repairRes.gold;
+    } else if (type == "salvage_snapshot") {
+      crates.clear();
+      if (msg.contains("crates") && msg["crates"].is_array())
+        for (const auto& c : msg["crates"]) {
+          SalvageCrate sc{ c.value("id", std::string()), c.value("x", 0.0f), c.value("z", 0.0f) };
+          if (!sc.id.empty()) crates[sc.id] = sc;
+        }
+    } else if (type == "salvage_spawn") {
+      SalvageCrate sc{ msg.value("id", std::string()), msg.value("x", 0.0f), msg.value("z", 0.0f) };
+      if (!sc.id.empty()) crates[sc.id] = sc;
+    } else if (type == "salvage_despawn") {
+      crates.erase(msg.value("id", std::string()));
+    } else if (type == "salvage_collected") {
+      salvaged.valid = true;
+      salvaged.gold += msg.value("gold", 0);
+      if (msg.contains("goods") && msg["goods"].is_object())
+        for (auto& [k, v] : msg["goods"].items())
+          if (v.is_number()) salvaged.goods[k] += v.get<int>();
     } else if (type == "recruit_result") {
       if (msg.value("ok", false)) {
         int charged = msg.value("charged", 0);
@@ -234,7 +331,6 @@ struct Client::Impl {
         chatIn.push_back(std::move(cm));
       }
     }
-    // combat / economy message types are handled as game systems land.
   }
 };
 
@@ -395,6 +491,84 @@ void Client::buyUpgrade(const std::string& kind) {
 void Client::requestCombatReset() {
   if (p_->conn.load() != ConnState::Open) return;
   p_->ws.send(json{{"type", "combat_reset"}}.dump());
+}
+
+// ── Combat sends + state accessors ────────────────────────────────────────────
+void Client::sendCannonShot(float ox, float oy, float oz,
+                            float vx, float vy, float vz,
+                            int seq, const std::string& shotType) {
+  if (p_->conn.load() != ConnState::Open) return;
+  json j = {
+    { "type", "cannon_shot" },
+    { "ox", ox }, { "oy", oy }, { "oz", oz },
+    { "vx", vx }, { "vy", vy }, { "vz", vz },
+    { "seq", seq }, { "shotType", shotType },
+  };
+  p_->ws.send(j.dump());
+}
+void Client::sendRespawn() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "respawn"}}.dump());
+}
+void Client::sendSalvageCollect(const std::string& crateId) {
+  if (p_->conn.load() != ConnState::Open || crateId.empty()) return;
+  p_->ws.send(json{{"type", "salvage_collect"}, {"crateId", crateId}}.dump());
+}
+
+std::vector<RemoteShot> Client::drainShots() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<RemoteShot> out;
+  out.swap(p_->shotsIn);
+  return out;
+}
+std::vector<CombatHit> Client::drainHits() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<CombatHit> out;
+  out.swap(p_->hitsIn);
+  return out;
+}
+std::vector<SunkEvent> Client::drainSunk() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<SunkEvent> out;
+  out.swap(p_->sunkIn);
+  return out;
+}
+std::vector<std::string> Client::drainRepaired() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<std::string> out;
+  out.swap(p_->repairedIn);
+  return out;
+}
+std::map<std::string, CombatShipState> Client::combatStates() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->combat;
+}
+std::map<std::string, std::pair<int, int>> Client::crews() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->crewBy;
+}
+float Client::mastRepairMs() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->mastRepairMs;
+}
+std::vector<SalvageCrate> Client::salvageCrates() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  std::vector<SalvageCrate> out;
+  out.reserve(p_->crates.size());
+  for (const auto& kv : p_->crates) out.push_back(kv.second);
+  return out;
+}
+SalvageCollected Client::consumeSalvageCollected() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  SalvageCollected s = p_->salvaged;
+  p_->salvaged = SalvageCollected{};
+  return s;
+}
+RepairResult Client::consumeRepairResult() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  RepairResult r = p_->repairRes;
+  p_->repairRes = RepairResult{};
+  return r;
 }
 
 } // namespace mp

@@ -60,6 +60,51 @@ struct ChatMessage {
   std::string chatType, from, to, text;
 };
 
+// ── Combat protocol (server-authoritative; see COMBAT_PLAN.md) ────────────────
+
+// A remote/NPC shot broadcast (server "cannon_shot" with id) — rendered as a
+// flying ball + muzzle FX. Our own shots are NOT echoed back.
+struct RemoteShot {
+  std::string id, shotType;      // shooter playerId; round | bar | grape
+  int seq = 0;
+  float ox = 0, oy = 0, oz = 0;  // muzzle world position
+  float vx = 0, vy = 0, vz = 0;  // initial velocity (world units/s)
+};
+
+// Server-adjudicated impact ("combat_hit"). Cosmetics are deferred until the
+// matching ball (key shooterId:seq) has flown `tof` seconds.
+struct CombatHit {
+  std::string shooterId, victimId, zone, side;   // zone: bow|stern|port|starboard|masts
+  int seq = 0;
+  float hx = 0, hy = 0, hz = 0;  // world impact point
+  float tof = 0;                 // server time-of-flight (s)
+  bool grape = false;            // crew-only pellet (no zone damage, no scorch)
+};
+
+// Authoritative zone HP per ship ("combat_state"). maxHp arrives with the
+// first state only; -1 = not received yet.
+struct CombatZones {
+  float bow = -1, stern = -1, port = -1, starboard = -1, masts = -1;
+};
+struct CombatShipState {
+  bool valid = false;
+  CombatZones zones;
+  CombatZones maxHp;             // kept once seen (server omits it later)
+};
+
+struct SunkEvent { std::string victimId, shooterId, shooterName; };
+
+struct SalvageCrate { std::string id; float x = 0, z = 0; };
+struct SalvageCollected {
+  bool valid = false;
+  int gold = 0;
+  std::map<std::string, int> goods;
+};
+struct RepairResult {
+  bool valid = false, ok = false, mercy = false, free = false;
+  int gold = 0, charged = 0;
+};
+
 // Our outbound pose (server "update" from client).
 struct PlayerUpdate {
   float x = 0, z = 0, heading = 0, speed = 0;
@@ -144,6 +189,29 @@ public:
   void buyShip(const std::string& slug);                   // shipwright: replace the hull
   void buyUpgrade(const std::string& kind);                // shipwright: 'cannon' | 'armor'
   void requestCombatReset();                               // shipwright: hull repair
+
+  // ── Combat (phase 0 plumbing; consumers land per COMBAT_PLAN.md phases) ──
+  // Fire one gun/pellet. The server validates origin (16 m), velocity band per
+  // ammo, and the per-side reload token bucket — invalid shots vanish silently.
+  void sendCannonShot(float ox, float oy, float oz,
+                      float vx, float vy, float vz,
+                      int seq, const std::string& shotType);
+  void sendRespawn();                                      // after combat_sunk: back to harbour
+  void sendSalvageCollect(const std::string& crateId);
+
+  std::vector<RemoteShot> drainShots();                    // remote/NPC cannon_shot broadcasts
+  std::vector<CombatHit> drainHits();                      // combat_hit events (all ships)
+  std::vector<SunkEvent> drainSunk();                      // combat_sunk events
+  std::vector<std::string> drainRepaired();                // combat_repair playerIds (clear wreck/decals)
+  // Zone HP per ship, keyed by playerId (self included). Copies.
+  std::map<std::string, CombatShipState> combatStates() const;
+  std::map<std::string, std::pair<int, int>> crews() const;   // playerId -> {crew, maxCrew}
+  // Jury-rig timer: >0 ms while the server has our demasting repair armed
+  // (cleared when a combat_state shows masts back above 0).
+  float mastRepairMs() const;
+  std::vector<SalvageCrate> salvageCrates() const;
+  SalvageCollected consumeSalvageCollected();
+  RepairResult consumeRepairResult();
 
 private:
   struct Impl;

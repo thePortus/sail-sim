@@ -9,11 +9,16 @@ struct PostU {
     misc  : vec4<f32>,   // x,y = resolution; z = time (s); w = rain amount [0..1]
     grade : vec4<f32>,   // x = exposure; y = contrast; z = bloom weight; w = grade enabled
     fx    : vec4<f32>,   // x = grain intensity (/255); y = grain animated; z = vignette weight; w = sharpen
+    dof   : vec4<f32>,   // x = focus distance (m); y = CoC scale; z unused; w = DOF enabled
+    zp    : vec4<f32>,   // x = proj[2][2]; y = proj[3][2]; z = SSAO enabled; w unused
 };
 @group(0) @binding(0) var<uniform> u : PostU;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
 @group(0) @binding(2) var bloomTex : texture_2d<f32>;
 @group(0) @binding(3) var samp     : sampler;
+@group(0) @binding(4) var aoTex    : texture_2d<f32>;   // half-res blurred SSAO
+@group(0) @binding(5) var dofTex   : texture_2d<f32>;   // half-res CoC-blurred scene
+@group(0) @binding(6) var depthT   : texture_depth_2d;  // scene depth (read-only bound)
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -111,11 +116,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let res = u.misc.xy;
     var uv = in.uv;
 
-    // ── Rain lens: drops + trails refract the scene under them. ──
+    // ── Rain lens: drops + trails refract the scene under them. The Heartfelt
+    //    math assumes ShaderToy's y-up fragCoord — our uv is y-down, so flip into
+    //    y-up space (else the drops climb and trails hang above them). ──
     let rainAmount = clamp(u.misc.w, 0.0, 1.0);
     if (rainAmount > 0.02) {
         let fragCoord = in.uv * res;
-        let ruv = (fragCoord - 0.5 * res) / res.y;
+        let ruv = vec2<f32>(fragCoord.x - 0.5 * res.x, 0.5 * res.y - fragCoord.y) / res.y;
         let t = u.misc.z * 0.2;
         let fade = S(0.0, 0.08, rainAmount);
         let rd = pow(rainAmount, 0.55) * (1.0 - 0.2 * rainAmount);
@@ -126,19 +133,40 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         let e = vec2<f32>(0.001, 0.0);
         let cx = Drops(ruv + e, t, staticDrops, layer1, layer2).x;
         let cy = Drops(ruv + e.yx, t, staticDrops, layer1, layer2).x;
-        uv += vec2<f32>(cx - c.x, cy - c.x);   // refraction normal — the drops lens the scene
+        uv += vec2<f32>(cx - c.x, -(cy - c.x));   // refraction normal (y flipped back to y-down uv)
     }
 
     var col = textureSampleLevel(sceneTex, samp, uv, 0.0).rgb;
 
-    // ── Sharpen (pipeline.sharpen edgeAmount) — restores rigging/deck crispness. ──
-    if (u.fx.w > 0.001) {
+    // ── Depth of field merge: blend toward the half-res CoC-blurred scene by the
+    //    full-res CoC (per-pixel from depth, so the ship's silhouette stays crisp
+    //    against a soft horizon instead of haloing). ──
+    var focusK = 1.0;   // 1 = in focus (gates the sharpen below)
+    if (u.dof.w > 0.5) {
+        let dp = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(0.9995)) * res);
+        let d = textureLoad(depthT, dp, 0);
+        let dist = u.zp.y / (d + u.zp.x);
+        let coc = clamp(u.dof.y * abs(dist - u.dof.x) / max(dist, 1.0), 0.0, 1.0);
+        let blend = smoothstep(0.02, 0.40, coc);
+        col = mix(col, textureSampleLevel(dofTex, samp, uv, 0.0).rgb, blend);
+        focusK = 1.0 - blend;
+    }
+
+    // ── Sharpen (pipeline.sharpen edgeAmount) — restores rigging/deck crispness
+    //    (faded out where DOF blurs, so it doesn't fight the defocus). ──
+    if (u.fx.w > 0.001 && focusK > 0.01) {
         let px = 1.0 / res;
         var nb = textureSampleLevel(sceneTex, samp, uv + vec2<f32>(px.x, 0.0), 0.0).rgb;
         nb += textureSampleLevel(sceneTex, samp, uv - vec2<f32>(px.x, 0.0), 0.0).rgb;
         nb += textureSampleLevel(sceneTex, samp, uv + vec2<f32>(0.0, px.y), 0.0).rgb;
         nb += textureSampleLevel(sceneTex, samp, uv - vec2<f32>(0.0, px.y), 0.0).rgb;
-        col = max(vec3<f32>(0.0), col + (col - nb * 0.25) * u.fx.w);
+        col = max(vec3<f32>(0.0), col + (col - nb * 0.25) * u.fx.w * focusK);
+    }
+
+    // ── SSAO multiply (runs before grading, like the client's SSAO2 pipeline
+    //    which sat ahead of the DefaultRenderingPipeline). ──
+    if (u.zp.z > 0.5) {
+        col *= textureSampleLevel(aoTex, samp, uv, 0.0).r;
     }
 
     if (u.grade.w > 0.5) {

@@ -14,12 +14,62 @@ struct Camera {
     tmisc    : vec4<f32>,   // x,y = heightfield texel size; z = field ready; w = see-depth (m)
     proj     : vec4<f32>,   // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
     cloud0   : vec4<f32>,   // x = coverage, y = cloud type, z = slab base (m), w = slab top (m)
-    cloud1   : vec4<f32>,   // x,y = weather drift; zw unused
+    cloud1   : vec4<f32>,   // x,y = weather drift; z = flash count; w = wake boat count
     shadow0  : mat4x4<f32>, // world -> sun-shadow clip, tight ship cascade
     shadow1  : mat4x4<f32>, // world -> sun-shadow clip, wide landscape cascade
     shadowP  : vec4<f32>,   // x = enabled, y = bias 0, z = bias 1, w = shadow texel (uv)
     flash    : array<vec4<f32>, 6>,   // cannon glow pool: x, z, age, beam angle (count = cloud1.z)
+    wakeMeta : array<vec4<f32>, 4>,   // per wake boat: x, z, point count, live speed
+    wakePaths : array<vec4<f32>, 160>, // per point: x, z, age (s), speed-at-laydown (40/boat)
 };
+
+// Ship wake along each boat's actual (curved) CPU track (client _wakeCV): find
+// the nearest point on the breadcrumb polyline, then build a turbulent core + a
+// pair of diverging bow-wave edges that spread as the wake ages. Following the
+// track means the wake bends through turns. Returns (core, edge); both fade
+// with the track point's age.
+fn wakeCV(wxz : vec2<f32>) -> vec2<f32> {
+    var res = vec2<f32>(0.0);
+    let nBoats = cam.cloud1.w;
+    for (var b = 0; b < 4; b = b + 1) {
+        if (f32(b) >= nBoats) { break; }
+        let bmeta = cam.wakeMeta[b];                                  // x, z, count, speed
+        let toBoat = wxz - bmeta.xy;
+        if (dot(toBoat, toBoat) > 45000.0) { continue; }              // ~210 m cull per ship
+        if (bmeta.z < 2.0) { continue; }
+        let base = b * 40;
+        var bestD = 1.0e9;
+        var bestAge = 0.0;
+        var bestSpd = 0.0;
+        for (var i = 0; i < 39; i = i + 1) {
+            if (f32(i) >= bmeta.z - 1.0) { break; }
+            let a = cam.wakePaths[base + i].xy;
+            let c = cam.wakePaths[base + i + 1].xy;
+            let ab = c - a;
+            let L2 = max(dot(ab, ab), 1.0e-3);
+            let t = clamp(dot(wxz - a, ab) / L2, 0.0, 1.0);
+            let d = length(wxz - (a + ab * t));
+            if (d < bestD) {
+                bestD = d;
+                bestAge = mix(cam.wakePaths[base + i].z, cam.wakePaths[base + i + 1].z, t);
+                bestSpd = mix(cam.wakePaths[base + i].w, cam.wakePaths[base + i + 1].w, t);
+            }
+        }
+        let ageFade = 1.0 - smoothstep(0.0, 11.0, bestAge);
+        if (ageFade <= 0.001) { continue; }
+        // Strength + width scale with how fast the ship was when it laid this
+        // segment (bestSpd = abs speed x4): a crawling ship leaves a faint,
+        // narrow trail; one at speed a broad, bright one. Old fast wakes stay
+        // strong even after the ship slows.
+        let speedFac = mix(0.08, 1.0, smoothstep(3.0, 16.0, bestSpd));
+        let width = 1.6 + min(9.0, bestAge * 1.1) + min(6.0, bestSpd * 0.30);
+        let coreW = max(1.5, width * 0.40);
+        let core = exp(-(bestD * bestD) / (coreW * coreW)) * ageFade * speedFac;
+        let edge = exp(-((bestD - width) * (bestD - width)) / 5.0) * ageFade * speedFac;
+        res = max(res, vec2<f32>(core, edge));
+    }
+    return res;
+}
 
 // Cannon muzzle-flash glow (client _cannonFlashGlow): a brief warm pool of
 // light on the sea under a firing muzzle, masked to the firing side of the
@@ -61,6 +111,7 @@ fn cannonFlashGlow(wxz : vec2<f32>) -> vec3<f32> {
 @group(0) @binding(15) var shadowT0 : texture_depth_2d;     // sun shadow, ship cascade
 @group(0) @binding(16) var shadowT1 : texture_depth_2d;     // sun shadow, landscape cascade
 @group(0) @binding(17) var shadowS : sampler_comparison;
+@group(0) @binding(18) var foamTex : texture_2d<f32>;       // tiling foam blobs (wake froth break-up)
 
 // Sun visibility from the shadow cascades: prefer the tight ship cascade when
 // the point lands inside it (hull/rigging shadows on the water), else the wide
@@ -135,6 +186,13 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     let vamp = cam.lod.x;
     let hamp = min(vamp, 1.0 + max(vamp - 1.0, 0.0) * 0.35);
     disp = vec3<f32>(disp.x * hamp, disp.y * vamp, disp.z * hamp);
+
+    // Wake riding on the swell (client HAS_WAKE vertex block): flatten the FFT
+    // chop in the churned core (the boat smooths the water), carve a trough
+    // there, and raise the diverging bow-wave crests.
+    let wcv = wakeCV(world);
+    disp *= (1.0 - 0.65 * wcv.x);
+    disp.y += -0.80 * wcv.x + 0.70 * wcv.y;
 
     let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
@@ -254,6 +312,20 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
                  + textureSample(turb1, samp, uv1).x
                  + textureSample(turb2, samp, uv2).x;
     jacobian = min(1.0, max(0.0, (-jacobian + _FoamBias * foamChop) * _FoamScale));
+
+    // Wake foam (client HAS_WAKE fragment block): bright churned core + thin
+    // diverging bow-wave lines, broken up by a scrolling foam texture so it
+    // reads as turbulent froth rather than a painted band. The client's _Time
+    // uniform is seconds/10, hence the 0.1 on our plain-seconds clock.
+    {
+        let wcvF = wakeCV(in.worldUV);
+        var wakeFoam = wcvF.x * 0.95 + wcvF.y * 0.85;
+        let t10 = cam.lod.w * 0.1;
+        let wfTex = textureSample(foamTex, samp, in.worldUV * 0.09 + t10 * 1.4).r
+                  * textureSample(foamTex, samp, in.worldUV * 0.21 - t10 * 0.9).r;
+        wakeFoam *= smoothstep(0.05, 0.45, wfTex + 0.18);
+        jacobian = max(jacobian, clamp(wakeFoam, 0.0, 1.0));
+    }
 
     // Subsurface scattering — back-lit turquoise glow on wave backs, sun-gated.
     let sunUp = smoothstep(0.0, 0.12, L.y);

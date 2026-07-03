@@ -62,6 +62,7 @@
 #include "cannon_fx.hpp"
 #include "prims.hpp"
 #include "sail_physics.hpp"
+#include "wake.hpp"
 #include "ocean_fft.hpp"
 #include "session.hpp"
 #include "sky_assets.hpp"
@@ -779,11 +780,15 @@ struct OceanCamera {
   glm::vec4 tmisc;    // x,y = heightfield texel size; z = field ready; w = see-depth (m)
   glm::vec4 proj;     // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
   glm::vec4 cloud0;   // x = coverage, y = cloud type, z = slab base (m), w = slab top (m)
-  glm::vec4 cloud1;   // x,y = weather drift (worldZX offset); zw unused
+  glm::vec4 cloud1;   // x,y = weather drift (worldZX offset); z = flash count; w = wake boat count
   glm::mat4 shadow0;  // world -> sun-shadow clip, tight ship cascade
   glm::mat4 shadow1;  // world -> sun-shadow clip, wide landscape cascade
   glm::vec4 shadowP;  // x = enabled, y = bias 0, z = bias 1, w unused
   glm::vec4 flash[6]; // cannon muzzle glow pool: x, z, age, beam angle (count in cloud1.z)
+  // Ship wake tracks (client WakeTracker buffers): per-boat meta (x, z, point
+  // count, live speed) + 40 breadcrumb points each (x, z, age, laydown speed).
+  glm::vec4 wakeMeta[wake::kMaxBoats];
+  glm::vec4 wakePaths[wake::kMaxBoats * wake::kPoints];
 };
 
 // A colour render target (planar reflection).
@@ -867,6 +872,10 @@ struct Ocean {
   // 1x1 deep-water placeholder for the terrain heightfield slot until it loads.
   WGPUTexture         placeTex = nullptr;
   WGPUTextureView     placeView = nullptr;
+  // Tiling foam-blob texture (client _makeFoamTexture): breaks the wake foam
+  // into turbulent froth instead of a painted band.
+  WGPUTexture         foamTex = nullptr;
+  WGPUTextureView     foamView = nullptr;
   // Coarse, geometrically-flat FAR ring: same ocean shader (wave normals, foam,
   // reflection) so the real ocean look reaches the horizon without displacement
   // aliasing. Its own uniform (displacement amp 0, inner discard radius set).
@@ -993,7 +1002,7 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   // R32F unfilterable — drives the coastal-shallows transparency), pre-ocean
   // scene depth snapshot (13 — drives the underwater see-through alpha), cloud
   // weather map (14 — drives the cloud shadows).
-  WGPUBindGroupLayoutEntry be[18] = {};
+  WGPUBindGroupLayoutEntry be[19] = {};
   be[0].binding = 0; be[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   be[0].buffer.type = WGPUBufferBindingType_Uniform;
   for (int i = 1; i <= 9; ++i) {
@@ -1023,8 +1032,44 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   be[16].texture.viewDimension = WGPUTextureViewDimension_2D;
   be[17].binding = 17; be[17].visibility = WGPUShaderStage_Fragment;
   be[17].sampler.type = WGPUSamplerBindingType_Comparison;               // PCF comparator
-  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 18; bld.entries = be;
+  be[18].binding = 18; be[18].visibility = WGPUShaderStage_Fragment;
+  be[18].texture.sampleType = WGPUTextureSampleType_Float;               // wake foam blobs
+  be[18].texture.viewDimension = WGPUTextureViewDimension_2D;
+  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 19; bld.entries = be;
   o.bgl = wgpuDeviceCreateBindGroupLayout(device, &bld);
+  // Foam-blob texture (client _makeFoamTexture): 256x256 black canvas with 220
+  // soft radial white blobs (r 4-18 px, peak alpha 0.35-0.85) source-over
+  // composited — the wake foam's froth break-up pattern. Deterministic LCG in
+  // place of Math.random(); the client regenerated it randomly every launch.
+  {
+    const int S = 256;
+    std::vector<float> px((size_t)S * S, 0.0f);
+    uint32_t rng = 0x2c9277b5u;
+    auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 8) / 16777216.0f; };
+    for (int i = 0; i < 220; ++i) {
+      const float bx = rnd() * S, by = rnd() * S, br = 4.0f + rnd() * 14.0f;
+      const float ba = 0.35f + rnd() * 0.5f;
+      const int x0 = (int)std::floor(bx - br), x1 = (int)std::ceil(bx + br);
+      const int y0 = (int)std::floor(by - br), y1 = (int)std::ceil(by + br);
+      for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+          const float r = std::hypot((float)x + 0.5f - bx, (float)y + 0.5f - by);
+          if (r >= br) continue;
+          const float a = ba * (1.0f - r / br);            // canvas radial gradient: alpha -> 0 at the rim
+          // Wrapped write (the canvas clipped at the border; wrapping instead
+          // keeps the tiling texture seam-free — the blobs are the same).
+          float& d = px[(size_t)((y % S + S) % S) * S + ((x % S + S) % S)];
+          d = d * (1.0f - a) + a;                          // source-over onto black
+        }
+    }
+    std::vector<uint8_t> rgba((size_t)S * S * 4);
+    for (size_t i = 0; i < px.size(); ++i) {
+      const uint8_t v = (uint8_t)std::lround(std::min(px[i], 1.0f) * 255.0f);
+      rgba[i * 4 + 0] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255;
+    }
+    o.foamTex = makeSampledRGBA(device, queue, S, S, rgba.data(), false);
+    o.foamView = wgpuTextureCreateView(o.foamTex, nullptr);
+  }
   // Deep-water placeholder heightfield (-1000 m) until the real one arrives.
   {
     WGPUTextureDescriptor td = {};
@@ -2917,6 +2962,9 @@ int main(int argc, char** argv) {
   // sea under firing muzzles, masked to the firing side of the keel.
   struct OceanFlash { float x = 0, z = 0, age = 0, ang = 0; };
   std::vector<OceanFlash> oceanFlashes;      // capped at 6, oldest dropped
+  // Ship wake breadcrumb tracks (local + remotes) feeding the ocean's curved
+  // trailing wakes — the client's WakeTracker, fed the smoothed display poses.
+  wake::Tracker wakeTracker;
   const float kFlashLife = 0.45f;
   // Salvage (phase 4): crates already requested (re-armed when we sail back out).
   std::set<std::string> salvageReq;
@@ -5165,9 +5213,16 @@ int main(int argc, char** argv) {
     };
     std::vector<ShipInst> ships;
     Mesh* ownMesh = nullptr;
+    // Wake sources this frame: local boat first (id "local", always packed
+    // first), remotes appended below with their SMOOTHED display poses — the
+    // client fed dispX/dispZ too, so the wake follows the rendered track, not
+    // the raw 500 ms network snaps. Speed = abs(protocol speed) x4, the
+    // client's exact scaling (the wake shader's thresholds assume it).
+    std::vector<wake::Source> wakeBoats;
     if (sailing && !ownVesselSlug.empty()) {
       ownMesh = &vesselFor(ownVesselSlug);
       ships.push_back({ ownMesh, ownShipModel(*ownMesh) });
+      wakeBoats.push_back({ "local", vessel.x, vessel.z, std::fabs(vessel.speed) * 4.0f });
     }
     struct ImpInst { const ShipImpSlug* slug; float x, z, heading; };
     std::vector<ImpInst> shipImposters;
@@ -5236,6 +5291,7 @@ int main(int argc, char** argv) {
         }
         rp.x = rm.dispX; rp.z = rm.dispZ;
         rp.heading = glm::degrees(rm.dispHeading);
+        wakeBoats.push_back({ rp.id, rp.x, rp.z, std::fabs(rp.speed) * 4.0f });
         // Distant-ship LOD (client LOD_NEAR=460/LOD_FAR=540 hysteresis): beyond the
         // far edge swap the full rigged GLB for the baked azimuth billboard.
         auto ait = shipImp.slugs.find(slug);
@@ -5254,6 +5310,10 @@ int main(int argc, char** argv) {
       // Drop motion state for departed ships.
       for (auto it2 = remoteMotion.begin(); it2 != remoteMotion.end();)
         it2 = motionSeen.count(it2->first) ? std::next(it2) : remoteMotion.erase(it2);
+      // Record/extend every ship's wake path, then pack the nearest few for the
+      // ocean material (client _updateWakes: dt capped at 50 ms, camera-sorted).
+      wakeTracker.update(std::min(dt, 0.05f), wakeBoats);
+      wakeTracker.assemble(eye.x, eye.z);
       // Town streaming (client BUILD_RANGE=600 / PIER_BUILD_RANGE=2400): real GLBs
       // near the player, appended as plain static ship-instances (same draw path).
       if (terrainR.ready) {
@@ -5592,7 +5652,8 @@ int main(int argc, char** argv) {
     const float cloudBase = 900.0f - storminess * 220.0f;
     const float cloudTop  = cloudBase + (600.0f + storminess * 700.0f);
     const glm::vec4 oceanCloud0(cloudCov, cloudType, cloudBase, cloudTop);
-    const glm::vec4 oceanCloud1(cloudDrift.x, cloudDrift.y, (float)oceanFlashes.size(), 0.0f);
+    const glm::vec4 oceanCloud1(cloudDrift.x, cloudDrift.y, (float)oceanFlashes.size(),
+                                (float)wakeTracker.boatCount());
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                     glm::vec4(seaAmp, 0.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
                     oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
@@ -5600,11 +5661,18 @@ int main(int argc, char** argv) {
       oc.flash[fi] = fi < oceanFlashes.size()
                    ? glm::vec4(oceanFlashes[fi].x, oceanFlashes[fi].z, oceanFlashes[fi].age, oceanFlashes[fi].ang)
                    : glm::vec4(0, 0, 99.0f, 0);
+    std::memcpy(oc.wakeMeta, wakeTracker.meta(), sizeof(oc.wakeMeta));
+    std::memcpy(oc.wakePaths, wakeTracker.paths(), sizeof(oc.wakePaths));
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                        glm::vec4(0.0f, 1400.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
                        oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
     for (size_t fi = 0; fi < 6; ++fi) ocFar.flash[fi] = oc.flash[fi];
+    // No wakes on the far ring: its 200 m cells can't resolve a 2 m trough, and
+    // its fragments inside 1.4 km (where wakes live) are discarded anyway.
+    ocFar.cloud1.w = 0.0f;
+    std::memset(ocFar.wakeMeta, 0, sizeof(ocFar.wakeMeta));
+    std::memset(ocFar.wakePaths, 0, sizeof(ocFar.wakePaths));
     wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
                     skyMoon, skyParams };
@@ -6171,7 +6239,7 @@ int main(int argc, char** argv) {
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
-    WGPUBindGroupEntry oe[18] = {};
+    WGPUBindGroupEntry oe[19] = {};
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
     oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
@@ -6193,11 +6261,12 @@ int main(int argc, char** argv) {
       oe[16].binding = 16; oe[16].textureView = shdw.view1;
       oe[17].binding = 17; oe[17].sampler = shdw.cmp;
     }
+    oe[18].binding = 18; oe[18].textureView = ocean.foamView;
     oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
-    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 18; obdF.entries = oe;
+    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 19; obdF.entries = oe;
     oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
     oe[0].buffer = ocean.uniformBuf;
-    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 18; obd.entries = oe;
+    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 19; obd.entries = oe;
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);

@@ -70,11 +70,16 @@ const _FoamScale   = 2.6;
 const _FoamBias    = 2.80;   // LOD2 (3 cascades)
 const _Choppiness  = 0.3;
 
+// Cascade LOD fade (client _LOD_scale): each cascade's contribution dies off
+// with view distance — far water keeps only the broad 250 m swell, so it reads
+// smooth and mirror-like instead of shimmering with full-strength 5 m chop.
+const _LODScale = 7.13;
+
 struct VSOut {
     @builtin(position) position : vec4<f32>,
     @location(0)       worldPos : vec3<f32>,
     @location(1)       worldUV  : vec2<f32>,   // undisplaced grid xz (for texture sampling)
-    @location(2)       height   : f32,          // summed displacement.y (for SSS)
+    @location(2)       lods     : vec4<f32>,   // xyz = cascade lod weights; w = SSS height factor
 };
 
 @vertex
@@ -83,13 +88,16 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     let uv0 = world / cam.params.x;
     let uv1 = world / cam.params.y;
     let uv2 = world / cam.params.z;
-    var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
-    disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
-    disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
-    // Vertex displacement amp (0 on the flat far ring). The storm seaAmp (up to
-    // 2.2 at B7) scales HEAVE fully but the horizontal choppy displacement only
-    // gently: scaling XZ past ~1.4 folds wave crests over the 5.9 m grid cells,
-    // which rendered as big black slivers / dry seabed wedges in heavy weather.
+    let viewDist = max(1.0, distance(cam.eye.xyz, vec3<f32>(world.x, 0.0, world.y)));
+    let lod0 = min(_LODScale * cam.params.x / viewDist, 1.0);
+    let lod1 = min(_LODScale * cam.params.y / viewDist, 1.0);
+    let lod2 = min(_LODScale * cam.params.z / viewDist, 1.0);
+    var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz * lod0;
+    let largeWavesBias = disp.y;
+    disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz * lod1;
+    disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz * lod2;
+    // Vertex displacement amp (0 on the flat far ring). The hamp cap guards the
+    // horizontal displacement against crest fold-over if the amp ever exceeds 1.
     let vamp = cam.lod.x;
     let hamp = min(vamp, 1.0 + max(vamp - 1.0, 0.0) * 0.35);
     disp = vec3<f32>(disp.x * hamp, disp.y * vamp, disp.z * hamp);
@@ -99,7 +107,8 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     out.position = cam.viewProj * vec4<f32>(p, 1.0);
     out.worldPos = p;
     out.worldUV = world;
-    out.height = disp.y;
+    out.lods = vec4<f32>(lod0, lod1, lod2,
+                         max(disp.y - largeWavesBias * 0.8 - _SSSBase, 0.0) / _SSSScale);
     return out;
 }
 
@@ -153,10 +162,11 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let uv1 = in.worldUV / cam.params.y;
     let uv2 = in.worldUV / cam.params.z;
 
-    // Normal from summed derivative maps.
+    // Normal from summed derivative maps, cascades faded with distance like the
+    // client (c0 always full; c1/c2 die off so far water reads smooth).
     var derivatives = textureSample(deriv0, samp, uv0);
-    derivatives += textureSample(deriv1, samp, uv1);
-    derivatives += textureSample(deriv2, samp, uv2);
+    derivatives += textureSample(deriv1, samp, uv1) * in.lods.y;
+    derivatives += textureSample(deriv2, samp, uv2) * in.lods.z;
     let slope = vec2<f32>(derivatives.x * cam.params.w / (1.0 + derivatives.z),
                           derivatives.y * cam.params.w / (1.0 + derivatives.w));
     var N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
@@ -218,8 +228,11 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let hv = -N + L;
     let H = hv / max(length(hv), 1e-4);
     let viewDotH = pow5(clamp(dot(V, -H), 0.0, 1.0)) * 30.0 * _SSSStrength * sunUp * sunVis;
-    let sssW = max(in.height - _SSSBase, 0.0) / _SSSScale;
-    let color = clamp(_Color + _SSSColor * viewDotH * sssW, vec3<f32>(0.0), vec3<f32>(1.0));
+    // SSS gated by the near cascade's lod (client: mix by vLodScales.z) — the
+    // turquoise glow is a close-up effect, distant water keeps the deep body colour.
+    let color = mix(_Color,
+                    clamp(_Color + _SSSColor * viewDotH * in.lods.w, vec3<f32>(0.0), vec3<f32>(1.0)),
+                    in.lods.z);
 
     // ── Coastal shallows (client ocean-material Phase 4): TRUE vertical seabed
     //    depth from the terrain heightfield. reveal = the sand shows through up
@@ -277,9 +290,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     // Sun glint. Epsilon-guarded: V can oppose L on wave facets, and
     // normalize(0) is NaN — the black-wedge artifact (view-dependent).
+    // Distance gloss (client _RoughnessScale 0.0044 / _MaxGloss 0.91): the water
+    // goes matte with range, so the horizon doesn't fizz with per-pixel sparkle.
     let hs2 = V + L;
     let Hs = hs2 / max(length(hs2), 1e-4);
-    waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2 * reflCut * sunVis;
+    let glossK = 1.0 / (1.0 + viewDist * 0.0044);
+    let glint = pow(max(dot(N, Hs), 0.0), mix(24.0, 300.0, glossK)) * 1.2 * glossK;
+    waterCol += vec3<f32>(1.0, 0.96, 0.86) * glint * reflCut * sunVis;
 
     // Shadow the water body the way the client did: waterCol *= 1 - shadow*0.8
     // (cloud + geometry shadows read clearly; foam keeps its own sun dimming).

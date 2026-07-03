@@ -228,6 +228,15 @@ set(USE_ZLIB OFF CACHE BOOL "" FORCE)
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ixwebsocket)
 
+# ── miniaudio (header-only audio output; the procedural ocean/rain sound beds) ─
+FetchContent_Declare(
+  miniaudio
+  GIT_REPOSITORY https://github.com/mackron/miniaudio
+  GIT_TAG        0.11.21
+  GIT_SHALLOW    ON
+)
+FetchContent_MakeAvailable(miniaudio)
+
 # Embed each WGSL file as a C header at configure time — single source of truth
 # is the .wgsl file. Uses a raw string literal so no escaping is needed;
 # reconfigure after editing a .wgsl.
@@ -249,6 +258,7 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/post.wgsl"             POST_WGSL
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/bloom.wgsl"            BLOOM_WGSL            "${WGSL_GEN_DIR}/bloom_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssao.wgsl"             SSAO_WGSL             "${WGSL_GEN_DIR}/ssao_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/dof.wgsl"              DOF_WGSL              "${WGSL_GEN_DIR}/dof_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain.wgsl"             RAIN_WGSL             "${WGSL_GEN_DIR}/rain_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds_denoise.wgsl"   CLOUDS_DENOISE_WGSL   "${WGSL_GEN_DIR}/clouds_denoise_wgsl.h")
 
 # ── UI fonts ─────────────────────────────────────────────────────────────────
@@ -309,6 +319,7 @@ add_executable(sailsim_native
   src/sky_assets.cpp
   src/terrain.cpp
   src/terrain_biome.cpp
+  src/audio.cpp
   src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
@@ -322,7 +333,7 @@ target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
 
 target_include_directories(sailsim_native PRIVATE
   "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder" "${stb_SOURCE_DIR}"
-  "${httplib_SOURCE_DIR}")
+  "${httplib_SOURCE_DIR}" "${miniaudio_SOURCE_DIR}")
 get_filename_component(SAILSIM_SHIP_MODEL_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
 target_compile_definitions(sailsim_native PRIVATE

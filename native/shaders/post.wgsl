@@ -101,6 +101,35 @@ fn Drops(uv : vec2<f32>, t : f32, l0 : f32, l1 : f32, l2 : f32) -> vec2<f32> {
     return vec2<f32>(c, max(m1.y * l0, m2.y * l1));
 }
 
+// ── Second lens layer (cloud.service LENS_RAIN port): large, slow-sliding
+//    droplets that refract the scene. The browser stacked BOTH passes — this one
+//    (always attached, early-out when dry) and the Heartfelt drops above. ──
+fn h21(pIn : vec2<f32>) -> f32 {
+    var p = fract(pIn * vec2<f32>(123.34, 345.45));
+    p += dot(p, p + vec2<f32>(34.345));
+    return fract(p.x * p.y);
+}
+
+fn dropLayerBig(uv : vec2<f32>, scl : f32, seed : f32, t : f32) -> vec4<f32> {
+    let gv = uv * scl;
+    let id = floor(gv);
+    let f = fract(gv) - vec2<f32>(0.5);
+    let r1 = h21(id + vec2<f32>(seed));
+    let r2 = h21(id + vec2<f32>(seed + 7.7));
+    if (h21(id + vec2<f32>(seed + 3.1)) < 0.5) { return vec4<f32>(0.0); }
+    let period = mix(3.5, 7.5, r2);
+    let life = fract((t + r1 * 90.0) / period);
+    var c = (vec2<f32>(r1, r2) - vec2<f32>(0.5)) * 0.55;
+    c.y -= life * 0.30;
+    let rad = mix(0.10, 0.34, smoothstep(0.0, 0.12, life)) * (0.65 + 0.35 * r2);
+    let d = length(f - c);
+    var m = smoothstep(rad, rad * 0.45, d);
+    m *= 1.0 - smoothstep(0.72, 1.0, life);
+    let offset = -(f - c) * m * (0.05 / scl);
+    let rim = (1.0 - smoothstep(rad * 0.45, rad, d)) * smoothstep(rad * 0.55, rad, d) * m;
+    return vec4<f32>(offset, m, rim);
+}
+
 // ── ACES filmic tonemap (Babylon toneMappingType 2) ─────────────────────────
 fn aces(x : vec3<f32>) -> vec3<f32> {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
@@ -137,6 +166,24 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     }
 
     var col = textureSampleLevel(sceneTex, samp, uv, 0.0).rgb;
+
+    // ── Big sliding lens drops (the browser's second, stacked lens pass). It ran
+    //    BEFORE the Heartfelt pass there, so here it reads through the Heartfelt-
+    //    refracted uv — same composition order. The dropLayer math is y-up. ──
+    if (rainAmount > 0.02) {
+        let aspect = res.x / res.y;
+        let dl_uv = vec2<f32>(uv.x * aspect, 1.0 - uv.y);
+        let l1 = dropLayerBig(dl_uv, 6.0, 0.0, u.misc.z);
+        let l2 = dropLayerBig(dl_uv, 10.0, 23.0, u.misc.z);
+        let offset = vec2<f32>(l1.x + l2.x, -(l1.y + l2.y));   // back to y-down uv space
+        let cover = max(l1.z, l2.z);
+        let rim = l1.w + l2.w;
+        let amt = clamp(rainAmount * 1.4, 0.0, 1.0);
+        let ruv2 = clamp(uv + offset * amt, vec2<f32>(0.001), vec2<f32>(0.999));
+        let refr = textureSampleLevel(sceneTex, samp, ruv2, 0.0).rgb;
+        col = mix(col, refr, clamp(cover * amt, 0.0, 1.0));
+        col += vec3<f32>(rim * amt * 0.08);
+    }
 
     // ── Depth of field merge: blend toward the half-res CoC-blurred scene by the
     //    full-res CoC (per-pixel from depth, so the ship's silhouette stays crisp

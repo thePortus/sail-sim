@@ -1174,7 +1174,10 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
       dirX += cx2 / cl * Impl::W_COH; dirZ += cz2 / cl * Impl::W_COH;
     }
     dirX += sepX * Impl::W_SEP; dirZ += sepZ * Impl::W_SEP;
-    float ty = (m.dipState == 1 || m.dipState == 2) ? Impl::SEA_Y + Impl::DIP_SKIM_H
+    // Dip/skim heights ride the DISPLACED wave surface (a storm crest must not
+    // swallow a skimming gull, a trough must not leave it dipping at thin air).
+    float ws = p->waveH(m.px, m.pz);
+    float ty = (m.dipState == 1 || m.dipState == 2) ? ws + Impl::SEA_Y + Impl::DIP_SKIM_H
                                                     : f.gy + m.altBias * 0.5f;
     float desired = std::atan2(dirX, dirZ);
     float dh = angDiff(desired, m.hdg);
@@ -1195,6 +1198,11 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
     if (groundY > 0.5f) {
       float floorY = groundY + Impl::GROUND_CLEARANCE;
       if (m.py < floorY) { m.py = floorY; if (m.vy < 0) m.vy = 0; }
+    } else {
+      // Wave floor: low cruisers/skimmers stay above the crests (below the
+      // settle threshold, so landing flocks can still touch down).
+      float wFloor = ws + 0.35f;
+      if (m.py < wFloor) { m.py = wFloor; if (m.vy < 0) m.vy = 0; }
     }
     float targetBank = std::clamp(yawRate / Impl::TURN_RATE * Impl::MAX_BANK, -Impl::MAX_BANK, Impl::MAX_BANK);
     m.bank += (targetBank - m.bank) * std::min(1.0f, dt * Impl::BANK_EASE);
@@ -1214,7 +1222,7 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
     }
     m.dipTimer -= dt;
     if (m.dipState == 1) {
-      if (m.py <= Impl::SEA_Y + Impl::DIP_SKIM_H + 0.5f || m.dipTimer <= 0) { m.dipState = 2; m.dipTimer = 0.3f + p->frand() * 0.5f; }
+      if (m.py <= p->waveH(m.px, m.pz) + Impl::SEA_Y + Impl::DIP_SKIM_H + 0.5f || m.dipTimer <= 0) { m.dipState = 2; m.dipTimer = 0.3f + p->frand() * 0.5f; }
     } else if (m.dipState == 2) {
       if (m.dipTimer <= 0) { m.dipState = 3; m.dipTimer = 6; }
     } else if (m.py >= f.goalAlt - 4 || m.dipTimer <= 0) {
@@ -1232,7 +1240,7 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
         if (m.spd > Impl::LAND_SPD) m.spd = std::max(Impl::LAND_SPD, m.spd - Impl::ACCEL * 2 * dt);
         float f01 = std::clamp(1 - (m.py - Impl::SEA_Y) / (Impl::FLARE_ALT - Impl::SEA_Y), 0.0f, 1.0f);
         m.flare += (f01 - m.flare) * std::min(1.0f, dt * 4);
-        if (m.py <= Impl::SEA_Y + 0.8f && m.vy <= 0.3f) {   // settleMember
+        if (m.py <= p->waveH(m.px, m.pz) + Impl::SEA_Y + 0.8f && m.vy <= 0.3f) {   // settleMember
           m.airborne = false; m.py = Impl::SEA_Y;
           m.ox = m.px - f.anchorX; m.oz = m.pz - f.anchorZ;
           m.yaw = std::atan2(std::cos(m.hdg), -std::sin(m.hdg));
@@ -1782,7 +1790,6 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
   updateBirds(p, dt, ship.x, ship.z, ship, storminess);
   updateDolphins(p, dt, t, ship);
   updateFish(p, dt, t, ship);
-  p->waveHFn = nullptr;   // the callback captures caller frame-locals; don't let it dangle
 
   // Write animal instances.
   auto writeSets = [&](Layer& l, const std::vector<std::vector<Inst>>& per) {
@@ -1812,7 +1819,10 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
                              energy * Impl::kBirdAmp[v]);
         } else {
           v = m.restWingsOut ? m.flyVariant : 2;
-          wx = f.cx + m.ox; wy = Impl::SEA_Y; wz = f.cz + m.oz;
+          // Rafting gulls ride the swell like corks instead of sitting at flat
+          // sea level (where a crest drowns them and a trough floats them in air).
+          wx = f.cx + m.ox; wz = f.cz + m.oz;
+          wy = p->waveH(wx, wz) + Impl::SEA_Y;
           inst = composeBird(m.yaw, 0, 0, m.scale, wx, wy, wz, m.tint, Impl::kBirdAmp[v]);
         }
         if (v >= (int)per.size() || !p->birdsL.full[(size_t)v].vbuf) v = 0;
@@ -1843,6 +1853,7 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
     }
     writeSets(p->fishL, per);
   }
+  p->waveHFn = nullptr;   // the callback captures caller frame-locals; don't let it dangle
 }
 
 // ── Draw: frustum-culled patch flush + per-set draws ──────────────────────────

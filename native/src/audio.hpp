@@ -43,6 +43,10 @@ public:
   void setWeather(float windSpeedMps);
   // Rain patter follows the eased precip intensity [0..1].
   void setRain(float intensity);
+  // One-shot cannon fire (cannon.service playCannonSound, six synth layers) and
+  // water-impact splash. vol 0..1 (callers distance-attenuate: 1 - d/800).
+  void playCannon(float vol);
+  void playSplash(float vol);
   // One-shot procedural thunder (cloud.service playThunder): vol 0..1 sets the
   // rumble's brightness, attack sharpness and length (distant rolls longer).
   void playThunder(float vol);

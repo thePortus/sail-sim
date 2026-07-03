@@ -59,6 +59,7 @@
 #include "combat.hpp"
 #include "combat_constants.hpp"
 #include "cannon.hpp"
+#include "cannon_fx.hpp"
 #include "prims.hpp"
 #include "sail_physics.hpp"
 #include "ocean_fft.hpp"
@@ -2624,6 +2625,8 @@ int main(int argc, char** argv) {
   std::string gunSlug;
   prims::System primsSys;
   primsSys.init(device, kSceneFormat);
+  fx::System cannonFx;
+  cannonFx.init(device, kSceneFormat);
   // Celestial textures (moon colour map + all-sky star map) fetched + decoded off
   // the render thread; uploaded and wired into the sky bind group once ready.
   std::future<sky::Image> moonFuture = std::async(std::launch::async,
@@ -4588,28 +4591,42 @@ int main(int argc, char** argv) {
         if (frame == 120) guns.armOrFire(1);
         if (frame == 420) guns.armOrFire(1);
       }
+      // FX isolation: repeatedly blast at a fixed spot ahead of the ship.
+      if (std::getenv("SAILSIM_FXTEST") && frame >= 200 && frame % 90 == 0) {
+        glm::vec3 at(vessel.x + 10.0f, 2.5f, vessel.z + 8.0f);
+        cannonFx.muzzleBlast(at, 0.7f, 0.7f, glm::distance(lastEye, at));
+      }
       std::vector<combat::FireEvent> fires;
       guns.update(dt, gpose, enemies, crewFactor, meId, fires);
+      bool firedThisFrame = false;
       for (const combat::FireEvent& fe : fires) {
         mpClient.sendCannonShot(fe.mwx, fe.mwy, fe.mwz, fe.vx, fe.vy, fe.vz,
                                 fe.seq, combat::shotName(fe.kind));
-        std::printf("[combat] fired %s seq %d muzzle (%.1f, %.1f, %.1f) v (%.1f, %.1f, %.1f) |v| %.1f lock %s\n",
-                    combat::shotName(fe.kind), fe.seq, fe.mwx, fe.mwy, fe.mwz,
-                    fe.vx, fe.vy, fe.vz,
-                    std::sqrt(fe.vx * fe.vx + fe.vy * fe.vy + fe.vz * fe.vz),
-                    guns.lock(fe.side).valid ? guns.lock(fe.side).lockId.c_str() : "none");
+        // Muzzle FX once per gun (grape shares one blast across its pellets).
+        if (fe.seq == fires.front().seq || fe.kind != combat::ShotKind::Grape || !firedThisFrame) {
+          glm::vec3 mw(fe.mwx, fe.mwy, fe.mwz);
+          cannonFx.muzzleBlast(mw, fe.dirX, fe.dirZ, glm::distance(lastEye, mw));
+          audioSys.playCannon(1.0f);
+          firedThisFrame = true;
+        }
       }
       for (int gs = 0; gs < 2; ++gs) {
         int dep = 0;
         if (guns.consumeDeployChange(gs, dep)) mpClient.sendGunState(gs, dep);
       }
-      // Remote/NPC broadsides fly in the same ball pool.
+      // Remote/NPC broadsides fly in the same ball pool, with muzzle FX and a
+      // distance-attenuated report (client: vol = 1 - d/800).
       for (const mp::RemoteShot& rs : mpClient.drainShots()) {
         combat::ShotKind k = rs.shotType == "bar" ? combat::ShotKind::Bar
                            : rs.shotType == "grape" ? combat::ShotKind::Grape
                            : combat::ShotKind::Round;
         guns.spawnBall(rs.id + ":" + std::to_string(rs.seq), k,
                        rs.ox, rs.oy, rs.oz, rs.vx, rs.vy, rs.vz);
+        glm::vec3 mw(rs.ox, rs.oy, rs.oz);
+        float hv = std::hypot(rs.vx, rs.vz);
+        float dX = hv > 1e-3f ? rs.vx / hv : 0.0f, dZ = hv > 1e-3f ? rs.vz / hv : 1.0f;
+        cannonFx.muzzleBlast(mw, dX, dZ, glm::distance(lastEye, mw));
+        audioSys.playCannon(std::max(0.0f, 1.0f - glm::distance(lastEye, mw) / 800.0f));
       }
       // Server-adjudicated hits: matched balls defer to the server tof; the
       // impact list feeds the phase-2 FX (splash/splinters/scorch).
@@ -4623,7 +4640,32 @@ int main(int argc, char** argv) {
       guns.updateBalls(dt, [&](float x, float z) {
         return terr.loaded() ? terr.elevation(x, z) : 0.0f;
       }, impacts);
-      (void)impacts;   // phase 2: impact FX consume these
+      for (const combat::ImpactEvent& ie : impacts) {
+        const glm::vec3 ip(ie.x, ie.y, ie.z);
+        const glm::vec3 iv(ie.vx, ie.vy, ie.vz);
+        const float d = glm::distance(lastEye, ip);
+        if (ie.shipHit) {
+          glm::vec3 dir = iv;
+          float l = glm::length(dir);
+          if (l > 1e-3f) dir /= l;
+          if (!ie.hit.grape) cannonFx.shipHit(ip, dir);
+          audioSys.playSplash(std::max(0.0f, 0.8f - d / 600.0f));   // crunchy thud placeholder tail
+        } else {
+          const float surf = terr.loaded() ? terr.elevation(ie.x, ie.z) : 0.0f;
+          if (surf > 0.0f) cannonFx.landHit(ip, iv);
+          else {
+            cannonFx.waterSplash(ip, iv);
+            audioSys.playSplash(std::max(0.0f, 1.0f - d / 500.0f));
+          }
+        }
+      }
+      // Advance the effect fields (wind-drifted smoke).
+      {
+        mp::WaveState fw = mpClient.wave();
+        float wRad = glm::radians((fw.valid ? fw.windBearing : 270.0f) + 180.0f);
+        float wSpd = (fw.valid ? fw.windSpeed : 8.0f) * 0.2f;   // gentle drift, m/s-ish
+        cannonFx.update(dt, std::sin(wRad) * wSpd, std::cos(wRad) * wSpd);
+      }
       // Jury-rig timer: arm the progress bar when the server arms the repair.
       float mrMs = mpClient.mastRepairMs();
       if (mrMs > 0.0f && mastRepairStartT < 0) { mastRepairStartT = t; mastRepairArmedMs = mrMs; }
@@ -5927,6 +5969,14 @@ int main(int argc, char** argv) {
         }
       }
       primsSys.flush(device, queue, pass, viewProj);
+      // Combat FX billboards: particles, smoke puffs, muzzle fireballs.
+      {
+        const glm::vec3 fxRight(viewM[0][0], viewM[1][0], viewM[2][0]);
+        const glm::vec3 fxUp(viewM[0][1], viewM[1][1], viewM[2][1]);
+        const glm::vec3 fxFwd(-viewM[0][2], -viewM[1][2], -viewM[2][2]);
+        cannonFx.draw(device, queue, pass, viewProj, fxRight, fxUp, fxFwd, eye,
+                      oceanDepthReadView, oceanProj);
+      }
     }
 
     // Distant-ship impostor billboards (alpha-tested, depth-written like hulls).

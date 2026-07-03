@@ -40,6 +40,13 @@ struct Biquad {
     b0 = (1 - cw) * 0.5f / a0; b1 = (1 - cw) / a0; b2 = b0;
     a1 = -2 * cw / a0; a2 = (1 - alpha) / a0;
   }
+  void bandpass(float sr, float freq, float q) {   // RBJ constant-skirt BPF
+    float w = 2.0f * (float)M_PI * freq / sr, cw = std::cos(w), sw = std::sin(w);
+    float alpha = sw / (2.0f * q);
+    float a0 = 1 + alpha;
+    b0 = alpha / a0; b1 = 0; b2 = -alpha / a0;
+    a1 = -2 * cw / a0; a2 = (1 - alpha) / a0;
+  }
   void highpass(float sr, float freq, float q) {
     float w = 2.0f * (float)M_PI * freq / sr, cw = std::cos(w), sw = std::sin(w);
     float alpha = sw / (2.0f * q);
@@ -150,6 +157,93 @@ struct ThunderVoice {
   }
 };
 
+// One cannon shot: the client's six synth layers (cannon.service playCannonSound)
+// — BANG (bandpass noise crack), BLAST (lowpass sweep roar), PUNCH + SUB (sine
+// drops), ROLL + delayed ECHO (long lowpassed rumbles, fed through the reverb).
+struct CannonDesc { float vol = 1, bangF = 1800, blastF0 = 880, punchF0 = 117, subF0 = 56; };
+struct CannonVoice {
+  CannonDesc d;
+  Biquad bangBp, blastLp, rollLp, echoLp;
+  double tau = 0;
+  uint32_t rng = 1;
+  bool active = false;
+  float punchPh = 0, subPh = 0;
+  inline float noise() {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return (float)(int32_t)rng * (1.0f / 2147483648.0f);
+  }
+  static float expEnv(float t, float g0, float dur) {   // exponentialRampTo 0.001
+    if (t < 0 || t > dur) return 0.0f;
+    return g0 * std::pow(0.001f / std::max(1e-4f, g0), t / dur);
+  }
+  // dry + wet (reverb send) for one sample at rate sr.
+  void render(float sr, float& dry, float& wet) {
+    const float t = (float)tau;
+    const float v = d.vol;
+    float o = 0.0f, send = 0.0f;
+    if (t < 0.07f) {   // 1) BANG
+      float g = t < 0.001f ? 0.85f * v * (t / 0.001f) : expEnv(t - 0.001f, 0.85f * v, 0.059f);
+      o += bangBp.process(noise()) * g;
+    }
+    if (t < 1.1f) {    // 2) BLAST
+      o += blastLp.process(noise()) * expEnv(t, 1.7f * v, 1.0f);
+    }
+    if (t < 0.43f) {   // 3) PUNCH
+      float f = d.punchF0 * std::pow(34.0f / d.punchF0, std::min(1.0f, t / 0.20f));
+      punchPh += 2.0f * (float)M_PI * f / sr;
+      o += std::sin(punchPh) * expEnv(t, 1.0f * v, 0.42f);
+    }
+    if (t < 1.47f) {   // 4) SUB
+      float f = d.subF0 * std::pow(18.0f / d.subF0, std::min(1.0f, t / 0.7f));
+      subPh += 2.0f * (float)M_PI * f / sr;
+      o += std::sin(subPh) * expEnv(t, 1.15f * v, 1.45f);
+    }
+    if (t < 3.6f) {    // 5) ROLL (reverb send)
+      float g = t < 0.06f ? 0.80f * v * (t / 0.06f)
+              : 0.80f * v * std::exp(-std::max(0.0f, t - 0.40f) / 1.05f);
+      send += rollLp.process(noise()) * g;
+    }
+    const float te = t - 0.45f;
+    if (te > 0 && te < 3.2f) {   // 6) ECHO (reverb send)
+      float g = te < 0.18f ? 0.45f * v * (te / 0.18f)
+              : 0.45f * v * std::exp(-std::max(0.0f, te - 0.6f) / 1.2f);
+      send += echoLp.process(noise()) * g;
+    }
+    dry += o + send * 0.35f;
+    wet += send;
+    tau += 1.0 / (double)sr;
+  }
+};
+
+// Water-impact splash: a falling chirp + a wet lowpassed noise tail.
+struct SplashVoice {
+  float vol = 0;
+  Biquad lp;
+  double tau = 0;
+  uint32_t rng = 7;
+  bool active = false;
+  float ph = 0;
+  inline float noise() {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return (float)(int32_t)rng * (1.0f / 2147483648.0f);
+  }
+  float render(float sr) {
+    const float t = (float)tau;
+    float o = 0.0f;
+    if (t < 0.22f) {   // chirp 2600 -> 180 Hz
+      float f = 2600.0f * std::pow(180.0f / 2600.0f, t / 0.22f);
+      ph += 2.0f * (float)M_PI * f / sr;
+      o += std::sin(ph) * 0.25f * vol * std::exp(-t / 0.08f);
+    }
+    if (t < 0.7f) {    // wet noise tail
+      float g = t < 0.02f ? vol * 0.55f * (t / 0.02f) : vol * 0.55f * std::exp(-(t - 0.02f) / 0.16f);
+      o += lp.process(noise()) * g;
+    }
+    tau += 1.0 / (double)sr;
+    return o;
+  }
+};
+
 }  // namespace
 
 struct System::Impl {
@@ -181,6 +275,17 @@ struct System::Impl {
   ThunderDesc thunderDesc[kThunder];
   std::atomic<int> thunderState[kThunder]{};   // 0 free, 1 queued, 2 playing
   ThunderVoice thunderVoice[kThunder];
+
+  // Cannon + splash one-shots (same queued/playing hand-off as thunder).
+  static constexpr int kCannon = 6;
+  CannonDesc cannonDesc[kCannon];
+  std::atomic<int> cannonState[kCannon]{};
+  CannonVoice cannonVoice[kCannon];
+  static constexpr int kSplash = 6;
+  std::atomic<int> splashState[kSplash]{};
+  float splashVol[kSplash] = {};
+  SplashVoice splashVoice[kSplash];
+  Reverb cannonReverb;
 
   // ── Music engine ──
   // Program hand-off: game thread parks the next program in `musicPending`;
@@ -344,6 +449,50 @@ struct System::Impl {
         tv.lpf.lowpass(sr, f, 0.4f);
       }
 
+      // Claim queued cannon/splash voices + refresh their filter sweeps.
+      for (int v = 0; v < kCannon; ++v) {
+        int q = 1;
+        if (cannonState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          CannonVoice& cv = cannonVoice[v];
+          cv = CannonVoice();
+          cv.d = cannonDesc[v];
+          cv.rng = 0xB5297A4Du + (uint32_t)v * 0x68E31DA4u;
+          cv.bangBp.bandpass(sr, cv.d.bangF, 0.7f);
+          cv.active = true;
+        }
+        CannonVoice& cv = cannonVoice[v];
+        if (!cv.active) continue;
+        if (cv.tau >= 4.2) {
+          cv.active = false;
+          cannonState[v].store(0, std::memory_order_release);
+          continue;
+        }
+        float tb = (float)cv.tau;
+        float fBlast = cv.d.blastF0 * std::pow(70.0f / cv.d.blastF0, std::min(1.0f, tb / 0.6f));
+        cv.blastLp.lowpass(sr, std::max(70.0f, fBlast), 0.8f);
+        float fRoll = 360.0f * std::pow(75.0f / 360.0f, std::min(1.0f, tb / 2.6f));
+        cv.rollLp.lowpass(sr, std::max(75.0f, fRoll), 0.5f);
+        float teB = std::max(0.0f, tb - 0.45f);
+        float fEcho = 230.0f * std::pow(55.0f / 230.0f, std::min(1.0f, teB / 2.4f));
+        cv.echoLp.lowpass(sr, std::max(55.0f, fEcho), 0.5f);
+      }
+      for (int v = 0; v < kSplash; ++v) {
+        int q = 1;
+        if (splashState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          SplashVoice& sv = splashVoice[v];
+          sv = SplashVoice();
+          sv.vol = splashVol[v];
+          sv.rng = 0x1234567u + (uint32_t)v * 0x9E3779B9u;
+          sv.lp.lowpass(sr, 1200.0f, 0.7f);
+          sv.active = true;
+        }
+        SplashVoice& sv = splashVoice[v];
+        if (sv.active && sv.tau >= 0.75) {
+          sv.active = false;
+          splashState[v].store(0, std::memory_order_release);
+        }
+      }
+
       for (ma_uint32 i = 0; i < n; ++i) {
         // Wash: brown -> LPF -> swell (0.7 base + LFO*depth) -> bed.
         float wash = washLpf.process(brown[bi]);
@@ -366,6 +515,16 @@ struct System::Impl {
           thunder += tv.lpf.process(tv.noise()) * tv.envAt((float)tv.tau);
           tv.tau += 1.0 / (double)sr;
         }
+        // Cannon shots: six-layer synth + shared reverb (the rolling boom).
+        float cannonDry = 0.0f, cannonSend = 0.0f;
+        for (int v = 0; v < kCannon; ++v)
+          if (cannonVoice[v].active) cannonVoice[v].render(sr, cannonDry, cannonSend);
+        float cannon = cannonDry * 0.5f + cannonReverb.process(cannonSend * 0.5f) * 0.85f;
+        cannon = std::tanh(cannon * 1.4f) / 1.4f;   // the client's cannon-bus limiter
+        // Water-impact splashes.
+        float splash = 0.0f;
+        for (int v = 0; v < kSplash; ++v)
+          if (splashVoice[v].active) splash += splashVoice[v].render(sr);
         // Music synth — its own bus/gain, independent of the SFX master.
         float music = 0.0f;
         if (musicCurrent) {
@@ -373,7 +532,7 @@ struct System::Impl {
           musicPlayhead += 1.0 / (double)sr;
         }
 
-        float s = (bed + rain + thunder) * sMaster.value + music;
+        float s = (bed + rain + thunder + cannon + splash) * sMaster.value + music;
         s = std::tanh(s * 1.2f) / 1.2f;   // gentle safety limiter
         out[(done + i) * 2 + 0] = s;
         out[(done + i) * 2 + 1] = s;
@@ -425,6 +584,7 @@ bool System::init() {
   impl->sMaster.configure(impl->sr, 0.5f, kBlock);
   impl->sMusicGain.configure(impl->sr, 0.15f, kBlock);
   impl->musicReverb.init(impl->sr);
+  impl->cannonReverb.init(impl->sr);
   impl->sWashF.value = 480.0f; impl->sSwellFreq.value = 0.08f;
   if (ma_device_start(&impl->device) != MA_SUCCESS) {
     ma_device_uninit(&impl->device);
@@ -491,6 +651,39 @@ void System::playThunder(float vol) {
 void System::setEnabled(bool on) {
   if (!impl) return;
   impl->tMaster.store(on ? impl->masterVol : 0.0f, std::memory_order_relaxed);
+}
+
+// One cannon shot (client playCannonSound, six layers). vol 0..1 (distance-set).
+void System::playCannon(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  int slot = -1;
+  for (int v = 0; v < Impl::kCannon; ++v)
+    if (impl->cannonState[v].load(std::memory_order_relaxed) == 0) { slot = v; break; }
+  if (slot < 0) return;
+  CannonDesc d;
+  d.vol = vol;
+  auto rnd = [](float a, float b) { return a + (float)std::rand() / RAND_MAX * (b - a); };
+  d.bangF = rnd(1400.0f, 2200.0f);
+  d.blastF0 = rnd(780.0f, 980.0f);
+  d.punchF0 = rnd(108.0f, 126.0f);
+  d.subF0 = rnd(52.0f, 60.0f);
+  impl->cannonDesc[slot] = d;
+  impl->cannonState[slot].store(1, std::memory_order_release);
+}
+
+// Water-impact splash chirp + wet noise. vol 0..1.
+void System::playSplash(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  int slot = -1;
+  for (int v = 0; v < Impl::kSplash; ++v)
+    if (impl->splashState[v].load(std::memory_order_relaxed) == 0) { slot = v; break; }
+  if (slot < 0) return;
+  impl->splashVol[slot] = vol;
+  impl->splashState[slot].store(1, std::memory_order_release);
 }
 
 void System::setMasterVolume(float v) {

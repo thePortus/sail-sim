@@ -18,7 +18,31 @@ struct Camera {
     shadow0  : mat4x4<f32>, // world -> sun-shadow clip, tight ship cascade
     shadow1  : mat4x4<f32>, // world -> sun-shadow clip, wide landscape cascade
     shadowP  : vec4<f32>,   // x = enabled, y = bias 0, z = bias 1, w = shadow texel (uv)
+    flash    : array<vec4<f32>, 6>,   // cannon glow pool: x, z, age, beam angle (count = cloud1.z)
 };
+
+// Cannon muzzle-flash glow (client _cannonFlashGlow): a brief warm pool of
+// light on the sea under a firing muzzle, masked to the firing side of the
+// keel so a port cannonade never lights the starboard water.
+fn cannonFlashGlow(wxz : vec2<f32>) -> vec3<f32> {
+    let n = cam.cloud1.z;
+    if (n < 0.5) { return vec3<f32>(0.0); }
+    var sum = vec3<f32>(0.0);
+    for (var i = 0; i < 6; i = i + 1) {
+        if (f32(i) >= n) { break; }
+        let c = cam.flash[i].xy;
+        let t01 = cam.flash[i].z / 0.45;
+        if (t01 >= 1.0) { continue; }
+        let env = (1.0 - t01) * (1.0 - t01);
+        let r = length(wxz - c);
+        let fall = exp(-(r * r) / 110.0);
+        let D = vec2<f32>(cos(cam.flash[i].w), sin(cam.flash[i].w));
+        let sFrag = dot(wxz - c, D) + 2.5;
+        let sideMask = mix(0.08, 1.0, smoothstep(-1.5, 1.5, sFrag));
+        sum += vec3<f32>(1.0, 0.52, 0.18) * env * fall * sideMask;
+    }
+    return sum;
+}
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
 @group(0) @binding(1)  var disp0  : texture_2d<f32>;
@@ -326,6 +350,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let hd = distance(cam.eye.xyz, in.worldPos);
     let haze = 1.0 - exp(-pow(hd * 0.00009, 2.0));
     outColor = mix(outColor, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
+    outColor += cannonFlashGlow(in.worldUV);   // broadside glow on the water (emissive)
     // REAL transparency over the shallows — the client's exact composite: it mixed
     // the revealed seabed in at reveal * 0.9 (10% water colour always remains), so
     // our alpha is 1 - reveal * 0.9. The Beer-Lambert see-through takes over

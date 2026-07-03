@@ -783,6 +783,7 @@ struct OceanCamera {
   glm::mat4 shadow0;  // world -> sun-shadow clip, tight ship cascade
   glm::mat4 shadow1;  // world -> sun-shadow clip, wide landscape cascade
   glm::vec4 shadowP;  // x = enabled, y = bias 0, z = bias 1, w unused
+  glm::vec4 flash[6]; // cannon muzzle glow pool: x, z, age, beam angle (count in cloud1.z)
 };
 
 // A colour render target (planar reflection).
@@ -2912,9 +2913,15 @@ int main(int argc, char** argv) {
   float camShake = 0.0f;                           // decaying camera shake magnitude (m)
   struct HullDecal { glm::vec3 local; float size; float ang; uint32_t seed; };
   std::map<std::string, std::vector<HullDecal>> shipDecals;   // "" = own ship
+  // Ocean cannon-flash glow (client addCannonFlash): warm pools of light on the
+  // sea under firing muzzles, masked to the firing side of the keel.
+  struct OceanFlash { float x = 0, z = 0, age = 0, ang = 0; };
+  std::vector<OceanFlash> oceanFlashes;      // capped at 6, oldest dropped
+  const float kFlashLife = 0.45f;
   // Salvage (phase 4): crates already requested (re-armed when we sail back out).
   std::set<std::string> salvageReq;
   std::string repairStatus; double repairStatusAtT = -100;    // shipwright repair_result line
+  double lastGrapeSplashT = -1;                               // grape water-patter throttle
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
   // match server combat-constants.js) so distances feel right at realistic knots.
@@ -4645,6 +4652,8 @@ int main(int argc, char** argv) {
         if (fe.seq == fires.front().seq || fe.kind != combat::ShotKind::Grape || !firedThisFrame) {
           glm::vec3 mw(fe.mwx, fe.mwy, fe.mwz);
           cannonFx.muzzleBlast(mw, fe.dirX, fe.dirZ, glm::distance(lastEye, mw));
+          if (oceanFlashes.size() >= 6) oceanFlashes.erase(oceanFlashes.begin());
+          oceanFlashes.push_back({ fe.mwx, fe.mwz, 0.0f, std::atan2(fe.dirZ, fe.dirX) });
           audioSys.playCannon(1.0f);
           firedThisFrame = true;
           shudVel += (fe.side == 0 ? 0.22f : -0.22f);   // recoil rocks away from the firing side
@@ -4667,6 +4676,8 @@ int main(int argc, char** argv) {
         float hv = std::hypot(rs.vx, rs.vz);
         float dX = hv > 1e-3f ? rs.vx / hv : 0.0f, dZ = hv > 1e-3f ? rs.vz / hv : 1.0f;
         cannonFx.muzzleBlast(mw, dX, dZ, glm::distance(lastEye, mw));
+        if (oceanFlashes.size() >= 6) oceanFlashes.erase(oceanFlashes.begin());
+        oceanFlashes.push_back({ rs.ox, rs.oz, 0.0f, std::atan2(dZ, dX) });
         audioSys.playCannon(std::max(0.0f, 1.0f - glm::distance(lastEye, mw) / 800.0f));
       }
       // Server-adjudicated hits: matched balls defer to the server tof; the
@@ -4725,7 +4736,16 @@ int main(int argc, char** argv) {
             audioSys.playLandImpact(std::max(0.0f, 1.0f - d / 800.0f));
           } else {
             cannonFx.waterSplash(ip, iv);
-            audioSys.playSplash(std::max(0.0f, 1.0f - d / 800.0f));
+            // Grape: a volley lands many pellets at once — soften + throttle the
+            // sound (client _lastGrapeSplashSound gate, 0.18 s).
+            if (ie.kind == combat::ShotKind::Grape) {
+              if (t - lastGrapeSplashT > 0.18) {
+                lastGrapeSplashT = t;
+                audioSys.playSplash(std::max(0.0f, 1.0f - d / 800.0f) * 0.45f);
+              }
+            } else {
+              audioSys.playSplash(std::max(0.0f, 1.0f - d / 800.0f));
+            }
           }
         }
       }
@@ -4757,6 +4777,11 @@ int main(int argc, char** argv) {
           prevMastHp[pid] = cs.zones.masts;
         }
       }
+      // Age + expire the ocean muzzle-flash pool.
+      for (OceanFlash& fl : oceanFlashes) fl.age += dt;
+      oceanFlashes.erase(std::remove_if(oceanFlashes.begin(), oceanFlashes.end(),
+                                        [&](const OceanFlash& fl) { return fl.age > kFlashLife; }),
+                         oceanFlashes.end());
       // Hit shudder decay (damped oscillator) + camera shake decay.
       shudVel += -shudRoll * 22.0f * dt - shudVel * 5.0f * dt;
       shudRoll += shudVel * dt;
@@ -4823,7 +4848,11 @@ int main(int argc, char** argv) {
       auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
       int rudder = 0, sheetDir = 0;
       helmInput = 0;
-      if (!io.WantCaptureKeyboard) {
+      if (meSunk) {                       // a wreck answers no helm (respawn card only)
+        vessel.speed = 0.0f; vessel.yawRate = 0.0f;
+        if (guns.anyCancellable()) guns.cancel();
+      }
+      if (!io.WantCaptureKeyboard && !meSunk) {
         rudder = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
         bool raise = down(GLFW_KEY_W, GLFW_KEY_UP), lower = down(GLFW_KEY_S, GLFW_KEY_DOWN);
         bool anchor = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
@@ -5563,14 +5592,19 @@ int main(int argc, char** argv) {
     const float cloudBase = 900.0f - storminess * 220.0f;
     const float cloudTop  = cloudBase + (600.0f + storminess * 700.0f);
     const glm::vec4 oceanCloud0(cloudCov, cloudType, cloudBase, cloudTop);
-    const glm::vec4 oceanCloud1(cloudDrift.x, cloudDrift.y, 0.0f, 0.0f);
+    const glm::vec4 oceanCloud1(cloudDrift.x, cloudDrift.y, (float)oceanFlashes.size(), 0.0f);
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                     glm::vec4(seaAmp, 0.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
                     oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
+    for (size_t fi = 0; fi < 6; ++fi)
+      oc.flash[fi] = fi < oceanFlashes.size()
+                   ? glm::vec4(oceanFlashes[fi].x, oceanFlashes[fi].z, oceanFlashes[fi].age, oceanFlashes[fi].ang)
+                   : glm::vec4(0, 0, 99.0f, 0);
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                        glm::vec4(0.0f, 1400.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
                        oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
+    for (size_t fi = 0; fi < 6; ++fi) ocFar.flash[fi] = oc.flash[fi];
     wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
                     skyMoon, skyParams };

@@ -12,6 +12,7 @@ struct Camera {
     sun      : vec4<f32>,   // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
     tbounds  : vec4<f32>,   // terrain heightfield world bounds: minX, maxX, minZ, maxZ
     tmisc    : vec4<f32>,   // x,y = heightfield texel size; z = field ready; w = see-depth (m)
+    proj     : vec4<f32>,   // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
@@ -26,6 +27,7 @@ struct Camera {
 @group(0) @binding(9)  var turb2  : texture_2d<f32>;
 @group(0) @binding(10) var samp   : sampler;
 @group(0) @binding(12) var terrainH : texture_2d<f32>;   // R32F signed elevation (shallows)
+@group(0) @binding(13) var sceneDepth : texture_depth_2d;   // pre-ocean depth snapshot
 
 // Material constants (from ocean-material.ts).
 const _Color       = vec3<f32>(0.015, 0.090, 0.130);
@@ -172,20 +174,37 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     //    depth from the terrain heightfield. reveal = the sand shows through up
     //    close; shallow = the broad band that suppresses the blue water terms;
     //    shoal = a turquoise water-column ring just past the clear-view depth. ──
+    // Visibility falls off with view distance (scattering through the column):
+    // full reach up close, opaque by ~400 m — also kills grazing-angle noise.
+    let viewDist = distance(cam.eye.xyz, in.worldPos);
+    let distFade = 1.0 - smoothstep(150.0, 400.0, viewDist);
     var reveal = 0.0;
     var shallow = 0.0;
     var shoal = 0.0;
     if (cam.tmisc.z > 0.5) {
         let dz = max(0.0, -tSampleH(in.worldUV.x, in.worldUV.y));
-        // Visibility falls off with view distance (scattering through the column):
-        // full reach up close, opaque by ~400 m — also kills grazing-angle noise.
-        let viewDist = distance(cam.eye.xyz, in.worldPos);
-        let distFade = 1.0 - smoothstep(150.0, 400.0, viewDist);
         let seeD = cam.tmisc.w;
         reveal  = (1.0 - smoothstep(0.0, seeD, dz)) * distFade;
         shallow = (1.0 - smoothstep(0.0, seeD * 2.2, dz)) * distFade;
         shoal   = smoothstep(seeD, seeD * 1.8, dz)
                 * (1.0 - smoothstep(seeD * 1.8, seeD * 3.5, dz)) * distFade * (1.0 - reveal);
+    }
+
+    // ── Underwater see-through (Beer-Lambert): the pre-ocean depth snapshot holds
+    //    whatever was drawn beneath this fragment (hull, seabed, wildlife). The
+    //    slant water column between the surface and that point sets extra
+    //    transparency — a keel a couple of metres down ghosts through, deep open
+    //    water stays opaque (nothing behind but the far plane). ──
+    var seeThru = 0.0;
+    if (distFade > 0.001) {
+        let sdim = vec2<f32>(textureDimensions(sceneDepth));
+        let spx = vec2<i32>(clamp(in.position.xy, vec2<f32>(0.0), sdim - vec2<f32>(1.0)));
+        let dScene = textureLoad(sceneDepth, spx, 0);
+        let zScene = -cam.proj.w / (dScene + cam.proj.z);        // view z, negative forward
+        let zSurf  = -cam.proj.w / (in.position.z + cam.proj.z);
+        let fwd  = max(zSurf - zScene, 0.0);                     // metres along the view axis
+        let path = fwd * viewDist / max(-zSurf, 0.001);          // slant path through the column
+        seeThru = exp(-path * 0.5) * 0.85 * distFade;
     }
 
     // Fresnel sky reflection.
@@ -224,8 +243,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     outColor = mix(outColor, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
     // REAL transparency over the shallows — the client's exact composite: it mixed
     // the revealed seabed in at reveal * 0.9 (10% water colour always remains), so
-    // our alpha is 1 - reveal * 0.9. Foam stays opaque on top (composited last there
-    // too), so breakers read solid white even over sand.
-    let alpha = clamp(1.0 - reveal * 0.9 + jacobian, 0.0, 1.0);
+    // our alpha is 1 - reveal * 0.9. The Beer-Lambert see-through takes over
+    // wherever it opens the water more than the heightfield reveal does (a hull is
+    // invisible to the heightfield). Foam stays opaque on top (composited last
+    // there too), so breakers read solid white even over sand.
+    let alpha = clamp(1.0 - max(reveal * 0.9, seeThru) + jacobian, 0.0, 1.0);
     return vec4<f32>(outColor, alpha);
 }

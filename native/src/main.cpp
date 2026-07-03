@@ -167,10 +167,12 @@ static const uint32_t kHullStencilRef = 1;
 static const WGPUTextureFormat kSceneFormat = WGPUTextureFormat_RGBA16Float;
 
 // A framebuffer-sized depth texture, recreated on resize. TextureBinding so the
-// SSAO/DOF/post passes can read the depth aspect back.
+// SSAO/DOF/post passes can read the depth aspect back; CopySrc/CopyDst so the
+// pre-ocean depth snapshot (underwater see-through) can be cloned mid-frame.
 static WGPUTexture makeDepthTexture(WGPUDevice device, uint32_t w, uint32_t h) {
   WGPUTextureDescriptor td = {};
-  td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+  td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding |
+             WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
   td.dimension = WGPUTextureDimension_2D;
   td.size = { w, h, 1 };
   td.format = kDepthFormat;
@@ -656,6 +658,7 @@ struct OceanCamera {
   glm::vec4 sun;      // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
   glm::vec4 tbounds;  // terrain heightfield world bounds: minX, maxX, minZ, maxZ
   glm::vec4 tmisc;    // x,y = heightfield texel size; z = field ready; w = see-depth (m)
+  glm::vec4 proj;     // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
 };
 
 // A colour render target (planar reflection).
@@ -862,8 +865,9 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
 
   // Explicit bind group layout (auto-layout misrouted binding 11): uniform (0),
   // 9 cascade textures (1-9), sampler (10), reflection (11), terrain height (12,
-  // R32F unfilterable — drives the coastal-shallows transparency).
-  WGPUBindGroupLayoutEntry be[13] = {};
+  // R32F unfilterable — drives the coastal-shallows transparency), pre-ocean
+  // scene depth snapshot (13 — drives the underwater see-through alpha).
+  WGPUBindGroupLayoutEntry be[14] = {};
   be[0].binding = 0; be[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   be[0].buffer.type = WGPUBufferBindingType_Uniform;
   for (int i = 1; i <= 9; ++i) {
@@ -879,7 +883,10 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   be[12].binding = 12; be[12].visibility = WGPUShaderStage_Fragment;
   be[12].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;   // R32F heightfield
   be[12].texture.viewDimension = WGPUTextureViewDimension_2D;
-  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 13; bld.entries = be;
+  be[13].binding = 13; be[13].visibility = WGPUShaderStage_Fragment;
+  be[13].texture.sampleType = WGPUTextureSampleType_Depth;               // pre-ocean depth snapshot
+  be[13].texture.viewDimension = WGPUTextureViewDimension_2D;
+  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 14; bld.entries = be;
   o.bgl = wgpuDeviceCreateBindGroupLayout(device, &bld);
   // Deep-water placeholder heightfield (-1000 m) until the real one arrives.
   {
@@ -2594,6 +2601,12 @@ int main(int argc, char** argv) {
     return wgpuTextureCreateView(tex, &dv);
   };
   WGPUTextureView depthReadView = makeDepthReadView(depthTex);
+  // Pre-ocean depth snapshot: the main depth buffer is cloned here after the
+  // opaque scene (terrain, scatter, SHIPS) draws but before the ocean, so the
+  // ocean shader can measure the water column to whatever sits beneath each
+  // surface fragment (Beer-Lambert see-through — hulls ghost through the water).
+  WGPUTexture oceanDepthTex = makeDepthTexture(device, curW, curH);
+  WGPUTextureView oceanDepthReadView = makeDepthReadView(oceanDepthTex);
   // Planar reflection target (colour + its own depth).
   WGPUTexture reflTex = makeColorRTT(device, curW, curH, kSceneFormat);
   WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
@@ -2786,6 +2799,9 @@ int main(int argc, char** argv) {
       depthTex = makeDepthTexture(device, curW, curH);
       depthView = wgpuTextureCreateView(depthTex, nullptr);
       depthReadView = makeDepthReadView(depthTex);
+      wgpuTextureViewRelease(oceanDepthReadView); wgpuTextureRelease(oceanDepthTex);
+      oceanDepthTex = makeDepthTexture(device, curW, curH);
+      oceanDepthReadView = makeDepthReadView(oceanDepthTex);
       wgpuTextureViewRelease(reflView);   wgpuTextureRelease(reflTex);
       wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
       reflTex = makeColorRTT(device, curW, curH, kSceneFormat);
@@ -4750,11 +4766,14 @@ int main(int argc, char** argv) {
       oceanTB = glm::vec4((float)otm.minX, (float)otm.maxX, (float)otm.minZ, (float)otm.maxZ);
       oceanTM = glm::vec4((float)otm.width, (float)otm.height, 1.0f, 10.0f);
     }
+    const glm::vec4 oceanProj(proj[0][0], proj[1][1], proj[2][2], proj[3][2]);
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
-                    glm::vec4(seaAmp, 0.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM };
+                    glm::vec4(seaAmp, 0.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
+                    oceanProj };
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
-                       glm::vec4(0.0f, 1400.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM };
+                       glm::vec4(0.0f, 1400.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
+                       oceanProj };
     wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
                     skyMoon, skyParams };
@@ -5046,9 +5065,30 @@ int main(int argc, char** argv) {
       float windAmp = glm::clamp((swv.valid ? swv.windSpeed : 8.0f) / 12.0f, 0.3f, 1.5f);
       scatterSys.draw(pass, queue, viewProj, eye, lightDir, dayK, (double)t, windAmp);
     }
+    // Ships: one draw per instance, each selecting its uniform slot via dynamic
+    // offset. Drawn BEFORE the ocean (like the scatter) so the submerged hull
+    // stays in the framebuffer + depth snapshot and can ghost through the water.
+    {
+      std::map<Mesh*, uint32_t> slot;
+      for (const ShipInst& s : ships) {
+        Mesh* m = s.mesh;
+        uint32_t idx = slot[m];
+        if (idx >= kMaxShipInstances) continue;
+        uint32_t dynOffs[2] = { idx * m->uniformStride, idx * kPaletteStride };
+        wgpuRenderPassEncoderSetPipeline(pass, m->pipeline);
+        wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        for (size_t i = 0; i < m->submeshes.size(); ++i) {
+          const RigSubmesh& sm = m->submeshes[i];
+          wgpuRenderPassEncoderSetBindGroup(pass, 0, m->bindGroups[i], 2, dynOffs);
+          wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+        }
+        slot[m] = idx + 1;
+      }
+    }
     // Hull water mask: stamp every masked vessel's hull into the stencil plane
     // BEFORE the ocean draws (same per-instance uniform slots as the ship draws
-    // below, so the stamp rides the exact buoyancy/heel transform). The ocean's
+    // above, so the stamp rides the exact buoyancy/heel transform). The ocean's
     // stencil test (NotEqual ref) then rejects those pixels — no sea on the deck.
     if (!std::getenv("SAILSIM_NOSTENCIL")) {
       HullStencil& hs = hullStencil(device, kSceneFormat);
@@ -5070,13 +5110,30 @@ int main(int argc, char** argv) {
           wgpuRenderPassEncoderDrawIndexed(pass, r.second, 1, r.first, 0, 0);
       }
     }
-    // The ocean tests against the stamped ref; ships after it ignore the reference
+    // ── Pre-ocean depth snapshot: everything opaque (terrain, scatter, ships) is
+    //    in the depth buffer now. Clone it so the ocean pass below can measure the
+    //    water column per fragment while still depth-testing/writing normally
+    //    (WebGPU forbids sampling a depth texture that the same pass writes). ──
+    wgpuRenderPassEncoderEnd(pass);
+    wgpuRenderPassEncoderRelease(pass);
+    {
+      WGPUImageCopyTexture cSrc = {}; cSrc.texture = depthTex;
+      WGPUImageCopyTexture cDst = {}; cDst.texture = oceanDepthTex;
+      WGPUExtent3D cExt = { curW, curH, 1 };
+      wgpuCommandEncoderCopyTextureToTexture(encoder, &cSrc, &cDst, &cExt);
+    }
+    colorAttachment.loadOp = WGPULoadOp_Load;
+    depthAttachment.depthLoadOp = WGPULoadOp_Load;
+    depthAttachment.stencilLoadOp = WGPULoadOp_Load;   // keep the hull stamp
+    pass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
+
+    // The ocean tests against the stamped ref; ships before it ignore the reference
     // (their stencil compare is Always).
     wgpuRenderPassEncoderSetStencilReference(pass, kHullStencilRef);
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
-    WGPUBindGroupEntry oe[13] = {};
+    WGPUBindGroupEntry oe[14] = {};
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
     oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
@@ -5090,11 +5147,12 @@ int main(int argc, char** argv) {
     oe[11].binding = 11; oe[11].textureView = reflView;
     oe[12].binding = 12; oe[12].textureView = (terrainR.ready && terrainR.heightView)
                                             ? terrainR.heightView : ocean.placeView;
+    oe[13].binding = 13; oe[13].textureView = oceanDepthReadView;
     oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
-    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 13; obdF.entries = oe;
+    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 14; obdF.entries = oe;
     oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
     oe[0].buffer = ocean.uniformBuf;
-    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 13; obd.entries = oe;
+    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 14; obd.entries = oe;
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);
@@ -5107,26 +5165,6 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, ocean.vbuf, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderSetIndexBuffer(pass, ocean.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderDrawIndexed(pass, ocean.indexCount, 1, 0, 0, 0);
-
-    // Ships: one draw per instance, each selecting its uniform slot via dynamic offset.
-    {
-      std::map<Mesh*, uint32_t> slot;
-      for (const ShipInst& s : ships) {
-        Mesh* m = s.mesh;
-        uint32_t idx = slot[m];
-        if (idx >= kMaxShipInstances) continue;
-        uint32_t dynOffs[2] = { idx * m->uniformStride, idx * kPaletteStride };
-        wgpuRenderPassEncoderSetPipeline(pass, m->pipeline);
-        wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        for (size_t i = 0; i < m->submeshes.size(); ++i) {
-          const RigSubmesh& sm = m->submeshes[i];
-          wgpuRenderPassEncoderSetBindGroup(pass, 0, m->bindGroups[i], 2, dynOffs);
-          wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
-        }
-        slot[m] = idx + 1;
-      }
-    }
 
     // Distant-ship impostor billboards (alpha-tested, depth-written like hulls).
     if (shipImpCount) {

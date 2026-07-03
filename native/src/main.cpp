@@ -2955,7 +2955,10 @@ int main(int argc, char** argv) {
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
   float shudRoll = 0.0f, shudVel = 0.0f;           // damped hit/recoil oscillator (rad)
-  float camShake = 0.0f;                           // decaying camera shake magnitude (m)
+  // Camera shake — the client's trauma model (vessel.service): firing adds 0.32
+  // per shot, taking a hit 0.85; trauma decays 0.6/s. Applied as a ~2 Hz damped
+  // positional swing (distance-compensated) + a faster rotational view jolt.
+  float camTrauma = 0.0f, camShakeTime = 0.0f;
   struct HullDecal { glm::vec3 local; float size; float ang; uint32_t seed; };
   std::map<std::string, std::vector<HullDecal>> shipDecals;   // "" = own ship
   // Ocean cannon-flash glow (client addCannonFlash): warm pools of light on the
@@ -4719,7 +4722,8 @@ int main(int argc, char** argv) {
           scatterSys.startleAt(fe.mwx, fe.mwz);   // the bang flushes nearby resting gulls
           firedThisFrame = true;
           shudVel += (fe.side == 0 ? 0.22f : -0.22f);   // recoil rocks away from the firing side
-          camShake = std::min(1.2f, camShake + 0.15f);
+          if (camTrauma < 0.01f) camShakeTime = 0.0f;   // fresh shake swings from zero
+          camTrauma = std::min(1.0f, camTrauma + 0.32f);   // per shot — a broadside stacks toward a big jolt
         }
       }
       for (int gs = 0; gs < 2; ++gs) {
@@ -4768,7 +4772,8 @@ int main(int argc, char** argv) {
           // Shudder + shake when WE are struck (roll kick toward the hit side).
           if (ie.hit.victimId == meId) {
             shudVel += (ie.hit.side == "port" ? -1.0f : 1.0f) * 0.55f;
-            camShake = std::min(1.2f, camShake + 0.5f);
+            if (camTrauma < 0.01f) camShakeTime = 0.0f;
+            camTrauma = std::min(1.0f, camTrauma + 0.85f);   // taking a hit: a big, ringing shake
           }
           // Scorch decal (non-grape): stored vessel-local (yaw frame) so it rides the hull.
           if (!ie.hit.grape) {
@@ -4848,7 +4853,7 @@ int main(int argc, char** argv) {
       // Hit shudder decay (damped oscillator) + camera shake decay.
       shudVel += -shudRoll * 22.0f * dt - shudVel * 5.0f * dt;
       shudRoll += shudVel * dt;
-      camShake = std::max(0.0f, camShake - camShake * 3.0f * dt - 0.02f * dt);
+      camTrauma = std::max(0.0f, camTrauma - 0.6f * dt);   // slow decay: the shake rings ~1 s
       // Advance the effect fields (wind-drifted smoke).
       {
         mp::WaveState fw = mpClient.wave();
@@ -5139,12 +5144,24 @@ int main(int argc, char** argv) {
     glm::vec3 shipPos(shipX, shipY, shipZ);
     glm::vec3 back = glm::normalize(glm::vec3(glm::rotate(glm::mat4(1.0f), camYawOffset, glm::vec3(0, 1, 0)) * glm::vec4(-fwd, 0.0f)));
     glm::vec3 eye = shipPos + back * (camDist * std::cos(camPitch)) + glm::vec3(0.0f, camDist * std::sin(camPitch), 0.0f);
-    if (camShake > 0.001f) {   // combat hit/recoil shake (decaying pseudo-random jitter)
-      eye += glm::vec3(std::sin((float)t * 47.0f) + 0.6f * std::sin((float)t * 31.7f),
-                       std::sin((float)t * 39.3f + 1.7f),
-                       std::sin((float)t * 43.1f + 0.6f)) * (camShake * 0.35f);
+    // Camera shake (client updateCamera): a ~2 Hz damped positional swing —
+    // each axis a detuned sine under the decaying trauma envelope — scaled up
+    // with zoom so it reads the same at any camDist, plus a faster rotational
+    // VIEW JOLT on the aim point (the jarring whip; offset ~ camDist keeps the
+    // angle constant).
+    float shakeJoltX = 0.0f, shakeJoltY = 0.0f;
+    if (camTrauma > 1e-3f) {
+      camShakeTime += dt;
+      const float st = camShakeTime, amp = 1.2f * camTrauma;
+      const float distScale = std::min(2.0f, std::max(1.0f, camDist / 12.0f));
+      eye += glm::vec3(std::sin(st * 12.6f) * amp,
+                       std::sin(st * 12.6f * 1.11f + 1.2f) * amp * 0.55f,
+                       std::sin(st * 12.6f * 0.87f + 2.4f) * amp * 0.50f) * distScale;
+      const float ra = 0.02f * camTrauma * camDist;
+      shakeJoltX = std::sin(st * 12.6f * 1.8f) * ra;
+      shakeJoltY = std::sin(st * 12.6f * 2.1f + 1.7f) * ra * 0.7f;
     }
-    glm::vec3 lookTarget = shipPos + glm::vec3(0.0f, 1.0f, 0.0f);
+    glm::vec3 lookTarget = shipPos + glm::vec3(shakeJoltX, 1.0f + shakeJoltY, 0.0f);
     glm::vec3 lookUp(0.0f, 1.0f, 0.0f);
     if (std::getenv("SAILSIM_SKYLOOK")) {   // debug: aim at the moon to inspect stars/moon
       lookTarget = eye + moonDir;

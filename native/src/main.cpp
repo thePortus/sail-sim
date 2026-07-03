@@ -5279,7 +5279,11 @@ int main(int argc, char** argv) {
     struct ImpInst { const ShipImpSlug* slug; float x, z, heading; };
     std::vector<ImpInst> shipImposters;
     if (sailing) {
-      const double nowMs = t * 1000.0;
+      // The render cursor and the snapshot stamps share net_mp's steady clock
+      // (snapshots are stamped at MESSAGE RECEIPT, like the client's
+      // performance.now() buffer.push — not at the frame that noticed them).
+      const double nowMs = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
       const double renderAt = nowMs - kInterpDelayMs;
       std::set<std::string> motionSeen;
       for (mp::RemotePlayer rp : mpClient.players()) {
@@ -5289,9 +5293,12 @@ int main(int argc, char** argv) {
         //    (hull, rig animation, decals, labels) rides the smooth track. ──
         motionSeen.insert(rp.id);
         RemoteMotion& rm = remoteMotion[rp.id];
-        if (rp.seq != rm.lastSeq || rm.buf.empty()) {
-          rm.lastSeq = rp.seq;
-          rm.buf.push_back({ nowMs, rp.x, rp.z, rp.heading, rp.speed, rp.turnRate });
+        // Key on the per-MESSAGE counter, not the protocol seq: NPC broadcasts
+        // all carry seq 0, which froze their buffers at one stale snapshot —
+        // merchants then teleported on every interest-set re-entry.
+        if (rp.updSeq != rm.lastSeq || rm.buf.empty()) {
+          rm.lastSeq = rp.updSeq;
+          rm.buf.push_back({ rp.arrivedMs, rp.x, rp.z, rp.heading, rp.speed, rp.turnRate });
           if (rm.buf.size() > 12) rm.buf.erase(rm.buf.begin());
         }
         {

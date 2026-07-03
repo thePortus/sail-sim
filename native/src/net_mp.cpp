@@ -1,6 +1,7 @@
 #include "net_mp.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 
 #include <ixwebsocket/IXWebSocket.h>
@@ -68,6 +69,17 @@ struct Client::Impl {
     return r;
   }
 
+  // Store an update, bumping the per-player message counter + arrival stamp the
+  // motion smoothing keys on (the client's per-message buffer.push equivalent —
+  // the protocol seq can't be used: NPC broadcasts always carry seq 0).
+  void stampAndStore(RemotePlayer& rp) {
+    auto it = players.find(rp.id);
+    rp.updSeq = (it != players.end() ? it->second.updSeq : 0) + 1;
+    rp.arrivedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    players[rp.id] = rp;
+  }
+
   void onMessage(const json& msg) {
     const std::string type = msg.value("type", std::string());
     std::lock_guard<std::mutex> lock(mtx);
@@ -78,12 +90,12 @@ struct Client::Impl {
       if (msg.contains("players") && msg["players"].is_array()) {
         for (const auto& p : msg["players"]) {
           RemotePlayer rp = parsePlayer(p);
-          if (!rp.id.empty() && rp.id != myId) players[rp.id] = rp;
+          if (!rp.id.empty() && rp.id != myId) stampAndStore(rp);
         }
       }
     } else if (type == "update") {
       RemotePlayer rp = parsePlayer(msg);
-      if (!rp.id.empty() && rp.id != myId) players[rp.id] = rp;
+      if (!rp.id.empty() && rp.id != myId) stampAndStore(rp);
     } else if (type == "correction") {
       corr.valid = true;
       corr.x = msg.value("x", 0.0f);

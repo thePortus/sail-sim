@@ -22,7 +22,11 @@ struct RemotePlayer {
   std::string role;          // merchant | pirate | hunter (NPCs only)
   // Rig-animation state (relayed by the server; NPCs send sheetAngle 0).
   float turnRate = 0, sheetAngle = 30;
-  int seq = 0;               // server update sequence (motion-smoothing snapshots key on it)
+  int seq = 0;               // protocol seq (players echo theirs; NPCs always send 0)
+  // Motion-smoothing keys (client parity: it buffered a snapshot per received
+  // update MESSAGE at its arrival time — the protocol seq is useless for NPCs).
+  int updSeq = 0;            // local per-player message counter (bumps every update)
+  double arrivedMs = 0;      // steady-clock receipt time of that update (ms)
   bool isPortTack = false, anchored = false;
   std::string anchorSide = "S";
 };

@@ -25,6 +25,7 @@
 #include <ctime>
 #include <random>
 #include <memory>
+#include <set>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE   // WebGPU clip-space Z is [0,1], like D3D/Metal
 #include <glm/glm.hpp>
@@ -2655,6 +2656,10 @@ int main(int argc, char** argv) {
   std::unique_ptr<vanim::Controller> ownAnim;
   std::string ownAnimSlug;
   int helmInput = 0;
+  // Remote vessels each own a controller too (client: one per OtherPlayerEntry),
+  // pruned when a ship leaves range / swaps to its impostor.
+  std::map<std::string, std::unique_ptr<vanim::Controller>> remoteAnims;
+  std::map<std::string, std::string> remoteAnimSlugs;
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
@@ -2880,6 +2885,7 @@ int main(int argc, char** argv) {
             float sx = 0, sz = 0, sh = 0;
             if (std::sscanf(sp, "%f,%f,%f", &sx, &sz, &sh) >= 2) {
               vessel.x = sx; vessel.z = sz; vessel.heading = glm::radians(sh);
+              vessel.anchorX = sx; vessel.anchorZ = sz;   // carry the anchor (else the clamp yanks the hull back)
               shipX = sx; shipZ = sz; shipHeading = vessel.heading;
               std::printf("[terrain] SAILSIM_START override -> (%.0f, %.0f, %.0f deg)\n", sx, sz, sh);
             }
@@ -4119,6 +4125,16 @@ int main(int argc, char** argv) {
         pu.sailState = sailState;
         pu.vesselName = ownVesselSlug; pu.vesselSlug = ownVesselSlug;
         pu.callsign = authCallsign;
+        // Rig-animation state: remote clients pose our yards/boom/anchor from it.
+        pu.turnRate = glm::degrees(vessel.yawRate);
+        pu.sheetAngle = vessel.sheetAngleDeg;
+        {
+          mp::WaveState pw = mpClient.wave();
+          float pd = std::fmod(glm::degrees(vessel.heading) - (pw.valid ? pw.windBearing : 270.0f) + 360.0f, 360.0f);
+          pu.isPortTack = pd <= 180.0f;
+        }
+        pu.anchored = vessel.anchored;
+        pu.anchorSide = "S";
         mpClient.sendUpdate(pu, netSeq++);
       }
     }
@@ -4350,7 +4366,11 @@ int main(int argc, char** argv) {
     };
 
     // Draw list: our ship first (so it takes reflection slot 0), then remote players.
-    struct ShipInst { Mesh* mesh; glm::mat4 model; };
+    struct ShipInst {
+      Mesh* mesh; glm::mat4 model;
+      bool remote = false;            // animated remote vessel (towns/own stay false)
+      mp::RemotePlayer rp;            // broadcast rig state (remote only)
+    };
     std::vector<ShipInst> ships;
     Mesh* ownMesh = nullptr;
     if (sailing && !ownVesselSlug.empty()) {
@@ -4372,7 +4392,7 @@ int main(int argc, char** argv) {
           shipImposters.push_back({ &ait->second, rp.x, rp.z, glm::radians(rp.heading) });
         } else {
           Mesh& rmv = vesselFor(slug);
-          ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv) });   // server heading is degrees
+          ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv), true, rp });   // server heading is degrees
         }
       }
       // Town streaming (client BUILD_RANGE=600 / PIER_BUILD_RANGE=2400): real GLBs
@@ -4844,6 +4864,55 @@ int main(int argc, char** argv) {
       std::memcpy(blob.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4), mw.data(),
                   std::min(mw.size(), (size_t)kMaxMorphWeights) * sizeof(float));
       wgpuQueueWriteBuffer(queue, ownMesh->paletteBuf, 0, blob.data(), kPaletteStride);
+    }
+    // Remote vessels: one controller each, driven from the broadcast rig state
+    // (client tickOther): rudder from turnRate, trim from sheet+tack, furl from
+    // sailState, anchor per side, flags from the shared wind. Slot indices walk
+    // the ships list exactly like the uniform/draw loops so palettes line up.
+    if (sailing) {
+      mp::WaveState rw2 = mpClient.wave();
+      const float rwFrom = rw2.valid ? rw2.windBearing : 270.0f;
+      const float rwKn = rw2.valid ? rw2.windSpeed : 8.0f;
+      std::map<Mesh*, uint32_t> aslot;
+      std::vector<uint8_t> blob(kPaletteStride);
+      std::set<std::string> seen;
+      for (const ShipInst& si : ships) {
+        const uint32_t idx = aslot[si.mesh]++;
+        if (!si.remote || idx >= kMaxShipInstances) continue;
+        if (!si.mesh->rig || !si.mesh->rig->ok) continue;
+        seen.insert(si.rp.id);
+        const std::string slug = si.rp.vesselSlug.empty() ? "pinnace" : si.rp.vesselSlug;
+        auto& ctl = remoteAnims[si.rp.id];
+        if (!ctl || remoteAnimSlugs[si.rp.id] != slug) {
+          ctl = std::make_unique<vanim::Controller>(si.mesh->rig, slug, si.mesh->manifestPath);
+          remoteAnimSlugs[si.rp.id] = slug;
+          std::printf("[vanim] remote controller: %s (%s) slot %u\n", si.rp.callsign.c_str(), slug.c_str(), idx);
+        }
+        ctl->setRudder(glm::clamp(si.rp.turnRate / 20.0f, -1.0f, 1.0f));
+        ctl->setSailTrim(si.rp.sheetAngle > 0.0f ? si.rp.sheetAngle : 30.0f, si.rp.isPortTack);
+        const int rstate = si.rp.sailState == "reefed" || si.rp.sailState == "furled" || si.rp.sailState == "anchor" ? 0
+                         : si.rp.sailState == "topsails" || si.rp.sailState == "half" ? 1 : 2;
+        ctl->applySailState(rstate);
+        const char aside = si.rp.anchorSide == "P" ? 'P' : 'S';
+        ctl->dropAnchor('S', si.rp.anchored && aside == 'S' ? 1.0f : 0.0f);
+        ctl->dropAnchor('P', si.rp.anchored && aside == 'P' ? 1.0f : 0.0f);
+        ctl->idleWind(glm::radians(rwFrom + 180.0f) - glm::radians(si.rp.heading),
+                      std::min(1.2f, rwKn / 8.0f), t);
+        ctl->tickRig(dt);
+        std::fill(blob.begin(), blob.end(), 0);
+        const auto& rpal = ctl->palette();
+        std::memcpy(blob.data(), rpal.data(), std::min(rpal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
+        const auto& rmw = ctl->morphWeights();
+        std::memcpy(blob.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4), rmw.data(),
+                    std::min(rmw.size(), (size_t)kMaxMorphWeights) * sizeof(float));
+        wgpuQueueWriteBuffer(queue, si.mesh->paletteBuf, (uint64_t)idx * kPaletteStride, blob.data(), kPaletteStride);
+      }
+      // Prune controllers for ships gone / swapped to impostors (they re-create
+      // fresh on approach, like the client rebuilding an entry's controller).
+      for (auto it = remoteAnims.begin(); it != remoteAnims.end();) {
+        if (!seen.count(it->first)) { remoteAnimSlugs.erase(it->first); it = remoteAnims.erase(it); }
+        else ++it;
+      }
     }
     // Every ship's uniforms into its vessel's dynamic-offset slots (same per-mesh
     // ordering as the draw loop below, so slot indices line up).

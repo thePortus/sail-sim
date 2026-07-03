@@ -20,6 +20,10 @@ struct RemotePlayer {
   std::string callsign, vesselName, vesselSlug, sailState;
   bool npc = false;          // NPC merchant / pirate / hunter (hidden from the map for non-staff)
   std::string role;          // merchant | pirate | hunter (NPCs only)
+  // Rig-animation state (relayed by the server; NPCs send sheetAngle 0).
+  float turnRate = 0, sheetAngle = 30;
+  bool isPortTack = false, anchored = false;
+  std::string anchorSide = "S";
 };
 
 // Minimap intel (npc.js broadcasts): lane hotspots for everyone; the full
@@ -53,6 +57,10 @@ struct ChatMessage {
 struct PlayerUpdate {
   float x = 0, z = 0, heading = 0, speed = 0;
   std::string sailState, vesselName, vesselSlug, callsign;
+  // Rig-animation state (remote clients pose our yards/boom/anchor from these).
+  float turnRate = 0, sheetAngle = 30;
+  bool isPortTack = false, anchored = false;
+  std::string anchorSide = "S";
 };
 
 // ── Town economy (dock menu) state — mirrors the browser's MultiplayerService

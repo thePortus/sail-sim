@@ -124,6 +124,7 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     trimRate_ = 2.0f; boomSwingRate_ = 1.8f; furlRate_ = 0.6f;
     rudderNode_ = "B_Rudder"; rudderMaxRad_ = 35.0f * kPi / 180.0f; rudderSign_ = 1.0f;
     wheelNode_ = "B_Wheel"; wheelAxis_ = glm::vec3(0, 1, 0);
+    boomMap_ = BoomMap::SheetMinus90; boomNodes_ = { "B_Boom", "B_Gaff" };
     flags_ = { { "B_Flag", 2.0f, 0.0f, 0.15f }, { "B_Pennant", 1.6f, -0.4f, 0.30f } };
     flagYawOffset_ = kPi;   // rest streams ~180° off downwind (client FLAG_YAW_OFFSET)
     furlTables_[2] = table({ {"Mainsail",0},{"Topsail",0},{"Topgallant",0},{"Course",0},{"ForeStaysail",0},{"Jib",0} });
@@ -145,6 +146,8 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     trimMode_ = TrimMode::SymmetricSquare; rudderMode_ = RudderMode::SymmetricClip;
     trimRate_ = 1.4f; furlRate_ = 0.5f;
     wheelNode_ = "B_Wheel"; wheelAxis_ = glm::vec3(1, 0, 0);   // axle = local X
+    boomMap_ = BoomMap::SheetDirect; boomNodes_ = { "B_Boom", "B_Gaff" };
+    boomSign_ = -1.0f;   // leeward under this hull's handedness (verified: wind on port -> gaff to starboard)
     // Cat-tackle cable morphs are raw model-side while the AnchorDrop clips are
     // game-side — SWAPPED on purpose (BrigController cableIdx).
     cableS_ = { "CatTackle", "Drop_P", 1 };
@@ -189,10 +192,8 @@ void Controller::setRudder(float t) { rudderTarget_ = glm::clamp(t, -1.0f, 1.0f)
 void Controller::setSailTrim(float sheetAngleDeg, bool isPortTack) {
   switch (trimMode_) {
     case TrimMode::SloopHybrid: {
-      // Yards brace from the eased sheet; boom/gaff swing leeward per tack.
+      // Yards brace from the eased sheet; boom/gaff swing handled below.
       trimTarget_ = glm::clamp((88.0f - sheetAngleDeg) / 83.0f, 0.0f, 1.0f);
-      const float swingSide = isPortTack ? -1.0f : 1.0f;
-      boomTarget_ = swingSide * (sheetAngleDeg - 90.0f) * kPi / 180.0f;
       break;
     }
     case TrimMode::SymmetricLug: {
@@ -211,6 +212,11 @@ void Controller::setSailTrim(float sheetAngleDeg, bool isPortTack) {
       break;
     }
   }
+  // Fore-and-aft boom/gaff: swing to the leeward side by the sheet angle
+  // (offset per rig — see BoomMap in the header).
+  const float swingSide = (isPortTack ? -1.0f : 1.0f) * boomSign_;
+  if (boomMap_ == BoomMap::SheetMinus90)     boomTarget_ = swingSide * (sheetAngleDeg - 90.0f) * kPi / 180.0f;
+  else if (boomMap_ == BoomMap::SheetDirect) boomTarget_ = swingSide * sheetAngleDeg * kPi / 180.0f;
   if (!trimInit_) { trimCur_ = trimTarget_; boomCur_ = boomTarget_; trimInit_ = true; }
 }
 
@@ -399,10 +405,10 @@ void Controller::tickRig(float dt) {
   }
 
   // 4. Code-driven bones ON TOP of the clips.
-  if (trimMode_ == TrimMode::SloopHybrid) {
-    // Boom + gaff swing overrides the Trim clip's one-sided channels (tack-correct).
-    composeSpinParent(nodeByName("B_Boom"), glm::vec3(0, 1, 0), boomCur_);
-    composeSpinParent(nodeByName("B_Gaff"), glm::vec3(0, 1, 0), boomCur_);
+  if (boomMap_ != BoomMap::None) {
+    // Boom/gaff swing overrides the Trim clip's channels (tack-correct side).
+    for (const std::string& bn : boomNodes_)
+      composeSpinParent(nodeByName(bn), glm::vec3(0, 1, 0), boomCur_);
   }
   if (rudderMode_ == RudderMode::SloopBone) {
     composeSpinParent(nodeByName(rudderNode_), glm::vec3(0, 1, 0), rudderCur_ * rudderMaxRad_ * rudderSign_);

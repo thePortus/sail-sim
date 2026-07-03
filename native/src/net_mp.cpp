@@ -38,6 +38,11 @@ struct Client::Impl {
     r.sailState  = j.value("sailState", std::string());
     r.npc        = j.value("npc", false);
     r.role       = j.value("role", std::string());
+    r.turnRate   = j.value("turnRate", 0.0f);
+    r.sheetAngle = j.value("sheetAngle", 30.0f);
+    r.isPortTack = j.value("isPortTack", false);
+    r.anchored   = j.value("anchored", false);
+    r.anchorSide = j.value("anchorSide", std::string("S"));
     return r;
   }
 
@@ -287,6 +292,8 @@ void Client::sendUpdate(const PlayerUpdate& u, uint32_t seq) {
     { "x", u.x }, { "z", u.z }, { "heading", u.heading }, { "speed", u.speed },
     { "sailState", u.sailState }, { "vesselName", u.vesselName },
     { "vesselSlug", u.vesselSlug }, { "callsign", u.callsign }, { "seq", seq },
+    { "turnRate", u.turnRate }, { "sheetAngle", u.sheetAngle },
+    { "isPortTack", u.isPortTack }, { "anchored", u.anchored }, { "anchorSide", u.anchorSide },
   };
   p_->ws.send(j.dump());
 }

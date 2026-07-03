@@ -101,6 +101,16 @@ private:
   RudderMode rudderMode_ = RudderMode::SymmetricClip;
   float trimRate_ = 1.6f, rudderRate_ = 4.0f, furlRate_ = 0.6f, anchorRate_ = 0.7f;
   float boomSwingRate_ = 1.8f;
+  // Code-driven fore-and-aft boom/gaff swing (the Trim clip can't represent a
+  // tack-dependent side). Sloop: swing = side*(sheet-90) — its boom rest is
+  // athwartships. Brig: swing = side*sheet — its gaff rig rests on the
+  // centreline and the asset's Trim clip holds it CONSTANT (verified; the
+  // browser shares that flaw, fixed here). Merchantman's spanker trims via its
+  // clip, so it needs none.
+  enum class BoomMap { None, SheetMinus90, SheetDirect };
+  BoomMap boomMap_ = BoomMap::None;
+  float boomSign_ = 1.0f;
+  std::vector<std::string> boomNodes_;
   float rudderMaxRad_ = 0.61f, rudderSign_ = 1.0f, trimTackSign_ = 1.0f;
   std::string rudderNode_, wheelNode_;
   glm::vec3 wheelAxis_ = glm::vec3(0, 1, 0);

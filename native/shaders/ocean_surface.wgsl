@@ -36,7 +36,7 @@ fn wakeCV(wxz : vec2<f32>) -> vec2<f32> {
         let bmeta = cam.wakeMeta[b];                                  // x, z, count, speed
         let toBoat = wxz - bmeta.xy;
         if (dot(toBoat, toBoat) > 45000.0) { continue; }              // ~210 m cull per ship
-        if (bmeta.z < 2.0) { continue; }
+        if (bmeta.z < 1.0) { continue; }
         let base = b * 40;
         var bestD = 1.0e9;
         var bestAge = 0.0;
@@ -53,6 +53,25 @@ fn wakeCV(wxz : vec2<f32>) -> vec2<f32> {
                 bestD = d;
                 bestAge = mix(cam.wakePaths[base + i].z, cam.wakePaths[base + i + 1].z, t);
                 bestSpd = mix(cam.wakePaths[base + i].w, cam.wakePaths[base + i + 1].w, t);
+            }
+        }
+        // LIVE HEAD segment: newest laid point -> the ship's CURRENT position
+        // (bmeta.xy/.w), age blending to 0 and speed to the live speed. The wake
+        // head grows continuously with the hull, so a new breadcrumb landing
+        // (exactly at the head's end) changes nothing visually — this removes
+        // the 3 m chunk-pop each laid point used to cause. Gated on the same
+        // live-speed threshold the tracker lays points with (|speed|x4 > 0.2),
+        // so a stopped ship's trail still ages out completely.
+        if (bmeta.w > 0.2) {
+            let lastP = cam.wakePaths[base + i32(bmeta.z) - 1];
+            let ab = bmeta.xy - lastP.xy;
+            let L2 = max(dot(ab, ab), 1.0e-3);
+            let t = clamp(dot(wxz - lastP.xy, ab) / L2, 0.0, 1.0);
+            let d = length(wxz - (lastP.xy + ab * t));
+            if (d < bestD) {
+                bestD = d;
+                bestAge = mix(lastP.z, 0.0, t);
+                bestSpd = mix(lastP.w, bmeta.w, t);
             }
         }
         let ageFade = 1.0 - smoothstep(0.0, 11.0, bestAge);

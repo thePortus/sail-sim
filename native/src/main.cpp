@@ -2965,6 +2965,8 @@ int main(int argc, char** argv) {
   // Ship wake breadcrumb tracks (local + remotes) feeding the ocean's curved
   // trailing wakes — the client's WakeTracker, fed the smoothed display poses.
   wake::Tracker wakeTracker;
+  // Ship's-bell clock baseline (game hours last frame; -1 = not established).
+  float bellPrevHours = -1.0f;
   const float kFlashLife = 0.45f;
   // Salvage (phase 4): crates already requested (re-armed when we sail back out).
   std::set<std::string> salvageReq;
@@ -4685,6 +4687,14 @@ int main(int argc, char** argv) {
         if (frame >= 420 && frame % 780 == 0) guns.armOrFire(1);   // re-fire as reloads complete
         if (frame == 420) guns.armOrFire(1);
       }
+      // Audio test hook: SAILSIM_BELLTEST=1 rings the ship's bell at frame 240
+      // and follows with a small gull chorus (hear both synths on demand).
+      if (std::getenv("SAILSIM_BELLTEST") && frame == 240) {
+        audioSys.playBell(1.0f);
+        for (int ci = 0; ci < 6; ++ci)
+          audioSys.playGullCry(0.25f + 0.05f * ci, 760.0f + 110.0f * ci,
+                               -0.8f + 0.32f * ci, 12.0f + ci, 1.2f + 0.35f * ci);
+      }
       // FX isolation: repeatedly blast at a fixed spot ahead of the ship.
       if (std::getenv("SAILSIM_FXTEST") && frame >= 200 && frame % 90 == 0) {
         glm::vec3 at(vessel.x + 10.0f, 2.5f, vessel.z + 8.0f);
@@ -4703,6 +4713,7 @@ int main(int argc, char** argv) {
           if (oceanFlashes.size() >= 6) oceanFlashes.erase(oceanFlashes.begin());
           oceanFlashes.push_back({ fe.mwx, fe.mwz, 0.0f, std::atan2(fe.dirZ, fe.dirX) });
           audioSys.playCannon(1.0f);
+          scatterSys.startleAt(fe.mwx, fe.mwz);   // the bang flushes nearby resting gulls
           firedThisFrame = true;
           shudVel += (fe.side == 0 ? 0.22f : -0.22f);   // recoil rocks away from the firing side
           camShake = std::min(1.2f, camShake + 0.15f);
@@ -4727,6 +4738,7 @@ int main(int argc, char** argv) {
         if (oceanFlashes.size() >= 6) oceanFlashes.erase(oceanFlashes.begin());
         oceanFlashes.push_back({ rs.ox, rs.oz, 0.0f, std::atan2(dZ, dX) });
         audioSys.playCannon(std::max(0.0f, 1.0f - glm::distance(lastEye, mw) / 800.0f));
+        scatterSys.startleAt(rs.ox, rs.oz);   // a remote broadside startles gulls near its muzzle too
       }
       // Server-adjudicated hits: matched balls defer to the server tof; the
       // impact list feeds the phase-2 FX (splash/splinters/scorch).
@@ -5071,6 +5083,28 @@ int main(int argc, char** argv) {
       gameHours = (float)(wall / 60.0);
     }
     if (const char* th = std::getenv("SAILSIM_HOUR")) gameHours = (float)std::atof(th);   // debug: pin the hour
+    // Ship's bell (ship-bell.service): a "clang clang" whenever the day clock
+    // crosses a watch mark — midnight, dawn, noon, dusk. A big jump (server
+    // clock re-sync, or an admin time override landing) never rings.
+    if (sailing) {
+      const float prevH = bellPrevHours;
+      bellPrevHours = gameHours;
+      if (prevH >= 0.0f) {
+        float delta = gameHours - prevH;
+        if (delta < 0) delta += 24.0f;
+        if (delta > 0 && delta <= 1.0f) {
+          static const float kBellMarks[4] = { 0.0f, 6.0f, 12.0f, 18.0f };
+          for (float mark : kBellMarks) {
+            const bool crossed = prevH < gameHours
+                               ? (prevH < mark && mark <= gameHours)
+                               : (mark > prevH || mark <= gameHours);   // midnight wrap
+            if (crossed) { audioSys.playBell(1.0f); break; }
+          }
+        }
+      }
+    } else {
+      bellPrevHours = -1.0f;
+    }
     const glm::vec3 sunDir  = computeSunDir(gameHours);
     const glm::vec3 moonDir = -sunDir;
     const float sunEl = sunDir.y;                                  // -1 midnight .. +1 noon
@@ -5412,6 +5446,20 @@ int main(int argc, char** argv) {
                                     vessel.speed * 0.514f, vessel.anchored };
       scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
                         [&](float x, float z) { return fftHeight(x, z); });
+      // Gull cries queued by the flock behaviours -> attenuate by camera
+      // distance ((1 - d/320)^2, inaudible skipped), pan by view-space
+      // position (client playCry), and hand to the synth.
+      for (const scatter::System::CryEvent& ce : scatterSys.drainCries()) {
+        const float dist = glm::length(glm::vec3(ce.x, ce.y, ce.z) - eye);
+        if (dist >= 320.0f) continue;
+        const float fall = 1.0f - dist / 320.0f;
+        const float gain = fall * fall * ce.level;
+        if (gain < 0.012f) continue;
+        const glm::vec4 vpos = viewM * glm::vec4(ce.x, ce.y, ce.z, 1.0f);
+        const float pan = glm::clamp(vpos.x / std::max(8.0f, std::fabs(vpos.z)), -1.0f, 1.0f);
+        const float lfoHz = 12.0f + 7.0f * ((float)std::rand() / RAND_MAX);
+        audioSys.playGullCry(gain, ce.pitch, pan, lfoHz, ce.delay);
+      }
     }
     // Rain driver (cloud.service precip port): cloudiness -> drizzle/rain/storm
     // target, eased faster on the way in than out.

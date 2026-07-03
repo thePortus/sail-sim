@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <webgpu/webgpu.h>
@@ -50,6 +51,18 @@ public:
   void draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& viewProj,
             const glm::vec3& eye, const glm::vec3& lightDir, float dayK,
             double timeSec, float windAmp);
+
+  // ── Gull-cry audio events (bird.service cryBurst / updateAmbientCalls) ──
+  // update() queues cries at world positions (startled rafts burst 5-12 calls;
+  // the nearest flock makes an occasional relaxed call). The caller drains them
+  // each frame, attenuates by camera distance and pans by view space, then
+  // hands them to the audio system.
+  struct CryEvent { float x, y, z, level, pitch, delay; };
+  std::vector<CryEvent> drainCries();
+
+  // Flush every resting raft within `radius` of (x, z) — a cannon going off
+  // (client BirdService.startleAt, CANNON_RADIUS 130 m). Startled rafts cry.
+  void startleAt(float x, float z, float radius = 130.0f);
 
   struct Impl;   // public so the module's free helper functions can name it
 private:

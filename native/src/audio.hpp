@@ -53,6 +53,13 @@ public:
   void playShipHit(float vol);
   // Demasting: creaking groan + volley of wood cracks (mast-crack.service).
   void playMastCrack(float vol);
+  // Ship's bell (ship-bell.service): "clang clang" at the four watch marks —
+  // two strikes of an inharmonic struck-bell synth 0.5 s apart.
+  void playBell(float vol);
+  // One synthesized gull cry (bird.service playCry): reedy band-passed sawtooth
+  // with a rising->falling pitch contour and a square-tremolo "laugh". gain is
+  // pre-attenuated by the caller; pan -1..1; lfoHz 12-19; delay in seconds.
+  void playGullCry(float gain, float pitch, float pan, float lfoHz, float delay);
   // One-shot procedural thunder (cloud.service playThunder): vol 0..1 sets the
   // rumble's brightness, attack sharpness and length (distant rolls longer).
   void playThunder(float vol);

@@ -345,6 +345,12 @@ struct System::Impl {
   // Wildlife (client constants).
   std::vector<Flock> flocks;
   float spawnTimer = 0;
+  // Gull-cry audio events (drained by the caller each frame) + the relaxed
+  // ambient-call timer (bird.service _ambientTimer, first call after 1.5 s).
+  std::vector<System::CryEvent> cries;
+  float ambientTimer = 1.5f;
+  float lastStorm = 0;                           // for startleAt's weather gate
+  static constexpr float CRY_AUDIBLE = 320.0f;   // metres a cry carries
   static constexpr int   MAX_FLOCKS = 4;         // quality High
   static constexpr float SPAWN_INTERVAL = 1.2f;
   static constexpr float SPAWN_MIN = 60, SPAWN_MAX = 160, DESPAWN = 240, LAND_PROXIMITY = 250;
@@ -1062,9 +1068,37 @@ static void placePatch(Impl* p, Layer& l, int pxi, int pzi, Kernel k) {
 }
 
 // ── Wildlife updates: exact behaviour ports ───────────────────────────────────
+// Kick a resting raft into the air (bird.service beginTakeoff — also the
+// startle entry points: ship approach, cannon fire, worsening weather).
+static void flockTakeoff(Impl* p, Flock& f) {
+  f.state = FlockState::TAKEOFF; f.stateTimer = 0;
+  f.anchorX = f.cx; f.anchorZ = f.cz;
+  f.gx = f.cx; f.gz = f.cz; f.goalAlt = Impl::SEA_Y;
+  f.wTx = f.cx; f.wTz = f.cz; f.wanderTimer = 0;
+  for (BirdMember& m : f.members) {
+    m.airborne = true;
+    m.px = f.cx + m.ox; m.py = Impl::SEA_Y; m.pz = f.cz + m.oz;
+    m.hdg = std::atan2(m.px - f.cx, m.pz - f.cz) + (p->frand() - 0.5f) * 0.6f;
+    m.spd = Impl::MIN_SPD; m.vy = Impl::CLIMB_RATE * 0.7f; m.bank = 0;
+  }
+}
+
+// A flurry of cries from a startled raft (bird.service cryBurst): 5-12 gulls
+// at varied pitches, jittered positions and small time offsets.
+static void cryBurst(Impl* p, const Flock& f) {
+  const int n = 5 + (int)(p->frand() * 8.0f);
+  for (int i = 0; i < n && p->cries.size() < 64; ++i)
+    p->cries.push_back({ f.cx + (p->frand() - 0.5f) * 22.0f, 1.5f,
+                         f.cz + (p->frand() - 0.5f) * 22.0f,
+                         0.5f + p->frand() * 0.4f,
+                         760.0f + p->frand() * 620.0f,
+                         p->frand() * 1.3f });
+}
+
 static void updateBirds(Impl* p, float dt, float camX, float camZ,
                         const System::ShipInfo& ship, float storminess) {
   bool welcome = storminess < 0.35f;
+  p->lastStorm = storminess;
 
   for (int i = (int)p->flocks.size() - 1; i >= 0; --i) {
     Flock& f = p->flocks[(size_t)i];
@@ -1124,18 +1158,7 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
 
   bool shipUnderway = !ship.anchored && std::fabs(ship.speedMps) > Impl::FOLLOW_MIN_SPD && welcome;
 
-  auto beginTakeoff = [&](Flock& f) {
-    f.state = FlockState::TAKEOFF; f.stateTimer = 0;
-    f.anchorX = f.cx; f.anchorZ = f.cz;
-    f.gx = f.cx; f.gz = f.cz; f.goalAlt = Impl::SEA_Y;
-    f.wTx = f.cx; f.wTz = f.cz; f.wanderTimer = 0;
-    for (BirdMember& m : f.members) {
-      m.airborne = true;
-      m.px = f.cx + m.ox; m.py = Impl::SEA_Y; m.pz = f.cz + m.oz;
-      m.hdg = std::atan2(m.px - f.cx, m.pz - f.cz) + (p->frand() - 0.5f) * 0.6f;
-      m.spd = Impl::MIN_SPD; m.vy = Impl::CLIMB_RATE * 0.7f; m.bank = 0;
-    }
-  };
+  auto beginTakeoff = [&](Flock& f) { flockTakeoff(p, f); };
   auto updateGoal = [&](Flock& f) {
     if ((f.wanderTimer -= dt) <= 0) {
       float ang = p->frand() * TAU, r = f.wanderR * (0.3f + p->frand() * 0.7f);
@@ -1324,7 +1347,10 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
       else {
         bool closing = minD < f.nearShipDist - 0.3f;
         f.nearShipDist = minD;
-        if (minD < Impl::IMMINENT_RADIUS || (closing && minD < Impl::STARTLE_RADIUS)) beginTakeoff(f);
+        if (minD < Impl::IMMINENT_RADIUS || (closing && minD < Impl::STARTLE_RADIUS)) {
+          beginTakeoff(f);
+          if (welcome) cryBurst(p, f);   // no alarm calls once they're fleeing the weather
+        }
       }
     }
     // Rest stretch poses.
@@ -1336,6 +1362,29 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
         else if (p->frand() < 0.5f) { m.restWingsOut = true; m.restTimer = 1.5f + p->frand() * 4; }
         else m.restTimer = 4 + p->frand() * 10;
       }
+  }
+
+  // Occasional relaxed call from the flock nearest the camera (bird.service
+  // updateAmbientCalls): every 2.5-7.5 s, silent once the weather turns.
+  if (!p->flocks.empty() && welcome) {
+    p->ambientTimer -= dt;
+    if (p->ambientTimer <= 0) {
+      p->ambientTimer = 2.5f + p->frand() * 5.0f;
+      Flock* best = nullptr; float bestD = 1e9f;
+      for (Flock& f : p->flocks) {
+        float d = std::hypot(camX - f.cx, camZ - f.cz);
+        if (d < bestD) { bestD = d; best = &f; }
+      }
+      if (best && bestD <= Impl::CRY_AUDIBLE * 0.85f) {
+        int calls = p->frand() < 0.3f ? 2 : 1;   // usually a lone call, sometimes a pair
+        for (int i = 0; i < calls && p->cries.size() < 64; ++i)
+          p->cries.push_back({ best->cx + (p->frand() - 0.5f) * 18.0f, best->cy + 1.0f,
+                               best->cz + (p->frand() - 0.5f) * 18.0f,
+                               0.28f + p->frand() * 0.22f,
+                               780.0f + p->frand() * 560.0f,
+                               (float)i * 0.35f });
+      }
+    }
   }
 }
 
@@ -1621,6 +1670,28 @@ static void updateFish(Impl* p, float dt, float t, const System::ShipInfo& ship)
       f.y = std::min(f.y, ws - Impl::F_SURFACE_CLEAR * 0.5f);
       float effortTarget = std::clamp((f.speed - 1.0f) / 3.5f, 0.2f, 1.0f);
       f.effort += (effortTarget - f.effort) * std::min(1.0f, dt * 5);
+    }
+  }
+}
+
+std::vector<System::CryEvent> System::drainCries() {
+  Impl* p = p_.get();
+  std::vector<CryEvent> out;
+  if (p) out.swap(p->cries);
+  return out;
+}
+
+void System::startleAt(float x, float z, float radius) {
+  Impl* p = p_.get();
+  if (!p || !p->ready) return;
+  const float r2 = radius * radius;
+  const bool welcome = p->lastStorm < 0.35f;
+  for (Flock& f : p->flocks) {
+    if (f.state != FlockState::RESTING) continue;
+    const float dx = f.cx - x, dz = f.cz - z;
+    if (dx * dx + dz * dz <= r2) {
+      flockTakeoff(p, f);
+      if (welcome) cryBurst(p, f);
     }
   }
 }

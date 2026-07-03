@@ -294,6 +294,48 @@ struct ImpLayer {
   float attack = 0.002f, tauD = 0.3f;
 };
 struct ImpactDesc { float vol = 1; int n = 0; ImpLayer L[36]; };
+
+// Gull cry (bird.service playCry): a reedy band-passed sawtooth with a
+// rising->falling pitch contour, a fast square-wave tremolo "laugh", a
+// piecewise strike/decay envelope, and constant-power stereo pan. The caller
+// pre-attenuates gain by camera distance and derives pan from view space.
+struct GullDesc { float gain = 0.3f, pitch = 1000, pan = 0, lfoHz = 15, delay = 0; };
+struct GullVoice {
+  GullDesc d;
+  double tau = 0;
+  bool active = false;
+  Biquad bp;                       // fixed bandpass at 1.8x pitch, Q 3.5
+  float ph = 0;                    // sawtooth phase
+  double lfoPh = 0;                // tremolo square LFO phase
+  float gl = 0.7071f, gr = 0.7071f;   // equal-power pan gains
+  void render(float sr, float& L, float& R) {
+    const float lt = (float)tau - d.delay;
+    tau += 1.0 / (double)sr;
+    if (lt < 0.0f || lt > 0.48f) return;
+    // Pitch contour: 0.95p -> 1.22p by 70 ms -> 0.80p by 340 ms, then hold.
+    float f;
+    if (lt < 0.07f)      f = d.pitch * (0.95f + 0.27f * (lt / 0.07f));
+    else if (lt < 0.34f) f = d.pitch * (1.22f - 0.42f * ((lt - 0.07f) / 0.27f));
+    else                 f = d.pitch * 0.80f;
+    const float pdt = f / sr;
+    ph += pdt;
+    if (ph >= 1.0f) ph -= 1.0f;
+    const float saw = 2.0f * ph - 1.0f - polyblep(ph, pdt);
+    // Envelope: 20 ms strike to gain, exp to gain/2 by 180 ms, exp to 0.0006 by 420 ms.
+    float g;
+    const float half = std::max(0.0008f, d.gain * 0.5f);
+    if (lt < 0.02f)      g = d.gain * (lt / 0.02f);
+    else if (lt < 0.18f) g = d.gain * std::pow(half / std::max(1e-4f, d.gain), (lt - 0.02f) / 0.16f);
+    else                 g = half * std::pow(0.0006f / half, (lt - 0.18f) / 0.24f);
+    // Tremolo: gain 0.7 +- 0.3 square (the gull "laugh").
+    lfoPh += d.lfoHz / sr;
+    if (lfoPh >= 1.0) lfoPh -= 1.0;
+    const float trem = lfoPh < 0.5 ? 1.0f : 0.4f;
+    const float x = bp.process(saw) * trem * g;
+    L += x * gl;
+    R += x * gr;
+  }
+};
 struct ImpactVoice {
   ImpactDesc d;
   double tau = 0;
@@ -405,6 +447,12 @@ struct System::Impl {
   ImpactDesc impactDesc[kImpact];
   std::atomic<int> impactState[kImpact]{};
   ImpactVoice impactVoice[kImpact];
+  // Gull cries: a startled raft bursts 5-12 overlapping calls, so the pool is
+  // deeper than the other one-shots.
+  static constexpr int kGull = 12;
+  GullDesc gullDesc[kGull];
+  std::atomic<int> gullState[kGull]{};
+  GullVoice gullVoice[kGull];
   Reverb cannonReverb;
 
   // ── Music engine ──
@@ -638,6 +686,24 @@ struct System::Impl {
         }
         iv.refreshFilters(sr);
       }
+      // Claim queued gull cries (fixed bandpass + pan gains set once here).
+      for (int v = 0; v < kGull; ++v) {
+        int q = 1;
+        if (gullState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          GullVoice& gv = gullVoice[v];
+          gv = GullVoice();
+          gv.d = gullDesc[v];
+          gv.bp.bandpass(sr, gv.d.pitch * 1.8f, 3.5f);
+          const float a = (gv.d.pan + 1.0f) * 0.7853982f;   // equal-power pan
+          gv.gl = std::cos(a); gv.gr = std::sin(a);
+          gv.active = true;
+        }
+        GullVoice& gv = gullVoice[v];
+        if (gv.active && gv.tau >= (double)gv.d.delay + 0.5) {
+          gv.active = false;
+          gullState[v].store(0, std::memory_order_release);
+        }
+      }
 
       for (ma_uint32 i = 0; i < n; ++i) {
         // Wash: brown -> LPF -> swell (0.7 base + LFO*depth) -> bed.
@@ -675,6 +741,10 @@ struct System::Impl {
         float splash = 0.0f;
         for (int v = 0; v < kImpact; ++v)
           if (impactVoice[v].active) splash += impactVoice[v].render(sr);
+        // Gull cries — the only stereo voices (client StereoPanner by view pos).
+        float gullL = 0.0f, gullR = 0.0f;
+        for (int v = 0; v < kGull; ++v)
+          if (gullVoice[v].active) gullVoice[v].render(sr, gullL, gullR);
         // Music synth — its own bus/gain, independent of the SFX master.
         float music = 0.0f;
         if (musicCurrent) {
@@ -682,10 +752,11 @@ struct System::Impl {
           musicPlayhead += 1.0 / (double)sr;
         }
 
-        float s = (bed + rain + thunder + cannon + mastCrack + splash) * sMaster.value + music;
-        s = std::tanh(s * 1.2f) / 1.2f;   // gentle safety limiter
-        out[(done + i) * 2 + 0] = s;
-        out[(done + i) * 2 + 1] = s;
+        const float mono = (bed + rain + thunder + cannon + mastCrack + splash) * sMaster.value + music;
+        float sL = mono + gullL * sMaster.value;
+        float sR = mono + gullR * sMaster.value;
+        out[(done + i) * 2 + 0] = std::tanh(sL * 1.2f) / 1.2f;   // gentle safety limiter
+        out[(done + i) * 2 + 1] = std::tanh(sR * 1.2f) / 1.2f;
       }
       done += n;
     }
@@ -929,6 +1000,54 @@ void System::playShipHit(float vol) {
     d.L[d.n++] = L;
   }
   queueImpact(impl, d);
+}
+
+// Ship's bell (ship-bell.service ring/strike): two strikes 0.5 s apart. Each is
+// six inharmonic sine partials on f0 920 Hz with a 4 ms attack and long
+// exponential ring-outs, plus a short band-passed noise transient for the
+// metallic "clang". Output gain 0.22 (the partials sum to ~3.4 at the peak).
+void System::playBell(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  ImpactDesc d;
+  d.vol = 0.22f * vol;
+  static const float kPartials[6][3] = {   // ratio, gain, decay seconds
+    { 1.00f, 1.00f, 3.0f }, { 2.00f, 0.70f, 2.5f }, { 2.76f, 0.62f, 2.1f },
+    { 4.07f, 0.46f, 1.6f }, { 5.43f, 0.34f, 1.3f }, { 6.80f, 0.24f, 1.0f },
+  };
+  const float f0 = 920.0f;
+  for (int strike = 0; strike < 2; ++strike) {
+    const float t0 = strike * 0.5f;
+    for (const auto& pr : kPartials) {
+      ImpLayer L; L.kind = 1; L.t0 = t0; L.dur = pr[2];
+      L.f0 = L.f1 = f0 * pr[0]; L.g0 = pr[1];
+      // env 1 (attack + exp decay); tau chosen so the ring hits the client's
+      // 0.0001 ramp target exactly at the partial's decay time.
+      L.env = 1; L.attack = 0.004f; L.tauD = pr[2] / std::log(pr[1] / 0.0001f);
+      d.L[d.n++] = L;
+    }
+    ImpLayer N; N.kind = 0; N.filt = 0; N.t0 = t0; N.dur = 0.05f;   // strike transient
+    N.f0 = N.f1 = f0 * 3.0f; N.q = 0.8f; N.g0 = 0.7f; N.env = 0;
+    d.L[d.n++] = N;
+  }
+  queueImpact(impl, d);
+}
+
+// One gull cry (bird.service playCry). gain is pre-attenuated by the caller
+// (distance falloff (1 - d/320)^2 x level, skipped below 0.012); pan -1..1
+// from the cry's view-space position; lfoHz = the 12-19 Hz tremolo rate.
+void System::playGullCry(float gain, float pitch, float pan, float lfoHz, float delay) {
+  if (!impl) return;
+  if (gain < 0.012f) return;
+  for (int v = 0; v < Impl::kGull; ++v) {
+    if (impl->gullState[v].load(std::memory_order_relaxed) == 0) {
+      impl->gullDesc[v] = { gain, pitch, std::max(-1.0f, std::min(1.0f, pan)),
+                            lfoHz, std::max(0.0f, delay) };
+      impl->gullState[v].store(1, std::memory_order_release);
+      return;
+    }
+  }
 }
 
 void System::setMasterVolume(float v) {

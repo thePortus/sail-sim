@@ -245,6 +245,8 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain.wgsl"          TERRAIN_W
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sea_far.wgsl"          SEA_FAR_WGSL          "${WGSL_GEN_DIR}/sea_far_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds.wgsl"           CLOUDS_WGSL           "${WGSL_GEN_DIR}/clouds_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/godrays.wgsl"          GODRAYS_WGSL          "${WGSL_GEN_DIR}/godrays_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/post.wgsl"             POST_WGSL             "${WGSL_GEN_DIR}/post_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/bloom.wgsl"            BLOOM_WGSL            "${WGSL_GEN_DIR}/bloom_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds_denoise.wgsl"   CLOUDS_DENOISE_WGSL   "${WGSL_GEN_DIR}/clouds_denoise_wgsl.h")
 
 # ── UI fonts ─────────────────────────────────────────────────────────────────

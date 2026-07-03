@@ -7,7 +7,8 @@ struct Camera {
     eye      : vec4<f32>,   // xyz camera position
     params   : vec4<f32>,   // xyz = lengthScale0/1/2 (metres per tile); w = slope (wave-normal) amp
     screen   : vec4<f32>,   // xy = framebuffer size (px); zw = ocean origin (ship)
-    lod      : vec4<f32>,   // x = vertex displacement amp; y = inner discard radius (far ring)
+    lod      : vec4<f32>,   // x = vertex displacement amp; y = inner discard radius (far ring);
+                            // z = rain intensity [0..1]; w = time (s) for the rain ripples
     sun      : vec4<f32>,   // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
     tbounds  : vec4<f32>,   // terrain heightfield world bounds: minX, maxX, minZ, maxZ
     tmisc    : vec4<f32>,   // x,y = heightfield texel size; z = field ready; w = see-depth (m)
@@ -67,6 +68,29 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
 
 fn pow5(x : f32) -> f32 { let x2 = x * x; return x2 * x2 * x; }
 
+// ── Raindrop ripples (ocean-material HAS_RAIN port): expanding impact rings
+//    dimple the wave normal near the camera while it rains. ──
+fn rvHash(pIn : vec2<f32>) -> f32 {
+    let p = pIn - floor(pIn / 512.0) * 512.0;
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+fn rainField(p : vec2<f32>, t : f32) -> f32 {
+    let cell = floor(p);
+    let f = fract(p);
+    let h1 = rvHash(cell); let h2 = rvHash(cell + 5.7);
+    let h3 = rvHash(cell + 11.3); let h4 = rvHash(cell + 19.1);
+    let center = vec2<f32>(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+    let rate = mix(1.0, 3.2, h3);
+    let life = fract(t * rate + h1 * 7.0);
+    let r = length(f - center);
+    let sz = mix(0.16, 0.42, h4);
+    let impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+    let ringR = life * sz * 1.6;
+    var ring = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+    ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+    return impact + ring * 0.6;
+}
+
 // Bilinear terrain elevation at a world XZ (same mapping as terrain.wgsl) — gives
 // the TRUE vertical seabed depth per water fragment for the shallows reveal.
 fn tLoadH(ix : i32, iz : i32) -> f32 {
@@ -98,7 +122,21 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     derivatives += textureSample(deriv2, samp, uv2);
     let slope = vec2<f32>(derivatives.x * cam.params.w / (1.0 + derivatives.z),
                           derivatives.y * cam.params.w / (1.0 + derivatives.w));
-    let N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+    var N = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+
+    // Rain dimples the surface normal near the camera (client HAS_RAIN block).
+    if (cam.lod.z > 0.01) {
+        let nearF = 1.0 - smoothstep(25.0, 180.0, distance(cam.eye.xyz, in.worldPos));
+        if (nearF > 0.001) {
+            let rt = cam.lod.w * 10.0;
+            let rp = in.worldUV * 2.2;
+            let e = 0.18;
+            let n0 = rainField(rp, rt);
+            let grad = vec2<f32>(rainField(rp + vec2<f32>(e, 0.0), rt) - n0,
+                                 rainField(rp + vec2<f32>(0.0, e), rt) - n0) / e;
+            N = normalize(N + vec3<f32>(grad.x, 0.0, grad.y) * (0.65 * cam.lod.z * nearF));
+        }
+    }
 
     let V = normalize(cam.eye.xyz - in.worldPos);
     let L = normalize(cam.sun.xyz);   // sun by day, moon by night

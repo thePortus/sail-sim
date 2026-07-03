@@ -309,6 +309,7 @@ add_executable(sailsim_native
   src/main.cpp
   src/fft_test.cpp
   src/gltf_mesh.cpp
+  src/gltf_rig.cpp
   src/ktx2.cpp
   src/ocean_fft.cpp
   src/net_admin.cpp

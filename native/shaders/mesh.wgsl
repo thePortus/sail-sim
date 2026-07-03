@@ -14,6 +14,10 @@ struct Uniforms {
 @group(0) @binding(2) var normalTex     : texture_2d<f32>;
 @group(0) @binding(3) var metalRoughTex : texture_2d<f32>;
 @group(0) @binding(4) var texSamp       : sampler;
+// Unified matrix palette (gltf_rig): node worlds first, then skin joint
+// matrices. Rigid vertices reference their node slot with weight 1; skinned
+// vertices their joint slots — one path for both, animation = palette rewrite.
+@group(0) @binding(5) var<uniform> pal : array<mat4x4<f32>, 128>;
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -25,15 +29,21 @@ struct VSOut {
 };
 
 @vertex
-fn vs_main(@location(0) inPos    : vec3<f32>,
-           @location(1) inNormal : vec3<f32>,
-           @location(2) inUV     : vec2<f32>,
-           @location(3) inAlbedo : vec3<f32>,
-           @location(4) inMR     : vec2<f32>) -> VSOut {
+fn vs_main(@location(0) inPos     : vec3<f32>,
+           @location(1) inNormal  : vec3<f32>,
+           @location(2) inUV      : vec2<f32>,
+           @location(3) inAlbedo  : vec3<f32>,
+           @location(4) inMR      : vec2<f32>,
+           @location(5) inJoints  : vec4<f32>,
+           @location(6) inWeights : vec4<f32>) -> VSOut {
+    let skinM = inWeights.x * pal[u32(inJoints.x)] + inWeights.y * pal[u32(inJoints.y)]
+              + inWeights.z * pal[u32(inJoints.z)] + inWeights.w * pal[u32(inJoints.w)];
+    let lp = skinM * vec4<f32>(inPos, 1.0);
+    let ln = skinM * vec4<f32>(inNormal, 0.0);
     var out : VSOut;
-    out.position = u.mvp * vec4<f32>(inPos, 1.0);
-    out.worldPos = (u.model * vec4<f32>(inPos, 1.0)).xyz;
-    out.normal   = normalize((u.model * vec4<f32>(inNormal, 0.0)).xyz);
+    out.position = u.mvp * lp;
+    out.worldPos = (u.model * lp).xyz;
+    out.normal   = normalize((u.model * ln).xyz);
     out.albedo   = inAlbedo;
     out.mr       = inMR;
     out.uv       = inUV;

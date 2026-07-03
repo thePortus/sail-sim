@@ -15,6 +15,13 @@ public:
   void initSpectrum();                       // once (spectrum + conjugate + twiddles)
   void update(float time, float deltaTime);  // per frame (evolve + IFFT + merge)
 
+  // Live weather -> JONSWAP respectrum (client updateWeather port): the wave
+  // field emerges from the physics — stronger wind = larger, sharper,
+  // wind-aligned seas; choppier = pointier crests (lambda) + more foam.
+  // Rebuilds the initial spectrum, so call it throttled (the client: >0.3 m/s
+  // or >2 deg change, at most ~every 400 ms).
+  void updateWeather(float windKnots, float fromBearingDeg);
+
   WGPUTextureView displacement() const { return _displacementView; }
   WGPUTextureView derivatives() const { return _derivativesView; }
   WGPUTextureView turbulence() const { return _pingPong ? _turbulence2View : _turbulenceView; }

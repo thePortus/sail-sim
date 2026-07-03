@@ -288,6 +288,47 @@ void OceanFFT::ifft2d(WGPUComputePassEncoder pass, WGPUTexture input, WGPUTextur
   copyToInput(_bufferView);   // buffer -> input
 }
 
+// Live weather -> JONSWAP respectrum: exact port of the client's
+// ocean-fft-engine updateWeather(). The wave field emerges from the physics:
+// stronger wind = larger, sharper, wind-aligned seas; choppier conditions =
+// pointier crests (lambda) + more foam. Weather formulas (choppiness/beaufort)
+// mirror weather.service buildWeather().
+void OceanFFT::updateWeather(float windKnots, float fromBearingDeg) {
+  const float g = 9.81f;
+  const float pi = 3.14159265f;
+  float ms  = std::fmax(0.5f, windKnots * 0.5144f);        // knots -> m/s (JONSWAP needs >0)
+  // Crests run DOWNWIND when the spectrum angle = 90 - bearing (the field samples
+  // the FFT by world XZ and propagates along -k; raw bearing would be 90 deg off).
+  float dir = 90.0f - fromBearingDeg;
+  float chop = std::fmax(0.05f, std::fmin(1.0f, 0.05f + 0.95f * (windKnots / 24.0f)));
+  float beaufortT = std::fmin(12.0f, std::floor(windKnots / 2.5f)) / 12.0f;
+
+  float spectra[16];
+  // Wind-driven local sea (the dominant, locally-generated chop + waves).
+  spectra[0] = 0.5f;                                       // scale
+  spectra[1] = dir / 180.0f * pi;                          // angle
+  spectra[2] = 1.0f;                                       // spreadBlend
+  spectra[3] = 0.198f;                                     // swell (WavesSettings default)
+  spectra[4] = jonswapAlpha(g, 100000.0f, ms);
+  spectra[5] = jonswapPeak(g, 100000.0f, ms);
+  spectra[6] = 2.0f + 1.6f * beaufortT;                    // storms sharpen the spectral peak
+  spectra[7] = 0.03f - 0.025f * chop;                      // rougher seas keep more fine chop
+  // Long-period swell — slightly off the wind axis, grows with the sea state.
+  float sws = ms * 0.85f + 1.0f;
+  spectra[8]  = 0.2f + 0.4f * beaufortT;
+  spectra[9]  = (dir + 25.0f) / 180.0f * pi;
+  spectra[10] = 1.0f;
+  spectra[11] = 1.0f;
+  spectra[12] = jonswapAlpha(g, 300000.0f, sws);
+  spectra[13] = jonswapPeak(g, 300000.0f, sws);
+  spectra[14] = 3.3f;
+  spectra[15] = 0.01f;
+  wgpuQueueWriteBuffer(_queue, _spectrum, 0, spectra, sizeof(spectra));
+  // Horizontal displacement (choppiness): pointier, breaking crests as it builds.
+  _lambda = 0.7f + 0.6f * chop;
+  initSpectrum();
+}
+
 void OceanFFT::update(float time, float deltaTime) {
   const uint32_t g = _size / 8;
   float dt = deltaTime > 0.5f ? 0.5f : deltaTime;

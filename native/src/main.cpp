@@ -4438,8 +4438,8 @@ int main(int argc, char** argv) {
       c2.readbackDisplacement();
     }
 
-    // Weather: ease cloudiness/storminess/sea amplitude toward Beaufort-driven
-    // targets (server wave_state). Sea amplitude scales the FFT swell + buoyancy.
+    // Weather: ease cloudiness/storminess toward Beaufort-driven targets (server
+    // wave_state), and re-seed the FFT spectrum from the live wind.
     {
       mp::WaveState wv = mpClient.wave();
       float beau = wv.valid ? (float)wv.beaufort : 3.0f;
@@ -4454,7 +4454,26 @@ int main(int argc, char** argv) {
                                    glm::clamp((targetCloud - 0.68f) / 0.26f, 0.0f, 1.0f));
       cloudiness += (targetCloud - cloudiness) * glm::min(1.0f, dt * 0.70f);
       storminess += (targetStorm - storminess) * glm::min(1.0f, dt * 0.55f);
-      seaAmp      = glm::clamp(0.45f + beau * 0.19f, 0.45f, 2.2f);   // Beaufort 3 ~= 1.0
+      // The live JONSWAP respectrum below carries the wind's amplitude, exactly
+      // like the browser (which never scaled the FFT output) — the old
+      // 0.45+beau*0.19 vertex multiplier over-drove chop and foam at every wind.
+      seaAmp = 1.0f;
+      // Live respectrum (client ocean-fft-engine updateWeather port), throttled
+      // to real changes so the (cheap but not free) cascade re-seed stays rare.
+      {
+        static float lastMs = -100.0f, lastDir = -1000.0f;
+        static double lastRespec = -10.0;
+        float wKnots = wv.valid ? wv.windSpeed : 8.0f;
+        float wBear  = wv.valid ? wv.windBearing : 200.0f;
+        if (beauDbg) wKnots = beau * 2.5f + 1.0f;
+        float ms = std::fmax(0.5f, wKnots * 0.5144f);
+        float dirD = 90.0f - wBear;
+        if ((std::fabs(ms - lastMs) > 0.3f || std::fabs(dirD - lastDir) > 2.0f) &&
+            (double)t - lastRespec > 0.4) {
+          lastMs = ms; lastDir = dirD; lastRespec = (double)t;
+          for (OceanFFT* c : { &c0, &c1, &c2 }) c->updateWeather(wKnots, wBear);
+        }
+      }
     }
 
     // Water height at a world (x,z) = summed vertical displacement, wind-scaled.

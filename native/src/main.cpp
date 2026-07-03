@@ -1405,7 +1405,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUTextureFormat swapFormat) {
   fx.dofBlurPipe = makePipe(fx.dofModule, "fs_blur", fx.depthBGL, kSceneFormat, false);
 
   WGPUBufferDescriptor ubd = {}; ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  ubd.size = 5 * sizeof(glm::vec4); fx.postUbuf = wgpuDeviceCreateBuffer(device, &ubd);
+  ubd.size = 6 * sizeof(glm::vec4); fx.postUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   ubd.size = sizeof(glm::mat4) + 3 * sizeof(glm::vec4);   // SSAO: invView + pmat/params/misc
   fx.aoUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   fx.aoBlurHUbuf = wgpuDeviceCreateBuffer(device, &ubd);
@@ -1430,7 +1430,7 @@ static void rebuildPostBinds(WGPUDevice device, PostFx& fx, WGPUTextureView scen
   release(fx.dofDownBind); release(fx.dofBlurBind);
   {
     WGPUBindGroupEntry be[7] = {};
-    be[0].binding = 0; be[0].buffer = fx.postUbuf; be[0].size = 5 * sizeof(glm::vec4);
+    be[0].binding = 0; be[0].buffer = fx.postUbuf; be[0].size = 6 * sizeof(glm::vec4);
     be[1].binding = 1; be[1].textureView = sceneView;
     be[2].binding = 2; be[2].textureView = bloomAView;   // blurV output lands in A
     be[3].binding = 3; be[3].sampler = fx.samp;
@@ -2967,6 +2967,9 @@ int main(int argc, char** argv) {
   wake::Tracker wakeTracker;
   // Ship's-bell clock baseline (game hours last frame; -1 = not established).
   float bellPrevHours = -1.0f;
+  // Telescope (right-hold spyglass): held state + lens centre in window UV.
+  bool teleHeld = false;
+  float teleCX = 0.5f, teleCY = 0.5f;
   const float kFlashLife = 0.45f;
   // Salvage (phase 4): crates already requested (re-armed when we sail back out).
   std::set<std::string> salvageReq;
@@ -5067,6 +5070,21 @@ int main(int argc, char** argv) {
       }
       g_scrollAccum = 0.0;
     }
+    // Telescope (telescope.service): hold RIGHT mouse and a brass-rimmed 5x
+    // spyglass lens follows the cursor. Engages only over the 3D view (not the
+    // HUD); the hold survives a drag across HUD panels, releases with the button.
+    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+      if (!teleHeld && camActive && !io.WantCaptureMouse) teleHeld = true;
+    } else {
+      teleHeld = false;
+    }
+    {
+      int winW = 1, winH = 1;
+      glfwGetWindowSize(window, &winW, &winH);
+      teleCX = (float)(mx / std::max(1, winW));
+      teleCY = (float)(my / std::max(1, winH));
+    }
+    if (std::getenv("SAILSIM_TELE")) { teleHeld = true; teleCX = 0.5f; teleCY = 0.42f; }   // screenshot hook
 
     // ── Day/night: derive the game clock from wall time + the server's admin time
     //    offset (so every client shares the sky), then place the sun/moon. ──
@@ -5574,12 +5592,14 @@ int main(int argc, char** argv) {
       // lens 50 mm) collapse to a far-field CoC of ~0.19.
       const float focusDist = camDist;
       const float cocK = 0.19f;
-      glm::vec4 postU[5] = {
+      glm::vec4 postU[6] = {
         { (float)curW, (float)curH, t, sailing ? precipIntensity : 0.0f },
         { exposure, contrast, bloomWeight, sailing ? 1.0f : 0.0f },
         { (isNight ? 4.0f : 12.0f) / 255.0f, isNight ? 0.0f : 1.0f, 0.40f, 0.08f },
         { focusDist, cocK, 0.0f, sailing ? 1.0f : 0.0f },
         { proj[2][2], proj[3][2], sailing ? 1.0f : 0.0f, 0.0f },
+        // Telescope lens: centre (uv), radius (0 = off; client RADIUS 0.255), zoom 5x.
+        { teleCX, teleCY, (teleHeld && sailing) ? 0.255f : 0.0f, 5.0f },
       };
       wgpuQueueWriteBuffer(queue, postFx.postUbuf, 0, postU, sizeof(postU));
       glm::vec4 bp(bloomThreshold, 0.0f, 0.0f, 0.0f);

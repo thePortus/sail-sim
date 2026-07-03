@@ -12,6 +12,7 @@ struct PostU {
     fx    : vec4<f32>,   // x = grain intensity (/255); y = grain animated; z = vignette weight; w = sharpen
     dof   : vec4<f32>,   // x = focus distance (m); y = CoC scale; z unused; w = DOF enabled
     zp    : vec4<f32>,   // x = proj[2][2]; y = proj[3][2]; z = SSAO enabled; w unused
+    tele  : vec4<f32>,   // telescope lens: xy = centre (uv); z = radius, Y-normalized (0 = off); w = zoom
 };
 @group(0) @binding(0) var<uniform> u : PostU;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -161,6 +162,26 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let res = u.misc.xy;
     var uv = in.uv;
 
+    // ── Telescope (telescope.service): while right-held, the frame inside the
+    //    lens circle is resampled around the cursor at 1/zoom with a barrel
+    //    bulge; the chromatic fringe joins at the scene sample below, the rim
+    //    vignette + brass ring at the end of the grade (display space, like
+    //    the client's post-tonemap pass). Aspect-corrected distance keeps the
+    //    circle round on a wide screen. ──
+    let teleR = u.tele.z;
+    var teleRR = -1.0;        // 0 centre .. 1 rim inside the lens (-1 = outside)
+    var teleDist = 1.0e9;
+    if (teleR > 0.001) {
+        var td = in.uv - u.tele.xy;
+        td.x *= res.x / res.y;
+        teleDist = length(td);
+        if (teleDist < teleR) {
+            teleRR = clamp(teleDist / teleR, 0.0, 1.0);
+            let bulge = 1.0 + 0.34 * teleRR * teleRR;   // image compresses toward the rim
+            uv = u.tele.xy + (in.uv - u.tele.xy) * (bulge / u.tele.w);
+        }
+    }
+
     // ── Rain lens: drops + trails refract the scene under them. The Heartfelt
     //    math assumes ShaderToy's y-up fragCoord — our uv is y-down, so flip into
     //    y-up space (else the drops climb and trails hang above them). ──
@@ -182,6 +203,16 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     }
 
     var col = textureSampleLevel(sceneTex, samp, uv, 0.0).rgb;
+
+    // Telescope chromatic aberration: coloured fringes grow toward the rim
+    // (the R/B channels resample at slightly different magnifications).
+    if (teleRR >= 0.0) {
+        let ca = 0.006 * teleRR;
+        let bulge = 1.0 + 0.34 * teleRR * teleRR;
+        let off = (in.uv - u.tele.xy) * (bulge / u.tele.w);
+        col.r = textureSampleLevel(sceneTex, samp, u.tele.xy + off * (1.0 + ca), 0.0).r;
+        col.b = textureSampleLevel(sceneTex, samp, u.tele.xy + off * (1.0 - ca), 0.0).b;
+    }
 
     // ── Big sliding lens drops (the browser's second, stacked lens pass). It ran
     //    BEFORE the Heartfelt pass there, so here it reads through the Heartfelt-
@@ -265,6 +296,27 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         let gseed = select(vec2<f32>(0.0), vec2<f32>(fract(u.misc.z * 13.7), fract(u.misc.z * 7.3)), u.fx.y > 0.5);
         let g = grainHash(in.uv * res * 0.5 + gseed) - 0.5;
         rgbG += g * u.fx.x;
+        // ── Telescope rim: glass vignette + shaded brass ring, composed on the
+        //    final display-space image exactly like the client's lens pass. ──
+        if (teleR > 0.001) {
+            let bw = teleR * 0.11;           // brass ring thickness
+            let aa = 1.5 / res.y;            // ~1.5 px edge feather
+            if (teleDist <= teleR + bw + aa) {
+                // Vignette: darken toward the rim so the glass seats into the ring.
+                if (teleRR >= 0.0) {
+                    rgbG *= mix(1.0, 0.5, smoothstep(0.55, 1.0, teleRR));
+                }
+                let brassHi = vec3<f32>(0.58, 0.46, 0.20);
+                let brassLo = vec3<f32>(0.22, 0.15, 0.04);
+                let ring = clamp((teleDist - teleR) / bw, 0.0, 1.0);   // 0 inner .. 1 outer
+                var brass = mix(brassHi, brassLo, ring);
+                brass += brassHi * 0.28 * smoothstep(0.16, 0.0, abs(ring - 0.28));   // highlight band
+                brass *= 0.9 + 0.1 * cos(ring * 12.0);                              // machined sheen
+                let onRing = smoothstep(teleR - aa, teleR + aa, teleDist)
+                           * smoothstep(teleR + bw + aa, teleR + bw - aa, teleDist);
+                rgbG = mix(rgbG, brass, onRing);
+            }
+        }
         // Back to linear: the sRGB swapchain re-encodes on write, so the display
         // sees Babylon's gamma-space result (2.2 vs sRGB piecewise ~ identical).
         col = pow(clamp(rgbG, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));

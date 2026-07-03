@@ -24,6 +24,7 @@ struct Client::Impl {
   std::vector<LaneHotspot> lanes;
   std::vector<MapShip> allMerchants;
   std::vector<MapPirate> allPirates;
+  Correction corr;
 
   static RemotePlayer parsePlayer(const json& j) {
     RemotePlayer r;
@@ -62,6 +63,12 @@ struct Client::Impl {
     } else if (type == "update") {
       RemotePlayer rp = parsePlayer(msg);
       if (!rp.id.empty() && rp.id != myId) players[rp.id] = rp;
+    } else if (type == "correction") {
+      corr.valid = true;
+      corr.x = msg.value("x", 0.0f);
+      corr.z = msg.value("z", 0.0f);
+      corr.heading = msg.value("heading", 0.0f);
+      corr.speed = msg.value("speed", 0.0f);
     } else if (type == "leave") {
       players.erase(msg.value("id", std::string()));
     } else if (type == "wave_state") {
@@ -278,6 +285,13 @@ ConnState Client::state() const { return p_->conn.load(); }
 std::string Client::myId() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->myId;
+}
+
+Correction Client::consumeCorrection() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  Correction c = p_->corr;
+  p_->corr = Correction{};
+  return c;
 }
 
 std::string Client::ownedShip() const {

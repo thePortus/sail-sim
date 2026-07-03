@@ -37,6 +37,13 @@ struct MapPirate  {
   int bounty = 0, kills = 0;
 };
 
+// Server-authoritative pose snap (server "correction"): sent when our claimed
+// pose was clamped (teleport/speed) or a collision moved us. Consume-once.
+struct Correction {
+  bool valid = false;
+  float x = 0, z = 0, heading = 0, speed = 0;
+};
+
 // Latest weather tick (server "wave_state").
 struct WaveState {
   bool valid = false;
@@ -119,6 +126,8 @@ public:
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   WaveState wave() const;
+  // Latest unconsumed server pose correction (cleared by this call).
+  Correction consumeCorrection();
   std::vector<LaneHotspot> lanes() const;      // busiest shipping-lane hotspots (all players)
   std::vector<MapShip> merchantsAll() const;   // staff-only full merchant fleet (else empty)
   std::vector<MapPirate> piratesAll() const;   // staff-only pirates + hunters (else empty)

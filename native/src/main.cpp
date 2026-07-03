@@ -2651,6 +2651,10 @@ int main(int argc, char** argv) {
   // Ported force-based sailing physics (sail_physics.hpp). shipX/Z/heading/speed
   // mirror the vessel each frame for the camera/ocean/network.
   sail::Vessel vessel;
+  // Broadcast gate: the FIRST pose update becomes the server's trusted baseline
+  // (multiplayer.js validateMove), so hold updates until the spawn is placed —
+  // else the server baselines us at (0,0) and clamps the real spawn as a jump.
+  bool spawnPlaced = false;
   // Vessel rig animation (Phase 1): the own ship's controller — recreated on
   // hull change — plus this frame's helm input for the rudder/wheel visuals.
   std::unique_ptr<vanim::Controller> ownAnim;
@@ -2890,6 +2894,7 @@ int main(int argc, char** argv) {
               std::printf("[terrain] SAILSIM_START override -> (%.0f, %.0f, %.0f deg)\n", sx, sz, sh);
             }
           }
+          spawnPlaced = true;   // first broadcast now carries the real spawn
         }
       }
       terrHandled = true;
@@ -4116,8 +4121,9 @@ int main(int argc, char** argv) {
       }
       ImGui::End();
 
-      // Broadcast our pose ~10 Hz. Heading is sent in DEGREES (server/client convention).
-      if (cs == mp::ConnState::Open && (frame % 6) == 0) {
+      // Broadcast our pose ~10 Hz (once the spawn is placed — the first update is
+      // the server's trusted baseline). Heading is sent in DEGREES.
+      if (cs == mp::ConnState::Open && spawnPlaced && (frame % 6) == 0) {
         const char* sailState = vessel.anchored ? "anchor"
                               : (vessel.sailState == 2 ? "full" : vessel.sailState == 1 ? "half" : "furled");
         mp::PlayerUpdate pu;
@@ -4140,6 +4146,19 @@ int main(int argc, char** argv) {
     }
     ImGui::Render();
 
+    // Server pose corrections (browser applyServerCorrection): the sim snaps to
+    // the authoritative pose — clamps, collisions, or an admin moving us. The
+    // anchor comes along so the clamp doesn't yank the hull back.
+    if (appState == AppState::Sailing) {
+      mp::Correction corr = mpClient.consumeCorrection();
+      if (corr.valid) {
+        vessel.x = corr.x; vessel.z = corr.z;
+        vessel.heading = glm::radians(corr.heading);
+        vessel.speed = corr.speed;
+        if (vessel.anchored) { vessel.anchorX = vessel.x; vessel.anchorZ = vessel.z; }
+        shipX = vessel.x; shipZ = vessel.z; shipHeading = vessel.heading; shipSpeed = vessel.speed;
+      }
+    }
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /
     // lower sail (furled -> half -> full); P = drop/weigh anchor. While MOORED at
     // a town the boat is pinned to the berth (no input, no drift) until cast off.

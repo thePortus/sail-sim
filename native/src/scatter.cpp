@@ -1943,30 +1943,33 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 2.0f, Impl::TREE_CULL);
   // Grass: dithers out at the GrassFade edge ((ring+0.5)*40 = 180 m; band 60).
   glm::vec4 grassFade(0.0f, 0.0f, 0.0f, (Impl::GRASS_RING + 0.5f) * Impl::PATCH - 60.0f);
-  drawSets(p->palms, false, fullFade);
-  drawSets(p->palms, true, impFade);
-  drawSets(p->trees, false, fullFade);
-  drawSets(p->trees, true, impFade);
-  drawSets(p->rocks, false, noLod);
-  drawSets(p->rocks, true, noLod);
-  drawSets(p->drift, false, noLod);
-  drawSets(p->drift, true, noLod);
-  drawSets(p->grass, false, grassFade);
-  drawSets(p->grass, true, grassFade);
+  // Debug: SAILSIM_SCATTER_SKIP=palms,trees,rocks,drift,grass,far,reeds,weeds,birds,dolphins,fish,blobs
+  const char* skipEnv = std::getenv("SAILSIM_SCATTER_SKIP");
+  auto skip = [&](const char* name) { return skipEnv && std::strstr(skipEnv, name); };
+  if (!skip("palms")) drawSets(p->palms, false, fullFade);
+  if (!skip("palms")) drawSets(p->palms, true, impFade);
+  if (!skip("trees")) drawSets(p->trees, false, fullFade);
+  if (!skip("trees")) drawSets(p->trees, true, impFade);
+  if (!skip("rocks")) drawSets(p->rocks, false, noLod);
+  if (!skip("rocks")) drawSets(p->rocks, true, noLod);
+  if (!skip("drift")) drawSets(p->drift, false, noLod);
+  if (!skip("drift")) drawSets(p->drift, true, noLod);
+  if (!skip("grass")) drawSets(p->grass, false, grassFade);
+  if (!skip("grass")) drawSets(p->grass, true, grassFade);
   // Far island impostors: grow in over the FarFadePlugin band (280 -> full 470 m)
   // as the near scatter ring hands off; distant coasts read as treed.
   glm::vec4 farFade(470.0f, 190.0f, 2.0f, 0.0f);
-  drawSets(p->farTrees, false, farFade);
-  drawSets(p->farPalms, false, farFade);
-  drawSets(p->reedsL, false, noLod);
-  drawSets(p->weedsL, false, noLod);
-  drawSets(p->birdsL, false, noLod);
-  drawSets(p->dolphinsL, false, noLod);
-  drawSets(p->fishL, false, noLod);
+  if (!skip("far")) drawSets(p->farTrees, false, farFade);
+  if (!skip("far")) drawSets(p->farPalms, false, farFade);
+  if (!skip("reeds")) drawSets(p->reedsL, false, noLod);
+  if (!skip("weeds")) drawSets(p->weedsL, false, noLod);
+  if (!skip("birds")) drawSets(p->birdsL, false, noLod);
+  if (!skip("dolphins")) drawSets(p->dolphinsL, false, noLod);
+  if (!skip("fish")) drawSets(p->fishL, false, noLod);
 
   // Shadow blobs last (blended decal over the terrain, before the ocean draws):
   // stretched away from the sun, lengthening + fading as it lowers; gone at night.
-  if (p->blobSet.instCount && p->blobPipeline) {
+  if (p->blobSet.instCount && p->blobPipeline && !skip("blobs")) {
     // lightDir is the sun by day (dayK gates the moon out at night, matching the
     // client's sun-elevation fade). stretch = 1/max(sun.y, 0.30), clamped 1..3.5.
     float sunY = lightDir.y;

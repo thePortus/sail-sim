@@ -55,7 +55,13 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     var disp = textureSampleLevel(disp0, samp, uv0, 0.0).xyz;
     disp += textureSampleLevel(disp1, samp, uv1, 0.0).xyz;
     disp += textureSampleLevel(disp2, samp, uv2, 0.0).xyz;
-    disp = disp * cam.lod.x;   // vertex displacement amp (0 on the flat far ring)
+    // Vertex displacement amp (0 on the flat far ring). The storm seaAmp (up to
+    // 2.2 at B7) scales HEAVE fully but the horizontal choppy displacement only
+    // gently: scaling XZ past ~1.4 folds wave crests over the 5.9 m grid cells,
+    // which rendered as big black slivers / dry seabed wedges in heavy weather.
+    let vamp = cam.lod.x;
+    let hamp = min(vamp, 1.0 + max(vamp - 1.0, 0.0) * 0.35);
+    disp = vec3<f32>(disp.x * hamp, disp.y * vamp, disp.z * hamp);
 
     let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
@@ -154,7 +160,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     // Subsurface scattering — back-lit turquoise glow on wave backs, sun-gated.
     let sunUp = smoothstep(0.0, 0.12, L.y);
-    let H = normalize(-N + L);
+    // Epsilon-guarded: on steep storm facets N can align with L, and
+    // normalize(0) is NaN — which painted whole wave facets as black polygons.
+    let hv = -N + L;
+    let H = hv / max(length(hv), 1e-4);
     let viewDotH = pow5(clamp(dot(V, -H), 0.0, 1.0)) * 30.0 * _SSSStrength * sunUp;
     let sssW = max(in.height - _SSSBase, 0.0) / _SSSScale;
     let color = clamp(_Color + _SSSColor * viewDotH * sssW, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -193,8 +202,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let reflColor = textureSample(reflTex, samp, reflUV).rgb;
     waterCol += reflColor * fresnel * _ReflStrength * reflCut;
 
-    // Sun glint.
-    let Hs = normalize(V + L);
+    // Sun glint. Epsilon-guarded: V can oppose L on wave facets, and
+    // normalize(0) is NaN — the black-wedge artifact (view-dependent).
+    let hs2 = V + L;
+    let Hs = hs2 / max(length(hs2), 1e-4);
     waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2 * reflCut;
 
     // Composite foam (lit white) over water.

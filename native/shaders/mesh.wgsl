@@ -123,7 +123,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     let V = normalize(u.eye.xyz - in.worldPos);
     let L = normalize(u.sun.xyz);                  // sun by day, moon by night
-    let H = normalize(V + L);
+    let hv = V + L;
+    let H = hv / max(length(hv), 1e-4);            // epsilon: V ~ -L would NaN
 
     let F0 = mix(vec3<f32>(0.04), albedo, metallic);
     // Warm bright sunlight cross-fading to dim cool moonlight (u.sun.w = daylight).

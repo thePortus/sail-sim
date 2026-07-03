@@ -1217,7 +1217,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUTextureFormat swapFormat) {
 
   WGPUBufferDescriptor ubd = {}; ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
   ubd.size = 5 * sizeof(glm::vec4); fx.postUbuf = wgpuDeviceCreateBuffer(device, &ubd);
-  ubd.size = 3 * sizeof(glm::vec4);
+  ubd.size = sizeof(glm::mat4) + 3 * sizeof(glm::vec4);   // SSAO: invView + pmat/params/misc
   fx.aoUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   fx.aoBlurHUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   fx.aoBlurVUbuf = wgpuDeviceCreateBuffer(device, &ubd);
@@ -1264,7 +1264,7 @@ static void rebuildPostBinds(WGPUDevice device, PostFx& fx, WGPUTextureView scen
   fx.blurVBind = mk3(fx.blurVUbuf, bloomBView);     // blurV:  B -> A (post reads A)
   auto mk4 = [&](WGPUBuffer ubuf, WGPUTextureView src) {
     WGPUBindGroupEntry be[4] = {};
-    be[0].binding = 0; be[0].buffer = ubuf; be[0].size = 3 * sizeof(glm::vec4);
+    be[0].binding = 0; be[0].buffer = ubuf; be[0].size = sizeof(glm::mat4) + 3 * sizeof(glm::vec4);
     be[1].binding = 1; be[1].textureView = depthReadView;
     be[2].binding = 2; be[2].textureView = src;
     be[3].binding = 3; be[3].sampler = fx.samp;
@@ -4688,12 +4688,14 @@ int main(int argc, char** argv) {
       const glm::vec4 aoPmat(proj[0][0], proj[1][1], proj[2][2], proj[3][2]);
       const glm::vec4 aoParams(2.0f, 1.2f, 0.15f, 100.0f);   // radius, strength, base, maxZ
       const float hw = (float)(curW / 2), hh = (float)(curH / 2);
-      glm::vec4 aoU[3] = { aoPmat, aoParams, { hw, hh, 0.0f, 0.0f } };
-      wgpuQueueWriteBuffer(queue, postFx.aoUbuf, 0, aoU, sizeof(aoU));
-      aoU[2] = { hw, hh, 1.0f, 0.0f };
-      wgpuQueueWriteBuffer(queue, postFx.aoBlurHUbuf, 0, aoU, sizeof(aoU));
-      aoU[2] = { hw, hh, 0.0f, 1.0f };
-      wgpuQueueWriteBuffer(queue, postFx.aoBlurVUbuf, 0, aoU, sizeof(aoU));
+      struct { glm::mat4 invView; glm::vec4 v[3]; } aoU{ glm::inverse(viewM),
+        { aoPmat, aoParams, { hw, hh, 0.0f, 0.0f } } };
+      wgpuQueueWriteBuffer(queue, postFx.aoUbuf, 0, &aoU, sizeof(aoU));
+      aoU.v[2] = { hw, hh, 1.0f, 0.0f };
+      wgpuQueueWriteBuffer(queue, postFx.aoBlurHUbuf, 0, &aoU, sizeof(aoU));
+      aoU.v[2] = { hw, hh, 0.0f, 1.0f };
+      wgpuQueueWriteBuffer(queue, postFx.aoBlurVUbuf, 0, &aoU, sizeof(aoU));
+      // DOF keeps its own 3-vec4 layout at offset 0 (its shader has no invView).
       glm::vec4 dofU[3] = { aoPmat, { focusDist, cocK, 14.0f, sailing ? 1.0f : 0.0f },
                             { hw, hh, 0.0f, 0.0f } };
       wgpuQueueWriteBuffer(queue, postFx.dofUbuf, 0, dofU, sizeof(dofU));
@@ -5048,7 +5050,7 @@ int main(int argc, char** argv) {
     // BEFORE the ocean draws (same per-instance uniform slots as the ship draws
     // below, so the stamp rides the exact buoyancy/heel transform). The ocean's
     // stencil test (NotEqual ref) then rejects those pixels — no sea on the deck.
-    {
+    if (!std::getenv("SAILSIM_NOSTENCIL")) {
       HullStencil& hs = hullStencil(device, kSceneFormat);
       bool stencilBound = false;
       std::map<Mesh*, uint32_t> slot;

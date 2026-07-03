@@ -7,6 +7,7 @@
 // depth-aware bilateral, H then V — the client's bilateralSamples pass).
 
 struct SsaoU {
+    invView : mat4x4<f32>,  // view -> world (to find each sample's height)
     pmat   : vec4<f32>,   // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
     params : vec4<f32>,   // x = radius (m), y = totalStrength, z = base, w = maxZ (m)
     misc   : vec4<f32>,   // x,y = output resolution; z,w = blur direction (px)
@@ -70,6 +71,12 @@ fn kernelAt(i : i32) -> vec3<f32> {
 fn fs_ao(in : VSOut) -> @location(0) vec4<f32> {
     let P = viewPos(in.uv);
     let dist = -P.z;
+    // The client EXCLUDED the ocean from SSAO (its prePass skipped water
+    // materials): deep storm-wave troughs read as fully-occluded pits and
+    // painted black patches on the sea. Fade AO out near/below sea level.
+    let worldY = (u.invView * vec4<f32>(P, 1.0)).y;
+    let seaFade = smoothstep(0.5, 1.8, worldY);
+    if (seaFade <= 0.001) { return vec4<f32>(1.0); }
     // Beyond maxZ the AO fades to nothing (client ssao.maxZ = 100 — excludes
     // islands / far terrain, where half-res AO would just shimmer).
     let zfade = 1.0 - smoothstep(u.params.w * 0.8, u.params.w, dist);
@@ -117,7 +124,10 @@ fn fs_ao(in : VSOut) -> @location(0) vec4<f32> {
         occ = occ + select(0.0, 1.0, sz >= sp.z + bias) * rangeCheck;
     }
     occ = occ / 16.0;
-    let ao = clamp(1.0 - occ * u.params.y * zfade + u.params.z, 0.0, 1.0);
+    // base is a true floor now (the old 1-occ*s+base could clamp to 0 black).
+    var ao = clamp(1.0 - occ * u.params.y * zfade, 0.0, 1.0);
+    ao = u.params.z + (1.0 - u.params.z) * ao;
+    ao = mix(1.0, ao, seaFade);
     return vec4<f32>(ao, ao, ao, 1.0);
 }
 

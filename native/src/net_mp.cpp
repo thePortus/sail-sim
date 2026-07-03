@@ -60,6 +60,7 @@ struct Client::Impl {
     r.npc        = j.value("npc", false);
     r.role       = j.value("role", std::string());
     r.turnRate   = j.value("turnRate", 0.0f);
+    r.seq        = j.value("seq", 0);
     r.sheetAngle = j.value("sheetAngle", 30.0f);
     r.isPortTack = j.value("isPortTack", false);
     r.anchored   = j.value("anchored", false);

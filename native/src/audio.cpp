@@ -280,29 +280,80 @@ struct MastCrackVoice {
   }
 };
 
-// Water-impact splash: a falling chirp + a wet lowpassed noise tail.
-struct SplashVoice {
-  float vol = 0;
-  Biquad lp;
+// Impact one-shots (cannon.service playSplashSound / playLandImpactSound /
+// playShipHitSound): a schedule of filtered-noise / sine-sweep / spiky-crunch
+// layers, each with its own filter, sweep and envelope — built by the play*()
+// functions with the client's exact numbers.
+struct ImpLayer {
+  int kind = 0;        // 0 = noise, 1 = sine, 2 = spiky crunch noise
+  int filt = 0;        // 0 = bandpass, 1 = lowpass, 2 = highpass 2400 + lowpass 8500
+  float t0 = 0, dur = 0.3f;
+  float f0 = 500, f1 = 500, sweepDur = 0.3f, q = 1.0f;
+  float g0 = 1.0f;
+  int env = 0;         // 0 = exp decay g0 -> 0.001 over dur; 1 = ramp(attack) then exp(-x/tauD)
+  float attack = 0.002f, tauD = 0.3f;
+};
+struct ImpactDesc { float vol = 1; int n = 0; ImpLayer L[36]; };
+struct ImpactVoice {
+  ImpactDesc d;
   double tau = 0;
-  uint32_t rng = 7;
   bool active = false;
-  float ph = 0;
+  uint32_t rng = 5;
+  Biquad flt[36], flt2[36];   // flt2 = the spray's second (lowpass) stage
+  float ph[36] = {};
+  bool fltInit[36] = {};
+  float total = 1.0f;
   inline float noise() {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
     return (float)(int32_t)rng * (1.0f / 2147483648.0f);
   }
+  void refreshFilters(float sr) {   // block-rate frequency sweeps
+    const float t = (float)tau;
+    for (int i = 0; i < d.n; ++i) {
+      ImpLayer& L = d.L[i];
+      const float lt = t - L.t0;
+      if (lt < -0.05f || lt > L.dur) continue;
+      float f = L.f1 != L.f0
+              ? L.f0 * std::pow(L.f1 / L.f0, std::min(1.0f, std::max(0.0f, lt / std::max(0.01f, L.sweepDur))))
+              : L.f0;
+      if (L.kind == 1) continue;   // sine: no filter
+      if (L.filt == 0) flt[i].bandpass(sr, std::max(30.0f, f), L.q);
+      else if (L.filt == 1) flt[i].lowpass(sr, std::max(30.0f, f), 0.8f);
+      else if (!fltInit[i]) { flt[i].highpass(sr, 2400.0f, 0.7f); flt2[i].lowpass(sr, 8500.0f, 0.7f); }
+      fltInit[i] = true;
+    }
+  }
   float render(float sr) {
     const float t = (float)tau;
     float o = 0.0f;
-    if (t < 0.22f) {   // chirp 2600 -> 180 Hz
-      float f = 2600.0f * std::pow(180.0f / 2600.0f, t / 0.22f);
-      ph += 2.0f * (float)M_PI * f / sr;
-      o += std::sin(ph) * 0.25f * vol * std::exp(-t / 0.08f);
-    }
-    if (t < 0.7f) {    // wet noise tail
-      float g = t < 0.02f ? vol * 0.55f * (t / 0.02f) : vol * 0.55f * std::exp(-(t - 0.02f) / 0.16f);
-      o += lp.process(noise()) * g;
+    for (int i = 0; i < d.n; ++i) {
+      const ImpLayer& L = d.L[i];
+      const float lt = t - L.t0;
+      if (lt < 0 || lt > L.dur) continue;
+      float g;
+      if (L.env == 0) g = L.g0 * std::pow(0.001f / std::max(1e-4f, L.g0), lt / L.dur);
+      else g = lt < L.attack ? L.g0 * (lt / L.attack)
+             : L.g0 * std::exp(-(lt - L.attack) / L.tauD);
+      g *= d.vol;
+      float x;
+      if (L.kind == 1) {
+        float f = L.f0 * std::pow(L.f1 / L.f0, std::min(1.0f, lt / std::max(0.01f, L.sweepDur)));
+        ph[i] += f / sr;
+        if (ph[i] >= 1.0f) ph[i] -= 1.0f;
+        x = std::sin(ph[i] * 2.0f * (float)M_PI);
+        o += x * g;
+        continue;
+      }
+      if (L.kind == 2) {   // spiky crunch: sparse full-scale clicks over a quiet bed
+        float u = lt / L.dur;
+        float envP = std::pow(1.0f - u, 1.6f);
+        float r = noise();
+        float spike = std::fabs(noise()) < 0.07f ? r : r * 0.22f;
+        x = spike * envP;
+      } else x = noise();
+      float y = flt[i].process(x);
+      if (L.filt == 2) y = flt2[i].process(y);
+      o += y * g;
     }
     tau += 1.0 / (double)sr;
     return o;
@@ -350,10 +401,10 @@ struct System::Impl {
   MastCrackDesc mastCrackDesc[kMastCrack];
   std::atomic<int> mastCrackState[kMastCrack]{};
   MastCrackVoice mastCrackVoice[kMastCrack];
-  static constexpr int kSplash = 6;
-  std::atomic<int> splashState[kSplash]{};
-  float splashVol[kSplash] = {};
-  SplashVoice splashVoice[kSplash];
+  static constexpr int kImpact = 6;
+  ImpactDesc impactDesc[kImpact];
+  std::atomic<int> impactState[kImpact]{};
+  ImpactVoice impactVoice[kImpact];
   Reverb cannonReverb;
 
   // ── Music engine ──
@@ -566,21 +617,26 @@ struct System::Impl {
         float f = 320.0f + 170.0f * (float)std::sin(mv.lfoPhase);
         mv.groanLp.lowpass(sr, std::max(60.0f, f), 5.0f);
       }
-      for (int v = 0; v < kSplash; ++v) {
+      for (int v = 0; v < kImpact; ++v) {
         int q = 1;
-        if (splashState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
-          SplashVoice& sv = splashVoice[v];
-          sv = SplashVoice();
-          sv.vol = splashVol[v];
-          sv.rng = 0x1234567u + (uint32_t)v * 0x9E3779B9u;
-          sv.lp.lowpass(sr, 1200.0f, 0.7f);
-          sv.active = true;
+        if (impactState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          ImpactVoice& iv = impactVoice[v];
+          iv = ImpactVoice();
+          iv.d = impactDesc[v];
+          iv.rng = 0x1234567u + (uint32_t)v * 0x9E3779B9u;
+          float tmax = 0.1f;
+          for (int i = 0; i < iv.d.n; ++i) tmax = std::max(tmax, iv.d.L[i].t0 + iv.d.L[i].dur);
+          iv.total = tmax + 0.05f;
+          iv.active = true;
         }
-        SplashVoice& sv = splashVoice[v];
-        if (sv.active && sv.tau >= 0.75) {
-          sv.active = false;
-          splashState[v].store(0, std::memory_order_release);
+        ImpactVoice& iv = impactVoice[v];
+        if (!iv.active) continue;
+        if (iv.tau >= iv.total) {
+          iv.active = false;
+          impactState[v].store(0, std::memory_order_release);
+          continue;
         }
+        iv.refreshFilters(sr);
       }
 
       for (ma_uint32 i = 0; i < n; ++i) {
@@ -615,10 +671,10 @@ struct System::Impl {
         float mastCrack = 0.0f;
         for (int v = 0; v < kMastCrack; ++v)
           if (mastCrackVoice[v].active) mastCrack += mastCrackVoice[v].render(sr);
-        // Water-impact splashes.
+        // Impact one-shots (splash / land thud / ship crunch).
         float splash = 0.0f;
-        for (int v = 0; v < kSplash; ++v)
-          if (splashVoice[v].active) splash += splashVoice[v].render(sr);
+        for (int v = 0; v < kImpact; ++v)
+          if (impactVoice[v].active) splash += impactVoice[v].render(sr);
         // Music synth — its own bus/gain, independent of the SFX master.
         float music = 0.0f;
         if (musicCurrent) {
@@ -795,17 +851,84 @@ void System::playMastCrack(float vol) {
   impl->mastCrackState[slot].store(1, std::memory_order_release);
 }
 
-// Water-impact splash chirp + wet noise. vol 0..1.
+static float rnd2(float a, float b) { return a + (float)std::rand() / RAND_MAX * (b - a); }
+
+static bool queueImpact(System::Impl* impl, const ImpactDesc& d) {
+  for (int v = 0; v < System::Impl::kImpact; ++v) {
+    if (impl->impactState[v].load(std::memory_order_relaxed) == 0) {
+      impl->impactDesc[v] = d;
+      impl->impactState[v].store(1, std::memory_order_release);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Water splash (client playSplashSound): resonant gloop + low whoomp + sub
+// thump + a foamy spray that swells in then rains down.
 void System::playSplash(float vol) {
   if (!impl) return;
   vol = std::max(0.0f, std::min(1.0f, vol));
   if (vol < 0.01f) return;
-  int slot = -1;
-  for (int v = 0; v < Impl::kSplash; ++v)
-    if (impl->splashState[v].load(std::memory_order_relaxed) == 0) { slot = v; break; }
-  if (slot < 0) return;
-  impl->splashVol[slot] = vol;
-  impl->splashState[slot].store(1, std::memory_order_release);
+  ImpactDesc d;
+  d.vol = vol;
+  d.L[d.n++] = { 0, 0, 0.0f, 0.48f, rnd2(520, 640), 120, 0.30f, 4.0f, 1.5f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 0, 1, 0.0f, 0.50f, 700, 110, 0.32f, 0.8f, 1.1f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 1, 0, 0.0f, 0.40f, rnd2(85, 100), 34, 0.22f, 1.0f, 0.85f, 0, 0.002f, 0.3f };
+  { ImpLayer L; L.kind = 0; L.filt = 2; L.t0 = 0; L.dur = 1.2f; L.f0 = L.f1 = 2400;
+    L.g0 = 0.55f; L.env = 1; L.attack = 0.10f; L.tauD = 0.34f; d.L[d.n++] = L; }
+  queueImpact(impl, d);
+}
+
+// Land impact (client playLandImpactSound): hard thud + gritty crack + a
+// clatter of nine debris ticks settling over ~0.9 s.
+void System::playLandImpact(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  ImpactDesc d;
+  d.vol = vol;
+  d.L[d.n++] = { 1, 0, 0.0f, 0.35f, rnd2(120, 140), 32, 0.18f, 1.0f, 1.35f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 0, 1, 0.0f, 0.16f, 2800, 400, 0.12f, 0.8f, 1.1f, 0, 0.002f, 0.3f };
+  for (int k = 0; k < 9; ++k) {
+    float dt = rnd2(0.06f, 0.85f);
+    ImpLayer L; L.kind = 0; L.filt = 0; L.t0 = dt; L.dur = 0.05f;
+    L.f0 = L.f1 = rnd2(800, 3200); L.q = rnd2(2, 6);
+    L.g0 = std::max(0.02f, rnd2(0.12f, 0.40f) * (1.0f - dt));
+    L.env = 1; L.attack = 0.002f; L.tauD = 0.012f;
+    d.L[d.n++] = L;
+  }
+  queueImpact(impl, d);
+}
+
+// Ship hit (client playShipHitSound): the land impact PLUS two crunch passes
+// (the ball crushing planking), four splintering cracks, and a long shatter
+// of woody ticks — the hull breaking apart.
+void System::playShipHit(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  ImpactDesc d;
+  d.vol = vol;
+  d.L[d.n++] = { 1, 0, 0.0f, 0.35f, rnd2(120, 140), 32, 0.18f, 1.0f, 1.35f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 0, 1, 0.0f, 0.16f, 2800, 400, 0.12f, 0.8f, 1.1f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 2, 0, 0.00f, 0.30f, 1100, 240, 0.24f, 0.8f, 1.5f, 0, 0.002f, 0.3f };
+  d.L[d.n++] = { 2, 0, 0.10f, 0.34f,  800, 180, 0.27f, 0.8f, 1.0f, 0, 0.002f, 0.3f };
+  for (int k = 0; k < 4; ++k) {
+    ImpLayer L; L.kind = 0; L.filt = 0; L.t0 = k * 0.045f; L.dur = 0.10f;
+    L.f0 = rnd2(900, 1500); L.f1 = rnd2(300, 500); L.sweepDur = 0.09f; L.q = 1.2f;
+    L.g0 = 0.9f; L.env = 1; L.attack = 0.002f; L.tauD = 0.02f;
+    d.L[d.n++] = L;
+  }
+  for (int k = 0; k < 18 && d.n < 36; ++k) {
+    float dt = rnd2(0.02f, 1.10f);
+    ImpLayer L; L.kind = 0; L.filt = 0; L.t0 = dt; L.dur = 0.05f;
+    L.f0 = L.f1 = rnd2(260, 1900); L.q = rnd2(3, 9);
+    L.g0 = std::max(0.02f, rnd2(0.10f, 0.35f) * (1.0f - dt / 1.2f));
+    L.env = 1; L.attack = 0.002f; L.tauD = 0.012f;
+    d.L[d.n++] = L;
+  }
+  queueImpact(impl, d);
 }
 
 void System::setMasterVolume(float v) {

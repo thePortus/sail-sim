@@ -2890,6 +2890,20 @@ int main(int argc, char** argv) {
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
   std::map<std::string, std::pair<float, float>> remoteGunCur;   // eased remote gun deploy (P,S)
+  // ── Remote movement smoothing (client tickRemoteMotion port): render remotes
+  //    ~110 ms behind the newest snapshot and interpolate through the buffer;
+  //    past its end, dead-reckon along the sender's turn rate (max 1 s); ease the
+  //    DISPLAYED pose toward the target so corrections never visibly jump. ──
+  struct MotionSnap { double arrived; float x, z, headingDeg, speed, turnRate; };
+  struct RemoteMotion {
+    std::vector<MotionSnap> buf;
+    float dispX = 0, dispZ = 0, dispHeading = 0;   // heading radians
+    int lastSeq = -1;
+    bool init = false;
+  };
+  std::map<std::string, RemoteMotion> remoteMotion;
+  const double kInterpDelayMs = 110.0, kExtrapolateMaxMs = 1000.0;
+  const float kReconcile = 0.25f;   // per-frame @60fps ease toward the target
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
@@ -4660,7 +4674,7 @@ int main(int argc, char** argv) {
           float l = glm::length(dir);
           if (l > 1e-3f) dir /= l;
           if (!ie.hit.grape) cannonFx.shipHit(ip, dir);
-          audioSys.playSplash(std::max(0.0f, 0.8f - d / 600.0f));   // crunchy thud placeholder tail
+          audioSys.playShipHit(std::max(0.0f, 1.0f - d / 800.0f));
           // Shudder + shake when WE are struck (roll kick toward the hit side).
           if (ie.hit.victimId == meId) {
             shudVel += (ie.hit.side == "port" ? -1.0f : 1.0f) * 0.55f;
@@ -4690,10 +4704,12 @@ int main(int argc, char** argv) {
           }
         } else {
           const float surf = terr.loaded() ? terr.elevation(ie.x, ie.z) : 0.0f;
-          if (surf > 0.0f) cannonFx.landHit(ip, iv);
-          else {
+          if (surf > 0.0f) {
+            cannonFx.landHit(ip, iv);
+            audioSys.playLandImpact(std::max(0.0f, 1.0f - d / 800.0f));
+          } else {
             cannonFx.waterSplash(ip, iv);
-            audioSys.playSplash(std::max(0.0f, 1.0f - d / 500.0f));
+            audioSys.playSplash(std::max(0.0f, 1.0f - d / 800.0f));
           }
         }
       }
@@ -5086,8 +5102,70 @@ int main(int argc, char** argv) {
     struct ImpInst { const ShipImpSlug* slug; float x, z, heading; };
     std::vector<ImpInst> shipImposters;
     if (sailing) {
-      for (const mp::RemotePlayer& rp : mpClient.players()) {
+      const double nowMs = t * 1000.0;
+      const double renderAt = nowMs - kInterpDelayMs;
+      std::set<std::string> motionSeen;
+      for (mp::RemotePlayer rp : mpClient.players()) {
         std::string slug = rp.vesselSlug.empty() ? "pinnace" : rp.vesselSlug;
+        // ── Motion smoothing: buffer new snapshots, interpolate/dead-reckon,
+        //    then OVERWRITE rp's pose with the displayed one so every consumer
+        //    (hull, rig animation, decals, labels) rides the smooth track. ──
+        motionSeen.insert(rp.id);
+        RemoteMotion& rm = remoteMotion[rp.id];
+        if (rp.seq != rm.lastSeq || rm.buf.empty()) {
+          rm.lastSeq = rp.seq;
+          rm.buf.push_back({ nowMs, rp.x, rp.z, rp.heading, rp.speed, rp.turnRate });
+          if (rm.buf.size() > 12) rm.buf.erase(rm.buf.begin());
+        }
+        {
+          const MotionSnap& newest = rm.buf.back();
+          float tx, tz, tHeading;
+          auto angleDelta = [](float a, float b) {
+            float dd = b - a;
+            while (dd > 3.14159265f) dd -= 6.2831853f;
+            while (dd < -3.14159265f) dd += 6.2831853f;
+            return dd;
+          };
+          if (renderAt <= rm.buf.front().arrived) {
+            tx = rm.buf.front().x; tz = rm.buf.front().z;
+            tHeading = glm::radians(rm.buf.front().headingDeg);
+          } else if (renderAt >= newest.arrived) {
+            // Dead-reckon forward, curving through the sender's turn (sub-stepped).
+            const float ahead = (float)std::min(renderAt - newest.arrived, kExtrapolateMaxMs) / 1000.0f;
+            const float turnRad = glm::radians(newest.turnRate);
+            const float vWorld = newest.speed * kTravelScale;
+            float px2 = newest.x, pz2 = newest.z, ph2 = glm::radians(newest.headingDeg);
+            const float sdt = ahead / 6.0f;
+            for (int i2 = 0; i2 < 6; ++i2) {
+              ph2 += turnRad * sdt;
+              px2 += std::sin(ph2) * vWorld * sdt;
+              pz2 += std::cos(ph2) * vWorld * sdt;
+            }
+            tx = px2; tz = pz2; tHeading = ph2;
+          } else {
+            // Interpolate between the snapshots straddling the render cursor.
+            const MotionSnap* a2 = &rm.buf.front();
+            const MotionSnap* b2 = &rm.buf.back();
+            for (size_t i2 = 0; i2 + 1 < rm.buf.size(); ++i2)
+              if (rm.buf[i2].arrived <= renderAt && rm.buf[i2 + 1].arrived >= renderAt) {
+                a2 = &rm.buf[i2]; b2 = &rm.buf[i2 + 1]; break;
+              }
+            const float span = std::max(1.0f, (float)(b2->arrived - a2->arrived));
+            const float f2 = glm::clamp((float)(renderAt - a2->arrived) / span, 0.0f, 1.0f);
+            tx = a2->x + (b2->x - a2->x) * f2;
+            tz = a2->z + (b2->z - a2->z) * f2;
+            const float ah = glm::radians(a2->headingDeg);
+            tHeading = ah + angleDelta(ah, glm::radians(b2->headingDeg)) * f2;
+            while (rm.buf.size() > 2 && rm.buf[1].arrived < renderAt) rm.buf.erase(rm.buf.begin());
+          }
+          if (!rm.init) { rm.dispX = tx; rm.dispZ = tz; rm.dispHeading = tHeading; rm.init = true; }
+          const float k2 = 1.0f - std::pow(1.0f - kReconcile, dt * 60.0f);
+          rm.dispX += (tx - rm.dispX) * k2;
+          rm.dispZ += (tz - rm.dispZ) * k2;
+          rm.dispHeading += angleDelta(rm.dispHeading, tHeading) * k2;
+        }
+        rp.x = rm.dispX; rp.z = rm.dispZ;
+        rp.heading = glm::degrees(rm.dispHeading);
         // Distant-ship LOD (client LOD_NEAR=460/LOD_FAR=540 hysteresis): beyond the
         // far edge swap the full rigged GLB for the baked azimuth billboard.
         auto ait = shipImp.slugs.find(slug);
@@ -5100,9 +5178,12 @@ int main(int argc, char** argv) {
           Mesh& rmv = vesselFor(slug);
           auto cp = combatPose(rp.id, slug);
           ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv,
-                                            cp.roll, cp.pitch, cp.ydrop), true, rp });   // server heading is degrees
+                                            cp.roll, cp.pitch, cp.ydrop), true, rp });   // pose = smoothed display track
         }
       }
+      // Drop motion state for departed ships.
+      for (auto it2 = remoteMotion.begin(); it2 != remoteMotion.end();)
+        it2 = motionSeen.count(it2->first) ? std::next(it2) : remoteMotion.erase(it2);
       // Town streaming (client BUILD_RANGE=600 / PIER_BUILD_RANGE=2400): real GLBs
       // near the player, appended as plain static ship-instances (same draw path).
       if (terrainR.ready) {

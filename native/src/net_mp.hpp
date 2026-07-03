@@ -22,6 +22,7 @@ struct RemotePlayer {
   std::string role;          // merchant | pirate | hunter (NPCs only)
   // Rig-animation state (relayed by the server; NPCs send sheetAngle 0).
   float turnRate = 0, sheetAngle = 30;
+  int seq = 0;               // server update sequence (motion-smoothing snapshots key on it)
   bool isPortTack = false, anchored = false;
   std::string anchorSide = "S";
 };

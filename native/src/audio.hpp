@@ -46,7 +46,11 @@ public:
   // One-shot cannon fire (cannon.service playCannonSound, six synth layers) and
   // water-impact splash. vol 0..1 (callers distance-attenuate: 1 - d/800).
   void playCannon(float vol);
+  // Impact one-shots (cannon.service): water gloop/whoomp/spray, land
+  // thud+clatter, ship crunch/splinter/shatter. vol 0..1.
   void playSplash(float vol);
+  void playLandImpact(float vol);
+  void playShipHit(float vol);
   // Demasting: creaking groan + volley of wood cracks (mast-crack.service).
   void playMastCrack(float vol);
   // One-shot procedural thunder (cloud.service playThunder): vol 0..1 sets the

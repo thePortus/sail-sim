@@ -3254,6 +3254,12 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_Appearing);
+        // AlwaysAutoResize sizes the window to its content, so one long unwrapped
+        // line (a verbose server error in admStatus) could stretch it past the
+        // screen edge. Clamp the auto-resize to a sane width; long text wraps.
+        ImGui::SetNextWindowSizeConstraints(
+            ImVec2(360.0f, 0.0f),
+            ImVec2(std::min(460.0f, io.DisplaySize.x - 40.0f), io.DisplaySize.y - 40.0f));
         if (ImGui::Begin("Admin Controls", &adminOpen,
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
           const bool busy = admFuture.valid();
@@ -3344,9 +3350,13 @@ int main(int argc, char** argv) {
           if (busy) { ImGui::Spacing(); ImGui::TextDisabled("applying..."); }
           else if (!admStatus.empty()) {
             ImGui::Spacing();
-            ImGui::TextColored(admStatus.find("failed") != std::string::npos
-                                 ? ImVec4(0.95f, 0.55f, 0.45f, 1.0f) : onCol,
-                               "%s", admStatus.c_str());
+            // Wrapped (not TextColored): long failure strings fold within the
+            // window instead of widening it (see the size constraints above).
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  admStatus.find("failed") != std::string::npos
+                                      ? ImVec4(0.95f, 0.55f, 0.45f, 1.0f) : onCol);
+            ImGui::TextWrapped("%s", admStatus.c_str());
+            ImGui::PopStyleColor();
           }
         }
         ImGui::End();

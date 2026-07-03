@@ -1,9 +1,10 @@
 // Final post-process: the client's DefaultRenderingPipeline "pretty" pass.
 // Reads the linear HDR scene, applies (in order) the rain-on-the-lens refraction
 // (Martijn Steinrucken's "Heartfelt", as adapted in rain-lens.ts), a light
-// sharpen, exposure, ACES filmic tonemapping, contrast, bloom composite,
-// vignette, and animated film grain — all driven by the same time-of-day /
-// weather curves scene.service's tickTimeOfDay used.
+// sharpen, then Babylon's exact imageProcessing chain: exposure, vignette,
+// KHR PBR Neutral tonemapping, gamma-space contrast, bloom composite, and
+// animated film grain — all driven by the same time-of-day / weather curves
+// scene.service's tickTimeOfDay used.
 
 struct PostU {
     misc  : vec4<f32>,   // x,y = resolution; z = time (s); w = rain amount [0..1]
@@ -130,10 +131,25 @@ fn dropLayerBig(uv : vec2<f32>, scl : f32, seed : f32, t : f32) -> vec4<f32> {
     return vec4<f32>(offset, m, rim);
 }
 
-// ── ACES filmic tonemap (Babylon toneMappingType 2) ─────────────────────────
-fn aces(x : vec3<f32>) -> vec3<f32> {
-    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+// ── KHR PBR Neutral tonemap — Babylon toneMappingType 2. The client's comment
+//    said "ACES" but in Babylon 2 = TONEMAPPING_KHR_PBR_NEUTRAL (ACES is 1), so
+//    the browser actually renders through this hue-preserving Khronos curve:
+//    skies keep their saturated blue instead of the warmer, desaturated wash
+//    the Narkowicz ACES fit gave. Verbatim port of Babylon's
+//    PBRNeutralToneMapping (imageProcessingFunctions.wgsl). ──
+fn pbrNeutral(colorIn : vec3<f32>) -> vec3<f32> {
+    let startCompression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    let x = min(colorIn.r, min(colorIn.g, colorIn.b));
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    var result = colorIn - offset;
+    let peak = max(result.r, max(result.g, result.b));
+    if (peak < startCompression) { return result; }
+    let d = 1.0 - startCompression;
+    let newPeak = 1.0 - d * d / (peak + d - startCompression);
+    result *= newPeak / peak;
+    let g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(result, vec3<f32>(newPeak), g);
 }
 
 fn grainHash(p : vec2<f32>) -> f32 {
@@ -219,17 +235,39 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     if (u.grade.w > 0.5) {
         // ── Bloom composite (thresholded half-res blur, additive by weight). ──
         col += textureSampleLevel(bloomTex, samp, uv, 0.0).rgb * u.grade.z;
-        // ── Exposure -> ACES tonemap -> contrast (imageProcessing order). ──
+        // ── Babylon applyImageProcessing, exact order: exposure (linear) ->
+        //    vignette (linear, multiply mode) -> KHR PBR Neutral tonemap ->
+        //    toGammaSpace + saturate -> contrast (GAMMA space, smoothstep
+        //    curve — Babylon does NOT use a linear pivot) -> grain. ──
         col *= u.grade.x;
-        col = aces(col);
-        col = clamp((col - 0.5) * u.grade.y + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
-        // ── Vignette (weight 0.40 — light corner falloff). ──
-        let d2 = dot(in.uv - 0.5, in.uv - 0.5);
-        col *= 1.0 - u.fx.z * smoothstep(0.12, 0.55, d2);
-        // ── Film grain: animated when fx.y > 0.5, static otherwise. ──
+        // Vignette: viewportXY in NDC, scaleY = tan(vignetteCameraFov/2) with the
+        // default fov 0.5, scaleX = scaleY * aspect; term^( -2 * weight ). Black
+        // vignette colour in multiply mode => straight multiplier.
+        {
+            let vXY = in.uv * 2.0 - 1.0;
+            let vScaleY = 0.25534192;   // tan(0.25)
+            let vScaleX = vScaleY * (res.x / res.y);
+            let vXY1 = vec3<f32>(vXY.x * vScaleX, vXY.y * vScaleY, 1.0);
+            let vig = pow(dot(vXY1, vXY1), -2.0 * u.fx.z);
+            col *= vig;
+        }
+        col = pbrNeutral(col);
+        var rgbG = clamp(pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), vec3<f32>(0.0), vec3<f32>(1.0));
+        let highContrast = rgbG * rgbG * (3.0 - 2.0 * rgbG);
+        if (u.grade.y < 1.0) {
+            rgbG = mix(vec3<f32>(0.5), rgbG, u.grade.y);
+        } else {
+            rgbG = mix(rgbG, highContrast, u.grade.y - 1.0);
+        }
+        rgbG = max(rgbG, vec3<f32>(0.0));
+        // ── Film grain (gamma space, like Babylon's grain pass): animated when
+        //    fx.y > 0.5, static otherwise. ──
         let gseed = select(vec2<f32>(0.0), vec2<f32>(fract(u.misc.z * 13.7), fract(u.misc.z * 7.3)), u.fx.y > 0.5);
         let g = grainHash(in.uv * res * 0.5 + gseed) - 0.5;
-        col += g * u.fx.x;
+        rgbG += g * u.fx.x;
+        // Back to linear: the sRGB swapchain re-encodes on write, so the display
+        // sees Babylon's gamma-space result (2.2 vs sRGB piecewise ~ identical).
+        col = pow(clamp(rgbG, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
     }
     return vec4<f32>(col, 1.0);
 }

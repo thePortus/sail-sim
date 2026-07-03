@@ -163,6 +163,11 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   // half-size with slop for the differing origin snaps; 0 on the near grid).
   if (u.extra.z > 0.0 &&
       max(abs(in.worldPos.x - u.misc.z), abs(in.worldPos.z - u.misc.w)) < u.extra.z) { discard; }
+  // Mirror clip (extra.w = 1 only in the reflection pass): a planar mirror
+  // across y=0 must reflect ONLY geometry above the water — without this the
+  // seabed (below y=0 for kilometres) fills the whole mirror and buries the
+  // island reflections under a wall of sand.
+  if (u.extra.w > 0.5 && in.worldPos.y < 0.02) { discard; }
   // The seabed DRAWS now (no waterline cull): the ocean surface above is
   // alpha-blended by true depth, so submerged sand shows through the shallows.
   // Underwater fragments get absorption shading below so reef flats read as

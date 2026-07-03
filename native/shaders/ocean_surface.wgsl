@@ -17,7 +17,7 @@ struct Camera {
     cloud1   : vec4<f32>,   // x,y = weather drift; zw unused
     shadow0  : mat4x4<f32>, // world -> sun-shadow clip, tight ship cascade
     shadow1  : mat4x4<f32>, // world -> sun-shadow clip, wide landscape cascade
-    shadowP  : vec4<f32>,   // x = enabled, y = bias 0, z = bias 1, w unused
+    shadowP  : vec4<f32>,   // x = enabled, y = bias 0, z = bias 1, w = shadow texel (uv)
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
@@ -47,7 +47,17 @@ fn sunShadowW(worldPos : vec3<f32>) -> f32 {
     let uv0 = vec2<f32>(sp0.x * 0.5 + 0.5, 0.5 - sp0.y * 0.5);
     if (uv0.x > 0.01 && uv0.x < 0.99 && uv0.y > 0.01 && uv0.y < 0.99 &&
         sp0.z > 0.0 && sp0.z < 1.0) {
-        return textureSampleCompareLevel(shadowT0, shadowS, uv0, sp0.z - cam.shadowP.y);
+        // Wide 3x3 PCF (~2-texel spread): water scatters light, so the hull and
+        // rigging shadows on the surface read soft, not razor-cut.
+        let px = cam.shadowP.w * 2.0;
+        var s = 0.0;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                s += textureSampleCompareLevel(shadowT0, shadowS,
+                        uv0 + vec2<f32>(f32(dx), f32(dy)) * px, sp0.z - cam.shadowP.y);
+            }
+        }
+        return s / 9.0;
     }
     let sp1 = cam.shadow1 * vec4<f32>(worldPos, 1.0);
     let uv1 = vec2<f32>(sp1.x * 0.5 + 0.5, 0.5 - sp1.y * 0.5);

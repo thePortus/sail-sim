@@ -4971,7 +4971,8 @@ int main(int argc, char** argv) {
       ShadowUniform off{ glm::mat4(1.0f), glm::vec4(0.0f) };
       wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &off, sizeof(off));
     }
-    const glm::vec4 oceanShadowP(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1, 0.0f);
+    const glm::vec4 oceanShadowP(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1,
+                                 1.0f / (float)kShadowRes);   // w = shadow texel (PCF spread)
 
     const glm::vec4 oceanProj(proj[0][0], proj[1][1], proj[2][2], proj[3][2]);
     // Cloud slab parameters (shared by the raymarch uniforms below and the
@@ -5157,6 +5158,8 @@ int main(int argc, char** argv) {
       if (terrUniformsLive) {
         TerrainU tuR = tu; tuR.viewProj = reflVP; tuR.eye = glm::vec4(reflEye, 1.0f);
         TerrainU tfR = tf; tfR.viewProj = reflVP; tfR.eye = glm::vec4(reflEye, 1.0f);
+        tuR.extra.w = 1.0f;   // mirror clip: reflect only geometry above the water
+        tfR.extra.w = 1.0f;
         wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tuR, sizeof(tuR));
         wgpuQueueWriteBuffer(queue, terrainR.farUniformBuf, 0, &tfR, sizeof(tfR));
       }

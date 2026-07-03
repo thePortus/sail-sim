@@ -2541,7 +2541,7 @@ int main(int argc, char** argv) {
   // mirror the vessel each frame for the camera/ocean/network.
   sail::Vessel vessel;
   sail::Rig    vrig = sail::rigForSlug("sloop");
-  bool prevRaise = false, prevLower = false, prevAnchor = false;
+  bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
@@ -3001,6 +3001,31 @@ int main(int argc, char** argv) {
       ImGui::Text("Speed %.1f kn", shipSpeed);
       ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.95f, 1.0f), "%s", pos);
 
+      // Sheet gauge (client HUD sheet control): fill = sheet angle (5-88 deg,
+      // hauled -> eased), white tick = optimal for the current wind, colour =
+      // trim quality (green > 75%, yellow > 40%, red). Hidden while furled.
+      if (vessel.sailState != 0) {
+        const float q = vessel.trimQ;
+        const ImVec4 qcol = q > 0.75f ? ImVec4(0.35f, 0.85f, 0.50f, 1.0f)
+                          : q > 0.40f ? ImVec4(0.95f, 0.83f, 0.35f, 1.0f)
+                                      : ImVec4(0.94f, 0.38f, 0.38f, 1.0f);
+        ImGui::Spacing();
+        ImGui::TextDisabled("SHEET");
+        ImGui::SameLine(70.0f);
+        ImGui::TextColored(qcol, "%.0f%s  -  %d%%", vessel.sheetAngleDeg, "\u00b0", (int)std::lround(q * 100.0f));
+        ImVec2 gp = ImGui::GetCursorScreenPos();
+        const float gw = 176.0f, gh = 7.0f;
+        ImGui::Dummy(ImVec2(gw, gh + 4.0f));
+        const float fill = (vessel.sheetAngleDeg - 5.0f) / 83.0f;
+        const float opt = (sail::optimalSheetAngle(vessel.driveAngle) - 5.0f) / 83.0f;
+        ImDrawList* gdl = ImGui::GetWindowDrawList();
+        gdl->AddRectFilled(gp, ImVec2(gp.x + gw, gp.y + gh), IM_COL32(255, 255, 255, 26), 3.5f);
+        gdl->AddRectFilled(gp, ImVec2(gp.x + gw * fill, gp.y + gh), ImGui::GetColorU32(qcol), 3.5f);
+        gdl->AddRectFilled(ImVec2(gp.x + gw * opt - 1.0f, gp.y - 2.0f),
+                           ImVec2(gp.x + gw * opt + 1.0f, gp.y + gh + 2.0f), IM_COL32(255, 255, 255, 160));
+        ImGui::TextDisabled("Q ease    T auto    E haul");
+      }
+
       const char* connLabel = cs == mp::ConnState::Open ? "connected" : cs == mp::ConnState::Connecting ? "connecting..."
                             : cs == mp::ConnState::AuthFailed ? "auth failed" : "offline";
       const ImVec4 connCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f) : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
@@ -3028,7 +3053,7 @@ int main(int argc, char** argv) {
       ImGui::PushFont(fontTitle);
       ImGui::TextColored(sailCol, "%s", sailLabel);
       ImGui::PopFont();
-      ImGui::TextDisabled("W / S  sail    P  anchor");
+      ImGui::TextDisabled("W / S  sail    Q / E  trim    P  anchor");
       ImGui::End();
 
       // ── World map (mirrors the browser's minimap.component): a small always-on
@@ -3992,11 +4017,18 @@ int main(int argc, char** argv) {
       shipSpeed = 0.0f;
     } else if (appState == AppState::Sailing) {
       auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
-      int rudder = 0;
+      int rudder = 0, sheetDir = 0;
       if (!io.WantCaptureKeyboard) {
         rudder = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
         bool raise = down(GLFW_KEY_W, GLFW_KEY_UP), lower = down(GLFW_KEY_S, GLFW_KEY_DOWN);
         bool anchor = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+        // Sheet: Q eases the sail out, E hauls it in, T jumps to the optimal
+        // angle for the current apparent-wind angle (the client bindings).
+        sheetDir = (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS ? 1 : 0)
+                 - (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS ? 1 : 0);
+        bool autoTrim = glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS;
+        if (autoTrim && !prevAutoTrim) vessel.sheetAngleDeg = sail::optimalSheetAngle(vessel.driveAngle);
+        prevAutoTrim = autoTrim;
         if (raise && !prevRaise) vessel.sailState = std::min(2, vessel.sailState + 1);
         if (lower && !prevLower) vessel.sailState = std::max(0, vessel.sailState - 1);
         if (anchor && !prevAnchor) {
@@ -4011,7 +4043,7 @@ int main(int argc, char** argv) {
       float windKn      = wv.valid ? wv.windSpeed  : 8.0f;
       float seaRough    = glm::clamp((wv.valid ? (float)wv.beaufort : 3.0f) / 8.0f, 0.0f, 1.0f);
       float preX = vessel.x, preZ = vessel.z;   // for the land-collision revert
-      sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale);
+      sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale, sheetDir);
       // Hull-vs-land collision (client hullHitsLand): sample the hull CENTRELINE
       // from centre toward the moving end (bow ahead / stern astern), plus the
       // centre itself, so the bow halts at the shoreline instead of burying

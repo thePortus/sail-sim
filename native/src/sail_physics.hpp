@@ -64,7 +64,22 @@ struct Vessel {
   bool  anchored = false;
   float anchorX = 0, anchorZ = 0;
   float heaveF = 0, pitchF = 0, rollF = 0;   // filtered buoyancy
+  // Sheet (sail trim), player-set: 5 = hauled hard in .. 88 = fully eased.
+  float sheetAngleDeg = 30.0f;       // client default (reaching start)
+  float trimQ = 1.0f;                // last tick's trim quality 0..1 (for the HUD)
+  float driveAngle = 90.0f;          // last tick's apparent-wind angle (for auto-trim/HUD)
 };
+
+// Ideal sheet angle (deg from centreline) for a wind angle — client table.
+inline float optimalSheetAngle(float a) {
+  if (a < 38.0f)  return 5.0f;
+  if (a < 60.0f)  return 18.0f;
+  if (a < 90.0f)  return 35.0f;
+  if (a < 115.0f) return 52.0f;
+  if (a < 145.0f) return 68.0f;
+  if (a < 165.0f) return 82.0f;
+  return 88.0f;
+}
 
 namespace detail {
 inline float polarDrive(float a, const Rig& r) {
@@ -85,12 +100,34 @@ inline float turnRate(float speed, float maxSpeed) {
   float rate = 155.0f * sf / (1.0f + (sf / 0.28f) * (sf / 0.28f));
   return std::clamp(rate, 4.0f, 30.0f);
 }
+inline float smooth01(float v, float a, float b) {
+  float t = std::clamp((v - a) / (b - a), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+// v2 trim quality (client trimFactorV2): upwind the sail is an airfoil (tight
+// tolerance, stalls/luffs toward 0); dead downwind it's a drag device (wide
+// tolerance, high floor, cannot stall).
+inline float trimFactorV2(float sheetAngleDeg, float absAngle, const Rig& r) {
+  float optimal  = optimalSheetAngle(absAngle);
+  float mismatch = sheetAngleDeg - optimal;             // <0 too tight, >0 eased too far
+  float dw       = smooth01(absAngle, 100.0f, 160.0f);  // 0 airfoil -> 1 drag device
+  float floorQ   = 0.70f * dw;
+  float tightW   = (20.0f + 56.0f * dw) * r.trimForgive;
+  float easeW    = (32.0f + 58.0f * dw) * r.trimForgive;
+  float width    = std::max(1.0f, mismatch < 0.0f ? tightW : easeW);
+  float x        = std::min(1.0f, std::fabs(mismatch) / width);
+  return floorQ + (1.0f - floorQ) * (1.0f - x * x);
+}
 }  // namespace detail
 
 // One physics tick. windFromDeg = wind FROM bearing (deg); windSpeed knots; rudder -1/0/+1.
-// seaRough 0..1. Auto-trims the sheets (assumes a well-set sail).
+// seaRough 0..1. Drive is scaled by the player-set sheet trim (v.sheetAngleDeg);
+// sheetDir eases (+1, Q) / hauls (-1, E) at the client's 28 deg/s.
 inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float windSpeed,
-                 float seaRough, int rudder, float travelScale) {
+                 float seaRough, int rudder, float travelScale, int sheetDir = 0) {
+  const float SHEET_RATE = 28.0f;   // deg/s while Q/E held (client SHEET_RATE)
+  if (sheetDir > 0) v.sheetAngleDeg = std::min(88.0f, v.sheetAngleDeg + SHEET_RATE * dt);
+  if (sheetDir < 0) v.sheetAngleDeg = std::max(5.0f, v.sheetAngleDeg - SHEET_RATE * dt);
   const float DEG = glm::pi<float>() / 180.0f;
   const float HEEL_K = 0.22f, COMFORT_HEEL = 16.0f, SPILL_RANGE = 14.0f, SPILL_MAX = 0.75f, MAX_HEEL = 26.0f;
   const float DRAG_K = 1.0f, TURN_SCRUB = 0.06f, SEA_DRAG_K = 0.06f, FORCE_RESPONSE = 0.04f, WEIGHT_REF = 2800.0f;
@@ -111,8 +148,14 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
   float cosA = (-ax * std::sin(hr) - az * std::cos(hr)) / (appWind > 1e-4f ? appWind : 1.0f);
   float driveAngle = std::acos(std::clamp(cosA, -1.0f, 1.0f)) / DEG;   // 0 = bow into apparent wind
 
-  // Drive coefficient (auto-trim: trim quality = 1).
-  float eff = (v.sailState == 0) ? 0.0f : detail::polarDrive(driveAngle, r) * (v.sailState == 1 ? 0.5f : 1.0f);
+  // Drive coefficient × trim quality (client sailEfficiency: trim penalty is 1
+  // inside the no-go zone, and reefed sails report perfect trim with no drive).
+  v.driveAngle = driveAngle;
+  float trim = (v.sailState == 0 || driveAngle < r.minTackAngle)
+             ? 1.0f : detail::trimFactorV2(v.sheetAngleDeg, driveAngle, r);
+  v.trimQ = trim;
+  float eff = (v.sailState == 0) ? 0.0f
+            : detail::polarDrive(driveAngle, r) * (v.sailState == 1 ? 0.5f : 1.0f) * trim;
 
   // Heel from wind side-force; over comfort the sail spills wind (drive falls off).
   float canvas = (v.sailState == 2) ? 1.0f : (v.sailState == 1 ? 0.5f : 0.0f);

@@ -4464,9 +4464,10 @@ int main(int argc, char** argv) {
       float horizon = std::max(0.0f, 1.0f - std::fabs(h) / 0.22f);
       bool isNight = h < -0.05f;
       float nightBlend = isNight ? 1.0f : glm::clamp((-h - 0.03f) / 0.20f, 0.0f, 1.0f);
-      // Night exposure 1.0 (client 0.72): our shaders already night-dim the scene,
-      // so the client value would double-darken.
-      float exposure = isNight ? 1.0f
+      // Night exposure 1.15 (client 0.72): our shaders night-dim the scene
+      // themselves (the client's dimming lived in its lighting rig), and the
+      // night floors below the client's — the small lift lands the same look.
+      float exposure = isNight ? 1.15f
                      : std::max(0.6f, 1.35f + horizon * 0.22f - cloudiness * 0.18f - nightBlend * 0.70f);
       // Lightning: the client added flash*2.6 to the ambient light — the whole
       // scene strobes. Our equivalent whole-scene knob is exposure.
@@ -4674,7 +4675,7 @@ int main(int argc, char** argv) {
       glm::vec2 r2(viewM[0][0], viewM[2][0]);   // camera-right, projected to XZ
       float r2l = glm::length(r2);
       r2 = r2l > 1e-4f ? r2 / r2l : glm::vec2(1.0f, 0.0f);
-      glm::vec3 impTint = glm::vec3(glm::mix(0.13f, 1.0f, dayK))
+      glm::vec3 impTint = glm::vec3(glm::mix(0.30f, 1.0f, dayK))
                         * glm::mix(glm::vec3(0.48f, 0.58f, 0.82f), glm::vec3(1.0f), dayK);
       for (uint32_t i = 0; i < shipImpCount; ++i) {
         const ImpInst& ii = shipImposters[i];
@@ -4687,14 +4688,14 @@ int main(int argc, char** argv) {
         int c0 = (int)f % sg.n; int c1 = (c0 + 1) % sg.n;
         float hd = std::hypot(ii.x - eye.x, ii.z - eye.z);
         float hAmt = 1.0f - std::exp(-std::pow(hd * 0.00009f, 2.0f));
-        glm::vec3 hCol = glm::mix(glm::vec3(0.10f, 0.12f, 0.16f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
+        glm::vec3 hCol = glm::mix(glm::vec3(0.13f, 0.155f, 0.21f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
         ShipImpU su{ viewProj,
                      glm::vec4(ii.x, fftHeight(ii.x, ii.z) + sg.centerY, ii.z, sg.size),
                      glm::vec4((float)c0 / sg.cols, (float)c1 / sg.cols, f - std::floor(f), 1.0f / sg.cols),
                      glm::vec4(impTint, 0.0f), glm::vec4(r2, 0.0f, 0.0f), glm::vec4(hCol, hAmt) };
         wgpuQueueWriteBuffer(queue, shipImp.ubuf, (uint64_t)i * shipImp.stride, &su, sizeof(su));
       }
-      glm::vec3 hCol2 = glm::mix(glm::vec3(0.10f, 0.12f, 0.16f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
+      glm::vec3 hCol2 = glm::mix(glm::vec3(0.13f, 0.155f, 0.21f), glm::vec3(0.66f, 0.72f, 0.80f), dayK);
       for (TownImpType& tt : townImp.types) {
         TownImpU tu{ viewProj, glm::vec4(eye.x, eye.z, r2.x, r2.y),
                      glm::vec4(600.0f, 850.0f, 4200.0f, 5200.0f),   // client TownImpostorPlugin.band

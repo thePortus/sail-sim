@@ -204,13 +204,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // ship in reflTex) is already dark at night, so this only crushes the deep-water
     // body + glint; the surface still catches the moon and its reflection.
     let dayK = cam.sun.w;
-    let bright = mix(0.10, 1.0, dayK);
+    let bright = mix(0.30, 1.0, dayK);   // night floor raised with the land (was 0.10)
     let tint   = mix(vec3<f32>(0.42, 0.54, 0.82), vec3<f32>(1.0), dayK);
     outColor = outColor * bright * tint;
     // Aerial haze — the far water recedes into the same horizon colour as the land.
     let hd = distance(cam.eye.xyz, in.worldPos);
     let haze = 1.0 - exp(-pow(hd * 0.00009, 2.0));
-    outColor = mix(outColor, mix(vec3<f32>(0.10, 0.12, 0.16), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
+    outColor = mix(outColor, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
     // REAL transparency over the shallows — the client's exact composite: it mixed
     // the revealed seabed in at reveal * 0.9 (10% water colour always remains), so
     // our alpha is 1 - reveal * 0.9. Foam stays opaque on top (composited last there

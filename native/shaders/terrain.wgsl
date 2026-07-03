@@ -294,12 +294,14 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     col = col * vec3<f32>(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
   }
   // Day/night (u.sun.w = daylight): dim + cool the land toward a moonlit night.
+  // Night floor 0.30 (was 0.13) — the client deliberately raised its night
+  // ambient/moonlight so mountains read as moonlit, not featureless black.
   let dayK = u.sun.w;
-  col = col * mix(0.13, 1.0, dayK) * mix(vec3<f32>(0.48, 0.58, 0.82), vec3<f32>(1.0), dayK);
+  col = col * mix(0.30, 1.0, dayK) * mix(vec3<f32>(0.48, 0.58, 0.82), vec3<f32>(1.0), dayK);
   // Aerial haze (client EXP2 fog): distant land recedes into the horizon colour.
   let hazeD = distance(u.eye.xyz, in.worldPos);
   let hazeAmt = 1.0 - exp(-pow(hazeD * 0.00009, 2.0));
-  let hazeCol = mix(vec3<f32>(0.10, 0.12, 0.16), vec3<f32>(0.66, 0.72, 0.80), dayK);
+  let hazeCol = mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK);
   col = mix(col, hazeCol, hazeAmt);
   return vec4<f32>(col, 1.0);   // sRGB target does gamma
 }

@@ -98,7 +98,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let F0 = mix(vec3<f32>(0.04), albedo, metallic);
     // Warm bright sunlight cross-fading to dim cool moonlight (u.sun.w = daylight).
     let dayK = u.sun.w;
-    let radiance = mix(vec3<f32>(0.22, 0.27, 0.42), vec3<f32>(3.0), dayK);
+    let radiance = mix(vec3<f32>(0.42, 0.50, 0.76), vec3<f32>(3.0), dayK);   // night floor raised with the scene
 
     let NDF = distributionGGX(N, H, roughness);
     let G = geometrySmith(N, V, L, roughness);
@@ -112,7 +112,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let NdotL = max(dot(N, L), 0.0);
     let Lo = (kD * albedo / PI + specular) * radiance * NdotL;
 
-    let ambient = mix(vec3<f32>(0.05, 0.06, 0.09), vec3<f32>(0.18), dayK) * albedo;
+    let ambient = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
     var color = ambient + Lo;
     color = color / (color + vec3<f32>(1.0));       // Reinhard tonemap (sRGB target does gamma)
     return vec4<f32>(color, 1.0);

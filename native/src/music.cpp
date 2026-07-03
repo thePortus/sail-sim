@@ -54,8 +54,10 @@ static bool parseSmf(const std::string& bytes, std::vector<RawTrack>& outTracks,
   tpq = division;
   r.skip(hlen > 6 ? hlen - 6 : 0);
 
+  // No seeded default entry: tickToSec starts at 500000 (120 bpm) and only
+  // real tempo events override it. (A seeded {0, 500000} pair sorted AFTER a
+  // faster real tempo at tick 0 and clobbered it — every song played at 120.)
   tempoMap.clear();
-  tempoMap.push_back({ 0.0, 500000.0 });      // default 120 bpm
 
   for (int t = 0; t < ntrks && r.ok; ++t) {
     if (r.u32() != 0x4D54726Bu) return false; // "MTrk"
@@ -99,7 +101,10 @@ static bool parseSmf(const std::string& bytes, std::vector<RawTrack>& outTracks,
     r.p = trackEnd;
     if (!track.notes.empty()) outTracks.push_back(std::move(track));
   }
-  std::sort(tempoMap.begin(), tempoMap.end());
+  std::stable_sort(tempoMap.begin(), tempoMap.end(),
+                   [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                     return a.first < b.first;
+                   });
   return r.ok && !outTracks.empty();
 }
 

@@ -2912,6 +2912,9 @@ int main(int argc, char** argv) {
   float camShake = 0.0f;                           // decaying camera shake magnitude (m)
   struct HullDecal { glm::vec3 local; float size; float ang; uint32_t seed; };
   std::map<std::string, std::vector<HullDecal>> shipDecals;   // "" = own ship
+  // Salvage (phase 4): crates already requested (re-armed when we sail back out).
+  std::set<std::string> salvageReq;
+  std::string repairStatus; double repairStatusAtT = -100;    // shipwright repair_result line
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
   // match server combat-constants.js) so distances feel right at realistic knots.
@@ -4221,6 +4224,8 @@ int main(int argc, char** argv) {
               drawMenuImage("shipwright");
               // Hull repair (server validates; free when broke - "mercy repair").
               if (ImGui::Button("Repair hull to full", ImVec2(-1, 0))) mpClient.requestCombatReset();
+              if (!repairStatus.empty() && t - repairStatusAtT < 20.0)
+                ImGui::TextColored(ImVec4(0.72f, 0.85f, 0.72f, 1.0f), "%s", repairStatus.c_str());
               // Per-hull upgrades, costed from the catalogue row of the owned hull.
               int cUp = 3000, aUp = 3000;
               for (const auto& r : swShips) if (r.slug == ts.ship) { cUp = r.cannonUpgradeCost; aUp = r.armorUpgradeCost; }
@@ -4767,6 +4772,31 @@ int main(int argc, char** argv) {
       float mrMs = mpClient.mastRepairMs();
       if (mrMs > 0.0f && mastRepairStartT < 0) { mastRepairStartT = t; mastRepairArmedMs = mrMs; }
       if (mrMs <= 0.0f) mastRepairStartT = -1;
+      // Salvage collection: request once inside 40 m (server re-checks 60 m);
+      // re-arm when we leave the radius so a full hold can retry after selling.
+      for (const mp::SalvageCrate& cr : mpClient.salvageCrates()) {
+        const float dx2 = cr.x - vessel.x, dz2 = cr.z - vessel.z;
+        const bool near2 = dx2 * dx2 + dz2 * dz2 <=
+                           combat::kCrateCollectR * combat::kCrateCollectR;
+        if (near2 && !salvageReq.count(cr.id)) {
+          mpClient.sendSalvageCollect(cr.id);
+          salvageReq.insert(cr.id);
+        } else if (!near2) {
+          salvageReq.erase(cr.id);
+        }
+      }
+      // Dock repair outcome (repair_result) -> shipwright status line.
+      {
+        mp::RepairResult rr = mpClient.consumeRepairResult();
+        if (rr.valid) {
+          if (!rr.ok) repairStatus = "The yard cannot repair her now.";
+          else if (rr.mercy) repairStatus = "Patched up for free - the harbourmaster's mercy.";
+          else if (rr.free) repairStatus = "Repaired, no charge.";
+          else if (rr.charged > 0) repairStatus = "Repaired for " + std::to_string(rr.charged) + "g.";
+          else repairStatus = "Hull already sound.";
+          repairStatusAtT = t;
+        }
+      }
       // Salvage pickup toast (crate rendering lands in phase 4; the protocol is live).
       mp::SalvageCollected got = mpClient.consumeSalvageCollected();
       if (got.valid) {
@@ -6194,6 +6224,43 @@ int main(int argc, char** argv) {
               primsSys.billboard(corner - cr * (bl * 0.5f * (float)cx2), cr, cu, bl, bt, amber);
               primsSys.billboard(corner - cu * (bl * 0.5f * (float)cy2), cr, cu, bt, bl, amber);
             }
+        }
+      }
+      // Salvage crates (salvage.service): wooden boxes riding the swell with a
+      // gentle roll and a per-location yaw; the ocean's depth hides the wet bottom.
+      {
+        std::vector<mp::SalvageCrate> crates = mpClient.salvageCrates();
+        if (std::getenv("SAILSIM_FAKECRATE"))   // screenshot hook: one crate ahead
+          crates.push_back({ "dbg", vessel.x + 14.0f, vessel.z + 10.0f });
+        const glm::vec3 lightN = glm::normalize(glm::vec3(0.4f, 0.85f, 0.3f));
+        for (const mp::SalvageCrate& cr : crates) {
+          const float cy = fftHeight(cr.x, cr.z) + 0.5f;
+          const float yaw = std::fmod(cr.x * 0.013f + cr.z * 0.017f, 3.14159265f);
+          const float rollA = std::sin((float)t * 0.9f + cr.x * 0.01f) * 0.12f;
+          const float cyw = std::cos(yaw), syw = std::sin(yaw);
+          const float crl = std::cos(rollA), srl = std::sin(rollA);
+          // R = yawY * rollZ (client root.rotation).
+          const glm::mat3 Ry(cyw, 0, -syw, 0, 1, 0, syw, 0, cyw);
+          const glm::mat3 Rz(crl, srl, 0, -srl, crl, 0, 0, 0, 1);
+          const glm::mat3 R = Ry * Rz;
+          const glm::vec3 c0(cr.x, cy, cr.z);
+          const glm::vec3 ex = R * glm::vec3(combat::kCrateW * 0.5f, 0, 0);
+          const glm::vec3 ey = R * glm::vec3(0, combat::kCrateH * 0.5f, 0);
+          const glm::vec3 ez = R * glm::vec3(0, 0, combat::kCrateD * 0.5f);
+          const glm::vec3 wood(0.45f, 0.30f, 0.16f);
+          struct Face { glm::vec3 n, u, v; };
+          const Face faces[6] = {
+            { ey, ex, ez }, { -ey, ez, ex }, { ex, ey, ez },
+            { -ex, ez, ey }, { ez, ey, ex }, { -ez, ex, ey },
+          };
+          for (const Face& f : faces) {
+            const glm::vec3 nrm = glm::normalize(f.n);
+            const float sh = 0.4f + 0.6f * std::max(0.0f, glm::dot(nrm, lightN));
+            const glm::vec4 col(wood * sh, 1.0f);
+            const glm::vec3 fc = c0 + f.n;
+            primsSys.tri(fc - f.u - f.v, fc + f.u - f.v, fc - f.u + f.v, col, false);
+            primsSys.tri(fc + f.u - f.v, fc + f.u + f.v, fc - f.u + f.v, col, false);
+          }
         }
       }
       // Scorch decals: ragged radial-fade fans stored hull-local (yaw frame),

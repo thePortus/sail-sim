@@ -3462,7 +3462,7 @@ int main(int argc, char** argv) {
               }
               auto sevCol = [](float hp, float maxHp) {
                 switch (combat::severityFor(hp, maxHp)) {
-                  case combat::Severity::None:      return IM_COL32(72, 150, 92, 190);
+                  case combat::Severity::None:      return IM_COL32(200, 215, 230, 34);   // untouched: faint silhouette only
                   case combat::Severity::Green:     return IM_COL32(62, 196, 96, 215);
                   case combat::Severity::Yellow:    return IM_COL32(238, 198, 62, 225);
                   case combat::Severity::Red:       return IM_COL32(228, 70, 56, 240);

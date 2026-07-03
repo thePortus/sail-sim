@@ -78,6 +78,55 @@ struct ThunderDesc {
   bool pe[kMaxPts];     // exponential (vs linear) ramp from the previous point
 };
 
+// A music synth voice: polyBLEP oscillator + ADSR (linear attack, exponential
+// decay/release — Tone.Synth's default envelope shape).
+struct MusicVoice {
+  bool active = false;
+  int synth = 0;
+  float freq = 440, vel = 1, phase = 0;
+  int stage = 0;            // 0 attack, 1 decay, 2 sustain, 3 release
+  float env = 0;
+  double releaseAt = 0;     // playhead time to enter release
+};
+
+inline float polyblep(float t, float dt) {
+  if (t < dt) { float x = t / dt; return x + x - x * x - 1.0f; }
+  if (t > 1.0f - dt) { float x = (t - 1.0f) / dt; return x * x + x + x + 1.0f; }
+  return 0.0f;
+}
+
+// Schroeder/Freeverb-style mono reverb approximating Tone.Reverb(decay 3.5).
+struct Reverb {
+  static constexpr int kCombs = 6, kAllpass = 3;
+  std::vector<float> comb[kCombs]; int ci[kCombs] = {};
+  float cf[kCombs] = {};          // per-comb lowpass damping state
+  std::vector<float> ap[kAllpass]; int ai[kAllpass] = {};
+  void init(float sr) {
+    static const float combMs[kCombs] = { 29.7f, 37.1f, 41.1f, 43.7f, 50.1f, 56.3f };
+    static const float apMs[kAllpass] = { 5.0f, 1.7f, 12.3f };
+    for (int i = 0; i < kCombs; ++i) comb[i].assign((size_t)(combMs[i] * 0.001f * sr) + 1, 0.0f);
+    for (int i = 0; i < kAllpass; ++i) ap[i].assign((size_t)(apMs[i] * 0.001f * sr) + 1, 0.0f);
+  }
+  inline float process(float x) {
+    float out = 0.0f;
+    for (int i = 0; i < kCombs; ++i) {
+      float y = comb[i][(size_t)ci[i]];
+      cf[i] = y * 0.35f + cf[i] * 0.65f;                 // damping in the loop
+      comb[i][(size_t)ci[i]] = x + cf[i] * 0.86f;        // ~3.5 s decay
+      if (++ci[i] >= (int)comb[i].size()) ci[i] = 0;
+      out += y;
+    }
+    out *= 1.0f / kCombs;
+    for (int i = 0; i < kAllpass; ++i) {
+      float b = ap[i][(size_t)ai[i]];
+      ap[i][(size_t)ai[i]] = out + b * 0.5f;
+      out = b - 0.5f * out;
+      if (++ai[i] >= (int)ap[i].size()) ai[i] = 0;
+    }
+    return out;
+  }
+};
+
 struct ThunderVoice {
   ThunderDesc d;
   Biquad lpf;
@@ -133,6 +182,78 @@ struct System::Impl {
   std::atomic<int> thunderState[kThunder]{};   // 0 free, 1 queued, 2 playing
   ThunderVoice thunderVoice[kThunder];
 
+  // ── Music engine ──
+  // Program hand-off: game thread parks the next program in `musicPending`;
+  // the audio thread swaps it into `musicCurrent` at a block boundary and parks
+  // the old one in `musicRetired` for the game thread to delete (no frees on
+  // the audio thread). All three are exchanged atomically.
+  std::atomic<MusicProgram*> musicPending{nullptr};
+  std::atomic<MusicProgram*> musicRetired{nullptr};
+  std::atomic<bool> musicStopReq{false};
+  std::atomic<bool> musicFinishedFlag{false};
+  std::atomic<float> tMusicGain{0.0f};
+  MusicProgram* musicCurrent = nullptr;   // audio thread only
+  size_t musicCursor = 0;                 // next note event
+  double musicPlayhead = 0;               // seconds into the track
+  bool musicDone = false;                  // finished flag already raised
+  static constexpr int kMusicVoices = 64;
+  MusicVoice musicVoice[kMusicVoices];
+  Smoothed sMusicGain;
+  Reverb musicReverb;
+
+  void musicNoteOn(const MusicNote& n) {
+    // Free voice, else steal the quietest releasing voice.
+    int pick = -1; float quiet = 1e9f;
+    for (int i = 0; i < kMusicVoices; ++i) {
+      if (!musicVoice[i].active) { pick = i; break; }
+      float score = musicVoice[i].env + (musicVoice[i].stage == 3 ? 0.0f : 10.0f);
+      if (score < quiet) { quiet = score; pick = i; }
+    }
+    MusicVoice& v = musicVoice[pick];
+    v.active = true; v.synth = n.synth; v.freq = n.freq; v.vel = n.vel;
+    v.phase = 0; v.stage = 0; v.env = 0;
+    v.releaseAt = n.t + (double)n.dur;
+  }
+
+  float renderMusicSample() {
+    if (!musicCurrent) return 0.0f;
+    const double dt = 1.0 / (double)sr;
+    float mix = 0.0f;
+    for (int i = 0; i < kMusicVoices; ++i) {
+      MusicVoice& v = musicVoice[i];
+      if (!v.active) continue;
+      const MusicSynthSpec& s = musicCurrent->synths[(size_t)v.synth];
+      // Envelope.
+      if (v.stage != 3 && musicPlayhead >= v.releaseAt) v.stage = 3;
+      switch (v.stage) {
+        case 0: v.env += (float)dt / std::max(0.003f, s.attack);
+                if (v.env >= 1.0f) { v.env = 1.0f; v.stage = 1; } break;
+        case 1: v.env = s.sustain + (v.env - s.sustain) * std::exp(-(float)dt * 4.6f / std::max(0.01f, s.decay));
+                if (v.env - s.sustain < 0.01f) v.stage = 2; break;
+        case 2: v.env = s.sustain; break;
+        case 3: v.env *= std::exp(-(float)dt * 4.6f / std::max(0.02f, s.release));
+                if (v.env < 1e-4f) { v.active = false; continue; } break;
+      }
+      // polyBLEP oscillator.
+      float pdt = v.freq / sr;
+      v.phase += pdt;
+      if (v.phase >= 1.0f) v.phase -= 1.0f;
+      float osc;
+      if (s.osc == 1) {         // sawtooth
+        osc = 2.0f * v.phase - 1.0f - polyblep(v.phase, pdt);
+      } else if (s.osc == 2) {  // square
+        osc = (v.phase < 0.5f ? 1.0f : -1.0f) + polyblep(v.phase, pdt);
+        float p2 = v.phase + 0.5f; if (p2 >= 1.0f) p2 -= 1.0f;
+        osc -= polyblep(p2, pdt);
+      } else {                  // triangle
+        osc = 4.0f * std::fabs(v.phase - 0.5f) - 1.0f;
+      }
+      mix += osc * v.env * v.vel * s.volLin;
+    }
+    // Shared reverb bus (Tone.Reverb decay 3.5, wet 0.35).
+    return mix * 0.65f + musicReverb.process(mix) * 0.35f;
+  }
+
   void buildNoise() {
     std::mt19937 rng(1717);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
@@ -165,6 +286,41 @@ struct System::Impl {
         lastWashF = sWashF.value;
       }
       const double lfoInc = 2.0 * M_PI * (double)sSwellFreq.value / (double)sr;
+
+      // Music: adopt a pending program / stop request at the block boundary.
+      if (musicStopReq.exchange(false, std::memory_order_acquire)) {
+        if (musicCurrent) {
+          MusicProgram* old = musicRetired.exchange(musicCurrent, std::memory_order_release);
+          delete old;   // (previous retiree unclaimed — safe: we're its only producer)
+          musicCurrent = nullptr;
+        }
+        for (auto& v : musicVoice) v.active = false;
+        musicDone = false;
+      }
+      if (MusicProgram* next = musicPending.exchange(nullptr, std::memory_order_acquire)) {
+        if (musicCurrent) {
+          MusicProgram* old = musicRetired.exchange(musicCurrent, std::memory_order_release);
+          delete old;
+        }
+        musicCurrent = next;
+        musicCursor = 0; musicPlayhead = 0; musicDone = false;
+        for (auto& v : musicVoice) v.active = false;
+      }
+      sMusicGain.step(tMusicGain.load(std::memory_order_relaxed));
+      if (musicCurrent) {
+        // Fire note-ons that fall inside this block.
+        const double blockEnd = musicPlayhead + (double)n / (double)sr;
+        while (musicCursor < musicCurrent->notes.size() &&
+               musicCurrent->notes[musicCursor].t <= blockEnd) {
+          musicNoteOn(musicCurrent->notes[musicCursor]);
+          ++musicCursor;
+        }
+        // Track played out (+ the client's 1.5 s gap) -> raise the advance flag.
+        if (!musicDone && musicPlayhead > musicCurrent->duration + 1.5) {
+          musicDone = true;
+          musicFinishedFlag.store(true, std::memory_order_release);
+        }
+      }
 
       // Claim queued thunder and refresh live voices' block-rate params.
       for (int v = 0; v < kThunder; ++v) {
@@ -210,8 +366,14 @@ struct System::Impl {
           thunder += tv.lpf.process(tv.noise()) * tv.envAt((float)tv.tau);
           tv.tau += 1.0 / (double)sr;
         }
+        // Music synth — its own bus/gain, independent of the SFX master.
+        float music = 0.0f;
+        if (musicCurrent) {
+          music = renderMusicSample() * sMusicGain.value;
+          musicPlayhead += 1.0 / (double)sr;
+        }
 
-        float s = (bed + rain + thunder) * sMaster.value;
+        float s = (bed + rain + thunder) * sMaster.value + music;
         s = std::tanh(s * 1.2f) / 1.2f;   // gentle safety limiter
         out[(done + i) * 2 + 0] = s;
         out[(done + i) * 2 + 1] = s;
@@ -261,6 +423,8 @@ bool System::init() {
   impl->sSwellFreq.configure(impl->sr, 0.7f, kBlock);
   impl->sRain.configure(impl->sr, 0.25f, kBlock);
   impl->sMaster.configure(impl->sr, 0.5f, kBlock);
+  impl->sMusicGain.configure(impl->sr, 0.15f, kBlock);
+  impl->musicReverb.init(impl->sr);
   impl->sWashF.value = 480.0f; impl->sSwellFreq.value = 0.08f;
   if (ma_device_start(&impl->device) != MA_SUCCESS) {
     ma_device_uninit(&impl->device);
@@ -329,9 +493,46 @@ void System::setEnabled(bool on) {
   impl->tMaster.store(on ? impl->masterVol : 0.0f, std::memory_order_relaxed);
 }
 
+void System::setMasterVolume(float v) {
+  if (!impl) return;
+  impl->masterVol = std::max(0.0f, std::min(1.0f, v));
+  // Re-assert through the enable gate (harmless if currently muted: enable
+  // path re-stores on the next setEnabled call every frame).
+}
+
+void System::musicPlay(MusicProgram&& program) {
+  if (!impl) return;
+  delete impl->musicRetired.exchange(nullptr, std::memory_order_acquire);
+  MusicProgram* p = new MusicProgram(std::move(program));
+  delete impl->musicPending.exchange(p, std::memory_order_release);   // replace an unconsumed pending
+  impl->musicFinishedFlag.store(false, std::memory_order_relaxed);
+}
+
+void System::musicStop() {
+  if (!impl) return;
+  delete impl->musicRetired.exchange(nullptr, std::memory_order_acquire);
+  delete impl->musicPending.exchange(nullptr, std::memory_order_acquire);
+  impl->musicStopReq.store(true, std::memory_order_release);
+  impl->musicFinishedFlag.store(false, std::memory_order_relaxed);
+}
+
+void System::musicSetGain(float linear) {
+  if (!impl) return;
+  impl->tMusicGain.store(std::max(0.0f, std::min(1.0f, linear)), std::memory_order_relaxed);
+}
+
+bool System::musicConsumeFinished() {
+  if (!impl) return false;
+  delete impl->musicRetired.exchange(nullptr, std::memory_order_acquire);
+  return impl->musicFinishedFlag.exchange(false, std::memory_order_acq_rel);
+}
+
 void System::shutdown() {
   if (!impl) return;
   if (impl->started) ma_device_uninit(&impl->device);
+  delete impl->musicPending.load();
+  delete impl->musicRetired.load();
+  delete impl->musicCurrent;
   delete impl;
   impl = nullptr;
 }

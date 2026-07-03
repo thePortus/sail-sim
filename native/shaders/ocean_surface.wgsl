@@ -61,7 +61,7 @@ fn sunShadowW(worldPos : vec3<f32>) -> f32 {
 // Material constants (from ocean-material.ts).
 const _Color       = vec3<f32>(0.015, 0.090, 0.130);
 const _SkyColor    = vec3<f32>(0.45, 0.62, 0.82);
-const _ReflStrength = 0.35;
+const _ReflStrength = 0.9;    // client ocean-material value — islands mirror visibly
 const _SSSColor    = vec3<f32>(0.1541919, 0.8857628, 0.990566);
 const _SSSStrength = 0.205;
 const _SSSBase     = -0.261;
@@ -267,10 +267,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // Kill the mirror glint across the shallows — transparent water over sand
     // reads as wet sand, never mirroring the sky (client reflCut).
     let reflCut = clamp(1.0 - max(reveal, shallow) * 1.6, 0.0, 1.0);
-    // Planar reflection (sky + ship), rippled by the surface normal, at grazing angles.
-    let reflUV = clamp(in.position.xy / cam.screen.xy + slope * 0.12, vec2<f32>(0.001), vec2<f32>(0.999));
+    // Planar reflection (sky + islands + ship + clouds), rippled by the surface
+    // normal, strongest at grazing angles — plus the client's analytic-sky
+    // remainder so the fresnel band never reads flat-dark.
+    let reflUV = clamp(in.position.xy / cam.screen.xy + slope * 0.05, vec2<f32>(0.001), vec2<f32>(0.999));
     let reflColor = textureSample(reflTex, samp, reflUV).rgb;
     waterCol += reflColor * fresnel * _ReflStrength * reflCut;
+    waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * reflCut;
 
     // Sun glint. Epsilon-guarded: V can oppose L on wave facets, and
     // normalize(0) is NaN — the black-wedge artifact (view-dependent).
@@ -278,11 +281,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let Hs = hs2 / max(length(hs2), 1e-4);
     waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2 * reflCut * sunVis;
 
-    // Composite foam (lit white) over water. Both take the cloud shadow on their
-    // direct-sun term; the body keeps most of its (ambient sky) light.
+    // Shadow the water body the way the client did: waterCol *= 1 - shadow*0.8
+    // (cloud + geometry shadows read clearly; foam keeps its own sun dimming).
+    waterCol *= 1.0 - (1.0 - sunVis) * 0.8;
+
+    // Composite foam (lit white) over water.
     let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0) * sunVis);
     var outColor = mix(waterCol, foamLit, jacobian);   // sRGB target does gamma
-    outColor = outColor * mix(0.80, 1.0, sunVis);
     // Day/night: darken and cool the sea toward night. The planar reflection (sky +
     // ship in reflTex) is already dark at night, so this only crushes the deep-water
     // body + glint; the surface still catches the moon and its reflection.

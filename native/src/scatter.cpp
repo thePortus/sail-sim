@@ -383,6 +383,11 @@ struct System::Impl {
                          BOLT_SPEED = 4.5f, BOIL_DEPTH = -0.7f;
   static constexpr int   NSPECIES = 4;
 
+  // Displaced ocean surface at (x, z) — the buoyancy fftHeight, handed in per
+  // update() so swimmers clamp under the REAL waves, not flat sea level.
+  std::function<float(float, float)> waveHFn;
+  float waveH(float x, float z) const { return waveHFn ? waveHFn(x, z) : 0.0f; }
+
   float ground(float x, float z) const { return terr ? terr->elevation(x, z) : -1000.0f; }
   bool isLand(float x, float z) const { return ground(x, z) > 0.02f; }
   float slope(float x, float z) const {
@@ -1452,15 +1457,22 @@ static void updateDolphins(Impl* p, float dt, float t, const System::ShipInfo& s
     d.z += std::sin(d.theta) * d.speed * dt;
 
     float sb = p->ground(d.x, d.z);
+    // Depths measure against the DISPLACED wave surface, not flat sea level —
+    // otherwise a storm trough drops the water out from under a shallow swimmer
+    // and leaves it hanging in mid-air. (Breaching is the one licensed exit.)
+    float ws = p->waveH(d.x, d.z);
     if (d.breaching) {
       d.breachVy -= Impl::BREACH_G * dt;
       d.y += d.breachVy * dt;
-      if (d.y <= Impl::BREACH_REENTRY && d.breachVy < 0) d.breaching = false;
+      if (d.y <= ws + Impl::BREACH_REENTRY && d.breachVy < 0) d.breaching = false;
     } else {
       float yTarget = d.baseY + std::sin(t * d.depthRate + d.depthPhase) * d.depthAmp;
-      float lo = sb + Impl::D_SEABED_CLEAR, hi = -Impl::D_SURFACE_CLEAR;
+      float lo = sb + Impl::D_SEABED_CLEAR, hi = ws - Impl::D_SURFACE_CLEAR;
       yTarget = hi < lo ? (lo + hi) * 0.5f : std::clamp(yTarget, lo, hi);
       d.y += (yTarget - d.y) * std::min(1.0f, dt * 1.5f);
+      // The ease above chases a moving trough; hard-cap so not even a fast wave
+      // can outrun it and expose the animal.
+      d.y = std::min(d.y, ws - Impl::D_SURFACE_CLEAR * 0.5f);
       if (!avoiding && d.bowSlot < 0 && d.speed > 2.2f && sb < -Impl::BREACH_MIN_DEPTH &&
           breachCount < Impl::MAX_BREACH && p->frand() < Impl::BREACH_CHANCE * dt) {
         d.breaching = true; d.breachVy = Impl::BREACH_VY0; d.targetSpeed = 6; ++breachCount;
@@ -1590,11 +1602,15 @@ static void updateFish(Impl* p, float dt, float t, const System::ShipInfo& ship)
       f.x += std::cos(f.theta) * f.speed * dt;
       f.z += std::sin(f.theta) * f.speed * dt;
       float sb = p->ground(f.x, f.z);
-      float depthBase = boil ? std::max(f.baseY, Impl::BOIL_DEPTH) : f.baseY;
+      // Same wave-surface clamp as the dolphins: boils happen just under the
+      // REAL surface, and a trough can never leave the school airborne.
+      float ws = p->waveH(f.x, f.z);
+      float depthBase = boil ? std::max(f.baseY, ws + Impl::BOIL_DEPTH) : f.baseY;
       float yTarget = depthBase + std::sin(t * f.depthRate + f.depthPhase) * f.depthAmp * (boil ? 1.5f : 1.0f);
-      float lo = sb + Impl::F_SEABED_CLEAR, hi = -Impl::F_SURFACE_CLEAR;
+      float lo = sb + Impl::F_SEABED_CLEAR, hi = ws - Impl::F_SURFACE_CLEAR;
       yTarget = hi < lo ? (lo + hi) * 0.5f : std::clamp(yTarget, lo, hi);
       f.y += (yTarget - f.y) * std::min(1.0f, dt * 1.8f);
+      f.y = std::min(f.y, ws - Impl::F_SURFACE_CLEAR * 0.5f);
       float effortTarget = std::clamp((f.speed - 1.0f) / 3.5f, 0.2f, 1.0f);
       f.effort += (effortTarget - f.effort) * std::min(1.0f, dt * 5);
     }
@@ -1602,9 +1618,11 @@ static void updateFish(Impl* p, float dt, float t, const System::ShipInfo& ship)
 }
 
 void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
-                    const ShipInfo& ship, float storminess) {
+                    const ShipInfo& ship, float storminess,
+                    const std::function<float(float, float)>& waveHeight) {
   Impl* p = p_.get();
   if (!p->ready || !p->terr) return;
+  p->waveHFn = waveHeight;
   float dt = std::min(0.05f, dtIn);
   float t = (float)timeSec;
 
@@ -1764,6 +1782,7 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
   updateBirds(p, dt, ship.x, ship.z, ship, storminess);
   updateDolphins(p, dt, t, ship);
   updateFish(p, dt, t, ship);
+  p->waveHFn = nullptr;   // the callback captures caller frame-locals; don't let it dangle
 
   // Write animal instances.
   auto writeSets = [&](Layer& l, const std::vector<std::vector<Inst>>& per) {

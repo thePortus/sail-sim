@@ -4570,7 +4570,8 @@ int main(int argc, char** argv) {
       float gale = std::max(0.0f, ((swv0.valid ? swv0.windSpeed : 8.0f) - 20.0f) / 8.0f);
       scatter::System::ShipInfo si{ vessel.x, vessel.z, vessel.heading,
                                     vessel.speed * 0.514f, vessel.anchored };
-      scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)));
+      scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
+                        [&](float x, float z) { return fftHeight(x, z); });
     }
     // Rain driver (cloud.service precip port): cloudiness -> drizzle/rain/storm
     // target, eased faster on the way in than out.

@@ -8,6 +8,7 @@
 // transform + tint), before the ocean so submerged props show through the
 // transparent shallows.
 #pragma once
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -38,8 +39,12 @@ public:
   struct ShipInfo { float x = 0, z = 0, headingRad = 0, speedMps = 0; bool anchored = false; };
 
   // Stream patches around the ship + advance the wildlife (exact client ports).
+  // waveHeight(x, z) = the displaced ocean surface (the buoyancy fftHeight) so
+  // swimmers clamp under the REAL surface — a storm trough must never expose a
+  // dolphin or fish in mid-air. Null = flat sea level.
   void update(WGPUDevice device, WGPUQueue queue, float dt, double timeSec,
-              const ShipInfo& ship, float storminess);
+              const ShipInfo& ship, float storminess,
+              const std::function<float(float, float)>& waveHeight = nullptr);
 
   // Draw everything (called inside the main pass, after terrain, before ocean).
   void draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& viewProj,

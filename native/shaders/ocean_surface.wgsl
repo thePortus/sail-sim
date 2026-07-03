@@ -128,8 +128,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     if (cam.lod.z > 0.01) {
         let nearF = 1.0 - smoothstep(25.0, 180.0, distance(cam.eye.xyz, in.worldPos));
         if (nearF > 0.001) {
-            let rt = cam.lod.w * 10.0;
-            let rp = in.worldUV * 2.2;
+            // Clock: the client sets _Time = seconds/10 and the shader does *10,
+            // so the effective rain clock is PLAIN SECONDS (a raw t*10 here ran
+            // the ripples 10x too fast). Density: client cells were worldUV*2.2
+            // (~0.45 m); 1.7 spreads the impacts out a touch (~0.59 m cells).
+            let rt = cam.lod.w;
+            let rp = in.worldUV * 1.7;
             let e = 0.18;
             let n0 = rainField(rp, rt);
             let grad = vec2<f32>(rainField(rp + vec2<f32>(e, 0.0), rt) - n0,

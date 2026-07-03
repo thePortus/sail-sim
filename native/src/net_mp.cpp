@@ -33,6 +33,7 @@ struct Client::Impl {
   std::map<std::string, CombatShipState> combat;
   std::map<std::string, std::pair<int, int>> crewBy;   // playerId -> {crew, maxCrew}
   float mastRepairMs = 0;                              // armed jury-rig duration (0 = none)
+  std::map<std::string, std::pair<int, int>> gunBy;    // playerId -> {port, stbd} deploy targets
   std::map<std::string, SalvageCrate> crates;
   SalvageCollected salvaged;
   RepairResult repairRes;
@@ -90,6 +91,7 @@ struct Client::Impl {
       corr.speed = msg.value("speed", 0.0f);
     } else if (type == "leave") {
       players.erase(msg.value("id", std::string()));
+      gunBy.erase(msg.value("id", std::string()));
     } else if (type == "wave_state") {
       wave.valid       = true;
       wave.windBearing = msg.value("windBearing", 0.0f);
@@ -136,6 +138,13 @@ struct Client::Impl {
         s.shotType = msg.value("shotType", std::string("round"));
         if (shotsIn.size() >= 256) shotsIn.erase(shotsIn.begin());
         shotsIn.push_back(std::move(s));
+      }
+    } else if (type == "gun_state") {
+      const std::string pid = msg.value("id", std::string());
+      if (!pid.empty() && pid != myId) {
+        auto& g = gunBy[pid];
+        int dep = msg.value("deploy", 0);
+        if (msg.value("side", std::string()) == "port") g.first = dep; else g.second = dep;
       }
     } else if (type == "combat_hit") {
       CombatHit h;
@@ -494,6 +503,18 @@ void Client::requestCombatReset() {
 }
 
 // ── Combat sends + state accessors ────────────────────────────────────────────
+void Client::sendGunState(int side, int deploy) {
+  if (p_->conn.load() != ConnState::Open) return;
+  json j = { { "type", "gun_state" },
+             { "side", side == 0 ? "port" : "stbd" },
+             { "deploy", deploy } };
+  p_->ws.send(j.dump());
+}
+std::map<std::string, std::pair<int, int>> Client::gunStates() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->gunBy;
+}
+
 void Client::sendCannonShot(float ox, float oy, float oz,
                             float vx, float vy, float vz,
                             int seq, const std::string& shotType) {

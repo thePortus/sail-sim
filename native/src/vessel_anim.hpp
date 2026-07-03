@@ -47,6 +47,13 @@ public:
   void setSailTrim(float sheetAngleDeg, bool isPortTack);
   void applySailState(int state, bool immediate = false);    // 0 reefed, 1 topsails, 2 full
   void dropAnchor(char side, float t);                       // 'S'/'P', 0 stowed .. 1 lowered
+  // Gunports + run-out (combat phase 1): deploy 0 stowed .. 1 run out; recoil
+  // kicks the gun back briefly after firing. Values are pre-eased by the caller.
+  void setGunDeploy(char side, float deploy01, float recoil01 = 0.0f) {
+    int i = side == 'P' ? 0 : 1;
+    gunDeploy_[i] = deploy01;
+    gunRecoil_[i] = recoil01;
+  }
   void idleWind(float windDirLocalRad, float strength, float t);
   void tickRig(float dt);
 
@@ -89,6 +96,9 @@ private:
   bool trimInit_ = false;
   float boomCur_ = 0, boomTarget_ = 0;         // sloop boom/gaff swing (rad)
   float anchorCur_[2] = { 0, 0 }, anchorReq_[2] = { 0, 0 };   // [0]=S, [1]=P
+  // Gun deploy/recoil per side ([0]=P, [1]=S), pre-eased by the caller.
+  float gunDeploy_[2] = { 0, 0 };
+  float gunRecoil_[2] = { 0, 0 };
   // Flag state (written by idleWind, applied in tickRig after the clip scrubs).
   float flagPhi_[4] = { 0, 0, 0, 0 };
   float flagW_ = 0;

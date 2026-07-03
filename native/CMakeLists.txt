@@ -328,6 +328,8 @@ add_executable(sailsim_native
   src/music.cpp
   src/settings.cpp
   src/combat.cpp
+  src/cannon.cpp
+  src/prims.cpp
   src/stb_impl.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )

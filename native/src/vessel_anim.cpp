@@ -403,6 +403,19 @@ void Controller::tickRig(float dt) {
     scrubNorm("AnchorDrop_P", anchorCur_[1]);
     if (!cableS_.node.empty()) { setMorph(cableS_, anchorCur_[0]); setMorph(cableP_, anchorCur_[1]); }
   }
+  // Guns: lids open over the first half of the deploy, the gun runs out over the
+  // second half minus the recoil kick (the client controllers' applyGunPose).
+  // Rigs without lid clips (pinnace open mounts) run out over the whole deploy.
+  for (int i = 0; i < 2; ++i) {
+    const std::string sd = i == 0 ? "P" : "S";
+    const float dep = gunDeploy_[i], rec = gunRecoil_[i];
+    if (clips_.count("Lid_" + sd)) {
+      scrubNorm("Lid_" + sd, std::clamp(dep * 2.0f, 0.0f, 1.0f));
+      scrubNorm("Gun_" + sd, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
+    } else if (clips_.count("Gun_" + sd)) {
+      scrubNorm("Gun_" + sd, std::clamp(dep - rec, 0.0f, 1.0f));
+    }
+  }
 
   // 4. Code-driven bones ON TOP of the clips.
   if (boomMap_ != BoomMap::None) {

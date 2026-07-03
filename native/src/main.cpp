@@ -58,6 +58,8 @@
 #include "net_mp.hpp"
 #include "combat.hpp"
 #include "combat_constants.hpp"
+#include "cannon.hpp"
+#include "prims.hpp"
 #include "sail_physics.hpp"
 #include "ocean_fft.hpp"
 #include "session.hpp"
@@ -2616,6 +2618,12 @@ int main(int argc, char** argv) {
   // client's placement kernels run on the CPU here, streamed in 40 m patches.
   scatter::System scatterSys;
   scatterSys.init(device, queue, kSceneFormat, geometryDir() + "/scatter");
+  // Gunnery (combat phase 1): per-side batteries + ball pool + aim assist, and
+  // the immediate-mode primitive renderer for balls / aim arcs / the reticle.
+  combat::Guns guns;
+  std::string gunSlug;
+  prims::System primsSys;
+  primsSys.init(device, kSceneFormat);
   // Celestial textures (moon colour map + all-sky star map) fetched + decoded off
   // the render thread; uploaded and wired into the sky bind group once ready.
   std::future<sky::Image> moonFuture = std::async(std::launch::async,
@@ -2877,6 +2885,8 @@ int main(int argc, char** argv) {
   std::map<std::string, std::string> remoteAnimSlugs;
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
+  bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
+  std::map<std::string, std::pair<float, float>> remoteGunCur;   // eased remote gun deploy (P,S)
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
@@ -3242,7 +3252,8 @@ int main(int argc, char** argv) {
         }
         const bool escKey = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
         if (escKey && !prevEscKey) {
-          if (settingsOpen) settingsOpen = false;
+          if (guns.anyCancellable()) guns.cancel();   // stand the batteries down first
+          else if (settingsOpen) settingsOpen = false;
           else escMenu = !escMenu;
         }
         prevEscKey = escKey;
@@ -3497,6 +3508,60 @@ int main(int argc, char** argv) {
           mpClient.sendRespawn();   // server restores the hull + teleports via correction
           meSunk = false;
         }
+        ImGui::End();
+      }
+
+      // ── Gunnery panel (bottom-centre; the browser cannon HUD): per-side state,
+      //    loaded pips + reload progress, ammo + elevation readouts. ──
+      if (!tiedUp) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 12.0f),
+                                ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+        ImGui::Begin("gunhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+        auto sideUi = [&](int gside, const char* name, const char* key) {
+          combat::HudGunState st = guns.hudState(gside);
+          const char* label = st == combat::HudGunState::Arming ? "ARMING"
+                            : st == combat::HudGunState::Ready ? "FIRE!"
+                            : st == combat::HudGunState::Reloading ? "RELOADING" : "STOWED";
+          const ImVec4 col = st == combat::HudGunState::Ready ? ImVec4(0.40f, 0.95f, 0.45f, 1.0f)
+                           : st == combat::HudGunState::Arming ? ImVec4(0.95f, 0.85f, 0.40f, 1.0f)
+                           : st == combat::HudGunState::Reloading ? ImVec4(0.95f, 0.65f, 0.30f, 1.0f)
+                           : ImVec4(0.60f, 0.64f, 0.70f, 1.0f);
+          ImGui::BeginGroup();
+          ImGui::TextDisabled("%s [%s]", name, key);
+          ImGui::TextColored(col, "%s", label);
+          const int loaded = guns.loadedCount(gside), n = guns.gunsPerSide();
+          // Loaded pips.
+          ImVec2 pp = ImGui::GetCursorScreenPos();
+          ImDrawList* pdl = ImGui::GetWindowDrawList();
+          for (int i = 0; i < n; ++i)
+            pdl->AddCircleFilled(ImVec2(pp.x + 7.0f + i * 16.0f, pp.y + 6.0f), 5.0f,
+                                 i < loaded ? IM_COL32(90, 220, 110, 255) : IM_COL32(255, 255, 255, 50));
+          ImGui::Dummy(ImVec2(n * 16.0f + 4.0f, 13.0f));
+          // Reload progress (mean per-gun load).
+          if (st == combat::HudGunState::Ready || st == combat::HudGunState::Reloading) {
+            ImVec2 rp2 = ImGui::GetCursorScreenPos();
+            const float rw2 = n * 16.0f + 4.0f, rh2 = 5.0f;
+            pdl->AddRectFilled(rp2, ImVec2(rp2.x + rw2, rp2.y + rh2), IM_COL32(255, 255, 255, 30), 2.0f);
+            pdl->AddRectFilled(rp2, ImVec2(rp2.x + rw2 * guns.reloadFrac(gside), rp2.y + rh2),
+                               IM_COL32(240, 200, 90, 200), 2.0f);
+            ImGui::Dummy(ImVec2(rw2, rh2 + 2.0f));
+          }
+          ImGui::EndGroup();
+        };
+        sideUi(0, "PORT", "Z");
+        ImGui::SameLine(0.0f, 26.0f);
+        ImGui::BeginGroup();
+        const char* ammoName = guns.shotType() == combat::ShotKind::Bar ? "BAR"
+                             : guns.shotType() == combat::ShotKind::Grape ? "GRAPE" : "ROUND";
+        ImGui::TextDisabled("AMMO [G]");
+        ImGui::Text("%s", ammoName);
+        ImGui::TextDisabled("ELEV [Shift/Ctrl]");
+        ImGui::Text("%.0f%s  %s", guns.elevDeg(), "\u00b0",
+                    guns.elevDeg() >= (combat::kElevHull + combat::kElevMast) * 0.5f ? "masts" : "hull");
+        ImGui::EndGroup();
+        ImGui::SameLine(0.0f, 26.0f);
+        sideUi(1, "STBD", "C");
         ImGui::End();
       }
 
@@ -4505,10 +4570,60 @@ int main(int argc, char** argv) {
         remoteSunkAt.erase(pid);
         if (pid == meId) meSunk = false;
       }
-      // Phase 1/2 consume these for ball flight + impact FX; drained now so the
-      // inbox never grows unbounded.
-      (void)mpClient.drainShots();
-      (void)mpClient.drainHits();
+      // ── Gunnery (phase 1): batteries, aim assist, ball pool, remote shots. ──
+      if (ownVesselSlug != gunSlug) {
+        guns.configure(ownVesselSlug.empty() ? "pinnace" : ownVesselSlug);
+        gunSlug = ownVesselSlug;
+      }
+      std::vector<combat::Enemy> enemies;
+      for (const mp::RemotePlayer& rp : mpClient.players())
+        enemies.push_back({ rp.id, rp.x, rp.z, rp.heading, rp.speed });
+      mp::TownState cts = mpClient.town();
+      const float crewFactor = cts.maxCrew > 0
+          ? 0.5f + 0.5f * glm::clamp((float)cts.crew / (float)cts.maxCrew, 0.0f, 1.0f) : 1.0f;
+      combat::ShipPose gpose{ vessel.x, vessel.z, vessel.heading };
+      // Headless test hook: SAILSIM_GUNS=1 runs out the starboard battery at
+      // frame 120 and fires it at frame 420 (screenshot the arcs + balls).
+      if (std::getenv("SAILSIM_GUNS")) {
+        if (frame == 120) guns.armOrFire(1);
+        if (frame == 420) guns.armOrFire(1);
+      }
+      std::vector<combat::FireEvent> fires;
+      guns.update(dt, gpose, enemies, crewFactor, meId, fires);
+      for (const combat::FireEvent& fe : fires) {
+        mpClient.sendCannonShot(fe.mwx, fe.mwy, fe.mwz, fe.vx, fe.vy, fe.vz,
+                                fe.seq, combat::shotName(fe.kind));
+        std::printf("[combat] fired %s seq %d muzzle (%.1f, %.1f, %.1f) v (%.1f, %.1f, %.1f) |v| %.1f lock %s\n",
+                    combat::shotName(fe.kind), fe.seq, fe.mwx, fe.mwy, fe.mwz,
+                    fe.vx, fe.vy, fe.vz,
+                    std::sqrt(fe.vx * fe.vx + fe.vy * fe.vy + fe.vz * fe.vz),
+                    guns.lock(fe.side).valid ? guns.lock(fe.side).lockId.c_str() : "none");
+      }
+      for (int gs = 0; gs < 2; ++gs) {
+        int dep = 0;
+        if (guns.consumeDeployChange(gs, dep)) mpClient.sendGunState(gs, dep);
+      }
+      // Remote/NPC broadsides fly in the same ball pool.
+      for (const mp::RemoteShot& rs : mpClient.drainShots()) {
+        combat::ShotKind k = rs.shotType == "bar" ? combat::ShotKind::Bar
+                           : rs.shotType == "grape" ? combat::ShotKind::Grape
+                           : combat::ShotKind::Round;
+        guns.spawnBall(rs.id + ":" + std::to_string(rs.seq), k,
+                       rs.ox, rs.oy, rs.oz, rs.vx, rs.vy, rs.vz);
+      }
+      // Server-adjudicated hits: matched balls defer to the server tof; the
+      // impact list feeds the phase-2 FX (splash/splinters/scorch).
+      std::vector<combat::ImpactEvent> impacts;
+      for (const mp::CombatHit& h : mpClient.drainHits()) {
+        std::printf("[combat] hit: %s -> %s seq %d zone %s at (%.1f, %.1f, %.1f) tof %.2f grape %d\n",
+                    h.shooterId.c_str(), h.victimId.c_str(), h.seq, h.zone.c_str(),
+                    h.hx, h.hy, h.hz, h.tof, (int)h.grape);
+        guns.onCombatHit(h, impacts);
+      }
+      guns.updateBalls(dt, [&](float x, float z) {
+        return terr.loaded() ? terr.elevation(x, z) : 0.0f;
+      }, impacts);
+      (void)impacts;   // phase 2: impact FX consume these
       // Jury-rig timer: arm the progress bar when the server arms the repair.
       float mrMs = mpClient.mastRepairMs();
       if (mrMs > 0.0f && mastRepairStartT < 0) { mastRepairStartT = t; mastRepairArmedMs = mrMs; }
@@ -4556,6 +4671,25 @@ int main(int argc, char** argv) {
           vessel.anchored = !vessel.anchored;
           if (vessel.anchored) { vessel.anchorX = vessel.x; vessel.anchorZ = vessel.z; }
         }
+        // Gunnery (client bindings): Z port / C stbd arm-or-fire, G ammo,
+        // H/M elevation presets, Shift/Ctrl continuous elevation.
+        const bool kZ = glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS;
+        const bool kC = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+        const bool kG = glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS;
+        const bool kH = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
+        const bool kM = glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS;
+        if (kZ && !prevKeyZ) guns.armOrFire(0);
+        if (kC && !prevKeyC) guns.armOrFire(1);
+        if (kG && !prevKeyG) guns.toggleShotType();
+        if (kH && !prevKeyH) guns.setElevPreset(false);
+        if (kM && !prevKeyM) guns.setElevPreset(true);
+        prevKeyZ = kZ; prevKeyC = kC; prevKeyG = kG; prevKeyH = kH; prevKeyM = kM;
+        const bool elevUp = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                            glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+        const bool elevDn = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                            glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+        if (elevUp) guns.elevHold(1.0f, dt);
+        if (elevDn) guns.elevHold(-1.0f, dt);
         prevRaise = raise; prevLower = lower; prevAnchor = anchor;
       }
       vrig = sail::rigForSlug(ownVesselSlug.empty() ? "sloop" : ownVesselSlug);
@@ -5445,6 +5579,8 @@ int main(int argc, char** argv) {
       ownAnim->setSailTrim(vessel.sheetAngleDeg, isPortTack);
       ownAnim->applySailState(vessel.sailState);
       ownAnim->dropAnchor('S', vessel.anchored ? 1.0f : 0.0f);
+      ownAnim->setGunDeploy('P', guns.deploy(0), guns.recoil(0));
+      ownAnim->setGunDeploy('S', guns.deploy(1), guns.recoil(1));
       // Downwind direction relative to the hull (client windLocalRad).
       const float windToRad = glm::radians(wFrom + 180.0f);
       ownAnim->idleWind(windToRad - vessel.heading, std::min(1.2f, wKn / 8.0f), t);
@@ -5490,6 +5626,21 @@ int main(int argc, char** argv) {
         ctl->dropAnchor('P', si.rp.anchored && aside == 'P' ? 1.0f : 0.0f);
         ctl->idleWind(glm::radians(rwFrom + 180.0f) - glm::radians(si.rp.heading),
                       std::min(1.2f, rwKn / 8.0f), t);
+        // Remote gunports: ease toward the broadcast gun_state targets at the
+        // same deploy rate the shooter's own controller uses.
+        {
+          static std::map<std::string, std::pair<int, int>> gunTargets;
+          if (idx == 0) gunTargets = mpClient.gunStates();   // one fetch per frame
+          auto& gc = remoteGunCur[si.rp.id];
+          auto gtIt = gunTargets.find(si.rp.id);
+          const float tgtP = gtIt != gunTargets.end() ? (float)gtIt->second.first : 0.0f;
+          const float tgtS = gtIt != gunTargets.end() ? (float)gtIt->second.second : 0.0f;
+          const float step = combat::kGunDeployRate * dt;
+          gc.first  += glm::clamp(tgtP - gc.first, -step, step);
+          gc.second += glm::clamp(tgtS - gc.second, -step, step);
+          ctl->setGunDeploy('P', gc.first);
+          ctl->setGunDeploy('S', gc.second);
+        }
         ctl->tickRig(dt);
         std::fill(blob.begin(), blob.end(), 0);
         const auto& rpal = ctl->palette();
@@ -5725,6 +5876,58 @@ int main(int argc, char** argv) {
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, ocean.vbuf, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderSetIndexBuffer(pass, ocean.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
     wgpuRenderPassEncoderDrawIndexed(pass, ocean.indexCount, 1, 0, 0, 0);
+
+    // ── Combat visuals: cannonballs, aim-arc tubes, the lock reticle (drawn
+    //    after the ocean so the sea occludes low arcs correctly). ──
+    {
+      primsSys.clear();
+      const glm::vec4 iron(0.16f, 0.15f, 0.14f, 1.0f);
+      for (const combat::Ball& b : guns.balls()) {
+        if (!b.alive) continue;
+        const glm::vec3 bp(b.ox + b.vx * b.t,
+                           b.oy + b.vy * b.t - 0.5f * combat::kGravity * b.t * b.t,
+                           b.oz + b.vz * b.t);
+        if (b.kind == combat::ShotKind::Bar) {
+          // End-over-end dumbbell: tumble axis in the flight plane.
+          const glm::vec3 vel(b.vx, b.vy - combat::kGravity * b.t, b.vz);
+          const glm::vec3 f = glm::normalize(vel + glm::vec3(1e-4f));
+          glm::vec3 e = f * std::cos(b.spin) + glm::vec3(0, 1, 0) * std::sin(b.spin);
+          e = glm::normalize(e + glm::vec3(1e-4f));
+          primsSys.sphere(bp + e * 0.20f, 0.075f, iron);
+          primsSys.sphere(bp - e * 0.20f, 0.075f, iron);
+          primsSys.cylinder(bp - e * 0.20f, bp + e * 0.20f, 0.0225f, iron, 6, false);
+        } else {
+          primsSys.sphere(bp, b.kind == combat::ShotKind::Grape ? 0.04f : 0.10f, iron);
+        }
+      }
+      combat::ShipPose apose{ vessel.x, vessel.z, vessel.heading };
+      for (int s2 = 0; s2 < 2; ++s2) {
+        if (guns.sideState(s2) != combat::SideState::Engaged || guns.loadedCount(s2) == 0)
+          continue;
+        const combat::LockSolution& lk = guns.lock(s2);
+        // GREEN converging on the lock, RED splashing free (client tube colours).
+        const glm::vec4 col = lk.valid ? glm::vec4(0.25f, 0.95f, 0.40f, 0.32f)
+                                       : glm::vec4(0.95f, 0.30f, 0.25f, 0.28f);
+        for (int gi = 0; gi < guns.gunsPerSide(); ++gi)
+          primsSys.tube(guns.arcPath(s2, gi, apose), 0.16f, col, 6);
+        if (lk.valid) {
+          // Pulsing amber corner brackets over the locked ship.
+          const glm::vec3 rc(lk.cx, 3.5f, lk.cz);
+          const glm::vec3 cr(viewM[0][0], viewM[1][0], viewM[2][0]);
+          const glm::vec3 cu(viewM[0][1], viewM[1][1], viewM[2][1]);
+          const float sc = (1.0f + 0.08f * std::sin((float)t * 6.0f)) * 2.4f;
+          const glm::vec4 amber(1.0f, 0.75f, 0.25f, 0.9f);
+          const float hw2 = sc * 0.5f, bl = sc * 0.28f, bt = sc * 0.06f;
+          for (int cx2 = -1; cx2 <= 1; cx2 += 2)
+            for (int cy2 = -1; cy2 <= 1; cy2 += 2) {
+              const glm::vec3 corner = rc + cr * (hw2 * (float)cx2) + cu * (hw2 * (float)cy2);
+              primsSys.billboard(corner - cr * (bl * 0.5f * (float)cx2), cr, cu, bl, bt, amber);
+              primsSys.billboard(corner - cu * (bl * 0.5f * (float)cy2), cr, cu, bt, bl, amber);
+            }
+        }
+      }
+      primsSys.flush(device, queue, pass, viewProj);
+    }
 
     // Distant-ship impostor billboards (alpha-tested, depth-written like hulls).
     if (shipImpCount) {

@@ -199,6 +199,11 @@ public:
   void sendRespawn();                                      // after combat_sunk: back to harbour
   void sendSalvageCollect(const std::string& crateId);
 
+  // Broadcast our run-out state so remote clients open our gunports (gun_state).
+  void sendGunState(int side, int deploy);                 // side 0 port, 1 stbd
+  // Remote ships' gun deploy TARGETS (playerId -> {port, stbd} 0/1).
+  std::map<std::string, std::pair<int, int>> gunStates() const;
+
   std::vector<RemoteShot> drainShots();                    // remote/NPC cannon_shot broadcasts
   std::vector<CombatHit> drainHits();                      // combat_hit events (all ships)
   std::vector<SunkEvent> drainSunk();                      // combat_sunk events

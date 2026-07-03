@@ -19,6 +19,9 @@ public:
   void setWeather(float windSpeedMps);
   // Rain patter follows the eased precip intensity [0..1].
   void setRain(float intensity);
+  // One-shot procedural thunder (cloud.service playThunder): vol 0..1 sets the
+  // rumble's brightness, attack sharpness and length (distant rolls longer).
+  void playThunder(float vol);
   // Master fade (login screen / docked menus mute the beds like leaving the scene).
   void setEnabled(bool on);
   void shutdown();

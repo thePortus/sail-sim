@@ -65,6 +65,42 @@ struct Smoothed {
 
 constexpr uint32_t kBlock = 64;   // param-smoothing / coefficient-update granularity
 
+// A one-shot thunder event (cloud.service playThunder): white noise through a
+// lowpass whose frequency ramps exponentially (300+vol*700 -> 70 Hz) under a
+// breakpoint gain envelope — sharp crack + rolling swells + decaying tail. The
+// game thread precomputes the breakpoints; the audio thread just interpolates.
+struct ThunderDesc {
+  static constexpr int kMaxPts = 14;
+  float dur = 4.0f, f0 = 600.0f;
+  int nPts = 0;
+  float pt[kMaxPts];    // breakpoint time (s)
+  float pg[kMaxPts];    // breakpoint gain
+  bool pe[kMaxPts];     // exponential (vs linear) ramp from the previous point
+};
+
+struct ThunderVoice {
+  ThunderDesc d;
+  Biquad lpf;
+  double tau = 0;          // seconds into the event
+  uint32_t rng = 1;        // xorshift white-noise state
+  bool active = false;
+  inline float noise() {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return (float)(int32_t)rng * (1.0f / 2147483648.0f);
+  }
+  float envAt(float t) const {
+    if (d.nPts == 0 || t <= d.pt[0]) return d.nPts ? d.pg[0] : 0.0f;
+    for (int i = 1; i < d.nPts; ++i) {
+      if (t <= d.pt[i]) {
+        float u = (t - d.pt[i - 1]) / std::max(1e-4f, d.pt[i] - d.pt[i - 1]);
+        float g0 = std::max(1e-4f, d.pg[i - 1]), g1 = std::max(1e-4f, d.pg[i]);
+        return d.pe[i] ? g0 * std::pow(g1 / g0, u) : g0 + (g1 - g0) * u;
+      }
+    }
+    return d.pg[d.nPts - 1];
+  }
+};
+
 }  // namespace
 
 struct System::Impl {
@@ -88,6 +124,14 @@ struct System::Impl {
   // Audio-thread smoothed params.
   Smoothed sBed, sWashF, sHiss, sSwellDepth, sSwellFreq, sRain, sMaster;
   float lastWashF = -1.0f;
+
+  // Thunder hand-off: game thread fills a free slot then flips it to QUEUED;
+  // the audio thread claims QUEUED slots into voices (the state transition
+  // orders the descriptor write). Up to 4 overlapping rumbles.
+  static constexpr int kThunder = 4;
+  ThunderDesc thunderDesc[kThunder];
+  std::atomic<int> thunderState[kThunder]{};   // 0 free, 1 queued, 2 playing
+  ThunderVoice thunderVoice[kThunder];
 
   void buildNoise() {
     std::mt19937 rng(1717);
@@ -122,6 +166,28 @@ struct System::Impl {
       }
       const double lfoInc = 2.0 * M_PI * (double)sSwellFreq.value / (double)sr;
 
+      // Claim queued thunder and refresh live voices' block-rate params.
+      for (int v = 0; v < kThunder; ++v) {
+        int q = 1;
+        if (thunderState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          thunderVoice[v].d = thunderDesc[v];
+          thunderVoice[v].tau = 0;
+          thunderVoice[v].rng = 0x9e3779b9u + (uint32_t)v * 0x85ebca6bu;
+          thunderVoice[v].lpf = Biquad();
+          thunderVoice[v].active = true;
+        }
+        ThunderVoice& tv = thunderVoice[v];
+        if (!tv.active) continue;
+        if (tv.tau >= tv.d.dur) {
+          tv.active = false;
+          thunderState[v].store(0, std::memory_order_release);
+          continue;
+        }
+        // Lowpass sweeps exponentially down to 70 Hz — deep, dark rumble.
+        float f = tv.d.f0 * std::pow(70.0f / tv.d.f0, (float)(tv.tau / tv.d.dur));
+        tv.lpf.lowpass(sr, f, 0.4f);
+      }
+
       for (ma_uint32 i = 0; i < n; ++i) {
         // Wash: brown -> LPF -> swell (0.7 base + LFO*depth) -> bed.
         float wash = washLpf.process(brown[bi]);
@@ -136,8 +202,16 @@ struct System::Impl {
         // Rain patter: white -> HPF 600 -> LPF 7000 -> gain.
         float rain = rainLpf.process(rainHpf.process(rainNoise[ri])) * sRain.value;
         if (++ri >= rainNoise.size()) ri = 0;
+        // Thunder voices: filtered noise under their breakpoint envelopes.
+        float thunder = 0.0f;
+        for (int v = 0; v < kThunder; ++v) {
+          ThunderVoice& tv = thunderVoice[v];
+          if (!tv.active) continue;
+          thunder += tv.lpf.process(tv.noise()) * tv.envAt((float)tv.tau);
+          tv.tau += 1.0 / (double)sr;
+        }
 
-        float s = (bed + rain) * sMaster.value;
+        float s = (bed + rain + thunder) * sMaster.value;
         s = std::tanh(s * 1.2f) / 1.2f;   // gentle safety limiter
         out[(done + i) * 2 + 0] = s;
         out[(done + i) * 2 + 1] = s;
@@ -210,6 +284,44 @@ void System::setWeather(float windSpeedMps) {
 void System::setRain(float intensity) {
   if (!impl) return;
   impl->tRain.store(std::min(1.0f, std::max(0.0f, intensity)) * 0.14f, std::memory_order_relaxed);
+}
+
+void System::playThunder(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  // Find a free slot (drop the strike if all four rumbles are still rolling).
+  int slot = -1;
+  for (int v = 0; v < Impl::kThunder; ++v) {
+    if (impl->thunderState[v].load(std::memory_order_relaxed) == 0) { slot = v; break; }
+  }
+  if (slot < 0) return;
+
+  // The client's WebAudio envelope, verbatim: sharp crack for close strikes,
+  // soft build for distant ones, then a few rolling swells and a decaying tail.
+  ThunderDesc d;
+  d.dur = 3.0f + (1.0f - vol) * 3.0f;   // distant thunder rolls longer
+  d.f0 = 300.0f + vol * 700.0f;
+  const float peak = 0.9f * std::max(0.05f, vol);
+  auto pt = [&](float t, float g, bool exp) {
+    if (d.nPts >= ThunderDesc::kMaxPts) return;
+    if (d.nPts > 0) t = std::max(t, d.pt[d.nPts - 1] + 0.001f);   // keep breakpoints sorted
+    d.pt[d.nPts] = t; d.pg[d.nPts] = g; d.pe[d.nPts] = exp; ++d.nPts;
+  };
+  auto frand = [] { return (float)std::rand() / (float)RAND_MAX; };
+  pt(0.0f, 0.0001f, false);
+  if (vol > 0.6f) pt(0.03f, peak, true);
+  else            pt(0.2f, peak * 0.6f, false);
+  float tt = 0.25f;
+  for (int k = 0; k < 4 && tt < d.dur - 0.4f; ++k) {
+    float p = std::max(0.001f, peak * (0.35f + frand() * 0.6f));
+    pt(tt + 0.22f, p, true);
+    pt(tt + 0.5f, std::max(0.001f, p * 0.4f), true);
+    tt += 0.45f + frand() * 0.5f;
+  }
+  pt(d.dur, 0.0001f, true);
+
+  impl->thunderDesc[slot] = d;
+  impl->thunderState[slot].store(1, std::memory_order_release);
 }
 
 void System::setEnabled(bool on) {

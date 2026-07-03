@@ -246,6 +246,8 @@ RiggedData loadGltfRigged(const char* path) {
           RigMorph m;
           m.submesh = smIndex;
           m.target = (int)ti;
+          if (nd.mesh->target_names && ti < nd.mesh->target_names_count && nd.mesh->target_names[ti])
+            m.targetName = nd.mesh->target_names[ti];
           m.vertexBase = base;
           m.vertexCount = (uint32_t)vcount;
           m.dpos.resize(vcount);

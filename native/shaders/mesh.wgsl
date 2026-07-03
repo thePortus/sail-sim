@@ -15,9 +15,18 @@ struct Uniforms {
 @group(0) @binding(3) var metalRoughTex : texture_2d<f32>;
 @group(0) @binding(4) var texSamp       : sampler;
 // Unified matrix palette (gltf_rig): node worlds first, then skin joint
-// matrices. Rigid vertices reference their node slot with weight 1; skinned
-// vertices their joint slots — one path for both, animation = palette rewrite.
-@group(0) @binding(5) var<uniform> pal : array<mat4x4<f32>, 128>;
+// matrices, then the morph-target weights — one 9216-byte block per vessel
+// INSTANCE (dynamic offset), so every ship animates independently.
+struct Palette {
+    m : array<mat4x4<f32>, 128>,
+    w : array<vec4<f32>, 64>,   // morph weights, indexed by RigMorph slot
+};
+@group(0) @binding(5) var<uniform> pal : Palette;
+// Morph machinery (static per mesh): per-submesh {count, tableBase, vertexBase},
+// the (deltaBase, weightSlot) table, and the concatenated position deltas.
+@group(0) @binding(6) var<uniform> subInfo : vec4<u32>;
+@group(0) @binding(7) var<storage, read> morphDeltas : array<f32>;
+@group(0) @binding(8) var<storage, read> morphTable : array<vec2<u32>>;
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -29,16 +38,27 @@ struct VSOut {
 };
 
 @vertex
-fn vs_main(@location(0) inPos     : vec3<f32>,
+fn vs_main(@builtin(vertex_index) vid : u32,
+           @location(0) inPos     : vec3<f32>,
            @location(1) inNormal  : vec3<f32>,
            @location(2) inUV      : vec2<f32>,
            @location(3) inAlbedo  : vec3<f32>,
            @location(4) inMR      : vec2<f32>,
            @location(5) inJoints  : vec4<f32>,
            @location(6) inWeights : vec4<f32>) -> VSOut {
-    let skinM = inWeights.x * pal[u32(inJoints.x)] + inWeights.y * pal[u32(inJoints.y)]
-              + inWeights.z * pal[u32(inJoints.z)] + inWeights.w * pal[u32(inJoints.w)];
-    let lp = skinM * vec4<f32>(inPos, 1.0);
+    // Morph targets (sail furl etc.): position deltas applied pre-skin.
+    var p = inPos;
+    for (var mi = 0u; mi < subInfo.x; mi = mi + 1u) {
+        let e = morphTable[subInfo.y + mi];
+        let wgt = pal.w[e.y >> 2u][e.y & 3u];
+        if (wgt > 0.0001) {
+            let di = (e.x + (vid - subInfo.z)) * 3u;
+            p += vec3<f32>(morphDeltas[di], morphDeltas[di + 1u], morphDeltas[di + 2u]) * wgt;
+        }
+    }
+    let skinM = inWeights.x * pal.m[u32(inJoints.x)] + inWeights.y * pal.m[u32(inJoints.y)]
+              + inWeights.z * pal.m[u32(inJoints.z)] + inWeights.w * pal.m[u32(inJoints.w)];
+    let lp = skinM * vec4<f32>(p, 1.0);
     let ln = skinM * vec4<f32>(inNormal, 0.0);
     var out : VSOut;
     out.position = u.mvp * lp;

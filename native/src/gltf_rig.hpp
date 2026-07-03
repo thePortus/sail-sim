@@ -55,6 +55,7 @@ struct RigClip {
 struct RigMorph {
   int submesh = -1;
   int target = 0;                     // morph target index within the primitive
+  std::string targetName;             // from the glTF target_names extras ('Furl', 'Drop_S', …)
   uint32_t vertexBase = 0, vertexCount = 0;
   std::vector<glm::vec3> dpos;
 };

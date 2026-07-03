@@ -51,6 +51,7 @@
 #include "fft_test.hpp"
 #include "gltf_mesh.hpp"
 #include "gltf_rig.hpp"
+#include "vessel_anim.hpp"
 #include "net_admin.hpp"
 #include "net_auth.hpp"
 #include "net_mp.hpp"
@@ -193,11 +194,17 @@ struct MeshUniforms {
 // How many ships (you + remote players) one vessel mesh can draw per frame via
 // dynamic uniform offsets. Each instance uses one aligned MeshUniforms slot.
 static constexpr uint32_t kMaxShipInstances = 64;
+// Per-instance palette slot: 128 mat4 (node worlds + skin joints) + 64 vec4 of
+// morph weights = 9216 B (256-aligned), selected by a dynamic offset like the
+// per-instance MeshUniforms — every vessel instance animates independently.
+static constexpr uint32_t kMaxMorphWeights = 64;
+static constexpr uint32_t kPaletteStride = kMaxPaletteSlots * sizeof(glm::mat4) + kMaxMorphWeights * sizeof(glm::vec4);
 
 struct Mesh {
   WGPURenderPipeline           pipeline;
   WGPUBuffer                   vbuf, ibuf, uniformBuf;
-  WGPUBuffer                   paletteBuf;   // unified node/skin matrix palette (gltf_rig)
+  WGPUBuffer                   paletteBuf;   // per-instance palette+morph slots (kPaletteStride each)
+  WGPUBuffer                   morphDeltaBuf, morphTableBuf, submeshInfoBuf;   // static morph data
   WGPUShaderModule             module;
   WGPUSampler                  sampler;
   std::vector<WGPUTexture>     textures;     // decoded maps + 1x1 white + flat-normal defaults
@@ -205,6 +212,7 @@ struct Mesh {
   std::vector<WGPUBindGroup>   bindGroups;   // one per submesh
   std::vector<RigSubmesh>      submeshes;
   std::shared_ptr<RiggedData>  rig;          // nodes/skins/clips/morphs (Phase 1 consumes)
+  std::string                  manifestPath;   // companion <ship>.manifest.json
   uint32_t                     uniformStride = 0;   // bytes between per-ship uniform slots
   // Placement, computed at load from the model's bounds + per-vessel spec (loadVessel).
   float     shipScale = 1.0f;
@@ -290,6 +298,7 @@ fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
   ble[0].buffer.minBindingSize = sizeof(MeshUniforms);
   ble[1].binding = 1; ble[1].visibility = WGPUShaderStage_Vertex;
   ble[1].buffer.type = WGPUBufferBindingType_Uniform;
+  ble[1].buffer.hasDynamicOffset = true;   // per-instance palette slot
   ble[1].buffer.minBindingSize = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);
   WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 2; bgld.entries = ble;
   hs.bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
@@ -362,15 +371,56 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   ubd.size = (uint64_t)mesh.uniformStride * kMaxShipInstances;
   mesh.uniformBuf = wgpuDeviceCreateBuffer(device, &ubd);
 
-  // Matrix palette: rest pose now; Phase 1 controllers rewrite it per frame.
+  // Matrix palette + morph weights: one kPaletteStride slot per instance, all
+  // initialised to the rest pose; controllers rewrite their instance's slot.
   {
     WGPUBufferDescriptor pbd = {};
     pbd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-    pbd.size = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);
+    pbd.size = (uint64_t)kPaletteStride * kMaxShipInstances;
     mesh.paletteBuf = wgpuDeviceCreateBuffer(device, &pbd);
+    std::vector<uint8_t> slot(kPaletteStride, 0);
     std::vector<glm::mat4> pal(kMaxPaletteSlots, glm::mat4(1.0f));
     for (size_t i = 0; i < data.restPalette.size() && i < pal.size(); ++i) pal[i] = data.restPalette[i];
-    wgpuQueueWriteBuffer(queue, mesh.paletteBuf, 0, pal.data(), pbd.size);
+    std::memcpy(slot.data(), pal.data(), pal.size() * sizeof(glm::mat4));
+    for (uint32_t i = 0; i < kMaxShipInstances; ++i)
+      wgpuQueueWriteBuffer(queue, mesh.paletteBuf, (uint64_t)i * kPaletteStride, slot.data(), kPaletteStride);
+  }
+
+  // Morph machinery (static per mesh): concatenated position deltas, the
+  // per-submesh (deltaBase, weightSlot) table, and per-submesh info blocks.
+  {
+    std::vector<float> deltas;
+    std::vector<uint32_t> tableData;                        // pairs (deltaBase, weightSlot)
+    struct SubInfo { uint32_t cnt, base, vbase, pad; };
+    std::vector<SubInfo> infos(data.submeshes.size(), { 0, 0, 0, 0 });
+    for (size_t si = 0; si < data.submeshes.size(); ++si) {
+      infos[si].base = (uint32_t)(tableData.size() / 2);
+      for (size_t mi = 0; mi < data.morphs.size(); ++mi) {
+        const RigMorph& m = data.morphs[mi];
+        if (m.submesh != (int)si || mi >= kMaxMorphWeights) continue;
+        infos[si].vbase = m.vertexBase;
+        tableData.push_back((uint32_t)(deltas.size() / 3));
+        tableData.push_back((uint32_t)mi);
+        for (const glm::vec3& d : m.dpos) { deltas.push_back(d.x); deltas.push_back(d.y); deltas.push_back(d.z); }
+        infos[si].cnt++;
+      }
+    }
+    if (deltas.empty()) deltas.assign(3, 0.0f);             // dummy for morph-free meshes
+    if (tableData.empty()) tableData.assign(2, 0u);
+    WGPUBufferDescriptor sbd = {};
+    sbd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    sbd.size = deltas.size() * sizeof(float);
+    mesh.morphDeltaBuf = wgpuDeviceCreateBuffer(device, &sbd);
+    wgpuQueueWriteBuffer(queue, mesh.morphDeltaBuf, 0, deltas.data(), sbd.size);
+    sbd.size = tableData.size() * sizeof(uint32_t);
+    mesh.morphTableBuf = wgpuDeviceCreateBuffer(device, &sbd);
+    wgpuQueueWriteBuffer(queue, mesh.morphTableBuf, 0, tableData.data(), sbd.size);
+    WGPUBufferDescriptor ibd2 = {};
+    ibd2.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    ibd2.size = (uint64_t)256 * std::max<size_t>(1, infos.size());
+    mesh.submeshInfoBuf = wgpuDeviceCreateBuffer(device, &ibd2);
+    for (size_t si = 0; si < infos.size(); ++si)
+      wgpuQueueWriteBuffer(queue, mesh.submeshInfoBuf, (uint64_t)si * 256, &infos[si], sizeof(SubInfo));
   }
 
   // Water-mask stencil bind group: same per-instance uniform slots, stencil BGL.
@@ -378,7 +428,7 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     HullStencil& hs = hullStencil(device, colorFormat);
     WGPUBindGroupEntry sbe[2] = {};
     sbe[0].binding = 0; sbe[0].buffer = mesh.uniformBuf; sbe[0].size = sizeof(MeshUniforms);
-    sbe[1].binding = 1; sbe[1].buffer = mesh.paletteBuf; sbe[1].size = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);
+    sbe[1].binding = 1; sbe[1].buffer = mesh.paletteBuf; sbe[1].size = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);   // dynamic offset selects the instance slot
     WGPUBindGroupDescriptor sbd = {}; sbd.layout = hs.bgl; sbd.entryCount = 2; sbd.entries = sbe;
     mesh.stencilBind = wgpuDeviceCreateBindGroup(device, &sbd);
   }
@@ -391,8 +441,9 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   mesh.module = wgpuDeviceCreateShaderModule(device, &smd);
 
   // bind group layout: uniform (b0), base/normal/metal-rough textures (b1-3),
-  // sampler (b4), matrix palette (b5).
-  WGPUBindGroupLayoutEntry ble[6] = {};
+  // sampler (b4), palette+morph weights (b5, dynamic per instance), per-submesh
+  // morph info (b6), morph deltas (b7), morph table (b8).
+  WGPUBindGroupLayoutEntry ble[9] = {};
   ble[0].binding = 0; ble[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   ble[0].buffer.type = WGPUBufferBindingType_Uniform;
   ble[0].buffer.hasDynamicOffset = true;   // select the per-ship slot at draw time
@@ -405,9 +456,17 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   ble[4].sampler.type = WGPUSamplerBindingType_Filtering;
   ble[5].binding = 5; ble[5].visibility = WGPUShaderStage_Vertex;
   ble[5].buffer.type = WGPUBufferBindingType_Uniform;
-  ble[5].buffer.minBindingSize = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);
+  ble[5].buffer.hasDynamicOffset = true;   // per-instance palette slot
+  ble[5].buffer.minBindingSize = kPaletteStride;
+  ble[6].binding = 6; ble[6].visibility = WGPUShaderStage_Vertex;
+  ble[6].buffer.type = WGPUBufferBindingType_Uniform;
+  ble[6].buffer.minBindingSize = 16;       // per-submesh morph info (static offset)
+  ble[7].binding = 7; ble[7].visibility = WGPUShaderStage_Vertex;
+  ble[7].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+  ble[8].binding = 8; ble[8].visibility = WGPUShaderStage_Vertex;
+  ble[8].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
   WGPUBindGroupLayoutDescriptor bgld = {};
-  bgld.entryCount = 6; bgld.entries = ble;
+  bgld.entryCount = 9; bgld.entries = ble;
   WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
 
   WGPUPipelineLayoutDescriptor pld = {};
@@ -501,15 +560,19 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     WGPUTextureView baseView   = mesh.views[sm.baseColor  >= 0 ? sm.baseColor  : whiteIndex];
     WGPUTextureView normalView = mesh.views[sm.normal     >= 0 ? sm.normal     : flatNormalIndex];
     WGPUTextureView mrView     = mesh.views[sm.metalRough >= 0 ? sm.metalRough : whiteIndex];
-    WGPUBindGroupEntry bge[6] = {};
+    WGPUBindGroupEntry bge[9] = {};
     bge[0].binding = 0; bge[0].buffer = mesh.uniformBuf; bge[0].size = sizeof(MeshUniforms);
     bge[1].binding = 1; bge[1].textureView = baseView;
     bge[2].binding = 2; bge[2].textureView = normalView;
     bge[3].binding = 3; bge[3].textureView = mrView;
     bge[4].binding = 4; bge[4].sampler = mesh.sampler;
-    bge[5].binding = 5; bge[5].buffer = mesh.paletteBuf; bge[5].size = (uint64_t)kMaxPaletteSlots * sizeof(glm::mat4);
+    bge[5].binding = 5; bge[5].buffer = mesh.paletteBuf; bge[5].size = kPaletteStride;
+    bge[6].binding = 6; bge[6].buffer = mesh.submeshInfoBuf;
+    bge[6].offset = (uint64_t)256 * (&sm - mesh.submeshes.data()); bge[6].size = 16;
+    bge[7].binding = 7; bge[7].buffer = mesh.morphDeltaBuf; bge[7].size = WGPU_WHOLE_SIZE;
+    bge[8].binding = 8; bge[8].buffer = mesh.morphTableBuf; bge[8].size = WGPU_WHOLE_SIZE;
     WGPUBindGroupDescriptor bgd = {};
-    bgd.layout = bgl; bgd.entryCount = 6; bgd.entries = bge;
+    bgd.layout = bgl; bgd.entryCount = 9; bgd.entries = bge;
     mesh.bindGroups.push_back(wgpuDeviceCreateBindGroup(device, &bgd));
   }
 
@@ -532,6 +595,9 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
                        const std::string& path, const std::string& slug) {
   RiggedData data = loadGltfRigged(path.c_str());
   if (!data.ok) data = makeRiggedCube();
+  std::string manifestPath = path;
+  if (manifestPath.size() > 4 && manifestPath.substr(manifestPath.size() - 4) == ".glb")
+    manifestPath = manifestPath.substr(0, manifestPath.size() - 4) + ".manifest.json";
   glm::vec3 bbMin(data.bbMin[0], data.bbMin[1], data.bbMin[2]);
   glm::vec3 bbMax(data.bbMax[0], data.bbMax[1], data.bbMax[2]);
   glm::vec3 center = 0.5f * (bbMin + bbMax);
@@ -539,6 +605,7 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
   VesselSpec spec = vesselSpecFor(slug);
   float horiz = std::max(extent.x, extent.z);   // hull length runs along the longer axis
   Mesh mesh = createMesh(device, queue, fmt, std::move(data));
+  mesh.manifestPath = manifestPath;
   mesh.shipScale  = (horiz > 1e-6f) ? (2.0f * spec.hullHalfLen / horiz) : 1.0f;
   mesh.keelCenter = glm::vec3(center.x, bbMin.y, center.z);
   // Keel depth below the waterline: the client's tuned per-vessel floatDraft
@@ -2367,6 +2434,7 @@ int main(int argc, char** argv) {
     if (mp.find("merchantman") != std::string::npos)      cliSlug = "merchantman";
     else if (mp.find("brig") != std::string::npos)        cliSlug = "brig";
     else if (mp.find("pinnace") != std::string::npos)     cliSlug = "pinnace";
+    else if (mp.find("sloop") != std::string::npos)       cliSlug = "sloop";
     else if (mp.find("sloop") != std::string::npos || mp.find("bermuda") != std::string::npos) cliSlug = "sloop";
     vessels.emplace(cliSlug, loadVessel(device, queue, kSceneFormat, modelArg, cliSlug));
     ownVesselSlug = cliSlug;
@@ -2582,6 +2650,11 @@ int main(int argc, char** argv) {
   // Ported force-based sailing physics (sail_physics.hpp). shipX/Z/heading/speed
   // mirror the vessel each frame for the camera/ocean/network.
   sail::Vessel vessel;
+  // Vessel rig animation (Phase 1): the own ship's controller — recreated on
+  // hull change — plus this frame's helm input for the rudder/wheel visuals.
+  std::unique_ptr<vanim::Controller> ownAnim;
+  std::string ownAnimSlug;
+  int helmInput = 0;
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
@@ -4060,6 +4133,7 @@ int main(int argc, char** argv) {
     } else if (appState == AppState::Sailing) {
       auto down = [&](int k1, int k2) { return glfwGetKey(window, k1) == GLFW_PRESS || glfwGetKey(window, k2) == GLFW_PRESS; };
       int rudder = 0, sheetDir = 0;
+      helmInput = 0;
       if (!io.WantCaptureKeyboard) {
         rudder = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
         bool raise = down(GLFW_KEY_W, GLFW_KEY_UP), lower = down(GLFW_KEY_S, GLFW_KEY_DOWN);
@@ -4085,6 +4159,7 @@ int main(int argc, char** argv) {
       float windKn      = wv.valid ? wv.windSpeed  : 8.0f;
       float seaRough    = glm::clamp((wv.valid ? (float)wv.beaufort : 3.0f) / 8.0f, 0.0f, 1.0f);
       float preX = vessel.x, preZ = vessel.z;   // for the land-collision revert
+      helmInput = rudder;
       sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale, sheetDir);
       // Hull-vs-land collision (client hullHitsLand): sample the hull CENTRELINE
       // from centre toward the moving end (bow ahead / stern astern), plus the
@@ -4409,12 +4484,12 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
       wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
       if (ownMesh) {
-        uint32_t zeroOff = 0;
+        uint32_t zeroOffs[2] = { 0, 0 };   // instance slot 0: uniforms + palette
         wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
         wgpuRenderPassEncoderSetVertexBuffer(rp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(rp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
         for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
-          wgpuRenderPassEncoderSetBindGroup(rp, 0, ownMesh->bindGroups[i], 1, &zeroOff);
+          wgpuRenderPassEncoderSetBindGroup(rp, 0, ownMesh->bindGroups[i], 2, zeroOffs);
           wgpuRenderPassEncoderDrawIndexed(rp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
         }
       }
@@ -4727,6 +4802,49 @@ int main(int argc, char** argv) {
                  glm::vec4(t, cloudDrift.x, cloudDrift.y, 120000.0f) };
       wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cu, sizeof(cu));
     }
+    // Vessel rig animation (Phase 1): drive the own ship's controller — trim
+    // from the player sheet + tack, furl from the sail state, anchor, flags,
+    // rudder/wheel from the helm — then upload its palette+morph slot
+    // (instance 0 of its mesh; the client calls this same set per frame).
+    if (sailing && ownMesh && ownMesh->rig && ownMesh->rig->ok) {
+      if (!ownAnim || ownAnimSlug != ownVesselSlug) {
+        std::string profileSlug = ownVesselSlug.empty() ? "pinnace" : ownVesselSlug;
+        ownAnim = std::make_unique<vanim::Controller>(ownMesh->rig, profileSlug, ownMesh->manifestPath);
+        ownAnimSlug = ownVesselSlug;
+        std::printf("[vanim] controller ready: %s (%zu morphs)\n", profileSlug.c_str(), ownMesh->rig->morphs.size());
+      }
+      // Debug poses for headless screenshots.
+      static bool animDbg = false;
+      if (!animDbg) {
+        animDbg = true;
+        if (const char* v = std::getenv("SAILSIM_SHEET")) vessel.sheetAngleDeg = (float)std::atof(v);
+        if (const char* v = std::getenv("SAILSIM_SAILSTATE")) vessel.sailState = std::atoi(v);
+      }
+      if (std::getenv("SAILSIM_ANCHOR")) {
+        vessel.anchored = true; vessel.anchorX = vessel.x; vessel.anchorZ = vessel.z;
+      }
+      mp::WaveState aw2 = mpClient.wave();
+      const float wFrom = aw2.valid ? aw2.windBearing : 270.0f;
+      const float wKn = aw2.valid ? aw2.windSpeed : 8.0f;
+      float diffDeg = std::fmod(glm::degrees(vessel.heading) - wFrom + 360.0f, 360.0f);
+      if (diffDeg < 0.0f) diffDeg += 360.0f;
+      const bool isPortTack = diffDeg <= 180.0f;
+      ownAnim->setRudder((float)helmInput);
+      ownAnim->setSailTrim(vessel.sheetAngleDeg, isPortTack);
+      ownAnim->applySailState(vessel.sailState);
+      ownAnim->dropAnchor('S', vessel.anchored ? 1.0f : 0.0f);
+      // Downwind direction relative to the hull (client windLocalRad).
+      const float windToRad = glm::radians(wFrom + 180.0f);
+      ownAnim->idleWind(windToRad - vessel.heading, std::min(1.2f, wKn / 8.0f), t);
+      ownAnim->tickRig(dt);
+      std::vector<uint8_t> blob(kPaletteStride, 0);
+      const auto& pal = ownAnim->palette();
+      std::memcpy(blob.data(), pal.data(), std::min(pal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
+      const auto& mw = ownAnim->morphWeights();
+      std::memcpy(blob.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4), mw.data(),
+                  std::min(mw.size(), (size_t)kMaxMorphWeights) * sizeof(float));
+      wgpuQueueWriteBuffer(queue, ownMesh->paletteBuf, 0, blob.data(), kPaletteStride);
+    }
     // Every ship's uniforms into its vessel's dynamic-offset slots (same per-mesh
     // ordering as the draw loop below, so slot indices line up).
     {
@@ -4853,10 +4971,10 @@ int main(int argc, char** argv) {
         slot[m] = idx + 1;                       // keep slot numbering aligned with the draw loop
         if (!m->oceanMask || m->hullRanges.empty()) continue;
         if (!stencilBound) { wgpuRenderPassEncoderSetPipeline(pass, hs.pipeline); stencilBound = true; }
-        uint32_t dynOff = idx * m->uniformStride;
+        uint32_t dynOffs[2] = { idx * m->uniformStride, idx * kPaletteStride };
         wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderSetBindGroup(pass, 0, m->stencilBind, 1, &dynOff);
+        wgpuRenderPassEncoderSetBindGroup(pass, 0, m->stencilBind, 2, dynOffs);
         wgpuRenderPassEncoderSetStencilReference(pass, kHullStencilRef);
         for (const auto& r : m->hullRanges)
           wgpuRenderPassEncoderDrawIndexed(pass, r.second, 1, r.first, 0, 0);
@@ -4907,13 +5025,13 @@ int main(int argc, char** argv) {
         Mesh* m = s.mesh;
         uint32_t idx = slot[m];
         if (idx >= kMaxShipInstances) continue;
-        uint32_t dynOff = idx * m->uniformStride;
+        uint32_t dynOffs[2] = { idx * m->uniformStride, idx * kPaletteStride };
         wgpuRenderPassEncoderSetPipeline(pass, m->pipeline);
         wgpuRenderPassEncoderSetVertexBuffer(pass, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(pass, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
         for (size_t i = 0; i < m->submeshes.size(); ++i) {
           const RigSubmesh& sm = m->submeshes[i];
-          wgpuRenderPassEncoderSetBindGroup(pass, 0, m->bindGroups[i], 1, &dynOff);
+          wgpuRenderPassEncoderSetBindGroup(pass, 0, m->bindGroups[i], 2, dynOffs);
           wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
         }
         slot[m] = idx + 1;

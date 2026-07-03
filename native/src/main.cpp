@@ -3443,7 +3443,18 @@ int main(int argc, char** argv) {
       {
         bool haveCombat = false;
         { auto cbIt = combatBy.find(mpClient.myId());
-          haveCombat = cbIt != combatBy.end() && cbIt->second.valid && cbIt->second.zones.bow >= 0; }
+          if (cbIt != combatBy.end() && cbIt->second.valid && cbIt->second.zones.bow >= 0) {
+            // Like the browser HUD: nothing at all while the ship is untouched.
+            const mp::CombatZones& z0 = cbIt->second.zones;
+            mp::CombatZones m0 = cbIt->second.maxHp;
+            if (m0.bow < 0) {
+              combat::Zones d0 = combat::zoneHpFor(ownVesselSlug, mpClient.town().armorUpgrade);
+              m0 = { d0.bow, d0.stern, d0.port, d0.starboard, d0.masts };
+            }
+            haveCombat = z0.bow < m0.bow || z0.stern < m0.stern || z0.port < m0.port ||
+                         z0.starboard < m0.starboard || z0.masts < m0.masts ||
+                         (mastRepairStartT >= 0 && mastRepairArmedMs > 0);
+          } }
         if (haveCombat) {
           ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
           ImGui::Begin("damagehud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |

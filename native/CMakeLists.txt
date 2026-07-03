@@ -238,11 +238,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(miniaudio)
 
 # Embed each WGSL file as a C header at configure time — single source of truth
-# is the .wgsl file. Uses a raw string literal so no escaping is needed;
-# reconfigure after editing a .wgsl.
+# is the .wgsl file. Uses a raw string literal so no escaping is needed.
 set(WGSL_GEN_DIR "${CMAKE_BINARY_DIR}/gen")
 file(MAKE_DIRECTORY "${WGSL_GEN_DIR}")
 function(embed_wgsl SRC VARNAME OUT)
+  # Embedding happens at CONFIGURE time, so editing a .wgsl must re-run cmake —
+  # without this dependency, shader edits silently never reach the binary.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SRC}")
   file(READ "${SRC}" _wgsl_src)
   file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
 endfunction()

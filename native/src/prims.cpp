@@ -103,6 +103,14 @@ void System::tri(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
   v.push_back({ c, color });
 }
 
+void System::tri3(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                  const glm::vec4& ca, const glm::vec4& cb, const glm::vec4& cc, bool translucent) {
+  auto& v = translucent ? trans_ : opaque_;
+  v.push_back({ a, ca });
+  v.push_back({ b, cb });
+  v.push_back({ c, cc });
+}
+
 void System::sphere(const glm::vec3& c, float r, const glm::vec4& color, const glm::mat3& orient) {
   const int SEG = 7, RING = 5;   // client used 7-segment low-poly spheres
   const glm::vec3 lightDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.3f));

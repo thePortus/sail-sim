@@ -47,6 +47,9 @@ public:
   void setSailTrim(float sheetAngleDeg, bool isPortTack);
   void applySailState(int state, bool immediate = false);    // 0 reefed, 1 topsails, 2 full
   void dropAnchor(char side, float t);                       // 'S'/'P', 0 stowed .. 1 lowered
+  // Mast damage (combat phase 3): health 1 intact .. 0 destroyed. tickRig eases
+  // the collapse (MAST_FALL_RATE 0.4/s) so the rig falls / rises over seconds.
+  void setMastDamage(float health01) { mastHealth_ = health01 < 0 ? 0.0f : health01 > 1 ? 1.0f : health01; }
   // Gunports + run-out (combat phase 1): deploy 0 stowed .. 1 run out; recoil
   // kicks the gun back briefly after firing. Values are pre-eased by the caller.
   void setGunDeploy(char side, float deploy01, float recoil01 = 0.0f) {
@@ -96,6 +99,16 @@ private:
   bool trimInit_ = false;
   float boomCur_ = 0, boomTarget_ = 0;         // sloop boom/gaff swing (rad)
   float anchorCur_[2] = { 0, 0 }, anchorReq_[2] = { 0, 0 };   // [0]=S, [1]=P
+  // Mast-damage zones: single-mast rigs use the combat.constants curves; multi-
+  // mast rigs map the one masts-zone HP onto per-mast collapse windows.
+  struct MastZone {
+    std::string fallClip;
+    MorphRef breakMorph;        // node "" = no splinter morph
+    float from = -1, to = 1;    // window over damage fraction; from < 0 = curve mode
+    float downCur = 0, breakCur = 0;
+  };
+  std::vector<MastZone> mastZones_;
+  float mastHealth_ = 1.0f;
   // Gun deploy/recoil per side ([0]=P, [1]=S), pre-eased by the caller.
   float gunDeploy_[2] = { 0, 0 };
   float gunRecoil_[2] = { 0, 0 };

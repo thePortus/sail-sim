@@ -131,6 +131,7 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     furlTables_[1] = table({ {"Mainsail",1},{"Topsail",0},{"Topgallant",1},{"Course",1},{"ForeStaysail",0},{"Jib",0} });
     furlTables_[0] = table({ {"Mainsail",1},{"Topsail",1},{"Topgallant",1},{"Course",1},{"ForeStaysail",1},{"Jib",1} });
     trimCur_ = trimTarget_ = 0.0f;   // one-sided clip: 0 = square
+    mastZones_ = { { "MastDown", { "Sloop_Mast", "Break", 0 }, -1, 1, 0, 0 } };
   } else if (slug_ == "pinnace") {
     trimMode_ = TrimMode::SymmetricLug; rudderMode_ = RudderMode::PinnaceAbsolute;
     trimRate_ = 1.6f; furlRate_ = 0.6f;
@@ -142,6 +143,7 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     furlTables_[2] = table({ {"Mainsail",0},{"Jib",0} });
     furlTables_[1] = table({ {"Mainsail",0.5f},{"Jib",0} });   // main reefed ~50%, jib up
     furlTables_[0] = table({ {"Mainsail",1},{"Jib",1} });
+    mastZones_ = { { "MastDown", { "Pinnace_Mast", "Break", 0 }, -1, 1, 0, 0 } };
   } else if (slug_ == "brig") {
     trimMode_ = TrimMode::SymmetricSquare; rudderMode_ = RudderMode::SymmetricClip;
     trimRate_ = 1.4f; furlRate_ = 0.5f;
@@ -160,6 +162,9 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     const char* KITES[] = { "ForeRoyal","ForeTGallant","GaffTopsail","FlyingJib","MainTGallStaysail","MainTopStaysail" };
     for (const char* s : ALL) { furlTables_[2][s] = 0; furlTables_[1][s] = 0; furlTables_[0][s] = 1; }
     for (const char* k : KITES) furlTables_[1][k] = 1;   // topsails: strike the light kites
+    // Foremast topples first (down by ~30% HP left); the main only at 0 HP.
+    mastZones_ = { { "MastDown_Fore", { "Mast_Fore_Lower", "Break_Fore", 0 }, 0.40f, 0.70f, 0, 0 },
+                   { "MastDown_Main", { "Mast_Main_Lower", "Break_Main", 0 }, 0.70f, 1.00f, 0, 0 } };
   } else {   // merchantman (also the fallback)
     trimMode_ = TrimMode::SymmetricSquare; rudderMode_ = RudderMode::SymmetricClipReversed;
     trimRate_ = 1.4f; furlRate_ = 0.5f;
@@ -173,6 +178,9 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     const char* KITES[] = { "Sail_Fore_TGallant","Sail_Main_TGallant","Sail_Mizzen_TGallant","Sail_OuterJib" };
     for (const char* s : ALL) { furlTables_[2][s] = 0; furlTables_[1][s] = 0; furlTables_[0][s] = 1; }
     for (const char* k : KITES) furlTables_[1][k] = 1;
+    mastZones_ = { { "MastDown_Fore",   { "", "", 0 }, 0.40f, 0.60f, 0, 0 },
+                   { "MastDown_Mizzen", { "", "", 0 }, 0.60f, 0.80f, 0, 0 },
+                   { "MastDown_Main",   { "", "", 0 }, 0.80f, 1.00f, 0, 0 } };
   }
 
   applySailState(2, true);   // default pose: full sail
@@ -402,6 +410,33 @@ void Controller::tickRig(float dt) {
     scrubNorm("AnchorDrop_S", anchorCur_[0]);
     scrubNorm("AnchorDrop_P", anchorCur_[1]);
     if (!cableS_.node.empty()) { setMorph(cableS_, anchorCur_[0]); setMorph(cableP_, anchorCur_[1]); }
+  }
+  // Mast damage: map the masts-zone health onto each zone's collapse window
+  // (or the single-mast curves), ease at MAST_FALL_RATE 0.4/s, scrub the fall
+  // clip + ramp the splinter morph over the last ~40% of the fall.
+  {
+    const float frac = 1.0f - mastHealth_;
+    for (auto& z : mastZones_) {
+      float downTgt, breakTgt;
+      if (z.from < 0.0f) {
+        // Single-mast rigs: the client's combat.constants curves.
+        const float onset = 0.60f;
+        if (mastHealth_ <= 0.0f) downTgt = 1.0f;
+        else if (mastHealth_ >= onset) downTgt = 0.0f;
+        else downTgt = std::sqrt((onset - mastHealth_) / onset) * 0.55f;
+        breakTgt = mastHealth_ >= onset ? 0.0f : (onset - std::max(0.0f, mastHealth_)) / onset;
+      } else {
+        const float span = std::max(0.0001f, z.to - z.from);
+        downTgt = std::clamp((frac - z.from) / span, 0.0f, 1.0f);
+        breakTgt = std::clamp((downTgt - 0.6f) / 0.4f, 0.0f, 1.0f);
+      }
+      z.downCur = approach(z.downCur, downTgt, 0.4f * dt);
+      z.breakCur = approach(z.breakCur, breakTgt, 0.4f * dt);
+      if (z.downCur > 0.0001f || downTgt > 0.0f) {
+        scrubNorm(z.fallClip, z.downCur);
+        if (!z.breakMorph.node.empty()) setMorph(z.breakMorph, z.breakCur);
+      }
+    }
   }
   // Guns: lids open over the first half of the deploy, the gun runs out over the
   // second half minus the recoil kick (the client controllers' applyGunPose).

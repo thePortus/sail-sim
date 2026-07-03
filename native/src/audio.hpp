@@ -47,6 +47,8 @@ public:
   // water-impact splash. vol 0..1 (callers distance-attenuate: 1 - d/800).
   void playCannon(float vol);
   void playSplash(float vol);
+  // Demasting: creaking groan + volley of wood cracks (mast-crack.service).
+  void playMastCrack(float vol);
   // One-shot procedural thunder (cloud.service playThunder): vol 0..1 sets the
   // rumble's brightness, attack sharpness and length (distant rolls longer).
   void playThunder(float vol);

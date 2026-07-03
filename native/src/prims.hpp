@@ -19,6 +19,9 @@ class System {
   void clear();
   void tri(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
            const glm::vec4& color, bool translucent);
+  // Per-vertex colours (radial-fade fans: scorch decals).
+  void tri3(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+            const glm::vec4& ca, const glm::vec4& cb, const glm::vec4& cc, bool translucent);
   // Low-poly UV sphere (balls; lit by a fixed pseudo-light for cheap shading).
   void sphere(const glm::vec3& center, float radius, const glm::vec4& color,
               const glm::mat3& orient = glm::mat3(1.0f));

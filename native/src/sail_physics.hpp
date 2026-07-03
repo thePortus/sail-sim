@@ -68,6 +68,9 @@ struct Vessel {
   float sheetAngleDeg = 30.0f;       // client default (reaching start)
   float trimQ = 1.0f;                // last tick's trim quality 0..1 (for the HUD)
   float driveAngle = 90.0f;          // last tick's apparent-wind angle (for auto-trim/HUD)
+  // Combat: mast-damage sail-power multiplier (combat.constants mastSpeedMult —
+  // 1 intact, floor 0.30 partial, 0 when the rig is down).
+  float driveMult = 1.0f;
 };
 
 // Ideal sheet angle (deg from centreline) for a wind angle — client table.
@@ -168,7 +171,7 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
 
   // Force model: a = (thrust - drag)*response/mass.
   float driveC = eff * (1.0f - SPILL_MAX * heelSpill);
-  float thrust = r.forceK * r.sailAreaFactor * driveC * appWind * appWind;
+  float thrust = r.forceK * r.sailAreaFactor * driveC * appWind * appWind * v.driveMult;
   float intoSea = 1.0f - driveAngle / 180.0f;
   float drag = DRAG_K * v.speed * std::fabs(v.speed)
              + TURN_SCRUB * std::fabs(v.yawRate) * std::fabs(v.speed)

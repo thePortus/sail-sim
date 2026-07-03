@@ -2891,6 +2891,13 @@ int main(int argc, char** argv) {
   bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
   std::map<std::string, std::pair<float, float>> remoteGunCur;   // eased remote gun deploy (P,S)
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
+  // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
+  std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
+  float ownMastHealth = 1.0f;
+  float shudRoll = 0.0f, shudVel = 0.0f;           // damped hit/recoil oscillator (rad)
+  float camShake = 0.0f;                           // decaying camera shake magnitude (m)
+  struct HullDecal { glm::vec3 local; float size; float ang; uint32_t seed; };
+  std::map<std::string, std::vector<HullDecal>> shipDecals;   // "" = own ship
   // Bow orientation is now per-vessel (Mesh.bowYaw, from vesselSpecFor). World
   // velocity = knots x TRAVEL_SCALE — the client's map-compression factor (must
   // match server combat-constants.js) so distances feel right at realistic knots.
@@ -4571,7 +4578,8 @@ int main(int argc, char** argv) {
       }
       for (const std::string& pid : mpClient.drainRepaired()) {
         remoteSunkAt.erase(pid);
-        if (pid == meId) meSunk = false;
+        shipDecals.erase(pid == meId ? std::string() : pid);
+        if (pid == meId) { meSunk = false; shipDecals.erase(std::string()); }
       }
       // ── Gunnery (phase 1): batteries, aim assist, ball pool, remote shots. ──
       if (ownVesselSlug != gunSlug) {
@@ -4589,6 +4597,7 @@ int main(int argc, char** argv) {
       // frame 120 and fires it at frame 420 (screenshot the arcs + balls).
       if (std::getenv("SAILSIM_GUNS")) {
         if (frame == 120) guns.armOrFire(1);
+        if (frame >= 420 && frame % 780 == 0) guns.armOrFire(1);   // re-fire as reloads complete
         if (frame == 420) guns.armOrFire(1);
       }
       // FX isolation: repeatedly blast at a fixed spot ahead of the ship.
@@ -4608,6 +4617,8 @@ int main(int argc, char** argv) {
           cannonFx.muzzleBlast(mw, fe.dirX, fe.dirZ, glm::distance(lastEye, mw));
           audioSys.playCannon(1.0f);
           firedThisFrame = true;
+          shudVel += (fe.side == 0 ? 0.22f : -0.22f);   // recoil rocks away from the firing side
+          camShake = std::min(1.2f, camShake + 0.15f);
         }
       }
       for (int gs = 0; gs < 2; ++gs) {
@@ -4650,6 +4661,33 @@ int main(int argc, char** argv) {
           if (l > 1e-3f) dir /= l;
           if (!ie.hit.grape) cannonFx.shipHit(ip, dir);
           audioSys.playSplash(std::max(0.0f, 0.8f - d / 600.0f));   // crunchy thud placeholder tail
+          // Shudder + shake when WE are struck (roll kick toward the hit side).
+          if (ie.hit.victimId == meId) {
+            shudVel += (ie.hit.side == "port" ? -1.0f : 1.0f) * 0.55f;
+            camShake = std::min(1.2f, camShake + 0.5f);
+          }
+          // Scorch decal (non-grape): stored vessel-local (yaw frame) so it rides the hull.
+          if (!ie.hit.grape) {
+            float vx2 = 0, vz2 = 0, vh2 = 0;
+            bool have = false;
+            if (ie.hit.victimId == meId) { vx2 = vessel.x; vz2 = vessel.z; vh2 = vessel.heading; have = true; }
+            else {
+              for (const mp::RemotePlayer& rp : mpClient.players())
+                if (rp.id == ie.hit.victimId) { vx2 = rp.x; vz2 = rp.z; vh2 = glm::radians(rp.heading); have = true; break; }
+            }
+            if (have) {
+              const float ch = std::cos(-vh2), sh = std::sin(-vh2);
+              const glm::vec3 rel(ie.x - vx2, ie.y, ie.z - vz2);
+              HullDecal dcl;
+              dcl.local = glm::vec3(rel.x * ch - rel.z * sh, rel.y, rel.x * sh + rel.z * ch);
+              dcl.size = (ie.hit.zone == "masts" ? 0.55f : 1.35f) * (0.82f + 0.36f * (float)(rand() % 100) / 100.0f);
+              dcl.ang = (float)(rand() % 628) / 100.0f;
+              dcl.seed = (uint32_t)rand();
+              auto& list = shipDecals[ie.hit.victimId == meId ? std::string() : ie.hit.victimId];
+              list.push_back(dcl);
+              while (list.size() > (size_t)combat::kDecalMaxPerShip) list.erase(list.begin());
+            }
+          }
         } else {
           const float surf = terr.loaded() ? terr.elevation(ie.x, ie.z) : 0.0f;
           if (surf > 0.0f) cannonFx.landHit(ip, iv);
@@ -4659,6 +4697,38 @@ int main(int argc, char** argv) {
           }
         }
       }
+      // ── Mast damage: crack audio one-shots + drive/turn penalties. ──
+      {
+        auto mastHpOf = [&](const std::string& pid, const std::string& slugStr) -> std::pair<float, float> {
+          auto it = combatBy.find(pid);
+          if (it == combatBy.end() || !it->second.valid || it->second.zones.masts < 0) return { -1, -1 };
+          float mx = it->second.maxHp.masts;
+          if (mx <= 0) mx = combat::zoneHpFor(slugStr, false).masts;
+          return { it->second.zones.masts, mx };
+        };
+        auto [ownM, ownMx] = mastHpOf(meId, ownVesselSlug.empty() ? "pinnace" : ownVesselSlug);
+        ownMastHealth = ownM < 0 ? 1.0f : glm::clamp(ownM / std::max(1.0f, ownMx), 0.0f, 1.0f);
+        vessel.driveMult = combat::mastSpeedMult(ownMastHealth);
+        // Crack one-shots: any ship whose masts just hit zero.
+        for (const auto& [pid, cs] : combatBy) {
+          if (!cs.valid || cs.zones.masts < 0) continue;
+          float prev = prevMastHp.count(pid) ? prevMastHp[pid] : cs.zones.masts;
+          if (prev > 0.0f && cs.zones.masts <= 0.0f) {
+            float vol = 1.0f;
+            if (pid != meId) {
+              vol = 0.0f;
+              for (const mp::RemotePlayer& rp : mpClient.players())
+                if (rp.id == pid) { vol = std::max(0.0f, 1.0f - std::hypot(rp.x - vessel.x, rp.z - vessel.z) / 700.0f); break; }
+            }
+            audioSys.playMastCrack(vol);
+          }
+          prevMastHp[pid] = cs.zones.masts;
+        }
+      }
+      // Hit shudder decay (damped oscillator) + camera shake decay.
+      shudVel += -shudRoll * 22.0f * dt - shudVel * 5.0f * dt;
+      shudRoll += shudVel * dt;
+      camShake = std::max(0.0f, camShake - camShake * 3.0f * dt - 0.02f * dt);
       // Advance the effect fields (wind-drifted smoke).
       {
         mp::WaveState fw = mpClient.wave();
@@ -4742,6 +4812,11 @@ int main(int argc, char** argv) {
       float preX = vessel.x, preZ = vessel.z;   // for the land-collision revert
       helmInput = rudder;
       sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale, sheetDir);
+      // Dismasted: the hull only pivots slowly (client MAST_DOWN_TURN_MAX 6 deg/s).
+      if (ownMastHealth <= 0.0f) {
+        const float cap = glm::radians(combat::kMastDownTurnMax);
+        vessel.yawRate = glm::clamp(vessel.yawRate, -cap, cap);
+      }
       // Hull-vs-land collision (client hullHitsLand): sample the hull CENTRELINE
       // from centre toward the moving end (bow ahead / stern astern), plus the
       // centre itself, so the bow halts at the shoreline instead of burying
@@ -4878,6 +4953,11 @@ int main(int argc, char** argv) {
     glm::vec3 shipPos(shipX, shipY, shipZ);
     glm::vec3 back = glm::normalize(glm::vec3(glm::rotate(glm::mat4(1.0f), camYawOffset, glm::vec3(0, 1, 0)) * glm::vec4(-fwd, 0.0f)));
     glm::vec3 eye = shipPos + back * (camDist * std::cos(camPitch)) + glm::vec3(0.0f, camDist * std::sin(camPitch), 0.0f);
+    if (camShake > 0.001f) {   // combat hit/recoil shake (decaying pseudo-random jitter)
+      eye += glm::vec3(std::sin((float)t * 47.0f) + 0.6f * std::sin((float)t * 31.7f),
+                       std::sin((float)t * 39.3f + 1.7f),
+                       std::sin((float)t * 43.1f + 0.6f)) * (camShake * 0.35f);
+    }
     glm::vec3 lookTarget = shipPos + glm::vec3(0.0f, 1.0f, 0.0f);
     glm::vec3 lookUp(0.0f, 1.0f, 0.0f);
     if (std::getenv("SAILSIM_SKYLOOK")) {   // debug: aim at the moon to inspect stars/moon
@@ -4919,30 +4999,72 @@ int main(int argc, char** argv) {
     // Place a ship on the wave field: heave to the surface, tilt to its normal
     // (central differences of the FFT height, ~2 m step), yaw to heading, then
     // scale + keel-align per that hull.
-    auto shipModel = [&](float x, float z, float heading, const Mesh& m) {
+    auto shipModel = [&](float x, float z, float heading, const Mesh& m,
+                         float cRoll = 0.0f, float cPitch = 0.0f, float cDrop = 0.0f) {
       float y = fftHeight(x, z);
       const float ee = 2.0f;
       float gx = fftHeight(x + ee, z) - fftHeight(x - ee, z);
       float gz = fftHeight(x, z + ee) - fftHeight(x, z - ee);
       glm::vec3 up = glm::normalize(glm::vec3(-gx / (2.0f * ee), 1.0f, -gz / (2.0f * ee)));
-      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(x, y - m.draft, z));
+      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(x, y - m.draft - cDrop, z));
       glm::vec3 axis = glm::cross(glm::vec3(0, 1, 0), up);
       float axisLen = glm::length(axis);
       if (axisLen > 1e-5f)
         mm = mm * glm::rotate(glm::mat4(1.0f), std::asin(glm::clamp(axisLen, 0.0f, 1.0f)), axis / axisLen);
-      mm = glm::rotate(mm, heading + m.bowYaw, glm::vec3(0, 1, 0));
+      mm = glm::rotate(mm, heading, glm::vec3(0, 1, 0));
+      if (cPitch != 0.0f) mm = glm::rotate(mm, cPitch, glm::vec3(1, 0, 0));   // combat listing/capsize
+      if (cRoll != 0.0f) mm = glm::rotate(mm, cRoll, glm::vec3(0, 0, 1));
+      mm = glm::rotate(mm, m.bowYaw, glm::vec3(0, 1, 0));
       mm = glm::scale(mm, glm::vec3(m.shipScale));
       mm = glm::translate(mm, -m.keelCenter);
       return mm;
     };
 
+    // Combat pose for a ship: damage listing (roll toward the holed beam, settle
+    // by the damaged end) + the capsize/sink blend once combat_sunk arrives.
+    const std::string cpMeId = mpClient.myId();
+    auto combatPose = [&](const std::string& id, const std::string& slugStr) {
+      struct Pose { float roll = 0, pitch = 0, ydrop = 0; } out;
+      combat::Zones z{}, mx{};
+      bool haveZones = false;
+      auto it = combatBy.find(id);
+      if (it != combatBy.end() && it->second.valid && it->second.zones.bow >= 0) {
+        const mp::CombatZones& cz = it->second.zones;
+        z = { cz.bow, cz.stern, cz.port, cz.starboard, cz.masts };
+        mp::CombatZones cm = it->second.maxHp;
+        if (cm.bow < 0) {
+          combat::Zones dz = combat::zoneHpFor(slugStr, false);
+          cm = { dz.bow, dz.stern, dz.port, dz.starboard, dz.masts };
+        }
+        mx = { cm.bow, cm.stern, cm.port, cm.starboard, cm.masts };
+        haveZones = true;
+        combat::Listing l = combat::listingFor(z, mx);
+        out.roll = l.roll;
+        out.pitch = l.pitch;
+      }
+      double sunkAt = -1;
+      if (id == cpMeId && meSunk) sunkAt = meSunkAtT;
+      auto rs = remoteSunkAt.find(id);
+      if (rs != remoteSunkAt.end()) sunkAt = rs->second;
+      if (sunkAt >= 0 && haveZones) {
+        const float env = combat::sinkProgress((float)(t - sunkAt));
+        combat::Listing c = combat::capsizeFor(z, mx);
+        out.roll = glm::mix(out.roll, c.roll, env);
+        out.pitch = glm::mix(out.pitch, c.pitch, env);
+        out.ydrop = combat::kSinkDepth * env;
+      }
+      return out;
+    };
+
     // Our hull uses the ported buoyancy (heave + pitch/roll) and sailing heel,
     // applied in the ship's own frame (yaw -> pitch -> roll -> model bow-yaw).
     auto ownShipModel = [&](const Mesh& m) {
-      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, ownBuoy.x - m.draft, shipZ));
+      auto cp = combatPose(cpMeId, ownVesselSlug.empty() ? "pinnace" : ownVesselSlug);
+      glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(shipX, ownBuoy.x - m.draft - cp.ydrop, shipZ));
       mm = glm::rotate(mm, shipHeading, glm::vec3(0, 1, 0));
-      mm = glm::rotate(mm, -ownBuoy.y, glm::vec3(1, 0, 0));                          // pitch (bow up on +)
-      mm = glm::rotate(mm, ownBuoy.z + glm::radians(vessel.heelDeg), glm::vec3(0, 0, 1));  // roll + heel
+      mm = glm::rotate(mm, -ownBuoy.y + cp.pitch, glm::vec3(1, 0, 0));               // pitch (bow up on +)
+      mm = glm::rotate(mm, ownBuoy.z + glm::radians(vessel.heelDeg) + cp.roll + shudRoll,
+                       glm::vec3(0, 0, 1));                                          // roll + heel + listing + shudder
       mm = glm::rotate(mm, m.bowYaw, glm::vec3(0, 1, 0));
       mm = glm::scale(mm, glm::vec3(m.shipScale));
       mm = glm::translate(mm, -m.keelCenter);
@@ -4976,7 +5098,9 @@ int main(int argc, char** argv) {
           shipImposters.push_back({ &ait->second, rp.x, rp.z, glm::radians(rp.heading) });
         } else {
           Mesh& rmv = vesselFor(slug);
-          ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv), true, rp });   // server heading is degrees
+          auto cp = combatPose(rp.id, slug);
+          ships.push_back({ &rmv, shipModel(rp.x, rp.z, glm::radians(rp.heading), rmv,
+                                            cp.roll, cp.pitch, cp.ydrop), true, rp });   // server heading is degrees
         }
       }
       // Town streaming (client BUILD_RANGE=600 / PIER_BUILD_RANGE=2400): real GLBs
@@ -5623,6 +5747,7 @@ int main(int argc, char** argv) {
       ownAnim->dropAnchor('S', vessel.anchored ? 1.0f : 0.0f);
       ownAnim->setGunDeploy('P', guns.deploy(0), guns.recoil(0));
       ownAnim->setGunDeploy('S', guns.deploy(1), guns.recoil(1));
+      ownAnim->setMastDamage(ownMastHealth);
       // Downwind direction relative to the hull (client windLocalRad).
       const float windToRad = glm::radians(wFrom + 180.0f);
       ownAnim->idleWind(windToRad - vessel.heading, std::min(1.2f, wKn / 8.0f), t);
@@ -5682,6 +5807,17 @@ int main(int argc, char** argv) {
           gc.second += glm::clamp(tgtS - gc.second, -step, step);
           ctl->setGunDeploy('P', gc.first);
           ctl->setGunDeploy('S', gc.second);
+        }
+        // Mast damage from the broadcast combat_state.
+        {
+          auto cit = combatBy.find(si.rp.id);
+          float mh = 1.0f;
+          if (cit != combatBy.end() && cit->second.valid && cit->second.zones.masts >= 0) {
+            float mx = cit->second.maxHp.masts;
+            if (mx <= 0) mx = combat::zoneHpFor(slug, false).masts;
+            mh = glm::clamp(cit->second.zones.masts / std::max(1.0f, mx), 0.0f, 1.0f);
+          }
+          ctl->setMastDamage(mh);
         }
         ctl->tickRig(dt);
         std::fill(blob.begin(), blob.end(), 0);
@@ -5967,6 +6103,49 @@ int main(int argc, char** argv) {
               primsSys.billboard(corner - cu * (bl * 0.5f * (float)cy2), cr, cu, bt, bl, amber);
             }
         }
+      }
+      // Scorch decals: ragged radial-fade fans stored hull-local (yaw frame),
+      // re-rooted on their ship every frame so they ride the hull.
+      {
+        auto drawDecals = [&](const std::string& key, float sx2, float sz2, float sh2) {
+          auto dit = shipDecals.find(key);
+          if (dit == shipDecals.end()) return;
+          const float ch2 = std::cos(sh2), sn2 = std::sin(sh2);
+          for (const HullDecal& dd : dit->second) {
+            glm::vec3 w(sx2 + dd.local.x * ch2 + dd.local.z * sn2,
+                        dd.local.y,
+                        sz2 - dd.local.x * sn2 + dd.local.z * ch2);
+            glm::vec3 n = glm::vec3(w.x - sx2, 0.0f, w.z - sz2);
+            float nl = glm::length(n);
+            n = nl > 1e-3f ? n / nl : glm::vec3(1, 0, 0);
+            n.y = 0.25f;
+            n = glm::normalize(n);
+            const glm::vec3 tt = glm::normalize(glm::cross(glm::vec3(0, 1, 0), n));
+            const glm::vec3 bb = glm::cross(n, tt);
+            const glm::vec3 c0 = w + n * 0.07f;
+            const glm::vec4 core(0.05f, 0.04f, 0.035f, 0.94f);
+            const glm::vec4 rim(0.12f, 0.08f, 0.05f, 0.0f);
+            const int SEG2 = 10;
+            auto rad = [&](int kk) {
+              uint32_t h = dd.seed * 374761393u + (uint32_t)(kk % SEG2) * 668265263u;
+              h = (h ^ (h >> 13)) * 1274126177u;
+              return 0.62f + 0.38f * (float)((h >> 8) & 1023) / 1023.0f;
+            };
+            for (int k2 = 0; k2 < SEG2; ++k2) {
+              float a0 = dd.ang + 6.2832f * k2 / SEG2;
+              float a1 = dd.ang + 6.2832f * (k2 + 1) / SEG2;
+              float r0 = rad(k2) * dd.size * 0.5f;
+              float r1 = rad(k2 + 1) * dd.size * 0.5f;
+              primsSys.tri3(c0,
+                            c0 + (tt * std::cos(a0) + bb * std::sin(a0)) * r0,
+                            c0 + (tt * std::cos(a1) + bb * std::sin(a1)) * r1,
+                            core, rim, rim, true);
+            }
+          }
+        };
+        drawDecals(std::string(), vessel.x, vessel.z, vessel.heading);
+        for (const ShipInst& si : ships)
+          if (si.remote) drawDecals(si.rp.id, si.rp.x, si.rp.z, glm::radians(si.rp.heading));
       }
       primsSys.flush(device, queue, pass, viewProj);
       // Combat FX billboards: particles, smoke puffs, muzzle fireballs.

@@ -215,6 +215,71 @@ struct CannonVoice {
   }
 };
 
+// Demasting crack (mast-crack.service): a creaking-timber brown-noise groan
+// under a volley of eight tapering wood cracks and a heavier final crash.
+struct MastCrackDesc {
+  float vol = 1;
+  int n = 0;
+  float t[10], inten[10], bpF[10], bpQ[10], thudF0[10];
+};
+struct MastCrackVoice {
+  MastCrackDesc d;
+  double tau = 0;
+  bool active = false;
+  // Groan: brown noise -> LP 320 Q5 with a 2.3 Hz LFO on the cutoff (+-170 Hz).
+  float brownLast = 0;
+  Biquad groanLp;
+  double lfoPhase = 0;
+  uint32_t rng = 3;
+  // Crack channel (cracks are sequential; one biquad, reconfigured per crack).
+  int crackIdx = -1;
+  Biquad crackBp;
+  float thudPh = 0;
+  inline float noise() {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return (float)(int32_t)rng * (1.0f / 2147483648.0f);
+  }
+  float render(float sr) {
+    const float t = (float)tau;
+    float o = 0.0f;
+    // Groan bed (0..2.4 s): env ramp 0.25 s -> hold -> fade over the last 1.18 s.
+    if (t < 2.4f) {
+      brownLast = (brownLast + 0.02f * noise()) / 1.02f;
+      float env = t < 0.25f ? 0.2f * (t / 0.25f)
+                : t < 1.32f ? 0.2f
+                : 0.2f * std::max(0.0f, 1.0f - (t - 1.32f) / 1.08f);
+      o += groanLp.process(brownLast * 3.5f) * env * 3.0f * d.vol;
+    }
+    // Advance to the crack whose window contains t.
+    for (int i = crackIdx + 1; i < d.n; ++i) {
+      if (t >= d.t[i]) {
+        crackIdx = i;
+        crackBp.bandpass(sr, d.bpF[i], d.bpQ[i]);
+        thudPh = 0;
+      } else break;
+    }
+    if (crackIdx >= 0) {
+      const float ct = t - d.t[crackIdx];
+      const float I = d.inten[crackIdx] * d.vol;
+      if (ct < 0.14f) {   // splinter report: shaped noise through the bandpass
+        float shaped = noise() * (1.0f - ct / 0.14f) * (1.0f - ct / 0.14f);
+        float g = ct < 0.003f ? 0.6f * I * (ct / 0.003f) : 0.6f * I * std::exp(-(ct - 0.003f) / 0.05f);
+        o += crackBp.process(shaped) * g;
+      }
+      if (ct < 0.22f) {   // low woody thud: triangle with a pitch drop to 55 Hz
+        float f = d.thudF0[crackIdx] * std::pow(55.0f / d.thudF0[crackIdx], std::min(1.0f, ct / 0.13f));
+        thudPh += f / sr;
+        if (thudPh >= 1.0f) thudPh -= 1.0f;
+        float tri = 4.0f * std::fabs(thudPh - 0.5f) - 1.0f;
+        float g = ct < 0.005f ? 0.5f * I * (ct / 0.005f) : 0.5f * I * std::exp(-(ct - 0.005f) / 0.06f);
+        o += tri * g;
+      }
+    }
+    tau += 1.0 / (double)sr;
+    return o * 0.6f;   // shared mix gain (client)
+  }
+};
+
 // Water-impact splash: a falling chirp + a wet lowpassed noise tail.
 struct SplashVoice {
   float vol = 0;
@@ -281,6 +346,10 @@ struct System::Impl {
   CannonDesc cannonDesc[kCannon];
   std::atomic<int> cannonState[kCannon]{};
   CannonVoice cannonVoice[kCannon];
+  static constexpr int kMastCrack = 2;
+  MastCrackDesc mastCrackDesc[kMastCrack];
+  std::atomic<int> mastCrackState[kMastCrack]{};
+  MastCrackVoice mastCrackVoice[kMastCrack];
   static constexpr int kSplash = 6;
   std::atomic<int> splashState[kSplash]{};
   float splashVol[kSplash] = {};
@@ -476,6 +545,27 @@ struct System::Impl {
         float fEcho = 230.0f * std::pow(55.0f / 230.0f, std::min(1.0f, teB / 2.4f));
         cv.echoLp.lowpass(sr, std::max(55.0f, fEcho), 0.5f);
       }
+      for (int v = 0; v < kMastCrack; ++v) {
+        int q = 1;
+        if (mastCrackState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
+          MastCrackVoice& mv = mastCrackVoice[v];
+          mv = MastCrackVoice();
+          mv.d = mastCrackDesc[v];
+          mv.rng = 0xC0FFEEu + (uint32_t)v * 0x9E3779B9u;
+          mv.active = true;
+        }
+        MastCrackVoice& mv = mastCrackVoice[v];
+        if (!mv.active) continue;
+        if (mv.tau >= 3.0) {
+          mv.active = false;
+          mastCrackState[v].store(0, std::memory_order_release);
+          continue;
+        }
+        // Groan LP cutoff wobbles at 2.3 Hz (+-170 Hz around 320).
+        mv.lfoPhase += 2.0 * M_PI * 2.3 * 128.0 / sr;   // block-rate-ish update
+        float f = 320.0f + 170.0f * (float)std::sin(mv.lfoPhase);
+        mv.groanLp.lowpass(sr, std::max(60.0f, f), 5.0f);
+      }
       for (int v = 0; v < kSplash; ++v) {
         int q = 1;
         if (splashState[v].compare_exchange_strong(q, 2, std::memory_order_acquire)) {
@@ -521,6 +611,10 @@ struct System::Impl {
           if (cannonVoice[v].active) cannonVoice[v].render(sr, cannonDry, cannonSend);
         float cannon = cannonDry * 0.5f + cannonReverb.process(cannonSend * 0.5f) * 0.85f;
         cannon = std::tanh(cannon * 1.4f) / 1.4f;   // the client's cannon-bus limiter
+        // Demasting cracks.
+        float mastCrack = 0.0f;
+        for (int v = 0; v < kMastCrack; ++v)
+          if (mastCrackVoice[v].active) mastCrack += mastCrackVoice[v].render(sr);
         // Water-impact splashes.
         float splash = 0.0f;
         for (int v = 0; v < kSplash; ++v)
@@ -532,7 +626,7 @@ struct System::Impl {
           musicPlayhead += 1.0 / (double)sr;
         }
 
-        float s = (bed + rain + thunder + cannon + splash) * sMaster.value + music;
+        float s = (bed + rain + thunder + cannon + mastCrack + splash) * sMaster.value + music;
         s = std::tanh(s * 1.2f) / 1.2f;   // gentle safety limiter
         out[(done + i) * 2 + 0] = s;
         out[(done + i) * 2 + 1] = s;
@@ -671,6 +765,34 @@ void System::playCannon(float vol) {
   d.subF0 = rnd(52.0f, 60.0f);
   impl->cannonDesc[slot] = d;
   impl->cannonState[slot].store(1, std::memory_order_release);
+}
+
+// Demasting crack (mast-crack.service): groan + 8 tapering cracks + final crash.
+void System::playMastCrack(float vol) {
+  if (!impl) return;
+  vol = std::max(0.0f, std::min(1.0f, vol));
+  if (vol < 0.01f) return;
+  int slot = -1;
+  for (int v = 0; v < Impl::kMastCrack; ++v)
+    if (impl->mastCrackState[v].load(std::memory_order_relaxed) == 0) { slot = v; break; }
+  if (slot < 0) return;
+  auto rnd = [](float a, float b) { return a + (float)std::rand() / RAND_MAX * (b - a); };
+  MastCrackDesc d;
+  d.vol = vol;
+  static const float base[8] = { 0.0f, 0.16f, 0.4f, 0.72f, 1.08f, 1.45f, 1.9f, 2.25f };
+  for (int i = 0; i < 8; ++i) {
+    float jit = rnd(-0.06f, 0.06f);
+    d.t[i] = std::max(0.0f, base[i] + (i == 0 ? 0.0f : jit));
+    d.inten[i] = i == 0 ? 1.0f : std::max(0.25f, 0.9f - i * 0.07f + rnd(-0.1f, 0.1f));
+    d.bpF[i] = rnd(220.0f, 970.0f);
+    d.bpQ[i] = rnd(1.4f, 4.4f);
+    d.thudF0[i] = rnd(110.0f - 70.0f, 110.0f + 70.0f);
+  }
+  d.t[8] = 2.5f; d.inten[8] = 1.15f;             // the heavier final crash
+  d.bpF[8] = rnd(220.0f, 600.0f); d.bpQ[8] = 2.0f; d.thudF0[8] = rnd(70.0f, 110.0f);
+  d.n = 9;
+  impl->mastCrackDesc[slot] = d;
+  impl->mastCrackState[slot].store(1, std::memory_order_release);
 }
 
 // Water-impact splash chirp + wet noise. vol 0..1.

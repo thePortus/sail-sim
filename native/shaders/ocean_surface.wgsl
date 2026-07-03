@@ -13,6 +13,11 @@ struct Camera {
     tbounds  : vec4<f32>,   // terrain heightfield world bounds: minX, maxX, minZ, maxZ
     tmisc    : vec4<f32>,   // x,y = heightfield texel size; z = field ready; w = see-depth (m)
     proj     : vec4<f32>,   // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
+    cloud0   : vec4<f32>,   // x = coverage, y = cloud type, z = slab base (m), w = slab top (m)
+    cloud1   : vec4<f32>,   // x,y = weather drift; zw unused
+    shadow0  : mat4x4<f32>, // world -> sun-shadow clip, tight ship cascade
+    shadow1  : mat4x4<f32>, // world -> sun-shadow clip, wide landscape cascade
+    shadowP  : vec4<f32>,   // x = enabled, y = bias 0, z = bias 1, w unused
 };
 @group(0) @binding(0)  var<uniform> cam : Camera;
 @group(0) @binding(11) var reflTex : texture_2d<f32>;   // planar reflection RTT
@@ -28,6 +33,30 @@ struct Camera {
 @group(0) @binding(10) var samp   : sampler;
 @group(0) @binding(12) var terrainH : texture_2d<f32>;   // R32F signed elevation (shallows)
 @group(0) @binding(13) var sceneDepth : texture_depth_2d;   // pre-ocean depth snapshot
+@group(0) @binding(14) var weatherT : texture_2d<f32>;      // cloud weather map (R8, tiling)
+@group(0) @binding(15) var shadowT0 : texture_depth_2d;     // sun shadow, ship cascade
+@group(0) @binding(16) var shadowT1 : texture_depth_2d;     // sun shadow, landscape cascade
+@group(0) @binding(17) var shadowS : sampler_comparison;
+
+// Sun visibility from the shadow cascades: prefer the tight ship cascade when
+// the point lands inside it (hull/rigging shadows on the water), else the wide
+// one (island shadows). Out of both maps = lit.
+fn sunShadowW(worldPos : vec3<f32>) -> f32 {
+    if (cam.shadowP.x < 0.5) { return 1.0; }
+    let sp0 = cam.shadow0 * vec4<f32>(worldPos, 1.0);
+    let uv0 = vec2<f32>(sp0.x * 0.5 + 0.5, 0.5 - sp0.y * 0.5);
+    if (uv0.x > 0.01 && uv0.x < 0.99 && uv0.y > 0.01 && uv0.y < 0.99 &&
+        sp0.z > 0.0 && sp0.z < 1.0) {
+        return textureSampleCompareLevel(shadowT0, shadowS, uv0, sp0.z - cam.shadowP.y);
+    }
+    let sp1 = cam.shadow1 * vec4<f32>(worldPos, 1.0);
+    let uv1 = vec2<f32>(sp1.x * 0.5 + 0.5, 0.5 - sp1.y * 0.5);
+    if (uv1.x > 0.005 && uv1.x < 0.995 && uv1.y > 0.005 && uv1.y < 0.995 &&
+        sp1.z > 0.0 && sp1.z < 1.0) {
+        return textureSampleCompareLevel(shadowT1, shadowS, uv1, sp1.z - cam.shadowP.z);
+    }
+    return 1.0;
+}
 
 // Material constants (from ocean-material.ts).
 const _Color       = vec3<f32>(0.015, 0.090, 0.130);
@@ -153,6 +182,28 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let V = normalize(cam.eye.xyz - in.worldPos);
     let L = normalize(cam.sun.xyz);   // sun by day, moon by night
 
+    // ── Cloud shadows: project this point along the light up to the cloud slab
+    //    and evaluate the SAME 2-D weather coverage the volumetric raymarch
+    //    shades with (vc_getDensity's largeWeather x coverage-threshold terms) —
+    //    the water darkens exactly under the clouds you see. ──
+    var cloudShadow = 1.0;
+    if (cam.cloud0.x > 0.02 && L.y > 0.05) {
+        let mid = mix(cam.cloud0.z, cam.cloud0.w, 0.35);
+        let pc = in.worldPos + L * ((mid - in.worldPos.y) / L.y);
+        let pzx = pc.zx + cam.cloud1.yx;
+        let storm = smoothstep(0.40, 0.95, cam.cloud0.y);
+        let largeW = clamp((textureSampleLevel(weatherT, samp, -0.00005 * pzx, 0.0).r - 0.18) * 5.0, 0.0, 2.0);
+        let covThresh = 0.28 - (cam.cloud0.x - 0.5) * 0.5 - storm * 0.05;
+        let weather = largeW * max(0.0, textureSampleLevel(weatherT, samp, 0.0002 * pzx, 0.0).r - covThresh) / 0.72;
+        // Optical depth ~ 2-D density x slab thickness; the floor keeps full
+        // shadow at "overcast sky", not "eclipse".
+        let od = weather * mix(0.20, 0.32, storm) * 22.0;
+        cloudShadow = max(exp(-od), 0.30);
+    }
+    // Geometry shadows (ship hull/rigging up close, islands at range) combine
+    // with the cloud shadows into one direct-sun visibility factor.
+    let sunVis = cloudShadow * sunShadowW(in.worldPos);
+
     // Foam from summed turbulence (Jacobian): folds/breaks read white.
     let foamChop = 1.0 - _Choppiness * 0.32;
     var jacobian = textureSample(turb0, samp, uv0).x
@@ -166,7 +217,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // normalize(0) is NaN — which painted whole wave facets as black polygons.
     let hv = -N + L;
     let H = hv / max(length(hv), 1e-4);
-    let viewDotH = pow5(clamp(dot(V, -H), 0.0, 1.0)) * 30.0 * _SSSStrength * sunUp;
+    let viewDotH = pow5(clamp(dot(V, -H), 0.0, 1.0)) * 30.0 * _SSSStrength * sunUp * sunVis;
     let sssW = max(in.height - _SSSBase, 0.0) / _SSSScale;
     let color = clamp(_Color + _SSSColor * viewDotH * sssW, vec3<f32>(0.0), vec3<f32>(1.0));
 
@@ -225,11 +276,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // normalize(0) is NaN — the black-wedge artifact (view-dependent).
     let hs2 = V + L;
     let Hs = hs2 / max(length(hs2), 1e-4);
-    waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2 * reflCut;
+    waterCol += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, Hs), 0.0), 300.0) * 1.2 * reflCut * sunVis;
 
-    // Composite foam (lit white) over water.
-    let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0));
+    // Composite foam (lit white) over water. Both take the cloud shadow on their
+    // direct-sun term; the body keeps most of its (ambient sky) light.
+    let foamLit = vec3<f32>(1.0) * (0.55 + 0.45 * max(dot(N, L), 0.0) * sunVis);
     var outColor = mix(waterCol, foamLit, jacobian);   // sRGB target does gamma
+    outColor = outColor * mix(0.80, 1.0, sunVis);
     // Day/night: darken and cool the sea toward night. The planar reflection (sky +
     // ship in reflTex) is already dark at night, so this only crushes the deep-water
     // body + glint; the surface still catches the moon and its reflection.

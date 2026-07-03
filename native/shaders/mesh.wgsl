@@ -28,6 +28,61 @@ struct Palette {
 @group(0) @binding(7) var<storage, read> morphDeltas : array<f32>;
 @group(0) @binding(8) var<storage, read> morphTable : array<vec2<u32>>;
 
+// ── Sun shadow (cascade 0: a tight orthographic box around the player vessel).
+//    vs_shadow renders the casters into the depth-only map (layout binds just the
+//    uniform); fs_main compares against it so masts, rigging and sails shadow the
+//    deck. ──
+struct ShadowU {
+    vp     : mat4x4<f32>,   // world -> shadow clip
+    params : vec4<f32>,     // x = enabled, y = depth bias, z = texel size (uv), w unused
+};
+@group(1) @binding(0) var<uniform> shadowU : ShadowU;
+@group(1) @binding(1) var shadowT : texture_depth_2d;
+@group(1) @binding(2) var shadowS : sampler_comparison;
+
+// Morph + skin a vertex to model-local space (shared by both vertex entries).
+fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec4<f32>) -> vec4<f32> {
+    var p = inPos;
+    for (var mi = 0u; mi < subInfo.x; mi = mi + 1u) {
+        let e = morphTable[subInfo.y + mi];
+        let wgt = pal.w[e.y >> 2u][e.y & 3u];
+        if (wgt > 0.0001) {
+            let di = (e.x + (vid - subInfo.z)) * 3u;
+            p += vec3<f32>(morphDeltas[di], morphDeltas[di + 1u], morphDeltas[di + 2u]) * wgt;
+        }
+    }
+    let skinM = inWeights.x * pal.m[u32(inJoints.x)] + inWeights.y * pal.m[u32(inJoints.y)]
+              + inWeights.z * pal.m[u32(inJoints.z)] + inWeights.w * pal.m[u32(inJoints.w)];
+    return skinM * vec4<f32>(p, 1.0);
+}
+
+@vertex
+fn vs_shadow(@builtin(vertex_index) vid : u32,
+             @location(0) inPos     : vec3<f32>,
+             @location(5) inJoints  : vec4<f32>,
+             @location(6) inWeights : vec4<f32>) -> @builtin(position) vec4<f32> {
+    return shadowU.vp * (u.model * skinLocal(vid, inPos, inJoints, inWeights));
+}
+
+// 3x3 PCF visibility at a world point. Geometric-normal offset + a small constant
+// bias fight acne on the sunlit deck; out-of-map points count as lit.
+fn sunShadow(worldPos : vec3<f32>, N : vec3<f32>) -> f32 {
+    if (shadowU.params.x < 0.5) { return 1.0; }
+    let sp = shadowU.vp * vec4<f32>(worldPos + N * 0.05, 1.0);
+    let uv = vec2<f32>(sp.x * 0.5 + 0.5, 0.5 - sp.y * 0.5);
+    if (uv.x <= 0.001 || uv.x >= 0.999 || uv.y <= 0.001 || uv.y >= 0.999 ||
+        sp.z <= 0.0 || sp.z >= 1.0) { return 1.0; }
+    let cmpZ = sp.z - shadowU.params.y;
+    let px = shadowU.params.z;
+    var s = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            s += textureSampleCompareLevel(shadowT, shadowS, uv + vec2<f32>(f32(dx), f32(dy)) * px, cmpZ);
+        }
+    }
+    return s / 9.0;
+}
+
 struct VSOut {
     @builtin(position) position : vec4<f32>,
     @location(0)       worldPos : vec3<f32>,
@@ -46,19 +101,10 @@ fn vs_main(@builtin(vertex_index) vid : u32,
            @location(4) inMR      : vec2<f32>,
            @location(5) inJoints  : vec4<f32>,
            @location(6) inWeights : vec4<f32>) -> VSOut {
-    // Morph targets (sail furl etc.): position deltas applied pre-skin.
-    var p = inPos;
-    for (var mi = 0u; mi < subInfo.x; mi = mi + 1u) {
-        let e = morphTable[subInfo.y + mi];
-        let wgt = pal.w[e.y >> 2u][e.y & 3u];
-        if (wgt > 0.0001) {
-            let di = (e.x + (vid - subInfo.z)) * 3u;
-            p += vec3<f32>(morphDeltas[di], morphDeltas[di + 1u], morphDeltas[di + 2u]) * wgt;
-        }
-    }
+    // Morph targets (sail furl etc.) + skinning, shared with vs_shadow.
+    let lp = skinLocal(vid, inPos, inJoints, inWeights);
     let skinM = inWeights.x * pal.m[u32(inJoints.x)] + inWeights.y * pal.m[u32(inJoints.y)]
               + inWeights.z * pal.m[u32(inJoints.z)] + inWeights.w * pal.m[u32(inJoints.w)];
-    let lp = skinM * vec4<f32>(p, 1.0);
     let ln = skinM * vec4<f32>(inNormal, 0.0);
     var out : VSOut;
     out.position = u.mvp * lp;
@@ -141,7 +187,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
     let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
     let NdotL = max(dot(N, L), 0.0);
-    let Lo = (kD * albedo / PI + specular) * radiance * NdotL;
+    // Cascade-0 sun shadow gates the DIRECT light only (rigging/mast/sail
+    // shadows on the deck); ambient sky light is unaffected.
+    let shadow = sunShadow(in.worldPos, Ngeom);
+    let Lo = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
 
     let ambient = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
     var color = ambient + Lo;

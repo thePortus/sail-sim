@@ -205,6 +205,7 @@ static constexpr uint32_t kPaletteStride = kMaxPaletteSlots * sizeof(glm::mat4) 
 
 struct Mesh {
   WGPURenderPipeline           pipeline;
+  WGPURenderPipeline           shadowPipeline = nullptr;   // vs_shadow, depth-only cascade draw
   WGPUBuffer                   vbuf, ibuf, uniformBuf;
   WGPUBuffer                   paletteBuf;   // per-instance palette+morph slots (kPaletteStride each)
   WGPUBuffer                   morphDeltaBuf, morphTableBuf, submeshInfoBuf;   // static morph data
@@ -344,6 +345,87 @@ fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
   return hs;
 }
 
+// ── Sun shadow map: two orthographic cascades rendered from the light. Cascade 0
+//    is a tight box around the player vessel (crisp mast/rigging shadows on the
+//    deck, hull shadow on the water); cascade 1 is a wide box for the landscape's
+//    shadows on the sea. Casters: ships (vs_shadow, full morph+skin path) and the
+//    terrain near grid. Receivers: mesh.wgsl (cascade 0) + ocean_surface.wgsl. ──
+struct ShadowUniform { glm::mat4 vp; glm::vec4 params; };   // params: x=enabled, y=bias, z=texel (uv), w=pad
+struct SunShadow {
+  WGPUTexture tex0 = nullptr, tex1 = nullptr;
+  WGPUTextureView view0 = nullptr, view1 = nullptr;
+  WGPUBuffer castU0 = nullptr, castU1 = nullptr, recvU = nullptr;
+  WGPUBindGroupLayout castBGL = nullptr, recvBGL = nullptr;
+  WGPUBindGroup castBG0 = nullptr, castBG1 = nullptr, recvBG = nullptr;
+  WGPUSampler cmp = nullptr;
+};
+static const uint32_t kShadowRes = 2048;
+static const WGPUTextureFormat kShadowFormat = WGPUTextureFormat_Depth32Float;
+static SunShadow& sunShadow(WGPUDevice device) {
+  static SunShadow s;
+  if (s.tex0) return s;
+  auto mkTex = [&](WGPUTexture& tex, WGPUTextureView& view) {
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    td.dimension = WGPUTextureDimension_2D;
+    td.size = { kShadowRes, kShadowRes, 1 };
+    td.format = kShadowFormat; td.mipLevelCount = 1; td.sampleCount = 1;
+    tex = wgpuDeviceCreateTexture(device, &td);
+    view = wgpuTextureCreateView(tex, nullptr);
+  };
+  mkTex(s.tex0, s.view0);
+  mkTex(s.tex1, s.view1);
+  WGPUBufferDescriptor bd = {};
+  bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; bd.size = sizeof(ShadowUniform);
+  s.castU0 = wgpuDeviceCreateBuffer(device, &bd);
+  s.castU1 = wgpuDeviceCreateBuffer(device, &bd);
+  s.recvU  = wgpuDeviceCreateBuffer(device, &bd);
+  WGPUSamplerDescriptor sd = {};
+  sd.addressModeU = WGPUAddressMode_ClampToEdge; sd.addressModeV = WGPUAddressMode_ClampToEdge;
+  sd.addressModeW = WGPUAddressMode_ClampToEdge;
+  sd.magFilter = WGPUFilterMode_Linear; sd.minFilter = WGPUFilterMode_Linear;
+  sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+  sd.lodMinClamp = 0.0f; sd.lodMaxClamp = 1.0f; sd.maxAnisotropy = 1;
+  sd.compare = WGPUCompareFunction_LessEqual;   // PCF comparison sampler
+  s.cmp = wgpuDeviceCreateSampler(device, &sd);
+  {
+    WGPUBindGroupLayoutEntry e = {};
+    e.binding = 0; e.visibility = WGPUShaderStage_Vertex;
+    e.buffer.type = WGPUBufferBindingType_Uniform; e.buffer.minBindingSize = sizeof(ShadowUniform);
+    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 1; d.entries = &e;
+    s.castBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
+  }
+  {
+    WGPUBindGroupLayoutEntry e[3] = {};
+    e[0].binding = 0; e[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+    e[0].buffer.type = WGPUBufferBindingType_Uniform; e[0].buffer.minBindingSize = sizeof(ShadowUniform);
+    e[1].binding = 1; e[1].visibility = WGPUShaderStage_Fragment;
+    e[1].texture.sampleType = WGPUTextureSampleType_Depth;
+    e[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    e[2].binding = 2; e[2].visibility = WGPUShaderStage_Fragment;
+    e[2].sampler.type = WGPUSamplerBindingType_Comparison;
+    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 3; d.entries = e;
+    s.recvBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
+  }
+  auto mkCastBG = [&](WGPUBuffer buf) {
+    WGPUBindGroupEntry e = {};
+    e.binding = 0; e.buffer = buf; e.size = sizeof(ShadowUniform);
+    WGPUBindGroupDescriptor d = {}; d.layout = s.castBGL; d.entryCount = 1; d.entries = &e;
+    return wgpuDeviceCreateBindGroup(device, &d);
+  };
+  s.castBG0 = mkCastBG(s.castU0);
+  s.castBG1 = mkCastBG(s.castU1);
+  {
+    WGPUBindGroupEntry e[3] = {};
+    e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
+    e[1].binding = 1; e[1].textureView = s.view0;
+    e[2].binding = 2; e[2].sampler = s.cmp;
+    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 3; d.entries = e;
+    s.recvBG = wgpuDeviceCreateBindGroup(device, &d);
+  }
+  return s;
+}
+
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, RiggedData data) {
   Mesh mesh;
   mesh.submeshes = data.submeshes;
@@ -472,8 +554,12 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   bgld.entryCount = 9; bgld.entries = ble;
   WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &bgld);
 
+  // Group 1 = sun shadow: the main pipeline binds the receive set (map + PCF
+  // comparator), the caster pipeline binds just the cascade matrix.
+  SunShadow& shadow = sunShadow(device);
+  WGPUBindGroupLayout mainBGLs[2] = { bgl, shadow.recvBGL };
   WGPUPipelineLayoutDescriptor pld = {};
-  pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &bgl;
+  pld.bindGroupLayoutCount = 2; pld.bindGroupLayouts = mainBGLs;
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 
   WGPUVertexAttribute attrs[7] = {};
@@ -521,6 +607,34 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   rpd.fragment = &frag;
   mesh.pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
   wgpuPipelineLayoutRelease(pl);
+
+  // Shadow-caster pipeline: vs_shadow (same morph+skin path), no fragment stage,
+  // depth-only into the Depth32Float cascade map.
+  {
+    WGPUBindGroupLayout castBGLs[2] = { bgl, shadow.castBGL };
+    WGPUPipelineLayoutDescriptor spld = {};
+    spld.bindGroupLayoutCount = 2; spld.bindGroupLayouts = castBGLs;
+    WGPUPipelineLayout spl = wgpuDeviceCreatePipelineLayout(device, &spld);
+    WGPUDepthStencilState sds = {};
+    sds.format = kShadowFormat;
+    sds.depthWriteEnabled = true;
+    sds.depthCompare = WGPUCompareFunction_Less;
+    sds.stencilFront.compare = WGPUCompareFunction_Always;
+    sds.stencilBack.compare = WGPUCompareFunction_Always;
+    sds.stencilReadMask = 0xFFFFFFFFu; sds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPURenderPipelineDescriptor srpd = {};
+    srpd.layout = spl;
+    srpd.vertex.module = mesh.module;
+    srpd.vertex.entryPoint = "vs_shadow";
+    srpd.vertex.bufferCount = 1; srpd.vertex.buffers = &vbl;
+    srpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    srpd.primitive.frontFace = WGPUFrontFace_CCW;
+    srpd.primitive.cullMode = WGPUCullMode_None;   // sails are single-sided
+    srpd.depthStencil = &sds;
+    srpd.multisample.count = 1; srpd.multisample.mask = 0xFFFFFFFFu;
+    mesh.shadowPipeline = wgpuDeviceCreateRenderPipeline(device, &srpd);
+    wgpuPipelineLayoutRelease(spl);
+  }
 
   // linear, repeating sampler
   WGPUSamplerDescriptor sd = {};
@@ -659,6 +773,11 @@ struct OceanCamera {
   glm::vec4 tbounds;  // terrain heightfield world bounds: minX, maxX, minZ, maxZ
   glm::vec4 tmisc;    // x,y = heightfield texel size; z = field ready; w = see-depth (m)
   glm::vec4 proj;     // x = proj[0][0], y = proj[1][1], z = proj[2][2], w = proj[3][2]
+  glm::vec4 cloud0;   // x = coverage, y = cloud type, z = slab base (m), w = slab top (m)
+  glm::vec4 cloud1;   // x,y = weather drift (worldZX offset); zw unused
+  glm::mat4 shadow0;  // world -> sun-shadow clip, tight ship cascade
+  glm::mat4 shadow1;  // world -> sun-shadow clip, wide landscape cascade
+  glm::vec4 shadowP;  // x = enabled, y = bias 0, z = bias 1, w unused
 };
 
 // A colour render target (planar reflection).
@@ -866,8 +985,9 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   // Explicit bind group layout (auto-layout misrouted binding 11): uniform (0),
   // 9 cascade textures (1-9), sampler (10), reflection (11), terrain height (12,
   // R32F unfilterable — drives the coastal-shallows transparency), pre-ocean
-  // scene depth snapshot (13 — drives the underwater see-through alpha).
-  WGPUBindGroupLayoutEntry be[14] = {};
+  // scene depth snapshot (13 — drives the underwater see-through alpha), cloud
+  // weather map (14 — drives the cloud shadows).
+  WGPUBindGroupLayoutEntry be[18] = {};
   be[0].binding = 0; be[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   be[0].buffer.type = WGPUBufferBindingType_Uniform;
   for (int i = 1; i <= 9; ++i) {
@@ -886,7 +1006,18 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   be[13].binding = 13; be[13].visibility = WGPUShaderStage_Fragment;
   be[13].texture.sampleType = WGPUTextureSampleType_Depth;               // pre-ocean depth snapshot
   be[13].texture.viewDimension = WGPUTextureViewDimension_2D;
-  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 14; bld.entries = be;
+  be[14].binding = 14; be[14].visibility = WGPUShaderStage_Fragment;
+  be[14].texture.sampleType = WGPUTextureSampleType_Float;               // cloud weather map (R8)
+  be[14].texture.viewDimension = WGPUTextureViewDimension_2D;
+  be[15].binding = 15; be[15].visibility = WGPUShaderStage_Fragment;
+  be[15].texture.sampleType = WGPUTextureSampleType_Depth;               // sun shadow cascade 0 (ship)
+  be[15].texture.viewDimension = WGPUTextureViewDimension_2D;
+  be[16].binding = 16; be[16].visibility = WGPUShaderStage_Fragment;
+  be[16].texture.sampleType = WGPUTextureSampleType_Depth;               // sun shadow cascade 1 (landscape)
+  be[16].texture.viewDimension = WGPUTextureViewDimension_2D;
+  be[17].binding = 17; be[17].visibility = WGPUShaderStage_Fragment;
+  be[17].sampler.type = WGPUSamplerBindingType_Comparison;               // PCF comparator
+  WGPUBindGroupLayoutDescriptor bld = {}; bld.entryCount = 18; bld.entries = be;
   o.bgl = wgpuDeviceCreateBindGroupLayout(device, &bld);
   // Deep-water placeholder heightfield (-1000 m) until the real one arrives.
   {
@@ -1761,6 +1892,10 @@ struct TerrainRender {
   WGPUBuffer farVbuf = nullptr, farIbuf = nullptr, farUniformBuf = nullptr;
   WGPUBindGroup farBindGroup = nullptr;
   uint32_t farIndexCount = 0;
+  // Sun-shadow caster (near grid drawn into the wide cascade, depth-only).
+  WGPURenderPipeline shadowPipeline = nullptr;
+  WGPUBuffer shadowUbuf = nullptr;
+  WGPUBindGroup shadowBind = nullptr;
   // Biome skinning (Angular terrain.service port): splat map + 5 diffuse tiles +
   // 3 normal tiles. All slots point at a 1x1 placeholder until the async fetch
   // lands (the shader gates on extra.y), then the bind group is rebuilt.
@@ -1803,6 +1938,10 @@ static void rebuildTerrainBind(WGPUDevice device, TerrainRender& t) {
   if (t.farBindGroup) wgpuBindGroupRelease(t.farBindGroup);
   bge[0].buffer = t.farUniformBuf;
   t.farBindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
+  // Shadow caster: ditto, with the shadow view-proj uniform.
+  if (t.shadowBind) wgpuBindGroupRelease(t.shadowBind);
+  bge[0].buffer = t.shadowUbuf;
+  t.shadowBind = wgpuDeviceCreateBindGroup(device, &bgd);
 }
 
 static WGPUShaderModule makeWGSL(WGPUDevice device, const char* code) {
@@ -1919,6 +2058,27 @@ static TerrainRender createTerrainRender(WGPUDevice device, WGPUQueue queue, WGP
   rpd.depthStencil = &ds; rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu; rpd.fragment = &frag;
   t.pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
   wgpuPipelineLayoutRelease(pl);
+
+  // Depth-only shadow-caster variant (near grid into the wide sun cascade): same
+  // vertex displacement, no fragment stage, its own uniform (shadow view-proj).
+  {
+    WGPUBufferDescriptor sub = {}; sub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    sub.size = sizeof(TerrainU);
+    t.shadowUbuf = wgpuDeviceCreateBuffer(device, &sub);
+    WGPUPipelineLayoutDescriptor spld = {}; spld.bindGroupLayoutCount = 1; spld.bindGroupLayouts = &t.bgl;
+    WGPUPipelineLayout spl = wgpuDeviceCreatePipelineLayout(device, &spld);
+    WGPUDepthStencilState sds = {}; sds.format = kShadowFormat; sds.depthWriteEnabled = true;
+    sds.depthCompare = WGPUCompareFunction_Less;
+    sds.stencilFront.compare = WGPUCompareFunction_Always; sds.stencilBack.compare = WGPUCompareFunction_Always;
+    sds.stencilReadMask = 0xFFFFFFFFu; sds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPURenderPipelineDescriptor srpd = {}; srpd.layout = spl;
+    srpd.vertex.module = t.module; srpd.vertex.entryPoint = "vs_main"; srpd.vertex.bufferCount = 1; srpd.vertex.buffers = &vbl;
+    srpd.primitive.topology = WGPUPrimitiveTopology_TriangleList; srpd.primitive.frontFace = WGPUFrontFace_CCW;
+    srpd.primitive.cullMode = WGPUCullMode_None;
+    srpd.depthStencil = &sds; srpd.multisample.count = 1; srpd.multisample.mask = 0xFFFFFFFFu;
+    t.shadowPipeline = wgpuDeviceCreateRenderPipeline(device, &srpd);
+    wgpuPipelineLayoutRelease(spl);
+  }
   return t;
 }
 
@@ -2607,10 +2767,13 @@ int main(int argc, char** argv) {
   // surface fragment (Beer-Lambert see-through — hulls ghost through the water).
   WGPUTexture oceanDepthTex = makeDepthTexture(device, curW, curH);
   WGPUTextureView oceanDepthReadView = makeDepthReadView(oceanDepthTex);
-  // Planar reflection target (colour + its own depth).
-  WGPUTexture reflTex = makeColorRTT(device, curW, curH, kSceneFormat);
+  // Planar reflection target (colour + its own depth + a cloud-march buffer for
+  // mirrored clouds), at HALF resolution — the waves distort the mirror anyway,
+  // and half-res pays for the terrain + cloud draws it now carries.
+  uint32_t reflW = std::max(1u, curW / 2), reflH = std::max(1u, curH / 2);
+  WGPUTexture reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
   WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
-  WGPUTexture reflDepth = makeDepthTexture(device, curW, curH);
+  WGPUTexture reflDepth = makeDepthTexture(device, reflW, reflH);
   WGPUTextureView reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
   // Offscreen cloud buffer (RGBA16F): the ray march writes here, then the denoise
   // pass filters it onto the frame. Its bind group is rebuilt when it resizes.
@@ -2625,6 +2788,31 @@ int main(int argc, char** argv) {
     return wgpuDeviceCreateBindGroup(device, &d);
   };
   WGPUBindGroup denoiseBG = buildDenoiseBG();
+
+  // Mirror-cloud buffer + composite bind group (reflection-sized): the reflection
+  // pass ray-marches the clouds a second time through the mirrored camera and
+  // composites them onto reflTex with the same denoise pipeline.
+  WGPUTexture reflCloudTex = makeColorRTT(device, reflW, reflH, kCloudFormat);
+  WGPUTextureView reflCloudView = wgpuTextureCreateView(reflCloudTex, nullptr);
+  WGPUBuffer reflDenoiseU = nullptr;
+  {
+    WGPUBufferDescriptor bd = {}; bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; bd.size = 16;
+    reflDenoiseU = wgpuDeviceCreateBuffer(device, &bd);
+  }
+  auto writeReflDenoiseU = [&]() {
+    float dsz[4] = { (float)reflW, (float)reflH, 0.0f, 0.0f };
+    wgpuQueueWriteBuffer(queue, reflDenoiseU, 0, dsz, sizeof(dsz));
+  };
+  writeReflDenoiseU();
+  auto buildReflDenoiseBG = [&]() {
+    WGPUBindGroupEntry e[3] = {};
+    e[0].binding = 0; e[0].buffer = reflDenoiseU; e[0].size = 16;
+    e[1].binding = 1; e[1].textureView = reflCloudView;
+    e[2].binding = 2; e[2].sampler = clouds.cloudSamp;
+    WGPUBindGroupDescriptor d = {}; d.layout = clouds.denoiseBGL; d.entryCount = 3; d.entries = e;
+    return wgpuDeviceCreateBindGroup(device, &d);
+  };
+  WGPUBindGroup reflDenoiseBG = buildReflDenoiseBG();
 
   // God-ray occlusion mask (sun bright where sky shows, occluded by geometry), plus
   // a clamp sampler and the two-pass godray pipeline.
@@ -2802,12 +2990,19 @@ int main(int argc, char** argv) {
       wgpuTextureViewRelease(oceanDepthReadView); wgpuTextureRelease(oceanDepthTex);
       oceanDepthTex = makeDepthTexture(device, curW, curH);
       oceanDepthReadView = makeDepthReadView(oceanDepthTex);
+      reflW = std::max(1u, curW / 2); reflH = std::max(1u, curH / 2);
       wgpuTextureViewRelease(reflView);   wgpuTextureRelease(reflTex);
       wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
-      reflTex = makeColorRTT(device, curW, curH, kSceneFormat);
+      reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
       reflView = wgpuTextureCreateView(reflTex, nullptr);
-      reflDepth = makeDepthTexture(device, curW, curH);
+      reflDepth = makeDepthTexture(device, reflW, reflH);
       reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
+      wgpuTextureViewRelease(reflCloudView); wgpuTextureRelease(reflCloudTex);
+      reflCloudTex = makeColorRTT(device, reflW, reflH, kCloudFormat);
+      reflCloudView = wgpuTextureCreateView(reflCloudTex, nullptr);
+      writeReflDenoiseU();
+      wgpuBindGroupRelease(reflDenoiseBG);
+      reflDenoiseBG = buildReflDenoiseBG();
       wgpuTextureViewRelease(cloudView); wgpuTextureRelease(cloudTex);
       cloudTex = makeColorRTT(device, curW, curH, kCloudFormat);
       cloudView = wgpuTextureCreateView(cloudTex, nullptr);
@@ -4509,52 +4704,8 @@ int main(int argc, char** argv) {
     const glm::vec4 skyMoon(moonDir, moonFade);
     const glm::vec4 skyParams(starFade, starsReady ? 1.0f : 0.0f, moonReady ? 1.0f : 0.0f, 0.0f);
 
-    // ── Reflection pass: sky + ship through a mirror camera (reflected across y=0),
-    //    rendered into reflView. Queue-ordered uniform writes let one buffer serve
-    //    both passes. Skipped on the landing screen. ──
-    if (sailing) {
-      glm::mat4 mirror = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, -1.0f, 1.0f));
-      glm::mat4 reflVP = proj * viewM * mirror;
-      glm::vec3 reflEye(eye.x, -eye.y, eye.z);
-      SkyUniform rs{ glm::inverse(reflVP), glm::vec4(reflEye, 1.0f), glm::vec4(sun, 0.0f),
-                     skyMoon, skyParams };
-      wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
-      if (ownMesh) {
-        MeshUniforms rm{ reflVP * ships[0].model, ships[0].model, glm::vec4(reflEye, 1.0f),
-                         glm::vec4(lightDir, dayK), glm::vec4(ownMesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
-        wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
-      }
-
-      WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
-      WGPURenderPassColorAttachment rc = {};
-      rc.view = reflView; rc.loadOp = WGPULoadOp_Clear; rc.storeOp = WGPUStoreOp_Store;
-      rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
-      WGPURenderPassDepthStencilAttachment rd = {};
-      rd.view = reflDepthView; rd.depthLoadOp = WGPULoadOp_Clear; rd.depthStoreOp = WGPUStoreOp_Store; rd.depthClearValue = 1.0f;
-      rd.stencilLoadOp = WGPULoadOp_Clear; rd.stencilStoreOp = WGPUStoreOp_Discard;   // stencil unused here (format has it)
-      WGPURenderPassDescriptor rp_desc = {};
-      rp_desc.colorAttachmentCount = 1; rp_desc.colorAttachments = &rc; rp_desc.depthStencilAttachment = &rd;
-      WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(renc, &rp_desc);
-      wgpuRenderPassEncoderSetPipeline(rp, sky.pipeline);
-      wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
-      wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-      if (ownMesh) {
-        uint32_t zeroOffs[2] = { 0, 0 };   // instance slot 0: uniforms + palette
-        wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
-        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderSetIndexBuffer(rp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
-          wgpuRenderPassEncoderSetBindGroup(rp, 0, ownMesh->bindGroups[i], 2, zeroOffs);
-          wgpuRenderPassEncoderDrawIndexed(rp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
-        }
-      }
-      wgpuRenderPassEncoderEnd(rp);
-      wgpuRenderPassEncoderRelease(rp);
-      WGPUCommandBuffer rcmd = wgpuCommandEncoderFinish(renc, nullptr);
-      wgpuQueueSubmit(queue, 1, &rcmd);
-      wgpuCommandBufferRelease(rcmd);
-      wgpuCommandEncoderRelease(renc);
-    }
+    // (The reflection pass now runs AFTER the terrain/cloud uniforms are computed
+    //  below, so the mirror can draw the landscape and ray-march the clouds too.)
 
     // ── Main-pass uniforms ──
     glm::vec4 oceanParams(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), seaAmp);
@@ -4767,14 +4918,58 @@ int main(int argc, char** argv) {
       oceanTB = glm::vec4((float)otm.minX, (float)otm.maxX, (float)otm.minZ, (float)otm.maxZ);
       oceanTM = glm::vec4((float)otm.width, (float)otm.height, 1.0f, 10.0f);
     }
+    // ── Sun-shadow cascades: cascade 0 = a tight ortho box around the player
+    //    vessel (mast/rigging shadows on the deck + hull shadow on the water),
+    //    cascade 1 = a wide box for the landscape's shadows on the sea. Texel-
+    //    snapped so the shadows don't shimmer as the ship glides. ──
+    const bool shadowOn = sailing && lightDir.y > 0.08f && !std::getenv("SAILSIM_NOSHADOW");
+    glm::mat4 shadowVP0(1.0f), shadowVP1(1.0f);
+    const float kShadowBias0 = 0.0005f, kShadowBias1 = 0.0008f;
+    if (shadowOn) {
+      glm::vec3 Ld = glm::normalize(lightDir);
+      glm::vec3 sUp = std::fabs(Ld.y) > 0.97f ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
+      auto cascade = [&](glm::vec3 center, float ext, float nearP, float farP) {
+        glm::mat4 v = glm::lookAt(center + Ld * (farP * 0.45f), center, sUp);
+        glm::mat4 p = glm::ortho(-ext, ext, -ext, ext, nearP, farP);
+        glm::mat4 vp = p * v;
+        // Snap the world origin to shadow-map texels (stops crawling edges).
+        glm::vec4 o = vp * glm::vec4(0, 0, 0, 1);
+        const float halfRes = (float)kShadowRes * 0.5f;
+        glm::vec2 snap = (glm::round(glm::vec2(o) * halfRes) - glm::vec2(o) * halfRes) / halfRes;
+        return glm::translate(glm::mat4(1.0f), glm::vec3(snap, 0.0f)) * vp;
+      };
+      shadowVP0 = cascade(glm::vec3(shipX, 6.0f, shipZ), 48.0f, 5.0f, 400.0f);
+      shadowVP1 = cascade(glm::vec3(shipX, 0.0f, shipZ), 1700.0f, 10.0f, 6000.0f);
+      SunShadow& shdw = sunShadow(device);
+      ShadowUniform su0{ shadowVP0, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
+      ShadowUniform su1{ shadowVP1, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
+      ShadowUniform sur{ shadowVP0, glm::vec4(1.0f, kShadowBias0, 1.0f / (float)kShadowRes, 0.0f) };
+      wgpuQueueWriteBuffer(queue, shdw.castU0, 0, &su0, sizeof(su0));
+      wgpuQueueWriteBuffer(queue, shdw.castU1, 0, &su1, sizeof(su1));
+      wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &sur, sizeof(sur));
+    } else {
+      SunShadow& shdw = sunShadow(device);
+      ShadowUniform off{ glm::mat4(1.0f), glm::vec4(0.0f) };
+      wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &off, sizeof(off));
+    }
+    const glm::vec4 oceanShadowP(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1, 0.0f);
+
     const glm::vec4 oceanProj(proj[0][0], proj[1][1], proj[2][2], proj[3][2]);
+    // Cloud slab parameters (shared by the raymarch uniforms below and the
+    // ocean's cloud-shadow term — the shadows reuse the same weather coverage).
+    const float cloudCov  = std::pow(cloudiness, 1.8f);
+    const float cloudType = 0.40f + storminess * 0.55f;
+    const float cloudBase = 900.0f - storminess * 220.0f;
+    const float cloudTop  = cloudBase + (600.0f + storminess * 700.0f);
+    const glm::vec4 oceanCloud0(cloudCov, cloudType, cloudBase, cloudTop);
+    const glm::vec4 oceanCloud1(cloudDrift.x, cloudDrift.y, 0.0f, 0.0f);
     OceanCamera oc{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                     glm::vec4(seaAmp, 0.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
-                    oceanProj };
+                    oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
     wgpuQueueWriteBuffer(queue, ocean.uniformBuf, 0, &oc, sizeof(oc));
     OceanCamera ocFar{ viewProj, glm::vec4(eye, 1.0f), oceanParams, oceanScreen,
                        glm::vec4(0.0f, 1400.0f, precipIntensity, t), oceanSun, oceanTB, oceanTM,
-                       oceanProj };
+                       oceanProj, oceanCloud0, oceanCloud1, shadowVP0, shadowVP1, oceanShadowP };
     wgpuQueueWriteBuffer(queue, ocean.farUniformBuf, 0, &ocFar, sizeof(ocFar));
     SkyUniform sku{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sun, 0.0f),
                     skyMoon, skyParams };
@@ -4804,6 +4999,8 @@ int main(int argc, char** argv) {
                      glm::vec4(0.05f, 0.9f, 48.0f, inView) };
       wgpuQueueWriteBuffer(queue, godrays.blurUniform, 0, &gb, sizeof(gb));
     }
+    TerrainU tu{}, tf{};                       // hoisted: the reflection pass reuses them
+    bool terrUniformsLive = false;
     if (terrainR.ready) {
       const terrain::Manifest& tm = terr.manifest();
       // Snap the camera-following grid origin to whole grid cells: an unsnapped
@@ -4814,23 +5011,31 @@ int main(int argc, char** argv) {
       const float tCell = 2.0f * 4000.0f / 512.0f;   // grid span / resolution (createTerrainRender)
       float tox = std::floor(shipX / tCell) * tCell;
       float toz = std::floor(shipZ / tCell) * tCell;
-      TerrainU tu{ viewProj, glm::vec4(eye, 1.0f),
+      tu = TerrainU{ viewProj, glm::vec4(eye, 1.0f),
                    glm::vec4((float)tm.minX, (float)tm.maxX, (float)tm.minZ, (float)tm.maxZ),
                    glm::vec4((float)tm.width, (float)tm.height, tox, toz),
                    glm::vec4(lightDir, dayK),   // land lit by sun (day) / moon (night); w = daylight
                    glm::vec4(terrainR.peakH, terrainR.hasBiome ? 1.0f : 0.0f, 0.0f, 0.0f) };
+      terrUniformsLive = true;
       wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));
       // Far ring: its own cell snap (156 m) + a centre discard just inside the
       // near grid's span (slop covers the two grids' differing snap origins).
       const float fCell = 2.0f * 20000.0f / 256.0f;
-      TerrainU tf = tu;
+      tf = tu;
       tf.misc.z = std::floor(shipX / fCell) * fCell;
       tf.misc.w = std::floor(shipZ / fCell) * fCell;
       tf.extra.z = 3700.0f;
       wgpuQueueWriteBuffer(queue, terrainR.farUniformBuf, 0, &tf, sizeof(tf));
+      // Shadow caster: the same near grid seen from the sun (wide cascade).
+      if (shadowOn && terrainR.shadowUbuf) {
+        TerrainU ts = tu;
+        ts.viewProj = shadowVP1;
+        wgpuQueueWriteBuffer(queue, terrainR.shadowUbuf, 0, &ts, sizeof(ts));
+      }
     }
     // Clouds: integrate wind drift, derive time-of-day light, write uniforms. The
     // sun/sky/ground colour model + coverage/type mirror the client's cloud plugin.
+    CloudU cu{};                               // hoisted: the reflection pass reuses it
     {
       mp::WaveState wv = mpClient.wave();
       float windSpeed = wv.valid ? wv.windSpeed : 0.0f;
@@ -4840,11 +5045,10 @@ int main(int argc, char** argv) {
       // in both since moonDir = -sunDir); dayK cross-fades warm sun ↔ cool moon.
       glm::vec3 sd = glm::normalize(lightDir);
       float el = glm::max(0.0f, sd.y);
-      // Coverage/type/base from the eased weather state (client's cloud.service model).
-      float cov = std::pow(cloudiness, 1.8f);
-      float ctype = 0.40f + storminess * 0.55f;
-      float cloudBase = 900.0f - storminess * 220.0f;
-      float cloudTop = cloudBase + (600.0f + storminess * 700.0f);
+      // Coverage/type/base from the eased weather state (client's cloud.service
+      // model) — computed with the ocean uniforms above (shared cloud slab).
+      float cov = cloudCov;
+      float ctype = cloudType;
       // Bright enough that the sunlit cloud faces saturate to white (the tops SHOULD be
       // white); paired with the low ambient above, that gives strong white-top ↔
       // dark-shadow contrast rather than a flat blob.
@@ -4857,10 +5061,176 @@ int main(int argc, char** argv) {
       glm::vec3 dayGrnd(stormDim * (0.05f + 0.16f * el), stormDim * (0.07f + 0.20f * el), stormDim * (0.09f + 0.26f * el));
       glm::vec3 skyC  = glm::mix(stormDim * glm::vec3(0.03f, 0.045f, 0.075f), daySky,  dayK);
       glm::vec3 grndC = glm::mix(stormDim * glm::vec3(0.02f, 0.025f, 0.040f), dayGrnd, dayK);
-      CloudU cu{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sd, 0.0f),
+      cu = CloudU{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sd, 0.0f),
                  glm::vec4(sunCol, 0.0f), glm::vec4(skyC, 0.0f), glm::vec4(grndC, 0.0f),
                  glm::vec4(cloudBase, cloudTop, cov, ctype),
                  glm::vec4(t, cloudDrift.x, cloudDrift.y, 120000.0f) };
+      wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cu, sizeof(cu));
+    }
+
+    // ── Shadow-map passes: render the casters into the two sun cascades. Their
+    //    own submit, BEFORE the reflection pass (whose ship draw samples them).
+    //    Uses last frame's palettes/models (queue order) — invisible one-frame lag. ──
+    if (shadowOn) {
+      SunShadow& shdw = sunShadow(device);
+      WGPUCommandEncoder senc = wgpuDeviceCreateCommandEncoder(device, nullptr);
+      auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, bool withTerrain) {
+        WGPURenderPassDepthStencilAttachment da = {};
+        da.view = view;
+        da.depthLoadOp = WGPULoadOp_Clear; da.depthStoreOp = WGPUStoreOp_Store;
+        da.depthClearValue = 1.0f;   // Depth32Float: no stencil ops
+        WGPURenderPassDescriptor pd = {};
+        pd.colorAttachmentCount = 0; pd.depthStencilAttachment = &da;
+        WGPURenderPassEncoder sp = wgpuCommandEncoderBeginRenderPass(senc, &pd);
+        if (withTerrain && terrainR.ready && terrainR.shadowBind && terrainR.shadowPipeline) {
+          wgpuRenderPassEncoderSetPipeline(sp, terrainR.shadowPipeline);
+          wgpuRenderPassEncoderSetBindGroup(sp, 0, terrainR.shadowBind, 0, nullptr);
+          wgpuRenderPassEncoderSetVertexBuffer(sp, 0, terrainR.vbuf, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderSetIndexBuffer(sp, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderDrawIndexed(sp, terrainR.indexCount, 1, 0, 0, 0);
+        }
+        std::map<Mesh*, uint32_t> slot;
+        for (const ShipInst& s : ships) {
+          Mesh* m = s.mesh;
+          uint32_t idx = slot[m];
+          if (idx >= kMaxShipInstances) continue;
+          slot[m] = idx + 1;
+          if (!m->shadowPipeline) continue;
+          uint32_t dynOffs[2] = { idx * m->uniformStride, idx * kPaletteStride };
+          wgpuRenderPassEncoderSetPipeline(sp, m->shadowPipeline);
+          wgpuRenderPassEncoderSetBindGroup(sp, 1, castBG, 0, nullptr);
+          wgpuRenderPassEncoderSetVertexBuffer(sp, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderSetIndexBuffer(sp, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+          for (size_t i = 0; i < m->submeshes.size(); ++i) {
+            const RigSubmesh& sm = m->submeshes[i];
+            wgpuRenderPassEncoderSetBindGroup(sp, 0, m->bindGroups[i], 2, dynOffs);
+            wgpuRenderPassEncoderDrawIndexed(sp, sm.indexCount, 1, sm.indexOffset, 0, 0);
+          }
+        }
+        wgpuRenderPassEncoderEnd(sp);
+        wgpuRenderPassEncoderRelease(sp);
+      };
+      shadowPass(shdw.view0, shdw.castBG0, false);   // tight ship cascade
+      shadowPass(shdw.view1, shdw.castBG1, true);    // wide landscape cascade
+      WGPUCommandBuffer scmd = wgpuCommandEncoderFinish(senc, nullptr);
+      wgpuQueueSubmit(queue, 1, &scmd);
+      wgpuCommandBufferRelease(scmd);
+      wgpuCommandEncoderRelease(senc);
+    }
+
+    // ── Reflection pass: sky + terrain + ship + clouds through a mirror camera
+    //    (reflected across y=0) into the half-res reflView. The mirror re-writes
+    //    the sky/terrain/cloud uniform buffers, encodes + SUBMITS its own command
+    //    buffer, then the main-camera values are written back — queue ordering
+    //    makes one buffer serve both passes. Skipped on the landing screen. ──
+    if (sailing) {
+      glm::mat4 mirror = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, -1.0f, 1.0f));
+      glm::mat4 reflVP = proj * viewM * mirror;
+      glm::vec3 reflEye(eye.x, -eye.y, eye.z);
+      SkyUniform rs{ glm::inverse(reflVP), glm::vec4(reflEye, 1.0f), glm::vec4(sun, 0.0f),
+                     skyMoon, skyParams };
+      wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
+      if (ownMesh) {
+        MeshUniforms rm{ reflVP * ships[0].model, ships[0].model, glm::vec4(reflEye, 1.0f),
+                         glm::vec4(lightDir, dayK), glm::vec4(ownMesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
+        wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
+      }
+      if (terrUniformsLive) {
+        TerrainU tuR = tu; tuR.viewProj = reflVP; tuR.eye = glm::vec4(reflEye, 1.0f);
+        TerrainU tfR = tf; tfR.viewProj = reflVP; tfR.eye = glm::vec4(reflEye, 1.0f);
+        wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tuR, sizeof(tuR));
+        wgpuQueueWriteBuffer(queue, terrainR.farUniformBuf, 0, &tfR, sizeof(tfR));
+      }
+      CloudU cuR = cu;
+      cuR.invViewProj = glm::inverse(reflVP);
+      cuR.camPos = glm::vec4(reflEye, 1.0f);
+      wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cuR, sizeof(cuR));
+
+      WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
+      {
+        // Mirror scene: sky, then the landscape (far ring + near grid), then the ship.
+        WGPURenderPassColorAttachment rc = {};
+        rc.view = reflView; rc.loadOp = WGPULoadOp_Clear; rc.storeOp = WGPUStoreOp_Store;
+        rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
+        WGPURenderPassDepthStencilAttachment rd = {};
+        rd.view = reflDepthView; rd.depthLoadOp = WGPULoadOp_Clear; rd.depthStoreOp = WGPUStoreOp_Store; rd.depthClearValue = 1.0f;
+        rd.stencilLoadOp = WGPULoadOp_Clear; rd.stencilStoreOp = WGPUStoreOp_Store;   // stencil unused here (format has it)
+        WGPURenderPassDescriptor rp_desc = {};
+        rp_desc.colorAttachmentCount = 1; rp_desc.colorAttachments = &rc; rp_desc.depthStencilAttachment = &rd;
+        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(renc, &rp_desc);
+        wgpuRenderPassEncoderSetPipeline(rp, sky.pipeline);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        if (terrainR.ready && terrUniformsLive) {
+          wgpuRenderPassEncoderSetPipeline(rp, terrainR.pipeline);
+          wgpuRenderPassEncoderSetBindGroup(rp, 0, terrainR.farBindGroup, 0, nullptr);
+          wgpuRenderPassEncoderSetVertexBuffer(rp, 0, terrainR.farVbuf, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderSetIndexBuffer(rp, terrainR.farIbuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderDrawIndexed(rp, terrainR.farIndexCount, 1, 0, 0, 0);
+          wgpuRenderPassEncoderSetBindGroup(rp, 0, terrainR.bindGroup, 0, nullptr);
+          wgpuRenderPassEncoderSetVertexBuffer(rp, 0, terrainR.vbuf, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderSetIndexBuffer(rp, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderDrawIndexed(rp, terrainR.indexCount, 1, 0, 0, 0);
+        }
+        if (ownMesh) {
+          uint32_t zeroOffs[2] = { 0, 0 };   // instance slot 0: uniforms + palette
+          wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
+          wgpuRenderPassEncoderSetBindGroup(rp, 1, sunShadow(device).recvBG, 0, nullptr);
+          wgpuRenderPassEncoderSetVertexBuffer(rp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
+          wgpuRenderPassEncoderSetIndexBuffer(rp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+          for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, ownMesh->bindGroups[i], 2, zeroOffs);
+            wgpuRenderPassEncoderDrawIndexed(rp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
+          }
+        }
+        wgpuRenderPassEncoderEnd(rp);
+        wgpuRenderPassEncoderRelease(rp);
+      }
+      {
+        // Mirror clouds: ray-march through the mirrored camera into the refl cloud
+        // buffer, depth-tested against the mirror scene (load, no write)...
+        WGPURenderPassColorAttachment ca = {};
+        ca.view = reflCloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
+        ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
+        WGPURenderPassDepthStencilAttachment da = {};
+        da.view = reflDepthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
+        da.stencilLoadOp = WGPULoadOp_Load; da.stencilStoreOp = WGPUStoreOp_Store;
+        WGPURenderPassDescriptor cpd = {};
+        cpd.colorAttachmentCount = 1; cpd.colorAttachments = &ca; cpd.depthStencilAttachment = &da;
+        WGPURenderPassEncoder cp = wgpuCommandEncoderBeginRenderPass(renc, &cpd);
+        wgpuRenderPassEncoderSetPipeline(cp, clouds.pipeline);
+        wgpuRenderPassEncoderSetBindGroup(cp, 0, clouds.bindGroup, 0, nullptr);
+        wgpuRenderPassEncoderDraw(cp, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(cp);
+        wgpuRenderPassEncoderRelease(cp);
+      }
+      {
+        // ...then denoise-composite them onto the mirror (premultiplied blend).
+        WGPURenderPassColorAttachment ca = {};
+        ca.view = reflView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
+        WGPURenderPassDepthStencilAttachment da = {};
+        da.view = reflDepthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
+        da.stencilLoadOp = WGPULoadOp_Load; da.stencilStoreOp = WGPUStoreOp_Store;
+        WGPURenderPassDescriptor fpd = {};
+        fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca; fpd.depthStencilAttachment = &da;
+        WGPURenderPassEncoder fp = wgpuCommandEncoderBeginRenderPass(renc, &fpd);
+        wgpuRenderPassEncoderSetPipeline(fp, clouds.denoisePipeline);
+        wgpuRenderPassEncoderSetBindGroup(fp, 0, reflDenoiseBG, 0, nullptr);
+        wgpuRenderPassEncoderDraw(fp, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(fp);
+        wgpuRenderPassEncoderRelease(fp);
+      }
+      WGPUCommandBuffer rcmd = wgpuCommandEncoderFinish(renc, nullptr);
+      wgpuQueueSubmit(queue, 1, &rcmd);
+      wgpuCommandBufferRelease(rcmd);
+      wgpuCommandEncoderRelease(renc);
+
+      // Write the main-camera values back (they apply to the main submit below).
+      wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &sku, sizeof(sku));
+      if (terrUniformsLive) {
+        wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tu, sizeof(tu));
+        wgpuQueueWriteBuffer(queue, terrainR.farUniformBuf, 0, &tf, sizeof(tf));
+      }
       wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cu, sizeof(cu));
     }
     // Vessel rig animation (Phase 1): drive the own ship's controller — trim
@@ -5070,6 +5440,7 @@ int main(int argc, char** argv) {
     // offset. Drawn BEFORE the ocean (like the scatter) so the submerged hull
     // stays in the framebuffer + depth snapshot and can ghost through the water.
     {
+      wgpuRenderPassEncoderSetBindGroup(pass, 1, sunShadow(device).recvBG, 0, nullptr);
       std::map<Mesh*, uint32_t> slot;
       for (const ShipInst& s : ships) {
         Mesh* m = s.mesh;
@@ -5134,7 +5505,7 @@ int main(int argc, char** argv) {
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
-    WGPUBindGroupEntry oe[14] = {};
+    WGPUBindGroupEntry oe[18] = {};
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
     oe[3].binding = 3;  oe[3].textureView  = c0.turbulence();
@@ -5149,11 +5520,18 @@ int main(int argc, char** argv) {
     oe[12].binding = 12; oe[12].textureView = (terrainR.ready && terrainR.heightView)
                                             ? terrainR.heightView : ocean.placeView;
     oe[13].binding = 13; oe[13].textureView = oceanDepthReadView;
+    oe[14].binding = 14; oe[14].textureView = clouds.weatherView;
+    {
+      SunShadow& shdw = sunShadow(device);
+      oe[15].binding = 15; oe[15].textureView = shdw.view0;
+      oe[16].binding = 16; oe[16].textureView = shdw.view1;
+      oe[17].binding = 17; oe[17].sampler = shdw.cmp;
+    }
     oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
-    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 14; obdF.entries = oe;
+    WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 18; obdF.entries = oe;
     oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
     oe[0].buffer = ocean.uniformBuf;
-    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 14; obd.entries = oe;
+    WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 18; obd.entries = oe;
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);

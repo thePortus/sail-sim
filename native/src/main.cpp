@@ -3442,6 +3442,34 @@ int main(int argc, char** argv) {
         dl->AddConvexPolyFilled(w.data(), (int)w.size(), IM_COL32(210, 70, 60, 70)); }
       dl->AddCircleFilled(c, R, IM_COL32(20, 34, 48, 160));
       dl->AddCircle(c, R, IM_COL32(150, 180, 205, 200), 48, 1.5f);
+      // Rotating compass card (client HUD): cardinal + intercardinal ticks and
+      // N/E/S/W labels spin with -heading so the bow always points up — the
+      // card shows which way the ship is heading. N is orange and longer; the
+      // labels stay upright as they travel the ring (like a real compass card).
+      {
+        const float s = R / 36.0f;                      // client viewBox ring r=36
+        auto cardPt = [&](float bearingDeg, float radius) {
+          float a = glm::radians(bearingDeg - headingDeg);
+          return ImVec2(c.x + radius * s * std::sin(a), c.y - radius * s * std::cos(a));
+        };
+        // Ticks: N 35->26 (orange, 2.5w), E 35->29, S 35->27, W 35->29.
+        dl->AddLine(cardPt(0, 35), cardPt(0, 26), IM_COL32(249, 115, 22, 255), 2.5f * s);
+        dl->AddLine(cardPt(90, 35), cardPt(90, 29), IM_COL32(255, 255, 255, 77), 1.0f * s);
+        dl->AddLine(cardPt(180, 35), cardPt(180, 27), IM_COL32(255, 255, 255, 77), 1.5f * s);
+        dl->AddLine(cardPt(270, 35), cardPt(270, 29), IM_COL32(255, 255, 255, 77), 1.0f * s);
+        for (int ic = 45; ic < 360; ic += 90)
+          dl->AddLine(cardPt((float)ic, 36), cardPt((float)ic, 32), IM_COL32(255, 255, 255, 46), 0.8f * s);
+        // Labels (counter-rotated = just positioned; ImGui text is upright).
+        auto cardLabel = [&](float bearingDeg, float radius, const char* txt, ImU32 col) {
+          ImVec2 lp = cardPt(bearingDeg, radius);
+          ImVec2 ts = ImGui::CalcTextSize(txt);
+          dl->AddText(ImVec2(lp.x - ts.x * 0.5f, lp.y - ts.y * 0.5f), col, txt);
+        };
+        cardLabel(0, 19, "N", IM_COL32(251, 146, 60, 255));
+        cardLabel(90, 20, "E", IM_COL32(255, 255, 255, 102));
+        cardLabel(180, 22, "S", IM_COL32(255, 255, 255, 102));
+        cardLabel(270, 20, "W", IM_COL32(255, 255, 255, 102));
+      }
       // Wind arrow: rim (FROM) -> toward centre (the way it blows).
       ImVec2 wt = dirAt(rel), wh(c.x + (wt.x - c.x) * 0.30f, c.y + (wt.y - c.y) * 0.30f);
       dl->AddLine(wt, wh, IM_COL32(90, 180, 240, 255), 3.0f);

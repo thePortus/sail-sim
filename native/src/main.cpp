@@ -5892,14 +5892,18 @@ int main(int argc, char** argv) {
       float bloomWeight = isNight ? 0.0f : std::max(0.0f, dayBloomW * (1.0f - nightBlend));
       // DOF (DepthOfFieldEffect port): focus tracks the camera->ship distance
       // (the client hardcoded its 8 m rig); the client optics (f/2.8, 85 mm,
-      // lens 50 mm) collapse to a far-field CoC of ~0.19.
+      // lens 50 mm) collapse to a far-field CoC of ~0.19. OFF on deck: the
+      // near-field CoC model over-blurs anything a metre or two from the eye,
+      // and in first-person the deck + rigging you're looking at sit right
+      // there — a soft foreground reads as broken, not cinematic.
       const float focusDist = camDist;
       const float cocK = 0.19f;
+      const float dofOn = (sailing && !firstPerson) ? 1.0f : 0.0f;
       glm::vec4 postU[6] = {
         { (float)curW, (float)curH, t, sailing ? precipIntensity : 0.0f },
         { exposure, contrast, bloomWeight, sailing ? 1.0f : 0.0f },
         { (isNight ? 4.0f : 12.0f) / 255.0f, isNight ? 0.0f : 1.0f, 0.40f, 0.08f },
-        { focusDist, cocK, 0.0f, sailing ? 1.0f : 0.0f },
+        { focusDist, cocK, 0.0f, dofOn },
         { proj[2][2], proj[3][2], sailing ? 1.0f : 0.0f, 0.0f },
         // Telescope lens: centre (uv), radius (0 = off; client RADIUS 0.255), zoom 5x.
         { teleCX, teleCY, (teleHeld && sailing) ? 0.255f : 0.0f, 5.0f },
@@ -5924,7 +5928,7 @@ int main(int argc, char** argv) {
       aoU.v[2] = { hw, hh, 0.0f, 1.0f };
       wgpuQueueWriteBuffer(queue, postFx.aoBlurVUbuf, 0, &aoU, sizeof(aoU));
       // DOF keeps its own 3-vec4 layout at offset 0 (its shader has no invView).
-      glm::vec4 dofU[3] = { aoPmat, { focusDist, cocK, 14.0f, sailing ? 1.0f : 0.0f },
+      glm::vec4 dofU[3] = { aoPmat, { focusDist, cocK, 14.0f, dofOn },
                             { hw, hh, 0.0f, 0.0f } };
       wgpuQueueWriteBuffer(queue, postFx.dofUbuf, 0, dofU, sizeof(dofU));
     }

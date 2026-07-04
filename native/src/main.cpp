@@ -6232,6 +6232,9 @@ int main(int argc, char** argv) {
             wgpuRenderPassEncoderDrawIndexed(sp, sm.indexCount, 1, sm.indexOffset, 0, 0);
           }
         }
+        // Near full-mesh palms/beeches into the WIDE cascade only (real tree
+        // shadows on land; the tight ship cascade skips them).
+        if (withTerrain) scatterSys.drawShadow(sp, shadowVP1, t);
         wgpuRenderPassEncoderEnd(sp);
         wgpuRenderPassEncoderRelease(sp);
       };

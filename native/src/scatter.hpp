@@ -52,6 +52,11 @@ public:
             const glm::vec3& eye, const glm::vec3& lightDir, float dayK,
             double timeSec, float windAmp);
 
+  // Cast the near full-mesh palms + beeches into a sun cascade (depth-only), so
+  // close trees throw real shadows on the ground the terrain now receives. Call
+  // in the shadow pass; uses the instance buffers packed by the last draw().
+  void drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec);
+
   // ── Gull-cry audio events (bird.service cryBurst / updateAmbientCalls) ──
   // update() queues cries at world positions (startled rafts burst 5-12 calls;
   // the nearest flock makes an occasional relaxed call). The caller drains them

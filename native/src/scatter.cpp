@@ -316,6 +316,11 @@ struct System::Impl {
   WGPURenderPipeline blobPipeline = nullptr;
   WGPUBuffer blobUbuf = nullptr;
   DrawSet blobSet;
+  // Depth-only caster: near full-mesh trees into the sun cascade (real shadows).
+  WGPURenderPipeline shadowPipeline = nullptr;
+  WGPUBindGroupLayout shadowBGL = nullptr;
+  WGPUBuffer shadowUbuf = nullptr;
+  WGPUBindGroup shadowBind = nullptr;
   int lastPX = INT32_MIN, lastPZ = INT32_MIN;
   float flushX = 1e9f, flushZ = 1e9f;   // camera pos of the last visible-set flush
 
@@ -583,6 +588,38 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   rpd.fragment = &frag;
   p->pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
   wgpuPipelineLayoutRelease(pl);
+
+  // Depth-only SHADOW caster: the near full-mesh trees drawn into the sun
+  // cascade so palms/beeches throw REAL shadows on the ground (the terrain now
+  // receives). Reuses vs_main (which only reads the uniform at binding 0 — no
+  // tex/samp), so a 1-binding layout suffices; no fragment stage.
+  {
+    WGPUBindGroupLayoutEntry sle = {};
+    sle.binding = 0; sle.visibility = WGPUShaderStage_Vertex;
+    sle.buffer.type = WGPUBufferBindingType_Uniform;
+    WGPUBindGroupLayoutDescriptor sbld = {}; sbld.entryCount = 1; sbld.entries = &sle;
+    p->shadowBGL = wgpuDeviceCreateBindGroupLayout(device, &sbld);
+    WGPUPipelineLayoutDescriptor spld = {}; spld.bindGroupLayoutCount = 1; spld.bindGroupLayouts = &p->shadowBGL;
+    WGPUPipelineLayout spl = wgpuDeviceCreatePipelineLayout(device, &spld);
+    WGPUDepthStencilState sds = {}; sds.format = WGPUTextureFormat_Depth32Float;
+    sds.depthWriteEnabled = true; sds.depthCompare = WGPUCompareFunction_Less;
+    sds.stencilFront.compare = WGPUCompareFunction_Always; sds.stencilBack.compare = WGPUCompareFunction_Always;
+    sds.stencilReadMask = 0xFFFFFFFFu; sds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPURenderPipelineDescriptor srpd = {}; srpd.layout = spl;
+    srpd.vertex.module = module; srpd.vertex.entryPoint = "vs_main";
+    srpd.vertex.bufferCount = 2; srpd.vertex.buffers = vbls;
+    srpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    srpd.primitive.cullMode = WGPUCullMode_None;
+    srpd.depthStencil = &sds; srpd.multisample.count = 1; srpd.multisample.mask = 0xFFFFFFFFu;
+    p->shadowPipeline = wgpuDeviceCreateRenderPipeline(device, &srpd);
+    wgpuPipelineLayoutRelease(spl);
+    WGPUBufferDescriptor sub = {}; sub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    sub.size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);   // LU layout
+    p->shadowUbuf = wgpuDeviceCreateBuffer(device, &sub);
+    WGPUBindGroupEntry sbe = {}; sbe.binding = 0; sbe.buffer = p->shadowUbuf; sbe.size = sub.size;
+    WGPUBindGroupDescriptor sbgd = {}; sbgd.layout = p->shadowBGL; sbgd.entryCount = 1; sbgd.entries = &sbe;
+    p->shadowBind = wgpuDeviceCreateBindGroup(device, &sbgd);
+  }
 
   WGPUSamplerDescriptor sd = {};
   sd.addressModeU = WGPUAddressMode_Repeat; sd.addressModeV = WGPUAddressMode_Repeat;
@@ -943,7 +980,8 @@ static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float s = 0.92f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.16f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
-  blobs.push_back(blobInst(px, y, pz, s * 2.6f));
+  // No blob disc: near palms now throw a REAL cascade shadow (drawShadow); a
+  // fake sun-stretched blob under the same trunk would double the shadow.
 }
 static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
@@ -958,7 +996,7 @@ static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
-  blobs.push_back(blobInst(px, y, pz, s * 4.2f));
+  // No blob disc: near beeches throw a REAL cascade shadow now (see palmKernel).
 }
 static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
@@ -1935,6 +1973,30 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
 }
 
 // ── Draw: frustum-culled patch flush + per-set draws ──────────────────────────
+void System::drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec) {
+  Impl* p = p_.get();
+  if (!p->ready || !p->shadowPipeline) return;
+  // Cast the near full-mesh palms + beeches (their instance buffers, packed by
+  // the last draw()) into the cascade. lod = 0 disables the LOD shrink (full
+  // size everywhere), windAmp = 0 keeps the caster steady; only the full[]
+  // sets are cast (impostors beyond NEAR_FADE fall back to no shadow).
+  struct LU { glm::mat4 vp; glm::vec4 eye, sun, anim, lod; };
+  LU u{ shadowVP, glm::vec4(0.0f), glm::vec4(0.0f),
+        glm::vec4((float)timeSec, 1.0f, 0.0f, 0.0f), glm::vec4(0.0f) };
+  wgpuQueueWriteBuffer(p->queue, p->shadowUbuf, 0, &u, sizeof(u));
+  wgpuRenderPassEncoderSetPipeline(pass, p->shadowPipeline);
+  wgpuRenderPassEncoderSetBindGroup(pass, 0, p->shadowBind, 0, nullptr);
+  Layer* casters[] = { &p->palms, &p->trees };
+  for (Layer* l : casters)
+    for (const DrawSet& d : l->full) {
+      if (!d.instCount || !d.vbuf) continue;
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 0, d.vbuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 1, d.instBuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(pass, d.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderDrawIndexed(pass, d.indexCount, d.instCount, 0, 0, 0);
+    }
+}
+
 void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& viewProj,
                   const glm::vec3& eye, const glm::vec3& lightDir, float dayK,
                   double timeSec, float windAmp) {

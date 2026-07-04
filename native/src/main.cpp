@@ -3113,6 +3113,10 @@ int main(int argc, char** argv) {
   std::unique_ptr<crew::Deck> crewDeck;
   std::string crewDeckSlug;   // slug the current deck was built for (rebuild on hull change)
   glm::mat4 crewInner(1.0f);  // ship bowYaw*scale*(-keel) at deck-build time
+  // Remote crews (Phase 6): one deck per nearby other-player ship, keyed by id and
+  // seeded from it (deterministic per ship). Pruned when a ship leaves crew range.
+  std::map<std::string, std::unique_ptr<crew::Deck>> remoteCrewDecks;
+  std::map<std::string, std::string> remoteCrewSlugs;
   // Body-build morph global slots (Fem=target0, Heavy=1, Lean=2) across the rig's
   // morphed meshes; face morph slots (BrowsUp=3, Frown=4, Smile=5, MouthOpen=6 on
   // the base mesh) — driven per member into the palette slot's weight region.
@@ -5822,6 +5826,10 @@ int main(int argc, char** argv) {
     };
     std::vector<ShipInst> ships;
     Mesh* ownMesh = nullptr;
+    // Crew render list this frame: which decks got shared palette slots (own +
+    // budgeted nearby remotes), filled by the crew drive block, drawn in the pass.
+    struct CrewRender { crew::Deck* deck; uint32_t slotBase; bool far; };
+    std::vector<CrewRender> crewRenders;
     // Wake sources this frame: local boat first (id "local", always packed
     // first), remotes appended below with their SMOOTHED display poses — the
     // client fed dispX/dispZ too, so the wake follows the rendered track, not
@@ -6806,71 +6814,102 @@ int main(int argc, char** argv) {
           }
         }
       }
-      if (crewMesh && crewDeck) {
-        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel — maps the members'
-        // root-local poses (which the deck maintains) into world with the heel/pitch.
-        // Its axis columns give the deck's world tilt: X.y = heel, Z.y = pitch, which
-        // the members brace against.
-        glm::mat4 outer = ownShipModel(*ownMesh) * glm::inverse(crewInner);
-        const float shipHeel = std::asin(glm::clamp(outer[0].y, -1.0f, 1.0f));
-        const float shipPitch = std::asin(glm::clamp(outer[2].y, -1.0f, 1.0f));
-        crewDeck->tick(dt, shipHeel, shipPitch);
-        if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 60) == 0) {
-          int st = 0, wk = 0, cl = 0, dead = 0, res = 0, flin = 0, stag = 0, work = 0, pan = 0;
-          for (auto& mm : crewDeck->members()) {
-            if (mm.state == crew::State::Dead) dead++;
-            else if (mm.state == crew::State::Reserve) res++;
-            else if (mm.state == crew::State::Walk) wk++;
-            else if (mm.state == crew::State::Climb) cl++;
-            else st++;
-            if (mm.flinch > 0.01f) flin++;
-            if (mm.stagger > 0.01f) stag++;
-            if (mm.workBurst > 0) work++;
-            if (mm.panicT > 0) pan++;
+      // ── Assemble the crewed ships this frame (own + nearby remotes), tick them,
+      // and budget the shared 64 palette slots by distance. Frozen (far) ships skip
+      // the animation tick and reuse their last pose; beyond CREW_CULL, no crew. ──
+      if (crewMesh) {
+        constexpr float CREW_CULL = 260.0f, CREW_FREEZE = 130.0f, CREW_LOD = 55.0f;
+        auto hasLayout = [](const std::string& s) {
+          return s == "sloop" || s == "pinnace" || s == "brig" || s == "merchantman";
+        };
+        auto innerFor = [](const Mesh& mm) {
+          glm::mat4 in = glm::rotate(glm::mat4(1.0f), mm.bowYaw, glm::vec3(0, 1, 0));
+          in = glm::scale(in, glm::vec3(mm.shipScale));
+          return glm::translate(in, -mm.keelCenter);
+        };
+        auto countFor = [](const std::string& s) { return s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
+        // Candidates: own deck (dist 0) + each nearby remote ship with a layout.
+        struct Cand { crew::Deck* deck; glm::mat4 outer; float dist; bool frozen; };
+        std::vector<Cand> cands;
+        if (crewDeck) cands.push_back({ crewDeck.get(), ownShipModel(*ownMesh) * glm::inverse(crewInner), 0.0f, false });
+        const auto crewCounts = mpClient.crews();   // playerId -> {crew, maxCrew}
+        std::set<std::string> seenCrew;
+        for (const ShipInst& si : ships) {
+          if (!si.remote || !si.mesh || si.mesh->deckTris.empty()) continue;
+          const std::string slug = si.rp.vesselSlug.empty() ? "pinnace" : si.rp.vesselSlug;
+          if (!hasLayout(slug)) continue;
+          const float dist = glm::length(glm::vec2(si.rp.x - eye.x, si.rp.z - eye.z));
+          if (dist > CREW_CULL) continue;
+          seenCrew.insert(si.rp.id);
+          const glm::mat4 rin = innerFor(*si.mesh);
+          auto& d = remoteCrewDecks[si.rp.id];
+          if (!d || remoteCrewSlugs[si.rp.id] != slug) {
+            const std::string lp = geometryDir() + "/crew_stations." + slug + ".json";
+            d = std::make_unique<crew::Deck>(crewMesh->rig, lp, (uint32_t)std::hash<std::string>{}(si.rp.id),
+                                             countFor(slug), rin, si.mesh->deckTris, si.mesh->bowYaw, 1.2f);
+            remoteCrewSlugs[si.rp.id] = slug;
+            if (!d->ok()) d.reset();
           }
-          float fb = 0, fm = 0;
-          for (auto& mm : crewDeck->members()) { fb = std::max(fb, mm.faceBrows); fm = std::max(fm, mm.faceMouth); }
-          std::printf("[crew] f%ld st=%d wk=%d cl=%d dead=%d res=%d | flinch=%d stagger=%d gunwork=%d panic=%d | maxWince(brows=%.2f mouth=%.2f)\n",
-                      frame, st, wk, cl, dead, res, flin, stag, work, pan, fb, fm);
+          if (d) {
+            auto cr = crewCounts.find(si.rp.id);   // server crew count for this ship
+            if (cr != crewCounts.end() && cr->second.second > 0) d->setAliveCount(cr->second.first);
+            cands.push_back({ d.get(), si.model * glm::inverse(rin), dist, dist > CREW_FREEZE });
+          }
         }
+        for (auto it = remoteCrewDecks.begin(); it != remoteCrewDecks.end();) {   // prune out-of-range / gone
+          if (!seenCrew.count(it->first)) { remoteCrewSlugs.erase(it->first); it = remoteCrewDecks.erase(it); }
+          else ++it;
+        }
+        // Nearest first, then greedily hand out the 64 shared slots.
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist < b.dist; });
         const size_t morphBase = (size_t)kMaxPaletteSlots * sizeof(glm::mat4);
         std::vector<uint8_t> blob(kPaletteStride, 0);
-        auto& members = crewDeck->members();
-        for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
-          crew::Member& m = members[i];
-          if (m.state == crew::State::Reserve) continue;   // unrecruited: not on deck
-          // Palette slot = joint matrices + body-build morph weights + garment tints.
-          const auto& pal = m.anim->palette();
-          std::memcpy(blob.data(), pal.data(),
-                      std::min(pal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
-          auto setW = [&](int gi, float v) {
-            if (gi >= 0 && morphBase + (size_t)gi * 4 + 4 <= blob.size())
-              std::memcpy(blob.data() + morphBase + (size_t)gi * 4, &v, 4);
-          };
-          for (int gi : crewFemIdx)   setW(gi, m.kit.fem);
-          for (int gi : crewHeavyIdx) setW(gi, m.kit.heavy);
-          for (int gi : crewLeanIdx)  setW(gi, m.kit.lean);
-          for (int gi : crewBrowsIdx) setW(gi, m.faceBrows);
-          for (int gi : crewFrownIdx) setW(gi, m.faceFrown);
-          for (int gi : crewSmileIdx) setW(gi, m.faceSmile);
-          for (int gi : crewMouthIdx) setW(gi, m.faceMouth);
-          for (int k = 0; k < crew::kTintSlotCount; ++k) {
-            glm::vec4 tv(crew::kitTintFor(m.kit, k), 1.0f);
-            size_t toff = morphBase + (size_t)(32 + k) * sizeof(glm::vec4);
-            if (toff + sizeof(glm::vec4) <= blob.size()) std::memcpy(blob.data() + toff, &tv, sizeof(glm::vec4));
+        uint32_t slotBase = 0;
+        for (Cand& c : cands) {
+          const float heel = std::asin(glm::clamp(c.outer[0].y, -1.0f, 1.0f));
+          const float pitch = std::asin(glm::clamp(c.outer[2].y, -1.0f, 1.0f));
+          if (!c.frozen) c.deck->tick(dt, heel, pitch);   // far ships reuse their last pose (skip anim)
+          auto& members = c.deck->members();
+          uint32_t used = 0;
+          for (auto& m : members) if (m.state != crew::State::Reserve) used++;
+          if (slotBase + used > kMaxShipInstances) break;   // budget spent — farther ships lose their crew
+          uint32_t slot = slotBase;
+          for (crew::Member& m : members) {
+            if (m.state == crew::State::Reserve) continue;
+            const auto& pal = m.anim->palette();
+            std::memcpy(blob.data(), pal.data(), std::min(pal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
+            auto setW = [&](int gi, float v) {
+              if (gi >= 0 && morphBase + (size_t)gi * 4 + 4 <= blob.size()) std::memcpy(blob.data() + morphBase + (size_t)gi * 4, &v, 4);
+            };
+            for (int gi : crewFemIdx)   setW(gi, m.kit.fem);
+            for (int gi : crewHeavyIdx) setW(gi, m.kit.heavy);
+            for (int gi : crewLeanIdx)  setW(gi, m.kit.lean);
+            for (int gi : crewBrowsIdx) setW(gi, m.faceBrows);
+            for (int gi : crewFrownIdx) setW(gi, m.faceFrown);
+            for (int gi : crewSmileIdx) setW(gi, m.faceSmile);
+            for (int gi : crewMouthIdx) setW(gi, m.faceMouth);
+            for (int k = 0; k < crew::kTintSlotCount; ++k) {
+              glm::vec4 tv(crew::kitTintFor(m.kit, k), 1.0f);
+              size_t toff = morphBase + (size_t)(32 + k) * sizeof(glm::vec4);
+              if (toff + sizeof(glm::vec4) <= blob.size()) std::memcpy(blob.data() + toff, &tv, sizeof(glm::vec4));
+            }
+            wgpuQueueWriteBuffer(queue, crewMesh->paletteBuf, (uint64_t)slot * kPaletteStride, blob.data(), kPaletteStride);
+            glm::mat4 cmModel = glm::translate(c.outer, m.pos + m.swayOffset);
+            cmModel = glm::rotate(cmModel, m.leanRoll, glm::vec3(0, 0, 1));
+            cmModel = glm::rotate(cmModel, m.leanPitch, glm::vec3(1, 0, 0));
+            cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
+            cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
+            MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),
+                             glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 0.0f, 0.0f, 0.0f) };
+            wgpuQueueWriteBuffer(queue, crewMesh->uniformBuf, (uint64_t)slot * crewMesh->uniformStride, &mu, sizeof(mu));
+            slot++;
           }
-          wgpuQueueWriteBuffer(queue, crewMesh->paletteBuf, (uint64_t)i * kPaletteStride, blob.data(), kPaletteStride);
-          // Presence: weight-shift/bob offset on the position, then the brace lean
-          // (roll about the bow axis, pitch about the beam) composed OUTSIDE the yaw.
-          glm::mat4 cmModel = glm::translate(outer, m.pos + m.swayOffset);
-          cmModel = glm::rotate(cmModel, m.leanRoll, glm::vec3(0, 0, 1));
-          cmModel = glm::rotate(cmModel, m.leanPitch, glm::vec3(1, 0, 0));
-          cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
-          cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
-          MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),
-                           glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 0.0f, 0.0f, 0.0f) };
-          wgpuQueueWriteBuffer(queue, crewMesh->uniformBuf, (uint64_t)i * crewMesh->uniformStride, &mu, sizeof(mu));
+          crewRenders.push_back({ c.deck, slotBase, c.dist > CREW_LOD });
+          slotBase += used;
         }
+        if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 60) == 0)
+          std::printf("[crew] f%ld crewed-ships=%zu slots=%u/%u remoteDecks=%zu\n",
+                      frame, crewRenders.size(), slotBase, kMaxShipInstances, remoteCrewDecks.size());
       }
     }
     // Impostor uniforms: distant-ship billboards (one dynamic slot each) + the
@@ -6993,23 +7032,28 @@ int main(int argc, char** argv) {
         }
         slot[m] = idx + 1;
       }
-      // Crew (Phase 2): draw each member from its own slot like a ship instance,
-      // skipping the submeshes its kit hides (unchosen hat/coat/hair/neckerchief).
-      // Group 1 (shadow-receive) stays bound from the ships above.
-      if (crewEnabled && sailing && crewMesh && crewDeck && !crewDeck->members().empty()) {
-        auto& members = crewDeck->members();
+      // Crew (Phase 6): draw every budgeted deck's members from their assigned slot
+      // range, skipping kit-hidden submeshes; far decks also drop the tiny detail
+      // parts (eyes/neckerchief). Group 1 (shadow-receive) stays bound from above.
+      if (crewEnabled && sailing && crewMesh && !crewRenders.empty()) {
         wgpuRenderPassEncoderSetPipeline(pass, crewMesh->pipeline);
         wgpuRenderPassEncoderSetVertexBuffer(pass, 0, crewMesh->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(pass, crewMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
-          if (members[i].state == crew::State::Reserve) continue;   // unrecruited: not drawn
-          uint32_t off[2] = { (uint32_t)(i * crewMesh->uniformStride), (uint32_t)(i * kPaletteStride) };
-          const crew::Kit& kit = members[i].kit;
-          for (size_t s = 0; s < crewMesh->submeshes.size(); ++s) {
-            const RigSubmesh& sm = crewMesh->submeshes[s];
-            if (!crew::kitShowsSubmesh(kit, sm.name)) continue;
-            wgpuRenderPassEncoderSetBindGroup(pass, 0, crewMesh->bindGroups[s], 2, off);
-            wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+        for (const CrewRender& crd : crewRenders) {
+          uint32_t slot = crd.slotBase;
+          for (crew::Member& m : crd.deck->members()) {
+            if (m.state == crew::State::Reserve) continue;
+            if (slot >= kMaxShipInstances) break;
+            uint32_t off[2] = { slot * crewMesh->uniformStride, slot * kPaletteStride };
+            const crew::Kit& kit = m.kit;
+            for (size_t s = 0; s < crewMesh->submeshes.size(); ++s) {
+              const RigSubmesh& sm = crewMesh->submeshes[s];
+              if (!crew::kitShowsSubmesh(kit, sm.name)) continue;
+              if (crd.far && (sm.name.find("Eye") != std::string::npos || sm.name.find("Neckerchief") != std::string::npos)) continue;
+              wgpuRenderPassEncoderSetBindGroup(pass, 0, crewMesh->bindGroups[s], 2, off);
+              wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+            }
+            slot++;
           }
         }
       }

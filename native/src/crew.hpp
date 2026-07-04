@@ -115,7 +115,7 @@ struct Station { std::string id, kind, clip, wp; glm::vec3 pos{0}; float yaw = 0
 struct Climb   { std::string id, clip, approachWp; std::vector<glm::vec3> poly; };
 struct PathLeg { glm::vec3 to{0}; std::string kind; };
 
-enum class State { Station, Walk, Climb };
+enum class State { Station, Walk, Climb, Dead, Reserve };
 
 struct Member {
   std::unique_ptr<Animator> anim;
@@ -132,6 +132,11 @@ struct Member {
   uint32_t rngState = 1;
   // Presence (Phase 3): a desynced idle sway + the brace/lean this member rides.
   float swayPhase = 0, swayFreq = 1.0f, railDamp = 1.0f;
+  // Combat reactions (Phase 4): transient startles that decay 1->0 over their own
+  // window (additive duck/lurch pose), a one-shot reaction-clip timer, and morale.
+  float flinch = 0, stagger = 0; int staggerDir = 1;
+  float reactT = 0, reactCD = 0, panicT = 0; bool fleeing = false;
+  float workBurst = 0;   // >0 -> gun crew heaving after their broadside
   // Output pose modifiers (computed each tick), applied by the renderer on top of
   // pos/yaw: a body lean (roll about the bow axis, pitch about the beam) + a small
   // positional weight-shift/breathing offset in root-local axes.
@@ -157,8 +162,23 @@ class Deck {
   void tick(float dt, float shipHeel = 0.0f, float shipPitch = 0.0f);
   std::vector<Member>& members() { return members_; }
 
+  // ── Combat hooks (a port of CrewHandle's public reaction API) ──
+  void reactToFire(int side);         // a gun fired -> non-gun crew flinch/duck
+  void emphasizeGun(int side);        // that side's gun crews heave for a beat
+  void reactToHit(int side);          // ship took a hit -> everyone staggers
+  void reactCheer();                  // a kill -> stationed crew cheer
+  void crewPanic(float frac, float dur);   // morale breaks -> flee / cower
+  void setAliveCount(int target);     // reconcile living crew to the server count
+  int  aliveCount() const;
+
  private:
   void  computePresence(Member& m);                           // brace + idle sway/bob/lean
+  void  playReact(Member& m, const std::string& clip, float dur);
+  void  startFlee(Member& m);
+  bool  killOne();
+  bool  reviveOne();
+  void  hideMember(Member& m);
+  std::string randomFleeWp(Member& m);
   float deckHeight(float lx, float lz, float footRef) const;   // deckLocalHeight port
   void  deckSnap(glm::vec3& p) const;                          // snap y to the planks
   Station* pickStation(Member& m, bool excludeCurrent = false);
@@ -191,6 +211,7 @@ class Deck {
   // beam) that damps motion near the bulwark; beamAxis picks the across-ship axis.
   float clock_ = 0.0f, maxBeam_ = 1.0f, shipHeel_ = 0.0f, shipPitch_ = 0.0f;
   bool beamAxisZ_ = false;
+  bool firstFill_ = true;   // first setAliveCount hides the surplus as reserve
   float rand();
 };
 

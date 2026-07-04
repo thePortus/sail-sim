@@ -313,6 +313,21 @@ constexpr float HEEL_SHIFT    = 0.05f;   // m lateral weight-shift per rad of he
 constexpr float IDLE_LEAN_AMP = 0.06f;   // rad idle side-to-side weight-shift lean
 constexpr float IDLE_PITCH_AMP= 0.03f;   // rad idle fore-aft lean
 constexpr float IDLE_BOB      = 0.013f;  // m vertical breathing bob
+// Reactions (crew realism P4), verbatim from crew.service.
+constexpr float FLINCH_FIRE   = 0.6f;    // flinch level at a nearby gun blast
+constexpr float FLINCH_DECAY  = 0.42f;   // s for a flinch to fade
+constexpr float FLINCH_DUCK_P = 0.20f;   // rad forward pitch (duck) at full flinch
+constexpr float FLINCH_DUCK_Y = 0.045f;  // m drop (crouch) at full flinch
+constexpr float STAGGER_DECAY = 0.85f;   // s for a hit-stagger to fade
+constexpr float STAGGER_ROLL  = 0.26f;   // rad sideways lurch at full stagger
+constexpr float STAGGER_PITCH = 0.10f;   // rad forward jolt at full stagger
+constexpr float STAGGER_DUCK_Y= 0.05f;   // m drop at full stagger
+constexpr float HIT_CLIP_CHANCE = 0.5f;  // fraction that play the full recoil clip
+constexpr float HIT_REACT_DUR   = 1.0f;  // s the recoil clip holds
+constexpr float REACT_COOLDOWN  = 3.0f;  // s min between a member's one-shot clips
+constexpr float WORK_BURST_DUR  = 2.6f;  // s a gun crew heaves after their broadside
+constexpr float FLEE_FRAC       = 0.6f;  // of panicking crew, this fraction scramble
+constexpr float FLEE_SPEED_MUL  = 1.8f;  // x walk speed while fleeing (a frantic scramble)
 float mul32(uint32_t& a) {
   a += 0x6D2B79F5u; uint32_t t = a;
   t = (t ^ (t >> 15)) * (t | 1u);
@@ -477,13 +492,14 @@ float Deck::legSpeed(const std::string& kind) const {
 
 void Deck::playLeg(Member& m, const std::string& kind) {
   if (kind == "ladder") { m.anim->play("Climb", true, m.animSpeed); return; }
-  const float sr = m.animSpeed * std::max(0.35f, legSpeed(kind) / walkSpeed_);
+  const float sr = m.animSpeed * std::max(0.35f, legSpeed(kind) / walkSpeed_) * (m.fleeing ? FLEE_SPEED_MUL : 1.0f);
   m.anim->play("Walk", true, sr);
 }
 
 void Deck::play(Member& m, const std::string& clip, bool loop) { m.anim->play(clip, loop, m.animSpeed); }
 
 void Deck::tickWalk(Member& m, float dt) {
+  if (m.fleeing && m.panicT > 0.0f) m.panicT = std::max(0.0f, m.panicT - dt);   // panic decays while scrambling
   if (m.legs.empty()) { finishWalk(m); return; }
   PathLeg& leg = m.legs.front();
   const float span = glm::distance(m.legFrom, leg.to);
@@ -491,7 +507,7 @@ void Deck::tickWalk(Member& m, float dt) {
   if (dx * dx + dz * dz > 0.01f) m.yawTarget = std::atan2(dx, dz);
   const float err = wrapPi(m.yawTarget - m.yaw);
   const float turnSlow = std::max(0.25f, std::cos(std::min(std::fabs(err), 1.5707963f)));
-  const float speed = legSpeed(leg.kind) * turnSlow;
+  const float speed = legSpeed(leg.kind) * turnSlow * (m.fleeing ? FLEE_SPEED_MUL : 1.0f);
   m.legT = span > 1e-4f ? std::min(1.0f, m.legT + speed * dt / span) : 1.0f;
   m.pos = glm::mix(m.legFrom, leg.to, m.legT);
   if (leg.kind == "step_over") m.pos.y += 0.45f * std::sin(3.14159265f * m.legT);
@@ -504,6 +520,13 @@ void Deck::tickWalk(Member& m, float dt) {
 
 void Deck::finishWalk(Member& m) {
   if (walkers_ > 0) --walkers_;
+  if (m.fleeing) {   // still panicking -> keep scrambling; else settle at a post
+    if (m.panicT > 0.0f) { startFlee(m); return; }
+    m.fleeing = false;
+    Station* st = pickStation(m);
+    if (st) { arriveAt(m, st ? *st : stations_.front(), false); return; }
+    m.state = State::Station; m.dwell = 3.0f; play(m, "Idle", true); return;
+  }
   if (!m.targetClimb.empty()) {
     for (const Climb& c : climbs_)
       if (c.id == m.targetClimb && !c.poly.empty()) {
@@ -573,6 +596,23 @@ void Deck::tickMember(Member& m, float dt) {
   m.yaw += d * std::min(1.0f, dt * 8.0f);
   switch (m.state) {
     case State::Station: {
+      if (m.reactCD > 0.0f) m.reactCD = std::max(0.0f, m.reactCD - dt);
+      if (m.panicT > 0.0f) {                         // morale broken: cower until it lifts
+        m.panicT -= dt;
+        if (m.panicT <= 0.0f) play(m, m.stationClip, true);
+        return;
+      }
+      if (m.reactT > 0.0f) {                          // one-shot recoil / cheer clip
+        m.reactT -= dt;
+        if (m.reactT <= 0.0f) play(m, m.stationClip, true);
+        return;
+      }
+      if (m.workBurst > 0.0f) {                        // gun crew heaving after their broadside
+        m.workBurst -= dt;
+        if (m.workBurst <= 0.0f) play(m, m.stationClip, true);
+        else if (m.stationId.rfind("gun_", 0) == 0 && m.anim->hasClip("Work_Cannon")) play(m, "Work_Cannon", true);
+        return;
+      }
       m.dwell -= dt;
       if (m.dwell > 0.0f) return;
       if (walkers_ >= 2) { m.dwell = 4.0f + m.rand() * 6.0f; return; }   // walker cap
@@ -611,13 +651,146 @@ void Deck::computePresence(Member& m) {
     m.swayOffset.z = std::cos(clock_ * m.swayFreq * 0.8f + m.swayPhase) * SWAY_AMP * 0.6f;
     m.swayOffset.y = std::sin(clock_ * 0.9f + m.swayPhase) * IDLE_BOB;
   }
+  // Reactions (any live state): add the transient startles' duck (flinch) /
+  // sideways lurch (stagger) — decayed in tick(). When a recoil CLIP is playing
+  // (reactT>0) it poses the body itself, so the additive stagger pose is suppressed.
+  const float stag = m.reactT > 0 ? 0.0f : m.stagger;
+  pitch += FLINCH_DUCK_P * m.flinch + STAGGER_PITCH * stag;
+  roll  += STAGGER_ROLL * stag * (float)m.staggerDir;
+  m.swayOffset.y -= FLINCH_DUCK_Y * m.flinch + STAGGER_DUCK_Y * stag;
   m.leanRoll  = std::max(-BRACE_MAX, std::min(BRACE_MAX, roll));
   m.leanPitch = std::max(-BRACE_MAX, std::min(BRACE_MAX, pitch));
 }
 
 void Deck::tick(float dt, float shipHeel, float shipPitch) {
   shipHeel_ = shipHeel; shipPitch_ = shipPitch; clock_ += dt;
-  for (Member& m : members_) { tickMember(m, dt); computePresence(m); m.anim->update(dt); }
+  for (Member& m : members_) {
+    if (m.state == State::Reserve) continue;              // unrecruited: hidden, frozen
+    if (m.state == State::Dead) { m.anim->update(dt); continue; }   // hold the fallen pose
+    if (m.flinch  > 0) m.flinch  = std::max(0.0f, m.flinch  - dt / FLINCH_DECAY);
+    if (m.stagger > 0) m.stagger = std::max(0.0f, m.stagger - dt / STAGGER_DECAY);
+    tickMember(m, dt);
+    computePresence(m);
+    m.anim->update(dt);
+  }
+}
+
+// ── Combat reactions + casualties (a port of CrewHandle's public API) ────────
+void Deck::playReact(Member& m, const std::string& clip, float dur) {
+  if (m.state != State::Station || !m.anim->hasClip(clip)) return;
+  m.reactT = dur; m.reactCD = REACT_COOLDOWN;
+  m.anim->play(clip, false, m.animSpeed);
+}
+
+void Deck::reactToFire(int /*side*/) {
+  // A gun fired -> crew NOT working that piece flinch/duck at the blast (the gun
+  // crew heaving via emphasizeGun are exempt). Call AFTER emphasizeGun.
+  for (Member& m : members_) {
+    if (m.state != State::Station && m.state != State::Walk) continue;
+    if (m.workBurst > 0) continue;
+    m.flinch = std::max(m.flinch, FLINCH_FIRE);
+  }
+}
+
+void Deck::emphasizeGun(int side) {
+  const std::string tag = side == 0 ? "gun_P" : "gun_S";
+  for (Member& m : members_)
+    if (m.state == State::Station && m.stationId.rfind(tag, 0) == 0) m.workBurst = WORK_BURST_DUR;
+}
+
+void Deck::reactToHit(int side) {
+  const int dir = side == 0 ? 1 : -1;   // port hit -> lurch to starboard
+  for (Member& m : members_) {
+    if (m.state == State::Dead || m.state == State::Reserve) continue;
+    m.stagger = 1.0f; m.staggerDir = dir;
+    if (m.state == State::Station && m.reactCD <= 0.0f && m.rand() < HIT_CLIP_CHANCE)
+      playReact(m, "React_Hit", HIT_REACT_DUR);
+  }
+}
+
+void Deck::reactCheer() {
+  for (Member& m : members_)
+    if (m.state == State::Station && m.reactCD <= 0.0f && m.rand() < 0.7f)
+      playReact(m, "React_Cheer", 2.2f);
+}
+
+std::string Deck::randomFleeWp(Member& m) {
+  if (waypoints_.empty()) return {};
+  std::vector<std::string> ids; ids.reserve(waypoints_.size());
+  for (const auto& kv : waypoints_) ids.push_back(kv.first);
+  for (int i = 0; i < 5; ++i) { const std::string& id = ids[(size_t)(m.rand() * ids.size()) % ids.size()]; if (id != m.wpId) return id; }
+  return ids[(size_t)(m.rand() * ids.size()) % ids.size()];
+}
+
+void Deck::startFlee(Member& m) {
+  const std::string wp = randomFleeWp(m);
+  if (wp.empty()) { if (m.anim->hasClip("React_Panic")) m.anim->play("React_Panic", true, m.animSpeed); return; }
+  m.fleeing = true;
+  beginWalk(m, wp, nullptr, nullptr);   // the fleeing flag speeds it up + loops in finishWalk
+}
+
+void Deck::crewPanic(float frac, float dur) {
+  for (Member& m : members_) {
+    if ((m.state != State::Station && m.state != State::Walk) || !m.anim->hasClip("React_Panic")) continue;
+    if (m.panicT > 0) { m.panicT = std::max(m.panicT, dur); continue; }
+    if (m.rand() >= frac) continue;
+    m.panicT = dur;
+    if (m.rand() < FLEE_FRAC && waypoints_.size() > 1) startFlee(m);
+    else m.anim->play("React_Panic", true, m.animSpeed);   // cower in place
+  }
+}
+
+int Deck::aliveCount() const {
+  int n = 0;
+  for (const Member& m : members_) if (m.state != State::Dead && m.state != State::Reserve) ++n;
+  return n;
+}
+
+bool Deck::killOne() {
+  std::vector<Member*> alive;
+  for (Member& m : members_) if (m.state != State::Dead && m.state != State::Reserve) alive.push_back(&m);
+  if (alive.empty()) return false;
+  Member& m = *alive[(size_t)(rand() * alive.size()) % alive.size()];
+  if (m.state == State::Walk && walkers_ > 0) --walkers_;
+  if (m.state == State::Climb) climbBusy_ = false;
+  releaseStation(m);
+  m.state = State::Dead; m.legs.clear(); m.fleeing = false;
+  m.anim->play("Death", false, m.animSpeed);   // no Dead clip -> non-loop holds the last frame
+  return true;
+}
+
+bool Deck::reviveOne() {
+  Member* back = nullptr;
+  for (Member& m : members_) if (m.state == State::Reserve) { back = &m; break; }
+  if (!back) for (Member& m : members_) if (m.state == State::Dead) { back = &m; break; }
+  if (!back) return false;
+  back->state = State::Station;
+  Station* st = pickStation(*back);
+  if (st) arriveAt(*back, *st, true);
+  else { back->state = State::Station; back->dwell = 3.0f; back->anim->play("Idle", true, back->animSpeed); }
+  return true;
+}
+
+void Deck::hideMember(Member& m) {
+  if (m.state == State::Walk && walkers_ > 0) --walkers_;
+  if (m.state == State::Climb) climbBusy_ = false;
+  releaseStation(m);
+  m.state = State::Reserve; m.legs.clear();
+}
+
+void Deck::setAliveCount(int target) {
+  const int t = std::max(0, std::min((int)members_.size(), target));
+  if (firstFill_) {
+    firstFill_ = false;
+    for (int i = t; i < (int)members_.size(); ++i) hideMember(members_[i]);
+    return;
+  }
+  int alive = aliveCount();
+  const int start = alive;
+  while (alive > t) { if (!killOne()) break; --alive; }
+  while (alive < t) { if (!reviveOne()) break; ++alive; }
+  // Heavy casualties: when losses drop the crew to a skeleton, some morale breaks.
+  if (t < start && t <= std::max(3, (int)(members_.size() * 0.4f))) crewPanic(0.3f, 6.0f);
 }
 
 }  // namespace crew

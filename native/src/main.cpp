@@ -5106,8 +5106,10 @@ int main(int argc, char** argv) {
         if (e.victimId == meId) {
           if (!meSunk) { meSunk = true; meSunkAtT = t; }
           meSunkBy = !e.shooterName.empty() ? e.shooterName : e.shooterId;
+          if (crewDeck) crewDeck->crewPanic(0.85f, 30.0f);   // she's going down -> the deck crew break and cower
         } else {
           remoteSunkAt[e.victimId] = t;
+          if (crewDeck && e.shooterId == meId) crewDeck->reactCheer();   // we sank her -> our crew cheer
         }
       }
       for (const std::string& pid : mpClient.drainRepaired()) {
@@ -5126,6 +5128,9 @@ int main(int argc, char** argv) {
       mp::TownState cts = mpClient.town();
       const float crewFactor = cts.maxCrew > 0
           ? 0.5f + 0.5f * glm::clamp((float)cts.crew / (float)cts.maxCrew, 0.0f, 1.0f) : 1.0f;
+      // Drop/raise living crew to the server's authoritative count (grape attrition,
+      // tavern hires). First call hides the under-fill as reserve, not corpses.
+      if (crewDeck && cts.maxCrew > 0) crewDeck->setAliveCount(cts.crew);
       combat::ShipPose gpose{ vessel.x, vessel.z, vessel.heading };
       // Headless test hook: SAILSIM_GUNS=1 runs out the starboard battery at
       // frame 120 and fires it at frame 420 (screenshot the arcs + balls).
@@ -5167,6 +5172,9 @@ int main(int argc, char** argv) {
           const float rdir = fe.side == 0 ? 1.0f : -1.0f;
           recoilRollVel += rdir * 0.40f;
           recoilSwayVel += rdir * 0.95f;
+          // Deck crew: that side's gun crew heave into a reload; everyone else
+          // flinches at the blast (emphasize BEFORE react so the gun crew are exempt).
+          if (crewDeck) { crewDeck->emphasizeGun(fe.side); crewDeck->reactToFire(fe.side); }
           if (camTrauma < 0.01f) camShakeTime = 0.0f;   // fresh shake swings from zero
           camTrauma = std::min(1.0f, camTrauma + 0.32f);   // per shot — a broadside stacks toward a big jolt
         }
@@ -5220,6 +5228,8 @@ int main(int argc, char** argv) {
             const float hdir = ie.hit.side == "port" ? 1.0f : -1.0f;
             hitRollVelSp += hdir * 1.1f;
             hitSwayVelSp += hdir * 2.6f;
+            if (crewDeck) crewDeck->reactToHit(ie.hit.side == "port" ? 0 : 1);   // deck crew stagger with the hit
+
             if (camTrauma < 0.01f) camShakeTime = 0.0f;
             camTrauma = std::min(1.0f, camTrauma + 0.85f);   // taking a hit: a big, ringing shake
           }
@@ -6799,20 +6809,28 @@ int main(int argc, char** argv) {
         const float shipHeel = std::asin(glm::clamp(outer[0].y, -1.0f, 1.0f));
         const float shipPitch = std::asin(glm::clamp(outer[2].y, -1.0f, 1.0f));
         crewDeck->tick(dt, shipHeel, shipPitch);
-        if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 120) == 0) {
-          int st = 0, wk = 0, cl = 0;
-          for (auto& mm : crewDeck->members())
-            (mm.state == crew::State::Walk ? wk : mm.state == crew::State::Climb ? cl : st)++;
-          const crew::Member& m0 = crewDeck->members().front();
-          std::printf("[crew] f%ld  station=%d walk=%d climb=%d | heel=%.3f pitch=%.3f | m0 lean(r=%.3f p=%.3f) sway=(%.3f,%.3f,%.3f)\n",
-                      frame, st, wk, cl, shipHeel, shipPitch, m0.leanRoll, m0.leanPitch,
-                      m0.swayOffset.x, m0.swayOffset.y, m0.swayOffset.z);
+        if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 60) == 0) {
+          int st = 0, wk = 0, cl = 0, dead = 0, res = 0, flin = 0, stag = 0, work = 0, pan = 0;
+          for (auto& mm : crewDeck->members()) {
+            if (mm.state == crew::State::Dead) dead++;
+            else if (mm.state == crew::State::Reserve) res++;
+            else if (mm.state == crew::State::Walk) wk++;
+            else if (mm.state == crew::State::Climb) cl++;
+            else st++;
+            if (mm.flinch > 0.01f) flin++;
+            if (mm.stagger > 0.01f) stag++;
+            if (mm.workBurst > 0) work++;
+            if (mm.panicT > 0) pan++;
+          }
+          std::printf("[crew] f%ld st=%d wk=%d cl=%d dead=%d res=%d | flinch=%d stagger=%d gunwork=%d panic=%d\n",
+                      frame, st, wk, cl, dead, res, flin, stag, work, pan);
         }
         const size_t morphBase = (size_t)kMaxPaletteSlots * sizeof(glm::mat4);
         std::vector<uint8_t> blob(kPaletteStride, 0);
         auto& members = crewDeck->members();
         for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
           crew::Member& m = members[i];
+          if (m.state == crew::State::Reserve) continue;   // unrecruited: not on deck
           // Palette slot = joint matrices + body-build morph weights + garment tints.
           const auto& pal = m.anim->palette();
           std::memcpy(blob.data(), pal.data(),
@@ -6972,6 +6990,7 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderSetVertexBuffer(pass, 0, crewMesh->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(pass, crewMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
         for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
+          if (members[i].state == crew::State::Reserve) continue;   // unrecruited: not drawn
           uint32_t off[2] = { (uint32_t)(i * crewMesh->uniformStride), (uint32_t)(i * kPaletteStride) };
           const crew::Kit& kit = members[i].kit;
           for (size_t s = 0; s < crewMesh->submeshes.size(); ++s) {

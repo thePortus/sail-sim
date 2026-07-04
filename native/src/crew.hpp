@@ -184,14 +184,14 @@ class Deck {
  private:
   void  computePresence(Member& m);                           // brace + idle sway/bob/lean
   void  computeFace(Member& m, float dt);                     // expression drift + reactions
+  float castHighest(float lx, float lz, float topY) const;    // highest deck-tri hit below topY
   void  playReact(Member& m, const std::string& clip, float dur);
   void  startFlee(Member& m);
   bool  killOne();
   bool  reviveOne();
   void  hideMember(Member& m);
   std::string randomFleeWp(Member& m);
-  float deckHeight(float lx, float lz, float footRef) const;   // deckLocalHeight port
-  void  deckSnap(glm::vec3& p) const;                          // snap y to the planks
+  void  deckSnap(glm::vec3& p) const;      // findOpenDeck: nudge to open deck + snap y
   Station* pickStation(Member& m, bool excludeCurrent = false);
   void  releaseStation(Member& m);
   void  arriveAt(Member& m, const Station& st, bool teleport);

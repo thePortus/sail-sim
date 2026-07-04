@@ -421,8 +421,10 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
   ok_ = true;
 }
 
-float Deck::deckHeight(float lx, float lz, float footRef) const {
-  const float roY = footRef + 2.2f;
+// Highest deck-tri hit under (lx,lz) from a ray dropped from topY (within a 3 m
+// reach). This includes deck furniture (the ship's boat, cannons, hatches), so a
+// spot that returns a hit well above the authored deck level is BLOCKED.
+float Deck::castHighest(float lx, float lz, float topY) const {
   float best = std::numeric_limits<float>::quiet_NaN();
   const auto& t = deckTris_;
   for (size_t i = 0; i + 2 < t.size(); i += 3) {
@@ -435,14 +437,34 @@ float Deck::deckHeight(float lx, float lz, float footRef) const {
     const float v = (d0x * pz - px * d0z) / den;
     if (u < 0.0f || v < 0.0f || u + v > 1.0f) continue;
     const float hy = a.y + u * (b.y - a.y) + v * (c.y - a.y);
-    if (hy > roY || hy < footRef - 3.0f || hy > footRef + 0.9f) continue;
+    if (hy > topY || topY - hy > 3.0f) continue;                 // below the ray start, within reach
     if (std::isnan(best) || hy > best) best = hy;
   }
   return best;
 }
 
+// Move a station/waypoint onto OPEN deck (feet clear of the ship's boat / cannon /
+// hatch): a spot is open iff its highest surface sits within a tight window of the
+// authored deck level (nothing tall is on it). If the authored spot is blocked,
+// search outward — biased inboard + fore/aft — for the nearest open one. Port of
+// crew.service findOpenDeck; without it a station near the boat snapped ONTO it.
 void Deck::deckSnap(glm::vec3& p) const {
-  const float dY = deckHeight(p.x, p.z, p.y);
+  static const float OFF[][2] = {
+    {0, 0}, {0.5f, 0}, {0, 0.8f}, {0, -0.8f}, {0.5f, 0.8f}, {0.5f, -0.8f}, {1.0f, 0},
+    {0, 1.5f}, {0, -1.5f}, {1.0f, 0.8f}, {1.0f, -0.8f}, {0.5f, 1.5f}, {0.5f, -1.5f}, {1.5f, 0},
+    {-0.4f, 0.8f}, {-0.4f, -0.8f},
+  };
+  const float lo = p.y - 0.7f, hi = p.y + 0.35f, topY = p.y + 1.8f;
+  const float beam = beamAxisZ_ ? p.z : p.x;
+  const float inb = beam >= 0.0f ? -1.0f : 1.0f;   // toward the centreline
+  for (const auto& o : OFF) {
+    const float a = o[0] * inb, b = o[1];          // a = inboard along beam, b = fore/aft along keel
+    const float cx = beamAxisZ_ ? p.x + b : p.x + a;
+    const float cz = beamAxisZ_ ? p.z + a : p.z + b;
+    const float hy = castHighest(cx, cz, topY);
+    if (!std::isnan(hy) && hy >= lo && hy <= hi) { p.x = cx; p.z = cz; p.y = hy + deckLift_; return; }
+  }
+  const float dY = castHighest(p.x, p.z, topY);    // nothing open nearby: keep xz, snap y
   if (!std::isnan(dY)) p.y = dY + deckLift_;
 }
 

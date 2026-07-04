@@ -22,8 +22,10 @@ struct Palette {
     w : array<vec4<f32>, 64>,   // morph weights, indexed by RigMorph slot
 };
 @group(0) @binding(5) var<uniform> pal : Palette;
-// Morph machinery (static per mesh): per-submesh {count, tableBase, vertexBase},
-// the (deltaBase, weightSlot) table, and the concatenated position deltas.
+// Morph machinery (static per mesh): per-submesh {count, tableBase, vertexBase, kit}.
+// .w (kit) is 0 for ships; for crew garments it packs a per-instance tint slot in
+// bits 0-3 (0 = none, else slot+1 -> pal.w[31+slot]) and a depth-bias LEVEL in bits
+// 4-7 (layers an outer garment in front of the shirt without z-fighting).
 @group(0) @binding(6) var<uniform> subInfo : vec4<u32>;
 @group(0) @binding(7) var<storage, read> morphDeltas : array<f32>;
 @group(0) @binding(8) var<storage, read> morphTable : array<vec2<u32>>;
@@ -108,6 +110,11 @@ fn vs_main(@builtin(vertex_index) vid : u32,
     let ln = skinM * vec4<f32>(inNormal, 0.0);
     var out : VSOut;
     out.position = u.mvp * lp;
+    // Crew garment layering: pull an outer layer slightly toward the camera (in
+    // perspective-correct NDC) so it wins the depth test over the shirt beneath
+    // instead of z-fighting it. Ships have subInfo.w = 0 -> no change.
+    let cbias = f32((subInfo.w >> 4u) & 0xFu);
+    out.position.z -= cbias * 0.00006 * out.position.w;
     out.worldPos = (u.model * lp).xyz;
     out.normal   = normalize((u.model * ln).xyz);
     out.albedo   = inAlbedo;
@@ -158,7 +165,14 @@ fn fresnelSchlick(cosT : f32, F0 : vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
-    let albedo = in.albedo * textureSample(baseColorTex, texSamp, in.uv).rgb;
+    let baseTex = textureSample(baseColorTex, texSamp, in.uv).rgb;
+    // Crew per-member garment tint: bits 0-3 of subInfo.w select a tint colour
+    // stored in this instance's palette weight region (pal.w[32..40]). It REPLACES
+    // the garment base colour (like the client's albedoColor swap), the texture
+    // still modulating it. 0 = no tint (ships + the crew's skin/eyes) -> no-op.
+    let tslot = subInfo.w & 0xFu;
+    var albedo = in.albedo * baseTex;
+    if (tslot != 0u) { albedo = pal.w[31u + tslot].rgb * baseTex; }
     let mrTex = textureSample(metalRoughTex, texSamp, in.uv);   // glTF: G=rough, B=metal
     let metallic = clamp(in.mr.x * mrTex.b, 0.0, 1.0);
     let roughness = clamp(in.mr.y * mrTex.g, 0.05, 1.0);

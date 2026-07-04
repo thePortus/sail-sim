@@ -24,6 +24,37 @@ namespace crew {
 // Cross-fade window between clips (s) — the client's CLIP_BLEND_S.
 constexpr float kClipBlendS = 0.22f;
 
+// Per-member look, a native port of crew.service applyKitVariants' SELECTION
+// (body build + which outer layer / hat / hair / neckerchief). Phase 1a drives
+// the body-build morphs, stature and layer visibility; Phase 1b adds the garment
+// colour tints on top. Deterministic from a seed so a member is stable.
+struct Kit {
+  float fem = 0.0f, heavy = 0.0f, lean = 0.0f;   // body-morph weights (targets 0/1/2)
+  float stature = 1.0f;                          // uniform height scale (~0.9..1.06)
+  int   outer = 0;                               // 0 none, 1 vest, 2 coat
+  int   hat = 0;                                 // 0 bare, 1 bandana, 2 cap, 3 tricorn
+  bool  hairLong = false;
+  bool  neckerchief = false;
+  bool  female = false;
+  // Phase 1b garment tints (linear RGB), one per garment slot. Identity (1,1,1)
+  // means "leave the GLB colour". Filled by makeKit; consumed by the tint upload.
+  glm::vec3 tintShirt{1}, tintCoat{1}, tintVest{1}, tintBreeches{1}, tintSash{1},
+            tintBoots{1}, tintHat{1}, tintHair{1}, tintNeck{1}, tintSkin{1};
+};
+
+// Deterministic kit from a seed (mirrors applyKitVariants' probabilities).
+Kit makeKit(uint32_t seed);
+
+// Whether a submesh (by its RigSubmesh name) is drawn for this kit — hides the
+// unchosen outer layer / hat / hair / neckerchief so each member wears one combo.
+bool kitShowsSubmesh(const Kit& k, const std::string& submeshName);
+
+// Garment tint slot (0..N) for a submesh, or -1 if it takes no per-member tint.
+// Used to pack the kit colours into the palette's spare morph-weight region.
+int garmentTintSlot(const std::string& submeshName);
+glm::vec3 kitTintFor(const Kit& k, int slot);
+constexpr int kTintSlotCount = 9;
+
 // One crew member's skeletal state. Cheap: a handful of per-node TRS scratch
 // arrays + two clip cursors. update() re-samples every frame from rest, so bones
 // a clip doesn't touch stay at their bind pose.

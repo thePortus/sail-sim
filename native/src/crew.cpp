@@ -5,6 +5,7 @@
 #include "crew.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 
@@ -32,6 +33,122 @@ glm::mat4 composeTRS(const glm::vec3& t, const glm::quat& r, const glm::vec3& s)
 }
 
 }  // namespace
+
+// ── Kit (look) selection — a native port of applyKitVariants ──────────────────
+namespace {
+struct KitRng {   // mulberry32, matching the Animator/client PRNG family
+  uint32_t a;
+  explicit KitRng(uint32_t s) : a(s ? s : 0x9e3779b9u) {}
+  float operator()() {
+    a += 0x6D2B79F5u; uint32_t t = a;
+    t = (t ^ (t >> 15)) * (t | 1u);
+    t ^= t + (t ^ (t >> 7)) * (t | 61u);
+    return ((t ^ (t >> 14)) >> 0) / 4294967296.0f;
+  }
+};
+template <size_t N>
+glm::vec3 pick(KitRng& r, const float (&tbl)[N][3]) {
+  size_t i = (size_t)(r() * N); if (i >= N) i = N - 1;
+  return glm::vec3(tbl[i][0], tbl[i][1], tbl[i][2]);
+}
+// Colour tables lifted verbatim from applyKitVariants.
+const float SHIRT[5][3] = {{0.86f,0.80f,0.66f},{0.92f,0.92f,0.86f},{0.36f,0.46f,0.60f},{0.60f,0.15f,0.11f},{0.74f,0.62f,0.44f}};
+const float COAT[5][3]  = {{0.24f,0.13f,0.08f},{0.07f,0.09f,0.18f},{0.05f,0.05f,0.06f},{0.34f,0.10f,0.08f},{0.09f,0.17f,0.11f}};
+const float BREE[5][3]  = {{0.24f,0.17f,0.11f},{0.15f,0.10f,0.06f},{0.26f,0.26f,0.28f},{0.06f,0.06f,0.07f},{0.10f,0.12f,0.20f}};
+const float SASH[5][3]  = {{0.60f,0.09f,0.07f},{0.66f,0.54f,0.11f},{0.16f,0.26f,0.52f},{0.11f,0.34f,0.14f},{0.05f,0.05f,0.06f}};
+const float BAND[4][3]  = {{0.60f,0.09f,0.07f},{0.16f,0.26f,0.52f},{0.05f,0.05f,0.06f},{0.22f,0.14f,0.09f}};
+const float BOOT[4][3]  = {{0.16f,0.09f,0.05f},{0.10f,0.06f,0.04f},{0.05f,0.04f,0.035f},{0.22f,0.12f,0.06f}};
+const float VEST[6][3]  = {{0.24f,0.17f,0.10f},{0.30f,0.30f,0.32f},{0.14f,0.16f,0.26f},{0.40f,0.12f,0.10f},{0.18f,0.22f,0.15f},{0.10f,0.10f,0.12f}};
+const float CAP[6][3]   = {{0.30f,0.20f,0.12f},{0.34f,0.34f,0.36f},{0.13f,0.17f,0.30f},{0.46f,0.13f,0.11f},{0.64f,0.56f,0.42f},{0.15f,0.24f,0.17f}};
+const float TRI[3][3]   = {{0.05f,0.05f,0.06f},{0.17f,0.11f,0.07f},{0.10f,0.12f,0.22f}};
+const float NECK[5][3]  = {{0.56f,0.11f,0.09f},{0.14f,0.23f,0.44f},{0.82f,0.80f,0.74f},{0.68f,0.54f,0.13f},{0.16f,0.35f,0.19f}};
+const float HAIR[5][3]  = {{0.06f,0.045f,0.03f},{0.11f,0.07f,0.04f},{0.20f,0.14f,0.08f},{0.46f,0.43f,0.41f},{0.30f,0.16f,0.07f}};
+
+std::string kitBase(const std::string& n) {
+  std::string s = n;
+  size_t p = s.find_last_of('.');   // strip '.NNN' + '_primitiveN'
+  if (p != std::string::npos) s = s.substr(0, p);
+  p = s.find("_primitive"); if (p != std::string::npos) s = s.substr(0, p);
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
+bool has(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
+}  // namespace
+
+Kit makeKit(uint32_t seed) {
+  KitRng r(seed);
+  Kit k;
+  k.female = r() < 0.16f;
+  const float bulk = r();
+  k.heavy = bulk > 0.64f ? 0.45f + r() * 0.5f : 0.0f;
+  k.lean  = (k.heavy == 0.0f && bulk < 0.34f) ? 0.35f + r() * 0.5f : 0.0f;
+  k.fem   = k.female ? 0.9f + r() * 0.1f : 0.0f;
+  // Shirt: ~30% striped (texture in the client; here just a bluish/red tint), else linen.
+  if (r() < 0.3f) { k.tintShirt = r() < 0.6f ? glm::vec3(0.20f,0.24f,0.42f) : glm::vec3(0.55f,0.14f,0.12f); }
+  else            { k.tintShirt = pick(r, SHIRT); }
+  k.tintBreeches = pick(r, BREE);
+  k.tintSash     = pick(r, SASH);
+  k.tintBoots    = pick(r, BOOT);
+  // Outer layer.
+  const float ro = r();
+  k.outer = k.female ? (ro < 0.30f ? 1 : ro < 0.45f ? 2 : 0)
+                     : (ro < 0.28f ? 1 : ro < 0.60f ? 2 : 0);
+  if (k.outer == 1) k.tintVest = pick(r, VEST);
+  else if (k.outer == 2) k.tintCoat = pick(r, COAT);
+  // Headwear.
+  const float rh = r();
+  k.hat = k.female ? (rh < 0.55f ? 1 : rh < 0.74f ? 2 : rh < 0.82f ? 3 : 0)
+                   : (rh < 0.30f ? 1 : rh < 0.58f ? 2 : rh < 0.72f ? 3 : 0);
+  if (k.hat == 1) k.tintHat = pick(r, BAND);
+  else if (k.hat == 2) k.tintHat = pick(r, CAP);
+  else if (k.hat == 3) k.tintHat = pick(r, TRI);
+  // Neckerchief (~35%).
+  k.neckerchief = r() < 0.35f;
+  if (k.neckerchief) k.tintNeck = pick(r, NECK);
+  // Long hair only on a bare head (the client also gates on a haired face texture).
+  k.hairLong = k.hat == 0 && r() < (k.female ? 0.8f : 0.4f);
+  if (k.hairLong) k.tintHair = pick(r, HAIR);
+  // Stature.
+  k.stature = 0.93f + r() * 0.13f;
+  if (k.female) k.stature *= 0.95f;
+  if (k.heavy > 0.0f) k.stature *= 1.02f;
+  return k;
+}
+
+bool kitShowsSubmesh(const Kit& k, const std::string& submeshName) {
+  const std::string b = kitBase(submeshName);
+  if (has(b, "vest"))       return k.outer == 1;
+  if (has(b, "coat"))       return k.outer == 2;
+  if (has(b, "bandana"))    return k.hat == 1;
+  if (has(b, "cap"))        return k.hat == 2;
+  if (has(b, "tricorn"))    return k.hat == 3;
+  if (has(b, "hair"))       return k.hairLong;
+  if (has(b, "neckerchief"))return k.neckerchief;
+  return true;   // shirt / breeches / boots / sash / base / eyes always show
+}
+
+int garmentTintSlot(const std::string& submeshName) {
+  const std::string b = kitBase(submeshName);
+  if (has(b, "shirt"))      return 0;
+  if (has(b, "coat"))       return 1;
+  if (has(b, "vest"))       return 2;
+  if (has(b, "breeches"))   return 3;
+  if (has(b, "sash"))       return 4;
+  if (has(b, "boots"))      return 5;
+  if (has(b, "bandana") || has(b, "cap") || has(b, "tricorn")) return 6;
+  if (has(b, "hair"))       return 7;
+  if (has(b, "neckerchief"))return 8;
+  return -1;   // base / eyes: skin, no per-member tint yet
+}
+
+glm::vec3 kitTintFor(const Kit& k, int slot) {
+  switch (slot) {
+    case 0: return k.tintShirt; case 1: return k.tintCoat; case 2: return k.tintVest;
+    case 3: return k.tintBreeches; case 4: return k.tintSash; case 5: return k.tintBoots;
+    case 6: return k.tintHat; case 7: return k.tintHair; case 8: return k.tintNeck;
+    default: return glm::vec3(1.0f);
+  }
+}
 
 Animator::Animator(std::shared_ptr<const RiggedData> rig, uint32_t seed)
     : rig_(std::move(rig)), rngState_(seed ? seed : 0x9e3779b9u) {

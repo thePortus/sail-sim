@@ -1266,7 +1266,7 @@ static void updateBirds(Impl* p, float dt, float camX, float camZ,
         if (m.py <= p->waveH(m.px, m.pz) + Impl::SEA_Y + 0.8f && m.vy <= 0.3f) {   // settleMember
           m.airborne = false; m.py = Impl::SEA_Y;
           m.ox = m.px - f.anchorX; m.oz = m.pz - f.anchorZ;
-          m.yaw = std::atan2(std::cos(m.hdg), -std::sin(m.hdg));
+          m.yaw = std::atan2(std::cos(m.hdg), -std::sin(m.hdg)) + glm::pi<float>();   // +pi: no-flip loader (see writeBird)
           m.bank = 0; m.vy = 0; m.onFinal = false; m.flare = 0; m.dipState = 0;
           m.restWingsOut = false; m.restTimer = 2 + p->frand() * 6;
         }
@@ -1883,10 +1883,15 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
           energy = m.onFinal ? 0.5f : (m.gliding ? 0.12f : m.flapE);
           wx = m.px; wy = m.py; wz = m.pz;
           float vx = std::sin(m.hdg), vz = std::cos(m.hdg);
-          float yaw = std::atan2(vz, -vx);
+          // +pi: the client's atan2(vz,-vx) assumes the gull noses along -X in
+          // Babylon's root-flipped scene; our raw loader doesn't flip, so the
+          // model noses along +X and needs the half-turn (same missing flip the
+          // dolphins/fish compensate). Pitch (about the span axis) survives the
+          // half-turn; bank (roll about the nose) inverts, so negate it.
+          float yaw = std::atan2(vz, -vx) + glm::pi<float>();
           float pitch = std::clamp(std::atan2(m.vy, std::max(m.spd, 1.0f)) * Impl::PITCH_GAIN
                                    + m.flare * Impl::FLARE_PITCH, -0.5f, 0.7f);
-          inst = composeBird(yaw, pitch, m.bank, m.scale, wx, wy, wz, m.tint,
+          inst = composeBird(yaw, pitch, -m.bank, m.scale, wx, wy, wz, m.tint,
                              energy * Impl::kBirdAmp[v]);
         } else {
           v = m.restWingsOut ? m.flyVariant : 2;

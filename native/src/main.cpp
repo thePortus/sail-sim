@@ -3104,24 +3104,19 @@ int main(int argc, char** argv) {
   // pruned when a ship leaves range / swaps to its impostor.
   std::map<std::string, std::unique_ptr<vanim::Controller>> remoteAnims;
   std::map<std::string, std::string> remoteAnimSlugs;
-  // Crew (Phase 1): one shared rigged Mesh (crew_spike.glb), N members drawn like
-  // ship instances — each its own crew::Animator (independent 52-joint palette
-  // slot) + seeded Kit (body build, stature, which hat/coat/hair). Loaded lazily;
-  // opt out with SAILSIM_NOCREW. Station-driven walking/reactions are Phase 2+.
+  // Crew (Phase 2): one shared rigged Mesh (crew_spike.glb) + a crew::Deck that runs
+  // the station/waypoint state machine (man stations, walk the graph, go aloft) in
+  // root-local space. Each member draws like a ship instance from its own palette
+  // slot with its seeded Kit. Loaded lazily; opt out with SAILSIM_NOCREW.
   const bool crewEnabled = std::getenv("SAILSIM_NOCREW") == nullptr;
   std::unique_ptr<Mesh> crewMesh;
-  struct CrewMember {
-    std::unique_ptr<crew::Animator> anim;
-    crew::Kit kit;
-    glm::vec3 rootLocal{0.0f};   // deck position (root-local: inner transform baked)
-    float yaw = 0.0f;            // facing about the deck normal (root-local)
-  };
-  std::vector<CrewMember> crewMembers;
+  std::unique_ptr<crew::Deck> crewDeck;
+  std::string crewDeckSlug;   // slug the current deck was built for (rebuild on hull change)
+  glm::mat4 crewInner(1.0f);  // ship bowYaw*scale*(-keel) at deck-build time
   // Body-build morph global slots (Fem=target0, Heavy=1, Lean=2) across the rig's
   // morphed meshes — driven per member into the palette slot's weight region.
   std::vector<int> crewFemIdx, crewHeavyIdx, crewLeanIdx;
   bool crewTried = false;
-  double crewClipT = 0.0;   // demo timer (SAILSIM_CREW_CYCLE)
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
@@ -6772,58 +6767,46 @@ int main(int argc, char** argv) {
           std::printf("[crew] FAILED to load %s\n", cpath.c_str());
         }
       }
-      // Spawn the crew once we have a mesh + a deck to stand on (deckTris ready).
-      if (crewMesh && crewMembers.empty() && !ownMesh->deckTris.empty()) {
-        const int want = ownVesselSlug == "brig" ? 12 : ownVesselSlug == "merchantman" ? 9
-                       : ownVesselSlug == "sloop" ? 7 : ownVesselSlug == "pinnace" ? 4 : 6;
-        glm::vec3 pov = fpCamFor(ownVesselSlug);
-        const float footRef = pov.y - 1.65f;   // kWalkEye
-        static const float LX[] = { 0.0f, -2.2f, 2.2f, -1.1f, 1.1f, -3.1f, 3.1f };
-        uint32_t seed = 0xC4E0u ^ std::hash<std::string>{}(ownVesselSlug);
-        auto nextRand = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
-        // Fill deck spots near the POV (sheer-tolerant: try a couple of foot bands).
-        for (float dz = -1.5f; dz <= 13.0f && (int)crewMembers.size() < want; dz += 1.8f) {
-          for (float lx : LX) {
-            if ((int)crewMembers.size() >= want) break;
-            const float x = pov.x + lx, z = pov.z + dz;
-            float dY = deckLocalHeight(*ownMesh, x, z, footRef);
-            if (std::isnan(dY)) dY = deckLocalHeight(*ownMesh, x, z, footRef + 2.2f);
-            if (std::isnan(dY)) continue;
-            bool tooClose = false;
-            for (const auto& o : crewMembers)
-              if (std::fabs(o.rootLocal.x - x) < 0.95f && std::fabs(o.rootLocal.z - z) < 0.95f) { tooClose = true; break; }
-            if (tooClose) continue;
-            CrewMember cm;
-            const uint32_t s = nextRand();
-            cm.anim = std::make_unique<crew::Animator>(crewMesh->rig, s);
-            cm.kit = crew::makeKit(s);
-            cm.rootLocal = glm::vec3(x, dY, z);
-            cm.yaw = (float)(nextRand() % 628) / 100.0f;   // random facing
-            crewMembers.push_back(std::move(cm));
+      // Build the station-graph deck once per hull (rebuild on a vessel change).
+      // Only the four rigs with an authored crew_stations.<slug>.json get a crew.
+      if (crewMesh && !ownMesh->deckTris.empty() &&
+          (!crewDeck || crewDeckSlug != ownVesselSlug)) {
+        const bool hasLayout = ownVesselSlug == "sloop" || ownVesselSlug == "pinnace" ||
+                               ownVesselSlug == "brig" || ownVesselSlug == "merchantman";
+        crewDeck.reset();
+        crewDeckSlug = ownVesselSlug;
+        if (hasLayout) {
+          const int want = ownVesselSlug == "brig" ? 12 : ownVesselSlug == "merchantman" ? 9
+                         : ownVesselSlug == "sloop" ? 7 : 4;
+          crewInner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
+          crewInner = glm::scale(crewInner, glm::vec3(ownMesh->shipScale));
+          crewInner = glm::translate(crewInner, -ownMesh->keelCenter);
+          const std::string layoutPath = geometryDir() + "/crew_stations." + ownVesselSlug + ".json";
+          const uint32_t seed = 0xC4E0u ^ (uint32_t)std::hash<std::string>{}(ownVesselSlug);
+          auto d = std::make_unique<crew::Deck>(crewMesh->rig, layoutPath, seed, want,
+                                                crewInner, ownMesh->deckTris, ownMesh->bowYaw, 1.2f);
+          if (d->ok()) { crewDeck = std::move(d);
+            std::printf("[crew] deck ready on '%s': %zu members\n", ownVesselSlug.c_str(), crewDeck->members().size());
           }
         }
-        std::printf("[crew] spawned %zu members on '%s'\n", crewMembers.size(), ownVesselSlug.c_str());
       }
-      if (crewMesh && !crewMembers.empty()) {
-        crewClipT += dt;
-        const char* forceClip = std::getenv("SAILSIM_CREW_CLIP");
-        const bool cycle = std::getenv("SAILSIM_CREW_CYCLE") != nullptr;
-        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel — the frame the
-        // deck-walk triangles (and so the members' root-local spots) live in.
-        glm::mat4 ownModel = ownShipModel(*ownMesh);
-        glm::mat4 inner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
-        inner = glm::scale(inner, glm::vec3(ownMesh->shipScale));
-        inner = glm::translate(inner, -ownMesh->keelCenter);
-        glm::mat4 outer = ownModel * glm::inverse(inner);
+      if (crewMesh && crewDeck) {
+        crewDeck->tick(dt);
+        if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 120) == 0) {
+          int st = 0, wk = 0, cl = 0;
+          for (auto& mm : crewDeck->members())
+            (mm.state == crew::State::Walk ? wk : mm.state == crew::State::Climb ? cl : st)++;
+          std::printf("[crew] f%ld  station=%d walk=%d climb=%d\n", frame, st, wk, cl);
+        }
+        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel — maps the members'
+        // root-local poses (which the deck maintains) into world with the heel/pitch.
+        glm::mat4 outer = ownShipModel(*ownMesh) * glm::inverse(crewInner);
         const size_t morphBase = (size_t)kMaxPaletteSlots * sizeof(glm::mat4);
         std::vector<uint8_t> blob(kPaletteStride, 0);
-        for (size_t i = 0; i < crewMembers.size() && i < kMaxShipInstances; ++i) {
-          CrewMember& m = crewMembers[i];
-          m.anim->play(forceClip ? forceClip
-                       : cycle ? (std::fmod(crewClipT, 8.0) > 4.0 ? "Walk" : "Idle")
-                       : "Idle", true, 1.0f);
-          m.anim->update(dt);
-          // Palette slot = joint matrices + body-build morph weights.
+        auto& members = crewDeck->members();
+        for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
+          crew::Member& m = members[i];
+          // Palette slot = joint matrices + body-build morph weights + garment tints.
           const auto& pal = m.anim->palette();
           std::memcpy(blob.data(), pal.data(),
                       std::min(pal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
@@ -6834,16 +6817,13 @@ int main(int argc, char** argv) {
           for (int gi : crewFemIdx)   setW(gi, m.kit.fem);
           for (int gi : crewHeavyIdx) setW(gi, m.kit.heavy);
           for (int gi : crewLeanIdx)  setW(gi, m.kit.lean);
-          // Garment tints into the palette weight region w[32..40] (vec4 each),
-          // read by the fragment shader via the submesh's tint slot.
           for (int k = 0; k < crew::kTintSlotCount; ++k) {
             glm::vec4 tv(crew::kitTintFor(m.kit, k), 1.0f);
             size_t toff = morphBase + (size_t)(32 + k) * sizeof(glm::vec4);
             if (toff + sizeof(glm::vec4) <= blob.size()) std::memcpy(blob.data() + toff, &tv, sizeof(glm::vec4));
           }
           wgpuQueueWriteBuffer(queue, crewMesh->paletteBuf, (uint64_t)i * kPaletteStride, blob.data(), kPaletteStride);
-          // Model: place the root-local deck spot in world, face + stature scale.
-          glm::mat4 cmModel = outer * glm::translate(glm::mat4(1.0f), m.rootLocal);
+          glm::mat4 cmModel = outer * glm::translate(glm::mat4(1.0f), m.pos);
           cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
           cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
           MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),
@@ -6972,16 +6952,17 @@ int main(int argc, char** argv) {
         }
         slot[m] = idx + 1;
       }
-      // Crew (Phase 1): draw each member from its own slot like a ship instance,
+      // Crew (Phase 2): draw each member from its own slot like a ship instance,
       // skipping the submeshes its kit hides (unchosen hat/coat/hair/neckerchief).
       // Group 1 (shadow-receive) stays bound from the ships above.
-      if (crewEnabled && sailing && crewMesh && !crewMembers.empty()) {
+      if (crewEnabled && sailing && crewMesh && crewDeck && !crewDeck->members().empty()) {
+        auto& members = crewDeck->members();
         wgpuRenderPassEncoderSetPipeline(pass, crewMesh->pipeline);
         wgpuRenderPassEncoderSetVertexBuffer(pass, 0, crewMesh->vbuf, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(pass, crewMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        for (size_t i = 0; i < crewMembers.size() && i < kMaxShipInstances; ++i) {
+        for (size_t i = 0; i < members.size() && i < kMaxShipInstances; ++i) {
           uint32_t off[2] = { (uint32_t)(i * crewMesh->uniformStride), (uint32_t)(i * kPaletteStride) };
-          const crew::Kit& kit = crewMembers[i].kit;
+          const crew::Kit& kit = members[i].kit;
           for (size_t s = 0; s < crewMesh->submeshes.size(); ++s) {
             const RigSubmesh& sm = crewMesh->submeshes[s];
             if (!crew::kitShowsSubmesh(kit, sm.name)) continue;

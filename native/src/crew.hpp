@@ -11,7 +11,9 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -103,6 +105,79 @@ class Animator {
   std::vector<glm::vec3> ct_, cs_, pt_, ps_, bt_, bs_;
   std::vector<glm::quat> cr_, pr_, br_;
   std::vector<glm::mat4> worlds_, palette_;
+};
+
+// ── Station/waypoint lifecycle (Phase 2, a port of CrewHandle) ────────────────
+// The authored layout (crew_stations.<slug>.json) converted into root-local space
+// (the frame the ship's deck triangles live in), so a member's position/heading
+// apply verbatim and the ship's heel/pitch come from the outer transform.
+struct Station { std::string id, kind, clip, wp; glm::vec3 pos{0}; float yaw = 0; };
+struct Climb   { std::string id, clip, approachWp; std::vector<glm::vec3> poly; };
+struct PathLeg { glm::vec3 to{0}; std::string kind; };
+
+enum class State { Station, Walk, Climb };
+
+struct Member {
+  std::unique_ptr<Animator> anim;
+  Kit kit;
+  State state = State::Station;
+  std::string stationId, wpId, targetStation, targetClimb, stationClip = "Idle";
+  glm::vec3 pos{0};                 // current root-local position
+  glm::vec3 stationPos{0};          // reserved station anchor
+  float yaw = 0, yawTarget = 0, stationYaw = 0;
+  float dwell = 0;
+  std::vector<PathLeg> legs; float legT = 0; glm::vec3 legFrom{0};
+  std::vector<glm::vec3> climbPoly; int climbSeg = 0; float climbT = 0, climbPause = 0; int climbDir = 1;
+  float animSpeed = 1.0f;
+  uint32_t rngState = 1;
+  float rand();
+};
+
+// One ship's crew: owns the members + the station graph, runs the state machine
+// each frame in root-local space. main.cpp renders members()' poses (pos+yaw+kit
+// + anim palette) exactly like Phase 1.
+class Deck {
+ public:
+  // inner = the ship model's bowYaw*scale*(-keel) (converts the authored raw coords
+  // to root-local); deckTris = the ship's root-local deck triangles (feet snapping);
+  // bowYaw re-aims the authored headings into root-local; walkSpeed m/s.
+  Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath, uint32_t seed,
+       int count, const glm::mat4& inner, std::vector<glm::vec3> deckTris, float bowYaw,
+       float walkSpeed = 1.2f);
+  bool ok() const { return ok_; }
+  void tick(float dt);
+  std::vector<Member>& members() { return members_; }
+
+ private:
+  float deckHeight(float lx, float lz, float footRef) const;   // deckLocalHeight port
+  void  deckSnap(glm::vec3& p) const;                          // snap y to the planks
+  Station* pickStation(Member& m, bool excludeCurrent = false);
+  void  releaseStation(Member& m);
+  void  arriveAt(Member& m, const Station& st, bool teleport);
+  void  beginWalk(Member& m, const std::string& goalWp, const Station* target, const Climb* climb);
+  void  tickMember(Member& m, float dt);
+  void  tickWalk(Member& m, float dt);
+  void  tickClimb(Member& m, float dt);
+  void  finishWalk(Member& m);
+  std::vector<std::string> bfs(const std::string& from, const std::string& to) const;
+  std::string edgeKind(const std::string& a, const std::string& b) const;
+  float legSpeed(const std::string& kind) const;
+  void  playLeg(Member& m, const std::string& kind);
+  void  play(Member& m, const std::string& clip, bool loop);
+
+  std::shared_ptr<const RiggedData> rig_;
+  std::vector<Member> members_;
+  std::map<std::string, glm::vec3> waypoints_;
+  std::map<std::string, std::vector<std::pair<std::string, std::string>>> adj_;   // id -> [(to,kind)]
+  std::vector<Station> stations_;
+  std::vector<Climb> climbs_;
+  std::set<std::string> reserved_;
+  std::vector<glm::vec3> deckTris_;
+  float walkSpeed_ = 1.2f, deckLift_ = 0.0f;
+  int walkers_ = 0; bool climbBusy_ = false;
+  uint32_t rootRng_ = 1;
+  bool ok_ = false;
+  float rand();
 };
 
 }  // namespace crew

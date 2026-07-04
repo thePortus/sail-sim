@@ -3245,6 +3245,8 @@ int main(int argc, char** argv) {
   std::string chatActiveTab;                   // "" = Main, else a DM callsign
   char chatInput[512] = "";
   bool chatFocusInput = false, chatStickBottom = true;
+  bool chatOpen = false;   // collapsed to a bubble by default (full-restructure HUD)
+  int  chatUnread = 0;     // messages arrived while collapsed (badge on the bubble)
 
   // Multiplayer: connected on entering Sailing, closed on logout. Our pose is
   // sent ~10 Hz; remote players/wind arrive on the client's own thread.
@@ -3665,10 +3667,10 @@ int main(int argc, char** argv) {
         ImGui::Begin("Menu", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse);
         const ImVec2 bsz(-FLT_MIN, 36);
-        if (ImGui::Button("Resume", bsz)) escMenu = false;
-        if (ImGui::Button("Settings", bsz)) { settingsOpen = true; escMenu = false; }
+        if (ImGui::Button(ICON_FA_PLAY "   Resume", bsz)) escMenu = false;
+        if (ImGui::Button(ICON_FA_GEAR "   Settings", bsz)) { settingsOpen = true; escMenu = false; }
         ImGui::Separator();
-        if (ImGui::Button("Log out", bsz)) {
+        if (ImGui::Button(ICON_FA_RIGHT_FROM_BRACKET "   Log out", bsz)) {
           escMenu = false; settingsOpen = false;
           musicMgr.stop();
           mpClient.close(); mpConnected = false;
@@ -3677,7 +3679,7 @@ int main(int argc, char** argv) {
           uiError.clear();
           appState = AppState::Login;
         }
-        if (ImGui::Button("Quit", bsz)) glfwSetWindowShouldClose(window, GLFW_TRUE);
+        if (ImGui::Button(ICON_FA_POWER_OFF "   Quit", bsz)) glfwSetWindowShouldClose(window, GLFW_TRUE);
         ImGui::End();
       }
       if (settingsOpen) {
@@ -3862,15 +3864,8 @@ int main(int argc, char** argv) {
                             : cs == mp::ConnState::AuthFailed ? "auth failed" : "offline";
       const ImVec4 connCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f) : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
       ImGui::TextColored(connCol, ICON_FA_TOWER_BROADCAST "  %s   (%d nearby)", connLabel, (int)others.size());
-      ImGui::Separator();
-      if (ImGui::Button(ICON_FA_RIGHT_FROM_BRACKET "  Log out")) {
-        musicMgr.stop();
-        mpClient.close(); mpConnected = false;
-        session::clear();
-        authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
-        uiError.clear();
-        appState = AppState::Login;
-      }
+      // Log out lives in the Esc menu (gear icon / Esc) — kept out of this panel
+      // to reclaim vertical space in the restructured HUD.
       ImGui::End();
 
       // ── Top-right: sail status ──
@@ -4911,16 +4906,37 @@ int main(int argc, char** argv) {
         if (chatLog.size() >= 400) chatLog.erase(chatLog.begin(), chatLog.begin() + 100);
         chatLog.push_back(std::move(cm));
         chatStickBottom = true;
+        if (!chatOpen) chatUnread++;   // badge the collapsed bubble
       }
-      // Enter (while not typing) jumps to the chat input — the browser's hotkey.
+      // Enter (while not typing) opens the chat + focuses the input (browser hotkey).
       if (!io.WantTextInput &&
-          (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
-        chatFocusInput = true;
+          (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+        chatFocusInput = true; chatOpen = true; chatUnread = 0;
+      }
+
+      // Collapsed: a chat-bubble button (bottom-left) with an unread badge.
+      if (!chatOpen) {
+        ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        ImGui::Begin("##chatbubble", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
+        const ImVec2 bp = ImGui::GetCursorScreenPos();
+        if (iconBtn(ICON_FA_COMMENT_DOTS, "Chat (Enter)", chatUnread > 0)) { chatOpen = true; chatUnread = 0; }
+        if (chatUnread > 0) {   // red unread badge, top-right of the bubble
+          ImDrawList* bdl = ImGui::GetWindowDrawList();
+          const ImVec2 bc(bp.x + 30.0f, bp.y + 4.0f);
+          bdl->AddCircleFilled(bc, 8.0f, IM_COL32(220, 60, 55, 255));
+          char cnt[8]; std::snprintf(cnt, sizeof(cnt), "%d", chatUnread > 9 ? 9 : chatUnread);
+          const ImVec2 cs2 = ImGui::CalcTextSize(cnt);
+          bdl->AddText(ImVec2(bc.x - cs2.x * 0.5f, bc.y - cs2.y * 0.5f), IM_COL32(255, 255, 255, 255), cnt);
+        }
+        ImGui::End();
+      }
 
       ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
       ImGui::SetNextWindowSize(ImVec2(380.0f, 262.0f), ImGuiCond_FirstUseEver);
       ImGui::SetNextWindowSizeConstraints(ImVec2(280.0f, 170.0f), ImVec2(820.0f, 640.0f));
-      if (ImGui::Begin("Chat", nullptr, ImGuiWindowFlags_NoCollapse)) {
+      const bool chatShown = chatOpen;   // Begin() called iff open — End() must match
+      if (chatShown && ImGui::Begin("Chat", &chatOpen, ImGuiWindowFlags_NoCollapse)) {
         // Tab bar: Main + a closable tab per DM partner.
         if (ImGui::BeginTabBar("##chattabs")) {   // new DM tabs appear but don't steal focus (matches the client)
           if (ImGui::BeginTabItem("Main")) { chatActiveTab.clear(); ImGui::EndTabItem(); }
@@ -5006,7 +5022,7 @@ int main(int argc, char** argv) {
           }
         }
       }
-      ImGui::End();
+      if (chatShown) ImGui::End();
       }   // end if (!photoMode) — HUD panels + labels + minimap + chat
 
       // Broadcast our pose ~10 Hz (once the spawn is placed — the first update is

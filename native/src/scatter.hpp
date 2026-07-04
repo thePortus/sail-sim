@@ -55,7 +55,9 @@ public:
   // Cast the near full-mesh palms + beeches into a sun cascade (depth-only), so
   // close trees throw real shadows on the ground the terrain now receives. Call
   // in the shadow pass; uses the instance buffers packed by the last draw().
-  void drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec);
+  // cascade = which sun cascade this pass is (0 tight / 1 wide) — selects a distinct
+  // uniform buffer so casting into BOTH cascades in one frame doesn't clobber.
+  void drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec, int cascade);
 
   // ── Gull-cry audio events (bird.service cryBurst / updateAmbientCalls) ──
   // update() queues cries at world positions (startled rafts burst 5-12 calls;

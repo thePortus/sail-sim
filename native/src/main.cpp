@@ -6444,7 +6444,7 @@ int main(int argc, char** argv) {
       SunShadow& shdw = sunShadow(device);
       WGPUCommandEncoder senc = wgpuDeviceCreateCommandEncoder(device, nullptr);
       auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, bool withTerrain,
-                            const glm::mat4& scatterVP) {
+                            const glm::mat4& scatterVP, int cascade) {
         WGPURenderPassDepthStencilAttachment da = {};
         da.view = view;
         da.depthLoadOp = WGPULoadOp_Clear; da.depthStoreOp = WGPUStoreOp_Store;
@@ -6481,12 +6481,12 @@ int main(int argc, char** argv) {
         // cascade (crisp, stable tree shadows on a beach the ship sails near — the
         // terrain reads it first for near points) AND the wide cascade (coarse, for
         // trees past the tight box). Trees outside a cascade just clip.
-        scatterSys.drawShadow(sp, scatterVP, t);
+        scatterSys.drawShadow(sp, scatterVP, t, cascade);
         wgpuRenderPassEncoderEnd(sp);
         wgpuRenderPassEncoderRelease(sp);
       };
-      shadowPass(shdw.view0, shdw.castBG0, false, shadowVP0);   // tight ship cascade (+ near trees)
-      shadowPass(shdw.view1, shdw.castBG1, true,  shadowVP1);   // wide landscape cascade
+      shadowPass(shdw.view0, shdw.castBG0, false, shadowVP0, 0);   // tight ship cascade (+ near trees)
+      shadowPass(shdw.view1, shdw.castBG1, true,  shadowVP1, 1);   // wide landscape cascade
       WGPUCommandBuffer scmd = wgpuCommandEncoderFinish(senc, nullptr);
       wgpuQueueSubmit(queue, 1, &scmd);
       wgpuCommandBufferRelease(scmd);

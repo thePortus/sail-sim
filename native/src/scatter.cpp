@@ -319,8 +319,8 @@ struct System::Impl {
   // Depth-only caster: near full-mesh trees into the sun cascade (real shadows).
   WGPURenderPipeline shadowPipeline = nullptr;
   WGPUBindGroupLayout shadowBGL = nullptr;
-  WGPUBuffer shadowUbuf = nullptr;
-  WGPUBindGroup shadowBind = nullptr;
+  WGPUBuffer shadowUbuf[2] = { nullptr, nullptr };     // one per cascade (no cross-clobber)
+  WGPUBindGroup shadowBind[2] = { nullptr, nullptr };
   int lastPX = INT32_MIN, lastPZ = INT32_MIN;
   float flushX = 1e9f, flushZ = 1e9f;   // camera pos of the last visible-set flush
 
@@ -615,10 +615,12 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
     wgpuPipelineLayoutRelease(spl);
     WGPUBufferDescriptor sub = {}; sub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     sub.size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);   // LU layout
-    p->shadowUbuf = wgpuDeviceCreateBuffer(device, &sub);
-    WGPUBindGroupEntry sbe = {}; sbe.binding = 0; sbe.buffer = p->shadowUbuf; sbe.size = sub.size;
-    WGPUBindGroupDescriptor sbgd = {}; sbgd.layout = p->shadowBGL; sbgd.entryCount = 1; sbgd.entries = &sbe;
-    p->shadowBind = wgpuDeviceCreateBindGroup(device, &sbgd);
+    for (int ci = 0; ci < 2; ++ci) {
+      p->shadowUbuf[ci] = wgpuDeviceCreateBuffer(device, &sub);
+      WGPUBindGroupEntry sbe = {}; sbe.binding = 0; sbe.buffer = p->shadowUbuf[ci]; sbe.size = sub.size;
+      WGPUBindGroupDescriptor sbgd = {}; sbgd.layout = p->shadowBGL; sbgd.entryCount = 1; sbgd.entries = &sbe;
+      p->shadowBind[ci] = wgpuDeviceCreateBindGroup(device, &sbgd);
+    }
   }
 
   WGPUSamplerDescriptor sd = {};
@@ -1973,9 +1975,10 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
 }
 
 // ── Draw: frustum-culled patch flush + per-set draws ──────────────────────────
-void System::drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec) {
+void System::drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, double timeSec, int cascade) {
   Impl* p = p_.get();
   if (!p->ready || !p->shadowPipeline) return;
+  const int ci = (cascade == 1) ? 1 : 0;
   // Cast the near full-mesh palms + beeches (their instance buffers, packed by
   // the last draw()) into the cascade. lod = 0 disables the LOD shrink (full
   // size everywhere), windAmp = 0 keeps the caster steady; only the full[]
@@ -1983,9 +1986,9 @@ void System::drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, d
   struct LU { glm::mat4 vp; glm::vec4 eye, sun, anim, lod; };
   LU u{ shadowVP, glm::vec4(0.0f), glm::vec4(0.0f),
         glm::vec4((float)timeSec, 1.0f, 0.0f, 0.0f), glm::vec4(0.0f) };
-  wgpuQueueWriteBuffer(p->queue, p->shadowUbuf, 0, &u, sizeof(u));
+  wgpuQueueWriteBuffer(p->queue, p->shadowUbuf[ci], 0, &u, sizeof(u));
   wgpuRenderPassEncoderSetPipeline(pass, p->shadowPipeline);
-  wgpuRenderPassEncoderSetBindGroup(pass, 0, p->shadowBind, 0, nullptr);
+  wgpuRenderPassEncoderSetBindGroup(pass, 0, p->shadowBind[ci], 0, nullptr);
   Layer* casters[] = { &p->palms, &p->trees };
   for (Layer* l : casters)
     for (const DrawSet& d : l->full) {

@@ -236,6 +236,12 @@ struct Mesh {
   bool  oceanMask = true;               // per-vessel opt-out (brig: freeboard does the job)
   float maskFloorY = -1.0e9f;           // hull-local clamp: mask only the deck above this (merchantman)
   float mastTop = 18.0f;                // world metres, keel->masthead (label anchor)
+  // Walkable deck triangles in ROOT-LOCAL space (bowYaw*scale*(-keelCenter)
+  // baked in), for the first-person deck-walk raycast (client deckLocalHeight).
+  // The buoyancy tilt is the OUTER transform, applied equally to eye + deck, so
+  // in this frame the deck is static — a straight-down ray needs no per-frame
+  // matrix. Captured for ships only (meshes with hull submeshes).
+  std::vector<glm::vec3> deckTris;      // flat list, 3 verts per triangle
 };
 
 // Per-vessel model quirks, mirroring the client's VESSEL_RIGS (vessel-controller.ts):
@@ -701,6 +707,34 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
 
   wgpuBindGroupLayoutRelease(bgl);
 
+  // Capture walkable deck triangles for the first-person deck-walk raycast,
+  // BEFORE the CPU vertex/index copies are dropped below. Ships only (meshes
+  // with a hull submesh) — piers/buildings never host a walk. Exclusions match
+  // the client deckCandsCam: skip water/ocean/sails/flags + crew/ik rigs; the
+  // per-frame band clamp (not this list) keeps overhead spars/mast off-limits.
+  // Positions are RAW model space here; loadVessel bakes them to root-local.
+  if (!mesh.hullRanges.empty() && !data.vertices.empty()) {
+    const size_t stride = kRigFloatsPerVertex;
+    auto pos = [&](uint32_t vi) {
+      return glm::vec3(data.vertices[vi * stride + 0], data.vertices[vi * stride + 1],
+                       data.vertices[vi * stride + 2]);
+    };
+    for (const RigSubmesh& sm : data.submeshes) {
+      std::string n = sm.name;
+      for (char& c : n) c = (char)std::tolower((unsigned char)c);
+      if (n.find("water") != std::string::npos || n.find("ocean") != std::string::npos ||
+          n.find("impostor") != std::string::npos || n.find("sail") != std::string::npos ||
+          n.find("flag") != std::string::npos || n.rfind("crew_", 0) == 0 ||
+          n.rfind("ik_", 0) == 0)
+        continue;
+      for (uint32_t i = 0; i + 2 < sm.indexCount; i += 3) {
+        mesh.deckTris.push_back(pos(data.indices[sm.indexOffset + i + 0]));
+        mesh.deckTris.push_back(pos(data.indices[sm.indexOffset + i + 1]));
+        mesh.deckTris.push_back(pos(data.indices[sm.indexOffset + i + 2]));
+      }
+    }
+  }
+
   // Retain the rig (nodes/skins/clips/morphs) for the Phase 1 controllers;
   // drop the heavy CPU copies that are now on the GPU.
   data.vertices.clear(); data.vertices.shrink_to_fit();
@@ -748,7 +782,56 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
   // the sky through the hole); clamping keeps the mask to the above-water hull.
   mesh.maskFloorY = spec.maskFloorY > -1.0e8f ? spec.maskFloorY
                   : bbMin.y + (mesh.draft + 0.3f) / std::max(mesh.shipScale, 1e-6f);
+  // Bake the captured deck triangles from raw model space into ROOT-LOCAL: the
+  // inner transform the ship model matrix applies (bowYaw -> scale -> keel), so
+  // the deck sits in the same frame the first-person eye lives in.
+  if (!mesh.deckTris.empty()) {
+    const glm::mat4 inner =
+        glm::rotate(glm::mat4(1.0f), mesh.bowYaw, glm::vec3(0, 1, 0)) *
+        glm::scale(glm::mat4(1.0f), glm::vec3(mesh.shipScale)) *
+        glm::translate(glm::mat4(1.0f), -mesh.keelCenter);
+    for (glm::vec3& p : mesh.deckTris) p = glm::vec3(inner * glm::vec4(p, 1.0f));
+  }
   return mesh;
+}
+
+// Vessel-local first-person eye point (server vessels.controller.js
+// firstPersonCam, verbatim). Vessel-local metres: +Z bow, +Y up, +X starboard.
+// Used as the deck-walk START; the deck raycast snaps the eye height each frame,
+// so a small model-scale difference just re-seats the eye on the real deck.
+static glm::vec3 fpCamFor(const std::string& slug) {
+  if (slug == "merchantman") return { 1.4f, 8.8f, -9.0f };
+  if (slug == "brig")        return { 1.2f, 6.6f, -9.5f };
+  if (slug == "pinnace")     return { -0.45f, 1.45f, -2.4f };
+  return { 0.6f, 2.6f, -2.8f };   // sloop / default
+}
+
+// Ship-local deck height under a root-local XZ (client deckLocalHeight): a short
+// straight-down ray against the baked deck triangles, accepting only a hit in a
+// gentle band [footY-3, footY+0.9] of the current foot level. The band lets the
+// quarterdeck stairs through and follows the deck down, but ignores overhead
+// spars/boom/mast-tops (no climbing the rigging) and refuses a big drop off the
+// rail. Returns the highest in-band hit, or NaN = off the deck.
+static float deckLocalHeight(const Mesh& m, float lx, float lz, float footY) {
+  const glm::vec3 ro(lx, footY + 2.2f, lz);
+  float best = std::numeric_limits<float>::quiet_NaN();
+  const std::vector<glm::vec3>& t = m.deckTris;
+  for (size_t i = 0; i + 2 < t.size(); i += 3) {
+    const glm::vec3& a = t[i]; const glm::vec3& b = t[i + 1]; const glm::vec3& c = t[i + 2];
+    // Straight-down ray (0,-1,0): a 2-D point-in-triangle on XZ, then bary Y.
+    const float d0x = b.x - a.x, d0z = b.z - a.z;
+    const float d1x = c.x - a.x, d1z = c.z - a.z;
+    const float den = d0x * d1z - d1x * d0z;
+    if (std::fabs(den) < 1e-9f) continue;
+    const float px = lx - a.x, pz = lz - a.z;
+    const float u = (px * d1z - d1x * pz) / den;
+    const float v = (d0x * pz - px * d0z) / den;
+    if (u < 0.0f || v < 0.0f || u + v > 1.0f) continue;
+    const float hy = a.y + u * (b.y - a.y) + v * (c.y - a.y);
+    if (hy > ro.y || hy < footY - 3.0f || hy > footY + 0.9f) continue;   // below ray start; in band
+    if (std::isnan(best) || hy > best) best = hy;
+  }
+  return best;
 }
 
 // Vessel slug -> GLB path (mirrors server/controllers/vessels.controller.js). The
@@ -2999,6 +3082,15 @@ int main(int argc, char** argv) {
   // keeps chasing as the ship turns while any drag offset is preserved.
   float camYawOffset = 0.0f, camPitch = 0.43f, camDist = 14.3f;
   bool  camFramed = false;   // set the default chase distance from the vessel size once
+  // ── View modes (client HUD buttons) ──
+  bool  firstPerson = false;            // camera sits on the deck; drag = free-look, LMB+WASD = walk
+  glm::vec3 fpEye(0.0f, 2.0f, -2.0f);   // root-local eye (deck-walk position)
+  float fpYaw = 0.0f, fpPitch = 0.0f;   // free-look offsets (degrees; +pitch = up)
+  bool  fpWalkActive = false;           // LMB held over the 3D view this frame (walk gate)
+  bool  photoMode = false;              // hide all HUD + labels for a clean shot (+ fullscreen)
+  bool  isFullscreen = false;
+  int   savedWinX = 60, savedWinY = 60, savedWinW = 1280, savedWinH = 720;   // restore from fullscreen
+  bool  prevKeyV = false, prevKeyF2 = false, prevKeyF11 = false;
   double lastMouseX = 0.0, lastMouseY = 0.0;
   glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
 
@@ -3341,20 +3433,81 @@ int main(int argc, char** argv) {
       std::vector<mp::RemotePlayer> others = mpClient.players();
       mp::WaveState wv = mpClient.wave();
 
-      // ── Escape menu: Esc closes settings first, then toggles the menu. ──
+      // ── View modes (client HUD buttons): fullscreen (F11), photo mode (F2 —
+      //    fullscreen + hide all HUD/labels for a clean shot), first-person
+      //    on-deck (V). Buttons drawn in the toolbar below; keys here. ──
+      auto setFullscreen = [&](bool on) {
+        if (on == isFullscreen) return;
+        if (on) {
+          glfwGetWindowPos(window, &savedWinX, &savedWinY);
+          glfwGetWindowSize(window, &savedWinW, &savedWinH);
+          GLFWmonitor* mon = glfwGetPrimaryMonitor();
+          const GLFWvidmode* vm = glfwGetVideoMode(mon);
+          glfwSetWindowMonitor(window, mon, 0, 0, vm->width, vm->height, vm->refreshRate);
+        } else {
+          glfwSetWindowMonitor(window, nullptr, savedWinX, savedWinY, savedWinW, savedWinH, 0);
+        }
+        isFullscreen = on;   // the per-frame resize block reconfigures the surface + targets
+      };
+      auto setPhotoMode = [&](bool on) {
+        if (on == photoMode) return;
+        photoMode = on;
+        setFullscreen(on);   // entering also goes fullscreen; leaving drops back (client parity)
+      };
+      auto enterFirstPerson = [&](bool on) {
+        firstPerson = on;
+        fpWalkActive = false;
+        if (on) {   // seed the eye at the vessel's manifest deck point, look forward
+          fpEye = fpCamFor(ownVesselSlug.empty() ? "sloop" : ownVesselSlug);
+          fpYaw = 0.0f; fpPitch = 0.0f;
+        }
+      };
+      {
+        const bool kV = glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS;
+        const bool kF2 = glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS;
+        const bool kF11 = glfwGetKey(window, GLFW_KEY_F11) == GLFW_PRESS;
+        if (kV && !prevKeyV) enterFirstPerson(!firstPerson);
+        if (kF2 && !prevKeyF2) setPhotoMode(!photoMode);
+        if (kF11 && !prevKeyF11) setFullscreen(!isFullscreen);
+        prevKeyV = kV; prevKeyF2 = kF2; prevKeyF11 = kF11;
+      }
+
+      // ── Escape menu: Esc leaves photo mode first, else closes settings, else
+      //    stands batteries down, else toggles the menu. ──
       {
         if (frame == 60) {   // headless screenshot hooks
           if (std::getenv("SAILSIM_ESCMENU")) escMenu = true;
           if (std::getenv("SAILSIM_SETTINGS")) settingsOpen = true;
+          if (std::getenv("SAILSIM_FP")) enterFirstPerson(true);
+          if (std::getenv("SAILSIM_PHOTO")) photoMode = true;
         }
         const bool escKey = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
         if (escKey && !prevEscKey) {
-          if (guns.anyCancellable()) guns.cancel();   // stand the batteries down first
+          if (photoMode) setPhotoMode(false);         // clean-shot mode exits on Esc (client capture-phase)
+          else if (guns.anyCancellable()) guns.cancel();   // stand the batteries down first
           else if (settingsOpen) settingsOpen = false;
           else escMenu = !escMenu;
         }
         prevEscKey = escKey;
       }
+      // ── View-mode toolbar (top-right, above the sail panel): fullscreen /
+      //    photo / first-person, mirroring the client's HUD buttons. Hidden in
+      //    photo mode itself (clean shot) — exit with Esc or F2. ──
+      if (!photoMode) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 12.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::Begin("##viewtools", nullptr,
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
+        if (firstPerson) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.65f, 1.0f));
+        if (ImGui::Button(firstPerson ? "Deck view [V]" : "1st person [V]")) enterFirstPerson(!firstPerson);
+        if (firstPerson) ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::Button("Photo [F2]")) setPhotoMode(true);
+        ImGui::SameLine();
+        if (ImGui::Button(isFullscreen ? "Windowed [F11]" : "Fullscreen [F11]")) setFullscreen(!isFullscreen);
+        ImGui::End();
+      }
+
       if (escMenu) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -3417,6 +3570,9 @@ int main(int argc, char** argv) {
                       : windAngle < 60 ? "Close Reach" : windAngle < 90 ? "Beam Reach"
                       : windAngle < 145 ? "Broad Reach" : windAngle < 165 ? "Running" : "Dead Downwind";
 
+      // Photo mode hides EVERY panel, label, minimap and chat below for a clean
+      // screenshot (client photoMode) — the toolbar + esc menu above stay.
+      if (!photoMode) {
       // ── Top-left: wind gauge + readouts ──
       ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -4651,6 +4807,7 @@ int main(int argc, char** argv) {
         }
       }
       ImGui::End();
+      }   // end if (!photoMode) — HUD panels + labels + minimap + chat
 
       // Broadcast our pose ~10 Hz (once the spawn is placed — the first update is
       // the server's trusted baseline). Heading is sent in DEGREES.
@@ -4972,9 +5129,14 @@ int main(int argc, char** argv) {
         vessel.speed = 0.0f; vessel.yawRate = 0.0f;
         if (guns.anyCancellable()) guns.cancel();
       }
+      // On-deck WASD walks the eye (client) — reroute it away from helm/sail
+      // while first-person with the left button held. Q/E/T + gunnery still pass.
+      const bool deckWalking = firstPerson && !io.WantCaptureMouse &&
+                               glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
       if (!io.WantCaptureKeyboard && !meSunk) {
-        rudder = (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
-        bool raise = down(GLFW_KEY_W, GLFW_KEY_UP), lower = down(GLFW_KEY_S, GLFW_KEY_DOWN);
+        rudder = deckWalking ? 0 : (down(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1 : 0) - (down(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1 : 0);
+        bool raise = !deckWalking && down(GLFW_KEY_W, GLFW_KEY_UP);
+        bool lower = !deckWalking && down(GLFW_KEY_S, GLFW_KEY_DOWN);
         bool anchor = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
         // Sheet: Q eases the sail out, E hauls it in, T jumps to the optimal
         // angle for the current apparent-wind angle (the client bindings).
@@ -5114,11 +5276,22 @@ int main(int argc, char** argv) {
     double mdx = mx - lastMouseX, mdy = my - lastMouseY;
     lastMouseX = mx; lastMouseY = my;
     const bool camActive = (appState == AppState::Sailing);
-    if (camActive && !io.WantCaptureMouse &&
-        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-      camYawOffset += (float)mdx * 0.005f;   // drag right -> orbit right (sign matches the mirrored projection)
-      camPitch     -= (float)mdy * 0.005f;   // drag up    -> look from higher
-      camPitch = glm::clamp(camPitch, 0.05f, 1.45f);
+    const bool lmbDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    // LMB over the 3D view (not the HUD) drags the camera; in first-person it
+    // also arms the deck-walk (client: WASD walks only while the button is held).
+    fpWalkActive = firstPerson && camActive && lmbDown && !io.WantCaptureMouse;
+    if (camActive && !io.WantCaptureMouse && lmbDown) {
+      if (firstPerson) {
+        // On-deck free-look: drag yaws (free 360) + pitches (clamped ±70), the
+        // client's 0.30/0.25 deg-per-pixel rates. Yaw sign matches the orbit
+        // (both feed sin/cos the same way through the mirrored projection).
+        fpYaw   += (float)mdx * 0.30f;
+        fpPitch  = glm::clamp(fpPitch - (float)mdy * 0.25f, -70.0f, 70.0f);
+      } else {
+        camYawOffset += (float)mdx * 0.005f;   // drag right -> orbit right (sign matches the mirrored projection)
+        camPitch     -= (float)mdy * 0.005f;   // drag up    -> look from higher
+        camPitch = glm::clamp(camPitch, 0.05f, 1.45f);
+      }
     }
     if (g_scrollAccum != 0.0) {
       if (camActive && !io.WantCaptureMouse) {
@@ -5215,6 +5388,55 @@ int main(int argc, char** argv) {
     }
     glm::vec3 lookTarget = shipPos + glm::vec3(shakeJoltX, 1.0f + shakeJoltY, 0.0f);
     glm::vec3 lookUp(0.0f, 1.0f, 0.0f);
+    // ── First-person "on deck" (client updateCamera FP branch): the eye rides a
+    //    root-local point on the deck; LMB+WASD walks it, a downward raycast
+    //    glues it to the deck (up the stairs, not up the mast), and drag
+    //    free-looks. Overrides the orbit eye/target computed above. ──
+    if (firstPerson && sailing && !ownVesselSlug.empty()) {
+      const float kWalkEye = 1.65f, kWalkSpeed = 4.5f;
+      Mesh& fpMesh = vesselFor(ownVesselSlug);
+      const float footY = fpEye.y - kWalkEye;   // current deck level (raycast band reference)
+      if (fpWalkActive) {
+        auto kd = [&](int a, int b) { return glfwGetKey(window, a) == GLFW_PRESS || glfwGetKey(window, b) == GLFW_PRESS; };
+        const float wf = (kd(GLFW_KEY_W, GLFW_KEY_UP) ? 1.0f : 0.0f) - (kd(GLFW_KEY_S, GLFW_KEY_DOWN) ? 1.0f : 0.0f);
+        const float wr = (kd(GLFW_KEY_D, GLFW_KEY_RIGHT) ? 1.0f : 0.0f) - (kd(GLFW_KEY_A, GLFW_KEY_LEFT) ? 1.0f : 0.0f);
+        if (wf != 0.0f || wr != 0.0f) {
+          const float yr = glm::radians(fpYaw);
+          glm::vec3 mv = glm::vec3(std::sin(yr), 0, std::cos(yr)) * wf   // forward (bow at fpYaw 0)
+                       + glm::vec3(std::cos(yr), 0, -std::sin(yr)) * wr;  // strafe (starboard)
+          if (glm::dot(mv, mv) > 1e-6f) {
+            mv = glm::normalize(mv) * (kWalkSpeed * dt);
+            const float tx = fpEye.x + mv.x, tz = fpEye.z + mv.z;
+            // Step only onto deck within the band (blocks walking off the rail
+            // or up a wall/rigging); otherwise stay put.
+            if (!std::isnan(deckLocalHeight(fpMesh, tx, tz, footY))) { fpEye.x = tx; fpEye.z = tz; }
+          }
+        }
+      }
+      const float dh = deckLocalHeight(fpMesh, fpEye.x, fpEye.z, footY);
+      if (!std::isnan(dh)) fpEye.y = dh + kWalkEye;   // glue standing height above the deck
+      // Outer transform (matches the hull's): water Y, heading, buoyancy tilt +
+      // heel + shudder, applied to the root-local eye so it rides the deck.
+      const float swayX = shudSway * std::cos(shipHeading);
+      const float swayZ = -shudSway * std::sin(shipHeading);
+      glm::mat4 outer = glm::translate(glm::mat4(1.0f),
+          glm::vec3(shipX + swayX, ownBuoy.x - fpMesh.draft, shipZ + swayZ));
+      outer = glm::rotate(outer, shipHeading, glm::vec3(0, 1, 0));
+      outer = glm::rotate(outer, -ownBuoy.y, glm::vec3(1, 0, 0));
+      outer = glm::rotate(outer, ownBuoy.z + glm::radians(vessel.heelDeg) + shudRoll, glm::vec3(0, 0, 1));
+      eye = glm::vec3(outer * glm::vec4(fpEye, 1.0f));
+      // Raw positional shake on the eye (no distance scale — it sits ON the eye).
+      if (camTrauma > 1e-3f) {
+        const float st = camShakeTime, amp = 1.2f * camTrauma;
+        eye += glm::vec3(std::sin(st * 12.6f) * amp,
+                         std::sin(st * 12.6f * 1.11f + 1.2f) * amp * 0.55f,
+                         std::sin(st * 12.6f * 0.87f + 2.4f) * amp * 0.50f);
+      }
+      // Look forward from the bow by (fpYaw, fpPitch).
+      const float yaw = shipHeading + glm::radians(fpYaw), pit = glm::radians(fpPitch);
+      const float cp2 = std::cos(pit);
+      lookTarget = eye + glm::vec3(std::sin(yaw) * cp2, std::sin(pit), std::cos(yaw) * cp2) * 20.0f;
+    }
     if (std::getenv("SAILSIM_SKYLOOK")) {   // debug: aim at the moon to inspect stars/moon
       lookTarget = eye + moonDir;
       if (std::abs(moonDir.y) > 0.95f) lookUp = glm::vec3(0.0f, 0.0f, 1.0f);   // avoid lookAt degeneracy near-vertical

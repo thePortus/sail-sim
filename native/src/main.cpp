@@ -1506,7 +1506,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUTextureFormat swapFormat) {
   // Post grades to the LDR intermediate (kSceneFormat, still depth read-only for
   // DOF); the FXAA/resolve pass takes it to the swapchain + hosts the UI.
   fx.postPipe   = makePipe(fx.postModule, "fs_main", fx.postBGL, kSceneFormat, true);
-  fx.fxaaPipe   = makePipe(fx.fxaaModule, "fs_main", fx.fxaaBGL, swapFormat, true);   // shares the UI pass (depth read-only)
+  fx.fxaaPipe   = makePipe(fx.fxaaModule, "fs_main", fx.fxaaBGL, swapFormat, false);   // resolve+UI: no depth
   fx.brightPipe = makePipe(fx.bloomModule, "fs_bright", fx.bloomBGL, kSceneFormat, false);
   fx.blurPipe   = makePipe(fx.bloomModule, "fs_blur", fx.bloomBGL, kSceneFormat, false);
   fx.aoPipe     = makePipe(fx.ssaoModule, "fs_ao", fx.depthBGL, WGPUTextureFormat_R8Unorm, false);
@@ -2958,7 +2958,16 @@ int main(int argc, char** argv) {
   c0.sanityCheck();
 
   uint32_t curW = (uint32_t)fbWidth, curH = (uint32_t)fbHeight;
-  WGPUTexture depthTex = makeDepthTexture(device, curW, curH);
+  // Render resolution: the whole offscreen chain renders at rW x rH (= swapchain
+  // x renderScale x adaptiveFactor) and the resolve/FXAA pass upscales it to the
+  // curW x curH swapchain. adaptiveFactor is nudged by the frame-time monitor
+  // when adaptive resolution is on (never above the user's renderScale).
+  float adaptiveFactor = 1.0f;
+  auto effScale = [&]() { return glm::clamp(userCfg.gfx.renderScale * adaptiveFactor, 0.3f, 1.0f); };
+  double adaptAccumMs = 0.0; int adaptFrames = 0; double adaptLastT = glfwGetTime();
+  uint32_t rW = std::max(1u, (uint32_t)std::lround(curW * effScale()));
+  uint32_t rH = std::max(1u, (uint32_t)std::lround(curH * effScale()));
+  WGPUTexture depthTex = makeDepthTexture(device, rW, rH);
   WGPUTextureView depthView = wgpuTextureCreateView(depthTex, nullptr);
   // Depth-only aspect view so SSAO/DOF/post can sample the scene depth back.
   auto makeDepthReadView = [](WGPUTexture tex) {
@@ -2974,19 +2983,19 @@ int main(int argc, char** argv) {
   // opaque scene (terrain, scatter, SHIPS) draws but before the ocean, so the
   // ocean shader can measure the water column to whatever sits beneath each
   // surface fragment (Beer-Lambert see-through — hulls ghost through the water).
-  WGPUTexture oceanDepthTex = makeDepthTexture(device, curW, curH);
+  WGPUTexture oceanDepthTex = makeDepthTexture(device, rW, rH);
   WGPUTextureView oceanDepthReadView = makeDepthReadView(oceanDepthTex);
   // Planar reflection target (colour + its own depth + a cloud-march buffer for
   // mirrored clouds), at HALF resolution — the waves distort the mirror anyway,
   // and half-res pays for the terrain + cloud draws it now carries.
-  uint32_t reflW = std::max(1u, curW / 2), reflH = std::max(1u, curH / 2);
+  uint32_t reflW = std::max(1u, rW / 2), reflH = std::max(1u, rH / 2);
   WGPUTexture reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
   WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
   WGPUTexture reflDepth = makeDepthTexture(device, reflW, reflH);
   WGPUTextureView reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
   // Offscreen cloud buffer (RGBA16F): the ray march writes here, then the denoise
   // pass filters it onto the frame. Its bind group is rebuilt when it resizes.
-  WGPUTexture cloudTex = makeColorRTT(device, curW, curH, kCloudFormat);
+  WGPUTexture cloudTex = makeColorRTT(device, rW, rH, kCloudFormat);
   WGPUTextureView cloudView = wgpuTextureCreateView(cloudTex, nullptr);
   auto buildDenoiseBG = [&]() {
     WGPUBindGroupEntry e[3] = {};
@@ -3025,7 +3034,7 @@ int main(int argc, char** argv) {
 
   // God-ray occlusion mask (sun bright where sky shows, occluded by geometry), plus
   // a clamp sampler and the two-pass godray pipeline.
-  WGPUTexture grTex = makeColorRTT(device, curW, curH, kGodrayFormat);
+  WGPUTexture grTex = makeColorRTT(device, rW, rH, kGodrayFormat);
   WGPUTextureView grView = wgpuTextureCreateView(grTex, nullptr);
   WGPUSamplerDescriptor grSampDesc = {};
   grSampDesc.addressModeU = WGPUAddressMode_ClampToEdge; grSampDesc.addressModeV = WGPUAddressMode_ClampToEdge;
@@ -3036,24 +3045,24 @@ int main(int argc, char** argv) {
   Godrays godrays = createGodrays(device, kSceneFormat, grSampler, grView);
 
   // Offscreen HDR scene target + half-res bloom ping-pong + the post-process chain.
-  WGPUTexture sceneTex = makeColorRTT(device, curW, curH, kSceneFormat);
+  WGPUTexture sceneTex = makeColorRTT(device, rW, rH, kSceneFormat);
   WGPUTextureView sceneView = wgpuTextureCreateView(sceneTex, nullptr);
   // LDR intermediate: post grades HERE, then the FXAA/resolve pass takes it to
   // the swapchain. RGBA16F keeps the graded values lossless for the AA blend.
-  WGPUTexture ldrTex = makeColorRTT(device, curW, curH, kSceneFormat);
+  WGPUTexture ldrTex = makeColorRTT(device, rW, rH, kSceneFormat);
   WGPUTextureView ldrView = wgpuTextureCreateView(ldrTex, nullptr);
-  WGPUTexture bloomATex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+  WGPUTexture bloomATex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
   WGPUTextureView bloomAView = wgpuTextureCreateView(bloomATex, nullptr);
-  WGPUTexture bloomBTex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+  WGPUTexture bloomBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
   WGPUTextureView bloomBView = wgpuTextureCreateView(bloomBTex, nullptr);
   // Half-res SSAO ping-pong (R8) + half-res DOF colour+CoC ping-pong.
-  WGPUTexture aoATex = makeColorRTT(device, curW / 2, curH / 2, WGPUTextureFormat_R8Unorm);
+  WGPUTexture aoATex = makeColorRTT(device, rW / 2, rH / 2, WGPUTextureFormat_R8Unorm);
   WGPUTextureView aoAView = wgpuTextureCreateView(aoATex, nullptr);
-  WGPUTexture aoBTex = makeColorRTT(device, curW / 2, curH / 2, WGPUTextureFormat_R8Unorm);
+  WGPUTexture aoBTex = makeColorRTT(device, rW / 2, rH / 2, WGPUTextureFormat_R8Unorm);
   WGPUTextureView aoBView = wgpuTextureCreateView(aoBTex, nullptr);
-  WGPUTexture dofATex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+  WGPUTexture dofATex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
   WGPUTextureView dofAView = wgpuTextureCreateView(dofATex, nullptr);
-  WGPUTexture dofBTex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+  WGPUTexture dofBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
   WGPUTextureView dofBView = wgpuTextureCreateView(dofBTex, nullptr);
   PostFx postFx = createPostFx(device, surfaceFormat);
   rebuildPostBinds(device, postFx, sceneView, bloomAView, bloomBView,
@@ -3191,7 +3200,7 @@ int main(int argc, char** argv) {
   imguiInit.Device = device;
   imguiInit.NumFramesInFlight = 3;
   imguiInit.RenderTargetFormat = surfaceFormat;
-  imguiInit.DepthStencilFormat = kDepthFormat;   // must match the main pass's depth attachment
+  imguiInit.DepthStencilFormat = WGPUTextureFormat_Undefined;   // UI draws in the resolve pass (no depth)
   ImGui_ImplWGPU_Init(&imguiInit);
 
   // App state: sign in first, then sail. The ocean scene renders behind the login.
@@ -3256,23 +3265,49 @@ int main(int argc, char** argv) {
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
 
-    // Handle window resize: reconfigure the surface and rebuild the depth buffer.
+    // Adaptive resolution (client scene.service): measure real frame time over a
+    // ~0.5 s window and nudge adaptiveFactor to hold the target budget — shed 5%
+    // of the pixels when over budget, recover 4% slower when under, floor 0.6.
+    // Never above the user's renderScale (adaptiveFactor caps at 1). Off => 1.
+    {
+      const double now = glfwGetTime();
+      adaptAccumMs += (now - adaptLastT) * 1000.0; adaptLastT = now; adaptFrames++;
+      if (!userCfg.gfx.adaptiveRes) {
+        adaptiveFactor = 1.0f; adaptAccumMs = 0.0; adaptFrames = 0;
+      } else if (adaptFrames >= 30) {
+        const double avg = adaptAccumMs / adaptFrames;
+        const double budget = userCfg.gfx.adaptiveTargetMs;
+        if (avg > budget * 1.10) adaptiveFactor = std::max(0.6f, adaptiveFactor - 0.05f);
+        else if (avg < budget * 0.85) adaptiveFactor = std::min(1.0f, adaptiveFactor + 0.04f);
+        adaptAccumMs = 0.0; adaptFrames = 0;
+      }
+    }
+
+    // Handle window resize OR a render-scale change: reconfigure the surface (on
+    // window resize only) and rebuild every offscreen target at the new rW x rH.
     int w = 0, h = 0;
     glfwGetFramebufferSize(window, &w, &h);
-    if (w > 0 && h > 0 && ((uint32_t)w != curW || (uint32_t)h != curH)) {
+    const uint32_t wantRW = std::max(1u, (uint32_t)std::lround((w > 0 ? w : (int)curW) * effScale()));
+    const uint32_t wantRH = std::max(1u, (uint32_t)std::lround((h > 0 ? h : (int)curH) * effScale()));
+    const bool winChanged = w > 0 && h > 0 && ((uint32_t)w != curW || (uint32_t)h != curH);
+    const bool scaleChanged = wantRW != rW || wantRH != rH;
+    if (w > 0 && h > 0 && (winChanged || scaleChanged)) {
       curW = (uint32_t)w; curH = (uint32_t)h;
-      surfaceConfig.width = curW; surfaceConfig.height = curH;
-      wgpuSurfaceConfigure(surface, &surfaceConfig);
+      rW = wantRW; rH = wantRH;
+      if (winChanged) {
+        surfaceConfig.width = curW; surfaceConfig.height = curH;
+        wgpuSurfaceConfigure(surface, &surfaceConfig);
+      }
       wgpuTextureViewRelease(depthView);
       wgpuTextureViewRelease(depthReadView);
       wgpuTextureRelease(depthTex);
-      depthTex = makeDepthTexture(device, curW, curH);
+      depthTex = makeDepthTexture(device, rW, rH);
       depthView = wgpuTextureCreateView(depthTex, nullptr);
       depthReadView = makeDepthReadView(depthTex);
       wgpuTextureViewRelease(oceanDepthReadView); wgpuTextureRelease(oceanDepthTex);
-      oceanDepthTex = makeDepthTexture(device, curW, curH);
+      oceanDepthTex = makeDepthTexture(device, rW, rH);
       oceanDepthReadView = makeDepthReadView(oceanDepthTex);
-      reflW = std::max(1u, curW / 2); reflH = std::max(1u, curH / 2);
+      reflW = std::max(1u, rW / 2); reflH = std::max(1u, rH / 2);
       wgpuTextureViewRelease(reflView);   wgpuTextureRelease(reflTex);
       wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
       reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
@@ -3286,38 +3321,38 @@ int main(int argc, char** argv) {
       wgpuBindGroupRelease(reflDenoiseBG);
       reflDenoiseBG = buildReflDenoiseBG();
       wgpuTextureViewRelease(cloudView); wgpuTextureRelease(cloudTex);
-      cloudTex = makeColorRTT(device, curW, curH, kCloudFormat);
+      cloudTex = makeColorRTT(device, rW, rH, kCloudFormat);
       cloudView = wgpuTextureCreateView(cloudTex, nullptr);
       wgpuBindGroupRelease(denoiseBG);
       denoiseBG = buildDenoiseBG();
       wgpuTextureViewRelease(grView); wgpuTextureRelease(grTex);
-      grTex = makeColorRTT(device, curW, curH, kGodrayFormat);
+      grTex = makeColorRTT(device, rW, rH, kGodrayFormat);
       grView = wgpuTextureCreateView(grTex, nullptr);
       rebuildGodrayBlurBind(device, godrays, grView, grSampler);
       wgpuTextureViewRelease(sceneView); wgpuTextureRelease(sceneTex);
-      sceneTex = makeColorRTT(device, curW, curH, kSceneFormat);
+      sceneTex = makeColorRTT(device, rW, rH, kSceneFormat);
       sceneView = wgpuTextureCreateView(sceneTex, nullptr);
       wgpuTextureViewRelease(ldrView); wgpuTextureRelease(ldrTex);
-      ldrTex = makeColorRTT(device, curW, curH, kSceneFormat);
+      ldrTex = makeColorRTT(device, rW, rH, kSceneFormat);
       ldrView = wgpuTextureCreateView(ldrTex, nullptr);
       rebuildFxaaBind();
       wgpuTextureViewRelease(bloomAView); wgpuTextureRelease(bloomATex);
-      bloomATex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+      bloomATex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
       bloomAView = wgpuTextureCreateView(bloomATex, nullptr);
       wgpuTextureViewRelease(bloomBView); wgpuTextureRelease(bloomBTex);
-      bloomBTex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+      bloomBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
       bloomBView = wgpuTextureCreateView(bloomBTex, nullptr);
       wgpuTextureViewRelease(aoAView); wgpuTextureRelease(aoATex);
-      aoATex = makeColorRTT(device, curW / 2, curH / 2, WGPUTextureFormat_R8Unorm);
+      aoATex = makeColorRTT(device, rW / 2, rH / 2, WGPUTextureFormat_R8Unorm);
       aoAView = wgpuTextureCreateView(aoATex, nullptr);
       wgpuTextureViewRelease(aoBView); wgpuTextureRelease(aoBTex);
-      aoBTex = makeColorRTT(device, curW / 2, curH / 2, WGPUTextureFormat_R8Unorm);
+      aoBTex = makeColorRTT(device, rW / 2, rH / 2, WGPUTextureFormat_R8Unorm);
       aoBView = wgpuTextureCreateView(aoBTex, nullptr);
       wgpuTextureViewRelease(dofAView); wgpuTextureRelease(dofATex);
-      dofATex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+      dofATex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
       dofAView = wgpuTextureCreateView(dofATex, nullptr);
       wgpuTextureViewRelease(dofBView); wgpuTextureRelease(dofBTex);
-      dofBTex = makeColorRTT(device, curW / 2, curH / 2, kSceneFormat);
+      dofBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
       dofBView = wgpuTextureCreateView(dofBTex, nullptr);
       rebuildPostBinds(device, postFx, sceneView, bloomAView, bloomBView,
                        aoAView, aoBView, dofAView, dofBView, depthReadView);
@@ -3654,6 +3689,16 @@ int main(int argc, char** argv) {
         }
         ImGui::TextDisabled("Preset: %s", g.preset < 0 ? "Custom" : kPresetNames[g.preset]);
         ImGui::Spacing();
+        // Render scale (biggest perf lever) + adaptive resolution.
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::SliderFloat("Render scale", &g.renderScale, 0.5f, 1.0f, "%.2f")) custom();
+        if (ImGui::IsItemDeactivatedAfterEdit()) gsave();
+        if (ImGui::Checkbox("Adaptive resolution", &g.adaptiveRes)) { custom(); gsave(); }
+        if (g.adaptiveRes) {
+          ImGui::SetNextItemWidth(160.0f);
+          if (ImGui::SliderFloat("Target frame (ms)", &g.adaptiveTargetMs, 16.7f, 66.0f, "%.1f")) custom();
+          if (ImGui::IsItemDeactivatedAfterEdit()) gsave();
+        }
         // Anti-aliasing.
         ImGui::SetNextItemWidth(160.0f);
         if (ImGui::Combo("Anti-aliasing", &g.aa, "Off\0FXAA\0")) { custom(); gsave(); }
@@ -5859,7 +5904,7 @@ int main(int argc, char** argv) {
 
     // ── Main-pass uniforms ──
     glm::vec4 oceanParams(c0.lengthScale(), c1.lengthScale(), c2.lengthScale(), seaAmp);
-    glm::vec4 oceanScreen((float)curW, (float)curH, shipX, shipZ);   // zw = ocean origin
+    glm::vec4 oceanScreen((float)rW, (float)rH, shipX, shipZ);   // zw = ocean origin
     // Near grid: full displacement, no discard. Far ring: flat (vertexAmp 0), but
     // discards the centre so the detailed near grid shows there.
     if (sailing) {
@@ -6008,7 +6053,7 @@ int main(int argc, char** argv) {
       const float dofOn = (sailing && !firstPerson && G.dof) ? 1.0f : 0.0f;
       const float ssaoOn = (sailing && G.ssao) ? 1.0f : 0.0f;
       glm::vec4 postU[6] = {
-        { (float)curW, (float)curH, t, sailing ? precipIntensity : 0.0f },
+        { (float)rW, (float)rH, t, sailing ? precipIntensity : 0.0f },
         { exposure, contrast, bloomWeight, sailing ? 1.0f : 0.0f },
         { (isNight ? 4.0f : 12.0f) / 255.0f, isNight ? 0.0f : 1.0f, 0.40f, 0.08f },
         { focusDist, cocK, 0.0f, dofOn },
@@ -6027,7 +6072,7 @@ int main(int argc, char** argv) {
       // directions; DOF downsample/blur share one uniform.
       const glm::vec4 aoPmat(proj[0][0], proj[1][1], proj[2][2], proj[3][2]);
       const glm::vec4 aoParams(2.0f, 1.2f, 0.15f, 100.0f);   // radius, strength, base, maxZ
-      const float hw = (float)(curW / 2), hh = (float)(curH / 2);
+      const float hw = (float)(rW / 2), hh = (float)(rH / 2);
       struct { glm::mat4 invView; glm::vec4 v[3]; } aoU{ glm::inverse(viewM),
         { aoPmat, aoParams, { hw, hh, 0.0f, 0.0f } } };
       wgpuQueueWriteBuffer(queue, postFx.aoUbuf, 0, &aoU, sizeof(aoU));
@@ -6735,7 +6780,7 @@ int main(int argc, char** argv) {
     {
       WGPUImageCopyTexture cSrc = {}; cSrc.texture = depthTex;
       WGPUImageCopyTexture cDst = {}; cDst.texture = oceanDepthTex;
-      WGPUExtent3D cExt = { curW, curH, 1 };
+      WGPUExtent3D cExt = { rW, rH, 1 };
       wgpuCommandEncoderCopyTextureToTexture(encoder, &cSrc, &cDst, &cExt);
     }
     colorAttachment.loadOp = WGPULoadOp_Load;
@@ -7085,12 +7130,10 @@ int main(int argc, char** argv) {
       WGPURenderPassColorAttachment ca = {};
       ca.view = view; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
-      // Depth attached READ-ONLY only so ImGui's pipeline (initialised with the
-      // depth-stencil format) matches this pass; nothing here writes depth.
-      WGPURenderPassDepthStencilAttachment da = {};
-      da.view = depthView; da.depthReadOnly = true; da.stencilReadOnly = true;
+      // No depth: this pass renders at swapchain res, while the scene depth is at
+      // render res — and neither FXAA nor ImGui needs depth.
       WGPURenderPassDescriptor fpd = {};
-      fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca; fpd.depthStencilAttachment = &da;
+      fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca;
       WGPURenderPassEncoder fp = wgpuCommandEncoderBeginRenderPass(encoder, &fpd);
       wgpuRenderPassEncoderSetPipeline(fp, postFx.fxaaPipe);
       wgpuRenderPassEncoderSetBindGroup(fp, 0, postFx.fxaaBind, 0, nullptr);

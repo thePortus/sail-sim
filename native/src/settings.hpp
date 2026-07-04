@@ -8,10 +8,11 @@ namespace settings {
 // native's own systems). Presets bundle these; any manual tweak drops to Custom.
 struct Graphics {
   int   preset = 3;              // -1 Custom, 0 Potato, 1 Low, 2 Medium, 3 High, 4 Ultra
-  float renderScale = 1.0f;      // 0.5..1.0 — offscreen render res / swapchain res
+  float renderScale = 1.0f;      // 0.5..1.0 — offscreen render res / swapchain res (perf lever)
   bool  adaptiveRes = false;     // fps-driven render-scale nudge (never above renderScale)
   float adaptiveTargetMs = 33.3f;// target frame time (16.7=60fps .. 66=15fps)
-  int   aa = 1;                  // 0 Off, 1 FXAA
+  int   aa = 1;                  // 0 Off, 1 FXAA (post edge-blur)
+  int   ssaa = 0;                // supersampling: 0 Off(1x), 1 1.5x, 2 2x — multiplies render res; stacks with FXAA
   int   shadows = 2;             // 0 Off, 1 Low(1024), 2 Medium(2048), 3 High(4096)
   bool  ssao = true;
   bool  dof = true;
@@ -37,5 +38,8 @@ void applyPreset(Graphics& g, int preset);
 
 // Shadow-map resolution (texels) for a shadows level (0 returns 0 = off).
 int shadowRes(int level);
+
+// Supersampling render-resolution multiplier for an ssaa level (0=1x,1=1.5x,2=2x).
+float ssaaFactor(int level);
 
 }  // namespace settings

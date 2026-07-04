@@ -2965,7 +2965,11 @@ int main(int argc, char** argv) {
   // curW x curH swapchain. adaptiveFactor is nudged by the frame-time monitor
   // when adaptive resolution is on (never above the user's renderScale).
   float adaptiveFactor = 1.0f;
-  auto effScale = [&]() { return glm::clamp(userCfg.gfx.renderScale * adaptiveFactor, 0.3f, 2.0f); };
+  // renderScale (<=1, perf downscale) x SSAA (>=1, quality upscale) x adaptive nudge.
+  auto effScale = [&]() {
+    return glm::clamp(userCfg.gfx.renderScale * settings::ssaaFactor(userCfg.gfx.ssaa) * adaptiveFactor,
+                      0.3f, 2.0f);
+  };
   double adaptAccumMs = 0.0; int adaptFrames = 0; double adaptLastT = glfwGetTime();
   uint32_t rW = std::max(1u, (uint32_t)std::lround(curW * effScale()));
   uint32_t rH = std::max(1u, (uint32_t)std::lround(curH * effScale()));
@@ -3731,8 +3735,7 @@ int main(int argc, char** argv) {
         ImGui::Spacing();
         // Render scale (biggest perf lever) + adaptive resolution.
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::SliderFloat("Render scale", &g.renderScale, 0.5f, 2.0f,
-                               g.renderScale > 1.02f ? "%.2fx (supersample)" : "%.2f")) custom();
+        if (ImGui::SliderFloat("Render scale", &g.renderScale, 0.5f, 1.0f, "%.2f")) custom();
         if (ImGui::IsItemDeactivatedAfterEdit()) gsave();
         if (ImGui::Checkbox("Adaptive resolution", &g.adaptiveRes)) { custom(); gsave(); }
         if (g.adaptiveRes) {
@@ -3740,9 +3743,24 @@ int main(int argc, char** argv) {
           if (ImGui::SliderFloat("Target frame (ms)", &g.adaptiveTargetMs, 16.7f, 66.0f, "%.1f")) custom();
           if (ImGui::IsItemDeactivatedAfterEdit()) gsave();
         }
-        // Anti-aliasing.
-        ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::Combo("Anti-aliasing", &g.aa, "Off\0FXAA\0")) { custom(); gsave(); }
+        // Anti-aliasing — ONE dropdown listing every method: FXAA (cheap post
+        // edge-blur), SSAA (supersample: render the whole scene higher-res and
+        // downsample — best quality, also kills foliage/rigging shimmer), and the
+        // stacked combos. Backed by the separate aa (0/1) + ssaa (0/1/2) fields, so
+        // presets/save/effScale are unchanged; this just maps the pair to one list.
+        static const int kAaModes[][2] = {   // {aa, ssaa} per list entry
+          {0,0}, {1,0}, {0,1}, {0,2}, {1,1}, {1,2},
+        };
+        int aaSel = 0;
+        for (int i = 0; i < 6; ++i) if (kAaModes[i][0] == g.aa && kAaModes[i][1] == g.ssaa) { aaSel = i; break; }
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::Combo("Anti-aliasing", &aaSel,
+                         "Off\0FXAA\0SSAA 1.5x\0SSAA 2x\0FXAA + SSAA 1.5x\0FXAA + SSAA 2x\0")) {
+          g.aa = kAaModes[aaSel][0]; g.ssaa = kAaModes[aaSel][1]; custom(); gsave();
+        }
+        if (g.ssaa > 0 && ImGui::IsItemHovered())
+          ImGui::SetTooltip("SSAA renders at %.2fx the pixels then downsamples. Best quality, high GPU cost.",
+                            (double)settings::ssaaFactor(g.ssaa) * settings::ssaaFactor(g.ssaa));
         // Shadows: 0 turns the sun cascades off; 1-3 select the map resolution.
         ImGui::SetNextItemWidth(160.0f);
         if (ImGui::Combo("Shadows", &g.shadows, "Off\0Low\0Medium\0High\0")) { custom(); gsave(); }

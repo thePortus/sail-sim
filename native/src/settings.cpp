@@ -34,10 +34,11 @@ Values load() {
       const auto& g = j["gfx"];
       Graphics& x = v.gfx;
       x.preset = g.value("preset", x.preset);
-      x.renderScale = std::max(0.5f, std::min(2.0f, g.value("renderScale", x.renderScale)));
+      x.renderScale = std::max(0.5f, std::min(1.0f, g.value("renderScale", x.renderScale)));
       x.adaptiveRes = g.value("adaptiveRes", x.adaptiveRes);
       x.adaptiveTargetMs = std::max(16.7f, std::min(66.0f, g.value("adaptiveTargetMs", x.adaptiveTargetMs)));
       x.aa = std::max(0, std::min(1, g.value("aa", x.aa)));
+      x.ssaa = std::max(0, std::min(2, g.value("ssaa", x.ssaa)));
       x.shadows = std::max(0, std::min(3, g.value("shadows", x.shadows)));
       x.ssao = g.value("ssao", x.ssao);
       x.dof = g.value("dof", x.dof);
@@ -59,7 +60,7 @@ void save(const Values& v) {
     { "gfx", {
       { "preset", g.preset }, { "renderScale", g.renderScale },
       { "adaptiveRes", g.adaptiveRes }, { "adaptiveTargetMs", g.adaptiveTargetMs },
-      { "aa", g.aa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
+      { "aa", g.aa }, { "ssaa", g.ssaa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
       { "bloom", g.bloom }, { "reflections", g.reflections },
       { "waterTransparency", g.waterTransparency }, { "scatter", g.scatter },
     } },
@@ -72,28 +73,32 @@ int shadowRes(int level) {
   switch (level) { case 1: return 1024; case 2: return 2048; case 3: return 4096; default: return 0; }
 }
 
+float ssaaFactor(int level) {
+  switch (level) { case 1: return 1.5f; case 2: return 2.0f; default: return 1.0f; }
+}
+
 void applyPreset(Graphics& g, int preset) {
   // Columns mirror the client's settings-menu preset table, mapped to the
   // native systems: render scale, shadows, AA, SSAO, DOF, bloom, reflections,
   // water transparency, scatter. (The native folds SSAO/DOF/bloom into the tier
   // the way the client's presets fold clouds/wildlife.)
-  struct P { float render; int shadows, aa; bool ssao, dof, bloom, refl, transp; int scatter; };
+  struct P { float render; int shadows, aa, ssaa; bool ssao, dof, bloom, refl, transp; int scatter; };
   static const P table[5] = {
     // Potato
-    { 0.50f, 0, 0, false, false, false, false, false, 0 },
+    { 0.50f, 0, 0, 0, false, false, false, false, false, 0 },
     // Low
-    { 0.65f, 1, 1, false, false, true,  false, false, 1 },
+    { 0.65f, 1, 1, 0, false, false, true,  false, false, 1 },
     // Medium
-    { 0.80f, 2, 1, true,  false, true,  false, true,  2 },
+    { 0.80f, 2, 1, 0, true,  false, true,  false, true,  2 },
     // High
-    { 1.00f, 2, 1, true,  true,  true,  true,  true,  3 },
-    // Ultra
-    { 1.00f, 3, 1, true,  true,  true,  true,  true,  4 },
+    { 1.00f, 2, 1, 0, true,  true,  true,  true,  true,  3 },
+    // Ultra — full render scale + 2x supersampling on top.
+    { 1.00f, 3, 1, 2, true,  true,  true,  true,  true,  4 },
   };
   if (preset < 0 || preset > 4) return;
   const P& p = table[preset];
   g.preset = preset;
-  g.renderScale = p.render; g.shadows = p.shadows; g.aa = p.aa;
+  g.renderScale = p.render; g.shadows = p.shadows; g.aa = p.aa; g.ssaa = p.ssaa;
   g.ssao = p.ssao; g.dof = p.dof; g.bloom = p.bloom;
   g.reflections = p.refl; g.waterTransparency = p.transp; g.scatter = p.scatter;
 }

@@ -280,6 +280,11 @@ set(SAILSIM_FONT_BODY_URL
 set(SAILSIM_FONT_TITLE_URL
     "https://github.com/google/fonts/raw/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf"
     CACHE STRING "URL of the TTF to embed as the title UI font")
+# Icon glyphs — Font Awesome 6 Free (Solid), SIL OFL. Merged into the body atlas
+# so ICON_FA_* codepoints (src/IconsFontAwesome6.h, Zlib) render inline with text.
+set(SAILSIM_FONT_ICONS_URL
+    "https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/webfonts/fa-solid-900.ttf"
+    CACHE STRING "URL of the TTF to embed as the icon font")
 
 function(fetch_font URL DEST)
   if (NOT EXISTS "${DEST}")
@@ -295,6 +300,7 @@ function(fetch_font URL DEST)
 endfunction()
 fetch_font("${SAILSIM_FONT_BODY_URL}"  "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIBody.ttf")
 fetch_font("${SAILSIM_FONT_TITLE_URL}" "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UITitle.ttf")
+fetch_font("${SAILSIM_FONT_ICONS_URL}" "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIIcons.ttf")
 
 # Emit a header with the TTF bytes as a C array (newline every 20 bytes so no
 # single line is absurdly long for MSVC).
@@ -307,6 +313,7 @@ function(embed_binary SRC VARNAME OUT)
 endfunction()
 embed_binary("${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIBody.ttf"  UI_FONT_BODY  "${WGSL_GEN_DIR}/ui_font_body.h")
 embed_binary("${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UITitle.ttf" UI_FONT_TITLE "${WGSL_GEN_DIR}/ui_font_title.h")
+embed_binary("${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/UIIcons.ttf" UI_FONT_ICONS "${WGSL_GEN_DIR}/ui_font_icons.h")
 
 add_executable(sailsim_native
   src/main.cpp

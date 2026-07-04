@@ -6791,16 +6791,23 @@ int main(int argc, char** argv) {
         }
       }
       if (crewMesh && crewDeck) {
-        crewDeck->tick(dt);
+        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel — maps the members'
+        // root-local poses (which the deck maintains) into world with the heel/pitch.
+        // Its axis columns give the deck's world tilt: X.y = heel, Z.y = pitch, which
+        // the members brace against.
+        glm::mat4 outer = ownShipModel(*ownMesh) * glm::inverse(crewInner);
+        const float shipHeel = std::asin(glm::clamp(outer[0].y, -1.0f, 1.0f));
+        const float shipPitch = std::asin(glm::clamp(outer[2].y, -1.0f, 1.0f));
+        crewDeck->tick(dt, shipHeel, shipPitch);
         if (std::getenv("SAILSIM_CREW_DEBUG") && (frame % 120) == 0) {
           int st = 0, wk = 0, cl = 0;
           for (auto& mm : crewDeck->members())
             (mm.state == crew::State::Walk ? wk : mm.state == crew::State::Climb ? cl : st)++;
-          std::printf("[crew] f%ld  station=%d walk=%d climb=%d\n", frame, st, wk, cl);
+          const crew::Member& m0 = crewDeck->members().front();
+          std::printf("[crew] f%ld  station=%d walk=%d climb=%d | heel=%.3f pitch=%.3f | m0 lean(r=%.3f p=%.3f) sway=(%.3f,%.3f,%.3f)\n",
+                      frame, st, wk, cl, shipHeel, shipPitch, m0.leanRoll, m0.leanPitch,
+                      m0.swayOffset.x, m0.swayOffset.y, m0.swayOffset.z);
         }
-        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel — maps the members'
-        // root-local poses (which the deck maintains) into world with the heel/pitch.
-        glm::mat4 outer = ownShipModel(*ownMesh) * glm::inverse(crewInner);
         const size_t morphBase = (size_t)kMaxPaletteSlots * sizeof(glm::mat4);
         std::vector<uint8_t> blob(kPaletteStride, 0);
         auto& members = crewDeck->members();
@@ -6823,7 +6830,11 @@ int main(int argc, char** argv) {
             if (toff + sizeof(glm::vec4) <= blob.size()) std::memcpy(blob.data() + toff, &tv, sizeof(glm::vec4));
           }
           wgpuQueueWriteBuffer(queue, crewMesh->paletteBuf, (uint64_t)i * kPaletteStride, blob.data(), kPaletteStride);
-          glm::mat4 cmModel = outer * glm::translate(glm::mat4(1.0f), m.pos);
+          // Presence: weight-shift/bob offset on the position, then the brace lean
+          // (roll about the bow axis, pitch about the beam) composed OUTSIDE the yaw.
+          glm::mat4 cmModel = glm::translate(outer, m.pos + m.swayOffset);
+          cmModel = glm::rotate(cmModel, m.leanRoll, glm::vec3(0, 0, 1));
+          cmModel = glm::rotate(cmModel, m.leanPitch, glm::vec3(1, 0, 0));
           cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
           cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
           MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),

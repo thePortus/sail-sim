@@ -305,6 +305,14 @@ void Animator::update(float dt) {
 // ── Deck (station/waypoint lifecycle) ────────────────────────────────────────
 namespace {
 constexpr float kPi2 = 6.28318530718f;
+// Presence (crew realism P1), verbatim from crew.service.
+constexpr float BRACE_FACTOR = 0.55f;   // counter-lean this fraction of the deck slope
+constexpr float BRACE_MAX    = 0.45f;   // rad cap on the brace lean
+constexpr float SWAY_AMP      = 0.03f;   // m idle weight-shift sway
+constexpr float HEEL_SHIFT    = 0.05f;   // m lateral weight-shift per rad of heel
+constexpr float IDLE_LEAN_AMP = 0.06f;   // rad idle side-to-side weight-shift lean
+constexpr float IDLE_PITCH_AMP= 0.03f;   // rad idle fore-aft lean
+constexpr float IDLE_BOB      = 0.013f;  // m vertical breathing bob
 float mul32(uint32_t& a) {
   a += 0x6D2B79F5u; uint32_t t = a;
   t = (t ^ (t >> 15)) * (t | 1u);
@@ -331,6 +339,7 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
     return glm::vec3(inner * glm::vec4(raw, 1.0f));
   };
   deckLift_ = j.value("deck_lift", 0.0f);
+  beamAxisZ_ = j.value("beam_axis", std::string("x")) == "z";
   if (j.contains("waypoints"))
     for (auto it = j["waypoints"].begin(); it != j["waypoints"].end(); ++it) {
       glm::vec3 p = toRL(it.value()); deckSnap(p); waypoints_[it.key()] = p;
@@ -358,6 +367,9 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
       climbs_.push_back(std::move(cl));
     }
   if (stations_.empty()) { std::fprintf(stderr, "[crew] layout has no stations: %s\n", layoutPath.c_str()); return; }
+  // Widest station beam (rail proxy) for idle-motion damping near the bulwark.
+  for (const Station& s : stations_) maxBeam_ = std::max(maxBeam_, std::fabs(beamAxisZ_ ? s.pos.z : s.pos.x));
+  if (maxBeam_ < 1e-3f) maxBeam_ = 1.0f;
 
   const int n = std::min(count, (int)stations_.size());
   members_.reserve(n);
@@ -370,6 +382,8 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
     m.kit = makeKit(s);
     m.rngState = s;
     m.animSpeed = 0.92f + m.rand() * 0.16f;
+    m.swayPhase = m.rand() * kPi2;
+    m.swayFreq = 0.7f + m.rand() * 0.5f;
     m.wpId = firstWp;
     m.dwell = 2.0f + m.rand() * 6.0f;
     members_.push_back(std::move(m));
@@ -577,8 +591,33 @@ void Deck::tickMember(Member& m, float dt) {
   }
 }
 
-void Deck::tick(float dt) {
-  for (Member& m : members_) { tickMember(m, dt); m.anim->update(dt); }
+void Deck::computePresence(Member& m) {
+  // Brace: counter-lean the deck's heel/pitch so the crew ride the swell instead
+  // of standing rigidly perpendicular to a heeled deck (composed OUTSIDE the yaw,
+  // so it's about the ship's fore-aft/lateral axes whichever way they face).
+  float roll  = -shipHeel_  * BRACE_FACTOR;
+  float pitch = -shipPitch_ * BRACE_FACTOR;
+  m.swayOffset = glm::vec3(0.0f);
+  if (m.state == State::Station) {
+    // Rail damping: 1 at the centreline -> ~0.4 at the rail-most station.
+    const float beam = beamAxisZ_ ? m.stationPos.z : m.stationPos.x;
+    const float f = std::fabs(beam) / maxBeam_;
+    m.railDamp = 1.0f - 0.6f * f * f;
+    const float rd = m.railDamp;
+    // Always-on idle weight-shift lean + a lean onto the downhill foot as she heels.
+    roll  += std::sin(clock_ * m.swayFreq + m.swayPhase) * IDLE_LEAN_AMP * rd;
+    pitch += std::sin(clock_ * m.swayFreq * 0.7f + m.swayPhase * 1.7f) * IDLE_PITCH_AMP;
+    m.swayOffset.x = (std::sin(clock_ * m.swayFreq + m.swayPhase) * SWAY_AMP + shipHeel_ * HEEL_SHIFT) * rd;
+    m.swayOffset.z = std::cos(clock_ * m.swayFreq * 0.8f + m.swayPhase) * SWAY_AMP * 0.6f;
+    m.swayOffset.y = std::sin(clock_ * 0.9f + m.swayPhase) * IDLE_BOB;
+  }
+  m.leanRoll  = std::max(-BRACE_MAX, std::min(BRACE_MAX, roll));
+  m.leanPitch = std::max(-BRACE_MAX, std::min(BRACE_MAX, pitch));
+}
+
+void Deck::tick(float dt, float shipHeel, float shipPitch) {
+  shipHeel_ = shipHeel; shipPitch_ = shipPitch; clock_ += dt;
+  for (Member& m : members_) { tickMember(m, dt); computePresence(m); m.anim->update(dt); }
 }
 
 }  // namespace crew

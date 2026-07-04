@@ -130,6 +130,13 @@ struct Member {
   std::vector<glm::vec3> climbPoly; int climbSeg = 0; float climbT = 0, climbPause = 0; int climbDir = 1;
   float animSpeed = 1.0f;
   uint32_t rngState = 1;
+  // Presence (Phase 3): a desynced idle sway + the brace/lean this member rides.
+  float swayPhase = 0, swayFreq = 1.0f, railDamp = 1.0f;
+  // Output pose modifiers (computed each tick), applied by the renderer on top of
+  // pos/yaw: a body lean (roll about the bow axis, pitch about the beam) + a small
+  // positional weight-shift/breathing offset in root-local axes.
+  float leanRoll = 0, leanPitch = 0;
+  glm::vec3 swayOffset{0};
   float rand();
 };
 
@@ -145,10 +152,13 @@ class Deck {
        int count, const glm::mat4& inner, std::vector<glm::vec3> deckTris, float bowYaw,
        float walkSpeed = 1.2f);
   bool ok() const { return ok_; }
-  void tick(float dt);
+  // shipHeel/shipPitch = the deck's current world tilt (rad) — the members brace
+  // against them so they ride the swell instead of standing rigid on a heeled deck.
+  void tick(float dt, float shipHeel = 0.0f, float shipPitch = 0.0f);
   std::vector<Member>& members() { return members_; }
 
  private:
+  void  computePresence(Member& m);                           // brace + idle sway/bob/lean
   float deckHeight(float lx, float lz, float footRef) const;   // deckLocalHeight port
   void  deckSnap(glm::vec3& p) const;                          // snap y to the planks
   Station* pickStation(Member& m, bool excludeCurrent = false);
@@ -177,6 +187,10 @@ class Deck {
   int walkers_ = 0; bool climbBusy_ = false;
   uint32_t rootRng_ = 1;
   bool ok_ = false;
+  // Presence: a running clock for the idle sway + the rail-proxy (widest station
+  // beam) that damps motion near the bulwark; beamAxis picks the across-ship axis.
+  float clock_ = 0.0f, maxBeam_ = 1.0f, shipHeel_ = 0.0f, shipPitch_ = 0.0f;
+  bool beamAxisZ_ = false;
   float rand();
 };
 

@@ -2965,7 +2965,7 @@ int main(int argc, char** argv) {
   // curW x curH swapchain. adaptiveFactor is nudged by the frame-time monitor
   // when adaptive resolution is on (never above the user's renderScale).
   float adaptiveFactor = 1.0f;
-  auto effScale = [&]() { return glm::clamp(userCfg.gfx.renderScale * adaptiveFactor, 0.3f, 1.0f); };
+  auto effScale = [&]() { return glm::clamp(userCfg.gfx.renderScale * adaptiveFactor, 0.3f, 2.0f); };
   double adaptAccumMs = 0.0; int adaptFrames = 0; double adaptLastT = glfwGetTime();
   uint32_t rW = std::max(1u, (uint32_t)std::lround(curW * effScale()));
   uint32_t rH = std::max(1u, (uint32_t)std::lround(curH * effScale()));
@@ -3201,8 +3201,7 @@ int main(int argc, char** argv) {
     icfg.FontDataOwnedByAtlas = false;
     icfg.MergeMode = true;
     icfg.PixelSnapH = true;
-    icfg.GlyphMinAdvanceX = 16.0f * uiScaleX;   // fixed advance so icon buttons align
-    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * uiScaleX);
+    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * uiScaleX);   // small baseline nudge for inline text icons
     imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_ICONS, (int)UI_FONT_ICONS_SIZE,
                                      15.0f * uiScaleX, &icfg, kIconRange);
   }
@@ -3618,12 +3617,21 @@ int main(int argc, char** argv) {
         prevEscKey = escKey;
       }
       // Square icon button with a hover tooltip (Font Awesome glyph merged into
-      // the body atlas). `active` tints it teal. Reused across the HUD.
+      // the body atlas). `active` tints it teal. The glyph is drawn manually,
+      // centred in the button rect — Button's own label centring keys off the
+      // padded glyph advance, which sits an icon visibly off-centre. Reused HUD-wide.
       auto iconBtn = [&](const char* icon, const char* tip, bool active) -> bool {
+        const ImVec2 sz(34.0f, 30.0f);
+        const ImVec2 p = ImGui::GetCursorScreenPos();
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.65f, 1.0f));
-        const bool clicked = ImGui::Button(icon, ImVec2(34.0f, 30.0f));
+        char id[24]; std::snprintf(id, sizeof(id), "##ib%p", (const void*)icon);
+        const bool clicked = ImGui::Button(id, sz);
         if (active) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        const ImVec2 ts = ImGui::CalcTextSize(icon);
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(p.x + (sz.x - ts.x) * 0.5f, p.y + (sz.y - ts.y) * 0.5f),
+            ImGui::GetColorU32(ImGuiCol_Text), icon);
         return clicked;
       };
 
@@ -3721,7 +3729,8 @@ int main(int argc, char** argv) {
         ImGui::Spacing();
         // Render scale (biggest perf lever) + adaptive resolution.
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::SliderFloat("Render scale", &g.renderScale, 0.5f, 1.0f, "%.2f")) custom();
+        if (ImGui::SliderFloat("Render scale", &g.renderScale, 0.5f, 2.0f,
+                               g.renderScale > 1.02f ? "%.2fx (supersample)" : "%.2f")) custom();
         if (ImGui::IsItemDeactivatedAfterEdit()) gsave();
         if (ImGui::Checkbox("Adaptive resolution", &g.adaptiveRes)) { custom(); gsave(); }
         if (g.adaptiveRes) {

@@ -464,8 +464,10 @@ void Deck::deckSnap(glm::vec3& p) const {
     const float hy = castHighest(cx, cz, topY);
     if (!std::isnan(hy) && hy >= lo && hy <= hi) { p.x = cx; p.z = cz; p.y = hy + deckLift_; return; }
   }
-  const float dY = castHighest(p.x, p.z, topY);    // nothing open nearby: keep xz, snap y
-  if (!std::isnan(dY)) p.y = dY + deckLift_;
+  // Nothing open nearby: KEEP the authored spot (a measured deck level) rather than
+  // snapping onto whatever the ray hits — else a station boxed in by the ship's boat
+  // / cannon lands the crew on top of the furniture (client leaves it unsnapped).
+  p.y += deckLift_;
 }
 
 Station* Deck::pickStation(Member& m, bool excludeCurrent) {

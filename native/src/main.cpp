@@ -2010,6 +2010,9 @@ static void captureSurface(WGPUDevice device, WGPUQueue queue, WGPUTexture tex,
 
 // ── Terrain rendering ─────────────────────────────────────────────────────────
 struct TerrainU { glm::mat4 viewProj; glm::vec4 eye; glm::vec4 bounds; glm::vec4 misc; glm::vec4 sun; glm::vec4 extra; };
+// Terrain shadow-RECEIVE uniform (group 1): the two sun cascades + PCF params,
+// so land reads the same shadow maps the ocean does (buildings cast on ground).
+struct TShadowU { glm::mat4 vp0; glm::mat4 vp1; glm::vec4 params; };
 struct SeaFarU  { glm::mat4 viewProj; glm::vec4 eye; glm::vec4 sun; glm::vec4 origin; };
 
 // A camera-following grid displaced by the world height texture. Pipeline/grid are
@@ -2030,6 +2033,12 @@ struct TerrainRender {
   WGPURenderPipeline shadowPipeline = nullptr;
   WGPUBuffer shadowUbuf = nullptr;
   WGPUBindGroup shadowBind = nullptr;
+  // Sun-shadow RECEIVE (group 1): land reads the cascades so buildings/piers/
+  // trees cast on the ground. Its own uniform + bind group (built once the
+  // shadow textures exist); the layout is baked into the main pipeline.
+  WGPUBindGroupLayout shadowRecvBGL = nullptr;
+  WGPUBuffer shadowRecvUbuf = nullptr;
+  WGPUBindGroup shadowRecvBind = nullptr;
   // Biome skinning (Angular terrain.service port): splat map + 5 diffuse tiles +
   // 3 normal tiles. All slots point at a 1x1 placeholder until the async fetch
   // lands (the shader gates on extra.y), then the bind group is rebuilt.
@@ -2176,7 +2185,26 @@ static TerrainRender createTerrainRender(WGPUDevice device, WGPUQueue queue, WGP
     t.placeTex = makeSampledRGBA(device, queue, 1, 1, grey, false);
     t.placeView = wgpuTextureCreateView(t.placeTex, nullptr);
   }
-  WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &t.bgl;
+  // Group 1: sun-shadow receive (uniform + 2 cascade depth textures + a
+  // comparison sampler). Baked into the MAIN pipeline layout; the shadow-caster
+  // pipeline keeps its group-0-only layout, so it never binds these.
+  {
+    WGPUBindGroupLayoutEntry se[4] = {};
+    se[0].binding = 0; se[0].visibility = WGPUShaderStage_Fragment;
+    se[0].buffer.type = WGPUBufferBindingType_Uniform;
+    se[1].binding = 1; se[1].visibility = WGPUShaderStage_Fragment;
+    se[1].texture.sampleType = WGPUTextureSampleType_Depth; se[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    se[2].binding = 2; se[2].visibility = WGPUShaderStage_Fragment;
+    se[2].texture.sampleType = WGPUTextureSampleType_Depth; se[2].texture.viewDimension = WGPUTextureViewDimension_2D;
+    se[3].binding = 3; se[3].visibility = WGPUShaderStage_Fragment;
+    se[3].sampler.type = WGPUSamplerBindingType_Comparison;
+    WGPUBindGroupLayoutDescriptor sbld = {}; sbld.entryCount = 4; sbld.entries = se;
+    t.shadowRecvBGL = wgpuDeviceCreateBindGroupLayout(device, &sbld);
+    WGPUBufferDescriptor rub = {}; rub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    rub.size = sizeof(TShadowU); t.shadowRecvUbuf = wgpuDeviceCreateBuffer(device, &rub);
+  }
+  WGPUBindGroupLayout mainBGLs[2] = { t.bgl, t.shadowRecvBGL };
+  WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 2; pld.bindGroupLayouts = mainBGLs;
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &pld);
 
   WGPUVertexAttribute attr = {}; attr.format = WGPUVertexFormat_Float32x2; attr.offset = 0; attr.shaderLocation = 0;
@@ -6110,6 +6138,25 @@ int main(int argc, char** argv) {
         ts.viewProj = shadowVP1;
         wgpuQueueWriteBuffer(queue, terrainR.shadowUbuf, 0, &ts, sizeof(ts));
       }
+      // Shadow RECEIVE (group 1): land samples both cascades so buildings/piers/
+      // trees throw real shadows on the ground. Built once; world-space matrices
+      // work for the main + reflection passes alike.
+      if (terrainR.shadowRecvUbuf) {
+        SunShadow& shdw = sunShadow(device);
+        if (!terrainR.shadowRecvBind && shdw.view0 && shdw.view1 && shdw.cmp) {
+          WGPUBindGroupEntry re[4] = {};
+          re[0].binding = 0; re[0].buffer = terrainR.shadowRecvUbuf; re[0].size = sizeof(TShadowU);
+          re[1].binding = 1; re[1].textureView = shdw.view0;
+          re[2].binding = 2; re[2].textureView = shdw.view1;
+          re[3].binding = 3; re[3].sampler = shdw.cmp;
+          WGPUBindGroupDescriptor rbd = {}; rbd.layout = terrainR.shadowRecvBGL; rbd.entryCount = 4; rbd.entries = re;
+          terrainR.shadowRecvBind = wgpuDeviceCreateBindGroup(device, &rbd);
+        }
+        TShadowU tsu{ shadowVP0, shadowVP1,
+                      glm::vec4(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1,
+                                1.0f / (float)kShadowRes) };
+        wgpuQueueWriteBuffer(queue, terrainR.shadowRecvUbuf, 0, &tsu, sizeof(tsu));
+      }
     }
     // Clouds: integrate wind drift, derive time-of-day light, write uniforms. The
     // sun/sky/ground colour model + coverage/type mirror the client's cloud plugin.
@@ -6243,6 +6290,8 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
         if (terrainR.ready && terrUniformsLive) {
           wgpuRenderPassEncoderSetPipeline(rp, terrainR.pipeline);
+          if (terrainR.shadowRecvBind)   // group 1 required by the pipeline
+            wgpuRenderPassEncoderSetBindGroup(rp, 1, terrainR.shadowRecvBind, 0, nullptr);
           wgpuRenderPassEncoderSetBindGroup(rp, 0, terrainR.farBindGroup, 0, nullptr);
           wgpuRenderPassEncoderSetVertexBuffer(rp, 0, terrainR.farVbuf, 0, WGPU_WHOLE_SIZE);
           wgpuRenderPassEncoderSetIndexBuffer(rp, terrainR.farIbuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
@@ -6529,6 +6578,8 @@ int main(int argc, char** argv) {
     // Terrain (islands) — far silhouette ring first, then the detailed near grid.
     if (terrainR.ready) {
       wgpuRenderPassEncoderSetPipeline(pass, terrainR.pipeline);
+      if (terrainR.shadowRecvBind)   // group 1: land receives the sun cascades
+        wgpuRenderPassEncoderSetBindGroup(pass, 1, terrainR.shadowRecvBind, 0, nullptr);
       wgpuRenderPassEncoderSetBindGroup(pass, 0, terrainR.farBindGroup, 0, nullptr);
       wgpuRenderPassEncoderSetVertexBuffer(pass, 0, terrainR.farVbuf, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderSetIndexBuffer(pass, terrainR.farIbuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);

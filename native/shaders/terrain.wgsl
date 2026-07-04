@@ -32,6 +32,46 @@ struct TU {
 @group(0) @binding(13) var tileSamp  : sampler;   // repeat, trilinear, aniso
 @group(0) @binding(14) var splatSamp : sampler;   // clamp, bilinear
 
+// ── Sun shadows RECEIVED on land (group 1, so the depth-only shadow CASTER
+//    pipeline — which shares group 0 — never binds these while writing them).
+//    Same 2-cascade scheme the ocean samples: the tight ship box up close, the
+//    wide landscape box out to ~1.7 km, so buildings/piers/trees throw real
+//    shadows on the ground. ──
+struct TShadow {
+  vp0    : mat4x4<f32>,   // world -> sun clip, tight cascade
+  vp1    : mat4x4<f32>,   // world -> sun clip, wide cascade
+  params : vec4<f32>,     // x = enabled; y = bias0; z = bias1; w = shadow texel (uv)
+};
+@group(1) @binding(0) var<uniform> ts : TShadow;
+@group(1) @binding(1) var shadowT0 : texture_depth_2d;
+@group(1) @binding(2) var shadowT1 : texture_depth_2d;
+@group(1) @binding(3) var shadowSamp : sampler_comparison;
+
+fn sunShadowLand(worldPos : vec3<f32>) -> f32 {
+  if (ts.params.x < 0.5) { return 1.0; }
+  let sp0 = ts.vp0 * vec4<f32>(worldPos, 1.0);
+  let uv0 = vec2<f32>(sp0.x * 0.5 + 0.5, 0.5 - sp0.y * 0.5);
+  if (uv0.x > 0.01 && uv0.x < 0.99 && uv0.y > 0.01 && uv0.y < 0.99 &&
+      sp0.z > 0.0 && sp0.z < 1.0) {
+    let px = ts.params.w;   // 3x3 PCF at 1-texel spread (crisp near shadow)
+    var s = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        s += textureSampleCompareLevel(shadowT0, shadowSamp,
+                uv0 + vec2<f32>(f32(dx), f32(dy)) * px, sp0.z - ts.params.y);
+      }
+    }
+    return s / 9.0;
+  }
+  let sp1 = ts.vp1 * vec4<f32>(worldPos, 1.0);
+  let uv1 = vec2<f32>(sp1.x * 0.5 + 0.5, 0.5 - sp1.y * 0.5);
+  if (uv1.x > 0.005 && uv1.x < 0.995 && uv1.y > 0.005 && uv1.y < 0.995 &&
+      sp1.z > 0.0 && sp1.z < 1.0) {
+    return textureSampleCompareLevel(shadowT1, shadowSamp, uv1, sp1.z - ts.params.z);
+  }
+  return 1.0;
+}
+
 fn worldToTexel(wx : f32, wz : f32) -> vec2<f32> {
   let ux = (wx - u.bounds.x) / (u.bounds.y - u.bounds.x);
   let uz = (u.bounds.w - wz) / (u.bounds.w - u.bounds.z);   // +Z is south
@@ -287,7 +327,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   }
 
   let diff = max(dot(N, L), 0.0);
-  col = col * (0.32 + 0.68 * diff);
+  // Sun shadows dim only the DIRECT term (buildings/piers/trees on land, plus
+  // the ship near shore); the ambient 0.32 stays so shadowed ground isn't black.
+  let sunVis = sunShadowLand(wp);
+  col = col * (0.32 + 0.68 * diff * sunVis);
   // Underwater: the client's exact seabed grade. Its refraction RTT rendered the
   // seabed with normal shading, then the water shader multiplied it by
   // (0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp) — a fixed sandy-dim grade, gated to

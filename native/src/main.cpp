@@ -6443,7 +6443,8 @@ int main(int argc, char** argv) {
     if (shadowOn) {
       SunShadow& shdw = sunShadow(device);
       WGPUCommandEncoder senc = wgpuDeviceCreateCommandEncoder(device, nullptr);
-      auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, bool withTerrain) {
+      auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, bool withTerrain,
+                            const glm::mat4& scatterVP) {
         WGPURenderPassDepthStencilAttachment da = {};
         da.view = view;
         da.depthLoadOp = WGPULoadOp_Clear; da.depthStoreOp = WGPUStoreOp_Store;
@@ -6476,14 +6477,16 @@ int main(int argc, char** argv) {
             wgpuRenderPassEncoderDrawIndexed(sp, sm.indexCount, 1, sm.indexOffset, 0, 0);
           }
         }
-        // Near full-mesh palms/beeches into the WIDE cascade only (real tree
-        // shadows on land; the tight ship cascade skips them).
-        if (withTerrain) scatterSys.drawShadow(sp, shadowVP1, t);
+        // Near full-mesh palms/beeches cast into BOTH cascades: the tight ship
+        // cascade (crisp, stable tree shadows on a beach the ship sails near — the
+        // terrain reads it first for near points) AND the wide cascade (coarse, for
+        // trees past the tight box). Trees outside a cascade just clip.
+        scatterSys.drawShadow(sp, scatterVP, t);
         wgpuRenderPassEncoderEnd(sp);
         wgpuRenderPassEncoderRelease(sp);
       };
-      shadowPass(shdw.view0, shdw.castBG0, false);   // tight ship cascade
-      shadowPass(shdw.view1, shdw.castBG1, true);    // wide landscape cascade
+      shadowPass(shdw.view0, shdw.castBG0, false, shadowVP0);   // tight ship cascade (+ near trees)
+      shadowPass(shdw.view1, shdw.castBG1, true,  shadowVP1);   // wide landscape cascade
       WGPUCommandBuffer scmd = wgpuCommandEncoderFinish(senc, nullptr);
       wgpuQueueSubmit(queue, 1, &scmd);
       wgpuCommandBufferRelease(scmd);

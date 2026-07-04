@@ -55,6 +55,7 @@
 #include "gltf_mesh.hpp"
 #include "gltf_rig.hpp"
 #include "vessel_anim.hpp"
+#include "crew.hpp"
 #include "net_admin.hpp"
 #include "net_auth.hpp"
 #include "net_mp.hpp"
@@ -3103,6 +3104,16 @@ int main(int argc, char** argv) {
   // pruned when a ship leaves range / swaps to its impostor.
   std::map<std::string, std::unique_ptr<vanim::Controller>> remoteAnims;
   std::map<std::string, std::string> remoteAnimSlugs;
+  // Crew (Phase 0): one shared rigged Mesh (crew_spike.glb) rendered like a ship
+  // instance, driven by a per-member crew::Animator. Loaded lazily on first use;
+  // opt out with SAILSIM_NOCREW. Phase 0 spawns a single member on the own deck to
+  // prove the skinned-clip playback + cross-fade + render path before Phase 1
+  // scales it to a full per-instance crew.
+  const bool crewEnabled = std::getenv("SAILSIM_NOCREW") == nullptr;
+  std::unique_ptr<Mesh> crewMesh;
+  std::unique_ptr<crew::Animator> crewAnim;
+  bool crewTried = false;
+  double crewClipT = 0.0;   // Phase 0 demo timer: auto-alternates Idle<->Walk
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
@@ -3169,6 +3180,7 @@ int main(int argc, char** argv) {
   // zoom. camYawOffset is relative to the heading (0 = directly astern), so the camera
   // keeps chasing as the ship turns while any drag offset is preserved.
   float camYawOffset = 0.0f, camPitch = 0.43f, camDist = 14.3f;
+  if (const char* cd = std::getenv("SAILSIM_CAMDIST")) camDist = (float)std::atof(cd);   // screenshot framing
   bool  camFramed = false;   // set the default chase distance from the vessel size once
   // ── View modes (client HUD buttons) ──
   bool  firstPerson = false;            // camera sits on the deck; drag = free-look, LMB+WASD = walk
@@ -6709,6 +6721,72 @@ int main(int argc, char** argv) {
         slot[s.mesh] = idx + 1;
       }
     }
+    // ── Crew (Phase 0): one animated member on the own deck. Lazy-load the shared
+    // crew rig, drive a demo Idle<->Walk cross-fade, and upload its palette +
+    // uniforms into slot 0 (drawn below with the ships). ──
+    if (crewEnabled && sailing && ownMesh) {
+      if (!crewTried) {
+        crewTried = true;
+        std::string cpath = geometryDir() + "/crew_spike.glb";
+        RiggedData crd = loadGltfRigged(cpath.c_str());
+        if (crd.ok) {
+          crewMesh = std::make_unique<Mesh>(createMesh(device, queue, kSceneFormat, std::move(crd)));
+          crewAnim = std::make_unique<crew::Animator>(crewMesh->rig, 0x51A11u);
+          std::printf("[crew] loaded crew_spike.glb: %zu nodes, %zu skins, %zu clips\n",
+                      crewMesh->rig->nodes.size(), crewMesh->rig->skins.size(), crewMesh->rig->clips.size());
+        } else {
+          std::printf("[crew] FAILED to load %s\n", cpath.c_str());
+        }
+      }
+      if (crewMesh && crewAnim) {
+        // Phase 0: a single member stands the deck on the Idle loop. SAILSIM_CREW_CLIP
+        // forces another clip (Walk/Work_Cannon/...) to exercise the sampler + the
+        // two-clip cross-fade; SAILSIM_CREW_CYCLE alternates Idle/Walk every 4 s.
+        crewClipT += dt;
+        const char* forceClip = std::getenv("SAILSIM_CREW_CLIP");
+        const bool cycle = std::getenv("SAILSIM_CREW_CYCLE") != nullptr;
+        crewAnim->play(forceClip ? forceClip
+                       : cycle ? (std::fmod(crewClipT, 8.0) > 4.0 ? "Walk" : "Idle")
+                       : "Idle", true, 1.0f);
+        crewAnim->update(dt);
+        // OUTER = own ship world pose WITHOUT bowYaw/scale/keel (the frame the
+        // deck-walk triangles live in); place a deck-local point in it at natural
+        // crew scale. Phase 2 will feed real station coords through this same map.
+        glm::mat4 ownModel = ownShipModel(*ownMesh);
+        glm::mat4 inner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
+        inner = glm::scale(inner, glm::vec3(ownMesh->shipScale));
+        inner = glm::translate(inner, -ownMesh->keelCenter);
+        glm::mat4 outer = ownModel * glm::inverse(inner);
+        // Deck-local spot: the authored first-person POV XZ (guaranteed on the main
+        // deck), snapped to the exact deck height with the same down-ray the
+        // deck-walk uses — so the member stands ON the planks, not up in the tops.
+        // A small forward nudge sets it clear of the stern rail for the chase cam.
+        glm::vec3 pov = fpCamFor(ownVesselSlug);
+        float sx = 0.0f, sz = pov.z + 3.5f;
+        float footRef = pov.y - 1.65f;   // kWalkEye
+        float deckY = deckLocalHeight(*ownMesh, sx, sz, footRef);
+        if (std::isnan(deckY)) { sz = pov.z; deckY = deckLocalHeight(*ownMesh, sx, sz, footRef); }
+        if (std::isnan(deckY)) deckY = footRef;
+        glm::vec3 spot(sx, deckY, sz);
+        glm::mat4 crewModel = outer * glm::translate(glm::mat4(1.0f), spot);
+        if (std::getenv("SAILSIM_CREW_DEBUG")) {
+          static bool once = false;
+          if (!once) { once = true;
+            glm::vec3 wp = glm::vec3(crewModel[3]);
+            std::printf("[crew] deck spot(root-local)=(%.2f,%.2f,%.2f) world=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) clip=%s\n",
+                        spot.x, spot.y, spot.z, wp.x, wp.y, wp.z, eye.x, eye.y, eye.z, crewAnim->currentClip().c_str());
+          }
+        }
+        const auto& pal = crewAnim->palette();
+        std::vector<uint8_t> blob(kPaletteStride, 0);
+        std::memcpy(blob.data(), pal.data(),
+                    std::min(pal.size(), (size_t)kMaxPaletteSlots) * sizeof(glm::mat4));
+        wgpuQueueWriteBuffer(queue, crewMesh->paletteBuf, 0, blob.data(), kPaletteStride);
+        MeshUniforms cmu{ viewProj * crewModel, crewModel, glm::vec4(eye, 1.0f),
+                          glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 0.0f, 0.0f, 0.0f) };
+        wgpuQueueWriteBuffer(queue, crewMesh->uniformBuf, 0, &cmu, sizeof(cmu));
+      }
+    }
     // Impostor uniforms: distant-ship billboards (one dynamic slot each) + the
     // town building layers (one uniform per type). Tint matches the terrain's
     // day/night grade so LODs darken with the scene instead of popping daylight.
@@ -6828,6 +6906,19 @@ int main(int argc, char** argv) {
           wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
         }
         slot[m] = idx + 1;
+      }
+      // Crew (Phase 0): draw the own-deck member (slot 0) like a ship instance.
+      // Group 1 (shadow-receive) stays bound from the ships above.
+      if (crewEnabled && sailing && crewMesh && crewAnim) {
+        uint32_t zo[2] = { 0, 0 };
+        wgpuRenderPassEncoderSetPipeline(pass, crewMesh->pipeline);
+        wgpuRenderPassEncoderSetVertexBuffer(pass, 0, crewMesh->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(pass, crewMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        for (size_t i = 0; i < crewMesh->submeshes.size(); ++i) {
+          const RigSubmesh& sm = crewMesh->submeshes[i];
+          wgpuRenderPassEncoderSetBindGroup(pass, 0, crewMesh->bindGroups[i], 2, zo);
+          wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
+        }
       }
     }
     // Hull water mask: stamp every masked vessel's hull into the stencil plane

@@ -321,6 +321,7 @@ add_executable(sailsim_native
   src/gltf_mesh.cpp
   src/gltf_rig.cpp
   src/vessel_anim.cpp
+  src/crew.cpp
   src/ktx2.cpp
   src/ocean_fft.cpp
   src/net_admin.cpp

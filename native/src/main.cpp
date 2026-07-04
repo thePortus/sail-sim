@@ -3114,8 +3114,10 @@ int main(int argc, char** argv) {
   std::string crewDeckSlug;   // slug the current deck was built for (rebuild on hull change)
   glm::mat4 crewInner(1.0f);  // ship bowYaw*scale*(-keel) at deck-build time
   // Body-build morph global slots (Fem=target0, Heavy=1, Lean=2) across the rig's
-  // morphed meshes — driven per member into the palette slot's weight region.
+  // morphed meshes; face morph slots (BrowsUp=3, Frown=4, Smile=5, MouthOpen=6 on
+  // the base mesh) — driven per member into the palette slot's weight region.
   std::vector<int> crewFemIdx, crewHeavyIdx, crewLeanIdx;
+  std::vector<int> crewBrowsIdx, crewFrownIdx, crewSmileIdx, crewMouthIdx;
   bool crewTried = false;
   sail::Rig    vrig = sail::rigForSlug("sloop");
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
@@ -6752,6 +6754,10 @@ int main(int argc, char** argv) {
               case 0: crewFemIdx.push_back((int)gi); break;
               case 1: crewHeavyIdx.push_back((int)gi); break;
               case 2: crewLeanIdx.push_back((int)gi); break;
+              case 3: crewBrowsIdx.push_back((int)gi); break;   // face morphs (base mesh)
+              case 4: crewFrownIdx.push_back((int)gi); break;
+              case 5: crewSmileIdx.push_back((int)gi); break;
+              case 6: crewMouthIdx.push_back((int)gi); break;
               default: break;
             }
           }
@@ -6822,8 +6828,10 @@ int main(int argc, char** argv) {
             if (mm.workBurst > 0) work++;
             if (mm.panicT > 0) pan++;
           }
-          std::printf("[crew] f%ld st=%d wk=%d cl=%d dead=%d res=%d | flinch=%d stagger=%d gunwork=%d panic=%d\n",
-                      frame, st, wk, cl, dead, res, flin, stag, work, pan);
+          float fb = 0, fm = 0;
+          for (auto& mm : crewDeck->members()) { fb = std::max(fb, mm.faceBrows); fm = std::max(fm, mm.faceMouth); }
+          std::printf("[crew] f%ld st=%d wk=%d cl=%d dead=%d res=%d | flinch=%d stagger=%d gunwork=%d panic=%d | maxWince(brows=%.2f mouth=%.2f)\n",
+                      frame, st, wk, cl, dead, res, flin, stag, work, pan, fb, fm);
         }
         const size_t morphBase = (size_t)kMaxPaletteSlots * sizeof(glm::mat4);
         std::vector<uint8_t> blob(kPaletteStride, 0);
@@ -6842,6 +6850,10 @@ int main(int argc, char** argv) {
           for (int gi : crewFemIdx)   setW(gi, m.kit.fem);
           for (int gi : crewHeavyIdx) setW(gi, m.kit.heavy);
           for (int gi : crewLeanIdx)  setW(gi, m.kit.lean);
+          for (int gi : crewBrowsIdx) setW(gi, m.faceBrows);
+          for (int gi : crewFrownIdx) setW(gi, m.faceFrown);
+          for (int gi : crewSmileIdx) setW(gi, m.faceSmile);
+          for (int gi : crewMouthIdx) setW(gi, m.faceMouth);
           for (int k = 0; k < crew::kTintSlotCount; ++k) {
             glm::vec4 tv(crew::kitTintFor(m.kit, k), 1.0f);
             size_t toff = morphBase + (size_t)(32 + k) * sizeof(glm::vec4);

@@ -44,6 +44,10 @@ struct Kit {
             tintBoots{1}, tintHat{1}, tintHair{1}, tintNeck{1}, tintSkin{1};
 };
 
+// Tint slots packed into the palette weight region (w[32 + slot]); slot count
+// includes the skin tone (slot 9) added in Phase 5.
+constexpr int kTintSlotCount = 10;
+
 // Deterministic kit from a seed (mirrors applyKitVariants' probabilities).
 Kit makeKit(uint32_t seed);
 
@@ -55,7 +59,6 @@ bool kitShowsSubmesh(const Kit& k, const std::string& submeshName);
 // Used to pack the kit colours into the palette's spare morph-weight region.
 int garmentTintSlot(const std::string& submeshName);
 glm::vec3 kitTintFor(const Kit& k, int slot);
-constexpr int kTintSlotCount = 9;
 
 // One crew member's skeletal state. Cheap: a handful of per-node TRS scratch
 // arrays + two clip cursors. update() re-samples every frame from rest, so bones
@@ -137,6 +140,13 @@ struct Member {
   float flinch = 0, stagger = 0; int staggerDir = 1;
   float reactT = 0, reactCD = 0, panicT = 0; bool fleeing = false;
   float workBurst = 0;   // >0 -> gun crew heaving after their broadside
+  // Face (Phase 5): a slow expression drift (eased cur toward a random tgt), with
+  // combat/heel reactions max'd over it each frame -> the output weights the
+  // renderer drives into the BrowsUp/Frown/Smile/MouthOpen morphs. (crew_spike has
+  // no Blink morph, so blink is omitted.)
+  float exprTimer = 0;
+  float curBrows = 0, curFrown = 0, curSmile = 0, tgtBrows = 0, tgtFrown = 0, tgtSmile = 0;
+  float faceBrows = 0, faceFrown = 0, faceSmile = 0, faceMouth = 0;
   // Output pose modifiers (computed each tick), applied by the renderer on top of
   // pos/yaw: a body lean (roll about the bow axis, pitch about the beam) + a small
   // positional weight-shift/breathing offset in root-local axes.
@@ -173,6 +183,7 @@ class Deck {
 
  private:
   void  computePresence(Member& m);                           // brace + idle sway/bob/lean
+  void  computeFace(Member& m, float dt);                     // expression drift + reactions
   void  playReact(Member& m, const std::string& clip, float dur);
   void  startFlee(Member& m);
   bool  killOne();

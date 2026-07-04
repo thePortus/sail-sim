@@ -69,6 +69,11 @@ const float CAP[6][3]   = {{0.30f,0.20f,0.12f},{0.34f,0.34f,0.36f},{0.13f,0.17f,
 const float TRI[3][3]   = {{0.05f,0.05f,0.06f},{0.17f,0.11f,0.07f},{0.10f,0.12f,0.22f}};
 const float NECK[5][3]  = {{0.56f,0.11f,0.09f},{0.14f,0.23f,0.44f},{0.82f,0.80f,0.74f},{0.68f,0.54f,0.13f},{0.16f,0.35f,0.19f}};
 const float HAIR[5][3]  = {{0.06f,0.045f,0.03f},{0.11f,0.07f,0.04f},{0.20f,0.14f,0.08f},{0.46f,0.43f,0.41f},{0.30f,0.16f,0.07f}};
+// Skin-tone multipliers over the base skin texture (Phase 5) — a spread of
+// complexions light -> dark since the crew_skins face textures (webp) can't be
+// decoded natively; a per-member tone stands in for real MakeHuman faces.
+const float SKIN[7][3]  = {{1.00f,0.92f,0.84f},{0.95f,0.82f,0.70f},{0.86f,0.68f,0.54f},
+                           {0.72f,0.54f,0.42f},{0.58f,0.42f,0.32f},{0.46f,0.32f,0.24f},{0.36f,0.25f,0.19f}};
 
 std::string kitBase(const std::string& n) {
   std::string s = n;
@@ -114,6 +119,8 @@ Kit makeKit(uint32_t seed) {
   // Long hair only on a bare head (the client also gates on a haired face texture).
   k.hairLong = k.hat == 0 && r() < (k.female ? 0.8f : 0.4f);
   if (k.hairLong) k.tintHair = pick(r, HAIR);
+  // Skin tone (Phase 5).
+  k.tintSkin = pick(r, SKIN);
   // Stature.
   k.stature = 0.93f + r() * 0.13f;
   if (k.female) k.stature *= 0.95f;
@@ -144,7 +151,9 @@ int garmentTintSlot(const std::string& submeshName) {
   if (has(b, "bandana") || has(b, "cap") || has(b, "tricorn")) return 6;
   if (has(b, "hair"))       return 7;
   if (has(b, "neckerchief"))return 8;
-  return -1;   // base / eyes: skin, no per-member tint yet
+  if (has(b, "eye"))        return -1;   // eyes keep their own colour
+  if (has(b, "base"))       return 9;    // body/face skin -> per-member tone
+  return -1;
 }
 
 glm::vec3 kitTintFor(const Kit& k, int slot) {
@@ -152,6 +161,7 @@ glm::vec3 kitTintFor(const Kit& k, int slot) {
     case 0: return k.tintShirt; case 1: return k.tintCoat; case 2: return k.tintVest;
     case 3: return k.tintBreeches; case 4: return k.tintSash; case 5: return k.tintBoots;
     case 6: return k.tintHat; case 7: return k.tintHair; case 8: return k.tintNeck;
+    case 9: return k.tintSkin;
     default: return glm::vec3(1.0f);
   }
 }
@@ -328,6 +338,8 @@ constexpr float REACT_COOLDOWN  = 3.0f;  // s min between a member's one-shot cl
 constexpr float WORK_BURST_DUR  = 2.6f;  // s a gun crew heaves after their broadside
 constexpr float FLEE_FRAC       = 0.6f;  // of panicking crew, this fraction scramble
 constexpr float FLEE_SPEED_MUL  = 1.8f;  // x walk speed while fleeing (a frantic scramble)
+constexpr float HEEL_TENSE_LO   = 0.085f; // rad heel where crew start to look tense
+constexpr float HEEL_TENSE_HI   = 0.32f;  // rad heel for a full worried face
 float mul32(uint32_t& a) {
   a += 0x6D2B79F5u; uint32_t t = a;
   t = (t ^ (t >> 15)) * (t | 1u);
@@ -399,6 +411,7 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
     m.animSpeed = 0.92f + m.rand() * 0.16f;
     m.swayPhase = m.rand() * kPi2;
     m.swayFreq = 0.7f + m.rand() * 0.5f;
+    m.exprTimer = 5.0f + m.rand() * 20.0f;
     m.wpId = firstWp;
     m.dwell = 2.0f + m.rand() * 6.0f;
     members_.push_back(std::move(m));
@@ -662,6 +675,34 @@ void Deck::computePresence(Member& m) {
   m.leanPitch = std::max(-BRACE_MAX, std::min(BRACE_MAX, pitch));
 }
 
+void Deck::computeFace(Member& m, float dt) {
+  // Slow expression drift: mostly neutral, occasionally a mild brow/smile/frown.
+  m.exprTimer -= dt;
+  if (m.exprTimer <= 0.0f) {
+    m.exprTimer = 12.0f + m.rand() * 28.0f;
+    m.tgtBrows = m.tgtFrown = m.tgtSmile = 0.0f;
+    const float roll = m.rand();
+    if (roll > 0.55f) {
+      const float w = 0.15f + m.rand() * 0.3f;   // subtle — working sailors, not actors
+      if (roll > 0.85f) m.tgtSmile = w; else if (roll > 0.70f) m.tgtFrown = w; else m.tgtBrows = w;
+    }
+  }
+  const float e = std::min(1.0f, dt * 2.5f);
+  m.curBrows += (m.tgtBrows - m.curBrows) * e;
+  m.curFrown += (m.tgtFrown - m.curFrown) * e;
+  m.curSmile += (m.tgtSmile - m.curSmile) * e;
+  // Reactions max'd over the drift: a WINCE on flinch/stagger, a TENSE brow as she
+  // heels hard, a held terror face when morale is broken.
+  const float react = std::max(m.flinch, m.stagger);
+  const float scared = m.panicT > 0.0f ? 1.0f : 0.0f;
+  const float tense = std::max(0.0f, std::min(1.0f,
+      (std::fabs(shipHeel_) - HEEL_TENSE_LO) / (HEEL_TENSE_HI - HEEL_TENSE_LO)));
+  m.faceBrows = std::max(std::max(m.curBrows, react * 0.40f), std::max(tense * 0.22f, scared * 0.55f));
+  m.faceFrown = std::max(std::max(m.curFrown, react * 0.45f), std::max(tense * 0.18f, scared * 0.50f));
+  m.faceSmile = (react > 0.05f || scared > 0.0f) ? 0.0f : m.curSmile;   // no grinning mid-flinch/panic
+  m.faceMouth = std::max(react * 0.35f, scared * 0.70f);                 // a gasp on a jolt; wide in terror
+}
+
 void Deck::tick(float dt, float shipHeel, float shipPitch) {
   shipHeel_ = shipHeel; shipPitch_ = shipPitch; clock_ += dt;
   for (Member& m : members_) {
@@ -671,6 +712,7 @@ void Deck::tick(float dt, float shipHeel, float shipPitch) {
     if (m.stagger > 0) m.stagger = std::max(0.0f, m.stagger - dt / STAGGER_DECAY);
     tickMember(m, dt);
     computePresence(m);
+    computeFace(m, dt);
     m.anim->update(dt);
   }
 }

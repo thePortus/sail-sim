@@ -265,6 +265,15 @@ fn tSampleH(wx : f32, wz : f32) -> f32 {
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
 }
 
+// Value noise (matches the terrain shader's _dHash/_dVal) for the shoreline scallop.
+fn shHash(p : vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
+fn shVal(p : vec2<f32>) -> f32 {
+    let i = floor(p); let f = fract(p);
+    let uu = f * f * (3.0 - 2.0 * f);
+    return mix(mix(shHash(i), shHash(i + vec2<f32>(1.0, 0.0)), uu.x),
+               mix(shHash(i + vec2<f32>(0.0, 1.0)), shHash(i + vec2<f32>(1.0, 1.0)), uu.x), uu.y);
+}
+
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // Far ring leaves the centre to the detailed near grid (cam.lod.y = 0 on near).
@@ -367,16 +376,34 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // full reach up close, opaque by ~400 m — also kills grazing-angle noise.
     let viewDist = distance(cam.eye.xyz, in.worldPos);
     let distFade = 1.0 - smoothstep(150.0, 400.0, viewDist);
+    // ── Shoreline scallop + dither offset (metres, centred on 0). Port of the
+    //    Angular waterline noise; applied below to BOTH the reveal shallows AND the
+    //    Beer-Lambert see-through (the dominant term over sand) so the coastline
+    //    reads as an organic, fuzzy line, not a smooth bathymetric contour. Two
+    //    octaves (~1.4 m + ~4.6 m) make the scallop; a ~0.17 m octave (faded with
+    //    range so it can't shimmer) fuzzes the edge; a ~8 s ±0.15 m wash breathes it.
+    let ssp = in.worldPos.xz;
+    let sScallop = shVal(ssp * 0.70) * 0.75 + shHash(floor(ssp * 2.3)) * 0.25;   // [0,1]
+    let sGrain   = 1.0 - smoothstep(60.0, 220.0, viewDist);
+    let sDither  = (shVal(ssp * 6.0) - 0.5) * sGrain;                            // ±0.5
+    let sEbb = sin(cam.lod.w * 0.8 + ssp.x * 0.13 + ssp.y * 0.09) * 0.10
+             + sin(cam.lod.w * 1.3 - ssp.y * 0.18) * 0.05;                       // ±0.15
+    // Amplitude knobs (metres): SCALLOP breaks the coastline into ~1.4 m waves,
+    // DITHER fuzzes that edge. Restrained so the shelf doesn't read as noise.
+    let shoreNoiseM = (sScallop - 0.5) * 2.4 + sDither * 1.0 + sEbb;
+    let seeDm = cam.tmisc.w;
+
     var reveal = 0.0;
     var shallow = 0.0;
     var shoal = 0.0;
     if (cam.tmisc.z > 0.5) {
-        let dz = max(0.0, -tSampleH(in.worldUV.x, in.worldUV.y));
-        let seeD = cam.tmisc.w;
-        reveal  = (1.0 - smoothstep(0.0, seeD, dz)) * distFade;
-        shallow = (1.0 - smoothstep(0.0, seeD * 2.2, dz)) * distFade;
-        shoal   = smoothstep(seeD, seeD * 1.8, dz)
-                * (1.0 - smoothstep(seeD * 1.8, seeD * 3.5, dz)) * distFade * (1.0 - reveal);
+        let dz0 = max(0.0, -tSampleH(in.worldUV.x, in.worldUV.y));
+        // Hold full strength across the halo; fade only in genuinely deep water.
+        let dz = max(0.0, dz0 + shoreNoiseM * (1.0 - smoothstep(seeDm * 2.6, seeDm * 4.5, dz0)));
+        reveal  = (1.0 - smoothstep(0.0, seeDm, dz)) * distFade;
+        shallow = (1.0 - smoothstep(0.0, seeDm * 2.2, dz)) * distFade;
+        shoal   = smoothstep(seeDm, seeDm * 1.8, dz)
+                * (1.0 - smoothstep(seeDm * 1.8, seeDm * 3.5, dz)) * distFade * (1.0 - reveal);
     }
 
     // ── Underwater see-through (Beer-Lambert): the pre-ocean depth snapshot holds
@@ -391,7 +418,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         let dScene = textureLoad(sceneDepth, spx, 0);
         let zScene = -cam.proj.w / (dScene + cam.proj.z);        // view z, negative forward
         let zSurf  = -cam.proj.w / (in.position.z + cam.proj.z);
-        let fwd  = max(zSurf - zScene, 0.0);                     // metres along the view axis
+        let fwd0 = max(zSurf - zScene, 0.0);                     // metres along the view axis
+        // Same shoreline scallop wiggles the water-column depth near shore, so the
+        // sand/water line the see-through paints is organic, not a smooth contour.
+        let fwd  = max(0.0, fwd0 + shoreNoiseM * (1.0 - smoothstep(seeDm * 2.6, seeDm * 4.5, fwd0)));
         let path = fwd * viewDist / max(-zSurf, 0.001);          // slant path through the column
         seeThru = exp(-path * 0.5) * 0.85 * distFade;
     }

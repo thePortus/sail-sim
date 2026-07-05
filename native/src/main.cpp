@@ -368,11 +368,14 @@ fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
 //    terrain near grid. Receivers: mesh.wgsl (cascade 0) + ocean_surface.wgsl. ──
 struct ShadowUniform { glm::mat4 vp; glm::vec4 params; };   // params: x=enabled, y=bias, z=texel (uv), w=pad
 struct SunShadow {
-  WGPUTexture tex0 = nullptr, tex1 = nullptr;
-  WGPUTextureView view0 = nullptr, view1 = nullptr;
-  WGPUBuffer castU0 = nullptr, castU1 = nullptr, recvU = nullptr;
+  // Cascade 0 = tight ship box; cascade 2 = mid box (trees/near-terrain, crisp out
+  // to a few hundred m); cascade 1 = wide landscape box. The terrain receiver picks
+  // the tightest in-range so beach tree shadows are crisp with no coarse seam.
+  WGPUTexture tex0 = nullptr, tex1 = nullptr, tex2 = nullptr;
+  WGPUTextureView view0 = nullptr, view1 = nullptr, view2 = nullptr;
+  WGPUBuffer castU0 = nullptr, castU1 = nullptr, castU2 = nullptr, recvU = nullptr;
   WGPUBindGroupLayout castBGL = nullptr, recvBGL = nullptr;
-  WGPUBindGroup castBG0 = nullptr, castBG1 = nullptr, recvBG = nullptr;
+  WGPUBindGroup castBG0 = nullptr, castBG1 = nullptr, castBG2 = nullptr, recvBG = nullptr;
   WGPUSampler cmp = nullptr;
 };
 static const uint32_t kShadowRes = 2048;
@@ -395,10 +398,12 @@ static SunShadow& sunShadow(WGPUDevice device) {
   };
   mkTex(s.tex0, s.view0);
   mkTex(s.tex1, s.view1);
+  mkTex(s.tex2, s.view2);
   WGPUBufferDescriptor bd = {};
   bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; bd.size = sizeof(ShadowUniform);
   s.castU0 = wgpuDeviceCreateBuffer(device, &bd);
   s.castU1 = wgpuDeviceCreateBuffer(device, &bd);
+  s.castU2 = wgpuDeviceCreateBuffer(device, &bd);
   s.recvU  = wgpuDeviceCreateBuffer(device, &bd);
   WGPUSamplerDescriptor sd = {};
   sd.addressModeU = WGPUAddressMode_ClampToEdge; sd.addressModeV = WGPUAddressMode_ClampToEdge;
@@ -435,6 +440,7 @@ static SunShadow& sunShadow(WGPUDevice device) {
   };
   s.castBG0 = mkCastBG(s.castU0);
   s.castBG1 = mkCastBG(s.castU1);
+  s.castBG2 = mkCastBG(s.castU2);
   {
     WGPUBindGroupEntry e[3] = {};
     e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
@@ -2043,7 +2049,7 @@ static void captureSurface(WGPUDevice device, WGPUQueue queue, WGPUTexture tex,
 struct TerrainU { glm::mat4 viewProj; glm::vec4 eye; glm::vec4 bounds; glm::vec4 misc; glm::vec4 sun; glm::vec4 extra; };
 // Terrain shadow-RECEIVE uniform (group 1): the two sun cascades + PCF params,
 // so land reads the same shadow maps the ocean does (buildings cast on ground).
-struct TShadowU { glm::mat4 vp0; glm::mat4 vp1; glm::vec4 params; };
+struct TShadowU { glm::mat4 vp0; glm::mat4 vp1; glm::mat4 vp2; glm::vec4 params; };
 struct SeaFarU  { glm::mat4 viewProj; glm::vec4 eye; glm::vec4 sun; glm::vec4 origin; };
 
 // A camera-following grid displaced by the world height texture. Pipeline/grid are
@@ -2062,8 +2068,8 @@ struct TerrainRender {
   uint32_t farIndexCount = 0;
   // Sun-shadow caster (near grid drawn into the wide cascade, depth-only).
   WGPURenderPipeline shadowPipeline = nullptr;
-  WGPUBuffer shadowUbuf = nullptr;
-  WGPUBindGroup shadowBind = nullptr;
+  WGPUBuffer shadowUbuf = nullptr, shadowUbuf2 = nullptr;   // wide + mid cascade view-proj
+  WGPUBindGroup shadowBind = nullptr, shadowBind2 = nullptr;
   // Sun-shadow RECEIVE (group 1): land reads the cascades so buildings/piers/
   // trees cast on the ground. Its own uniform + bind group (built once the
   // shadow textures exist); the layout is baked into the main pipeline.
@@ -2116,6 +2122,9 @@ static void rebuildTerrainBind(WGPUDevice device, TerrainRender& t) {
   if (t.shadowBind) wgpuBindGroupRelease(t.shadowBind);
   bge[0].buffer = t.shadowUbuf;
   t.shadowBind = wgpuDeviceCreateBindGroup(device, &bgd);
+  if (t.shadowBind2) wgpuBindGroupRelease(t.shadowBind2);
+  bge[0].buffer = t.shadowUbuf2;
+  t.shadowBind2 = wgpuDeviceCreateBindGroup(device, &bgd);
 }
 
 static WGPUShaderModule makeWGSL(WGPUDevice device, const char* code) {
@@ -2220,16 +2229,18 @@ static TerrainRender createTerrainRender(WGPUDevice device, WGPUQueue queue, WGP
   // comparison sampler). Baked into the MAIN pipeline layout; the shadow-caster
   // pipeline keeps its group-0-only layout, so it never binds these.
   {
-    WGPUBindGroupLayoutEntry se[4] = {};
+    WGPUBindGroupLayoutEntry se[5] = {};
     se[0].binding = 0; se[0].visibility = WGPUShaderStage_Fragment;
     se[0].buffer.type = WGPUBufferBindingType_Uniform;
     se[1].binding = 1; se[1].visibility = WGPUShaderStage_Fragment;
     se[1].texture.sampleType = WGPUTextureSampleType_Depth; se[1].texture.viewDimension = WGPUTextureViewDimension_2D;
     se[2].binding = 2; se[2].visibility = WGPUShaderStage_Fragment;
     se[2].texture.sampleType = WGPUTextureSampleType_Depth; se[2].texture.viewDimension = WGPUTextureViewDimension_2D;
-    se[3].binding = 3; se[3].visibility = WGPUShaderStage_Fragment;
-    se[3].sampler.type = WGPUSamplerBindingType_Comparison;
-    WGPUBindGroupLayoutDescriptor sbld = {}; sbld.entryCount = 4; sbld.entries = se;
+    se[3].binding = 3; se[3].visibility = WGPUShaderStage_Fragment;   // cascade 2 (mid) depth
+    se[3].texture.sampleType = WGPUTextureSampleType_Depth; se[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+    se[4].binding = 4; se[4].visibility = WGPUShaderStage_Fragment;
+    se[4].sampler.type = WGPUSamplerBindingType_Comparison;
+    WGPUBindGroupLayoutDescriptor sbld = {}; sbld.entryCount = 5; sbld.entries = se;
     t.shadowRecvBGL = wgpuDeviceCreateBindGroupLayout(device, &sbld);
     WGPUBufferDescriptor rub = {}; rub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     rub.size = sizeof(TShadowU); t.shadowRecvUbuf = wgpuDeviceCreateBuffer(device, &rub);
@@ -2258,6 +2269,7 @@ static TerrainRender createTerrainRender(WGPUDevice device, WGPUQueue queue, WGP
     WGPUBufferDescriptor sub = {}; sub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     sub.size = sizeof(TerrainU);
     t.shadowUbuf = wgpuDeviceCreateBuffer(device, &sub);
+    t.shadowUbuf2 = wgpuDeviceCreateBuffer(device, &sub);
     WGPUPipelineLayoutDescriptor spld = {}; spld.bindGroupLayoutCount = 1; spld.bindGroupLayouts = &t.bgl;
     WGPUPipelineLayout spl = wgpuDeviceCreatePipelineLayout(device, &spld);
     WGPUDepthStencilState sds = {}; sds.format = kShadowFormat; sds.depthWriteEnabled = true;
@@ -5618,7 +5630,8 @@ int main(int argc, char** argv) {
     } else {
       bellPrevHours = -1.0f;
     }
-    const glm::vec3 sunDir  = computeSunDir(gameHours);
+    glm::vec3 sunDir  = computeSunDir(gameHours);
+    if (std::getenv("SAILSIM_NOON")) sunDir = glm::normalize(glm::vec3(0.25f, 0.72f, 0.18f));   // test: force daylight
     const glm::vec3 moonDir = -sunDir;
     const float sunEl = sunDir.y;                                  // -1 midnight .. +1 noon
     const float dayK  = glm::clamp((sunEl + 0.10f) / 0.20f, 0.0f, 1.0f);   // 1 day, 0 night
@@ -6259,8 +6272,8 @@ int main(int argc, char** argv) {
     //    snapped so the shadows don't shimmer as the ship glides. ──
     const bool shadowOn = sailing && lightDir.y > 0.08f && userCfg.gfx.shadows > 0 &&
                           !std::getenv("SAILSIM_NOSHADOW");
-    glm::mat4 shadowVP0(1.0f), shadowVP1(1.0f);
-    const float kShadowBias0 = 0.0005f, kShadowBias1 = 0.0008f;
+    glm::mat4 shadowVP0(1.0f), shadowVP1(1.0f), shadowVP2(1.0f);
+    const float kShadowBias0 = 0.0005f, kShadowBias1 = 0.0008f, kShadowBias2 = 0.0006f;
     if (shadowOn) {
       glm::vec3 Ld = glm::normalize(lightDir);
       glm::vec3 sUp = std::fabs(Ld.y) > 0.97f ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
@@ -6275,13 +6288,16 @@ int main(int argc, char** argv) {
         return glm::translate(glm::mat4(1.0f), glm::vec3(snap, 0.0f)) * vp;
       };
       shadowVP0 = cascade(glm::vec3(shipX, 6.0f, shipZ), 48.0f, 5.0f, 400.0f);
+      shadowVP2 = cascade(glm::vec3(shipX, 0.0f, shipZ), 250.0f, 8.0f, 1200.0f);   // mid: trees/near land
       shadowVP1 = cascade(glm::vec3(shipX, 0.0f, shipZ), 1700.0f, 10.0f, 6000.0f);
       SunShadow& shdw = sunShadow(device);
       ShadowUniform su0{ shadowVP0, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
       ShadowUniform su1{ shadowVP1, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
+      ShadowUniform su2{ shadowVP2, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
       ShadowUniform sur{ shadowVP0, glm::vec4(1.0f, kShadowBias0, 1.0f / (float)g_shadowRes, 0.0f) };
       wgpuQueueWriteBuffer(queue, shdw.castU0, 0, &su0, sizeof(su0));
       wgpuQueueWriteBuffer(queue, shdw.castU1, 0, &su1, sizeof(su1));
+      wgpuQueueWriteBuffer(queue, shdw.castU2, 0, &su2, sizeof(su2));
       wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &sur, sizeof(sur));
     } else {
       SunShadow& shdw = sunShadow(device);
@@ -6381,22 +6397,25 @@ int main(int argc, char** argv) {
         TerrainU ts = tu;
         ts.viewProj = shadowVP1;
         wgpuQueueWriteBuffer(queue, terrainR.shadowUbuf, 0, &ts, sizeof(ts));
+        ts.viewProj = shadowVP2;
+        wgpuQueueWriteBuffer(queue, terrainR.shadowUbuf2, 0, &ts, sizeof(ts));
       }
       // Shadow RECEIVE (group 1): land samples both cascades so buildings/piers/
       // trees throw real shadows on the ground. Built once; world-space matrices
       // work for the main + reflection passes alike.
       if (terrainR.shadowRecvUbuf) {
         SunShadow& shdw = sunShadow(device);
-        if (!terrainR.shadowRecvBind && shdw.view0 && shdw.view1 && shdw.cmp) {
-          WGPUBindGroupEntry re[4] = {};
+        if (!terrainR.shadowRecvBind && shdw.view0 && shdw.view1 && shdw.view2 && shdw.cmp) {
+          WGPUBindGroupEntry re[5] = {};
           re[0].binding = 0; re[0].buffer = terrainR.shadowRecvUbuf; re[0].size = sizeof(TShadowU);
           re[1].binding = 1; re[1].textureView = shdw.view0;
           re[2].binding = 2; re[2].textureView = shdw.view1;
-          re[3].binding = 3; re[3].sampler = shdw.cmp;
-          WGPUBindGroupDescriptor rbd = {}; rbd.layout = terrainR.shadowRecvBGL; rbd.entryCount = 4; rbd.entries = re;
+          re[3].binding = 3; re[3].textureView = shdw.view2;   // mid cascade
+          re[4].binding = 4; re[4].sampler = shdw.cmp;
+          WGPUBindGroupDescriptor rbd = {}; rbd.layout = terrainR.shadowRecvBGL; rbd.entryCount = 5; rbd.entries = re;
           terrainR.shadowRecvBind = wgpuDeviceCreateBindGroup(device, &rbd);
         }
-        TShadowU tsu{ shadowVP0, shadowVP1,
+        TShadowU tsu{ shadowVP0, shadowVP1, shadowVP2,
                       glm::vec4(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1,
                                 1.0f / (float)g_shadowRes) };
         wgpuQueueWriteBuffer(queue, terrainR.shadowRecvUbuf, 0, &tsu, sizeof(tsu));
@@ -6443,8 +6462,9 @@ int main(int argc, char** argv) {
     if (shadowOn) {
       SunShadow& shdw = sunShadow(device);
       WGPUCommandEncoder senc = wgpuDeviceCreateCommandEncoder(device, nullptr);
-      auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, bool withTerrain,
-                            const glm::mat4& scatterVP, int cascade) {
+      auto shadowPass = [&](WGPUTextureView view, WGPUBindGroup castBG, WGPUBindGroup terrBG,
+                            const glm::mat4& scatterVP, int scatterBuf) {
+        const bool withTerrain = terrBG != nullptr;
         WGPURenderPassDepthStencilAttachment da = {};
         da.view = view;
         da.depthLoadOp = WGPULoadOp_Clear; da.depthStoreOp = WGPUStoreOp_Store;
@@ -6452,9 +6472,9 @@ int main(int argc, char** argv) {
         WGPURenderPassDescriptor pd = {};
         pd.colorAttachmentCount = 0; pd.depthStencilAttachment = &da;
         WGPURenderPassEncoder sp = wgpuCommandEncoderBeginRenderPass(senc, &pd);
-        if (withTerrain && terrainR.ready && terrainR.shadowBind && terrainR.shadowPipeline) {
+        if (withTerrain && terrainR.ready && terrBG && terrainR.shadowPipeline) {
           wgpuRenderPassEncoderSetPipeline(sp, terrainR.shadowPipeline);
-          wgpuRenderPassEncoderSetBindGroup(sp, 0, terrainR.shadowBind, 0, nullptr);
+          wgpuRenderPassEncoderSetBindGroup(sp, 0, terrBG, 0, nullptr);
           wgpuRenderPassEncoderSetVertexBuffer(sp, 0, terrainR.vbuf, 0, WGPU_WHOLE_SIZE);
           wgpuRenderPassEncoderSetIndexBuffer(sp, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
           wgpuRenderPassEncoderDrawIndexed(sp, terrainR.indexCount, 1, 0, 0, 0);
@@ -6477,16 +6497,16 @@ int main(int argc, char** argv) {
             wgpuRenderPassEncoderDrawIndexed(sp, sm.indexCount, 1, sm.indexOffset, 0, 0);
           }
         }
-        // Near full-mesh palms/beeches cast into BOTH cascades: the tight ship
-        // cascade (crisp, stable tree shadows on a beach the ship sails near — the
-        // terrain reads it first for near points) AND the wide cascade (coarse, for
-        // trees past the tight box). Trees outside a cascade just clip.
-        scatterSys.drawShadow(sp, scatterVP, t, cascade);
+        // Near full-mesh palms/beeches cast into the tight + mid cascades (each has
+        // its own scatter uniform buffer, so no cross-clobber). The wide cascade
+        // (scatterBuf < 0) casts no trees — past the mid box they're impostors.
+        if (scatterBuf >= 0) scatterSys.drawShadow(sp, scatterVP, t, scatterBuf);
         wgpuRenderPassEncoderEnd(sp);
         wgpuRenderPassEncoderRelease(sp);
       };
-      shadowPass(shdw.view0, shdw.castBG0, false, shadowVP0, 0);   // tight ship cascade (+ near trees)
-      shadowPass(shdw.view1, shdw.castBG1, true,  shadowVP1, 1);   // wide landscape cascade
+      shadowPass(shdw.view0, shdw.castBG0, nullptr,               shadowVP0, 0);   // tight ship box (+ near trees, buf0)
+      shadowPass(shdw.view2, shdw.castBG2, terrainR.shadowBind2, shadowVP2, 1);   // mid box (terrain + trees, buf1)
+      shadowPass(shdw.view1, shdw.castBG1, terrainR.shadowBind,  shadowVP1, -1);  // wide landscape box (terrain only)
       WGPUCommandBuffer scmd = wgpuCommandEncoderFinish(senc, nullptr);
       wgpuQueueSubmit(queue, 1, &scmd);
       wgpuCommandBufferRelease(scmd);

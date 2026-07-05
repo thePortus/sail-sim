@@ -38,37 +38,44 @@ struct TU {
 //    wide landscape box out to ~1.7 km, so buildings/piers/trees throw real
 //    shadows on the ground. ──
 struct TShadow {
-  vp0    : mat4x4<f32>,   // world -> sun clip, tight cascade
-  vp1    : mat4x4<f32>,   // world -> sun clip, wide cascade
+  vp0    : mat4x4<f32>,   // world -> sun clip, tight (ship) cascade
+  vp1    : mat4x4<f32>,   // world -> sun clip, wide (far landscape) cascade
+  vp2    : mat4x4<f32>,   // world -> sun clip, mid cascade (trees / near land)
   params : vec4<f32>,     // x = enabled; y = bias0; z = bias1; w = shadow texel (uv)
 };
 @group(1) @binding(0) var<uniform> ts : TShadow;
 @group(1) @binding(1) var shadowT0 : texture_depth_2d;
 @group(1) @binding(2) var shadowT1 : texture_depth_2d;
-@group(1) @binding(3) var shadowSamp : sampler_comparison;
+@group(1) @binding(3) var shadowT2 : texture_depth_2d;
+@group(1) @binding(4) var shadowSamp : sampler_comparison;
+
+// 3x3 PCF against a cascade; returns visibility, or -1 if the point is outside it.
+fn pcfCascade(t : texture_depth_2d, vp : mat4x4<f32>, worldPos : vec3<f32>, bias : f32, margin : f32) -> f32 {
+  let sp = vp * vec4<f32>(worldPos, 1.0);
+  let uv = vec2<f32>(sp.x * 0.5 + 0.5, 0.5 - sp.y * 0.5);
+  if (uv.x <= margin || uv.x >= 1.0 - margin || uv.y <= margin || uv.y >= 1.0 - margin ||
+      sp.z <= 0.0 || sp.z >= 1.0) { return -1.0; }
+  let px = ts.params.w;
+  var s = 0.0;
+  for (var dy = -1; dy <= 1; dy = dy + 1) {
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      s += textureSampleCompareLevel(t, shadowSamp, uv + vec2<f32>(f32(dx), f32(dy)) * px, sp.z - bias);
+    }
+  }
+  return s / 9.0;
+}
 
 fn sunShadowLand(worldPos : vec3<f32>) -> f32 {
   if (ts.params.x < 0.5) { return 1.0; }
-  let sp0 = ts.vp0 * vec4<f32>(worldPos, 1.0);
-  let uv0 = vec2<f32>(sp0.x * 0.5 + 0.5, 0.5 - sp0.y * 0.5);
-  if (uv0.x > 0.01 && uv0.x < 0.99 && uv0.y > 0.01 && uv0.y < 0.99 &&
-      sp0.z > 0.0 && sp0.z < 1.0) {
-    let px = ts.params.w;   // 3x3 PCF at 1-texel spread (crisp near shadow)
-    var s = 0.0;
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-      for (var dx = -1; dx <= 1; dx = dx + 1) {
-        s += textureSampleCompareLevel(shadowT0, shadowSamp,
-                uv0 + vec2<f32>(f32(dx), f32(dy)) * px, sp0.z - ts.params.y);
-      }
-    }
-    return s / 9.0;
-  }
-  let sp1 = ts.vp1 * vec4<f32>(worldPos, 1.0);
-  let uv1 = vec2<f32>(sp1.x * 0.5 + 0.5, 0.5 - sp1.y * 0.5);
-  if (uv1.x > 0.005 && uv1.x < 0.995 && uv1.y > 0.005 && uv1.y < 0.995 &&
-      sp1.z > 0.0 && sp1.z < 1.0) {
-    return textureSampleCompareLevel(shadowT1, shadowSamp, uv1, sp1.z - ts.params.z);
-  }
+  // Pick the TIGHTEST in-range cascade: ship box -> mid box -> wide box. Each has
+  // finer texels than the last, so beach tree shadows stay crisp with no coarse
+  // seam until the far cascade takes over well past the trees.
+  let v0 = pcfCascade(shadowT0, ts.vp0, worldPos, ts.params.y, 0.01);
+  if (v0 >= 0.0) { return v0; }
+  let v2 = pcfCascade(shadowT2, ts.vp2, worldPos, ts.params.z, 0.008);
+  if (v2 >= 0.0) { return v2; }
+  let v1 = pcfCascade(shadowT1, ts.vp1, worldPos, ts.params.z, 0.005);
+  if (v1 >= 0.0) { return v1; }
   return 1.0;
 }
 

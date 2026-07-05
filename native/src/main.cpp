@@ -3082,6 +3082,12 @@ int main(int argc, char** argv) {
   // whole world in slow motion (waves, physics, animation). simClock is the
   // monotonic sim time formerly given by frame/60; simLastT is the last sample.
   double simClock = 0.0; double simLastT = glfwGetTime();
+  // The ocean wave field is a DIRECT function of absolute time (displacement(x,t)),
+  // not an integrator, so it's unconditionally stable and gets its OWN clock that
+  // advances by UNCLAMPED real elapsed time. That keeps the sea at real-time pace
+  // even below the physics dt-clamp floor (e.g. when SSAA drops fps under 20), so
+  // heavy AA no longer runs the ocean in slow motion.
+  double waveClock = 0.0;
   uint32_t rW = std::max(1u, (uint32_t)std::lround(curW * effScale()));
   uint32_t rH = std::max(1u, (uint32_t)std::lround(curH * effScale()));
   WGPUTexture depthTex = makeDepthTexture(device, rW, rH);
@@ -3560,14 +3566,15 @@ int main(int argc, char** argv) {
     // anomalies fall back to a nominal 1/60. t is the accumulated sim clock (replaces
     // frame/60 as the monotonic time fed to the wave fields and shader time uniforms).
     double nowSim = glfwGetTime();
-    double rawDt = nowSim - simLastT;
+    double realDt = nowSim - simLastT;
     simLastT = nowSim;
-    if (!(rawDt > 0.0)) rawDt = 1.0 / 60.0;
-    else if (rawDt > 0.05) rawDt = 0.05;
-    simClock += rawDt;
+    if (!(realDt > 0.0)) realDt = 1.0 / 60.0;
+    waveClock += realDt;                                  // ocean: UNCLAMPED real time
+    double physDt = realDt > 0.05 ? 0.05 : realDt;        // physics: clamped (stability)
+    simClock += physDt;
     float t = (float)simClock;
-    float dt = (float)rawDt;
-    float waveT = t * kWaveSpeed;   // slowed sim clock for the wave fields
+    float dt = (float)physDt;
+    float waveT = (float)(waveClock * (double)kWaveSpeed);   // wave fields on the real clock
 
     // Terrain arrived? Upload its height texture and start the ship near a harbour.
     if (!terrHandled && terrFuture.valid() &&
@@ -5643,10 +5650,10 @@ int main(int argc, char** argv) {
     // the login/landing screen draws no scene, so there's nothing to simulate.
     const bool sailing = (appState == AppState::Sailing);
     if (sailing) {
-      // deltaTime drives the foam/turbulence accumulation in the merger; it must
-      // track the same real-time wave step as waveT (= dt*kWaveSpeed) so the foam
-      // field evolves at a framerate-independent rate.
-      const float waveDt = dt * kWaveSpeed;
+      // deltaTime drives the foam/turbulence accumulation in the merger; it tracks
+      // the same UNCLAMPED real-time wave step as waveT (= realDt*kWaveSpeed) so the
+      // foam field evolves at real-time pace regardless of framerate (incl. under 20fps).
+      const float waveDt = (float)(realDt * (double)kWaveSpeed);
       c0.update(waveT, waveDt);
       c1.update(waveT, waveDt);
       c2.update(waveT, waveDt);

@@ -21,6 +21,7 @@ struct Client::Impl {
   std::map<std::string, RemotePlayer> players;
   WaveState wave;
   std::vector<ChatMessage> chatIn;   // drained by the render loop each frame
+  SquadronState squad;               // our current squadron roster (live-read)
   TownState townSt;                  // wallet/crew/market/dock-menu replies
   std::vector<LaneHotspot> lanes;
   std::vector<MapShip> allMerchants;
@@ -352,7 +353,22 @@ struct Client::Impl {
         if (chatIn.size() >= 256) chatIn.erase(chatIn.begin());   // undrained backstop
         chatIn.push_back(std::move(cm));
       }
+    } else if (type == "squadron_state") {
+      // Roster broadcast: squadronId null (or empty members) => we left/disbanded.
+      squad = SquadronState{};
+      if (!msg.value("squadronId", json()).is_null()) {
+        squad.id       = msg.value("squadronId", std::string());
+        squad.leaderId = msg.value("leaderId", std::string());
+        if (msg.contains("members") && msg["members"].is_array()) {
+          for (const auto& m : msg["members"])
+            squad.members.push_back({ m.value("id", std::string()),
+                                      m.value("callsign", std::string()) });
+        }
+      }
     }
+    // squadron_invited needs no special handling: the server also sends a system
+    // chat line ("... invited you ... type /squad accept"), which the chat panel
+    // already shows, and /squad accept goes back through sendChat.
   }
 };
 
@@ -454,6 +470,11 @@ std::vector<RemotePlayer> Client::players() const {
 WaveState Client::wave() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->wave;
+}
+
+SquadronState Client::squadron() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->squad;
 }
 
 std::vector<LaneHotspot> Client::lanes() const {

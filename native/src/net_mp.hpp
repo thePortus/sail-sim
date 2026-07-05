@@ -65,6 +65,17 @@ struct ChatMessage {
   std::string chatType, from, to, text;
 };
 
+// Squadron roster (server "squadron_state"). The whole invite/accept/leave flow
+// runs through chat — the server parses "/squad ..." from raw chat text and
+// replies with system lines — so the native client only needs to RECEIVE the
+// roster here to mark squad-mates on the map. Empty id = not in a squadron.
+struct SquadronMember { std::string id, callsign; };
+struct SquadronState {
+  std::string id;        // squadron session id ("" = not in a squadron / disbanded)
+  std::string leaderId;
+  std::vector<SquadronMember> members;   // leader first
+};
+
 // ── Combat protocol (server-authoritative; see COMBAT_PLAN.md) ────────────────
 
 // A remote/NPC shot broadcast (server "cannon_shot" with id) — rendered as a
@@ -175,6 +186,7 @@ public:
   std::vector<ChatMessage> drainChat();
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
+  SquadronState squadron() const;              // our squadron roster ("" id = none)
   WaveState wave() const;
   // Latest unconsumed server pose correction (cleared by this call).
   Correction consumeCorrection();

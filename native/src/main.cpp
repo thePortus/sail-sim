@@ -4451,10 +4451,32 @@ int main(int argc, char** argv) {
           // Other players: orange dots (+ callsign labels on the expanded chart).
           // NPC ships are skipped — merchants are map-hidden for regular players
           // (staff see the fleet feed above); rumour/report marks handle the rest.
+          // Squad-mates (server "squadron_state" roster) get a gold diamond with an
+          // always-on callsign instead, matching the browser minimap.
+          const mp::SquadronState squad = mpClient.squadron();
+          const std::string myMapId = mpClient.myId();
+          auto isSquadMate = [&](const std::string& id) {
+            if (id.empty() || id == myMapId) return false;
+            for (const mp::SquadronMember& m : squad.members) if (m.id == id) return true;
+            return false;
+          };
           for (const mp::RemotePlayer& rp : mpClient.players()) {
             if (rp.npc) continue;
             ImVec2 pp(wx(rp.x), wz(rp.z));
             if (pp.x < p0.x || pp.x > p0.x + S || pp.y < p0.y || pp.y > p0.y + S) continue;
+            if (isSquadMate(rp.id)) {
+              const float s = expanded ? 6.0f : 5.0f;
+              const ImVec2 d0(pp.x, pp.y - s), d1(pp.x + s, pp.y), d2(pp.x, pp.y + s), d3(pp.x - s, pp.y);
+              mdl->AddQuadFilled(d0, d1, d2, d3, IM_COL32(251, 191, 36, 235));   // gold
+              mdl->AddQuad(d0, d1, d2, d3, IM_COL32(0, 0, 0, 150), 1.2f);
+              if (!rp.callsign.empty()) {
+                std::string cs = rp.callsign;
+                for (char& ch : cs) ch = (char)std::toupper((unsigned char)ch);
+                ImVec2 ts = ImGui::CalcTextSize(cs.c_str());
+                mdl->AddText(ImVec2(pp.x - ts.x * 0.5f, pp.y - s - ts.y - 1.0f), IM_COL32(251, 191, 36, 235), cs.c_str());
+              }
+              continue;
+            }
             mdl->AddCircleFilled(pp, 3.0f, IM_COL32(255, 120, 80, 220));
             if (expanded && !rp.callsign.empty()) {
               std::string cs = rp.callsign;

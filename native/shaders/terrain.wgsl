@@ -338,15 +338,26 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   // the ship near shore); the ambient 0.32 stays so shadowed ground isn't black.
   let sunVis = sunShadowLand(wp);
   col = col * (0.32 + 0.68 * diff * sunVis);
-  // Underwater: the client's exact seabed grade. Its refraction RTT rendered the
-  // seabed with normal shading, then the water shader multiplied it by
-  // (0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp) — a fixed sandy-dim grade, gated to
-  // fade the bottom to dark at night. sunUp is reconstructed from the daylight
-  // factor (dayK = clamp((sunEl + 0.10) / 0.20) -> sunEl = dayK * 0.2 - 0.1).
-  if (in.elev < 0.2) {
+  // Underwater: the client's exact seabed grade — a fixed sandy-dim multiply that
+  // fades to dark at night. sunUp is reconstructed from the daylight factor.
+  //
+  // ── Scalloped waterline (LAND side of the client's shoreline noise) ──────────
+  // The grade used to switch on a DEAD-STRAIGHT elev<0.2 contour — the ruler line
+  // where dry sand meets wet. Perturb that threshold with world-space value noise
+  // (~1.4 m scallop + ~4.6 m octave + ~0.17 m dither) and feather it, so the wet
+  // line undulates like a real shore. Uses the SAME world coords + noise as the
+  // ocean shallows (ocean_surface.wgsl), so land + water disguise the line together.
+  {
     let sunEl = u.sun.w * 0.2 - 0.1;
     let sunUp = smoothstep(0.0, 0.12, sunEl);
-    col = col * vec3<f32>(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
+    let shScal = dVal(wp.xz * 0.70) * 0.75 + dHash(floor(wp.xz * 2.3)) * 0.25;   // [0,1]
+    let shDith = dVal(wp.xz * 6.0);                                              // [0,1]
+    // Amplitude knobs (metres of threshold wobble): SCALLOP breaks it into waves,
+    // DITHER fuzzes the edge. FEATHER softens the razor edge into a wet band.
+    let shoreThresh = 0.2 + (shScal - 0.5) * 1.2 + (shDith - 0.5) * 0.5;
+    let underwater  = 1.0 - smoothstep(shoreThresh - 0.20, shoreThresh + 0.20, in.elev);
+    let seabedGrade = vec3<f32>(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
+    col = col * mix(vec3<f32>(1.0, 1.0, 1.0), seabedGrade, underwater);
   }
   // Day/night (u.sun.w = daylight): dim + cool the land toward a moonlit night.
   // Night floor 0.30 (was 0.13) — the client deliberately raised its night

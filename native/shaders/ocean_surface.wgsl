@@ -213,6 +213,15 @@ fn vs_main(@location(0) inXZ : vec2<f32>) -> VSOut {
     disp *= (1.0 - 0.65 * wcv.x);
     disp.y += -0.80 * wcv.x + 0.70 * wcv.y;
 
+    // Shoaling (client HAS_SHORE): flatten the swell as it runs into the beach —
+    // full height in deep water, tapering to zero at the waterline — so shallows
+    // don't chop wildly right against the sand. Reads the true seabed depth from
+    // the heightfield (only once it's loaded: cam.tmisc.z = field-ready).
+    if (cam.tmisc.z > 0.5) {
+        let shoalDz = max(0.0, -tSampleH(world.x, world.y));
+        disp *= smoothstep(0.4, 4.6, shoalDz);   // 0 by ~0.4 m deep, full by ~4.6 m
+    }
+
     let p = vec3<f32>(world.x + disp.x, disp.y, world.y + disp.z);
     var out : VSOut;
     out.position = cam.viewProj * vec4<f32>(p, 1.0);

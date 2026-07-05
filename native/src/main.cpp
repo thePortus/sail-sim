@@ -1114,7 +1114,7 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   be[11].binding = 11; be[11].visibility = WGPUShaderStage_Fragment;
   be[11].texture.sampleType = WGPUTextureSampleType_Float;
   be[11].texture.viewDimension = WGPUTextureViewDimension_2D;
-  be[12].binding = 12; be[12].visibility = WGPUShaderStage_Fragment;
+  be[12].binding = 12; be[12].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;   // + shoaling in VS
   be[12].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;   // R32F heightfield
   be[12].texture.viewDimension = WGPUTextureViewDimension_2D;
   be[13].binding = 13; be[13].visibility = WGPUShaderStage_Fragment;

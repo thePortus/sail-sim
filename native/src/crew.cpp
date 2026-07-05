@@ -454,7 +454,11 @@ void Deck::deckSnap(glm::vec3& p) const {
     {0, 1.5f}, {0, -1.5f}, {1.0f, 0.8f}, {1.0f, -0.8f}, {0.5f, 1.5f}, {0.5f, -1.5f}, {1.5f, 0},
     {-0.4f, 0.8f}, {-0.4f, -0.8f},
   };
-  const float lo = p.y - 0.7f, hi = p.y + 0.35f, topY = p.y + 1.8f;
+  // A spot is "open" only if its highest surface is within a TIGHT window above the
+  // authored deck level (0.18 m) — the ship's boat sits on a cradle ~0.3 m proud,
+  // and 0.35 (the client's value) let a station snap onto it. Below the deck the
+  // window is looser (authored Y can sit above the real planks).
+  const float lo = p.y - 0.7f, hi = p.y + 0.18f, topY = p.y + 1.8f;
   const float beam = beamAxisZ_ ? p.z : p.x;
   const float inb = beam >= 0.0f ? -1.0f : 1.0f;   // toward the centreline
   for (const auto& o : OFF) {

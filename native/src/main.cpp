@@ -3010,6 +3010,12 @@ int main(int argc, char** argv) {
   uint32_t reflW = std::max(1u, rW / 2), reflH = std::max(1u, rH / 2);
   WGPUTexture reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
   WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
+  // Ocean bind groups are CACHED across frames (their views change only on resize /
+  // terrain-load) instead of rebuilt every frame. Invalidated by a dirty flag set
+  // on resize (pointer comparison is unsafe — a freed view handle can be reused).
+  WGPUBindGroup oceanBG = nullptr, oceanBGfar = nullptr;
+  WGPUTextureView obHeightKey = nullptr;
+  bool oceanBGDirty = true;
   WGPUTexture reflDepth = makeDepthTexture(device, reflW, reflH);
   WGPUTextureView reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
   // Offscreen cloud buffer (RGBA16F): the ray march writes here, then the denoise
@@ -3365,6 +3371,7 @@ int main(int argc, char** argv) {
       wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
       reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
       reflView = wgpuTextureCreateView(reflTex, nullptr);
+      oceanBGDirty = true;   // ocean bind group references reflView / oceanDepthReadView
       reflDepth = makeDepthTexture(device, reflW, reflH);
       reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
       wgpuTextureViewRelease(reflCloudView); wgpuTextureRelease(reflCloudTex);
@@ -7006,7 +7013,6 @@ int main(int argc, char** argv) {
     passDesc.depthStencilAttachment = &depthAttachment;
 
     WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
-    WGPUBindGroup oceanBG = nullptr, oceanBGfar = nullptr;   // created below when the scene draws
     if (sailing) {
     // Sky first (background; doesn't write depth).
     wgpuRenderPassEncoderSetPipeline(pass, sky.pipeline);
@@ -7128,6 +7134,10 @@ int main(int argc, char** argv) {
     // Ocean — the real FFT shader on BOTH rings (shared cascade textures). The two
     // bind groups differ only in the uniform buffer: near = displaced detail; far =
     // geometrically flat but fully wave-shaded, reaching the horizon without alias.
+    // Only the reflection/terrain-height/depth views ever change (resize / load), so
+    // rebuild the (leaked-if-per-frame) bind groups only when one of those differs.
+    WGPUTextureView obHeightView = (terrainR.ready && terrainR.heightView) ? terrainR.heightView : ocean.placeView;
+    if (!oceanBG || oceanBGDirty || obHeightView != obHeightKey) {
     WGPUBindGroupEntry oe[19] = {};
     oe[1].binding = 1;  oe[1].textureView  = c0.displacement();
     oe[2].binding = 2;  oe[2].textureView  = c0.derivatives();
@@ -7140,8 +7150,7 @@ int main(int argc, char** argv) {
     oe[9].binding = 9;  oe[9].textureView  = c2.turbulence();
     oe[10].binding = 10; oe[10].sampler = ocean.sampler;
     oe[11].binding = 11; oe[11].textureView = reflView;
-    oe[12].binding = 12; oe[12].textureView = (terrainR.ready && terrainR.heightView)
-                                            ? terrainR.heightView : ocean.placeView;
+    oe[12].binding = 12; oe[12].textureView = obHeightView;
     oe[13].binding = 13; oe[13].textureView = oceanDepthReadView;
     oe[14].binding = 14; oe[14].textureView = clouds.weatherView;
     {
@@ -7153,10 +7162,14 @@ int main(int argc, char** argv) {
     oe[18].binding = 18; oe[18].textureView = ocean.foamView;
     oe[0].binding = 0;  oe[0].buffer = ocean.farUniformBuf; oe[0].size = sizeof(OceanCamera);
     WGPUBindGroupDescriptor obdF = {}; obdF.layout = ocean.bgl; obdF.entryCount = 19; obdF.entries = oe;
+    if (oceanBGfar) wgpuBindGroupRelease(oceanBGfar);
     oceanBGfar = wgpuDeviceCreateBindGroup(device, &obdF);
     oe[0].buffer = ocean.uniformBuf;
     WGPUBindGroupDescriptor obd = {}; obd.layout = ocean.bgl; obd.entryCount = 19; obd.entries = oe;
+    if (oceanBG) wgpuBindGroupRelease(oceanBG);
     oceanBG = wgpuDeviceCreateBindGroup(device, &obd);
+    obHeightKey = obHeightView; oceanBGDirty = false;
+    }
 
     wgpuRenderPassEncoderSetPipeline(pass, ocean.pipeline);
     // Far ring first (fills to the horizon), then the detailed near grid over it.
@@ -7488,8 +7501,7 @@ int main(int argc, char** argv) {
 
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);
-    if (oceanBG) wgpuBindGroupRelease(oceanBG);
-    if (oceanBGfar) wgpuBindGroupRelease(oceanBGfar);
+    // (ocean bind groups are cached now — released only on rebuild, not per frame)
     wgpuTextureViewRelease(view);
 
 #ifndef __EMSCRIPTEN__

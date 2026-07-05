@@ -303,6 +303,10 @@ struct System::Impl {
 
   Layer palms, trees, rocks, drift, grass;
   Layer birdsL, dolphinsL, fishL;   // wildlife draw sets (full[] only; instances per frame)
+  // Reusable per-frame draw scratch (cleared, not reallocated, each frame/layer) —
+  // avoids heap churn binning thousands of prop instances every frame.
+  std::vector<std::vector<Inst>> _fullBin, _lodBin;
+  std::vector<Inst> _blobBin;
   Layer reedsL, weedsL;             // shoreline reeds + underwater seaweed (stand/clump services)
   // Static FAR impostor layers (buildFarForest port): whole-map tree/palm
   // billboards on every island's forested slopes and coasts, faded IN over
@@ -2036,13 +2040,17 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
       return true;
     };
     Layer* statics[] = { &p->palms, &p->trees, &p->rocks, &p->drift, &p->grass };
-    std::vector<Inst> blobBin;
+    std::vector<Inst>& blobBin = p->_blobBin; blobBin.clear();
     for (Layer* l : statics) {
       l->dirty = false;
       size_t nv = l->full.size();
       bool isGrass = l == &p->grass;
       float lodSplit = isGrass ? Impl::GRASS_NEAR : Impl::LOD_SPLIT;
-      std::vector<std::vector<Inst>> fullBin(nv), lodBin(nv);
+      std::vector<std::vector<Inst>>& fullBin = p->_fullBin; std::vector<std::vector<Inst>>& lodBin = p->_lodBin;
+      if (fullBin.size() < nv) fullBin.resize(nv);   // grow-only: retains inner capacity
+      if (lodBin.size() < nv) lodBin.resize(nv);
+      for (auto& b : fullBin) b.clear();
+      for (auto& b : lodBin) b.clear();
       for (const auto& [key, pd2] : l->patches) {
         if (!patchVisible(key.first, key.second)) continue;
         const auto& per = pd2.per;

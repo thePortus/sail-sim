@@ -230,6 +230,15 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   col = mix(col, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
   return vec4<f32>(col, 1.0);
 }
+
+// Depth-only shadow caster WITH alpha test: sample the frond/leaf texture and
+// discard transparent texels so foliage throws leaf-shaped shadows instead of
+// chunky opaque quads. No colour target — it only writes depth. Reuses vs_main
+// (uniform viewProj = the cascade's shadow matrix).
+@fragment
+fn fs_shadow(in : VSOut) {
+  if (textureSample(tex, samp, in.uv).a < 0.5) { discard; }
+}
 )WGSL";
 
 // One drawable mesh + its instance buffer + texture bind group.
@@ -237,6 +246,8 @@ struct DrawSet {
   WGPUBuffer vbuf = nullptr, ibuf = nullptr, instBuf = nullptr;
   uint32_t indexCount = 0, instCap = 0, instCount = 0;
   WGPUBindGroup bind = nullptr;
+  WGPUTextureView texView = nullptr;        // leaf/frond texture (for the alpha-tested shadow)
+  WGPUBindGroup shadowBind[2] = { nullptr, nullptr };   // lazily built per cascade in drawShadow
 };
 
 struct PatchData {
@@ -500,7 +511,8 @@ static void makeDrawSet(Impl* p, DrawSet& d, const MeshData& md, WGPUBuffer ubuf
   d.instBuf = wgpuDeviceCreateBuffer(p->device, &xbd);
   WGPUBindGroupEntry be[3] = {};
   be[0].binding = 0; be[0].buffer = ubuf; be[0].size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);
-  be[1].binding = 1; be[1].textureView = tex ? tex : p->whiteView;
+  d.texView = tex ? tex : p->whiteView;
+  be[1].binding = 1; be[1].textureView = d.texView;
   be[2].binding = 2; be[2].sampler = p->samp;
   WGPUBindGroupDescriptor bgd = {}; bgd.layout = p->bgl; bgd.entryCount = 3; bgd.entries = be;
   d.bind = wgpuDeviceCreateBindGroup(p->device, &bgd);
@@ -593,38 +605,33 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   p->pipeline = wgpuDeviceCreateRenderPipeline(device, &rpd);
   wgpuPipelineLayoutRelease(pl);
 
-  // Depth-only SHADOW caster: the near full-mesh trees drawn into the sun
-  // cascade so palms/beeches throw REAL shadows on the ground (the terrain now
-  // receives). Reuses vs_main (which only reads the uniform at binding 0 — no
-  // tex/samp), so a 1-binding layout suffices; no fragment stage.
+  // SHADOW caster: the near full-mesh trees drawn into the sun cascade so
+  // palms/beeches throw REAL shadows on the ground. Reuses vs_main + p->bgl
+  // (uniform+tex+samp) and an fs_shadow fragment that ALPHA-TESTS the frond
+  // texture, so foliage casts leaf-shaped shadows, not chunky opaque quads.
+  // No colour target — depth only. The per-DrawSet bind groups (shadow uniform +
+  // that set's texture) are built lazily in drawShadow.
   {
-    WGPUBindGroupLayoutEntry sle = {};
-    sle.binding = 0; sle.visibility = WGPUShaderStage_Vertex;
-    sle.buffer.type = WGPUBufferBindingType_Uniform;
-    WGPUBindGroupLayoutDescriptor sbld = {}; sbld.entryCount = 1; sbld.entries = &sle;
-    p->shadowBGL = wgpuDeviceCreateBindGroupLayout(device, &sbld);
-    WGPUPipelineLayoutDescriptor spld = {}; spld.bindGroupLayoutCount = 1; spld.bindGroupLayouts = &p->shadowBGL;
+    WGPUPipelineLayoutDescriptor spld = {}; spld.bindGroupLayoutCount = 1; spld.bindGroupLayouts = &p->bgl;
     WGPUPipelineLayout spl = wgpuDeviceCreatePipelineLayout(device, &spld);
     WGPUDepthStencilState sds = {}; sds.format = WGPUTextureFormat_Depth32Float;
     sds.depthWriteEnabled = true; sds.depthCompare = WGPUCompareFunction_Less;
     sds.stencilFront.compare = WGPUCompareFunction_Always; sds.stencilBack.compare = WGPUCompareFunction_Always;
     sds.stencilReadMask = 0xFFFFFFFFu; sds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPUFragmentState sfrag = {}; sfrag.module = module; sfrag.entryPoint = "fs_shadow";
+    sfrag.targetCount = 0; sfrag.targets = nullptr;
     WGPURenderPipelineDescriptor srpd = {}; srpd.layout = spl;
     srpd.vertex.module = module; srpd.vertex.entryPoint = "vs_main";
     srpd.vertex.bufferCount = 2; srpd.vertex.buffers = vbls;
     srpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     srpd.primitive.cullMode = WGPUCullMode_None;
     srpd.depthStencil = &sds; srpd.multisample.count = 1; srpd.multisample.mask = 0xFFFFFFFFu;
+    srpd.fragment = &sfrag;
     p->shadowPipeline = wgpuDeviceCreateRenderPipeline(device, &srpd);
     wgpuPipelineLayoutRelease(spl);
     WGPUBufferDescriptor sub = {}; sub.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     sub.size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);   // LU layout
-    for (int ci = 0; ci < 2; ++ci) {
-      p->shadowUbuf[ci] = wgpuDeviceCreateBuffer(device, &sub);
-      WGPUBindGroupEntry sbe = {}; sbe.binding = 0; sbe.buffer = p->shadowUbuf[ci]; sbe.size = sub.size;
-      WGPUBindGroupDescriptor sbgd = {}; sbgd.layout = p->shadowBGL; sbgd.entryCount = 1; sbgd.entries = &sbe;
-      p->shadowBind[ci] = wgpuDeviceCreateBindGroup(device, &sbgd);
-    }
+    for (int ci = 0; ci < 2; ++ci) p->shadowUbuf[ci] = wgpuDeviceCreateBuffer(device, &sub);
   }
 
   WGPUSamplerDescriptor sd = {};
@@ -1992,11 +1999,21 @@ void System::drawShadow(WGPURenderPassEncoder pass, const glm::mat4& shadowVP, d
         glm::vec4((float)timeSec, 1.0f, 0.0f, 0.0f), glm::vec4(0.0f) };
   wgpuQueueWriteBuffer(p->queue, p->shadowUbuf[ci], 0, &u, sizeof(u));
   wgpuRenderPassEncoderSetPipeline(pass, p->shadowPipeline);
-  wgpuRenderPassEncoderSetBindGroup(pass, 0, p->shadowBind[ci], 0, nullptr);
   Layer* casters[] = { &p->palms, &p->trees };
   for (Layer* l : casters)
-    for (const DrawSet& d : l->full) {
+    for (DrawSet& d : l->full) {
       if (!d.instCount || !d.vbuf) continue;
+      // Lazily build this set's shadow bind group: the cascade's shadow uniform
+      // (viewProj) + the set's own frond texture, so fs_shadow can alpha-test it.
+      if (!d.shadowBind[ci]) {
+        WGPUBindGroupEntry sbe[3] = {};
+        sbe[0].binding = 0; sbe[0].buffer = p->shadowUbuf[ci]; sbe[0].size = sizeof(glm::mat4) + 4 * sizeof(glm::vec4);
+        sbe[1].binding = 1; sbe[1].textureView = d.texView ? d.texView : p->whiteView;
+        sbe[2].binding = 2; sbe[2].sampler = p->samp;
+        WGPUBindGroupDescriptor sbgd = {}; sbgd.layout = p->bgl; sbgd.entryCount = 3; sbgd.entries = sbe;
+        d.shadowBind[ci] = wgpuDeviceCreateBindGroup(p->device, &sbgd);
+      }
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, d.shadowBind[ci], 0, nullptr);
       wgpuRenderPassEncoderSetVertexBuffer(pass, 0, d.vbuf, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderSetVertexBuffer(pass, 1, d.instBuf, 0, WGPU_WHOLE_SIZE);
       wgpuRenderPassEncoderSetIndexBuffer(pass, d.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);

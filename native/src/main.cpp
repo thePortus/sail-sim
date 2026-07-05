@@ -5833,6 +5833,7 @@ int main(int argc, char** argv) {
     }
     glm::vec3 sunDir  = computeSunDir(gameHours);
     if (std::getenv("SAILSIM_NOON")) sunDir = glm::normalize(glm::vec3(0.25f, 0.72f, 0.18f));   // test: force daylight
+    if (std::getenv("SAILSIM_SUNLOW")) sunDir = glm::normalize(glm::vec3(0.82f, 0.20f, 0.14f));  // test: low sun, long shadows
     const glm::vec3 moonDir = -sunDir;
     const float sunEl = sunDir.y;                                  // -1 midnight .. +1 noon
     const float dayK  = glm::clamp((sunEl + 0.10f) / 0.20f, 0.0f, 1.0f);   // 1 day, 0 night

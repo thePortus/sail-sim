@@ -3088,6 +3088,16 @@ int main(int argc, char** argv) {
   // even below the physics dt-clamp floor (e.g. when SSAA drops fps under 20), so
   // heavy AA no longer runs the ocean in slow motion.
   double waveClock = 0.0;
+  // Temporal shadow cadence: cascade 0 (tight ship box, <=48 m — self-shadow + near
+  // trees) re-renders every frame, but the mid (250 m) and wide (1700 m) cascades
+  // cover only distant, slowly-changing geometry, so they update on ALTERNATE frames
+  // (each every 2nd frame, staggered so only one big terrain draw happens per frame).
+  // Their view-proj is cached here so every receiver samples the matrix that matches
+  // the depth map actually in the texture. A >48 m shadow lagging one frame is
+  // invisible; the crisp near shadows stay live.
+  glm::mat4 shadowVP1 = glm::mat4(1.0f), shadowVP2 = glm::mat4(1.0f);
+  long shadowTick = 0;
+  bool prevShadowOn = false;   // reset the cadence (warm up both cascades) on re-enable
   uint32_t rW = std::max(1u, (uint32_t)std::lround(curW * effScale()));
   uint32_t rH = std::max(1u, (uint32_t)std::lround(curH * effScale()));
   WGPUTexture depthTex = makeDepthTexture(device, rW, rH);
@@ -6441,7 +6451,8 @@ int main(int argc, char** argv) {
     //    snapped so the shadows don't shimmer as the ship glides. ──
     const bool shadowOn = sailing && lightDir.y > 0.08f && userCfg.gfx.shadows > 0 &&
                           !std::getenv("SAILSIM_NOSHADOW");
-    glm::mat4 shadowVP0(1.0f), shadowVP1(1.0f), shadowVP2(1.0f);
+    glm::mat4 shadowVP0(1.0f);   // shadowVP1/VP2 persist across frames (temporal cadence)
+    bool updateMid = false, updateFar = false;   // did the mid/wide cascade refresh this frame?
     const float kShadowBias0 = 0.0005f, kShadowBias1 = 0.0008f, kShadowBias2 = 0.0006f;
     if (shadowOn) {
       glm::vec3 Ld = glm::normalize(lightDir);
@@ -6456,23 +6467,33 @@ int main(int argc, char** argv) {
         glm::vec2 snap = (glm::round(glm::vec2(o) * halfRes) - glm::vec2(o) * halfRes) / halfRes;
         return glm::translate(glm::mat4(1.0f), glm::vec3(snap, 0.0f)) * vp;
       };
-      shadowVP0 = cascade(glm::vec3(shipX, 6.0f, shipZ), 48.0f, 5.0f, 400.0f);
-      shadowVP2 = cascade(glm::vec3(shipX, 0.0f, shipZ), 250.0f, 8.0f, 1200.0f);   // mid: trees/near land
-      shadowVP1 = cascade(glm::vec3(shipX, 0.0f, shipZ), 1700.0f, 10.0f, 6000.0f);
+      shadowVP0 = cascade(glm::vec3(shipX, 6.0f, shipZ), 48.0f, 5.0f, 400.0f);   // every frame
+      // Stagger the two distant cascades: warm both up for the first couple of
+      // frames, then refresh mid on even ticks and wide on odd ticks. Re-enabling
+      // shadows (dawn / setting toggle) resets the tick so both warm up again,
+      // avoiding a one-frame stale distant shadow.
+      if (!prevShadowOn) shadowTick = 0;
+      ++shadowTick;
+      const bool warmup = shadowTick <= 2;
+      updateMid = warmup || (shadowTick % 2 == 0);
+      updateFar = warmup || (shadowTick % 2 == 1);
+      if (updateMid) shadowVP2 = cascade(glm::vec3(shipX, 0.0f, shipZ), 250.0f, 8.0f, 1200.0f);   // mid: trees/near land
+      if (updateFar) shadowVP1 = cascade(glm::vec3(shipX, 0.0f, shipZ), 1700.0f, 10.0f, 6000.0f);
       SunShadow& shdw = sunShadow(device);
       ShadowUniform su0{ shadowVP0, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
       ShadowUniform su1{ shadowVP1, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
       ShadowUniform su2{ shadowVP2, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f) };
       ShadowUniform sur{ shadowVP0, glm::vec4(1.0f, kShadowBias0, 1.0f / (float)g_shadowRes, 0.0f) };
       wgpuQueueWriteBuffer(queue, shdw.castU0, 0, &su0, sizeof(su0));
-      wgpuQueueWriteBuffer(queue, shdw.castU1, 0, &su1, sizeof(su1));
-      wgpuQueueWriteBuffer(queue, shdw.castU2, 0, &su2, sizeof(su2));
+      if (updateFar) wgpuQueueWriteBuffer(queue, shdw.castU1, 0, &su1, sizeof(su1));
+      if (updateMid) wgpuQueueWriteBuffer(queue, shdw.castU2, 0, &su2, sizeof(su2));
       wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &sur, sizeof(sur));
     } else {
       SunShadow& shdw = sunShadow(device);
       ShadowUniform off{ glm::mat4(1.0f), glm::vec4(0.0f) };
       wgpuQueueWriteBuffer(queue, shdw.recvU, 0, &off, sizeof(off));
     }
+    prevShadowOn = shadowOn;
     const glm::vec4 oceanShadowP(shadowOn ? 1.0f : 0.0f, kShadowBias0, kShadowBias1,
                                  1.0f / (float)g_shadowRes);   // w = shadow texel (PCF spread)
 
@@ -6673,9 +6694,11 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderEnd(sp);
         wgpuRenderPassEncoderRelease(sp);
       };
-      shadowPass(shdw.view0, shdw.castBG0, nullptr,               shadowVP0, 0);   // tight ship box (+ near trees, buf0)
-      shadowPass(shdw.view2, shdw.castBG2, terrainR.shadowBind2, shadowVP2, 1);   // mid box (terrain + trees, buf1)
-      shadowPass(shdw.view1, shdw.castBG1, terrainR.shadowBind,  shadowVP1, -1);  // wide landscape box (terrain only)
+      shadowPass(shdw.view0, shdw.castBG0, nullptr,               shadowVP0, 0);   // tight ship box (+ near trees, buf0) — every frame
+      // Mid/wide cascades re-render only on their refresh frame; the depth texture
+      // (StoreOp_Store) keeps the last render otherwise, matching the cached VP.
+      if (updateMid) shadowPass(shdw.view2, shdw.castBG2, terrainR.shadowBind2, shadowVP2, 1);   // mid box (terrain + trees, buf1)
+      if (updateFar) shadowPass(shdw.view1, shdw.castBG1, terrainR.shadowBind,  shadowVP1, -1);  // wide landscape box (terrain only)
       WGPUCommandBuffer scmd = wgpuCommandEncoderFinish(senc, nullptr);
       wgpuQueueSubmit(queue, 1, &scmd);
       wgpuCommandBufferRelease(scmd);

@@ -68,9 +68,13 @@ private:
   // transient bind groups created during a frame; released after submit
   std::vector<WGPUBindGroup> _transient;
 
-  // persistent displacement readback for CPU buoyancy
+  // persistent displacement readback for CPU buoyancy — PIPELINED (async): each
+  // frame reads the PREVIOUS frame's mapped copy (1-frame stale, invisible to
+  // buoyancy) and issues the next, so the CPU never blocks on the GPU.
   WGPUBuffer _readback = nullptr;
   std::vector<float> _dispCPU;   // _size*_size*4 floats, decoded from rgba16f
+  bool _rbBusy = false;          // a copy+map is in flight
+  volatile bool _rbReady = false;// map callback fired -> data ready to decode
 
   void ifft2d(WGPUComputePassEncoder pass, WGPUTexture input, WGPUTextureView inputView);
   WGPUBindGroup bg(WGPUBindGroupLayout bgl, const std::vector<WGPUBindGroupEntry>& entries);

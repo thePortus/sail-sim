@@ -431,30 +431,38 @@ void OceanFFT::readbackDisplacement() {
   if (!_readback)
     _readback = makeBuffer(_device, bytes, WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead);
 
-  WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(_device, nullptr);
-  WGPUImageCopyTexture src = {}; src.texture = _displacement; src.aspect = WGPUTextureAspect_All;
-  WGPUImageCopyBuffer dst = {}; dst.buffer = _readback;
-  dst.layout.bytesPerRow = _size * 8; dst.layout.rowsPerImage = _size;
-  WGPUExtent3D ext = { _size, _size, 1 };
-  wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
-  WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-  wgpuQueueSubmit(_queue, 1, &cmd);
-  wgpuCommandBufferRelease(cmd);
-  wgpuCommandEncoderRelease(enc);
-
-  struct S { bool done; } st{ false };
-  wgpuBufferMapAsync(_readback, WGPUMapMode_Read, 0, bytes,
-    [](WGPUBufferMapAsyncStatus, void* ud) { ((S*)ud)->done = true; }, &st);
-  while (!st.done) {
+  // 1. If a copy is in flight, advance the map without blocking; when it's ready,
+  //    decode it (this is last frame's displacement — 1 frame is invisible here).
+  if (_rbBusy) {
 #if defined(WEBGPU_BACKEND_WGPU)
-    wgpuDevicePoll(_device, true, nullptr);
+    wgpuDevicePoll(_device, false, nullptr);   // NON-blocking: just pump callbacks
 #endif
+    if (_rbReady) {
+      const uint16_t* p = (const uint16_t*)wgpuBufferGetConstMappedRange(_readback, 0, bytes);
+      const size_t n = (size_t)_size * _size * 4;
+      if (_dispCPU.size() != n) _dispCPU.resize(n);
+      if (p) for (size_t i = 0; i < n; ++i) _dispCPU[i] = halfToFloat(p[i]);
+      wgpuBufferUnmap(_readback);
+      _rbBusy = false; _rbReady = false;
+    }
   }
-  const uint16_t* p = (const uint16_t*)wgpuBufferGetConstMappedRange(_readback, 0, bytes);
-  const size_t n = (size_t)_size * _size * 4;
-  if (_dispCPU.size() != n) _dispCPU.resize(n);
-  for (size_t i = 0; i < n; ++i) _dispCPU[i] = halfToFloat(p[i]);
-  wgpuBufferUnmap(_readback);
+  // 2. If idle, kick off the next copy + async map (no wait). It's read next frame.
+  if (!_rbBusy) {
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(_device, nullptr);
+    WGPUImageCopyTexture src = {}; src.texture = _displacement; src.aspect = WGPUTextureAspect_All;
+    WGPUImageCopyBuffer dst = {}; dst.buffer = _readback;
+    dst.layout.bytesPerRow = _size * 8; dst.layout.rowsPerImage = _size;
+    WGPUExtent3D ext = { _size, _size, 1 };
+    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+    _rbBusy = true; _rbReady = false;
+    wgpuBufferMapAsync(_readback, WGPUMapMode_Read, 0, bytes,
+      [](WGPUBufferMapAsyncStatus s, void* ud) { if (s == WGPUBufferMapAsyncStatus_Success) *(volatile bool*)ud = true; },
+      (void*)&_rbReady);
+  }
 }
 
 void OceanFFT::sampleDisplacement(float worldX, float worldZ, float& dx, float& dy, float& dz) const {

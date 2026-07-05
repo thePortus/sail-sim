@@ -264,6 +264,7 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain.wgsl"             RAIN_WGSL
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/lightning.wgsl"        LIGHTNING_WGSL        "${WGSL_GEN_DIR}/lightning_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds_denoise.wgsl"   CLOUDS_DENOISE_WGSL   "${WGSL_GEN_DIR}/clouds_denoise_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/fxaa.wgsl"             FXAA_WGSL             "${WGSL_GEN_DIR}/fxaa_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/smaa.wgsl"             SMAA_WGSL             "${WGSL_GEN_DIR}/smaa_wgsl.h")
 
 # ── UI fonts ─────────────────────────────────────────────────────────────────
 # Two fonts, downloaded at configure time (kept out of git, re-fetchable) and

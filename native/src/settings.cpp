@@ -37,7 +37,7 @@ Values load() {
       x.renderScale = std::max(0.5f, std::min(1.0f, g.value("renderScale", x.renderScale)));
       x.adaptiveRes = g.value("adaptiveRes", x.adaptiveRes);
       x.adaptiveTargetMs = std::max(16.7f, std::min(66.0f, g.value("adaptiveTargetMs", x.adaptiveTargetMs)));
-      x.aa = std::max(0, std::min(1, g.value("aa", x.aa)));
+      x.aa = std::max(0, std::min(2, g.value("aa", x.aa)));
       x.ssaa = std::max(0, std::min(2, g.value("ssaa", x.ssaa)));
       x.shadows = std::max(0, std::min(3, g.value("shadows", x.shadows)));
       x.ssao = g.value("ssao", x.ssao);

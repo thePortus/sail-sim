@@ -2958,6 +2958,7 @@ int main(int argc, char** argv) {
   // optional SAILSIM_SSAA=<0..2>.
   if (const char* aaEnv = std::getenv("SAILSIM_AA")) userCfg.gfx.aa = std::max(0, std::min(2, atoi(aaEnv)));
   if (const char* ssEnv = std::getenv("SAILSIM_SSAA")) userCfg.gfx.ssaa = std::max(0, std::min(2, atoi(ssEnv)));
+  if (std::getenv("SAILSIM_NOREFL")) userCfg.gfx.reflections = false;
   // Shadow-map resolution from the saved quality dial (applied here, at texture
   // creation, so it survives for the session; 0 = off keeps a small valid map).
   g_shadowRes = userCfg.gfx.shadows > 0 ? (uint32_t)settings::shadowRes(userCfg.gfx.shadows) : 1024u;
@@ -3955,6 +3956,9 @@ int main(int argc, char** argv) {
         if (ImGui::Checkbox("Ambient occlusion (SSAO)", &g.ssao)) { custom(); gsave(); }
         if (ImGui::Checkbox("Depth of field", &g.dof)) { custom(); gsave(); }
         if (ImGui::Checkbox("Bloom", &g.bloom)) { custom(); gsave(); }
+        if (ImGui::Checkbox("Water reflections", &g.reflections)) { custom(); gsave(); }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Mirror the islands, ship and clouds in the water. Off = sky-only\nreflection (cheaper — skips a full scene + cloud re-render each frame).");
         ImGui::End();
       }
 
@@ -6677,6 +6681,11 @@ int main(int argc, char** argv) {
     //    buffer, then the main-camera values are written back — queue ordering
     //    makes one buffer serve both passes. Skipped on the landing screen. ──
     if (sailing) {
+      // Reflections setting: full = mirror the whole scene (sky+islands+ship+clouds);
+      // off = draw only the mirrored sky into reflView (the ocean then samples a pure
+      // sky reflection — the "analytic sky only" the setting promises), skipping the
+      // expensive terrain grid, ship mesh, and cloud raymarch/denoise sub-passes.
+      const bool reflFull = userCfg.gfx.reflections;
       glm::mat4 mirror = glm::scale(glm::mat4(1.0f), glm::vec3(1.0f, -1.0f, 1.0f));
       glm::mat4 reflVP = proj * viewM * mirror;
       glm::vec3 reflEye(eye.x, -eye.y, eye.z);
@@ -6716,7 +6725,7 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderSetPipeline(rp, sky.pipeline);
         wgpuRenderPassEncoderSetBindGroup(rp, 0, sky.bindGroup, 0, nullptr);
         wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        if (terrainR.ready && terrUniformsLive) {
+        if (reflFull && terrainR.ready && terrUniformsLive) {
           wgpuRenderPassEncoderSetPipeline(rp, terrainR.pipeline);
           if (terrainR.shadowRecvBind)   // group 1 required by the pipeline
             wgpuRenderPassEncoderSetBindGroup(rp, 1, terrainR.shadowRecvBind, 0, nullptr);
@@ -6729,7 +6738,7 @@ int main(int argc, char** argv) {
           wgpuRenderPassEncoderSetIndexBuffer(rp, terrainR.ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
           wgpuRenderPassEncoderDrawIndexed(rp, terrainR.indexCount, 1, 0, 0, 0);
         }
-        if (ownMesh) {
+        if (reflFull && ownMesh) {
           uint32_t zeroOffs[2] = { 0, 0 };   // instance slot 0: uniforms + palette
           wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
           wgpuRenderPassEncoderSetBindGroup(rp, 1, sunShadow(device).recvBG, 0, nullptr);
@@ -6743,7 +6752,7 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
       }
-      {
+      if (reflFull) {
         // Mirror clouds: ray-march through the mirrored camera into the refl cloud
         // buffer, depth-tested against the mirror scene (load, no write)...
         WGPURenderPassColorAttachment ca = {};
@@ -6761,7 +6770,7 @@ int main(int argc, char** argv) {
         wgpuRenderPassEncoderEnd(cp);
         wgpuRenderPassEncoderRelease(cp);
       }
-      {
+      if (reflFull) {
         // ...then denoise-composite them onto the mirror (premultiplied blend).
         WGPURenderPassColorAttachment ca = {};
         ca.view = reflView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;

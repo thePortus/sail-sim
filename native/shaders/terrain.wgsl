@@ -350,11 +350,18 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   {
     let sunEl = u.sun.w * 0.2 - 0.1;
     let sunUp = smoothstep(0.0, 0.12, sunEl);
-    let shScal = dVal(wp.xz * 0.70) * 0.75 + dHash(floor(wp.xz * 2.3)) * 0.25;   // [0,1]
-    let shDith = dVal(wp.xz * 6.0);                                              // [0,1]
+    // Undulation: drift the scallop noise slowly ALONG the shore (travelling waves)
+    // and add a ~8 s ebb-and-flow wash that breathes the whole line up/down, so the
+    // waterline is alive instead of a frozen wavy contour. Time = u.eye.w (sim clock).
+    let tSec = u.eye.w;
+    let drift = vec2<f32>(tSec * 0.12, tSec * 0.05);
+    let shScal = dVal((wp.xz + drift) * 0.70) * 0.75 + dHash(floor((wp.xz + drift) * 2.3)) * 0.25;   // [0,1]
+    let shDith = dVal(wp.xz * 6.0);                                              // [0,1] (fine grain stays put)
+    let ebb = sin(tSec * 0.8 + wp.x * 0.13 + wp.z * 0.09) * 0.10
+            + sin(tSec * 1.3 - wp.z * 0.18) * 0.05;                              // ±0.15 m wash
     // Amplitude knobs (metres of threshold wobble): SCALLOP breaks it into waves,
     // DITHER fuzzes the edge. FEATHER softens the razor edge into a wet band.
-    let shoreThresh = 0.2 + (shScal - 0.5) * 1.2 + (shDith - 0.5) * 0.5;
+    let shoreThresh = 0.2 + (shScal - 0.5) * 1.2 + (shDith - 0.5) * 0.5 + ebb;
     let underwater  = 1.0 - smoothstep(shoreThresh - 0.20, shoreThresh + 0.20, in.elev);
     let seabedGrade = vec3<f32>(0.62, 0.62, 0.55) * (0.08 + 0.92 * sunUp);
     col = col * mix(vec3<f32>(1.0, 1.0, 1.0), seabedGrade, underwater);

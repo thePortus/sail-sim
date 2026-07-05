@@ -392,7 +392,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     //    octaves (~1.4 m + ~4.6 m) make the scallop; a ~0.17 m octave (faded with
     //    range so it can't shimmer) fuzzes the edge; a ~8 s ±0.15 m wash breathes it.
     let ssp = in.worldPos.xz;
-    let sScallop = shVal(ssp * 0.70) * 0.75 + shHash(floor(ssp * 2.3)) * 0.25;   // [0,1]
+    // Undulation drift — same coefficients + clock (cam.lod.w) as the terrain
+    // waterline scallop, so land + water travel together.
+    let sDrift = vec2<f32>(cam.lod.w * 0.12, cam.lod.w * 0.05);
+    let sScallop = shVal((ssp + sDrift) * 0.70) * 0.75 + shHash(floor((ssp + sDrift) * 2.3)) * 0.25;   // [0,1]
     let sGrain   = 1.0 - smoothstep(60.0, 220.0, viewDist);
     let sDither  = (shVal(ssp * 6.0) - 0.5) * sGrain;                            // ±0.5
     let sEbb = sin(cam.lod.w * 0.8 + ssp.x * 0.13 + ssp.y * 0.09) * 0.10

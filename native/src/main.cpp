@@ -6590,7 +6590,7 @@ int main(int argc, char** argv) {
       const float tCell = 2.0f * 4000.0f / 512.0f;   // grid span / resolution (createTerrainRender)
       float tox = std::floor(shipX / tCell) * tCell;
       float toz = std::floor(shipZ / tCell) * tCell;
-      tu = TerrainU{ viewProj, glm::vec4(eye, 1.0f),
+      tu = TerrainU{ viewProj, glm::vec4(eye, t),   // eye.w = sim clock (waterline undulation)
                    glm::vec4((float)tm.minX, (float)tm.maxX, (float)tm.minZ, (float)tm.maxZ),
                    glm::vec4((float)tm.width, (float)tm.height, tox, toz),
                    glm::vec4(lightDir, dayK),   // land lit by sun (day) / moon (night); w = daylight
@@ -6751,8 +6751,8 @@ int main(int argc, char** argv) {
         wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
       }
       if (terrUniformsLive) {
-        TerrainU tuR = tu; tuR.viewProj = reflVP; tuR.eye = glm::vec4(reflEye, 1.0f);
-        TerrainU tfR = tf; tfR.viewProj = reflVP; tfR.eye = glm::vec4(reflEye, 1.0f);
+        TerrainU tuR = tu; tuR.viewProj = reflVP; tuR.eye = glm::vec4(reflEye, tu.eye.w);
+        TerrainU tfR = tf; tfR.viewProj = reflVP; tfR.eye = glm::vec4(reflEye, tf.eye.w);
         tuR.extra.w = 1.0f;   // mirror clip: reflect only geometry above the water
         tfR.extra.w = 1.0f;
         wgpuQueueWriteBuffer(queue, terrainR.uniformBuf, 0, &tuR, sizeof(tuR));

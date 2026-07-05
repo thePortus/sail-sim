@@ -3,8 +3,6 @@
 # General or Current TODO Items
 
 
-* long summer day?
-* Add swear list filter, see if we can source from not us and build into the pipeline https://github.com/zautumnz/profane-words, so server filters unless user has option turned off (enabled by default)
 * frigate, galleon, barque, junkå
 * forts and taking towns
 * more tree varieties, flora.... regional/island differences

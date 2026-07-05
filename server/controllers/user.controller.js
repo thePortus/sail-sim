@@ -2,6 +2,7 @@ const db     = require('../models');
 const config = require('../config/db.config');
 const jwt    = require('jsonwebtoken');
 const md5    = require('md5');
+const { hasProfanity } = require('../profanity');
 
 const User = db.User;
 
@@ -49,6 +50,13 @@ exports.register = (req, res) => {
   if (typeof callsign === 'string' && /["']/.test(callsign)) {
     return res.status(400).send({ message: 'Callsign may not contain quote characters.' });
   }
+  // HARD profanity block (always enforced, not the opt-out chat filter): no profane usernames or callsigns.
+  if (hasProfanity(callsign)) {
+    return res.status(400).send({ message: 'That callsign contains language that isn’t allowed. Please choose another.' });
+  }
+  if (hasProfanity(username)) {
+    return res.status(400).send({ message: 'That username contains language that isn’t allowed. Please choose another.' });
+  }
   User.create({ username, callsign, password: md5(password), role: 'Viewer' })
     .then(user => res.status(201).send({
       message: 'Registered successfully.',
@@ -82,7 +90,13 @@ exports.update = (req, res) => {
     if (/["']/.test(req.body.callsign)) {
       return res.status(400).send({ message: 'Callsign may not contain quote characters.' });
     }
+    if (hasProfanity(req.body.callsign)) {
+      return res.status(400).send({ message: 'That callsign contains language that isn’t allowed. Please choose another.' });
+    }
     updates.callsign = req.body.callsign;
+  }
+  if (req.body.username && hasProfanity(req.body.username)) {
+    return res.status(400).send({ message: 'That username contains language that isn’t allowed. Please choose another.' });
   }
   if (req.body.password) updates.password = md5(req.body.password);
 

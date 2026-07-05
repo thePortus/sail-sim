@@ -52,6 +52,9 @@ db.ensureColumns = async () => {
     ['crew',         { type: Sequelize.DataTypes.INTEGER, allowNull: true, defaultValue: null }],
     // Quest progress (intro tutorial + future storyline). NULL = new player → intro auto-starts on login.
     ['questState',   { type: Sequelize.DataTypes.TEXT,    allowNull: true,  defaultValue: null }],
+    // Per-user CHAT profanity filter — masks profane words in received chat. Default TRUE (on); backfills
+    // existing players as filtered. The player can opt out. (Name/callsign block is separate + always on.)
+    ['profanityFilter', { type: Sequelize.DataTypes.BOOLEAN, allowNull: false, defaultValue: true }],
   ];
   for (const [name, spec] of adds) {
     try {

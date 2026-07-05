@@ -52,6 +52,7 @@
     "md5": "^2.3.0",
     "mysql2": ">=3.9.8",
     "pngjs": "^7.0.0",
+    "profane-words": "^2.1.0",
     "sequelize": "^6.21.3",
     "sequelize-cli": "^6.6.0",
     "serve-favicon": "^2.5.0",

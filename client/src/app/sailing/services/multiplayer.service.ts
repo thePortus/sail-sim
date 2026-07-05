@@ -182,6 +182,11 @@ export class MultiplayerService {
   // (set on tutorial completion, on buying a ship, or from the Shipwright's Rename button; null = closed).
   myShipName       = signal<string>('Saltmeadow');
   shipNameModal    = signal<{ current: string; reason: 'tutorial' | 'buy' | 'rename' } | null>(null);
+  // Set when the server REJECTS a rename (e.g. profanity) — the modal shows it and stays open.
+  shipNameError    = signal<string | null>(null);
+  // Per-user CHAT profanity filter (default ON). The server does the masking; this drives the settings toggle.
+  // Persisted per-device in localStorage; the toggle also tells the server (which persists it per-user).
+  profanityFilter  = signal<boolean>((() => { try { return localStorage.getItem('chat_profanity_filter') !== '0'; } catch { return true; } })());
   // The player's own custom flag colour (#rrggbb) — drives the shipwright colour picker + local flags.
   myFlagColor      = signal<string>('#b22222');
   // Set when the player collects salvage — the game overlay shows a transient toast.
@@ -377,7 +382,16 @@ export class MultiplayerService {
   setShipName(name: string): void {
     const n = (name || '').trim().slice(0, 28);
     if (!n) return;
+    this.shipNameError.set(null);   // clear any prior rejection; the reply (ship_name_set) resolves it
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'set_ship_name', shipName: n }));
+  }
+
+  /** Toggle the player's CHAT profanity filter (default on). The server masks received chat when on; this just
+   *  records the preference (locally + server-side). Does NOT affect the always-on block on profane names. */
+  setProfanityFilter(on: boolean): void {
+    this.profanityFilter.set(on);
+    try { localStorage.setItem('chat_profanity_filter', on ? '1' : '0'); } catch { /* ignore */ }
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'profanity_filter', on }));
   }
 
   /** Open the ship-naming modal (from the Shipwright's "Rename ship" button). */
@@ -940,12 +954,22 @@ export class MultiplayerService {
       this.upgradeError.set(String(msg.reason ?? 'upgrade failed'));
 
     } else if (msg.type === 'ship_name_set') {
-      // Server confirmed our rename → update our own readouts and close the modal. (Others see the new name on
-      // the floating label; the local player has no self-label, so there's nothing else to repaint.)
       const n = String(msg.shipName ?? 'Saltmeadow');
-      this.myShipName.set(n);
-      this.localState.vesselName = n;
-      this.shipNameModal.set(null);
+      if (msg.rejected === 'profanity') {
+        // Server refused the name (public label — profanity is never allowed). Keep the modal open, show why.
+        this.shipNameError.set('That name isn’t allowed. Please choose another.');
+      } else {
+        // Server confirmed our rename → update our own readouts and close the modal. (Others see the new name on
+        // the floating label; the local player has no self-label, so there's nothing else to repaint.)
+        this.myShipName.set(n);
+        this.localState.vesselName = n;
+        this.shipNameError.set(null);
+        this.shipNameModal.set(null);
+      }
+
+    } else if (msg.type === 'profanity_filter_set') {
+      // Server echoed our chat-filter preference (or its persisted value) → sync the toggle.
+      this.profanityFilter.set(msg.on !== false);
 
     } else if (msg.type === 'rename_prompt') {
       // The intro tutorial just finished → invite the new captain to name their ship.

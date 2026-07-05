@@ -9,6 +9,7 @@ import { OceanService } from '../../services/ocean.service';
 import { OceanFFTRenderer } from '../../services/ocean-fft-renderer.service';
 import { ScatterService } from '../../services/scatter/scatter.service';
 import { BirdService } from '../../services/bird.service';
+import { MultiplayerService } from '../../services/multiplayer.service';
 
 /**
  * Settings panel — opened from the pause menu's "Settings" button. Houses all
@@ -37,6 +38,17 @@ import { BirdService } from '../../services/bird.service';
                     (click)="toggleInvertCamera()">{{ invertCamera ? 'On' : 'Off' }}</button>
           </div>
           <div class="q-hint">Flips the up/down look direction when you drag to rotate the camera.</div>
+        </div>
+
+        <!-- ── Chat ─────────────────────────────────────────────────────── -->
+        <div class="set-section">
+          <div class="set-section-label">Chat</div>
+          <div class="q-row">
+            <span class="q-label">Filter Profanity in Chat</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="mp.profanityFilter()"
+                    (click)="toggleProfanityFilter()">{{ mp.profanityFilter() ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">Masks swear words in chat you receive. Offensive player, ship, and account names are always blocked.</div>
         </div>
 
         <!-- ── Graphics ─────────────────────────────────────────────────── -->
@@ -257,6 +269,10 @@ export class SettingsMenuComponent {
     this.invertCamera = !this.invertCamera;
     localStorage.setItem('ignis_invert_camera', this.invertCamera ? '1' : '0');
   }
+
+  /** Chat profanity filter (default on; server does the masking). Offensive names are always blocked regardless. */
+  readonly mp = inject(MultiplayerService);
+  toggleProfanityFilter(): void { this.mp.setProfanityFilter(!this.mp.profanityFilter()); }
   readonly sfx     = inject(SfxService);
   private readonly terrain  = inject(TerrainService);
   private readonly cloudSvc = inject(CloudService);

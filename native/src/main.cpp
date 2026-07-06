@@ -3426,6 +3426,9 @@ int main(int argc, char** argv) {
   std::future<net::LocationResult> locFuture;
   bool locResolved = false;
   double locDeadline = 0.0;   // wall-clock cutoff to stop waiting (keep harbour spawn)
+  // Dropped-connection watchdog: if the gameplay socket stays closed (no auto-
+  // reconnect) for more than a blip while playing, kick back to login with a note.
+  double disconnectSince = -1.0;   // wall-clock we first saw the socket closed (-1 = healthy)
 
   // Admin panel (backtick toggles; admin/owner role only — mirrors the browser
   // client's admin-panel.component). Weather/time overrides are server-authoritative:
@@ -3772,6 +3775,24 @@ int main(int argc, char** argv) {
       authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
       uiError = "Session expired - please sign in again.";
       appState = AppState::Login;
+    }
+
+    // Lost the gameplay socket (server down / network drop — NOT a token rejection).
+    // There's no auto-reconnect, so a closed socket won't recover; wait out a short
+    // grace (so a momentary blip doesn't kick) then bounce to login with a message.
+    // Keep the session — the token's fine, the server is unreachable.
+    if (appState == AppState::Sailing) {
+      if (mpClient.state() == mp::ConnState::Closed) {
+        if (disconnectSince < 0.0) disconnectSince = glfwGetTime();
+        else if (glfwGetTime() - disconnectSince > 3.5) {
+          mpClient.close(); mpConnected = false;
+          uiError = "Lost connection to the server - please sign in again.";
+          appState = AppState::Login;
+          disconnectSince = -1.0;
+        }
+      } else {
+        disconnectSince = -1.0;   // Open (or reconnecting) — healthy, reset the timer
+      }
     }
 
     // In-game HUD: identity, connection, nearby players, wind.

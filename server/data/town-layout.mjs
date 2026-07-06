@@ -101,6 +101,7 @@ export function deriveWalls(pad, tier) {
     W(-hZ, -mouth, 'corner'),   // left sea-return tip (edge of the open harbor mouth)
     W(-hZ, -hX,    'bastion'),  // seaward-left strongpoint
     W( hZ, -hX,    inland),     // inland-left
+    W( hZ,  0,     'gate'),     // LAND GATE — centre of the inland back wall (the landward entrance)
     W( hZ,  hX,    inland),     // inland-right
     W(-hZ,  hX,    'bastion'),  // seaward-right strongpoint
     W(-hZ,  mouth, 'corner'),   // right sea-return tip  (OPEN gap back to node 0 = the harbor mouth)

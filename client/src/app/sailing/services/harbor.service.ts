@@ -613,7 +613,7 @@ export class HarborService {
     const scene = this.sceneService.scene;
     const W = h.walls;
     if (!scene || !W || W.length < 2) return;
-    const MESH_LEN = 6.0, SPACING = 8.0;   // 6 m curtain repeated at ~8 m (fewer instances, mild stretch)
+    const MESH_LEN = 6.0, SPACING = 8.0, GATE_W = 8.0, GATE_HALF = 4.0;   // 6 m curtain repeated at ~8 m
     // The wall base must follow the sloping shore — a single flat elevation leaves pieces floating over the
     // downslope (even out over water). Drop each piece to the LOWEST ground it spans (min with padElev): it may
     // sink into the ground/water, but it never floats.
@@ -622,17 +622,23 @@ export class HarborService {
     // scaled to fit, oriented so the crenellations (authored -Z) face OUTWARD, away from the town centre.
     for (let i = 0; i + 1 < W.length; i++) {
       const a = W[i], b = W[i + 1];
-      const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
+      const ux0 = b.x - a.x, uz0 = b.z - a.z, len0 = Math.hypot(ux0, uz0);
+      if (len0 < 0.5) continue;
+      const ux = ux0 / len0, uz = uz0 / len0;
+      // Leave a GATE_HALF gap at each end that meets a gate node for the gatehouse.
+      let ax = a.x, az = a.z, bx = b.x, bz = b.z;
+      if (a.tag === 'gate') { ax += ux * GATE_HALF; az += uz * GATE_HALF; }
+      if (b.tag === 'gate') { bx -= ux * GATE_HALF; bz -= uz * GATE_HALF; }
+      const dx = bx - ax, dz = bz - az, len = Math.hypot(dx, dz);
       if (len < 0.5) continue;
-      const ux = dx / len, uz = dz / len;
-      const midx = (a.x + b.x) / 2, midz = (a.z + b.z) / 2;
+      const midx = (ax + bx) / 2, midz = (az + bz) / 2;
       let yaw = Math.atan2(ux, uz) - Math.PI / 2;   // local +X runs along the segment
       if (uz * (midx - h.x) - ux * (midz - h.z) < 0) yaw += Math.PI;   // -Z faces outward
       const count = Math.max(1, Math.round(len / SPACING));
       const half = (len / count) / 2;
       for (let k = 0; k < count; k++) {
         const t = (k + 0.5) / count;
-        const cx = a.x + dx * t, cz = a.z + dz * t;
+        const cx = ax + dx * t, cz = az + dz * t;
         const y0 = Math.min(groundY(cx, cz), groundY(cx - ux * half, cz - uz * half),
                             groundY(cx + ux * half, cz + uz * half));   // lowest ground under the piece → no float
         const parent = new TransformNode(`fortwall_${h.id}_${i}_${k}`, scene);
@@ -657,9 +663,29 @@ export class HarborService {
       parent.rotation.y = (f.heading * Math.PI) / 180 + Math.PI;   // -Z faces seaward (guns' heading)
       this.applyBuildingRecipe(node);
     }
-    // Bastion tower at each node (1.25x on bastions; a square tower reads the same at any yaw).
+    // A tower at each node — except a LAND GATE node, which gets the gatehouse filling the carved curtain gap.
     for (let i = 0; i < W.length; i++) {
       const n = W[i];
+      if (n.tag === 'gate') {
+        if (i === 0 || i + 1 >= W.length) continue;
+        const p = W[i - 1], q = W[i + 1];   // neighbours give the wall run
+        const rx0 = q.x - p.x, rz0 = q.z - p.z, rl = Math.hypot(rx0, rz0);
+        if (rl < 0.1) continue;
+        const rx = rx0 / rl, rz = rz0 / rl;
+        let yaw = Math.atan2(rx, rz) - Math.PI / 2;   // local +X along the wall run
+        if (rz * (n.x - h.x) - rx * (n.z - h.z) < 0) yaw += Math.PI;   // -Z faces outward
+        const y0 = Math.min(groundY(n.x, n.z), groundY(n.x - rx * GATE_HALF, n.z - rz * GATE_HALF),
+                            groundY(n.x + rx * GATE_HALF, n.z + rz * GATE_HALF));
+        const parent = new TransformNode(`fortgate_${h.id}_${i}`, scene);
+        parent.parent = root;
+        const node = await this.assetCache.instantiate('forts/wall_gate.glb', scene, parent, false);
+        if (!node) { parent.dispose(); continue; }
+        parent.position.set(n.x, y0, n.z);
+        parent.rotation.y = yaw;
+        parent.scaling.x = (2 * GATE_HALF) / GATE_W;
+        this.applyBuildingRecipe(node);
+        continue;
+      }
       const parent = new TransformNode(`fortnode_${h.id}_${i}`, scene);
       parent.parent = root;
       const node = await this.assetCache.instantiate('forts/wall_tower.glb', scene, parent, false);

@@ -6729,10 +6729,11 @@ int main(int argc, char** argv) {
           if (d < 1500.0f && hb.walls.size() >= 2) {
             Mesh* wsMesh = townMeshFor("../forts/wall_straight.glb");
             Mesh* wtMesh = townMeshFor("../forts/wall_tower.glb");
+            Mesh* wgMesh = townMeshFor("../forts/wall_gate.glb");
             // Repeat the 6 m curtain at ~SPACING intervals (fewer instances than a strict
             // 6 m tiling → stays under the per-mesh draw cap on a big capital, at a mild
             // crenellation stretch), scaled to fit each segment exactly.
-            const float MESH_LEN = 6.0f, SPACING = 8.0f;
+            const float MESH_LEN = 6.0f, SPACING = 8.0f, GATE_W = 8.0f, GATE_HALF = 4.0f;
             // The wall base must follow the sloping shore — a single flat elevation leaves
             // pieces floating over the downslope (even out over water). Drop each piece to the
             // LOWEST ground it spans (min with padElev): it may sink into the ground/water, but
@@ -6744,17 +6745,23 @@ int main(int argc, char** argv) {
               for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {
                 const terrain::WallNode& a = hb.walls[i];
                 const terrain::WallNode& b = hb.walls[i + 1];
-                float sx = b.x - a.x, sz = b.z - a.z, len = std::hypot(sx, sz);
+                float ux = b.x - a.x, uz = b.z - a.z, len0 = std::hypot(ux, uz);
+                if (len0 < 0.5f) continue;
+                ux /= len0; uz /= len0;
+                // Leave a GATE_HALF gap at each end that meets a gate node (tag 2) for the gatehouse.
+                float ax = a.x, az = a.z, bx = b.x, bz = b.z;
+                if (a.tag == 2) { ax += ux * GATE_HALF; az += uz * GATE_HALF; }
+                if (b.tag == 2) { bx -= ux * GATE_HALF; bz -= uz * GATE_HALF; }
+                float sx = bx - ax, sz = bz - az, len = std::hypot(sx, sz);
                 if (len < 0.5f) continue;
-                float ux = sx / len, uz = sz / len;
-                float midx = (a.x + b.x) * 0.5f, midz = (a.z + b.z) * 0.5f;
+                float midx = (ax + bx) * 0.5f, midz = (az + bz) * 0.5f;
                 float yaw = std::atan2(-uz, ux);   // local +X -> segment dir
                 if (uz * (midx - hb.x) - ux * (midz - hb.z) < 0.0f) yaw += glm::pi<float>();   // -Z faces outward
                 int count = std::max(1, (int)std::lround(len / SPACING));
                 float pieceLen = len / (float)count, half = pieceLen * 0.5f;
                 for (int k = 0; k < count; ++k) {
                   float t = ((float)k + 0.5f) / (float)count;
-                  float cx = a.x + sx * t, cz = a.z + sz * t;
+                  float cx = ax + sx * t, cz = az + sz * t;
                   // lowest ground under this piece (both ends + centre) → no float
                   float y0 = std::min({ groundY(cx, cz), groundY(cx - ux * half, cz - uz * half),
                                         groundY(cx + ux * half, cz + uz * half) });
@@ -6775,14 +6782,31 @@ int main(int argc, char** argv) {
               if (Mesh* ftMesh = townMeshFor("../forts/" + ft.glb + ".glb"))
                 ships.push_back({ ftMesh, mm });
             }
-            if (wtMesh)
-              for (const terrain::WallNode& n : hb.walls) {
+            for (size_t i = 0; i < hb.walls.size(); ++i) {
+              const terrain::WallNode& n = hb.walls[i];
+              if (n.tag == 2) {   // LAND GATE — the gatehouse fills the carved curtain gap
+                if (!wgMesh || i == 0 || i + 1 >= hb.walls.size()) continue;
+                const terrain::WallNode& p = hb.walls[i - 1];   // neighbours give the wall run
+                const terrain::WallNode& q = hb.walls[i + 1];
+                float rx = q.x - p.x, rz = q.z - p.z, rl = std::hypot(rx, rz);
+                if (rl < 0.1f) continue;
+                rx /= rl; rz /= rl;
+                float yaw = std::atan2(-rz, rx);   // local +X -> wall run
+                if (rz * (n.x - hb.x) - rx * (n.z - hb.z) < 0.0f) yaw += glm::pi<float>();   // -Z faces outward
+                float y0 = std::min({ groundY(n.x, n.z), groundY(n.x - rx * GATE_HALF, n.z - rz * GATE_HALF),
+                                      groundY(n.x + rx * GATE_HALF, n.z + rz * GATE_HALF) });
+                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
+                mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
+                mm = glm::scale(mm, glm::vec3((2.0f * GATE_HALF) / GATE_W, 1.0f, 1.0f));
+                ships.push_back({ wgMesh, mm });
+              } else if (wtMesh) {
                 float scv = (n.tag == 1) ? 1.25f : 1.0f;   // bastions a touch larger
                 glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, groundY(n.x, n.z), n.z));
                 mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));
                 mm = glm::scale(mm, glm::vec3(scv, 1.0f, scv));
                 ships.push_back({ wtMesh, mm });
               }
+            }
           }
         }
       }

@@ -3773,7 +3773,7 @@ int main(int argc, char** argv) {
             float d = h.x * h.x + h.z * h.z; if (d < bestD) { bestD = d; best = &h; }
           }
           float hr = glm::radians(best->heading);
-          glm::vec3 seaward(std::sin(hr), 0.0f, -std::cos(hr));   // 0=N(-Z), 90=E(+X)
+          glm::vec3 seaward(std::sin(hr), 0.0f, std::cos(hr));   // heading→seaward = (sinH, cosH), matching the server layout frame
           vessel.x = best->x + seaward.x * 700.0f;
           vessel.z = best->z + seaward.z * 700.0f;
           vessel.heading = hr + glm::pi<float>();   // bow toward the harbour
@@ -5117,7 +5117,7 @@ int main(int argc, char** argv) {
             float len = 14.3f, halfW = 1.6f;                      // PIER_DIMS straight
             if (hb.variant == "l" || hb.variant == "t") { len = 11.0f; halfW = 6.5f; }
             float hrr = glm::radians(hb.heading);
-            float fx = std::sin(hrr), fz = -std::cos(hrr);        // seaward (spawn convention)
+            float fx = std::sin(hrr), fz = std::cos(hrr);        // seaward = (sinH, cosH) — same frame as the pier body
             float ax = hb.x, az = hb.z, bx = hb.x + fx * len, bz = hb.z + fz * len;
             float ddx = bx - ax, ddz = bz - az, l2 = ddx * ddx + ddz * ddz;
             float tt = l2 > 1e-6f ? ((vessel.x - ax) * ddx + (vessel.z - az) * ddz) / l2 : 0.0f;
@@ -6717,7 +6717,10 @@ int main(int argc, char** argv) {
                                  : hb.variant == "t" ? "pier_t.glb" : "pier_straight.glb";
             if (Mesh* pm = townMeshFor(pierFile)) {
               glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(hb.x, 0.0f, hb.z));
-              mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));
+              // Pier body (authored -Z) faces seaward: yaw = heading + PI aims -Z along (sinH, cosH), the same
+              // frame as the fort + server layout. (The old -heading was flipped in Z — invisible on the
+              // symmetric straight pier, but it threw the asymmetric L/T crossbar to the wrong side.)
+              mm = glm::rotate(mm, glm::radians(hb.heading) + glm::pi<float>(), glm::vec3(0, 1, 0));
               ships.push_back({ pm, mm });
             }
           }

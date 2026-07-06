@@ -2803,12 +2803,28 @@ int main(int argc, char** argv) {
 
   // WebGPU manages the drawing surface; tell GLFW not to create an OpenGL context.
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  GLFWwindow* window = glfwCreateWindow(1280, 720, "sail-sim native — Phase 1: camera + depth", nullptr, nullptr);
+  // Open as LARGE as possible but WINDOWED (not fullscreen). Seed the size from the
+  // primary monitor's work area (screen minus menu bar / taskbar / dock), then ask
+  // the OS to MAXIMIZE — on macOS the work-area width alone under-sized the window,
+  // whereas glfwMaximizeWindow fills the work area in BOTH axes and honours the
+  // platform's real insets. Stays a normal resizable, decorated window.
+  int winW = 1280, winH = 720, winX = 0, winY = 0;
+  if (GLFWmonitor* pm = glfwGetPrimaryMonitor()) {
+    int wax = 0, way = 0, waw = 0, wah = 0;
+    glfwGetMonitorWorkarea(pm, &wax, &way, &waw, &wah);
+    if (waw > 0 && wah > 0) { winW = waw; winH = wah; winX = wax; winY = way; }
+  }
+  glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);   // hint honoured at creation on most platforms
+  GLFWwindow* window = glfwCreateWindow(winW, winH, "sail-sim native — Phase 1: camera + depth", nullptr, nullptr);
   if (!window) {
     std::fprintf(stderr, "[spike] glfwCreateWindow failed\n");
     glfwTerminate();
     return EXIT_FAILURE;
   }
+  glfwSetWindowPos(window, winX, winY);   // align to the work-area origin (below the menu bar)
+  glfwMaximizeWindow(window);              // fill the work area in both axes (macOS width fix)
+  { int gw = 0, gh = 0; glfwGetWindowSize(window, &gw, &gh);
+    std::printf("[spike] window %dx%d (work area seed %dx%d)\n", gw, gh, winW, winH); }
   glfwSetScrollCallback(window, onScroll);   // mouse-wheel zoom
 
   // 1. Instance
@@ -4091,11 +4107,24 @@ int main(int argc, char** argv) {
         float r = glm::radians(deg);
         return ImVec2(c.x + R * std::sin(r), c.y - R * std::cos(r));
       };
-      // No-go wedge around the wind eye.
-      { std::vector<ImVec2> w; w.push_back(c);
-        for (float a = rel - vrig.minTackAngle; a <= rel + vrig.minTackAngle; a += 5.0f) w.push_back(dirAt(a));
-        w.push_back(dirAt(rel + vrig.minTackAngle));
-        dl->AddConvexPolyFilled(w.data(), (int)w.size(), IM_COL32(210, 70, 60, 70)); }
+      // No-go / poor-pointing zone drawn from the ACTUAL polar (not a flat wedge):
+      // solid red where this hull can't make way (drive <= 0), fading out as drive
+      // climbs to a usable fraction of its best. So each ship's real ability to
+      // steer into the wind shows — the square-riggers (brig/merchantman) get a wide
+      // red zone, the close-winded sloop a narrow one.
+      {
+        float peak = 0.5f;
+        for (const glm::vec2& pt : vrig.polar) peak = std::max(peak, pt.y);
+        float good = std::max(0.01f, 0.7f * peak);
+        const float STEP = 4.0f;
+        for (float a = rel - 90.0f; a < rel + 90.0f; a += STEP) {
+          float offMid = std::fabs((a + STEP * 0.5f) - rel);           // angle off the wind eye
+          float drive  = sail::detail::polarDrive(offMid, vrig);
+          float redF   = glm::clamp((good - drive) / good, 0.0f, 1.0f);
+          if (redF <= 0.02f) continue;
+          dl->AddTriangleFilled(c, dirAt(a), dirAt(a + STEP), IM_COL32(210, 70, 60, (int)(redF * 90.0f)));
+        }
+      }
       dl->AddCircleFilled(c, R, IM_COL32(20, 34, 48, 160));
       dl->AddCircle(c, R, IM_COL32(150, 180, 205, 200), 48, 1.5f);
       // Rotating compass card (client HUD): cardinal + intercardinal ticks and

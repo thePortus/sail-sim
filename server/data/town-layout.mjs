@@ -68,6 +68,39 @@ export function composeTown(tier, rng) {
  * The lot grid (rowPitch / laneHalf) guarantees no two footprints overlap. Dwelling/avenue counts are
  * clamped to the site's measured flat depth/width so the pad never has to carve into a hillside.
  */
+/**
+ * Derive a town's defensive WALL RING from its flat `pad` rectangle (client-agnostic; both the Babylon and
+ * native clients walk this same polyline). The pad already bounds the whole town in world space, so the ring
+ * is the pad offset outward by `WALL_M` — a CLOSED loop of tagged nodes: the client places a straight curtain
+ * between consecutive nodes and a tower/bastion at each node, with the harbor gate on the SEAWARD edge where
+ * the pier-spine road crosses out toward the water.
+ *
+ * Nodes: { x, z, tag } where tag ∈ 'corner' | 'bastion' | 'gate'. Capitals get bastioned corners. Kept as a
+ * simple full rectangle for the wall-path SPIKE (validate the placement path with placeholder segments before
+ * the modular wall kit + tier-specific partial circuits land).
+ */
+export function deriveWalls(pad, tier) {
+  if (!pad) return [];
+  const WALL_M = 6;                                   // curtain stands this far outside the pad apron
+  const hr = pad.rotY * Math.PI / 180;
+  const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward); -fwd = seaward
+  const rgt = [ Math.cos(hr), -Math.sin(hr)];         // across the frontage
+  const hZ = pad.halfZ + WALL_M, hX = pad.halfX + WALL_M;
+  const W = (df, ds, tag) => ({                       // pad-centre-relative (df along fwd, ds across) → world
+    x: +(pad.cx + fwd[0] * df + rgt[0] * ds).toFixed(1),
+    z: +(pad.cz + fwd[1] * df + rgt[1] * ds).toFixed(1),
+    tag,
+  });
+  const corner = tier === 'capital' ? 'bastion' : 'corner';
+  return [
+    W(-hZ, -hX, corner),   // seaward-left
+    W(-hZ,   0, 'gate'),   // sea-gate (pier spine crosses here)
+    W(-hZ,  hX, corner),   // seaward-right
+    W( hZ,  hX, corner),   // inland-right
+    W( hZ, -hX, corner),   // inland-left  (ring closes back to seaward-left)
+  ];
+}
+
 export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const hr = town.heading * Math.PI / 180;
   const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward)
@@ -211,7 +244,8 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const elev = Math.max(1.2, samples[Math.floor(samples.length / 2)]);
   const pad = { cx: c.x, cz: c.z, halfX: Math.round((maxS - minS) / 2), halfZ: Math.round((maxF - minF) / 2), rotY: Math.round(town.heading), elev: +elev.toFixed(2) };
 
-  return { tier, buildings, square, streets, pad };
+  const walls = deriveWalls(pad, tier);
+  return { tier, buildings, square, streets, pad, walls };
 }
 
 /**
@@ -264,6 +298,7 @@ export function assignTowns(sites, seed, elevAt, footprints) {
     t.buildings = layout.buildings;
     t.square = layout.square;
     t.streets = layout.streets;
+    t.walls = layout.walls;
     delete t._site;
   }
 

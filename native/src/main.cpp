@@ -3037,6 +3037,7 @@ int main(int argc, char** argv) {
   double mastRepairStartT = -1; float mastRepairArmedMs = 0;   // jury-rig progress bar
   std::string salvageToast;  double salvageToastAtT = -100;    // "recovered X" line
   bool  sentDebugChat = false;                           // SAILSIM_CHAT one-shot (testing)
+  bool  sentProfPref = false;                            // send our chat-filter preference once per connection
   float mapZoom = 1.0f, mapVCX = 0.0f, mapVCZ = 0.0f;   // view centre (world) for zoom/pan
   float mapTpX = 0.0f, mapTpZ = 0.0f;                   // right-click teleport target
   bool moonReady = false, starsReady = false;
@@ -3683,6 +3684,7 @@ int main(int argc, char** argv) {
         locFuture = std::async(std::launch::async, net::playerLocation, kHost, kPort, authToken);
         locResolved = false;
         locDeadline = glfwGetTime() + 12.0;   // backstop beyond httplib's own timeouts
+        sentProfPref = false;                 // re-send the chat-filter preference on this connection
         mpConnected = true;
         appState = AppState::Sailing;
         musicMgr.resume();   // restart the track a logout stopped (client re-inits on entry)
@@ -3927,6 +3929,16 @@ int main(int argc, char** argv) {
         ImGui::Text("Track: %s", musicMgr.currentName().c_str());
         ImGui::SameLine();
         if (ImGui::Button(ICON_FA_FORWARD_STEP "  Next track")) musicMgr.next();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("CHAT");
+        if (ImGui::Checkbox("Filter profanity", &userCfg.profanityFilter)) {
+          mpClient.sendProfanityFilter(userCfg.profanityFilter);   // server masks per-recipient
+          settings::save(userCfg);
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Mask profane words in chat with ****.\nOff shows chat unfiltered. Profane player/ship names are always blocked.");
 
         // ── GRAPHICS (client settings-menu graphics dials, keyed to the native
         //    systems) — presets bundle the knobs; a manual tweak drops to Custom. ──
@@ -5633,6 +5645,13 @@ int main(int argc, char** argv) {
       if (!sentDebugChat && mpClient.state() == mp::ConnState::Open) {
         if (const char* dbg = std::getenv("SAILSIM_CHAT")) mpClient.sendChat(dbg);
         sentDebugChat = true;
+      }
+      // Sync our chat-filter preference once the socket is open (the server loads
+      // the persisted value on connect; this makes our local toggle authoritative
+      // so filtered chat matches what the settings show).
+      if (!sentProfPref && mpClient.state() == mp::ConnState::Open) {
+        mpClient.sendProfanityFilter(userCfg.profanityFilter);
+        sentProfPref = true;
       }
     }
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /

@@ -26,6 +26,7 @@ struct Values {
   float sfxVolume = 0.8f;     // client SfxService default
   float musicVolume = 0.1f;   // client MusicService default (gentle on first load)
   bool musicEnabled = true;   // client default: enabled
+  bool profanityFilter = true;// mask profane words in chat (opt-out; server does the masking)
   Graphics gfx;
 };
 

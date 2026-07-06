@@ -185,6 +185,10 @@ public:
   void sendChat(const std::string& text);
   std::vector<ChatMessage> drainChat();
 
+  // Chat profanity filter (opt-out; default on). The SERVER masks per-recipient;
+  // this just tells it our display preference (persisted server-side per user).
+  void sendProfanityFilter(bool on);
+
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   SquadronState squadron() const;              // our squadron roster ("" id = none)
   WaveState wave() const;

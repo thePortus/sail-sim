@@ -30,6 +30,7 @@ Values load() {
     v.sfxVolume = clamp01(j.value("sfxVolume", v.sfxVolume));
     v.musicVolume = clamp01(j.value("musicVolume", v.musicVolume));
     v.musicEnabled = j.value("musicEnabled", v.musicEnabled);
+    v.profanityFilter = j.value("profanityFilter", v.profanityFilter);
     if (j.contains("gfx")) {
       const auto& g = j["gfx"];
       Graphics& x = v.gfx;
@@ -57,6 +58,7 @@ void save(const Values& v) {
     { "sfxVolume", v.sfxVolume },
     { "musicVolume", v.musicVolume },
     { "musicEnabled", v.musicEnabled },
+    { "profanityFilter", v.profanityFilter },
     { "gfx", {
       { "preset", g.preset }, { "renderScale", g.renderScale },
       { "adaptiveRes", g.adaptiveRes }, { "adaptiveTargetMs", g.adaptiveTargetMs },

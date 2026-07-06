@@ -452,6 +452,14 @@ void Client::sendChat(const std::string& text) {
   p_->ws.send(j.dump());
 }
 
+void Client::sendProfanityFilter(bool on) {
+  if (p_->conn.load() != ConnState::Open) return;
+  // The server does all masking per-recipient; this just records our preference
+  // (it persists it to our user row and echoes 'profanity_filter_set').
+  json j = { { "type", "profanity_filter" }, { "on", on } };
+  p_->ws.send(j.dump());
+}
+
 std::vector<ChatMessage> Client::drainChat() {
   std::lock_guard<std::mutex> lock(p_->mtx);
   std::vector<ChatMessage> out;

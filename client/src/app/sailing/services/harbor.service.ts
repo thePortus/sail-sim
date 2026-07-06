@@ -675,6 +675,19 @@ export class HarborService {
       parent.rotation.y = hr + Math.PI;   // -Z faces seaward (guns' heading)
       this.tintFaction(node, h.faction);
       this.applyBuildingRecipe(node);
+      // Faction identity: national ensign at the flagstaff + (T1) the per-nation accent turret. The glTF loader
+      // adds a RH→LH __root__ (negates X/Z), so a fort-local offset becomes (-x, y, -z) under the fort parent.
+      const cc = h.faction === 'english' ? 'en' : h.faction === 'french' ? 'fr' : h.faction === 'dutch' ? 'nl' : 'es';
+      if (f.flag) {
+        const anchor = new TransformNode(`fortflag_${h.id}_${fi}`, scene);
+        anchor.parent = parent; anchor.position.set(-f.flag[0], f.flag[1], -f.flag[2]);
+        const fl = await this.assetCache.instantiate(`forts/flag_${cc}.glb`, scene, anchor, false);
+        if (fl) this.applyBuildingRecipe(fl); else anchor.dispose();   // ensign untinted (its own colours)
+      }
+      if (f.accent) {
+        const ac = await this.assetCache.instantiate(`forts/accent_${cc}.glb`, scene, parent, false);
+        if (ac) { this.tintFaction(ac, h.faction); this.applyBuildingRecipe(ac); }   // stone-tinted to match
+      }
     }
     // A tower at each node — except a LAND GATE node, which gets the gatehouse filling the carved curtain gap.
     for (let i = 0; i < W.length; i++) {

@@ -120,12 +120,17 @@ export function deriveWalls(pad, tier) {
 export const FORT_SPEC = {
   // depth/width = the fort's footprint (metres, seaward × across); depth sets the inland offset (seaward face on
   // the pad), and the client samples the footprint corners to SINK the fort to the lowest ground (never float).
+  // flag = the flagstaff-top offset in the fort's LOCAL frame (glTF Y-up); the client hangs flag_<cc>.glb there.
+  // accent = this tier carries the per-nation accent turret (accent_<cc>.glb, positioned in the fort's frame).
   small:   { glb: 'fort_t1', depth: 7,  width: 9,  range: 600, reload: 6.0, damage: 25,
+             flag: [-3.4, 7.4, 2.1], accent: true,
              guns: [{ fwd: 2.0, side: 0.0, up: 1.3 }] },                       // T1 battery: 1 central gun
   medium:  { glb: 'fort_t2', depth: 11, width: 14, range: 700, reload: 5.5, damage: 32,
+             flag: [-4.7, 8.5, 3.3],
              guns: [{ fwd: 4.7, side: -4.8, up: 2.5 }, { fwd: 4.7, side: -1.6, up: 2.5 },
                     { fwd: 4.7, side: 1.6, up: 2.5 },  { fwd: 4.7, side: 4.8, up: 2.5 }] },   // T2: 4 seaward guns
   capital: { glb: 'fort_t3', depth: 16, width: 22, range: 850, reload: 5.0, damage: 40,
+             flag: [0, 13.6, 1.6],
              guns: [{ fwd: 7.0, side: -7.5, up: 3.1 }, { fwd: 7.0, side: -4.5, up: 3.1 },
                     { fwd: 7.0, side: -1.5, up: 3.1 }, { fwd: 7.0, side: 1.5, up: 3.1 },
                     { fwd: 7.0, side: 4.5, up: 3.1 },  { fwd: 7.0, side: 7.5, up: 3.1 },       // 6 main battery
@@ -159,7 +164,8 @@ export function deriveForts(pad, tier) {
   }));
   // hd/hw = footprint half-extents (seaward/across) so the client can sample corners and sink the fort.
   return [{ tier, glb: spec.glb, x: fx, z: fz, y: pad.elev, heading: pad.rotY,
-            hd: spec.depth * 0.5, hw: (spec.width || spec.depth) * 0.5, guns }];
+            hd: spec.depth * 0.5, hw: (spec.width || spec.depth) * 0.5,
+            flag: spec.flag || null, accent: !!spec.accent, guns }];
 }
 
 export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {

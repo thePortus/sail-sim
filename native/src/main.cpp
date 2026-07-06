@@ -6819,6 +6819,17 @@ int main(int argc, char** argv) {
               mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
               if (Mesh* ftMesh = townMeshFor("../forts/" + ft.glb + ".glb"))
                 pushTinted(ftMesh, mm);
+              // Faction identity: national ensign at the flagstaff + (T1) the per-nation accent turret.
+              const char* cc = hb.faction == "english" ? "en" : hb.faction == "french" ? "fr"
+                             : hb.faction == "dutch" ? "nl" : "es";   // default Spanish Main
+              if (ft.hasFlag)
+                if (Mesh* fl = townMeshFor(std::string("../forts/flag_") + cc + ".glb")) {
+                  glm::mat4 fm = glm::translate(mm, glm::vec3(ft.flagX, ft.flagY, ft.flagZ));
+                  ships.push_back({ fl, fm });   // untinted — the ensign carries its own colours
+                }
+              if (ft.accent)
+                if (Mesh* ac = townMeshFor(std::string("../forts/accent_") + cc + ".glb"))
+                  pushTinted(ac, mm);            // stone-tinted to match the fort
             }
             for (size_t i = 0; i < hb.walls.size(); ++i) {
               const terrain::WallNode& n = hb.walls[i];

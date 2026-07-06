@@ -100,6 +100,11 @@ bool Terrain::load(const std::string& host, int port) {
           ft.x = num(f, "x", 0.0f); ft.z = num(f, "z", 0.0f); ft.y = num(f, "y", 0.0f);
           ft.heading = num(f, "heading", 0.0f);
           ft.hd = num(f, "hd", 0.0f); ft.hw = num(f, "hw", 0.0f);
+          if (f.contains("flag") && f["flag"].is_array() && f["flag"].size() == 3) {
+            ft.hasFlag = true;
+            ft.flagX = f["flag"][0].get<float>(); ft.flagY = f["flag"][1].get<float>(); ft.flagZ = f["flag"][2].get<float>();
+          }
+          ft.accent = f.value("accent", false);
           if (f.contains("guns") && f["guns"].is_array())
             for (const auto& g : f["guns"]) {
               if (!g.is_object()) continue;

@@ -99,7 +99,7 @@ export interface TownWallNode { x: number; z: number; tag: 'corner' | 'bastion' 
 export interface TownFortGun { x: number; z: number; y: number; heading: number; range: number; reload: number; damage: number; }
 /** One harbor FORT (Harbor Forts). Placement is server-derived (deriveForts) so both clients agree exactly; the
  *  client loads `forts/<glb>.glb` at (x,y,z), guns facing seaward (heading). See server deriveForts(). */
-export interface TownFort { glb: string; tier: string; x: number; z: number; y: number; heading: number; hd: number; hw: number; guns: TownFortGun[]; }
+export interface TownFort { glb: string; tier: string; x: number; z: number; y: number; heading: number; hd: number; hw: number; flag: number[] | null; accent: boolean; guns: TownFortGun[]; }
 
 export interface TerrainHarbor {
   id: string;

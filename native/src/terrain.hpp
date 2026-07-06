@@ -16,6 +16,8 @@ struct Building { std::string asset; float x = 0, z = 0, rotY = 0; };
 struct WallNode { float x = 0, z = 0; int tag = 0; };
 // One street segment of a town's road network (draped ribbon of width `w`).
 struct Street { float x1 = 0, z1 = 0, x2 = 0, z2 = 0, w = 5; };
+// An oriented rectangle (the civic square). halfZ = along heading, halfX = across.
+struct Rect { bool valid = false; float cx = 0, cz = 0, halfX = 0, halfZ = 0, rotY = 0; };
 struct Harbor {
   std::string id;                             // server town id ("town_0") for economy calls
   std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)
@@ -23,6 +25,7 @@ struct Harbor {
   float padElev = 0;                          // town pad ground elevation (metres)
   std::vector<Building> buildings;
   std::vector<Street>   streets;              // road network (draped ribbons)
+  Rect                  square;               // civic square (valid=false if none)
   std::vector<WallNode> walls;                // defensive wall ring (open polyline; placeholder for the spike)
 };
 struct Spawn  { float x = 0, z = 0, heading = 0; };

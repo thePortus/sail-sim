@@ -2966,7 +2966,43 @@ int main(int argc, char** argv) {
       }
     }
     WGPUTexture dtex = makeMippedRGBA(device, queue, DW, DH, dpx.data(), /*srgb=*/true);
-    primsSys.setDecalTexture(device, wgpuTextureCreateView(dtex, nullptr));
+    primsSys.setDecalTexture(device, wgpuTextureCreateView(dtex, nullptr), 0);
+  }
+  // Civic square: procedural cobblestone decal (port of harbor.service makeCobbleTexture)
+  // → decal slot 1 — warm-grey rounded stones on dark mortar, brick-offset rows, tiling.
+  {
+    const int CS = 256, cw = 22, ch = 18;
+    std::vector<uint8_t> cpx((size_t)CS * CS * 4);
+    auto chash = [](int a, int b, int c) -> float {
+      uint32_t h = (uint32_t)(a * 374761393 + b * 668265263 + c * 2246822519u);
+      h = (h ^ (h >> 13)) * 1274126177u; h = h ^ (h >> 16);
+      return (float)h / 4294967296.0f;
+    };
+    auto roundRectHit = [](float px, float py, float x0, float y0, float w, float h, float r) -> bool {
+      if (px < x0 || px > x0 + w || py < y0 || py > y0 + h) return false;
+      float qx = std::max(x0 + r - px, std::max(0.0f, px - (x0 + w - r)));
+      float qy = std::max(y0 + r - py, std::max(0.0f, py - (y0 + h - r)));
+      return qx * qx + qy * qy <= r * r;
+    };
+    for (int y = 0; y < CS; ++y)
+      for (int x = 0; x < CS; ++x) {
+        int row = (int)std::floor((float)y / ch);
+        float off = (row & 1) * (cw * 0.5f);
+        int col = (int)std::floor(((float)x - off) / (float)cw);
+        float r1 = chash(col, row, 0), r2 = chash(col, row, 1), r3 = chash(col, row, 2);
+        float sx0 = col * cw + off + 1.5f, sy0 = row * ch + 1.5f;
+        float w = cw - 3 - r1 * 2.0f, hh = ch - 3 - r2 * 2.0f;
+        int i = (y * CS + x) * 4;
+        if (roundRectHit((float)x, (float)y, sx0, sy0, w, hh, 4.0f)) {
+          int g = 118 + (int)(r3 * 64.0f);
+          cpx[i] = (uint8_t)g; cpx[i + 1] = (uint8_t)std::max(0, g - 8); cpx[i + 2] = (uint8_t)std::max(0, g - 18);
+        } else {
+          cpx[i] = 74; cpx[i + 1] = 69; cpx[i + 2] = 63;   // mortar #4a453f
+        }
+        cpx[i + 3] = 255;
+      }
+    WGPUTexture ctex = makeMippedRGBA(device, queue, CS, CS, cpx.data(), /*srgb=*/true);
+    primsSys.setDecalTexture(device, wgpuTextureCreateView(ctex, nullptr), 1);
   }
   fx::System cannonFx;
   cannonFx.init(device, kSceneFormat);
@@ -7936,6 +7972,22 @@ int main(int argc, char** argv) {
               }
               pl = L; pr = R; pv = v;
             }
+          }
+          // ── Civic square: a cobblestone quad on the pad (decal slot 1), tiling every 2.5 m. ──
+          if (hb.square.valid) {
+            const terrain::Rect& sq = hb.square;
+            float hr = sq.rotY * 3.14159265f / 180.0f;
+            float ax = std::sin(hr), az = std::cos(hr);    // along heading (halfZ axis)
+            float bx = std::cos(hr), bz = -std::sin(hr);   // across (halfX axis)
+            auto corner = [&](float a, float c) {
+              float wx = sq.cx + ax * a * sq.halfZ + bx * c * sq.halfX;
+              float wz = sq.cz + az * a * sq.halfZ + bz * c * sq.halfX;
+              return glm::vec3(wx, terr.elevation(wx, wz) + 0.15f, wz);
+            };
+            glm::vec3 c00 = corner(-1, -1), c10 = corner(1, -1), c01 = corner(-1, 1), c11 = corner(1, 1);
+            glm::vec2 u00(0, 0), u10(sq.halfZ / 2.5f, 0), u01(0, sq.halfX / 2.5f), u11(sq.halfZ / 2.5f, sq.halfX / 2.5f);
+            primsSys.triTex(c00, c01, c10, u00, u01, u10, 1);
+            primsSys.triTex(c10, c01, c11, u10, u01, u11, 1);
           }
           if (hb.walls.size() < 2) continue;
           for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {          // curtains — OPEN path (no wrap; the gap is the harbor mouth)

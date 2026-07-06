@@ -64,6 +64,13 @@ bool Terrain::load(const std::string& host, int port) {
           if (!bd.asset.empty()) hb.buildings.push_back(bd);
         }
       }
+      if (h.contains("square") && h["square"].is_object()) {
+        const auto& sq = h["square"];
+        hb.square.cx = num(sq, "cx", 0.0f); hb.square.cz = num(sq, "cz", 0.0f);
+        hb.square.halfX = num(sq, "halfX", 0.0f); hb.square.halfZ = num(sq, "halfZ", 0.0f);
+        hb.square.rotY = num(sq, "rotY", 0.0f);
+        hb.square.valid = hb.square.halfX > 0.0f && hb.square.halfZ > 0.0f;
+      }
       if (h.contains("streets") && h["streets"].is_array()) {
         for (const auto& s : h["streets"]) {
           if (!s.is_object()) continue;

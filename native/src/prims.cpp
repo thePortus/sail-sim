@@ -127,13 +127,15 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
     WGPUShaderModule tmod = wgpuDeviceCreateShaderModule(device, &tsmd);
 
     WGPUSamplerDescriptor sd = {};
-    sd.addressModeU = WGPUAddressMode_ClampToEdge;   // U = path cross-section (don't repeat the falloff)
-    sd.addressModeV = WGPUAddressMode_Repeat;         // V = along the path (tiles)
     sd.addressModeW = WGPUAddressMode_Repeat;
     sd.magFilter = WGPUFilterMode_Linear; sd.minFilter = WGPUFilterMode_Linear;
     sd.mipmapFilter = WGPUMipmapFilterMode_Linear;
     sd.lodMaxClamp = 32.0f; sd.maxAnisotropy = 1;
-    texSampler_ = wgpuDeviceCreateSampler(device, &sd);
+    // Slot 0 (roads): U = path cross-section (clamp), V tiles along. Slot 1 (cobble square): both tile.
+    sd.addressModeU = WGPUAddressMode_ClampToEdge; sd.addressModeV = WGPUAddressMode_Repeat;
+    texSampler_[0] = wgpuDeviceCreateSampler(device, &sd);
+    sd.addressModeU = WGPUAddressMode_Repeat;      sd.addressModeV = WGPUAddressMode_Repeat;
+    texSampler_[1] = wgpuDeviceCreateSampler(device, &sd);
 
     WGPUBindGroupLayoutEntry te[3] = {};
     te[0].binding = 0; te[0].visibility = WGPUShaderStage_Vertex; te[0].buffer.type = WGPUBufferBindingType_Uniform;
@@ -175,25 +177,26 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   return pipeOpaque_ && pipeTrans_;
 }
 
-void System::setDecalTexture(WGPUDevice device, WGPUTextureView view) {
-  if (!view || !texBgl_) return;
-  if (texBind_) { wgpuBindGroupRelease(texBind_); texBind_ = nullptr; }
+void System::setDecalTexture(WGPUDevice device, WGPUTextureView view, int slot) {
+  if (!view || !texBgl_ || slot < 0 || slot >= kDecalSlots) return;
+  if (texBind_[slot]) { wgpuBindGroupRelease(texBind_[slot]); texBind_[slot] = nullptr; }
   WGPUBindGroupEntry e[3] = {};
   e[0].binding = 0; e[0].buffer = ubuf_; e[0].size = sizeof(glm::mat4);
   e[1].binding = 1; e[1].textureView = view;
-  e[2].binding = 2; e[2].sampler = texSampler_;
+  e[2].binding = 2; e[2].sampler = texSampler_[slot];
   WGPUBindGroupDescriptor bgd = {}; bgd.layout = texBgl_; bgd.entryCount = 3; bgd.entries = e;
-  texBind_ = wgpuDeviceCreateBindGroup(device, &bgd);
+  texBind_[slot] = wgpuDeviceCreateBindGroup(device, &bgd);
 }
 
 void System::triTex(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
-                    const glm::vec2& ua, const glm::vec2& ub, const glm::vec2& uc) {
-  tex_.push_back({ a, ua });
-  tex_.push_back({ b, ub });
-  tex_.push_back({ c, uc });
+                    const glm::vec2& ua, const glm::vec2& ub, const glm::vec2& uc, int slot) {
+  if (slot < 0 || slot >= kDecalSlots) return;
+  tex_[slot].push_back({ a, ua });
+  tex_[slot].push_back({ b, ub });
+  tex_[slot].push_back({ c, uc });
 }
 
-void System::clear() { opaque_.clear(); trans_.clear(); tex_.clear(); }
+void System::clear() { opaque_.clear(); trans_.clear(); for (auto& t : tex_) t.clear(); }
 
 void System::tri(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
                  const glm::vec4& color, bool translucent) {
@@ -271,7 +274,8 @@ void System::billboard(const glm::vec3& c, const glm::vec3& r, const glm::vec3& 
 void System::flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass,
                    const glm::mat4& viewProj) {
   const uint64_t total = (uint64_t)(opaque_.size() + trans_.size()) * sizeof(Vtx);
-  if ((total == 0 && tex_.empty()) || !pipeOpaque_) return;
+  size_t texN = 0; for (const auto& t : tex_) texN += t.size();
+  if ((total == 0 && texN == 0) || !pipeOpaque_) return;
   if (total > vbufCap_ && total > 0) {
     if (vbuf_) wgpuBufferRelease(vbuf_);
     vbufCap_ = total * 2;
@@ -298,9 +302,10 @@ void System::flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pas
                                          trans_.size() * sizeof(Vtx));
     wgpuRenderPassEncoderDraw(pass, (uint32_t)trans_.size(), 1, 0, 0);
   }
-  // Textured decals (roads) — own vertex format + texture bind group.
-  if (!tex_.empty() && pipeTex_ && texBind_) {
-    const uint64_t tbytes = (uint64_t)tex_.size() * sizeof(TVtx);
+  // Textured decals — one draw per slot (roads slot 0, cobble square slot 1),
+  // packed back-to-back into tvbuf_; each slot binds its own texture+sampler.
+  if (texN && pipeTex_) {
+    const uint64_t tbytes = (uint64_t)texN * sizeof(TVtx);
     if (tbytes > tvbufCap_) {
       if (tvbuf_) wgpuBufferRelease(tvbuf_);
       tvbufCap_ = tbytes * 2;
@@ -308,11 +313,17 @@ void System::flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pas
       tvd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst; tvd.size = tvbufCap_;
       tvbuf_ = wgpuDeviceCreateBuffer(device, &tvd);
     }
-    wgpuQueueWriteBuffer(queue, tvbuf_, 0, tex_.data(), tbytes);
     wgpuRenderPassEncoderSetPipeline(pass, pipeTex_);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, texBind_, 0, nullptr);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, tvbuf_, 0, tbytes);
-    wgpuRenderPassEncoderDraw(pass, (uint32_t)tex_.size(), 1, 0, 0);
+    uint64_t off = 0;
+    for (int s = 0; s < kDecalSlots; ++s) {
+      if (tex_[s].empty() || !texBind_[s]) continue;
+      const uint64_t sb = (uint64_t)tex_[s].size() * sizeof(TVtx);
+      wgpuQueueWriteBuffer(queue, tvbuf_, off, tex_[s].data(), sb);
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, texBind_[s], 0, nullptr);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, 0, tvbuf_, off, sb);
+      wgpuRenderPassEncoderDraw(pass, (uint32_t)tex_[s].size(), 1, 0, 0);
+      off += sb;
+    }
   }
 }
 

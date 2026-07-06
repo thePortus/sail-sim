@@ -35,12 +35,14 @@ class System {
   void billboard(const glm::vec3& center, const glm::vec3& camRight, const glm::vec3& camUp,
                  float w, float h, const glm::vec4& color);
 
-  // ── Textured decal triangles (town roads / ground): a separate batch sampled from
-  //    ONE decal texture set via setDecalTexture(). Alpha-blended, no depth write
-  //    (draped on the terrain). UV convention: U across (clamp), V along (wraps). ──
-  void setDecalTexture(WGPUDevice device, WGPUTextureView view);   // call once after init()
+  // ── Textured decal triangles (town roads / ground): separate batches, one per
+  //    decal slot, each sampled from the texture set via setDecalTexture(slot).
+  //    Alpha-blended, no depth write (draped on the terrain). Slot 0 clamps U (road
+  //    cross-section) + repeats V; slot 1 repeats both (tiling cobble square). ──
+  static constexpr int kDecalSlots = 2;
+  void setDecalTexture(WGPUDevice device, WGPUTextureView view, int slot = 0);   // after init()
   void triTex(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
-              const glm::vec2& ua, const glm::vec2& ub, const glm::vec2& uc);
+              const glm::vec2& ua, const glm::vec2& ub, const glm::vec2& uc, int slot = 0);
 
   // Upload + draw into the current pass (main pass, after the ocean).
   void flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass,
@@ -50,11 +52,11 @@ class System {
   struct Vtx { glm::vec3 pos; glm::vec4 color; };
   struct TVtx { glm::vec3 pos; glm::vec2 uv; };
   std::vector<Vtx> opaque_, trans_;
-  std::vector<TVtx> tex_;
+  std::vector<TVtx> tex_[kDecalSlots];
   WGPURenderPipeline pipeOpaque_ = nullptr, pipeTrans_ = nullptr, pipeTex_ = nullptr;
-  WGPUBindGroup bind_ = nullptr, texBind_ = nullptr;
+  WGPUBindGroup bind_ = nullptr, texBind_[kDecalSlots] = {};
   WGPUBindGroupLayout texBgl_ = nullptr;
-  WGPUSampler texSampler_ = nullptr;
+  WGPUSampler texSampler_[kDecalSlots] = {};
   WGPUBuffer ubuf_ = nullptr, vbuf_ = nullptr, tvbuf_ = nullptr;
   uint64_t vbufCap_ = 0, tvbufCap_ = 0;
 };

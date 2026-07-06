@@ -107,8 +107,6 @@ export class HarborService {
   // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
   private squareMat: StandardMaterial | null = null;
   private roadMat: StandardMaterial | null = null;
-  private wallMat: StandardMaterial | null = null;   // Harbor Forts wall-path spike: placeholder curtain
-  private gateMat: StandardMaterial | null = null;    // and a contrast marker for the sea-gate
   // Building stream ranges: full 3-D buildings only in the CLOSE bubble now that the impostor layer (T3)
   // covers the mid-distance — so we pull this in hard (was 950/1150) to slash near-town building draws.
   // The impostor fade-in band (TownImpostorPlugin.band) is set to reach full right as real meshes drop, so
@@ -602,7 +600,7 @@ export class HarborService {
       this.applyBuildingRecipe(node);
     }
     this.buildGround(h, root, padElev);
-    this.buildWalls(h, root, padElev);
+    await this.buildWalls(h, root, padElev);
     return root;
   }
 
@@ -611,39 +609,46 @@ export class HarborService {
    *  tall curtain box between consecutive nodes, a taller box tower at each corner/bastion, and a low lintel at
    *  the gate. Parented to the town root so it streams + disposes with the buildings. Cheap StandardMaterial +
    *  frozen meshes (no shadows/prepass) to stay clear of the WebGPU town light/UBO cap. */
-  private buildWalls(h: TerrainHarbor, root: TransformNode, padElev: number): void {
+  private async buildWalls(h: TerrainHarbor, root: TransformNode, padElev: number): Promise<void> {
     const scene = this.sceneService.scene;
     const W = h.walls;
     if (!scene || !W || W.length < 2) return;
-    if (!this.wallMat) {
-      const m = new StandardMaterial('fort_wall_mat', scene);
-      m.diffuseColor = new Color3(0.62, 0.58, 0.5); m.specularColor = new Color3(0.05, 0.05, 0.05);
-      m.freeze(); this.wallMat = m;
-      const g = new StandardMaterial('fort_gate_mat', scene);
-      g.diffuseColor = new Color3(0.36, 0.26, 0.16); g.specularColor = new Color3(0.05, 0.05, 0.05);
-      g.freeze(); this.gateMat = g;
-    }
-    const H = 5, T = 1.4;
-    const seat = (mesh: Mesh) => { mesh.parent = root; mesh.receiveShadows = false; mesh.isPickable = false; mesh.freezeWorldMatrix(); };
-    // Curtains between consecutive nodes — OPEN polyline (no wrap; the last→first gap is the harbor mouth).
+    const PIECE = 6.0;   // wall_straight length (X, metres)
+    // Curtain: repeat wall_straight along each segment (OPEN polyline — the last→first gap is the harbor mouth),
+    // scaled to fit, oriented so the crenellations (authored -Z) face OUTWARD, away from the town centre.
+    // NB: Babylon's glTF import is left-handed — verify the outward side in-engine; flip the `yaw += PI` test if wrong.
     for (let i = 0; i + 1 < W.length; i++) {
       const a = W[i], b = W[i + 1];
       const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
       if (len < 0.5) continue;
-      const box = MeshBuilder.CreateBox(`fortwall_${h.id}_${i}`, { width: T, height: H, depth: len }, scene);
-      box.position.set((a.x + b.x) / 2, padElev + H / 2, (a.z + b.z) / 2);
-      box.rotation.y = Math.atan2(dx, dz);   // local +Z (depth) runs along the segment
-      box.material = this.wallMat!;
-      seat(box);
+      const ux = dx / len, uz = dz / len;
+      const midx = (a.x + b.x) / 2, midz = (a.z + b.z) / 2;
+      let yaw = Math.atan2(ux, uz) - Math.PI / 2;   // local +X runs along the segment
+      if (uz * (midx - h.x) - ux * (midz - h.z) < 0) yaw += Math.PI;   // -Z faces outward
+      const count = Math.max(1, Math.round(len / PIECE));
+      for (let k = 0; k < count; k++) {
+        const t = (k + 0.5) / count;
+        const parent = new TransformNode(`fortwall_${h.id}_${i}_${k}`, scene);
+        parent.parent = root;
+        const node = await this.assetCache.instantiate('forts/wall_straight.glb', scene, parent, false);
+        if (!node) { parent.dispose(); continue; }
+        parent.position.set(a.x + dx * t, padElev, a.z + dz * t);
+        parent.rotation.y = yaw;
+        parent.scaling.x = (len / count) / PIECE;
+        this.applyBuildingRecipe(node);
+      }
     }
-    // Node markers: tower at corners/bastions, a low lintel at the gate.
+    // Bastion tower at each node (1.25x on bastions; a square tower reads the same at any yaw).
     for (let i = 0; i < W.length; i++) {
-      const n = W[i], gate = n.tag === 'gate';
-      const s = n.tag === 'bastion' ? 4.5 : 3, th = gate ? 3 : 7;
-      const t = MeshBuilder.CreateBox(`fortnode_${h.id}_${i}`, { width: s, height: th, depth: s }, scene);
-      t.position.set(n.x, padElev + th / 2, n.z);
-      t.material = gate ? this.gateMat! : this.wallMat!;
-      seat(t);
+      const n = W[i];
+      const parent = new TransformNode(`fortnode_${h.id}_${i}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate('forts/wall_tower.glb', scene, parent, false);
+      if (!node) { parent.dispose(); continue; }
+      const s = n.tag === 'bastion' ? 1.25 : 1.0;
+      parent.position.set(n.x, padElev, n.z);
+      parent.scaling.set(s, 1, s);
+      this.applyBuildingRecipe(node);
     }
   }
 

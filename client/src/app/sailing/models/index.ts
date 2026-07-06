@@ -234,6 +234,21 @@ export interface VesselPhysics {
   /** Seconds a fired broadside takes to reload before that side can fire again.
    *  Later modified by crew/morale; a flat per-ship constant for now. */
   reloadWindow?:   number;
+  // ── v2 sailing rig — server-authoritative handling character (see vessels.controller.js). Optional so a
+  //    server without them still type-checks; the client falls back to the hardcoded VESSEL_RIGS when absent. ──
+  /** Drive scale (thrust = forceK·sailAreaFactor·driveC·V_app²). */
+  forceK?:       number;
+  /** Trim tolerance multiplier — a simple rig forgives sloppy sheeting. */
+  trimForgive?:  number;
+  /** Leeway (side-slip) multiplier — deep hulls make less. */
+  leewayK?:      number;
+  /** Point-of-sail polar: [apparentAngleDeg, driveCoeff] breakpoints. */
+  polar?:        [number, number][];
+  /** Hull half-dimensions (m) — buoyancy sample footprint. */
+  hullHalfLen?:  number;
+  hullHalfBeam?: number;
+  /** Buoyancy feel; tiltTau < 0 signals "use the client default smoothing". */
+  buoyancy?:     { pitchScale: number; heaveTau: number; tiltTau: number };
 }
 
 export interface VesselPartParams {

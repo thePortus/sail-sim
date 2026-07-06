@@ -7,8 +7,8 @@
  * Two uses:
  *   • hasProfanity(text) — HARD BLOCK, always enforced: reject profane usernames / callsigns / ship names
  *     at the moment they're set. Users can NEVER register/keep a profane name.
- *   • maskText(text)     — CHAT display filter: replace profane words with **** for players who keep the
- *     (default-on) filter on; the raw text is shown to players who opt out.
+ *   • maskText(text)     — CHAT display filter: replace profane words with a piratey "yarrrr" for players who
+ *     keep the (default-on) filter on; the raw text is shown to players who opt out.
  *
  * Matching is WHOLE-WORD, case-insensitive, with light leet-normalization (@→a, $→s, 0→o, 3→e, 1→i, …) and
  * edge/embedded punctuation stripped per token — so "damn!", "sh1t" and "@ss" match, but "assassin" does NOT
@@ -44,10 +44,26 @@ function hasProfanity(text) {
   return text.split(/\s+/).some(tokenProfane);
 }
 
-/** Replace each profane whole word in `text` with asterisks (same length). Use for the CHAT display filter. */
+/**
+ * Replace each profane whole word with a piratey "yarrrr" (this is a sailing game). Case-matched to the
+ * original — "YARRRR" for an all-caps shout, "Yarrrr" for a capitalized / sentence-start word, "yarrrr"
+ * otherwise — and any trailing sentence punctuation is kept ("damn!" → "yarrrr!"). Use for the CHAT filter.
+ */
 function maskText(text) {
   if (typeof text !== 'string' || !SET.size) { return text; }
-  return text.replace(/\S+/g, (tok) => (tokenProfane(tok) ? '*'.repeat(tok.length) : tok));
+  return text.replace(/\S+/g, (tok) => {
+    // Peel trailing sentence punctuation off FIRST, then test — otherwise the leet
+    // map reads a trailing "!" as an "i" ("damn!" -> "damni") and misses the word.
+    const trail = (tok.match(/[.,!?;:]+$/) || [''])[0];
+    const core  = trail ? tok.slice(0, tok.length - trail.length) : tok;
+    if (!tokenProfane(core)) { return tok; }
+    const letters = core.replace(/[^a-zA-Z]/g, '');            // ignore leet digits/symbols for case
+    let word;
+    if (letters.length > 1 && letters === letters.toUpperCase()) { word = 'YARRRR'; }   // all caps
+    else if (letters && letters[0] === letters[0].toUpperCase()) { word = 'Yarrrr'; }    // capitalized
+    else { word = 'yarrrr'; }
+    return word + trail;
+  });
 }
 
 module.exports = { hasProfanity, maskText, size: SET.size };

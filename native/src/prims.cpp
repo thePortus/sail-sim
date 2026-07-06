@@ -23,6 +23,32 @@ fn vs_main(@location(0) pos : vec3<f32>, @location(1) color : vec4<f32>) -> VSOu
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> { return in.color; }
 )WGSL";
 
+// Textured decal (town roads): sample the decal atlas; the texture's own alpha
+// gives the worn, soft-edged path. Unlit — ground decals read fine flat-lit.
+static const char* kTexWGSL = R"WGSL(
+struct U { viewProj : mat4x4<f32> };
+@group(0) @binding(0) var<uniform> u : U;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct VSOut {
+  @builtin(position) position : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+@vertex
+fn vs_main(@location(0) pos : vec3<f32>, @location(1) uv : vec2<f32>) -> VSOut {
+  var o : VSOut;
+  o.position = u.viewProj * vec4<f32>(pos, 1.0);
+  o.uv = uv;
+  return o;
+}
+@fragment
+fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
+  let c = textureSample(tex, samp, in.uv);
+  if (c.a < 0.02) { discard; }
+  return c;
+}
+)WGSL";
+
 bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   WGPUShaderModuleWGSLDescriptor wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
@@ -90,10 +116,84 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   bind_ = wgpuDeviceCreateBindGroup(device, &bgd);
   wgpuBindGroupLayoutRelease(bgl);
   wgpuPipelineLayoutRelease(pl);
+
+  // ── Textured decal pipeline (town roads): uniform + texture + sampler; alpha-
+  //    blended, NO depth write (draped on the terrain, avoids z-fighting). ──
+  {
+    WGPUShaderModuleWGSLDescriptor twgsl = {};
+    twgsl.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
+    twgsl.code = kTexWGSL;
+    WGPUShaderModuleDescriptor tsmd = {}; tsmd.nextInChain = &twgsl.chain;
+    WGPUShaderModule tmod = wgpuDeviceCreateShaderModule(device, &tsmd);
+
+    WGPUSamplerDescriptor sd = {};
+    sd.addressModeU = WGPUAddressMode_ClampToEdge;   // U = path cross-section (don't repeat the falloff)
+    sd.addressModeV = WGPUAddressMode_Repeat;         // V = along the path (tiles)
+    sd.addressModeW = WGPUAddressMode_Repeat;
+    sd.magFilter = WGPUFilterMode_Linear; sd.minFilter = WGPUFilterMode_Linear;
+    sd.mipmapFilter = WGPUMipmapFilterMode_Linear;
+    sd.lodMaxClamp = 32.0f; sd.maxAnisotropy = 1;
+    texSampler_ = wgpuDeviceCreateSampler(device, &sd);
+
+    WGPUBindGroupLayoutEntry te[3] = {};
+    te[0].binding = 0; te[0].visibility = WGPUShaderStage_Vertex; te[0].buffer.type = WGPUBufferBindingType_Uniform;
+    te[1].binding = 1; te[1].visibility = WGPUShaderStage_Fragment; te[1].texture.sampleType = WGPUTextureSampleType_Float;
+    te[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    te[2].binding = 2; te[2].visibility = WGPUShaderStage_Fragment; te[2].sampler.type = WGPUSamplerBindingType_Filtering;
+    WGPUBindGroupLayoutDescriptor tbld = {}; tbld.entryCount = 3; tbld.entries = te;
+    texBgl_ = wgpuDeviceCreateBindGroupLayout(device, &tbld);
+    WGPUPipelineLayoutDescriptor tpld = {}; tpld.bindGroupLayoutCount = 1; tpld.bindGroupLayouts = &texBgl_;
+    WGPUPipelineLayout tpl = wgpuDeviceCreatePipelineLayout(device, &tpld);
+
+    WGPUVertexAttribute tattrs[2] = {};
+    tattrs[0].format = WGPUVertexFormat_Float32x3; tattrs[0].offset = 0; tattrs[0].shaderLocation = 0;
+    tattrs[1].format = WGPUVertexFormat_Float32x2; tattrs[1].offset = 3 * sizeof(float); tattrs[1].shaderLocation = 1;
+    WGPUVertexBufferLayout tvbl = {}; tvbl.arrayStride = sizeof(TVtx); tvbl.attributeCount = 2; tvbl.attributes = tattrs;
+
+    WGPUDepthStencilState tds = {};
+    tds.format = WGPUTextureFormat_Depth24PlusStencil8;
+    tds.depthWriteEnabled = false; tds.depthCompare = WGPUCompareFunction_Less;
+    tds.stencilFront.compare = WGPUCompareFunction_Always; tds.stencilBack.compare = WGPUCompareFunction_Always;
+    tds.stencilReadMask = 0xFFFFFFFFu; tds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPUBlendState tblend = {};
+    tblend.color.srcFactor = WGPUBlendFactor_SrcAlpha; tblend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    tblend.color.operation = WGPUBlendOperation_Add;
+    tblend.alpha.srcFactor = WGPUBlendFactor_One; tblend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    tblend.alpha.operation = WGPUBlendOperation_Add;
+    WGPUColorTargetState ttarget = {}; ttarget.format = colorFormat; ttarget.writeMask = WGPUColorWriteMask_All; ttarget.blend = &tblend;
+    WGPUFragmentState tfrag = {}; tfrag.module = tmod; tfrag.entryPoint = "fs_main"; tfrag.targetCount = 1; tfrag.targets = &ttarget;
+    WGPURenderPipelineDescriptor trpd = {};
+    trpd.layout = tpl;
+    trpd.vertex.module = tmod; trpd.vertex.entryPoint = "vs_main"; trpd.vertex.bufferCount = 1; trpd.vertex.buffers = &tvbl;
+    trpd.primitive.topology = WGPUPrimitiveTopology_TriangleList; trpd.primitive.cullMode = WGPUCullMode_None;
+    trpd.depthStencil = &tds;
+    trpd.multisample.count = 1; trpd.multisample.mask = 0xFFFFFFFFu;
+    trpd.fragment = &tfrag;
+    pipeTex_ = wgpuDeviceCreateRenderPipeline(device, &trpd);
+    wgpuPipelineLayoutRelease(tpl);
+  }
   return pipeOpaque_ && pipeTrans_;
 }
 
-void System::clear() { opaque_.clear(); trans_.clear(); }
+void System::setDecalTexture(WGPUDevice device, WGPUTextureView view) {
+  if (!view || !texBgl_) return;
+  if (texBind_) { wgpuBindGroupRelease(texBind_); texBind_ = nullptr; }
+  WGPUBindGroupEntry e[3] = {};
+  e[0].binding = 0; e[0].buffer = ubuf_; e[0].size = sizeof(glm::mat4);
+  e[1].binding = 1; e[1].textureView = view;
+  e[2].binding = 2; e[2].sampler = texSampler_;
+  WGPUBindGroupDescriptor bgd = {}; bgd.layout = texBgl_; bgd.entryCount = 3; bgd.entries = e;
+  texBind_ = wgpuDeviceCreateBindGroup(device, &bgd);
+}
+
+void System::triTex(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                    const glm::vec2& ua, const glm::vec2& ub, const glm::vec2& uc) {
+  tex_.push_back({ a, ua });
+  tex_.push_back({ b, ub });
+  tex_.push_back({ c, uc });
+}
+
+void System::clear() { opaque_.clear(); trans_.clear(); tex_.clear(); }
 
 void System::tri(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
                  const glm::vec4& color, bool translucent) {
@@ -171,8 +271,8 @@ void System::billboard(const glm::vec3& c, const glm::vec3& r, const glm::vec3& 
 void System::flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass,
                    const glm::mat4& viewProj) {
   const uint64_t total = (uint64_t)(opaque_.size() + trans_.size()) * sizeof(Vtx);
-  if (total == 0 || !pipeOpaque_) return;
-  if (total > vbufCap_) {
+  if ((total == 0 && tex_.empty()) || !pipeOpaque_) return;
+  if (total > vbufCap_ && total > 0) {
     if (vbuf_) wgpuBufferRelease(vbuf_);
     vbufCap_ = total * 2;
     WGPUBufferDescriptor vbd = {};
@@ -197,6 +297,22 @@ void System::flush(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pas
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vbuf_, opaque_.size() * sizeof(Vtx),
                                          trans_.size() * sizeof(Vtx));
     wgpuRenderPassEncoderDraw(pass, (uint32_t)trans_.size(), 1, 0, 0);
+  }
+  // Textured decals (roads) — own vertex format + texture bind group.
+  if (!tex_.empty() && pipeTex_ && texBind_) {
+    const uint64_t tbytes = (uint64_t)tex_.size() * sizeof(TVtx);
+    if (tbytes > tvbufCap_) {
+      if (tvbuf_) wgpuBufferRelease(tvbuf_);
+      tvbufCap_ = tbytes * 2;
+      WGPUBufferDescriptor tvd = {};
+      tvd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst; tvd.size = tvbufCap_;
+      tvbuf_ = wgpuDeviceCreateBuffer(device, &tvd);
+    }
+    wgpuQueueWriteBuffer(queue, tvbuf_, 0, tex_.data(), tbytes);
+    wgpuRenderPassEncoderSetPipeline(pass, pipeTex_);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, texBind_, 0, nullptr);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, tvbuf_, 0, tbytes);
+    wgpuRenderPassEncoderDraw(pass, (uint32_t)tex_.size(), 1, 0, 0);
   }
 }
 

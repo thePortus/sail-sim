@@ -2929,6 +2929,45 @@ int main(int argc, char** argv) {
   std::string gunSlug;
   prims::System primsSys;
   primsSys.init(device, kSceneFormat);
+  // Town roads: procedural worn-dirt-path decal (port of harbor.service makeDirtTexture)
+  // fed to the prims decal sampler. U across = soft-edged cross-section (clamp); V along
+  // = trodden-earth colour noise (tiles). Alpha gives the airbrushed worn edges.
+  {
+    const int DW = 96, DH = 128, DP = 8;
+    std::vector<uint8_t> dpx((size_t)DW * DH * 4);
+    auto dhash = [](int x, int y) -> float {
+      uint32_t h = (uint32_t)(x * 374761393 + y * 668265263);
+      h = (h ^ (h >> 13)) * 1274126177u; h = h ^ (h >> 16);
+      return (float)h / 4294967296.0f;
+    };
+    auto dvn = [&](float x, float y) -> float {
+      int xi = (int)std::floor(x), yi = (int)std::floor(y);
+      float xf = x - (float)xi, yf = y - (float)yi;
+      float sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      auto hh = [&](int a, int b) { return dhash(a, ((b % DP) + DP) % DP); };
+      float n00 = hh(xi, yi), n10 = hh(xi + 1, yi), n01 = hh(xi, yi + 1), n11 = hh(xi + 1, yi + 1);
+      return (n00 * (1 - sx) + n10 * sx) * (1 - sy) + (n01 * (1 - sx) + n11 * sx) * sy;
+    };
+    auto dsmooth = [](float a, float b, float x) { float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+    for (int y = 0; y < DH; ++y) {
+      float vv = (float)y / (float)DH;
+      for (int x = 0; x < DW; ++x) {
+        float uu = (float)x / (float)(DW - 1), distC = std::fabs(uu - 0.5f) * 2.0f;
+        float halfW = 0.62f + (dvn(uu * 3, vv * DP) - 0.5f) * 0.30f;
+        float alpha = 1.0f - dsmooth(halfW - 0.28f, halfW + 0.04f, distC);
+        alpha *= 0.66f + 0.34f * dvn(uu * 5 + 11, vv * DP + 3);
+        float worn = 1.0f - (1.0f - distC) * 0.22f;
+        float base = (96.0f + dvn(uu * 7 + 3, vv * DP * 2) * 30.0f) * worn;
+        int i = (y * DW + x) * 4;
+        dpx[i]     = (uint8_t)std::clamp(base, 0.0f, 255.0f);
+        dpx[i + 1] = (uint8_t)std::clamp(base * 0.80f, 0.0f, 255.0f);
+        dpx[i + 2] = (uint8_t)std::clamp(base * 0.58f, 0.0f, 255.0f);
+        dpx[i + 3] = (uint8_t)std::clamp(alpha * 255.0f, 0.0f, 255.0f);
+      }
+    }
+    WGPUTexture dtex = makeMippedRGBA(device, queue, DW, DH, dpx.data(), /*srgb=*/true);
+    primsSys.setDecalTexture(device, wgpuTextureCreateView(dtex, nullptr));
+  }
   fx::System cannonFx;
   cannonFx.init(device, kSceneFormat);
   // Celestial textures (moon colour map + all-sky star map) fetched + decoded off
@@ -7872,26 +7911,30 @@ int main(int argc, char** argv) {
       // Immediate-mode + range-gated to keep the vertex count down.
       if (terrainR.ready) {
         const glm::vec4 stone(0.62f, 0.58f, 0.50f, 1.0f), gateCol(0.42f, 0.30f, 0.18f, 1.0f);
-        const glm::vec4 dirt(0.42f, 0.34f, 0.24f, 1.0f);
         const float H = 5.0f;
         for (const terrain::Harbor& hb : terr.manifest().harbors) {
           float dxc = hb.x - vessel.x, dzc = hb.z - vessel.z;
           if (dxc * dxc + dzc * dzc > 1600.0f * 1600.0f) continue;   // ~1.6 km stream range
           const float y0 = hb.padElev;
-          // ── Road network: each street → a ribbon draped on the terrain (port of
-          //    harbor.service buildGround's dirt roads). Subdivided so it tracks the slope. ──
+          // ── Road network: each street → a TEXTURED worn-dirt ribbon draped on the
+          //    terrain (port of harbor.service buildGround). Subdivided so it tracks
+          //    the slope; U across [0,1], V tiles along (len·t / 6) like the client. ──
           for (const terrain::Street& st : hb.streets) {
             float dx = st.x2 - st.x1, dz = st.z2 - st.z1, len = std::hypot(dx, dz);
             if (len < 0.5f) continue;
             float px = -dz / len * st.w * 0.5f, pz = dx / len * st.w * 0.5f;
             int n = std::max(1, (int)std::ceil(len / 6.0f));
-            glm::vec3 pl(0.0f), pr(0.0f);
+            glm::vec3 pl(0.0f), pr(0.0f); float pv = 0.0f;
             for (int i = 0; i <= n; ++i) {
               float t = (float)i / (float)n, cx = st.x1 + dx * t, cz = st.z1 + dz * t;
               float lx = cx + px, lz = cz + pz, rx = cx - px, rz = cz - pz;
               glm::vec3 L(lx, terr.elevation(lx, lz) + 0.12f, lz), R(rx, terr.elevation(rx, rz) + 0.12f, rz);
-              if (i > 0) { primsSys.tri(pl, pr, L, dirt, false); primsSys.tri(pr, R, L, dirt, false); }
-              pl = L; pr = R;
+              float v = (len * t) / 6.0f;
+              if (i > 0) {
+                primsSys.triTex(pl, L, pr, glm::vec2(0, pv), glm::vec2(0, v), glm::vec2(1, pv));
+                primsSys.triTex(pr, L, R, glm::vec2(1, pv), glm::vec2(0, v), glm::vec2(1, v));
+              }
+              pl = L; pr = R; pv = v;
             }
           }
           if (hb.walls.size() < 2) continue;

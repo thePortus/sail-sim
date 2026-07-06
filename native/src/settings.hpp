@@ -13,7 +13,7 @@ struct Graphics {
   float adaptiveTargetMs = 33.3f;// target frame time (16.7=60fps .. 66=15fps)
   int   aa = 1;                  // 0 Off, 1 FXAA (post edge-blur), 2 SMAA (morphological)
   int   ssaa = 0;                // supersampling: 0 Off(1x), 1 1.5x, 2 2x — multiplies render res; stacks with FXAA
-  int   shadows = 2;             // 0 Off, 1 Low(1024), 2 Medium(2048), 3 High(4096)
+  int   shadows = 2;             // 0 Off, 1 Low(1024), 2 Medium(2048), 3 High(4096), 4 Ultra(8192)
   bool  ssao = true;
   bool  dof = true;
   bool  bloom = true;

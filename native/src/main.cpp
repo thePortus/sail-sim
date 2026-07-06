@@ -4066,7 +4066,7 @@ int main(int argc, char** argv) {
                             (double)settings::ssaaFactor(g.ssaa) * settings::ssaaFactor(g.ssaa));
         // Shadows: 0 turns the sun cascades off; 1-3 select the map resolution.
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::Combo("Shadows", &g.shadows, "Off\0Low\0Medium\0High\0")) { custom(); gsave(); }
+        if (ImGui::Combo("Shadows", &g.shadows, "Off\0Low\0Medium\0High\0Ultra\0")) { custom(); gsave(); }
         // Cheap post toggles (live).
         if (ImGui::Checkbox("Ambient occlusion (SSAO)", &g.ssao)) { custom(); gsave(); }
         if (ImGui::Checkbox("Depth of field", &g.dof)) { custom(); gsave(); }
@@ -4707,6 +4707,23 @@ int main(int argc, char** argv) {
                        (0.5f - c.y / c.w * 0.5f) * io.DisplaySize.y);
           return true;
         };
+        // Terrain occlusion: true when a hill blocks the line of sight from the
+        // camera to `target`, so a ship or town tucked behind land doesn't float a
+        // nameplate through the hillside. Marches the eye->target segment (~20 m
+        // spacing, capped) and flags it where the ground rises above the ray.
+        auto terrainOccluded = [&](const glm::vec3& target) -> bool {
+          if (!terrainR.ready) return false;
+          glm::vec3 d = target - lastEye;
+          float horiz = std::hypot(d.x, d.z);
+          if (horiz < 1.0f) return false;
+          int steps = (int)std::min(160.0f, std::max(6.0f, horiz / 20.0f));
+          for (int i = 1; i < steps; ++i) {                 // skip the endpoints
+            float t = (float)i / (float)steps;
+            glm::vec3 pos = lastEye + d * t;
+            if (terr.elevation(pos.x, pos.z) > pos.y + 1.5f) return true;   // 1.5 m grazing bias
+          }
+          return false;
+        };
         // World height (m) at a spot -> projected pixel height + screen centre.
         auto pxHeight = [&](const glm::vec3& base, float worldH, ImVec2& center) -> float {
           ImVec2 a, b;
@@ -4761,6 +4778,7 @@ int main(int argc, char** argv) {
         for (const mp::RemotePlayer& rp : mpClient.players()) {
           float d = std::hypot(rp.x - lastEye.x, rp.z - lastEye.z);
           if (d > 1080.0f) continue;
+          if (terrainOccluded(glm::vec3(rp.x, 2.0f, rp.z))) continue;   // hull hidden behind land
           float sc = std::min(13.0f, std::max(1.0f, std::pow(d / 200.0f, 0.72f)));
           Mesh& rm = vesselFor(rp.vesselSlug.empty() ? "pinnace" : rp.vesselSlug);
           glm::vec3 base(rp.x, rm.mastTop + 3.0f, rp.z);   // above THIS hull's masthead
@@ -4777,6 +4795,7 @@ int main(int argc, char** argv) {
           for (const terrain::Harbor& hb : terr.manifest().harbors) {
             float d = std::hypot(hb.x - lastEye.x, hb.z - lastEye.z);
             if (d > 2000.0f) continue;
+            if (terrainOccluded(glm::vec3(hb.x, hb.padElev + 3.0f, hb.z))) continue;   // town behind a headland
             float sc = std::min(7.0f, std::max(1.0f, std::pow(d / 350.0f, 0.6f)));
             glm::vec3 base(hb.x, hb.padElev + 18.0f, hb.z);
             ImVec2 cpx; float ph = pxHeight(base, 12.8f * sc, cpx);

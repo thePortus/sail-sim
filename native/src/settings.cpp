@@ -41,7 +41,7 @@ Values load() {
       x.adaptiveTargetMs = std::max(16.7f, std::min(66.0f, g.value("adaptiveTargetMs", x.adaptiveTargetMs)));
       x.aa = std::max(0, std::min(2, g.value("aa", x.aa)));
       x.ssaa = std::max(0, std::min(2, g.value("ssaa", x.ssaa)));
-      x.shadows = std::max(0, std::min(3, g.value("shadows", x.shadows)));
+      x.shadows = std::max(0, std::min(4, g.value("shadows", x.shadows)));
       x.ssao = g.value("ssao", x.ssao);
       x.dof = g.value("dof", x.dof);
       x.bloom = g.value("bloom", x.bloom);
@@ -74,7 +74,7 @@ void save(const Values& v) {
 }
 
 int shadowRes(int level) {
-  switch (level) { case 1: return 1024; case 2: return 2048; case 3: return 4096; default: return 0; }
+  switch (level) { case 1: return 1024; case 2: return 2048; case 3: return 4096; case 4: return 8192; default: return 0; }
 }
 
 float ssaaFactor(int level) {
@@ -96,8 +96,8 @@ void applyPreset(Graphics& g, int preset) {
     { 0.80f, 2, 1, 0, true,  false, true,  false, true,  2 },
     // High
     { 1.00f, 2, 1, 0, true,  true,  true,  true,  true,  3 },
-    // Ultra — full render scale + 2x supersampling on top.
-    { 1.00f, 3, 1, 2, true,  true,  true,  true,  true,  4 },
+    // Ultra — full render scale + 2x supersampling + the 8192 shadow tier.
+    { 1.00f, 4, 1, 2, true,  true,  true,  true,  true,  4 },
   };
   if (preset < 0 || preset > 4) return;
   const P& p = table[preset];

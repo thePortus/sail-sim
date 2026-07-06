@@ -75,14 +75,18 @@ fn sunShadow(worldPos : vec3<f32>, N : vec3<f32>) -> f32 {
     if (uv.x <= 0.001 || uv.x >= 0.999 || uv.y <= 0.001 || uv.y >= 0.999 ||
         sp.z <= 0.0 || sp.z >= 1.0) { return 1.0; }
     let cmpZ = sp.z - shadowU.params.y;
-    let px = shadowU.params.z;
+    // Soft penumbra: 5x5 PCF whose per-tap step is FLOORED to a fixed UV radius, so
+    // the ship's shadow stays soft at every shadow-quality level — a higher-res map
+    // (Ultra 8192) samples the occluder more accurately without razor-sharpening the
+    // edge. params.z is the shadow texel (1/res).
+    let step = max(shadowU.params.z, 1.5 / 2048.0);
     var s = 0.0;
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -1; dx <= 1; dx = dx + 1) {
-            s += textureSampleCompareLevel(shadowT, shadowS, uv + vec2<f32>(f32(dx), f32(dy)) * px, cmpZ);
+    for (var dy = -2; dy <= 2; dy = dy + 1) {
+        for (var dx = -2; dx <= 2; dx = dx + 1) {
+            s += textureSampleCompareLevel(shadowT, shadowS, uv + vec2<f32>(f32(dx), f32(dy)) * step, cmpZ);
         }
     }
-    return s / 9.0;
+    return s / 25.0;
 }
 
 struct VSOut {

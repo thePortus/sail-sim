@@ -141,17 +141,19 @@ fn sunShadowW(worldPos : vec3<f32>) -> f32 {
     let uv0 = vec2<f32>(sp0.x * 0.5 + 0.5, 0.5 - sp0.y * 0.5);
     if (uv0.x > 0.01 && uv0.x < 0.99 && uv0.y > 0.01 && uv0.y < 0.99 &&
         sp0.z > 0.0 && sp0.z < 1.0) {
-        // Wide 3x3 PCF (~2-texel spread): water scatters light, so the hull and
-        // rigging shadows on the surface read soft, not razor-cut.
-        let px = cam.shadowP.w * 2.0;
+        // Wide 5x5 PCF: water scatters light, so the hull and rigging shadows on the
+        // surface read soft, not razor-cut. The per-tap step is FLOORED to a fixed UV
+        // radius so higher-res maps (Ultra) don't sharpen the ship's reflection-soft
+        // shadow — they just resolve the occluder better. shadowP.w = shadow texel.
+        let step = max(cam.shadowP.w * 2.0, 2.0 / 2048.0);
         var s = 0.0;
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
+        for (var dy = -2; dy <= 2; dy = dy + 1) {
+            for (var dx = -2; dx <= 2; dx = dx + 1) {
                 s += textureSampleCompareLevel(shadowT0, shadowS,
-                        uv0 + vec2<f32>(f32(dx), f32(dy)) * px, sp0.z - cam.shadowP.y);
+                        uv0 + vec2<f32>(f32(dx), f32(dy)) * step, sp0.z - cam.shadowP.y);
             }
         }
-        return s / 9.0;
+        return s / 25.0;
     }
     let sp1 = cam.shadow1 * vec4<f32>(worldPos, 1.0);
     let uv1 = vec2<f32>(sp1.x * 0.5 + 0.5, 0.5 - sp1.y * 0.5);

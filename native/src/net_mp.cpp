@@ -402,6 +402,7 @@ struct Client::Impl {
             q.id     = jstr(o, "id");
             q.type   = jstr(o, "type");
             q.image  = jstr(o, "image");   // nullable on the wire
+            q.townId = jstr(o, "townId");  // nullable; set for dock_at objectives
             q.label  = jstr(o, "label");
             q.hint   = jstr(o, "hint");
             q.manual = o.value("manual", false);

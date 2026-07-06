@@ -171,6 +171,7 @@ struct TownState {
 struct QuestPanel { std::string image, text; };   // narrative slide: art slot + prose
 struct QuestObjective {
   std::string id, type, image, label, hint;
+  std::string townId;    // dock_at target town (server-resolved) — marked on the map; empty otherwise
   bool manual = false;   // client_ack shown with a 'Done' button (else auto/server-verified)
   bool done = false;
 };

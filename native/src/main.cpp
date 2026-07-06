@@ -4639,6 +4639,28 @@ int main(int argc, char** argv) {
               break;
             }
           }
+          // Tutorial DOCK-HERE beacon: the town the active quest's dock objective
+          // points at (server-resolved townId). A cyan pulse, distinct from the gold
+          // SELL-HERE — so a new captain can see where to sail to put in.
+          {
+            mp::QuestUpdate dq = mpClient.quest();
+            std::string dockTown;
+            if (dq.active)
+              for (const auto& o : dq.objectives)
+                if (!o.done && o.type == "dock_at" && !o.townId.empty()) { dockTown = o.townId; break; }
+            if (!dockTown.empty()) {
+              for (const terrain::Harbor& hb3 : tm.harbors) {
+                if (hb3.id != dockTown) continue;
+                ImVec2 hp3(wx(hb3.x), wz(hb3.z));
+                mdl->AddCircle(hp3, 9.0f + pulse * 6.0f,
+                               IM_COL32(120, 200, 255, (int)(255 * (0.45f + 0.5f * pulse))), 0, 2.2f);
+                mdl->AddCircleFilled(hp3, expanded ? 4.0f : 3.5f, IM_COL32(140, 210, 255, 255));
+                tagLabel(expanded ? ("DOCK HERE - " + hb3.name) : "DOCK HERE",
+                         ImVec2(hp3.x, hp3.y - (expanded ? 26.0f : 20.0f)), IM_COL32(184, 224, 255, 255));
+                break;
+              }
+            }
+          }
           // Tavern marks: the rumoured merchant (gold TARGET) and the reported
           // pirate (red HUNT), looked up live among the streamed ships by id.
           if (!mts.rumorShipId.empty() || !mts.pirateShipId.empty()) {

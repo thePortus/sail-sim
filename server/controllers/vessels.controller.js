@@ -90,6 +90,39 @@ const VESSELS = [
     parts: [],
   },
   {
+    id: 4,
+    name: 'Merchantman',
+    slug: 'merchantman',
+    description: 'A three-masted hagboat — fore and main square-rigged, a gaff spanker aft. A huge hold and the toughest hull afloat, but only six guns and slow to gather way: the trader\'s ship, built to haul cargo, not to fight.',
+    glb:      'merchantman.glb',
+    manifest: 'merchantman.manifest.json',
+    importFlipY: false,           // merchantman exports bow = +X; the client rights it via baseYawDeg −90 (VESSEL_RIGS)
+    rightSign:   1,               // after the −90 yaw, starboard is +X
+    physics: {
+      maxSpeed:         8.6,      // big sail plan but a heavy laden hull → lower top end than the brig
+      accelerationRate: 0.12,     // very heavy → slowest to gather way
+      minTackAngle:     52,       // square-rigged → points even lower than the brig
+      sailAreaFactor:   0.50,     // a great spread of canvas
+      weight:           6500,     // the deepest, heaviest hull in the fleet
+    },
+    // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
+    // forward. y is vessel-local (rides the floated hull). y RAISED 6.0→8.8 (= wheel 7.93 + ~0.9 eye): the old
+    // 6.0 sat ~2 m BELOW the wheel, down inside the cabin beneath the quarterdeck. x offset to STARBOARD off the
+    // centreline so the view clears the centreline spanker/gaff and the masts.
+    firstPersonCam: { x: 1.4, y: 8.8, z: -9.0 },
+    // THREE guns a side on the gun deck (game frame: +Z bow, +X starboard). Fore→aft positions taken from the
+    // actual B_Lid gunport bones; muzzle y is the WORLD height = model gunport y(~6.3) + floatDraft(−3.8) ≈ 2.5.
+    cannons: {
+      port: [{ x: -3.4, y: 2.5, z: 4.1 }, { x: -3.4, y: 2.5, z: -2.4 }, { x: -3.4, y: 2.5, z: -5.9 }],
+      stbd: [{ x:  3.4, y: 2.5, z: 4.1 }, { x:  3.4, y: 2.5, z: -2.4 }, { x:  3.4, y: 2.5, z: -5.9 }],
+    },
+    zoneHp: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
+    crew: 9,                      // Crew resource: a thinly-manned trader (not a warship's full complement)
+    cargo: 120,                   // hold capacity — the whole point: the biggest hold in the fleet
+    price: 90000,                 // Ships-as-economy: a major purchase below the brig warship, for haulers
+    parts: [],
+  },
+  {
     id: 3,
     name: 'Brigantine',
     slug: 'brig',
@@ -123,39 +156,6 @@ const VESSELS = [
     crew: 12,                     // Crew resource: a big ship needs hands at every station
     cargo: 60,                    // hold capacity in cargo slots — a roomy warship hold
     price: 200000,                // Ships-as-economy: the top-tier shipwright purchase
-    parts: [],
-  },
-  {
-    id: 4,
-    name: 'Merchantman',
-    slug: 'merchantman',
-    description: 'A three-masted hagboat — fore and main square-rigged, a gaff spanker aft. A huge hold and the toughest hull afloat, but only six guns and slow to gather way: the trader\'s ship, built to haul cargo, not to fight.',
-    glb:      'merchantman.glb',
-    manifest: 'merchantman.manifest.json',
-    importFlipY: false,           // merchantman exports bow = +X; the client rights it via baseYawDeg −90 (VESSEL_RIGS)
-    rightSign:   1,               // after the −90 yaw, starboard is +X
-    physics: {
-      maxSpeed:         8.6,      // big sail plan but a heavy laden hull → lower top end than the brig
-      accelerationRate: 0.12,     // very heavy → slowest to gather way
-      minTackAngle:     52,       // square-rigged → points even lower than the brig
-      sailAreaFactor:   0.50,     // a great spread of canvas
-      weight:           6500,     // the deepest, heaviest hull in the fleet
-    },
-    // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
-    // forward. y is vessel-local (rides the floated hull). y RAISED 6.0→8.8 (= wheel 7.93 + ~0.9 eye): the old
-    // 6.0 sat ~2 m BELOW the wheel, down inside the cabin beneath the quarterdeck. x offset to STARBOARD off the
-    // centreline so the view clears the centreline spanker/gaff and the masts.
-    firstPersonCam: { x: 1.4, y: 8.8, z: -9.0 },
-    // THREE guns a side on the gun deck (game frame: +Z bow, +X starboard). Fore→aft positions taken from the
-    // actual B_Lid gunport bones; muzzle y is the WORLD height = model gunport y(~6.3) + floatDraft(−3.8) ≈ 2.5.
-    cannons: {
-      port: [{ x: -3.4, y: 2.5, z: 4.1 }, { x: -3.4, y: 2.5, z: -2.4 }, { x: -3.4, y: 2.5, z: -5.9 }],
-      stbd: [{ x:  3.4, y: 2.5, z: 4.1 }, { x:  3.4, y: 2.5, z: -2.4 }, { x:  3.4, y: 2.5, z: -5.9 }],
-    },
-    zoneHp: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
-    crew: 9,                      // Crew resource: a thinly-manned trader (not a warship's full complement)
-    cargo: 120,                   // hold capacity — the whole point: the biggest hold in the fleet
-    price: 90000,                 // Ships-as-economy: a major purchase below the brig warship, for haulers
     parts: [],
   },
 ];

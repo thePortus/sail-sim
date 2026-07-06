@@ -134,7 +134,9 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
   // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug, with
   // the shooter's once-per-hull CANNON upgrade applied (a player who bought it at the shipwright hits harder).
   const shooter = players.get(shot.shooterId);
-  const caliber = C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null, shooter && shooter.cannonUpgrade);
+  // A shot may carry its own caliber (fort guns — the shooter isn't a player entry); else look it up from the ship.
+  const caliber = shot.caliber != null ? shot.caliber
+                : C.caliberFor(shooter && shooter.combat ? shooter.combat.slug : null, shooter && shooter.cannonUpgrade);
 
   // Sub-step the ball through the freshly-elapsed window so a fast ball can't tunnel a hull.
   const tEnd = Math.min(tTo, C.SIM_MAX_T);

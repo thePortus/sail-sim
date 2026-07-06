@@ -1,6 +1,8 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const fs   = require('fs');
+const path = require('path');
 const jwt    = require('jsonwebtoken');
 const config = require('./config/db.config');
 const db   = require('./models');
@@ -53,11 +55,14 @@ const weatherState = require('./weather-state');
 
 // ── Server-authoritative ship-to-ship combat ─────────────────────────────────
 const combat = require('./combat');
+const combatConst = require('./combat-constants');
 const movement = require('./movement');
 const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const fortsMod = require('./forts');
+const terrainConfig = require('./config/terrain.config');
 const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
@@ -947,6 +952,8 @@ function attachMultiplayer(server) {
     const now = Date.now();
     npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot, announceConvoy);   // integrate, despawn sunk, return fire, telegraph
     npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
+    fortsMod.tickForts(fortList, players, now, fireFortShot);   // harbor forts: target hostiles + fire; rebuild if neutralised
+    for (const f of fortList) if (f.dirty) { f.dirty = false; broadcastFortState(f); }   // e.g. a rebuilt fort
   }, NPC_DT * 1000);
 
   // ── Authoritative location autosave (every 30 s) ──────────────────────────────
@@ -968,6 +975,32 @@ function attachMultiplayer(server) {
   // loop below, tested against each victim's CURRENT pose. A ship that manoeuvres during
   // the ball's multi-second flight actually dodges it (unlike fire-time prediction).
   const activeShots = [];   // { shooterId, seq, ox,oy,oz, vx,vy,vz, fireTime, lastT }
+
+  // ── Harbor forts (server-authoritative gun batteries) ─────────────────────────
+  // Built once from the baked terrain manifest's harbors[].forts[]. They fire through the same activeShots /
+  // stepShot / resolveHit path as ships, and take sectional damage from ship balls (forts.stepShotForts below).
+  let fortList = [];
+  try {
+    const mani = JSON.parse(fs.readFileSync(path.join(terrainConfig.outputDir, 'manifest.json'), 'utf8'));
+    fortList = fortsMod.build(mani.harbors || []);
+    console.log(`[forts] ${fortList.length} harbor forts armed (${fortList.reduce((n, f) => n + f.guns.length, 0)} guns).`);
+  } catch (e) { console.warn('[forts] no manifest / build failed:', e.message); }
+
+  const broadcastFortState = (fort) => {
+    const msg = JSON.stringify({ type: 'fort_state', ...fortsMod.serialize(fort) });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);
+  };
+
+  /** A fort gun fires: relay the ball to clients and register it (shooterId = fort id, carrying the fort's heavier
+   *  caliber so stepShot damages ships correctly since the fort isn't a `players` entry). */
+  const fireFortShot = (fort, gun, sol) => {
+    const now = Date.now();
+    const seq = (fort.shotSeq = (fort.shotSeq || 0) + 1);
+    const shotData = { ...sol, shotType: 'round' };
+    const msg = JSON.stringify({ type: 'cannon_shot', id: fort.id, seq, ...shotData, fort: true });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);
+    activeShots.push({ shooterId: fort.id, seq, ...shotData, caliber: fort.spec.caliber, fireTime: now, lastT: 0 });
+  };
 
   /** An NPC merchant fires (A3): relay the flight visual to every client and register the shot for the SAME
    *  wait-and-see adjudication a player's shot gets — so the merchant's ball is dodgeable exactly like a
@@ -1125,6 +1158,20 @@ function attachMultiplayer(server) {
     }
   };
 
+  /** A ship ball struck a fort: sectional damage → cosmetic splinter + throttled state broadcast + a shout when
+   *  the last gun falls. A fort kill has NO piracy-rep / plunder side effects (it isn't a `players` sink). */
+  const resolveFortHit = (shot, fh, nowMs) => {
+    const { fort, gunIdx, dmg } = fh;
+    const shooter = players.get(shot.shooterId);
+    const r = fortsMod.applyFortHit(fort, gunIdx, dmg, nowMs);
+    const hitMsg = JSON.stringify({ type: 'combat_hit', shooterId: shot.shooterId, fortId: fort.id, seq: shot.seq,
+      hx: fh.hx, hy: fh.hy, hz: fh.hz, tof: fh.tof, fort: true });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(hitMsg);
+    if (r.gunDown || r.neutralized || nowMs - (fort._stateMs || 0) > 300) { fort._stateMs = nowMs; broadcastFortState(fort); }
+    if (r.neutralized && shooter && !shooter.isNpc) sysReply(shooter.ws, `You have silenced the guns of ${fort.name}!`);
+    // TODO(capture): a neutralised fort is the hook for capturing/plundering the town — for now it rebuilds slowly.
+  };
+
   // Step every active shot forward in real time and resolve hits / expiries (~30 Hz).
   setInterval(() => {
     if (!activeShots.length) return;
@@ -1133,13 +1180,19 @@ function attachMultiplayer(server) {
       const s = activeShots[i];
       const tNow = (now - s.fireTime) / 1000;
       const result = combat.stepShot(s, s.lastT, tNow, players, now);
-      s.lastT = tNow;
       if (result && result.victimId) {
         resolveHit(s, result);
         activeShots.splice(i, 1);
       } else if (result && result.expired) {
         activeShots.splice(i, 1);
+      } else if (fortList.length && !String(s.shooterId).startsWith('fort_')) {
+        // No ship hit this window — test the same interval against harbor forts (a ship ball battering a fort).
+        const shooter = players.get(s.shooterId);
+        const cal = (shooter && shooter.combat) ? combatConst.caliberFor(shooter.combat.slug, shooter.cannonUpgrade) : 1;
+        const fh = fortsMod.stepShotForts(s, s.lastT, tNow, fortList, cal);
+        if (fh) { resolveFortHit(s, fh, now); activeShots.splice(i, 1); }
       }
+      s.lastT = tNow;
     }
   }, 33);
 

@@ -15,6 +15,7 @@
 const nav = require('./nav');
 const economy = require('./economy');
 const quest = require('./quest');   // to shield intro-tutorial players from pirate aggro
+const questAnchors = require('./quest-anchors');   // intro spawn point → keep pirate lairs well clear of it
 const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
@@ -1153,7 +1154,12 @@ function spawnConvoy(players, towns) {
 
 /** Pick a pirate lair: a patch of open, navigable water a fair way out from a random town (where shipping passes,
  *  but not on the pier). Tries several offsets and snaps each to the sea; returns {x,z} or null if none stuck. */
+// Keep pirate lairs this far from the intro-tutorial spawn so a brand-new captain never starts within sight of a
+// raider (> the pirate's leash + its lair-orbit radius, so its whole beat stays clear of the start port).
+const INTRO_SAFE_R2 = 2200 * 2200;
 function pickLair(towns) {
+  const a = questAnchors.getAnchors && questAnchors.getAnchors();
+  const spawn = a && a.spawn;                                // intro new-player spawn point (may be null pre-map)
   for (let attempt = 0; attempt < 12; attempt++) {
     const t = pick(towns);
     const ang = Math.random() * Math.PI * 2;
@@ -1164,6 +1170,7 @@ function pickLair(towns) {
     const w = nav.cellToWorld(sn.cx, sn.cz);
     const dx = w.x - t.x, dz = w.z - t.z;
     if (dx * dx + dz * dz < 350 * 350) continue;            // not right on top of the town
+    if (spawn) { const ex = w.x - spawn.x, ez = w.z - spawn.z; if (ex * ex + ez * ez < INTRO_SAFE_R2) continue; }   // clear of the tutorial start
     return { x: w.x, z: w.z };
   }
   return null;

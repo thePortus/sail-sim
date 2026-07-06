@@ -638,8 +638,26 @@ export class HarborService {
         this.applyBuildingRecipe(node);
       }
     }
+    // Small towns get a T1 harbour battery at their seaward strongpoint: the first bastion node
+    // (seaward-left). The fort's own corner geometry stands in for the wall tower there, so we skip
+    // that tower. Guns face seaward = away from the town centre (authored -Z outward), like the walls.
+    // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
+    let fortIdx = -1;
+    if (h.tier === 'small') fortIdx = W.findIndex((n) => n.tag === 'bastion');
+    if (fortIdx >= 0) {
+      const n = W[fortIdx];
+      const parent = new TransformNode(`fort_${h.id}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate('forts/fort_t1.glb', scene, parent, false);
+      if (node) {
+        parent.position.set(n.x, padElev, n.z);
+        parent.rotation.y = Math.atan2(-(n.x - h.x), -(n.z - h.z));   // -Z faces outward (seaward)
+        this.applyBuildingRecipe(node);
+      } else parent.dispose();
+    }
     // Bastion tower at each node (1.25x on bastions; a square tower reads the same at any yaw).
     for (let i = 0; i < W.length; i++) {
+      if (i === fortIdx) continue;   // the fort stands in for this tower
       const n = W[i];
       const parent = new TransformNode(`fortnode_${h.id}_${i}`, scene);
       parent.parent = root;

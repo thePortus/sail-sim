@@ -6753,8 +6753,27 @@ int main(int argc, char** argv) {
                   ships.push_back({ wsMesh, mm });
                 }
               }
+            // Small towns get a T1 harbour battery at their seaward strongpoint: the
+            // first bastion node (seaward-left). The fort's own corner geometry stands
+            // in for the wall tower there, so we skip the tower at that node. Guns face
+            // seaward = away from the town centre (mesh -Z outward), matching the walls.
+            // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
+            int fortNode = -1;
+            if (hb.tier == "small")
+              for (size_t i = 0; i < hb.walls.size(); ++i)
+                if (hb.walls[i].tag == 1) { fortNode = (int)i; break; }
+            if (fortNode >= 0) {
+              const terrain::WallNode& n = hb.walls[fortNode];
+              float yaw = std::atan2(-(n.x - hb.x), -(n.z - hb.z));   // -Z faces outward (seaward)
+              glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
+              mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
+              if (Mesh* ftMesh = townMeshFor("../forts/fort_t1.glb"))
+                ships.push_back({ ftMesh, mm });
+            }
             if (wtMesh)
-              for (const terrain::WallNode& n : hb.walls) {
+              for (size_t i = 0; i < hb.walls.size(); ++i) {
+                if ((int)i == fortNode) continue;   // the fort stands in for this tower
+                const terrain::WallNode& n = hb.walls[i];
                 float scv = (n.tag == 1) ? 1.25f : 1.0f;   // bastions a touch larger
                 glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
                 mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));

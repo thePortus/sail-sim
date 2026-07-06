@@ -91,6 +91,10 @@ export interface TownRect {
 
 export interface TownStreet { x1: number; z1: number; x2: number; z2: number; width: number; }
 
+/** One node of a town's defensive WALL RING (closed polyline). The client places a straight curtain between
+ *  consecutive nodes and a tower/bastion/gate at each node. World coords; see server deriveWalls(). */
+export interface TownWallNode { x: number; z: number; tag: 'corner' | 'bastion' | 'gate'; }
+
 export interface TerrainHarbor {
   id: string;
   name: string;
@@ -105,6 +109,7 @@ export interface TerrainHarbor {
   buildings?: TownBuilding[];
   square?: TownRect | null;
   streets?: TownStreet[];
+  walls?: TownWallNode[];   // Harbor Forts — defensive wall ring (placeholder segments for the spike)
   // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
   specialty?: string;
   // Factions — the owning nation (e.g. 'english'); contested border towns also carry a rivalFaction.

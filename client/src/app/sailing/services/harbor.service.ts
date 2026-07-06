@@ -107,6 +107,8 @@ export class HarborService {
   // Shared ground materials (procedural cobblestone for the square, dirt for the roads) — built once.
   private squareMat: StandardMaterial | null = null;
   private roadMat: StandardMaterial | null = null;
+  private wallMat: StandardMaterial | null = null;   // Harbor Forts wall-path spike: placeholder curtain
+  private gateMat: StandardMaterial | null = null;    // and a contrast marker for the sea-gate
   // Building stream ranges: full 3-D buildings only in the CLOSE bubble now that the impostor layer (T3)
   // covers the mid-distance — so we pull this in hard (was 950/1150) to slash near-town building draws.
   // The impostor fade-in band (TownImpostorPlugin.band) is set to reach full right as real meshes drop, so
@@ -600,7 +602,49 @@ export class HarborService {
       this.applyBuildingRecipe(node);
     }
     this.buildGround(h, root, padElev);
+    this.buildWalls(h, root, padElev);
     return root;
+  }
+
+  /** Harbor Forts — WALL-PATH SPIKE. Place PLACEHOLDER box segments along the town's server-derived `walls`
+   *  ring so we can validate the auto-generated path in-engine before the real modular wall kit exists: a thin
+   *  tall curtain box between consecutive nodes, a taller box tower at each corner/bastion, and a low lintel at
+   *  the gate. Parented to the town root so it streams + disposes with the buildings. Cheap StandardMaterial +
+   *  frozen meshes (no shadows/prepass) to stay clear of the WebGPU town light/UBO cap. */
+  private buildWalls(h: TerrainHarbor, root: TransformNode, padElev: number): void {
+    const scene = this.sceneService.scene;
+    const W = h.walls;
+    if (!scene || !W || W.length < 2) return;
+    if (!this.wallMat) {
+      const m = new StandardMaterial('fort_wall_mat', scene);
+      m.diffuseColor = new Color3(0.62, 0.58, 0.5); m.specularColor = new Color3(0.05, 0.05, 0.05);
+      m.freeze(); this.wallMat = m;
+      const g = new StandardMaterial('fort_gate_mat', scene);
+      g.diffuseColor = new Color3(0.36, 0.26, 0.16); g.specularColor = new Color3(0.05, 0.05, 0.05);
+      g.freeze(); this.gateMat = g;
+    }
+    const H = 5, T = 1.4;
+    const seat = (mesh: Mesh) => { mesh.parent = root; mesh.receiveShadows = false; mesh.isPickable = false; mesh.freezeWorldMatrix(); };
+    // Curtains between consecutive nodes (closed ring).
+    for (let i = 0; i < W.length; i++) {
+      const a = W[i], b = W[(i + 1) % W.length];
+      const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
+      if (len < 0.5) continue;
+      const box = MeshBuilder.CreateBox(`fortwall_${h.id}_${i}`, { width: T, height: H, depth: len }, scene);
+      box.position.set((a.x + b.x) / 2, padElev + H / 2, (a.z + b.z) / 2);
+      box.rotation.y = Math.atan2(dx, dz);   // local +Z (depth) runs along the segment
+      box.material = this.wallMat!;
+      seat(box);
+    }
+    // Node markers: tower at corners/bastions, a low lintel at the gate.
+    for (let i = 0; i < W.length; i++) {
+      const n = W[i], gate = n.tag === 'gate';
+      const s = n.tag === 'bastion' ? 4.5 : 3, th = gate ? 3 : 7;
+      const t = MeshBuilder.CreateBox(`fortnode_${h.id}_${i}`, { width: s, height: th, depth: s }, scene);
+      t.position.set(n.x, padElev + th / 2, n.z);
+      t.material = gate ? this.gateMat! : this.wallMat!;
+      seat(t);
+    }
   }
 
   /** Build the static distant-town impostor layer: for EVERY town's buildings, drop a camera-facing billboard

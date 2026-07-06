@@ -2,6 +2,7 @@
 
 #include <httplib.h>          // header-only; plain HTTP (dev server is http://localhost:9080)
 #include <nlohmann/json.hpp>
+#include <cmath>
 
 using json = nlohmann::json;
 
@@ -76,6 +77,30 @@ AuthResult me(const std::string& host, int port, const std::string& token) {
   r.username = parsed.value("username", std::string());
   r.role     = parsed.value("role", std::string());
   r.token    = token;   // echo it back so the caller can keep using it
+  return r;
+}
+
+LocationResult playerLocation(const std::string& host, int port, const std::string& token) {
+  LocationResult r;
+  httplib::Client cli(host, port);
+  cli.set_connection_timeout(5, 0);
+  cli.set_read_timeout(5, 0);
+  httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
+  // The controller keys off the JWT user id and ignores the :callsign path param,
+  // so a fixed safe segment avoids URL-encoding a callsign that may hold spaces.
+  auto res = cli.Get("/player-location/self", headers);
+  if (!res) return r;                               // unreachable -> harbour fallback
+  r.status = res->status;
+  if (res->status < 200 || res->status >= 300) return r;   // 404 none/stale -> fallback
+  json parsed = json::object();
+  if (!res->body.empty()) { try { parsed = json::parse(res->body); } catch (...) { return r; } }
+  if (!parsed.contains("x") || !parsed.contains("z") ||
+      !parsed["x"].is_number() || !parsed["z"].is_number()) return r;
+  r.x = parsed.value("x", 0.0f);
+  r.z = parsed.value("z", 0.0f);
+  r.heading = parsed.value("heading", 270.0f);
+  r.vesselSlug = parsed.value("vesselSlug", std::string());
+  r.ok = std::isfinite(r.x) && std::isfinite(r.z);
   return r;
 }
 

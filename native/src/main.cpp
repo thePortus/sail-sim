@@ -3420,6 +3420,11 @@ int main(int argc, char** argv) {
   bool uiRegisterMode = false, uiRemember = false;
   std::string uiError, authToken, authCallsign, authUsername, authRole;
   std::future<net::AuthResult> authFuture;
+  // Last-location restore: fetched once at login, applied over the harbour spawn
+  // before the first pose broadcast establishes the server baseline.
+  std::future<net::LocationResult> locFuture;
+  bool locResolved = false;
+  double locDeadline = 0.0;   // wall-clock cutoff to stop waiting (keep harbour spawn)
 
   // Admin panel (backtick toggles; admin/owner role only — mirrors the browser
   // client's admin-panel.component). Weather/time overrides are server-authoritative:
@@ -3673,6 +3678,11 @@ int main(int argc, char** argv) {
         std::memset(uiPass, 0, sizeof(uiPass));
         if (uiRemember) session::save({ authToken, authUsername, authCallsign, authRole });
         mpClient.connect(kHost, kPort, authToken);   // open the gameplay socket
+        // Kick off the last-location fetch now (localhost round-trip is fast, so
+        // it's ready well before terrain finishes and the ship spawns).
+        locFuture = std::async(std::launch::async, net::playerLocation, kHost, kPort, authToken);
+        locResolved = false;
+        locDeadline = glfwGetTime() + 6.0;
         mpConnected = true;
         appState = AppState::Sailing;
         musicMgr.resume();   // restart the track a logout stopped (client re-inits on entry)
@@ -5273,9 +5283,33 @@ int main(int argc, char** argv) {
       if (chatShown) ImGui::End();
       }   // end if (!photoMode) — HUD panels + labels + minimap + chat
 
-      // Broadcast our pose ~10 Hz (once the spawn is placed — the first update is
-      // the server's trusted baseline). Heading is sent in DEGREES.
-      if (cs == mp::ConnState::Open && spawnPlaced && (frame % 6) == 0) {
+      // Restore the player's last anchorage over the harbour spawn, ONCE, before
+      // the first broadcast fixes the server baseline. Applied only after the
+      // harbour spawn is placed; SAILSIM_START (test) wins; a 404/stale/slow fetch
+      // keeps the harbour spawn (resolve by the deadline so the broadcast isn't held).
+      if (!locResolved && spawnPlaced && appState == AppState::Sailing) {
+        if (std::getenv("SAILSIM_START")) {
+          locResolved = true;   // scripted test spawn — don't restore
+        } else if (locFuture.valid() &&
+                   locFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+          net::LocationResult loc = locFuture.get();
+          if (loc.ok) {
+            vessel.x = loc.x; vessel.z = loc.z; vessel.heading = glm::radians(loc.heading);
+            vessel.anchorX = loc.x; vessel.anchorZ = loc.z;   // carry the anchor (else the clamp yanks us back)
+            vessel.speed = 0.0f;
+            shipX = loc.x; shipZ = loc.z; shipHeading = vessel.heading; shipSpeed = 0.0f;
+            std::printf("[spawn] restored last location (%.0f, %.0f)\n", loc.x, loc.z);
+          }
+          locResolved = true;
+        } else if (!locFuture.valid() || glfwGetTime() > locDeadline) {
+          locResolved = true;   // no fetch or timed out -> keep the harbour spawn
+        }
+      }
+
+      // Broadcast our pose ~10 Hz (once the spawn is placed AND the last-location
+      // restore has resolved — the first update is the server's trusted baseline).
+      // Heading is sent in DEGREES.
+      if (cs == mp::ConnState::Open && spawnPlaced && locResolved && (frame % 6) == 0) {
         const char* sailState = vessel.anchored ? "anchor"
                               : (vessel.sailState == 2 ? "full" : vessel.sailState == 1 ? "half" : "furled");
         mp::PlayerUpdate pu;

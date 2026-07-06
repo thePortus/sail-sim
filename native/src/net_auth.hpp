@@ -33,4 +33,19 @@ AuthResult registerUser(const std::string& host, int port, const std::string& us
 // means the token was rejected/expired, so the caller should drop it.
 AuthResult me(const std::string& host, int port, const std::string& token);
 
+// The player's last saved anchorage, for restarting where they logged out.
+struct LocationResult {
+  bool  ok = false;              // true only when a usable, non-stale position came back
+  int   status = 0;             // HTTP status; 0 = couldn't reach the server
+  float x = 0, z = 0;
+  float heading = 270.0f;        // degrees (protocol convention, = degrees(vessel.heading))
+  std::string vesselSlug;
+};
+
+// GET /player-location/:callsign (JWT bearer). The server reads by the token's
+// user id, so it returns THIS player's saved pose. ok on 200 with a fresh
+// position (incl. the intro anchor for brand-new players); 404 (none / saved on
+// an old map) or any transport error -> ok=false, so the caller harbour-spawns.
+LocationResult playerLocation(const std::string& host, int port, const std::string& token);
+
 } // namespace net

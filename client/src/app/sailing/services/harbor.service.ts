@@ -663,8 +663,16 @@ export class HarborService {
       parent.parent = root;
       const node = await this.assetCache.instantiate(`forts/${f.glb}.glb`, scene, parent, false);
       if (!node) { parent.dispose(); continue; }
-      parent.position.set(f.x, f.y, f.z);
-      parent.rotation.y = (f.heading * Math.PI) / 180 + Math.PI;   // -Z faces seaward (guns' heading)
+      // Sink the fort to the LOWEST ground under its footprint (corners + centre) so it never floats over the
+      // sloping shore — matches the wall treatment (part-buried beats part-floating).
+      const hr = (f.heading * Math.PI) / 180;
+      const sdx = Math.sin(hr), sdz = Math.cos(hr), adx = Math.cos(hr), adz = -Math.sin(hr);
+      let fy = Math.min(f.y, this.terrainService.getElevation(f.x, f.z));
+      for (const du of [-1, 1]) for (const dv of [-1, 1])
+        fy = Math.min(fy, this.terrainService.getElevation(f.x + sdx * f.hd * du + adx * f.hw * dv,
+                                                            f.z + sdz * f.hd * du + adz * f.hw * dv));
+      parent.position.set(f.x, fy, f.z);
+      parent.rotation.y = hr + Math.PI;   // -Z faces seaward (guns' heading)
       this.tintFaction(node, h.faction);
       this.applyBuildingRecipe(node);
     }

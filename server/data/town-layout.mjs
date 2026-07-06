@@ -118,13 +118,14 @@ export function deriveWalls(pad, tier) {
  * bug). `glb` is the basename the client loads (`forts/<glb>.glb`).
  */
 export const FORT_SPEC = {
-  // depth = the fort's seaward footprint (metres); the fort is set inland so this face rests on the pad.
-  small:   { glb: 'fort_t1', depth: 7,  range: 600, reload: 6.0, damage: 25,
+  // depth/width = the fort's footprint (metres, seaward × across); depth sets the inland offset (seaward face on
+  // the pad), and the client samples the footprint corners to SINK the fort to the lowest ground (never float).
+  small:   { glb: 'fort_t1', depth: 7,  width: 9,  range: 600, reload: 6.0, damage: 25,
              guns: [{ fwd: 2.0, side: 0.0, up: 1.3 }] },                       // T1 battery: 1 central gun
-  medium:  { glb: 'fort_t2', depth: 11, range: 700, reload: 5.5, damage: 32,
+  medium:  { glb: 'fort_t2', depth: 11, width: 14, range: 700, reload: 5.5, damage: 32,
              guns: [{ fwd: 4.7, side: -4.8, up: 2.5 }, { fwd: 4.7, side: -1.6, up: 2.5 },
                     { fwd: 4.7, side: 1.6, up: 2.5 },  { fwd: 4.7, side: 4.8, up: 2.5 }] },   // T2: 4 seaward guns
-  capital: { glb: 'fort_t3', depth: 16, range: 850, reload: 5.0, damage: 40,
+  capital: { glb: 'fort_t3', depth: 16, width: 22, range: 850, reload: 5.0, damage: 40,
              guns: [{ fwd: 7.0, side: -7.5, up: 3.1 }, { fwd: 7.0, side: -4.5, up: 3.1 },
                     { fwd: 7.0, side: -1.5, up: 3.1 }, { fwd: 7.0, side: 1.5, up: 3.1 },
                     { fwd: 7.0, side: 4.5, up: 3.1 },  { fwd: 7.0, side: 7.5, up: 3.1 },       // 6 main battery
@@ -156,7 +157,9 @@ export function deriveForts(pad, tier) {
     y: +(pad.elev + g.up).toFixed(2),
     heading: pad.rotY, range: spec.range, reload: spec.reload, damage: spec.damage,
   }));
-  return [{ tier, glb: spec.glb, x: fx, z: fz, y: pad.elev, heading: pad.rotY, guns }];
+  // hd/hw = footprint half-extents (seaward/across) so the client can sample corners and sink the fort.
+  return [{ tier, glb: spec.glb, x: fx, z: fz, y: pad.elev, heading: pad.rotY,
+            hd: spec.depth * 0.5, hw: (spec.width || spec.depth) * 0.5, guns }];
 }
 
 export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {

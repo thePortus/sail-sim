@@ -99,6 +99,7 @@ bool Terrain::load(const std::string& host, int port) {
           ft.tier = (f.contains("tier") && f["tier"].is_string()) ? f["tier"].get<std::string>() : std::string();
           ft.x = num(f, "x", 0.0f); ft.z = num(f, "z", 0.0f); ft.y = num(f, "y", 0.0f);
           ft.heading = num(f, "heading", 0.0f);
+          ft.hd = num(f, "hd", 0.0f); ft.hw = num(f, "hw", 0.0f);
           if (f.contains("guns") && f["guns"].is_array())
             for (const auto& g : f["guns"]) {
               if (!g.is_object()) continue;

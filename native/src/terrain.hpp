@@ -22,7 +22,7 @@ struct Rect { bool valid = false; float cx = 0, cz = 0, halfX = 0, halfZ = 0, ro
 struct Gun { float x = 0, z = 0, y = 0, heading = 0, range = 0, reload = 0, damage = 0; };
 // One harbor fort (Harbor Forts). Placement is server-derived (deriveForts) so both clients agree exactly; the
 // client just loads forts/<glb>.glb at (x,y,z), guns facing seaward (heading). tier is informational.
-struct Fort { std::string glb, tier; float x = 0, z = 0, y = 0, heading = 0; std::vector<Gun> guns; };
+struct Fort { std::string glb, tier; float x = 0, z = 0, y = 0, heading = 0, hd = 0, hw = 0; std::vector<Gun> guns; };
 struct Harbor {
   std::string id;                             // server town id ("town_0") for economy calls
   std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)

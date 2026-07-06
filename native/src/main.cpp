@@ -6798,7 +6798,21 @@ int main(int argc, char** argv) {
             // Loads forts/<glb>.glb; a tier without an authored GLB (T2/T3) simply fails to load.
             for (const terrain::Fort& ft : hb.forts) {
               float yaw = glm::radians(ft.heading) + glm::pi<float>();
-              glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(ft.x, ft.y, ft.z));
+              // Sink the fort to the LOWEST ground under its footprint (corners + centre) so it never floats
+              // over the sloping shore — matches the wall treatment (part-buried beats part-floating).
+              float fy = ft.y;
+              float sdx = std::sin(glm::radians(ft.heading)), sdz = std::cos(glm::radians(ft.heading));
+              float adx = std::cos(glm::radians(ft.heading)), adz = -std::sin(glm::radians(ft.heading));
+              if (terr.loaded()) {
+                fy = std::min(fy, terr.elevation(ft.x, ft.z));
+                for (float du = -1.0f; du <= 1.0f; du += 2.0f)
+                  for (float dv = -1.0f; dv <= 1.0f; dv += 2.0f) {
+                    float px = ft.x + sdx * ft.hd * du + adx * ft.hw * dv;
+                    float pz = ft.z + sdz * ft.hd * du + adz * ft.hw * dv;
+                    fy = std::min(fy, terr.elevation(px, pz));
+                  }
+              }
+              glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(ft.x, fy, ft.z));
               mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
               if (Mesh* ftMesh = townMeshFor("../forts/" + ft.glb + ".glb"))
                 pushTinted(ftMesh, mm);

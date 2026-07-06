@@ -27,6 +27,7 @@ struct Values {
   float musicVolume = 0.1f;   // client MusicService default (gentle on first load)
   bool musicEnabled = true;   // client default: enabled
   bool profanityFilter = true;// mask profane words in chat (opt-out; server does the masking)
+  bool invertCameraY = false; // invert vertical (pitch) look when dragging to rotate the camera
   Graphics gfx;
 };
 

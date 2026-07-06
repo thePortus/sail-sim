@@ -3940,6 +3940,13 @@ int main(int argc, char** argv) {
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Mask profane words in chat with ****.\nOff shows chat unfiltered. Profane player/ship names are always blocked.");
 
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("CONTROLS");
+        if (ImGui::Checkbox("Invert camera (vertical)", &userCfg.invertCameraY)) settings::save(userCfg);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Invert the up/down look when dragging to rotate the camera.");
+
         // ── GRAPHICS (client settings-menu graphics dials, keyed to the native
         //    systems) — presets bundle the knobs; a manual tweak drops to Custom. ──
         ImGui::Spacing(); ImGui::Separator();
@@ -5832,7 +5839,8 @@ int main(int argc, char** argv) {
         fpPitch  = glm::clamp(fpPitch - (float)mdy * 0.25f, -70.0f, 70.0f);
       } else {
         camYawOffset += (float)mdx * 0.005f;   // drag right -> orbit right (sign matches the mirrored projection)
-        camPitch     -= (float)mdy * 0.005f;   // drag up    -> look from higher
+        // Vertical look: drag up -> look from higher, unless the invert-Y setting flips it.
+        camPitch     -= (userCfg.invertCameraY ? -1.0f : 1.0f) * (float)mdy * 0.005f;
         camPitch = glm::clamp(camPitch, 0.05f, 1.45f);
       }
     }

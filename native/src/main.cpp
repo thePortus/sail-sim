@@ -4104,6 +4104,9 @@ int main(int argc, char** argv) {
       // Photo mode hides EVERY panel, label, minimap and chat below for a clean
       // screenshot (client photoMode) — the toolbar + esc menu above stay.
       if (!photoMode) {
+      // Screen rects of HUD controls the tutorial guidance can ring (populated as
+      // each is drawn this frame; consumed by the quest-guidance pass at frame end).
+      std::map<std::string, ImVec4> guideRects;
       // ── Top-left: wind gauge + readouts ──
       ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -4115,6 +4118,7 @@ int main(int argc, char** argv) {
       const float G = 132.0f;
       ImVec2 p0 = ImGui::GetCursorScreenPos();
       ImGui::Dummy(ImVec2(G, G));
+      guideRects["wind"] = ImVec4(p0.x, p0.y, G, G);   // tutorial: "read the wind" ring
       ImDrawList* dl = ImGui::GetWindowDrawList();
       ImVec2 c(p0.x + G * 0.5f, p0.y + G * 0.5f);
       float R = G * 0.5f - 6.0f;
@@ -4238,6 +4242,8 @@ int main(int argc, char** argv) {
       ImGui::TextColored(sailCol, "%s", sailLabel);
       ImGui::PopFont();
       ImGui::TextDisabled("W / S  sail    Q / E  trim    P  anchor");
+      { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        guideRects["sails"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }   // tutorial: "set your canvas" ring
       ImGui::End();
 
       // ── Damage panel (top-right, under the sail status): its own window so the
@@ -5083,6 +5089,8 @@ int main(int argc, char** argv) {
             vessel.speed = 0; vessel.yawRate = 0;
             menuTavern = menuTrader = menuShipwright = menuGovernor = false;
           }
+          { ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            guideRects["dock"] = ImVec4(a.x, a.y, b.x - a.x, b.y - a.y); }   // tutorial: "dock here" ring
           ImGui::PopFont();
           ImGui::End();
         }
@@ -5107,6 +5115,8 @@ int main(int argc, char** argv) {
           if (ImGui::Button("Trade Goods", ImVec2(-1, 0))) {
             menuTrader = true; mpClient.tradeOpen(hb.id);
           }
+          { ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            guideRects["trade"] = ImVec4(a.x, a.y, b.x - a.x, b.y - a.y); }   // tutorial: "open the market" ring
           if (ImGui::Button("Shipwright", ImVec2(-1, 0))) {
             menuShipwright = true;
             if (!swRequested) {
@@ -5116,6 +5126,8 @@ int main(int argc, char** argv) {
             }
           }
           if (ImGui::Button("Tavern", ImVec2(-1, 0))) menuTavern = true;
+          { ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            guideRects["tavern"] = ImVec4(a.x, a.y, b.x - a.x, b.y - a.y); }   // tutorial: "into the tavern" ring
           if (!hb.faction.empty() && ImGui::Button(titleOf(hb), ImVec2(-1, 0))) menuGovernor = true;
           ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
           if (ImGui::Button("Cast Off", ImVec2(-1, 0))) {
@@ -5172,6 +5184,8 @@ int main(int argc, char** argv) {
                                     ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
             ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_Always);
             if (ImGui::Begin("Trade Goods", &menuTrader, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+              { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+                guideRects["market"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }   // tutorial: "buy/sell here" ring
               int used = 0; for (const auto& kv : ts.cargo) used += kv.second;
               ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), "%d gold", ts.gold);
               ImGui::SameLine(0, 18);
@@ -5306,6 +5320,63 @@ int main(int argc, char** argv) {
               if (ImGui::Button("Go Back to Town", ImVec2(-1, 0))) menuGovernor = false;
             }
             ImGui::End();
+          }
+        }
+      }
+
+      // ── Quest guidance (port of quest-guidance.component): ring the HUD control
+      //    the current step points at, or show a centred hint for the keyboard
+      //    steps. Runs last so every element's rect is captured this frame. ──
+      {
+        mp::QuestUpdate q = mpClient.quest();
+        if (q.active && qmPanels.empty() && !qNameOpen) {
+          const mp::QuestObjective* obj = nullptr;
+          for (const auto& o : q.objectives) if (!o.done) { obj = &o; break; }
+          struct GDef { const char* id; std::vector<const char*> keys; const char* text; };
+          static const std::vector<GDef> GUIDE = {
+            { "rotate_cam",    {},                  "Drag with the mouse to look around your ship." },
+            { "turn_helm",     {},                  "Steer with A / D (or drag the view) to turn to port and starboard." },
+            { "make_way",      {},                  "Bear off the wind and let the Saltmeadow gather way." },
+            { "read_wind",     { "wind" },          "This is the wind - the arrow points where it blows FROM." },
+            { "trim_sails",    { "sails" },         "Set your canvas here (W / S)." },
+            { "find_reach",    { "wind" },          "Turn until the wind is on your beam and your speed climbs." },
+            { "dock_portA",    { "dock" },          "Approach the pier and dock here." },
+            { "buy_cargo",     { "market", "trade" }, "Open the market and buy a cargo to carry." },
+            { "sell_cargo",    { "market", "trade" }, "The sell-hint names the port that pays best - sail there and sell." },
+            { "dock_tavern",   { "dock" },          "Approach the pier and dock here." },
+            { "listen_rumour", { "tavern" },        "Step into the tavern and listen for a rumour." },
+            { "sink_prey",     {},                  "Follow the gold marker. Run out your guns and fire a broadside until she sinks." },
+          };
+          const GDef* g = nullptr;
+          if (obj) for (const auto& e : GUIDE) if (obj->id == e.id) { g = &e; break; }
+          if (g) {
+            ImDrawList* fdl = ImGui::GetForegroundDrawList();
+            ImFont* gf = ImGui::GetFont(); float gfs = ImGui::GetFontSize();
+            float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 4.4f);
+            const ImVec4* rect = nullptr;
+            for (const char* k : g->keys) { auto it = guideRects.find(k); if (it != guideRects.end()) { rect = &it->second; break; } }
+            if (rect) {
+              ImVec2 a(rect->x - 6.0f, rect->y - 6.0f), b(rect->x + rect->z + 6.0f, rect->y + rect->w + 6.0f);
+              fdl->AddRect(a, b, IM_COL32(255, 212, 121, (int)(150 + 105 * pulse)), 9.0f, 0, 2.0f + pulse * 1.6f);
+              fdl->AddRect(ImVec2(a.x - 2, a.y - 2), ImVec2(b.x + 2, b.y + 2),
+                           IM_COL32(255, 200, 90, (int)(55 + 60 * pulse)), 11.0f, 0, 1.5f);
+              // Callout below the ring (clamped on-screen).
+              float wrapW = 260.0f;
+              ImVec2 ts = ImGui::CalcTextSize(g->text, nullptr, false, wrapW);
+              ImVec2 cp(std::min(a.x, io.DisplaySize.x - ts.x - 16.0f), b.y + 10.0f);
+              if (cp.y + ts.y > io.DisplaySize.y - 8.0f) cp.y = a.y - ts.y - 14.0f;   // flip above if off-screen
+              fdl->AddRectFilled(ImVec2(cp.x - 7, cp.y - 5), ImVec2(cp.x + ts.x + 7, cp.y + ts.y + 5), IM_COL32(18, 24, 31, 230), 5.0f);
+              fdl->AddText(gf, gfs, cp, IM_COL32(232, 224, 207, 255), g->text, nullptr, wrapW);
+            } else {
+              // No element on screen (keyboard step, or its menu isn't open) -> centred hint.
+              float wrapW = 440.0f;
+              ImVec2 ts = ImGui::CalcTextSize(g->text, nullptr, false, wrapW);
+              ImVec2 cp(io.DisplaySize.x * 0.5f - ts.x * 0.5f, io.DisplaySize.y * 0.80f);
+              fdl->AddRectFilled(ImVec2(cp.x - 13, cp.y - 9), ImVec2(cp.x + ts.x + 13, cp.y + ts.y + 9), IM_COL32(14, 20, 27, 222), 7.0f);
+              fdl->AddRect(ImVec2(cp.x - 13, cp.y - 9), ImVec2(cp.x + ts.x + 13, cp.y + ts.y + 9),
+                           IM_COL32(80, 110, 140, (int)(120 + 70 * pulse)), 7.0f, 0, 1.2f);
+              fdl->AddText(gf, gfs, cp, IM_COL32(232, 224, 207, 255), g->text, nullptr, wrapW);
+            }
           }
         }
       }

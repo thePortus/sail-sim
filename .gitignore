@@ -35,6 +35,10 @@ server/assets/scatter-src/
 # authoring-only source baked into the ship GLBs in Blender — never served, never committed.
 server/assets/ship-wood-src/
 
+# downloaded CC0 coquina fort-stone textures (re-fetchable via npm run download:fort-stone)
+# authoring-only source skinned onto the fort GLBs in Blender — never served, never committed.
+server/assets/fort-stone-src/
+
 # user info
 server/seeders/import/**/*
 

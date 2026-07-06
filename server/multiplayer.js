@@ -6,6 +6,7 @@ const config = require('./config/db.config');
 const db   = require('./models');
 const User = db.User;
 const { fn, col, where } = db.Sequelize;
+const { maskText, hasProfanity } = require('./profanity');
 
 // Above this many connected players, suppress join/leave chat announcements to
 // avoid spamming a crowded harbour.
@@ -475,8 +476,11 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState', 'profanityFilter'] });
     if (!u) return;
+    // Chat profanity filter — per-user display preference, DEFAULT ON. Masks profane words in chat the player
+    // RECEIVES; they can opt out to see raw. (Distinct from the always-on hard block on names/callsigns.)
+    p.filterProfanity = u.profanityFilter !== false;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
@@ -1579,11 +1583,19 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me) {
           const name = sanitizeShipName(msg.shipName) || 'Saltmeadow';
-          me.shipName = name;
-          if (me.state) me.state.vesselName = name;
-          saveEconomyState(me);
-          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
-          if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
+          // HARD block (always on): a ship name is a PUBLIC label, so profane ones are never accepted — keep the
+          // current name and tell the client it was rejected (this is NOT the opt-out chat filter).
+          if (hasProfanity(name)) {
+            if (me.ws.readyState === 1) {
+              me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: me.shipName || 'Saltmeadow', rejected: 'profanity' }));
+            }
+          } else {
+            me.shipName = name;
+            if (me.state) me.state.vesselName = name;
+            saveEconomyState(me);
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
+            if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
+          }
         }
 
       } else if (msg.type === 'set_flag_color') {
@@ -1597,6 +1609,17 @@ function attachMultiplayer(server) {
           saveEconomyState(me);
           if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'flag_color_set', flagColor: color }));
           if (me.state) broadcastPose(id, me);   // others see the new flag colour at once
+        }
+
+      } else if (msg.type === 'profanity_filter') {
+        // Toggle THIS player's chat profanity filter (display-only; default ON). Persisted to their user row so
+        // it survives reconnects. Does NOT affect the always-on hard block on names/callsigns.
+        const me = players.get(id);
+        if (me) {
+          const on = msg.on !== false;
+          me.filterProfanity = on;
+          if (me.auth?.userId) { User.update({ profanityFilter: on }, { where: { id: me.auth.userId } }).catch(() => {}); }
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'profanity_filter_set', on }));
         }
 
       } else if (msg.type === 'trade_open') {
@@ -1813,17 +1836,19 @@ function attachMultiplayer(server) {
           const { target: targetCallsign, rest: dmText } = parsed;
           if (!dmText || !targetCallsign) return;
 
-          const dmMsg = JSON.stringify({
-            type: 'chat', chatType: 'dm',
-            from: senderCallsign, to: targetCallsign, text: dmText,
+          // Mask profanity per-recipient (filtered unless the recipient opted out).
+          const cleanDm = maskText(dmText);
+          const dmMsg = (p) => JSON.stringify({
+            type: 'chat', chatType: 'dm', from: senderCallsign, to: targetCallsign,
+            text: p.filterProfanity === false ? dmText : cleanDm,
           });
           for (const [, p] of players) {
             if (p.state?.callsign === targetCallsign && p.ws.readyState === 1) {
-              p.ws.send(dmMsg); break;
+              p.ws.send(dmMsg(p)); break;
             }
           }
           const senderEntry = players.get(id);
-          if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg);
+          if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg(senderEntry));
 
         } else if (text.startsWith('/promote ') || text.startsWith('/demote ')) {
           // /promote "Red Sail"  → make target an Admin
@@ -2115,9 +2140,17 @@ function attachMultiplayer(server) {
           sysReply(players.get(id)?.ws, `Command not recognized: ${text.split(' ')[0]}. Type /help for a list.`);
 
         } else {
-          const globalMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });
-          for (const [, p] of players) {
-            if (p.ws.readyState === 1) p.ws.send(globalMsg);
+          // Global chat: mask profanity PER-RECIPIENT — filtered text for players who keep the (default-on)
+          // filter, raw for those who opted out. If the line is clean, one shared message (the common case).
+          const clean = maskText(text);
+          const rawMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });
+          if (clean === text) {
+            for (const [, p] of players) { if (p.ws.readyState === 1) p.ws.send(rawMsg); }
+          } else {
+            const cleanMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text: clean });
+            for (const [, p] of players) {
+              if (p.ws.readyState === 1) p.ws.send(p.filterProfanity === false ? rawMsg : cleanMsg);
+            }
           }
         }
       }

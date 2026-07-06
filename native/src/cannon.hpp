@@ -104,6 +104,7 @@ class Guns {
   float recoil(int side) const { return side_[side].recoil; }
   float reloadFrac(int side) const;
   int loadedCount(int side) const;
+  bool gunLoaded(int side, int gunIdx) const;   // is THIS gun re-armed (aim tube shows only when it is)?
   int gunsPerSide() const { return (int)layout_.port.size(); }
   ShotKind shotType() const { return shot_; }
   float elevDeg() const { return elevDeg_; }

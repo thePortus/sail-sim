@@ -127,6 +127,12 @@ int Guns::loadedCount(int side) const {
   return n;
 }
 
+bool Guns::gunLoaded(int side, int gunIdx) const {
+  const Side& g = side_[side];
+  if (gunIdx < 0 || gunIdx >= (int)g.loadAt.size()) return false;
+  return elapsed_ >= g.loadAt[gunIdx];
+}
+
 float Guns::reloadFrac(int side) const {
   const Side& g = side_[side];
   if (g.loadAt.empty()) return 0;

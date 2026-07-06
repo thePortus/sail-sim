@@ -7521,7 +7521,8 @@ int main(int argc, char** argv) {
         const glm::vec4 col = lk.valid ? glm::vec4(0.25f, 0.95f, 0.40f, 0.32f)
                                        : glm::vec4(0.95f, 0.30f, 0.25f, 0.28f);
         for (int gi = 0; gi < guns.gunsPerSide(); ++gi)
-          primsSys.tube(guns.arcPath(s2, gi, apose), 0.16f, col, 6);
+          if (guns.gunLoaded(s2, gi))   // only a re-armed gun shows its aim tube
+            primsSys.tube(guns.arcPath(s2, gi, apose), 0.16f, col, 6);
         if (lk.valid) {
           // Pulsing amber corner brackets over the locked ship.
           const glm::vec3 rc(lk.cx, 3.5f, lk.cz);

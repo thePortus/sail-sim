@@ -177,6 +177,9 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let tslot = subInfo.w & 0xFu;
     var albedo = in.albedo * baseTex;
     if (tslot != 0u) { albedo = pal.w[31u + tslot].rgb * baseTex; }
+    // Per-instance faction stone tint (misc.yzw): a subtle limestone lean toward the owning
+    // nation's hue on the harbour forts + walls. 1,1,1 on everything else -> a no-op.
+    albedo = albedo * u.misc.yzw;
     let mrTex = textureSample(metalRoughTex, texSamp, in.uv);   // glTF: G=rough, B=metal
     let metallic = clamp(in.mr.x * mrTex.b, 0.0, 1.0);
     let roughness = clamp(in.mr.y * mrTex.g, 0.05, 1.0);

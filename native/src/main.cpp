@@ -6591,6 +6591,7 @@ int main(int argc, char** argv) {
       Mesh* mesh; glm::mat4 model;
       bool remote = false;            // animated remote vessel (towns/own stay false)
       mp::RemotePlayer rp;            // broadcast rig state (remote only)
+      glm::vec3 tint = glm::vec3(1.0f);   // per-instance albedo multiply (faction stone tint on forts/walls; 1 = none)
     };
     std::vector<ShipInst> ships;
     Mesh* ownMesh = nullptr;
@@ -6740,6 +6741,16 @@ int main(int argc, char** argv) {
             Mesh* wsMesh = townMeshFor("../forts/wall_straight.glb");
             Mesh* wtMesh = townMeshFor("../forts/wall_tower.glb");
             Mesh* wgMesh = townMeshFor("../forts/wall_gate.glb");
+            // Faction identity: a subtle limestone lean toward the owning nation's hue on the whole
+            // fort/wall kit (per-instance albedo multiply via MeshUniforms.misc.yzw). 1,1,1 = none.
+            glm::vec3 stone(1.0f);
+            if      (hb.faction == "english") stone = glm::vec3(1.00f, 0.85f, 0.82f);
+            else if (hb.faction == "french")  stone = glm::vec3(0.82f, 0.89f, 1.00f);
+            else if (hb.faction == "spanish") stone = glm::vec3(1.00f, 0.94f, 0.76f);
+            else if (hb.faction == "dutch")   stone = glm::vec3(1.00f, 0.87f, 0.72f);
+            auto pushTinted = [&](Mesh* mh, const glm::mat4& mm) {
+              ShipInst si; si.mesh = mh; si.model = mm; si.tint = stone; ships.push_back(si);
+            };
             // Repeat the 6 m curtain at ~SPACING intervals (fewer instances than a strict
             // 6 m tiling → stays under the per-mesh draw cap on a big capital, at a mild
             // crenellation stretch), scaled to fit each segment exactly.
@@ -6778,7 +6789,7 @@ int main(int argc, char** argv) {
                   glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(cx, y0, cz));
                   mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
                   mm = glm::scale(mm, glm::vec3(pieceLen / MESH_LEN, 1.0f, 1.0f));
-                  ships.push_back({ wsMesh, mm });
+                  pushTinted(wsMesh, mm);
                 }
               }
             // Harbor fort(s): placement is server-authoritative (deriveForts) so the guns line up
@@ -6790,7 +6801,7 @@ int main(int argc, char** argv) {
               glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(ft.x, ft.y, ft.z));
               mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
               if (Mesh* ftMesh = townMeshFor("../forts/" + ft.glb + ".glb"))
-                ships.push_back({ ftMesh, mm });
+                pushTinted(ftMesh, mm);
             }
             for (size_t i = 0; i < hb.walls.size(); ++i) {
               const terrain::WallNode& n = hb.walls[i];
@@ -6808,13 +6819,13 @@ int main(int argc, char** argv) {
                 glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
                 mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
                 mm = glm::scale(mm, glm::vec3((2.0f * GATE_HALF) / GATE_W, 1.0f, 1.0f));
-                ships.push_back({ wgMesh, mm });
+                pushTinted(wgMesh, mm);
               } else if (wtMesh) {
                 float scv = (n.tag == 1) ? 1.25f : 1.0f;   // bastions a touch larger
                 glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, groundY(n.x, n.z), n.z));
                 mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));
                 mm = glm::scale(mm, glm::vec3(scv, 1.0f, scv));
-                ships.push_back({ wtMesh, mm });
+                pushTinted(wtMesh, mm);
               }
             }
           }
@@ -7386,7 +7397,7 @@ int main(int argc, char** argv) {
       wgpuQueueWriteBuffer(queue, sky.uniformBuf, 0, &rs, sizeof(rs));
       if (ownMesh) {
         MeshUniforms rm{ reflVP * ships[0].model, ships[0].model, glm::vec4(reflEye, 1.0f),
-                         glm::vec4(lightDir, dayK), glm::vec4(ownMesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
+                         glm::vec4(lightDir, dayK), glm::vec4(ownMesh->maskFloorY, 1.0f, 1.0f, 1.0f) };
         wgpuQueueWriteBuffer(queue, ownMesh->uniformBuf, 0, &rm, sizeof(rm));   // slot 0
       }
       if (terrUniformsLive) {
@@ -7620,7 +7631,7 @@ int main(int argc, char** argv) {
         uint32_t idx = slot[s.mesh];
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
-                         glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, 0.0f, 0.0f, 0.0f) };
+                         glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
         wgpuQueueWriteBuffer(queue, s.mesh->uniformBuf,
                              (uint64_t)idx * s.mesh->uniformStride, &mu, sizeof(mu));
         slot[s.mesh] = idx + 1;
@@ -7782,7 +7793,7 @@ int main(int argc, char** argv) {
             cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
             cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
             MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),
-                             glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 0.0f, 0.0f, 0.0f) };
+                             glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 1.0f, 1.0f, 1.0f) };
             wgpuQueueWriteBuffer(queue, crewMesh->uniformBuf, (uint64_t)slot * crewMesh->uniformStride, &mu, sizeof(mu));
             slot++;
           }

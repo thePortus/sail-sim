@@ -41,6 +41,9 @@ export class HarborService {
   // setting parent.rotation.y = heading then points the pier body seaward. Computed once per variant.
   private readonly seawardOffset = new Map<string, number>();
   private readonly frozenMats = new Set<Material>();
+  // Faction stone-tint material variants (Harbor Forts): shared base material cloned once per faction (textures
+  // are shared — only albedoColor differs), keyed `${baseMatUid}_${faction}`, so all towns of a nation reuse them.
+  private readonly tintMats = new Map<string, PBRMaterial>();
 
   // ONE shared warm light parked at the nearest town's civic square at night. Only ~1 town is streamed
   // at a time, so a single pooled light suffices, and it also reaches the waterfront/pier (the town
@@ -648,6 +651,7 @@ export class HarborService {
         parent.position.set(cx, y0, cz);
         parent.rotation.y = yaw;
         parent.scaling.x = (len / count) / MESH_LEN;
+        this.tintFaction(node, h.faction);
         this.applyBuildingRecipe(node);
       }
     }
@@ -661,6 +665,7 @@ export class HarborService {
       if (!node) { parent.dispose(); continue; }
       parent.position.set(f.x, f.y, f.z);
       parent.rotation.y = (f.heading * Math.PI) / 180 + Math.PI;   // -Z faces seaward (guns' heading)
+      this.tintFaction(node, h.faction);
       this.applyBuildingRecipe(node);
     }
     // A tower at each node — except a LAND GATE node, which gets the gatehouse filling the carved curtain gap.
@@ -683,6 +688,7 @@ export class HarborService {
         parent.position.set(n.x, y0, n.z);
         parent.rotation.y = yaw;
         parent.scaling.x = (2 * GATE_HALF) / GATE_W;
+        this.tintFaction(node, h.faction);
         this.applyBuildingRecipe(node);
         continue;
       }
@@ -693,6 +699,7 @@ export class HarborService {
       const s = n.tag === 'bastion' ? 1.25 : 1.0;
       parent.position.set(n.x, groundY(n.x, n.z), n.z);
       parent.scaling.set(s, 1, s);
+      this.tintFaction(node, h.faction);
       this.applyBuildingRecipe(node);
     }
   }
@@ -906,6 +913,32 @@ export class HarborService {
    *  the prePass, NOT shadow casters or glow-included (yet), light slots capped, and every optional PBR
    *  feature block disabled. Buildings are inland → also kept out of the ocean-reflection list.
    *  (Shadows + window glow come back in a later polish phase once the budget is profiled.) */
+  /** Faction identity (Harbor Forts): a subtle limestone lean toward the owning nation's hue on the fort/wall
+   *  kit. `instantiate` shares one material across instances, so we swap each mesh to a per-faction CLONE (cached;
+   *  textures shared, only albedoColor differs — which multiplies the albedo texture). Call BEFORE the recipe so
+   *  it freezes the tinted clone. No faction / capital-neutral → left as-is. */
+  private stoneTint(faction?: string): Color3 | null {
+    switch (faction) {
+      case 'english': return new Color3(1.0, 0.85, 0.82);
+      case 'french':  return new Color3(0.82, 0.89, 1.0);
+      case 'spanish': return new Color3(1.0, 0.94, 0.76);
+      case 'dutch':   return new Color3(1.0, 0.87, 0.72);
+      default:        return null;
+    }
+  }
+  private tintFaction(node: TransformNode, faction?: string): void {
+    const tint = this.stoneTint(faction);
+    if (!tint) return;
+    for (const m of node.getChildMeshes(false)) {
+      const mat = m.material;
+      if (!(mat instanceof PBRMaterial)) continue;
+      const key = `${mat.uniqueId}_${faction}`;
+      let tm = this.tintMats.get(key);
+      if (!tm) { tm = mat.clone(`${mat.name}_${faction}`) as PBRMaterial; tm.albedoColor = tint; this.tintMats.set(key, tm); }
+      m.material = tm;
+    }
+  }
+
   private applyBuildingRecipe(node: TransformNode): void {
     for (const m of node.getChildMeshes(false)) {
       m.receiveShadows = false;
@@ -1094,5 +1127,7 @@ export class HarborService {
     this.dockable.set(null);
     this.seawardOffset.clear();
     this.frozenMats.clear();
+    for (const tm of this.tintMats.values()) tm.dispose(false, false);   // clones own no textures (shared) — drop the material only
+    this.tintMats.clear();
   }
 }

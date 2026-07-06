@@ -889,9 +889,6 @@ buildFarLayers(const terrain::Terrain* terr) {
   float spanX = (float)(m.maxX - m.minX), spanZ = (float)(m.maxZ - m.minZ);
   int nx = std::max(2, m.width), nz = std::max(2, m.height);
   int stride = std::max(1, (int)std::ceil(std::sqrt((double)nx * nz / 8000000.0)));
-  float peak = 1.0f;
-  for (float v : terr->field()) peak = std::max(peak, v);
-  float yLo = std::max(0.6f, 0.04f * peak), yHi = 0.74f * peak;
   auto ground = [&](float x, float z) { return terr->elevation(x, z); };
   auto slopeAt = [&](float x, float z) {
     const float e = 3.0f;
@@ -914,14 +911,18 @@ buildFarLayers(const terrain::Terrain* terr) {
       float px = (float)m.minX + ((ix + jx) / (float)(nx - 1)) * spanX;
       float pz = (float)m.maxZ - ((iz + jz) / (float)(nz - 1)) * spanZ;
       float y = ground(px, pz);
-      // ── FAR FOREST (beech impostors): the client's dense canopy recipe. ──
-      if (y >= yLo && y <= yHi) {
+      // ── FAR FOREST (beech impostors): the SAME coverage gates as the near
+      //    treeKernel (elevation, slope, stand/clearing noise, shoreline) so the
+      //    impostors stand exactly where the near full meshes do — no whole patch
+      //    conjured on approach (esp. beech stands on low beach ground, which the
+      //    old y>=0.04*peak recipe skipped). The density scalar is left OFF (max ~1
+      //    per coarse cell) so the far fill is dense and approaching only thickens. ──
+      if (y >= 0.6f && y <= 80.0f) {
         float sl = slopeAt(px, pz);
-        if (sl <= 0.6f) {
+        if (sl <= 0.5f) {
           float stand = fbm2(px / 45.0f, pz / 45.0f), clearing = fbm2(px / 13.0f + 9.0f, pz / 13.0f - 4.0f);
-          float standC = sstep(0.28f, 0.62f, stand), clearC = sstep(0.18f, 0.52f, clearing);
-          float dens = (0.45f + 0.55f * standC) * clearC * (1.0f - sl * 0.35f);
-          if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) <= dens && !nearShoreline(px, pz, 6.0f)) {
+          float dens = sstep(0.46f, 0.72f, stand) * sstep(0.4f, 0.62f, clearing) * (1.0f - sl * 0.8f);
+          if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) <= dens && !nearShoreline(px, pz, 7.0f)) {
             int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));
             if ((int)out.first[(size_t)v].size() < BUDGET_PER) {
               float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;

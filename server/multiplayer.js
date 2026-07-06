@@ -525,7 +525,15 @@ async function loadAndSendWallet(id, p, players) {
     // started (so a disconnect mid-panel doesn't restart the story), then push the active quest to the client.
     p.questState = quest.parseState(u.questState);
     if (quest.startIfNew(p.questState)) { saveEconomyState(p); }
-    sendQuest(p);
+    sendQuest(p);   // restores the quest tracker + DOCK-HERE marker + guidance (all driven by the active quest)
+    // Reconnect: restore the tutorial trade SELL-HERE beacon — it's set from the market-state hint (connection
+    // state, lost on disconnect). During the intro_trade SELL stage the hint points at the nearby portB. (The
+    // intro_combat HUNT marker is restored separately by ensureTutorialTarget once the first pose arrives.)
+    const itq = p.questState.intro_trade;
+    if (itq && itq.status === 'active' && itq.stage >= 1) {
+      const pb = quest.resolvePort('tutorial.portB');
+      if (pb && p.ws.readyState === 1) p.ws.send(JSON.stringify({ type: 'sell_hint', townId: pb }));
+    }
 
     sendWallet(p);
     p.ws.send(JSON.stringify({ type: 'ledger', towns: p.ledger }));   // the player's discovered-towns ledger
@@ -615,15 +623,37 @@ function applyQuestEvent(p, eventType, data, players) {
   ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
 }
 
-/** Spawn (or respawn) the intro_combat tutorial target while that quest is active and no live one exists. The
- *  tavern rumour marks it; sinking it (the owner) completes the quest. */
+/** True once the player has heard the rumour and is in the HUNT stage (stages: [rumour, hunt]) of intro_combat —
+ *  i.e. the marked pinnace should be shown on their chart. */
+function inTutorialHunt(p) {
+  const qc = p && p.questState && p.questState.intro_combat;
+  return !!(qc && qc.status === 'active' && qc.stage >= 1);
+}
+
+/** (Re)mark the tutorial pinnace on the player's chart. Reuses the tavern-rumour reply the client already handles
+ *  (sets its map TARGET to shipId) — so a respawned pinnace, or a fresh one after reconnect, is marked without a
+ *  new client message type. */
+function sendTutorialMark(p, t) {
+  if (!p || !p.ws || p.ws.readyState !== 1 || !t || !t.state) return;
+  p.ws.send(JSON.stringify({ type: 'rumor_result', ok: true, shipId: t.id, slug: t.state.vesselSlug, from: null, to: 'uncharted waters' }));
+}
+
+/** Spawn (or respawn) the intro_combat tutorial target while that quest is active and no live one exists. Once the
+ *  player is in the hunt stage the pinnace is marked on their chart — and if it was sunk (by another player) or
+ *  lost to a disconnect, the fresh one is re-marked so the map TARGET follows it (the id changes on respawn). */
 function ensureTutorialTarget(p, players) {
   if (!p || !p.questState || !players || !p.authPose) return;
   if (quest.activeQuestId(p.questState) !== 'intro_combat') return;
   const cur = p.tutorialNpcId ? players.get(p.tutorialNpcId) : null;
-  if (cur && !(cur.combat && cur.combat.sunk)) return;   // a live target already exists
+  if (cur && !(cur.combat && cur.combat.sunk)) {
+    // Live target already exists — but after a reconnect the chart mark (connection state) is gone; restore it.
+    if (inTutorialHunt(p) && p.rumorShipId !== cur.id) { p.rumorShipId = cur.id; sendTutorialMark(p, cur); }
+    return;
+  }
   const t = npc.makeTutorialTarget(players, p);
-  if (t) p.tutorialNpcId = t.id;
+  if (!t) return;
+  p.tutorialNpcId = t.id;
+  if (inTutorialHunt(p)) { p.rumorShipId = t.id; sendTutorialMark(p, t); }   // re-point the chart mark at the fresh pinnace
 }
 
 /** Remove a player's tutorial target (on disconnect / skip). A sunk one is left to linger-despawn naturally. */

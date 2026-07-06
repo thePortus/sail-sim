@@ -267,6 +267,10 @@ struct Client::Impl {
         townSt.rumorStatus = r == "no_rumours" ? "No talk of treasure ships tonight."
                                                : "The talk dries up (" + r + ").";
       }
+    } else if (type == "sell_hint") {
+      // Server replays the trade sell-hint (map SELL-HERE beacon) — e.g. on reconnect, since the
+      // market-state hint that normally sets it is connection state lost on disconnect.
+      townSt.hintTownId = msg.value("townId", std::string());
     } else if (type == "pirate_report_result") {
       townSt.pirate.valid = true;
       townSt.pirate.ok = msg.value("ok", false);

@@ -759,6 +759,7 @@ function nearestPrey(pirate, players, maxR2) {
   let best = null, bestD2 = maxR2;
   for (const [, p] of players) {
     if (p === pirate || p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (p.questTag === 'tutorial') continue;   // the intro tutorial's pinnace is the player's prey — pirates leave it be
     if (!p.isNpc && p.questState && quest.inIntro(p.questState)) continue;   // leave brand-new captains alone until the tutorial's done
     const dx = p.state.x - pirate.state.x, dz = p.state.z - pirate.state.z, d2 = dx * dx + dz * dz;
     if (d2 < bestD2) { bestD2 = d2; best = p; }

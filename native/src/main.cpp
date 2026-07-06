@@ -5066,7 +5066,10 @@ int main(int argc, char** argv) {
         }
 
         // ── Ship-name modal (name the Saltmeadow after the intro / shipwright buy). ──
-        if (qNameOpen) {
+        //    Wait for the closing story beat to be dismissed first: two modals that each
+        //    call SetNextWindowFocus every frame fight for focus and neither's buttons
+        //    register a click. Sequencing them (Onward, THEN Christen her) fixes that.
+        if (qNameOpen && qmPanels.empty()) {
           ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(6, 10, 16, 180));
           ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
           ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Always);
@@ -5448,6 +5451,13 @@ int main(int argc, char** argv) {
           };
           const GDef* g = nullptr;
           if (obj) for (const auto& e : GUIDE) if (obj->id == e.id) { g = &e; break; }
+          // Don't lay a ring/hint over an open town sub-menu (trader/tavern/shipwright/governor) —
+          // e.g. the "listen for a rumour" ring firing while the trader is still up. The buy/sell
+          // steps DO target a control inside the market, so let those (keys include "market") through.
+          bool townMenuOpen = menuTavern || menuTrader || menuShipwright || menuGovernor;
+          bool inMenuStep = false;
+          if (g) for (const char* k : g->keys) if (std::strcmp(k, "market") == 0) inMenuStep = true;
+          if (townMenuOpen && !inMenuStep) g = nullptr;
           if (g) {
             ImDrawList* fdl = ImGui::GetForegroundDrawList();
             ImFont* gf = ImGui::GetFont(); float gfs = ImGui::GetFontSize();

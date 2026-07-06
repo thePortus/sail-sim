@@ -12,12 +12,15 @@ namespace terrain {
 
 // One placed structure of a harbour town (asset = GLB/impostor basename).
 struct Building { std::string asset; float x = 0, z = 0, rotY = 0; };
+// One node of a town's defensive wall ring (Harbor Forts). tag: 0 corner, 1 bastion, 2 gate.
+struct WallNode { float x = 0, z = 0; int tag = 0; };
 struct Harbor {
   std::string id;                             // server town id ("town_0") for economy calls
   std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)
   float x = 0, z = 0, heading = 0;
   float padElev = 0;                          // town pad ground elevation (metres)
   std::vector<Building> buildings;
+  std::vector<WallNode> walls;                // defensive wall ring (closed polyline; placeholder for the spike)
 };
 struct Spawn  { float x = 0, z = 0, heading = 0; };
 

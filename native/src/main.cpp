@@ -7865,6 +7865,33 @@ int main(int argc, char** argv) {
     //    after the ocean so the sea occludes low arcs correctly). ──
     {
       primsSys.clear();
+      // Harbor Forts — WALL-PATH SPIKE. Draw each nearby town's server-derived wall
+      // ring as PLACEHOLDER segments (a curtain bar between nodes, a post/tower at
+      // each corner/bastion, a low lintel at the sea-gate) so we can validate the
+      // auto-generated path in-engine before the real modular wall kit exists.
+      // Immediate-mode + range-gated to keep the vertex count down.
+      if (terrainR.ready) {
+        const glm::vec4 stone(0.62f, 0.58f, 0.50f, 1.0f), gateCol(0.42f, 0.30f, 0.18f, 1.0f);
+        const float H = 5.0f;
+        for (const terrain::Harbor& hb : terr.manifest().harbors) {
+          if (hb.walls.size() < 2) continue;
+          float dxc = hb.x - vessel.x, dzc = hb.z - vessel.z;
+          if (dxc * dxc + dzc * dzc > 1600.0f * 1600.0f) continue;   // ~1.6 km stream range
+          const float y0 = hb.padElev;
+          for (size_t i = 0; i < hb.walls.size(); ++i) {              // curtains (closed ring)
+            const terrain::WallNode& a = hb.walls[i];
+            const terrain::WallNode& b = hb.walls[(i + 1) % hb.walls.size()];
+            primsSys.cylinder(glm::vec3(a.x, y0 + H * 0.5f, a.z), glm::vec3(b.x, y0 + H * 0.5f, b.z),
+                              0.6f, stone, 6, false);
+          }
+          for (const terrain::WallNode& n : hb.walls) {               // towers / gate posts
+            const bool gate = n.tag == 2;
+            const float th = gate ? 3.0f : 7.0f, rad = n.tag == 1 ? 2.2f : 1.5f;
+            primsSys.cylinder(glm::vec3(n.x, y0, n.z), glm::vec3(n.x, y0 + th, n.z),
+                              rad, gate ? gateCol : stone, 8, true);
+          }
+        }
+      }
       const glm::vec4 iron(0.16f, 0.15f, 0.14f, 1.0f);
       for (const combat::Ball& b : guns.balls()) {
         if (!b.alive) continue;

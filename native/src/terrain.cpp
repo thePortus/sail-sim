@@ -64,6 +64,16 @@ bool Terrain::load(const std::string& host, int port) {
           if (!bd.asset.empty()) hb.buildings.push_back(bd);
         }
       }
+      if (h.contains("walls") && h["walls"].is_array()) {
+        for (const auto& w : h["walls"]) {
+          if (!w.is_object()) continue;
+          WallNode wn;
+          wn.x = num(w, "x", 0.0f); wn.z = num(w, "z", 0.0f);
+          std::string tag = (w.contains("tag") && w["tag"].is_string()) ? w["tag"].get<std::string>() : std::string();
+          wn.tag = tag == "gate" ? 2 : tag == "bastion" ? 1 : 0;
+          hb.walls.push_back(wn);
+        }
+      }
       m_.harbors.push_back(hb);
     }
   }

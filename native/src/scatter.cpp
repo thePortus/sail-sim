@@ -167,14 +167,15 @@ fn vs_main(@location(0) inPos : vec3<f32>, @location(1) inNrm : vec3<f32>,
     p.z = sPerp.y + sNew * sDir.y;
   }
   let isBlob = mode > 5.5;
-  // LoD cross-dissolve (NearFadePlugin port): the full mesh stays 1 inside `near`
-  // and shrinks out over [near, near+band]; the impostor is 1 outside and shrinks
-  // over [near-band, near] — around `near` BOTH are full-size (they overlap).
+  // LoD fade. Modes 1/2 (legacy) SCALE-collapse geometry; mode 3 (client's default
+  // LodDither) leaves size UNTOUCHED and dissolves in the fragment instead — the
+  // full mesh stays solid at full size while the impostor screen-doors over it, so
+  // nothing shrinks/grows (which the user disliked).
   let dCam = distance(vec2<f32>(r0.w, r2.w), vec2<f32>(u.eye.x, u.eye.z));
   var f = 1.0;
   if (!isBlob) {
     if (u.lod.z > 0.5 && u.lod.z < 1.5) { f = 1.0 - smoothstep(u.lod.x, u.lod.x + u.lod.y, dCam); }
-    if (u.lod.z > 1.5) { f = smoothstep(u.lod.x - u.lod.y, u.lod.x, dCam); }
+    if (u.lod.z > 1.5 && u.lod.z < 2.5) { f = smoothstep(u.lod.x - u.lod.y, u.lod.x, dCam); }
   }
   p = p * f;
   var wp = vec3<f32>(dot(vec3<f32>(r0.x, r0.y, r0.z), p) + r0.w,
@@ -208,11 +209,16 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(vec3<f32>(0.02, 0.03, 0.05), a);
   }
   if (u.anim.w > 0.0 && c.a < u.anim.w) { discard; }
-  // Screen-door dissolve at the patch-cull edge (LodDitherPlugin port): dithered
-  // out over [cullStart, cullStart+60] by interleaved-gradient noise.
-  if (u.lod.w > 0.0) {
+  // Screen-door LoD dissolve (LodDitherPlugin port): impostors DISSOLVE in/out by
+  // distance (no scale). mode 3 = cross-dissolve — the billboard appears over
+  // [near-band, near+band] (revealing the solid full mesh through the gaps) and, if
+  // a cull edge is set (lod.w>0), dithers back out over [cullStart, cullStart+60].
+  // Grass (mode 0, lod.w>0) keeps the cull-out-only behaviour.
+  if (u.lod.z > 2.5 || u.lod.w > 0.0) {
     let dd = distance(in.worldPos.xz, u.eye.xz);
-    let fade = 1.0 - smoothstep(u.lod.w, u.lod.w + 60.0, dd);
+    var fade = 1.0;
+    if (u.lod.z > 2.5) { fade = smoothstep(u.lod.x - u.lod.y, u.lod.x + u.lod.y, dd); }
+    if (u.lod.w > 0.0) { fade = fade * (1.0 - smoothstep(u.lod.w, u.lod.w + 60.0, dd)); }
     let ign = fract(52.9829189 * fract(dot(in.position.xy, vec2<f32>(0.06711056, 0.00583715))));
     if (fade < ign) { discard; }
   }
@@ -2198,10 +2204,12 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   };
 
   const glm::vec4 noLod(0.0f);
-  // Trees/palms: full mesh shrinks out at NEAR_FADE; impostor grows in there and
-  // dithers out at the patch edge (client NearFade + LodDither).
-  glm::vec4 fullFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 1.0f, 0.0f);
-  glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 2.0f, Impl::TREE_CULL);
+  // Trees/palms (client NearFade+LodDither default): the full mesh stays SOLID at
+  // full size (noLod) while the impostor screen-door DISSOLVES — mode 3 appears over
+  // [near-band, near+band] revealing the full mesh through the gaps, then dithers
+  // out at the patch-cull edge. No shrinking/growing.
+  glm::vec4 fullFade = noLod;
+  glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 3.0f, Impl::TREE_CULL);
   // Grass: dithers out at the GrassFade edge ((ring+0.5)*40 = 180 m; band 60).
   glm::vec4 grassFade(0.0f, 0.0f, 0.0f, (Impl::GRASS_RING + 0.5f) * Impl::PATCH - 60.0f);
   // Debug: SAILSIM_SCATTER_SKIP=palms,trees,rocks,drift,grass,far,reeds,weeds,birds,dolphins,fish,blobs
@@ -2217,9 +2225,11 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   if (!skip("drift")) drawSets(p->drift, true, noLod);
   if (!skip("grass")) drawSets(p->grass, false, grassFade);
   if (!skip("grass")) drawSets(p->grass, true, grassFade);
-  // Far island impostors: grow in over the FarFadePlugin band (280 -> full 470 m)
-  // as the near scatter ring hands off; distant coasts read as treed.
-  glm::vec4 farFade(470.0f, 190.0f, 2.0f, 0.0f);
+  // Far island impostors (client LodDither on the far layer): DISSOLVE in — mode 3
+  // appear over [260, 340] so they're fully opaque exactly as the near ring dithers
+  // out at its 340 m cull edge (a clean crossfade), and never scale. (near=300,
+  // band=40 → appear [near-band, near+band] = [260, 340]; no cull edge.)
+  glm::vec4 farFade(300.0f, 40.0f, 3.0f, 0.0f);
   if (!skip("far")) drawSets(p->farTrees, false, farFade);
   if (!skip("far")) drawSets(p->farPalms, false, farFade);
   if (!skip("reeds")) drawSets(p->reedsL, false, noLod);

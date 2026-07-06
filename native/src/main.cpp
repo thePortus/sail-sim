@@ -6720,6 +6720,43 @@ int main(int argc, char** argv) {
               }
             }
           }
+          // ── Fort wall kit: instance the coquina curtain along each segment (repeat
+          //    to fit) + a bastion tower at each node, oriented so the crenellations
+          //    (mesh -Z) face OUTWARD, away from the town centre. Replaces the prims
+          //    placeholders. Same static-mesh draw path as buildings/piers. ──
+          if (d < 1500.0f && hb.walls.size() >= 2) {
+            Mesh* wsMesh = townMeshFor("../forts/wall_straight.glb");
+            Mesh* wtMesh = townMeshFor("../forts/wall_tower.glb");
+            const float y0 = hb.padElev, PIECE = 6.0f;
+            if (wsMesh)
+              for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {
+                const terrain::WallNode& a = hb.walls[i];
+                const terrain::WallNode& b = hb.walls[i + 1];
+                float sx = b.x - a.x, sz = b.z - a.z, len = std::hypot(sx, sz);
+                if (len < 0.5f) continue;
+                float ux = sx / len, uz = sz / len;
+                float midx = (a.x + b.x) * 0.5f, midz = (a.z + b.z) * 0.5f;
+                float yaw = std::atan2(-uz, ux);   // local +X -> segment dir
+                if (uz * (midx - hb.x) - ux * (midz - hb.z) < 0.0f) yaw += glm::pi<float>();   // -Z faces outward
+                int count = std::max(1, (int)std::lround(len / PIECE));
+                float pieceLen = len / (float)count;
+                for (int k = 0; k < count; ++k) {
+                  float t = ((float)k + 0.5f) / (float)count;
+                  glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(a.x + sx * t, y0, a.z + sz * t));
+                  mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
+                  mm = glm::scale(mm, glm::vec3(pieceLen / PIECE, 1.0f, 1.0f));
+                  ships.push_back({ wsMesh, mm });
+                }
+              }
+            if (wtMesh)
+              for (const terrain::WallNode& n : hb.walls) {
+                float scv = (n.tag == 1) ? 1.25f : 1.0f;   // bastions a touch larger
+                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
+                mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));
+                mm = glm::scale(mm, glm::vec3(scv, 1.0f, scv));
+                ships.push_back({ wtMesh, mm });
+              }
+          }
         }
       }
     }
@@ -7940,18 +7977,13 @@ int main(int argc, char** argv) {
     //    after the ocean so the sea occludes low arcs correctly). ──
     {
       primsSys.clear();
-      // Harbor Forts — WALL-PATH SPIKE. Draw each nearby town's server-derived wall
-      // ring as PLACEHOLDER segments (a curtain bar between nodes, a post/tower at
-      // each corner/bastion, a low lintel at the sea-gate) so we can validate the
-      // auto-generated path in-engine before the real modular wall kit exists.
-      // Immediate-mode + range-gated to keep the vertex count down.
+      // Town ground decals (immediate-mode, range-gated): the textured worn-dirt road
+      // network + the cobblestone civic square for nearby towns. (The fort walls are
+      // real instanced coquina GLBs — placed in the town-streaming block above.)
       if (terrainR.ready) {
-        const glm::vec4 stone(0.62f, 0.58f, 0.50f, 1.0f), gateCol(0.42f, 0.30f, 0.18f, 1.0f);
-        const float H = 5.0f;
         for (const terrain::Harbor& hb : terr.manifest().harbors) {
           float dxc = hb.x - vessel.x, dzc = hb.z - vessel.z;
           if (dxc * dxc + dzc * dzc > 1600.0f * 1600.0f) continue;   // ~1.6 km stream range
-          const float y0 = hb.padElev;
           // ── Road network: each street → a TEXTURED worn-dirt ribbon draped on the
           //    terrain (port of harbor.service buildGround). Subdivided so it tracks
           //    the slope; U across [0,1], V tiles along (len·t / 6) like the client. ──
@@ -7988,19 +8020,6 @@ int main(int argc, char** argv) {
             glm::vec2 u00(0, 0), u10(sq.halfZ / 2.5f, 0), u01(0, sq.halfX / 2.5f), u11(sq.halfZ / 2.5f, sq.halfX / 2.5f);
             primsSys.triTex(c00, c01, c10, u00, u01, u10, 1);
             primsSys.triTex(c10, c01, c11, u10, u01, u11, 1);
-          }
-          if (hb.walls.size() < 2) continue;
-          for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {          // curtains — OPEN path (no wrap; the gap is the harbor mouth)
-            const terrain::WallNode& a = hb.walls[i];
-            const terrain::WallNode& b = hb.walls[i + 1];
-            primsSys.cylinder(glm::vec3(a.x, y0 + H * 0.5f, a.z), glm::vec3(b.x, y0 + H * 0.5f, b.z),
-                              0.6f, stone, 6, false);
-          }
-          for (const terrain::WallNode& n : hb.walls) {               // towers / gate posts
-            const bool gate = n.tag == 2;
-            const float th = gate ? 3.0f : 7.0f, rad = n.tag == 1 ? 2.2f : 1.5f;
-            primsSys.cylinder(glm::vec3(n.x, y0, n.z), glm::vec3(n.x, y0 + th, n.z),
-                              rad, gate ? gateCol : stone, 8, true);
           }
         }
       }

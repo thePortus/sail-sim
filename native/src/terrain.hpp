@@ -18,6 +18,11 @@ struct WallNode { float x = 0, z = 0; int tag = 0; };
 struct Street { float x1 = 0, z1 = 0, x2 = 0, z2 = 0, w = 5; };
 // An oriented rectangle (the civic square). halfZ = along heading, halfX = across.
 struct Rect { bool valid = false; float cx = 0, cz = 0, halfX = 0, halfZ = 0, rotY = 0; };
+// One harbor-fort gun: muzzle world position + combat spec (server-authoritative; the combat pass fires from here).
+struct Gun { float x = 0, z = 0, y = 0, heading = 0, range = 0, reload = 0, damage = 0; };
+// One harbor fort (Harbor Forts). Placement is server-derived (deriveForts) so both clients agree exactly; the
+// client just loads forts/<glb>.glb at (x,y,z), guns facing seaward (heading). tier is informational.
+struct Fort { std::string glb, tier; float x = 0, z = 0, y = 0, heading = 0; std::vector<Gun> guns; };
 struct Harbor {
   std::string id;                             // server town id ("town_0") for economy calls
   std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)
@@ -27,6 +32,7 @@ struct Harbor {
   std::vector<Street>   streets;              // road network (draped ribbons)
   Rect                  square;               // civic square (valid=false if none)
   std::vector<WallNode> walls;                // defensive wall ring (open polyline; placeholder for the spike)
+  std::vector<Fort>     forts;                // harbor forts (server-derived placement + gun spec)
 };
 struct Spawn  { float x = 0, z = 0, heading = 0; };
 

@@ -95,6 +95,12 @@ export interface TownStreet { x1: number; z1: number; x2: number; z2: number; wi
  *  consecutive nodes and a tower/bastion/gate at each node. World coords; see server deriveWalls(). */
 export interface TownWallNode { x: number; z: number; tag: 'corner' | 'bastion' | 'gate'; }
 
+/** One harbor-fort GUN: muzzle world position + combat spec (server-authoritative; fires from here). */
+export interface TownFortGun { x: number; z: number; y: number; heading: number; range: number; reload: number; damage: number; }
+/** One harbor FORT (Harbor Forts). Placement is server-derived (deriveForts) so both clients agree exactly; the
+ *  client loads `forts/<glb>.glb` at (x,y,z), guns facing seaward (heading). See server deriveForts(). */
+export interface TownFort { glb: string; tier: string; x: number; z: number; y: number; heading: number; guns: TownFortGun[]; }
+
 export interface TerrainHarbor {
   id: string;
   name: string;
@@ -110,6 +116,7 @@ export interface TerrainHarbor {
   square?: TownRect | null;
   streets?: TownStreet[];
   walls?: TownWallNode[];   // Harbor Forts — defensive wall ring (placeholder segments for the spike)
+  forts?: TownFort[];       // Harbor Forts — server-placed forts + gun spec (empty until a tier's GLB is authored)
   // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
   specialty?: string;
   // Factions — the owning nation (e.g. 'english'); contested border towns also carry a rivalFaction.

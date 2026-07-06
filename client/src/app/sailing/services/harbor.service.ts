@@ -645,29 +645,17 @@ export class HarborService {
         this.applyBuildingRecipe(node);
       }
     }
-    // Small towns get a T1 harbour battery guarding the harbour MOUTH: a standalone low water-battery set just
-    // inside the open gap (midpoint of the two seaward corner tips, pulled inland), guns facing OUT through the
-    // mouth (authored -Z seaward). It's its own structure — not a tower stand-in — so every wall tower still draws.
-    // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
-    if (h.tier === 'small' && W.length >= 2) {
-      const c0 = W[0], c1 = W[W.length - 1];
-      const mx = (c0.x + c1.x) / 2, mz = (c0.z + c1.z) / 2;   // mouth centre
-      let ix = h.x - mx, iz = h.z - mz;
-      const il = Math.hypot(ix, iz);
-      if (il > 0.1) {
-        ix /= il; iz /= il;                       // inland (mouth -> town)
-        const fx = mx + ix * 10, fz = mz + iz * 10;   // set back inside the mouth
-        const y0 = Math.min(groundY(fx, fz), groundY(fx + 4, fz), groundY(fx - 4, fz),
-                            groundY(fx, fz + 4), groundY(fx, fz - 4));
-        const parent = new TransformNode(`fort_${h.id}`, scene);
-        parent.parent = root;
-        const node = await this.assetCache.instantiate('forts/fort_t1.glb', scene, parent, false);
-        if (node) {
-          parent.position.set(fx, y0, fz);
-          parent.rotation.y = Math.atan2(ix, iz);   // -Z faces OUT the mouth (-inland)
-          this.applyBuildingRecipe(node);
-        } else parent.dispose();
-      }
+    // Harbor fort(s): placement is server-authoritative (deriveForts) so the guns line up with combat — the client
+    // just renders each fort at its given transform. The mesh's authored forward (-Z) faces seaward, so the yaw is
+    // heading + PI to aim -Z along the guns' heading. A tier without an authored GLB (T2/T3) simply fails to load.
+    for (const [fi, f] of (h.forts ?? []).entries()) {
+      const parent = new TransformNode(`fort_${h.id}_${fi}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate(`forts/${f.glb}.glb`, scene, parent, false);
+      if (!node) { parent.dispose(); continue; }
+      parent.position.set(f.x, f.y, f.z);
+      parent.rotation.y = (f.heading * Math.PI) / 180 + Math.PI;   // -Z faces seaward (guns' heading)
+      this.applyBuildingRecipe(node);
     }
     // Bastion tower at each node (1.25x on bastions; a square tower reads the same at any yaw).
     for (let i = 0; i < W.length; i++) {

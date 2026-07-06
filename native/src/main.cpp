@@ -6764,27 +6764,16 @@ int main(int argc, char** argv) {
                   ships.push_back({ wsMesh, mm });
                 }
               }
-            // Small towns get a T1 harbour battery guarding the harbour MOUTH: a standalone
-            // low water-battery set just inside the open gap (midpoint of the two seaward
-            // corner tips, pulled inland), guns facing OUT through the mouth (mesh -Z seaward).
-            // It's its own structure — not a tower stand-in — so every wall tower still draws.
-            // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
-            if (hb.tier == "small" && hb.walls.size() >= 2) {
-              const terrain::WallNode& c0 = hb.walls.front();
-              const terrain::WallNode& c1 = hb.walls.back();
-              float mx = (c0.x + c1.x) * 0.5f, mz = (c0.z + c1.z) * 0.5f;   // mouth centre
-              float ix = hb.x - mx, iz = hb.z - mz, il = std::hypot(ix, iz);
-              if (il > 0.1f) {
-                ix /= il; iz /= il;                       // inland (mouth -> town)
-                float fx = mx + ix * 10.0f, fz = mz + iz * 10.0f;   // set back inside the mouth
-                float yaw = std::atan2(ix, iz);           // -Z faces OUT the mouth (-inland)
-                float y0 = std::min({ groundY(fx, fz), groundY(fx + 4, fz), groundY(fx - 4, fz),
-                                      groundY(fx, fz + 4), groundY(fx, fz - 4) });
-                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(fx, y0, fz));
-                mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
-                if (Mesh* ftMesh = townMeshFor("../forts/fort_t1.glb"))
-                  ships.push_back({ ftMesh, mm });
-              }
+            // Harbor fort(s): placement is server-authoritative (deriveForts) so the guns line up
+            // with combat — we just render each fort at its given transform. The mesh's authored
+            // forward (-Z) faces seaward, so yaw = heading + PI aims -Z along the guns' heading.
+            // Loads forts/<glb>.glb; a tier without an authored GLB (T2/T3) simply fails to load.
+            for (const terrain::Fort& ft : hb.forts) {
+              float yaw = glm::radians(ft.heading) + glm::pi<float>();
+              glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(ft.x, ft.y, ft.z));
+              mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
+              if (Mesh* ftMesh = townMeshFor("../forts/" + ft.glb + ".glb"))
+                ships.push_back({ ftMesh, mm });
             }
             if (wtMesh)
               for (const terrain::WallNode& n : hb.walls) {

@@ -91,6 +91,26 @@ bool Terrain::load(const std::string& host, int port) {
           hb.walls.push_back(wn);
         }
       }
+      if (h.contains("forts") && h["forts"].is_array()) {
+        for (const auto& f : h["forts"]) {
+          if (!f.is_object()) continue;
+          Fort ft;
+          ft.glb  = (f.contains("glb")  && f["glb"].is_string())  ? f["glb"].get<std::string>()  : std::string();
+          ft.tier = (f.contains("tier") && f["tier"].is_string()) ? f["tier"].get<std::string>() : std::string();
+          ft.x = num(f, "x", 0.0f); ft.z = num(f, "z", 0.0f); ft.y = num(f, "y", 0.0f);
+          ft.heading = num(f, "heading", 0.0f);
+          if (f.contains("guns") && f["guns"].is_array())
+            for (const auto& g : f["guns"]) {
+              if (!g.is_object()) continue;
+              Gun gn;
+              gn.x = num(g, "x", 0.0f); gn.z = num(g, "z", 0.0f); gn.y = num(g, "y", 0.0f);
+              gn.heading = num(g, "heading", 0.0f); gn.range = num(g, "range", 0.0f);
+              gn.reload = num(g, "reload", 0.0f); gn.damage = num(g, "damage", 0.0f);
+              ft.guns.push_back(gn);
+            }
+          if (!ft.glb.empty()) hb.forts.push_back(ft);
+        }
+      }
       m_.harbors.push_back(hb);
     }
   }

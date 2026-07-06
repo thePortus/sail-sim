@@ -107,6 +107,47 @@ export function deriveWalls(pad, tier) {
   ];
 }
 
+/**
+ * Harbor-fort combat spec per town tier (server-authoritative). A fort that FIRES is a combatant, so its exact
+ * placement + gun characteristics live here — the clients render from what this emits, they don't compute it, so
+ * native and Babylon can never disagree about where the guns are. `range`/`reload`/`damage` are PLACEHOLDERS for
+ * the combat pass to tune. Each gun's muzzle is an offset in the fort frame: `fwd` = metres seaward of the fort
+ * centre, `side` = metres across (+ = right of seaward), `up` = metres above the pad. Only tiers with an authored
+ * GLB + spec get a fort; medium/capital await the T2/T3 forts (walls only until then — an absent entry, not a
+ * bug). `glb` is the basename the client loads (`forts/<glb>.glb`).
+ */
+export const FORT_SPEC = {
+  small: { glb: 'fort_t1', range: 600, reload: 6.0, damage: 25,
+           guns: [{ fwd: 2.0, side: 0.0, up: 1.3 }] },   // T1 battery: one central embrasure gun
+};
+
+/**
+ * Derive a town's harbor fort(s) from its flat `pad` (client-agnostic, like deriveWalls). The T1 battery sits on
+ * the seaward centreline, just inside the pad's seaward edge (so it rests on the flat pad — y = pad.elev, never
+ * floating), guns facing seaward (= the town's seaward heading). Returns an ARRAY (0 or 1 forts today; kept a
+ * list so a capital could later carry a water-battery + a citadel). Each fort carries its authoritative world
+ * transform + per-gun muzzle world positions for the combat pass.
+ */
+export function deriveForts(pad, tier) {
+  if (!pad) return [];
+  const spec = FORT_SPEC[tier];
+  if (!spec) return [];
+  const hr = pad.rotY * Math.PI / 180;
+  const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland; -fwd = seaward (guns face -fwd)
+  const rgt = [ Math.cos(hr), -Math.sin(hr)];         // across the frontage (+ = right)
+  const df = -pad.halfZ + 4;                          // 4 m inside the seaward pad edge → on the flat pad
+  const fx = +(pad.cx + fwd[0] * df).toFixed(1);
+  const fz = +(pad.cz + fwd[1] * df).toFixed(1);
+  const sea = [-fwd[0], -fwd[1]];                     // seaward unit (guns direction)
+  const guns = spec.guns.map((g) => ({
+    x: +(fx + sea[0] * g.fwd + rgt[0] * g.side).toFixed(1),
+    z: +(fz + sea[1] * g.fwd + rgt[1] * g.side).toFixed(1),
+    y: +(pad.elev + g.up).toFixed(2),
+    heading: pad.rotY, range: spec.range, reload: spec.reload, damage: spec.damage,
+  }));
+  return [{ tier, glb: spec.glb, x: fx, z: fz, y: pad.elev, heading: pad.rotY, guns }];
+}
+
 export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const hr = town.heading * Math.PI / 180;
   const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward)
@@ -251,7 +292,8 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const pad = { cx: c.x, cz: c.z, halfX: Math.round((maxS - minS) / 2), halfZ: Math.round((maxF - minF) / 2), rotY: Math.round(town.heading), elev: +elev.toFixed(2) };
 
   const walls = deriveWalls(pad, tier);
-  return { tier, buildings, square, streets, pad, walls };
+  const forts = deriveForts(pad, tier);
+  return { tier, buildings, square, streets, pad, walls, forts };
 }
 
 /**
@@ -305,6 +347,7 @@ export function assignTowns(sites, seed, elevAt, footprints) {
     t.square = layout.square;
     t.streets = layout.streets;
     t.walls = layout.walls;
+    t.forts = layout.forts;
     delete t._site;
   }
 

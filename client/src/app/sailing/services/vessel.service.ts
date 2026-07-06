@@ -461,18 +461,22 @@ export class VesselService {
   private portEmit  = new Vector3(0, this.WAKE_Y, 0);
   private stbdEmit  = new Vector3(0, this.WAKE_Y, 0);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  async init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): Promise<void> {
-    this.x       = spawnX;
-    this.z       = spawnZ;
-    this.heading = spawnHeading;
-    if (vessel.physics) Object.assign(this.physics, vessel.physics);
-
-    // Resolve the rig (GLB + manifest + orientation + handedness). The server vessel def is authoritative;
-    // fall back to the slug→rig map.
-    this.vesselSlug = vessel.slug;
+  /** Build the vessel rig by layering the SERVER's authoritative sailing physics (vessel.physics: polar,
+   *  forceK/trimForgive/leewayK, hull half-dims, buoyancy) over the hardcoded VESSEL_RIGS base. The base now
+   *  only supplies PRESENTATION (glb/manifest/orientation/hullCut/oceanMask) and a fallback for anything the
+   *  server omits, so a change to a ship's handling is made once, on the server, and both clients follow.
+   *  The sloop's buoyancy uses tiltTau < 0 as a "client default smoothing" sentinel → keep the base buoyancy. */
+  private mergeRig(vessel: Vessel): VesselRig {
     const base = rigForSlug(vessel.slug);
-    this.rig = {
+    const p = vessel.physics;
+    const sail: SailRig | undefined = (p?.polar && p.polar.length)
+      ? { polar: p.polar,
+          forceK:      p.forceK      ?? base.sail?.forceK,
+          trimForgive: p.trimForgive ?? base.sail?.trimForgive,
+          leewayK:     p.leewayK      ?? base.sail?.leewayK }
+      : base.sail;
+    const buoyancy = (p?.buoyancy && p.buoyancy.tiltTau >= 0) ? p.buoyancy : base.buoyancy;
+    return {
       glb:        vessel.glb        ?? base.glb,
       manifest:   vessel.manifest   ?? base.manifest,
       importFlipY: vessel.importFlipY ?? base.importFlipY,
@@ -480,14 +484,27 @@ export class VesselService {
       controller: base.controller,
       floatDraft: base.floatDraft,
       hullCut:    base.hullCut,
-      buoyancy:   base.buoyancy,
-      hullHalfLen:  base.hullHalfLen,
-      hullHalfBeam: base.hullHalfBeam,
+      buoyancy,
+      hullHalfLen:  p?.hullHalfLen  ?? base.hullHalfLen,
+      hullHalfBeam: p?.hullHalfBeam ?? base.hullHalfBeam,
       baseYawDeg:  base.baseYawDeg,
-      sail:        base.sail,
+      sail,
       oceanMask:   base.oceanMask,
       oceanMaskFloorY: base.oceanMaskFloorY,
     };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  async init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): Promise<void> {
+    this.x       = spawnX;
+    this.z       = spawnZ;
+    this.heading = spawnHeading;
+    if (vessel.physics) Object.assign(this.physics, vessel.physics);
+
+    // Resolve the rig (GLB + manifest + orientation + handedness + sailing character). The server vessel def
+    // is authoritative for handling; VESSEL_RIGS only supplies presentation + fallbacks. See mergeRig().
+    this.vesselSlug = vessel.slug;
+    this.rig = this.mergeRig(vessel);
     this.rightSign = this.rig.rightSign;
 
     // Per-vessel gun layout (muzzle offsets per side, vessel-local). Null → CannonService falls back to
@@ -724,23 +741,7 @@ export class VesselService {
     // Adopt the new vessel def — mirrors init()'s setup, minus pose/input/loop.
     if (vessel.physics) Object.assign(this.physics, vessel.physics);
     this.vesselSlug = vessel.slug;
-    const base = rigForSlug(vessel.slug);
-    this.rig = {
-      glb:         vessel.glb         ?? base.glb,
-      manifest:    vessel.manifest    ?? base.manifest,
-      importFlipY: vessel.importFlipY ?? base.importFlipY,
-      rightSign:   vessel.rightSign   ?? base.rightSign,
-      controller:  base.controller,
-      floatDraft:  base.floatDraft,
-      hullCut:     base.hullCut,
-      buoyancy:    base.buoyancy,
-      hullHalfLen:  base.hullHalfLen,
-      hullHalfBeam: base.hullHalfBeam,
-      baseYawDeg:  base.baseYawDeg,
-      sail:        base.sail,
-      oceanMask:   base.oceanMask,
-      oceanMaskFloorY: base.oceanMaskFloorY,
-    };
+    this.rig = this.mergeRig(vessel);
     this.rightSign = this.rig.rightSign;
     this.vesselCannons = vessel.cannons ?? null;
     const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };

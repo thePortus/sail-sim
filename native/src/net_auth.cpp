@@ -104,6 +104,53 @@ LocationResult playerLocation(const std::string& host, int port, const std::stri
   return r;
 }
 
+VesselPhysics vesselPhysics(const std::string& host, int port, const std::string& slug,
+                            const std::string& token) {
+  VesselPhysics r;
+  httplib::Client cli(host, port);
+  cli.set_connection_timeout(5, 0);
+  cli.set_read_timeout(5, 0);
+  httplib::Headers headers;
+  if (!token.empty()) headers.emplace("Authorization", "Bearer " + token);
+  auto res = cli.Get(("/vessels/" + slug).c_str(), headers);
+  if (!res) return r;                                       // unreachable -> caller uses hardcoded fallback
+  r.status = res->status;
+  if (res->status < 200 || res->status >= 300) return r;    // 404 unknown slug -> fallback
+  json parsed;
+  try { parsed = json::parse(res->body); } catch (...) { return r; }
+  if (!parsed.contains("physics") || !parsed["physics"].is_object()) return r;
+  const json& p = parsed["physics"];
+  r.maxSpeed         = p.value("maxSpeed", r.maxSpeed);
+  r.accelerationRate = p.value("accelerationRate", r.accelerationRate);
+  r.minTackAngle     = p.value("minTackAngle", r.minTackAngle);
+  r.sailAreaFactor   = p.value("sailAreaFactor", r.sailAreaFactor);
+  r.weight           = p.value("weight", r.weight);
+  // Rig/hull block: only authoritative when the server actually sent it (an older
+  // server without these fields must NOT silently downgrade a brig to sloop defaults).
+  if (p.contains("forceK")) {
+    r.hasRig       = true;
+    r.forceK       = p.value("forceK", r.forceK);
+    r.trimForgive  = p.value("trimForgive", r.trimForgive);
+    r.leewayK      = p.value("leewayK", r.leewayK);
+    r.hullHalfLen  = p.value("hullHalfLen", r.hullHalfLen);
+    r.hullHalfBeam = p.value("hullHalfBeam", r.hullHalfBeam);
+  }
+  if (p.contains("polar") && p["polar"].is_array()) {
+    for (const auto& pt : p["polar"])
+      if (pt.is_array() && pt.size() >= 2 && pt[0].is_number() && pt[1].is_number())
+        r.polar.emplace_back((float)pt[0].get<double>(), (float)pt[1].get<double>());
+  }
+  if (p.contains("buoyancy") && p["buoyancy"].is_object()) {
+    const json& b = p["buoyancy"];
+    r.pitchScale = b.value("pitchScale", r.pitchScale);
+    r.heaveTau   = b.value("heaveTau", r.heaveTau);
+    r.tiltTau    = b.value("tiltTau", r.tiltTau);
+    r.hasBuoyancy = true;
+  }
+  r.ok = true;
+  return r;
+}
+
 AuthResult registerUser(const std::string& host, int port, const std::string& username,
                         const std::string& callsign, const std::string& password) {
   // Register returns {message, user:{...}} with no token; report failure straight

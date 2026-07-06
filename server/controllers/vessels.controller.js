@@ -50,6 +50,15 @@ const VESSELS = [
       minTackAngle:     34,       // a lug rig points slightly lower than the sloop
       sailAreaFactor:   0.34,
       weight:           1400,     // half the sloop — nimble
+      // v2 sailing rig (server-authoritative handling; both clients read this) — a handy sprit/lug: lower peak
+      // drive but holds it dead downwind, and forgiving of sloppy trim.
+      forceK:           0.26,
+      trimForgive:      1.25,
+      leewayK:          1.4,
+      polar: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
+      hullHalfLen:      4.1,
+      hullHalfBeam:     1.1,
+      buoyancy: { pitchScale: 0.16, heaveTau: 0.45, tiltTau: 0.30 },
     },
     // Helm: near the front of the tiller, just to starboard (starboard = −X here), seated eye height.
     firstPersonCam: { x: -0.45, y: 1.45, z: -2.4 },
@@ -80,6 +89,15 @@ const VESSELS = [
       minTackAngle:     32,
       sailAreaFactor:   0.40,
       weight:           2800,
+      // Bermuda rig: points high, strong on a reach (peak ~120°), but the main blankets the jib dead
+      // downwind so the run falls off. A tuned rig → fussier trim. tiltTau -1 = client default smoothing.
+      forceK:           0.26,
+      trimForgive:      1.0,
+      leewayK:          1.0,
+      polar: [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
+      hullHalfLen:      7.0,
+      hullHalfBeam:     2.2,
+      buoyancy: { pitchScale: 0.14, heaveTau: 1.5, tiltTau: -1 },
     },
     // Helm — just aft of the wheel, on the centreline, standing eye height, looking forward.
     firstPersonCam: { x: 0.6, y: 2.6, z: -2.8 },
@@ -104,6 +122,15 @@ const VESSELS = [
       minTackAngle:     52,       // square-rigged → points even lower than the brig
       sailAreaFactor:   0.50,     // a great spread of canvas
       weight:           6500,     // the deepest, heaviest hull in the fleet
+      // Three-masted square-rigger: huge drive on a reach and HOLDS it dead downwind, slow to accelerate,
+      // little leeway, forgiving of sloppy trim.
+      forceK:           1.18,
+      trimForgive:      1.15,
+      leewayK:          0.85,
+      polar: [[52, 0.38], [72, 0.60], [92, 0.80], [120, 1.00], [150, 0.96], [180, 0.88]],
+      hullHalfLen:      15.0,
+      hullHalfBeam:     3.6,
+      buoyancy: { pitchScale: 0.06, heaveTau: 1.1, tiltTau: 0.65 },
     },
     // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
     // forward. y is vessel-local (rides the floated hull). y RAISED 6.0→8.8 (= wheel 7.93 + ~0.9 eye): the old
@@ -137,6 +164,15 @@ const VESSELS = [
       minTackAngle:     50,       // square sails can't point close
       sailAreaFactor:   0.48,     // lots of canvas
       weight:           5200,     // deep, heavily-built hull
+      // Square-rigged foremast + gaff main: points low, strong drive on a reach, HOLDS it dead downwind
+      // (square sails love a run, peak ~120°); heavy deep hull → little leeway, fairly forgiving of trim.
+      forceK:           1.12,
+      trimForgive:      1.1,
+      leewayK:          0.9,
+      polar: [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
+      hullHalfLen:      12.0,
+      hullHalfBeam:     3.2,
+      buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 },
     },
     // Helm — at the wheel aft (B_Wheel ≈ model 0,5.74,-11.1), standing eye height, looking forward.
     // y is vessel-local (rides the floated hull); the quarterdeck sits high on this ship.

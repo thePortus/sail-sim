@@ -3294,6 +3294,27 @@ int main(int argc, char** argv) {
   std::vector<int> crewBrowsIdx, crewFrownIdx, crewSmileIdx, crewMouthIdx;
   bool crewTried = false;
   sail::Rig    vrig = sail::rigForSlug("sloop");
+  // Server-authoritative sailing physics: the rig for the OWN vessel is fetched from
+  // GET /vessels/:slug once per slug and cached. rigForSlug() is only the offline /
+  // model-viewer fallback (and seeds any field the server omits). See net::vesselPhysics.
+  std::map<std::string, sail::Rig> serverRigs;
+  std::future<net::VesselPhysics>  rigFuture;
+  std::string                      rigFetchSlug;
+  auto rigFromServer = [](const net::VesselPhysics& p, const std::string& slug) {
+    sail::Rig r = sail::rigForSlug(slug);   // hardcoded fallback seeds anything the server omits
+    r.maxSpeed = p.maxSpeed; r.accelRate = p.accelerationRate; r.minTackAngle = p.minTackAngle;
+    r.sailAreaFactor = p.sailAreaFactor; r.weight = p.weight;
+    if (p.hasRig) {   // only when the server sent the v2 rig block (else keep the hardcoded rig)
+      r.forceK = p.forceK; r.trimForgive = p.trimForgive; r.leewayK = p.leewayK;
+      r.hullHalfLen = p.hullHalfLen; r.hullHalfBeam = p.hullHalfBeam;
+    }
+    if (!p.polar.empty()) {
+      r.polar.clear();
+      for (const auto& pt : p.polar) r.polar.emplace_back(pt.first, pt.second);
+    }
+    if (p.hasBuoyancy) { r.pitchScale = p.pitchScale; r.heaveTau = p.heaveTau; r.tiltTau = p.tiltTau; }
+    return r;
+  };
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
   bool prevKeyZ = false, prevKeyC = false, prevKeyG = false, prevKeyH = false, prevKeyM = false;
   std::map<std::string, std::pair<float, float>> remoteGunCur;   // eased remote gun deploy (P,S)
@@ -5750,7 +5771,24 @@ int main(int argc, char** argv) {
         if (elevDn) guns.elevHold(-1.0f, dt);
         prevRaise = raise; prevLower = lower; prevAnchor = anchor;
       }
-      vrig = sail::rigForSlug(ownVesselSlug.empty() ? "sloop" : ownVesselSlug);
+      {
+        std::string slug = ownVesselSlug.empty() ? "sloop" : ownVesselSlug;
+        // Land a completed server-physics fetch into the cache (negative-cache the
+        // hardcoded fallback on failure so we don't retry every frame).
+        if (rigFuture.valid() && rigFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+          net::VesselPhysics vp = rigFuture.get();
+          serverRigs[rigFetchSlug] = vp.ok ? rigFromServer(vp, rigFetchSlug) : sail::rigForSlug(rigFetchSlug);
+          rigFetchSlug.clear();
+        }
+        // Kick off a fetch for an unresolved slug (skipped in offline/model mode, which has no token).
+        if (serverRigs.find(slug) == serverRigs.end() && rigFetchSlug.empty() &&
+            !ownVesselSlug.empty() && !authToken.empty()) {
+          rigFetchSlug = slug;
+          rigFuture = std::async(std::launch::async, net::vesselPhysics, kHost, kPort, slug, authToken);
+        }
+        auto it = serverRigs.find(slug);
+        vrig = (it != serverRigs.end()) ? it->second : sail::rigForSlug(slug);
+      }
       mp::WaveState wv = mpClient.wave();
       float windFromDeg = wv.valid ? wv.windBearing : 270.0f;
       float windKn      = wv.valid ? wv.windSpeed  : 8.0f;

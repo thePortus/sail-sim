@@ -3,6 +3,8 @@
 // runs these off the render thread (see main.cpp's std::async use).
 #pragma once
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace net {
 
@@ -47,5 +49,24 @@ struct LocationResult {
 // position (incl. the intro anchor for brand-new players); 404 (none / saved on
 // an old map) or any transport error -> ok=false, so the caller harbour-spawns.
 LocationResult playerLocation(const std::string& host, int port, const std::string& token);
+
+// Server-authoritative per-vessel sailing physics (GET /vessels/:slug .physics).
+// The server is the single source of truth for handling; the client maps this
+// onto sail::Rig. Every field defaults to the sloop, so a partial/absent response
+// still yields a usable rig. `ok` is true only on a 200 with a physics object.
+struct VesselPhysics {
+  bool ok = false;
+  int  status = 0;
+  float maxSpeed = 9.0f, accelerationRate = 0.22f, minTackAngle = 32.0f, sailAreaFactor = 0.40f, weight = 2800.0f;
+  bool  hasRig = false;                          // server sent the v2 rig block (forceK/trim/leeway/hull)
+  float forceK = 0.26f, trimForgive = 1.0f, leewayK = 1.0f;
+  std::vector<std::pair<float, float>> polar;   // [apparentAngleDeg, driveCoeff] breakpoints
+  float hullHalfLen = 7.0f, hullHalfBeam = 2.2f;
+  bool  hasBuoyancy = false;
+  float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // tiltTau < 0 => client default smoothing
+};
+
+VesselPhysics vesselPhysics(const std::string& host, int port, const std::string& slug,
+                            const std::string& token);
 
 } // namespace net

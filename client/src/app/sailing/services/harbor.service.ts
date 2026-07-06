@@ -613,7 +613,7 @@ export class HarborService {
     const scene = this.sceneService.scene;
     const W = h.walls;
     if (!scene || !W || W.length < 2) return;
-    const PIECE = 6.0;   // wall_straight length (X, metres)
+    const MESH_LEN = 6.0, SPACING = 8.0;   // 6 m curtain repeated at ~8 m (fewer instances, mild stretch)
     // Curtain: repeat wall_straight along each segment (OPEN polyline — the last→first gap is the harbor mouth),
     // scaled to fit, oriented so the crenellations (authored -Z) face OUTWARD, away from the town centre.
     // NB: Babylon's glTF import is left-handed — verify the outward side in-engine; flip the `yaw += PI` test if wrong.
@@ -625,7 +625,7 @@ export class HarborService {
       const midx = (a.x + b.x) / 2, midz = (a.z + b.z) / 2;
       let yaw = Math.atan2(ux, uz) - Math.PI / 2;   // local +X runs along the segment
       if (uz * (midx - h.x) - ux * (midz - h.z) < 0) yaw += Math.PI;   // -Z faces outward
-      const count = Math.max(1, Math.round(len / PIECE));
+      const count = Math.max(1, Math.round(len / SPACING));
       for (let k = 0; k < count; k++) {
         const t = (k + 0.5) / count;
         const parent = new TransformNode(`fortwall_${h.id}_${i}_${k}`, scene);
@@ -634,7 +634,7 @@ export class HarborService {
         if (!node) { parent.dispose(); continue; }
         parent.position.set(a.x + dx * t, padElev, a.z + dz * t);
         parent.rotation.y = yaw;
-        parent.scaling.x = (len / count) / PIECE;
+        parent.scaling.x = (len / count) / MESH_LEN;
         this.applyBuildingRecipe(node);
       }
     }

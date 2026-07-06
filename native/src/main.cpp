@@ -206,9 +206,11 @@ struct MeshUniforms {
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
 // pipeline, buffers, decoded textures, and one bind group per texture; draws as a
 // sequence of submeshes, each selecting its material's base-colour texture.
-// How many ships (you + remote players) one vessel mesh can draw per frame via
-// dynamic uniform offsets. Each instance uses one aligned MeshUniforms slot.
-static constexpr uint32_t kMaxShipInstances = 64;
+// How many instances one mesh can draw per frame via dynamic uniform offsets
+// (you + remote players, and the STATIC town instances: buildings, piers, and the
+// fort wall kit — a capital's curtain alone is dozens of pieces). Each uses one
+// aligned MeshUniforms + palette slot.
+static constexpr uint32_t kMaxShipInstances = 128;
 // Per-instance palette slot: 128 mat4 (node worlds + skin joints) + 64 vec4 of
 // morph weights = 9216 B (256-aligned), selected by a dynamic offset like the
 // per-instance MeshUniforms — every vessel instance animates independently.
@@ -6727,7 +6729,10 @@ int main(int argc, char** argv) {
           if (d < 1500.0f && hb.walls.size() >= 2) {
             Mesh* wsMesh = townMeshFor("../forts/wall_straight.glb");
             Mesh* wtMesh = townMeshFor("../forts/wall_tower.glb");
-            const float y0 = hb.padElev, PIECE = 6.0f;
+            // Repeat the 6 m curtain at ~SPACING intervals (fewer instances than a strict
+            // 6 m tiling → stays under the per-mesh draw cap on a big capital, at a mild
+            // crenellation stretch), scaled to fit each segment exactly.
+            const float y0 = hb.padElev, MESH_LEN = 6.0f, SPACING = 8.0f;
             if (wsMesh)
               for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {
                 const terrain::WallNode& a = hb.walls[i];
@@ -6738,13 +6743,13 @@ int main(int argc, char** argv) {
                 float midx = (a.x + b.x) * 0.5f, midz = (a.z + b.z) * 0.5f;
                 float yaw = std::atan2(-uz, ux);   // local +X -> segment dir
                 if (uz * (midx - hb.x) - ux * (midz - hb.z) < 0.0f) yaw += glm::pi<float>();   // -Z faces outward
-                int count = std::max(1, (int)std::lround(len / PIECE));
+                int count = std::max(1, (int)std::lround(len / SPACING));
                 float pieceLen = len / (float)count;
                 for (int k = 0; k < count; ++k) {
                   float t = ((float)k + 0.5f) / (float)count;
                   glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(a.x + sx * t, y0, a.z + sz * t));
                   mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
-                  mm = glm::scale(mm, glm::vec3(pieceLen / PIECE, 1.0f, 1.0f));
+                  mm = glm::scale(mm, glm::vec3(pieceLen / MESH_LEN, 1.0f, 1.0f));
                   ships.push_back({ wsMesh, mm });
                 }
               }

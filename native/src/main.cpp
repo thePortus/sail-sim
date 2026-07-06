@@ -6732,7 +6732,14 @@ int main(int argc, char** argv) {
             // Repeat the 6 m curtain at ~SPACING intervals (fewer instances than a strict
             // 6 m tiling → stays under the per-mesh draw cap on a big capital, at a mild
             // crenellation stretch), scaled to fit each segment exactly.
-            const float y0 = hb.padElev, MESH_LEN = 6.0f, SPACING = 8.0f;
+            const float MESH_LEN = 6.0f, SPACING = 8.0f;
+            // The wall base must follow the sloping shore — a single flat elevation leaves
+            // pieces floating over the downslope (even out over water). Drop each piece to the
+            // LOWEST ground it spans (min with padElev): it may sink into the ground/water, but
+            // it never floats. Sample terrain and clamp at/below the pad.
+            auto groundY = [&](float x, float z) {
+              return terr.loaded() ? std::min(hb.padElev, terr.elevation(x, z)) : hb.padElev;
+            };
             if (wsMesh)
               for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {
                 const terrain::WallNode& a = hb.walls[i];
@@ -6744,38 +6751,45 @@ int main(int argc, char** argv) {
                 float yaw = std::atan2(-uz, ux);   // local +X -> segment dir
                 if (uz * (midx - hb.x) - ux * (midz - hb.z) < 0.0f) yaw += glm::pi<float>();   // -Z faces outward
                 int count = std::max(1, (int)std::lround(len / SPACING));
-                float pieceLen = len / (float)count;
+                float pieceLen = len / (float)count, half = pieceLen * 0.5f;
                 for (int k = 0; k < count; ++k) {
                   float t = ((float)k + 0.5f) / (float)count;
-                  glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(a.x + sx * t, y0, a.z + sz * t));
+                  float cx = a.x + sx * t, cz = a.z + sz * t;
+                  // lowest ground under this piece (both ends + centre) → no float
+                  float y0 = std::min({ groundY(cx, cz), groundY(cx - ux * half, cz - uz * half),
+                                        groundY(cx + ux * half, cz + uz * half) });
+                  glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(cx, y0, cz));
                   mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
                   mm = glm::scale(mm, glm::vec3(pieceLen / MESH_LEN, 1.0f, 1.0f));
                   ships.push_back({ wsMesh, mm });
                 }
               }
-            // Small towns get a T1 harbour battery at their seaward strongpoint: the
-            // first bastion node (seaward-left). The fort's own corner geometry stands
-            // in for the wall tower there, so we skip the tower at that node. Guns face
-            // seaward = away from the town centre (mesh -Z outward), matching the walls.
+            // Small towns get a T1 harbour battery guarding the harbour MOUTH: a standalone
+            // low water-battery set just inside the open gap (midpoint of the two seaward
+            // corner tips, pulled inland), guns facing OUT through the mouth (mesh -Z seaward).
+            // It's its own structure — not a tower stand-in — so every wall tower still draws.
             // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
-            int fortNode = -1;
-            if (hb.tier == "small")
-              for (size_t i = 0; i < hb.walls.size(); ++i)
-                if (hb.walls[i].tag == 1) { fortNode = (int)i; break; }
-            if (fortNode >= 0) {
-              const terrain::WallNode& n = hb.walls[fortNode];
-              float yaw = std::atan2(-(n.x - hb.x), -(n.z - hb.z));   // -Z faces outward (seaward)
-              glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
-              mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
-              if (Mesh* ftMesh = townMeshFor("../forts/fort_t1.glb"))
-                ships.push_back({ ftMesh, mm });
+            if (hb.tier == "small" && hb.walls.size() >= 2) {
+              const terrain::WallNode& c0 = hb.walls.front();
+              const terrain::WallNode& c1 = hb.walls.back();
+              float mx = (c0.x + c1.x) * 0.5f, mz = (c0.z + c1.z) * 0.5f;   // mouth centre
+              float ix = hb.x - mx, iz = hb.z - mz, il = std::hypot(ix, iz);
+              if (il > 0.1f) {
+                ix /= il; iz /= il;                       // inland (mouth -> town)
+                float fx = mx + ix * 10.0f, fz = mz + iz * 10.0f;   // set back inside the mouth
+                float yaw = std::atan2(ix, iz);           // -Z faces OUT the mouth (-inland)
+                float y0 = std::min({ groundY(fx, fz), groundY(fx + 4, fz), groundY(fx - 4, fz),
+                                      groundY(fx, fz + 4), groundY(fx, fz - 4) });
+                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(fx, y0, fz));
+                mm = glm::rotate(mm, yaw, glm::vec3(0, 1, 0));
+                if (Mesh* ftMesh = townMeshFor("../forts/fort_t1.glb"))
+                  ships.push_back({ ftMesh, mm });
+              }
             }
             if (wtMesh)
-              for (size_t i = 0; i < hb.walls.size(); ++i) {
-                if ((int)i == fortNode) continue;   // the fort stands in for this tower
-                const terrain::WallNode& n = hb.walls[i];
+              for (const terrain::WallNode& n : hb.walls) {
                 float scv = (n.tag == 1) ? 1.25f : 1.0f;   // bastions a touch larger
-                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, y0, n.z));
+                glm::mat4 mm = glm::translate(glm::mat4(1.0f), glm::vec3(n.x, groundY(n.x, n.z), n.z));
                 mm = glm::rotate(mm, -glm::radians(hb.heading), glm::vec3(0, 1, 0));
                 mm = glm::scale(mm, glm::vec3(scv, 1.0f, scv));
                 ships.push_back({ wtMesh, mm });

@@ -614,9 +614,12 @@ export class HarborService {
     const W = h.walls;
     if (!scene || !W || W.length < 2) return;
     const MESH_LEN = 6.0, SPACING = 8.0;   // 6 m curtain repeated at ~8 m (fewer instances, mild stretch)
+    // The wall base must follow the sloping shore — a single flat elevation leaves pieces floating over the
+    // downslope (even out over water). Drop each piece to the LOWEST ground it spans (min with padElev): it may
+    // sink into the ground/water, but it never floats.
+    const groundY = (x: number, z: number) => Math.min(padElev, this.terrainService.getElevation(x, z));
     // Curtain: repeat wall_straight along each segment (OPEN polyline — the last→first gap is the harbor mouth),
     // scaled to fit, oriented so the crenellations (authored -Z) face OUTWARD, away from the town centre.
-    // NB: Babylon's glTF import is left-handed — verify the outward side in-engine; flip the `yaw += PI` test if wrong.
     for (let i = 0; i + 1 < W.length; i++) {
       const a = W[i], b = W[i + 1];
       const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
@@ -626,45 +629,55 @@ export class HarborService {
       let yaw = Math.atan2(ux, uz) - Math.PI / 2;   // local +X runs along the segment
       if (uz * (midx - h.x) - ux * (midz - h.z) < 0) yaw += Math.PI;   // -Z faces outward
       const count = Math.max(1, Math.round(len / SPACING));
+      const half = (len / count) / 2;
       for (let k = 0; k < count; k++) {
         const t = (k + 0.5) / count;
+        const cx = a.x + dx * t, cz = a.z + dz * t;
+        const y0 = Math.min(groundY(cx, cz), groundY(cx - ux * half, cz - uz * half),
+                            groundY(cx + ux * half, cz + uz * half));   // lowest ground under the piece → no float
         const parent = new TransformNode(`fortwall_${h.id}_${i}_${k}`, scene);
         parent.parent = root;
         const node = await this.assetCache.instantiate('forts/wall_straight.glb', scene, parent, false);
         if (!node) { parent.dispose(); continue; }
-        parent.position.set(a.x + dx * t, padElev, a.z + dz * t);
+        parent.position.set(cx, y0, cz);
         parent.rotation.y = yaw;
         parent.scaling.x = (len / count) / MESH_LEN;
         this.applyBuildingRecipe(node);
       }
     }
-    // Small towns get a T1 harbour battery at their seaward strongpoint: the first bastion node
-    // (seaward-left). The fort's own corner geometry stands in for the wall tower there, so we skip
-    // that tower. Guns face seaward = away from the town centre (authored -Z outward), like the walls.
+    // Small towns get a T1 harbour battery guarding the harbour MOUTH: a standalone low water-battery set just
+    // inside the open gap (midpoint of the two seaward corner tips, pulled inland), guns facing OUT through the
+    // mouth (authored -Z seaward). It's its own structure — not a tower stand-in — so every wall tower still draws.
     // (Medium/capital want T2/T3 forts, not yet authored — walls only for now.)
-    let fortIdx = -1;
-    if (h.tier === 'small') fortIdx = W.findIndex((n) => n.tag === 'bastion');
-    if (fortIdx >= 0) {
-      const n = W[fortIdx];
-      const parent = new TransformNode(`fort_${h.id}`, scene);
-      parent.parent = root;
-      const node = await this.assetCache.instantiate('forts/fort_t1.glb', scene, parent, false);
-      if (node) {
-        parent.position.set(n.x, padElev, n.z);
-        parent.rotation.y = Math.atan2(-(n.x - h.x), -(n.z - h.z));   // -Z faces outward (seaward)
-        this.applyBuildingRecipe(node);
-      } else parent.dispose();
+    if (h.tier === 'small' && W.length >= 2) {
+      const c0 = W[0], c1 = W[W.length - 1];
+      const mx = (c0.x + c1.x) / 2, mz = (c0.z + c1.z) / 2;   // mouth centre
+      let ix = h.x - mx, iz = h.z - mz;
+      const il = Math.hypot(ix, iz);
+      if (il > 0.1) {
+        ix /= il; iz /= il;                       // inland (mouth -> town)
+        const fx = mx + ix * 10, fz = mz + iz * 10;   // set back inside the mouth
+        const y0 = Math.min(groundY(fx, fz), groundY(fx + 4, fz), groundY(fx - 4, fz),
+                            groundY(fx, fz + 4), groundY(fx, fz - 4));
+        const parent = new TransformNode(`fort_${h.id}`, scene);
+        parent.parent = root;
+        const node = await this.assetCache.instantiate('forts/fort_t1.glb', scene, parent, false);
+        if (node) {
+          parent.position.set(fx, y0, fz);
+          parent.rotation.y = Math.atan2(ix, iz);   // -Z faces OUT the mouth (-inland)
+          this.applyBuildingRecipe(node);
+        } else parent.dispose();
+      }
     }
     // Bastion tower at each node (1.25x on bastions; a square tower reads the same at any yaw).
     for (let i = 0; i < W.length; i++) {
-      if (i === fortIdx) continue;   // the fort stands in for this tower
       const n = W[i];
       const parent = new TransformNode(`fortnode_${h.id}_${i}`, scene);
       parent.parent = root;
       const node = await this.assetCache.instantiate('forts/wall_tower.glb', scene, parent, false);
       if (!node) { parent.dispose(); continue; }
       const s = n.tag === 'bastion' ? 1.25 : 1.0;
-      parent.position.set(n.x, padElev, n.z);
+      parent.position.set(n.x, groundY(n.x, n.z), n.z);
       parent.scaling.set(s, 1, s);
       this.applyBuildingRecipe(node);
     }

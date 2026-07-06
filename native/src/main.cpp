@@ -7878,9 +7878,9 @@ int main(int argc, char** argv) {
           float dxc = hb.x - vessel.x, dzc = hb.z - vessel.z;
           if (dxc * dxc + dzc * dzc > 1600.0f * 1600.0f) continue;   // ~1.6 km stream range
           const float y0 = hb.padElev;
-          for (size_t i = 0; i < hb.walls.size(); ++i) {              // curtains (closed ring)
+          for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {          // curtains — OPEN path (no wrap; the gap is the harbor mouth)
             const terrain::WallNode& a = hb.walls[i];
-            const terrain::WallNode& b = hb.walls[(i + 1) % hb.walls.size()];
+            const terrain::WallNode& b = hb.walls[i + 1];
             primsSys.cylinder(glm::vec3(a.x, y0 + H * 0.5f, a.z), glm::vec3(b.x, y0 + H * 0.5f, b.z),
                               0.6f, stone, 6, false);
           }

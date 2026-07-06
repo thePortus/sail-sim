@@ -625,9 +625,9 @@ export class HarborService {
     }
     const H = 5, T = 1.4;
     const seat = (mesh: Mesh) => { mesh.parent = root; mesh.receiveShadows = false; mesh.isPickable = false; mesh.freezeWorldMatrix(); };
-    // Curtains between consecutive nodes (closed ring).
-    for (let i = 0; i < W.length; i++) {
-      const a = W[i], b = W[(i + 1) % W.length];
+    // Curtains between consecutive nodes — OPEN polyline (no wrap; the last→first gap is the harbor mouth).
+    for (let i = 0; i + 1 < W.length; i++) {
+      const a = W[i], b = W[i + 1];
       const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
       if (len < 0.5) continue;
       const box = MeshBuilder.CreateBox(`fortwall_${h.id}_${i}`, { width: T, height: H, depth: len }, scene);

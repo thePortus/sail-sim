@@ -69,35 +69,41 @@ export function composeTown(tier, rng) {
  * clamped to the site's measured flat depth/width so the pad never has to carve into a hillside.
  */
 /**
- * Derive a town's defensive WALL RING from its flat `pad` rectangle (client-agnostic; both the Babylon and
- * native clients walk this same polyline). The pad already bounds the whole town in world space, so the ring
- * is the pad offset outward by `WALL_M` — a CLOSED loop of tagged nodes: the client places a straight curtain
- * between consecutive nodes and a tower/bastion at each node, with the harbor gate on the SEAWARD edge where
- * the pier-spine road crosses out toward the water.
+ * Derive a town's defensive WALL PATH from its flat `pad` rectangle (client-agnostic; both the Babylon and
+ * native clients walk this same polyline). The pad bounds the whole town, so the path is the pad offset
+ * outward by `WALL_M`.
  *
- * Nodes: { x, z, tag } where tag ∈ 'corner' | 'bastion' | 'gate'. Capitals get bastioned corners. Kept as a
- * simple full rectangle for the wall-path SPIKE (validate the placement path with placeholder segments before
- * the modular wall kit + tier-specific partial circuits land).
+ * Walls are LAND defence — like real Spanish-Main harbor works, the seaward frontage is left OPEN so ships can
+ * make the quay (the fort's guns cover the water instead). So this is an OPEN polyline (NOT a closed loop):
+ * the two land flanks + the inland back wall enclose the landward sides, and only short SEA-RETURN stubs flank
+ * an open harbor MOUTH in the centre of the seaward edge. Consecutive nodes are joined by a straight curtain;
+ * there is NO segment closing the last node back to the first (that gap is the harbor mouth).
+ *
+ * Nodes: { x, z, tag } where tag ∈ 'corner' | 'bastion' | 'gate'. The two seaward corners are bastions (they
+ * guard the harbor mouth); capitals bastion the inland corners too. A land GATE on the inland wall can be added
+ * later. Kept simple for the wall-path SPIKE (placeholder segments before the modular coquina kit lands).
  */
 export function deriveWalls(pad, tier) {
   if (!pad) return [];
   const WALL_M = 6;                                   // curtain stands this far outside the pad apron
   const hr = pad.rotY * Math.PI / 180;
-  const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward); -fwd = seaward
+  const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward); -fwd = seaward (the harbor)
   const rgt = [ Math.cos(hr), -Math.sin(hr)];         // across the frontage
   const hZ = pad.halfZ + WALL_M, hX = pad.halfX + WALL_M;
+  const mouth = hX * 0.55;                            // half-width of the OPEN harbor mouth (sea side stays open)
   const W = (df, ds, tag) => ({                       // pad-centre-relative (df along fwd, ds across) → world
     x: +(pad.cx + fwd[0] * df + rgt[0] * ds).toFixed(1),
     z: +(pad.cz + fwd[1] * df + rgt[1] * ds).toFixed(1),
     tag,
   });
-  const corner = tier === 'capital' ? 'bastion' : 'corner';
+  const inland = tier === 'capital' ? 'bastion' : 'corner';
   return [
-    W(-hZ, -hX, corner),   // seaward-left
-    W(-hZ,   0, 'gate'),   // sea-gate (pier spine crosses here)
-    W(-hZ,  hX, corner),   // seaward-right
-    W( hZ,  hX, corner),   // inland-right
-    W( hZ, -hX, corner),   // inland-left  (ring closes back to seaward-left)
+    W(-hZ, -mouth, 'corner'),   // left sea-return tip (edge of the open harbor mouth)
+    W(-hZ, -hX,    'bastion'),  // seaward-left strongpoint
+    W( hZ, -hX,    inland),     // inland-left
+    W( hZ,  hX,    inland),     // inland-right
+    W(-hZ,  hX,    'bastion'),  // seaward-right strongpoint
+    W(-hZ,  mouth, 'corner'),   // right sea-return tip  (OPEN gap back to node 0 = the harbor mouth)
   ];
 }
 

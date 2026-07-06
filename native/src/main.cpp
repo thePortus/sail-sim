@@ -4926,6 +4926,39 @@ int main(int argc, char** argv) {
             plaque(cpx, ph, hb.name.c_str(), sub.c_str(),
                    factionU32(hb.faction), IM_COL32(94, 64, 34, 255), true);
           }
+          // ── Fort HP bars: an overhead gauge on any fort that's been ENGAGED (a fort_state has arrived → it
+          //    took damage or was silenced). Aggregate gun HP; "SILENCED" once every gun is down. ──
+          auto fss = mpClient.fortStates();
+          for (const terrain::Harbor& hb : terr.manifest().harbors) {
+            if (hb.forts.empty()) continue;
+            auto it = fss.find("fort_" + hb.id);
+            if (it == fss.end()) continue;
+            const mp::FortState& fs = it->second;
+            const terrain::Fort& ft = hb.forts[0];
+            float d = std::hypot(ft.x - lastEye.x, ft.z - lastEye.z);
+            if (d > 1200.0f) continue;
+            float lift = hb.tier == "capital" ? 22.0f : hb.tier == "medium" ? 15.0f : 12.0f;
+            if (terrainOccluded(glm::vec3(ft.x, ft.y + 4.0f, ft.z))) continue;
+            ImVec2 cpx; float ph = pxHeight(glm::vec3(ft.x, ft.y + lift, ft.z), 6.0f, cpx);
+            if (ph <= 0.0f) continue;
+            float bw = std::clamp(ph * 7.0f, 46.0f, 150.0f), bh = std::max(5.0f, ph * 0.5f);
+            ImVec2 a(cpx.x - bw * 0.5f, cpx.y), b(cpx.x + bw * 0.5f, cpx.y + bh);
+            float frac = fs.maxHp > 0.0f ? std::clamp(fs.hp / fs.maxHp, 0.0f, 1.0f) : 0.0f;
+            ImU32 col = fs.neutralized ? IM_COL32(96, 96, 102, 255)
+                      : frac > 0.5f ? IM_COL32(120, 196, 96, 255)
+                      : frac > 0.25f ? IM_COL32(224, 188, 72, 255) : IM_COL32(214, 72, 54, 255);
+            wdl->AddRectFilled(ImVec2(a.x - 2, a.y - 2), ImVec2(b.x + 2, b.y + 2), IM_COL32(10, 14, 20, 220), 2.0f);
+            wdl->AddRectFilled(a, ImVec2(a.x + bw * frac, b.y), col, 1.5f);
+            wdl->AddRect(ImVec2(a.x - 2, a.y - 2), ImVec2(b.x + 2, b.y + 2), IM_COL32(220, 210, 190, 180), 2.0f);
+            char lbl[96];
+            if (fs.neutralized) std::snprintf(lbl, sizeof(lbl), "%s  -  SILENCED", hb.name.c_str());
+            else std::snprintf(lbl, sizeof(lbl), "%s  -  %d/%d guns", hb.name.c_str(), fs.gunsUp, fs.gunsTotal);
+            float ts = std::clamp(bh * 1.35f, 10.0f, 20.0f);
+            ImVec2 tsz = ImGui::GetFont()->CalcTextSizeA(ts, 1e9f, 0.0f, lbl);
+            ImVec2 tp(cpx.x - tsz.x * 0.5f, a.y - ts - 3.0f);
+            wdl->AddText(ImGui::GetFont(), ts, ImVec2(tp.x + 1, tp.y + 1), IM_COL32(6, 10, 16, 230), lbl);
+            wdl->AddText(ImGui::GetFont(), ts, tp, fs.neutralized ? IM_COL32(184, 184, 190, 255) : IM_COL32(255, 225, 180, 255), lbl);
+          }
         }
       }
 
@@ -5959,7 +5992,7 @@ int main(int argc, char** argv) {
         const glm::vec3 ip(ie.x, ie.y, ie.z);
         const glm::vec3 iv(ie.vx, ie.vy, ie.vz);
         const float d = glm::distance(lastEye, ip);
-        if (ie.shipHit) {
+        if (ie.shipHit && !ie.hit.fort) {   // a fort hit falls through to the land branch → stone debris, not wood
           glm::vec3 dir = iv;
           float l = glm::length(dir);
           if (l > 1e-3f) dir /= l;

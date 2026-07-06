@@ -33,6 +33,7 @@ struct Client::Impl {
   std::vector<SunkEvent> sunkIn;
   std::vector<std::string> repairedIn;
   std::map<std::string, CombatShipState> combat;
+  std::map<std::string, FortState> forts;
   std::map<std::string, std::pair<int, int>> crewBy;   // playerId -> {crew, maxCrew}
   float mastRepairMs = 0;                              // armed jury-rig duration (0 = none)
   std::map<std::string, std::pair<int, int>> gunBy;    // playerId -> {port, stbd} deploy targets
@@ -190,6 +191,8 @@ struct Client::Impl {
       h.side      = msg.value("side", std::string());
       h.tof       = msg.value("tof", 0.0f);
       h.grape     = msg.value("grape", false);
+      h.fortId    = msg.value("fortId", std::string());
+      h.fort      = msg.value("fort", false) || !h.fortId.empty();
       if (hitsIn.size() >= 256) hitsIn.erase(hitsIn.begin());
       hitsIn.push_back(std::move(h));
     } else if (type == "combat_state") {
@@ -201,6 +204,16 @@ struct Client::Impl {
         if (msg.contains("maxHp") && msg["maxHp"].is_object()) parseZones(msg["maxHp"], cs.maxHp);
         // The armed jury-rig clears once our masts climb back above zero.
         if (pid == myId && cs.zones.masts > 0.0f) mastRepairMs = 0;
+      }
+    } else if (type == "fort_state") {
+      const std::string fid = msg.value("id", std::string());
+      if (!fid.empty() && msg.contains("guns") && msg["guns"].is_array()) {
+        FortState fs; fs.neutralized = msg.value("neutralized", false);
+        for (const auto& g : msg["guns"]) {
+          float hp = g.value("hp", 0.0f), mx = g.value("maxHp", 0.0f);
+          fs.hp += hp; fs.maxHp += mx; fs.gunsTotal++; if (hp > 0.0f) fs.gunsUp++;
+        }
+        forts[fid] = fs;
       }
     } else if (type == "mast_repair") {
       mastRepairMs = msg.value("ms", 60000.0f);
@@ -719,6 +732,10 @@ std::vector<std::string> Client::drainRepaired() {
 std::map<std::string, CombatShipState> Client::combatStates() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->combat;
+}
+std::map<std::string, FortState> Client::fortStates() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->forts;
 }
 std::map<std::string, std::pair<int, int>> Client::crews() const {
   std::lock_guard<std::mutex> lock(p_->mtx);

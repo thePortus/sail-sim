@@ -91,10 +91,20 @@ struct RemoteShot {
 // matching ball (key shooterId:seq) has flown `tof` seconds.
 struct CombatHit {
   std::string shooterId, victimId, zone, side;   // zone: bow|stern|port|starboard|masts
+  std::string fortId;            // set (with fort=true) when the ball struck a harbor fort, not a ship
   int seq = 0;
   float hx = 0, hy = 0, hz = 0;  // world impact point
   float tof = 0;                 // server time-of-flight (s)
   bool grape = false;            // crew-only pellet (no zone damage, no scorch)
+  bool fort = false;             // impact on a stone fort → stone debris, not wood splinters
+};
+
+// Harbor-fort combat status ("fort_state"), keyed by fort id ("fort_<townId>"). Aggregated across the fort's
+// gun-sections for an overhead HP bar; a fort with all guns down is NEUTRALISED (silenced).
+struct FortState {
+  float hp = 0, maxHp = 0;
+  int gunsUp = 0, gunsTotal = 0;
+  bool neutralized = false;
 };
 
 // Authoritative zone HP per ship ("combat_state"). maxHp arrives with the
@@ -270,6 +280,7 @@ public:
   std::vector<std::string> drainRepaired();                // combat_repair playerIds (clear wreck/decals)
   // Zone HP per ship, keyed by playerId (self included). Copies.
   std::map<std::string, CombatShipState> combatStates() const;
+  std::map<std::string, FortState> fortStates() const;        // harbor-fort HP, keyed by fort id
   std::map<std::string, std::pair<int, int>> crews() const;   // playerId -> {crew, maxCrew}
   // Jury-rig timer: >0 ms while the server has our demasting repair armed
   // (cleared when a combat_state shows masts back above 0).

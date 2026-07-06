@@ -2204,11 +2204,13 @@ void System::draw(WGPURenderPassEncoder pass, WGPUQueue queue, const glm::mat4& 
   };
 
   const glm::vec4 noLod(0.0f);
-  // Trees/palms (client NearFade+LodDither default): the full mesh stays SOLID at
-  // full size (noLod) while the impostor screen-door DISSOLVES — mode 3 appears over
-  // [near-band, near+band] revealing the full mesh through the gaps, then dithers
-  // out at the patch-cull edge. No shrinking/growing.
-  glm::vec4 fullFade = noLod;
+  // Trees/palms (client NearFade+LodDither default, plus a native fade-in the client
+  // lacks): the full mesh renders at full SIZE (no scale) but screen-door DISSOLVES
+  // out past NEAR_FADE, so newly-streamed patches (whose instances reach ~355 m) fade
+  // in through the dither as you approach instead of popping in solid — and it never
+  // shrinks. The impostor dissolves in over [near-band, near+band] and out at the
+  // patch-cull edge; between them the two cross-dissolve over the solid inner mesh.
+  glm::vec4 fullFade(0.0f, 0.0f, 0.0f, Impl::NEAR_FADE);   // mode 0 + dither-cull from NEAR_FADE (band 60)
   glm::vec4 impFade(Impl::NEAR_FADE, Impl::NEAR_BAND, 3.0f, Impl::TREE_CULL);
   // Grass: dithers out at the GrassFade edge ((ring+0.5)*40 = 180 m; band 60).
   glm::vec4 grassFade(0.0f, 0.0f, 0.0f, (Impl::GRASS_RING + 0.5f) * Impl::PATCH - 60.0f);

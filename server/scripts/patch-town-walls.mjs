@@ -5,7 +5,9 @@
  * terrain` re-bake produces identical walls (layoutTown emits the same thing). Touches only `harbors[].walls`;
  * all geometry stays byte-identical.
  *
- * Usage (from server/):  node scripts/patch-town-walls.mjs
+ * Usage (from server/):  node scripts/patch-town-walls.mjs [path/to/manifest.json]
+ * With no arg it patches the configured bake output; pass a path to target a manifest elsewhere (e.g. another
+ * repo copy's server/assets/terrain/manifest.json — handy while the assets and this code live in separate copies).
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -14,7 +16,7 @@ import terrainConfig from '../config/terrain.config.js';
 import { deriveWalls } from '../data/town-layout.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const manifestPath = join(terrainConfig.outputDir, 'manifest.json');
+const manifestPath = process.argv[2] || join(terrainConfig.outputDir, 'manifest.json');
 
 const m = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const harbors = m.harbors || [];

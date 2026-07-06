@@ -3682,7 +3682,7 @@ int main(int argc, char** argv) {
         // it's ready well before terrain finishes and the ship spawns).
         locFuture = std::async(std::launch::async, net::playerLocation, kHost, kPort, authToken);
         locResolved = false;
-        locDeadline = glfwGetTime() + 6.0;
+        locDeadline = glfwGetTime() + 12.0;   // backstop beyond httplib's own timeouts
         mpConnected = true;
         appState = AppState::Sailing;
         musicMgr.resume();   // restart the track a logout stopped (client re-inits on entry)
@@ -5288,21 +5288,33 @@ int main(int argc, char** argv) {
       // harbour spawn is placed; SAILSIM_START (test) wins; a 404/stale/slow fetch
       // keeps the harbour spawn (resolve by the deadline so the broadcast isn't held).
       if (!locResolved && spawnPlaced && appState == AppState::Sailing) {
+        // Server slow/unreachable -> back to the login screen (Angular parity): the
+        // location fetch is a required bootstrap step, so a game can't half-spawn
+        // without it. Keep the session (the token is fine; the server is the problem).
+        auto dropToLogin = [&](const char* why) {
+          mpClient.close(); mpConnected = false;
+          uiError = why;
+          appState = AppState::Login;
+        };
         if (std::getenv("SAILSIM_START")) {
           locResolved = true;   // scripted test spawn — don't restore
         } else if (locFuture.valid() &&
                    locFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
           net::LocationResult loc = locFuture.get();
-          if (loc.ok) {
+          if (loc.ok) {                               // 200 — restore the saved anchorage
             vessel.x = loc.x; vessel.z = loc.z; vessel.heading = glm::radians(loc.heading);
             vessel.anchorX = loc.x; vessel.anchorZ = loc.z;   // carry the anchor (else the clamp yanks us back)
             vessel.speed = 0.0f;
             shipX = loc.x; shipZ = loc.z; shipHeading = vessel.heading; shipSpeed = 0.0f;
             std::printf("[spawn] restored last location (%.0f, %.0f)\n", loc.x, loc.z);
+            locResolved = true;
+          } else if (loc.status == 404) {             // no save / stale map — harbour spawn is correct
+            locResolved = true;
+          } else {                                    // unreachable (status 0) / server error — sign in again
+            dropToLogin("Lost contact with the server - please sign in again.");
           }
-          locResolved = true;
-        } else if (!locFuture.valid() || glfwGetTime() > locDeadline) {
-          locResolved = true;   // no fetch or timed out -> keep the harbour spawn
+        } else if (glfwGetTime() > locDeadline) {     // fetch never answered — server down
+          dropToLogin("The server is not responding - please sign in again.");
         }
       }
 

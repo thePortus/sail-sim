@@ -7872,12 +7872,29 @@ int main(int argc, char** argv) {
       // Immediate-mode + range-gated to keep the vertex count down.
       if (terrainR.ready) {
         const glm::vec4 stone(0.62f, 0.58f, 0.50f, 1.0f), gateCol(0.42f, 0.30f, 0.18f, 1.0f);
+        const glm::vec4 dirt(0.42f, 0.34f, 0.24f, 1.0f);
         const float H = 5.0f;
         for (const terrain::Harbor& hb : terr.manifest().harbors) {
-          if (hb.walls.size() < 2) continue;
           float dxc = hb.x - vessel.x, dzc = hb.z - vessel.z;
           if (dxc * dxc + dzc * dzc > 1600.0f * 1600.0f) continue;   // ~1.6 km stream range
           const float y0 = hb.padElev;
+          // ── Road network: each street → a ribbon draped on the terrain (port of
+          //    harbor.service buildGround's dirt roads). Subdivided so it tracks the slope. ──
+          for (const terrain::Street& st : hb.streets) {
+            float dx = st.x2 - st.x1, dz = st.z2 - st.z1, len = std::hypot(dx, dz);
+            if (len < 0.5f) continue;
+            float px = -dz / len * st.w * 0.5f, pz = dx / len * st.w * 0.5f;
+            int n = std::max(1, (int)std::ceil(len / 6.0f));
+            glm::vec3 pl(0.0f), pr(0.0f);
+            for (int i = 0; i <= n; ++i) {
+              float t = (float)i / (float)n, cx = st.x1 + dx * t, cz = st.z1 + dz * t;
+              float lx = cx + px, lz = cz + pz, rx = cx - px, rz = cz - pz;
+              glm::vec3 L(lx, terr.elevation(lx, lz) + 0.12f, lz), R(rx, terr.elevation(rx, rz) + 0.12f, rz);
+              if (i > 0) { primsSys.tri(pl, pr, L, dirt, false); primsSys.tri(pr, R, L, dirt, false); }
+              pl = L; pr = R;
+            }
+          }
+          if (hb.walls.size() < 2) continue;
           for (size_t i = 0; i + 1 < hb.walls.size(); ++i) {          // curtains — OPEN path (no wrap; the gap is the harbor mouth)
             const terrain::WallNode& a = hb.walls[i];
             const terrain::WallNode& b = hb.walls[i + 1];

@@ -64,6 +64,16 @@ bool Terrain::load(const std::string& host, int port) {
           if (!bd.asset.empty()) hb.buildings.push_back(bd);
         }
       }
+      if (h.contains("streets") && h["streets"].is_array()) {
+        for (const auto& s : h["streets"]) {
+          if (!s.is_object()) continue;
+          Street st;
+          st.x1 = num(s, "x1", 0.0f); st.z1 = num(s, "z1", 0.0f);
+          st.x2 = num(s, "x2", 0.0f); st.z2 = num(s, "z2", 0.0f);
+          st.w = num(s, "width", 5.0f);
+          hb.streets.push_back(st);
+        }
+      }
       if (h.contains("walls") && h["walls"].is_array()) {
         for (const auto& w : h["walls"]) {
           if (!w.is_object()) continue;

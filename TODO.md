@@ -9,6 +9,7 @@
 * camera clipping w terain
 * auto updater?
 * polars for sailing serverside, sailing penalties for mast damage should be serverside. Want server to enforce fair play
+* crew on pinnace sit with feet through floor
 
 # General or Current TODO Items
 

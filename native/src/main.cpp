@@ -3463,6 +3463,7 @@ int main(int argc, char** argv) {
   std::future<bool> terrFuture = std::async(std::launch::async,
       [&terr, kHost, kPort] { return terr.load(kHost, kPort); });
   bool terrHandled = false;
+  bool terrReady = false;   // terrain actually loaded (else the server hasn't generated any)
 
   // "Remember me": if a saved session exists, validate its token via /user/me and,
   // if still good, drop the player straight into the game. A 401 clears it.
@@ -3599,6 +3600,7 @@ int main(int argc, char** argv) {
     if (!terrHandled && terrFuture.valid() &&
         terrFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
       if (terrFuture.get() && terr.loaded()) {
+        terrReady = true;
         const terrain::Manifest& tm = terr.manifest();
         uploadTerrainHeight(device, queue, terrainR, tm.width, tm.height, terr.field().data());
         scatterSys.setTerrain(&terr);
@@ -3774,6 +3776,15 @@ int main(int argc, char** argv) {
       session::clear();
       authToken.clear(); authCallsign.clear(); authUsername.clear(); authRole.clear();
       uiError = "Session expired - please sign in again.";
+      appState = AppState::Login;
+    }
+
+    // Server has no terrain generated yet (/terrain/manifest 404): don't drop the
+    // player into a blank ocean — bounce to login with a note once the terrain
+    // fetch has resolved (terrHandled) and it came back empty. Keep the session.
+    if (appState == AppState::Sailing && terrHandled && !terrReady) {
+      mpClient.close(); mpConnected = false;
+      uiError = "Server not ready: no terrain has been generated yet.";
       appState = AppState::Login;
     }
 

@@ -3035,6 +3035,21 @@ int main(int argc, char** argv) {
     return out;
   };
 
+  // ── Intro tutorial / quest UI state (server-driven; see net_mp quest()) ──
+  std::vector<mp::QuestPanel> qmPanels;   // active narrative slide sequence (modal)
+  int  qmIdx = 0; bool qmBeat = false; int qmReward = 0;
+  std::string qmStageKey;                 // "questId:stage" already shown (intro slides once/stage)
+  int  qToastGold = -1; double qToastT = 0;          // silent stage-reward toast
+  bool qSkipConfirm = false;
+  // client_ack auto-detection bases (mirror quest-action.service): look about /
+  // work the helm both ways / change the canvas.
+  bool qCamBase = false; float qCamBaseYaw = 0, qCamBasePitch = 0;
+  bool qTurnedL = false, qTurnedR = false;
+  int  qSailBase = -1;
+  std::vector<std::string> qAcked;        // objectives client-acked (avoid re-sending pre-echo)
+  // Ship-name modal (server rename_prompt after the intro, or a shipwright buy)
+  bool qNameOpen = false; char qNameBuf[64] = { 0 }; std::string qNameErr;
+
   // Previous frame's camera (the HUD/label pass runs before this frame's camera
   // math; a one-frame lag on screen-projected labels is imperceptible).
   glm::mat4 lastViewProj(1.0f);
@@ -4806,6 +4821,173 @@ int main(int argc, char** argv) {
             plaque(cpx, ph, hb.name.c_str(), sub.c_str(),
                    factionU32(hb.faction), IM_COL32(94, 64, 34, 255), true);
           }
+        }
+      }
+
+      // ── Intro tutorial (server-driven quest engine; ports quest-tracker /
+      //    quest-modal / quest-action.service). The 3-quest arc, progress, rewards,
+      //    completion memory and skip all live server-side; here we render the
+      //    tracker + story modals, auto-detect the trivial UI acks, and confirm/skip.
+      {
+        mp::QuestUpdate q = mpClient.quest();
+        auto qAckedHas = [&](const std::string& id) {
+          return std::find(qAcked.begin(), qAcked.end(), id) != qAcked.end();
+        };
+        auto qLive = [&](const char* id) -> bool {
+          if (!q.active) return false;
+          for (const auto& o : q.objectives)
+            if (o.id == id) return !o.done && !qAckedHas(id);
+          return false;
+        };
+        auto doAck = [&](const std::string& id) { qAcked.push_back(id); mpClient.questAck(id); };
+
+        // ── Client-ack auto-detection: look about / work the helm both ways / change canvas. ──
+        if (qLive("rotate_cam")) {
+          if (!qCamBase) { qCamBase = true; qCamBaseYaw = camYawOffset; qCamBasePitch = camPitch; }
+          else if (std::fabs(camYawOffset - qCamBaseYaw) + std::fabs(camPitch - qCamBasePitch) > 0.21f) doAck("rotate_cam");
+        } else { qCamBase = false; }
+        if (qLive("turn_helm")) {
+          if (helmInput < 0) qTurnedL = true;
+          if (helmInput > 0) qTurnedR = true;
+          if (qTurnedL && qTurnedR) doAck("turn_helm");
+        } else { qTurnedL = qTurnedR = false; }
+        if (qLive("trim_sails")) {
+          if (qSailBase < 0) qSailBase = vessel.sailState;
+          else if (vessel.sailState != qSailBase) doAck("trim_sails");
+        } else { qSailBase = -1; }
+
+        // ── Story modal enqueue (mirror quest-modal): a closing BEAT takes priority
+        //    over the next stage's intro; each is enqueued only while idle. ──
+        int rg = mpClient.consumeQuestReward();
+        if (rg >= 0) { qToastGold = rg; qToastT = ImGui::GetTime(); }
+        if (qToastGold >= 0 && ImGui::GetTime() - qToastT > 2.8) qToastGold = -1;
+        if (qmPanels.empty()) {
+          mp::QuestNarrative beat = mpClient.consumeQuestNarrative();
+          if (beat.valid && !beat.panels.empty()) {
+            qmPanels = beat.panels; qmBeat = true; qmReward = beat.rewardGold; qmIdx = 0;
+          } else if (q.active && !q.narrative.empty()) {
+            std::string key = q.questId + ":" + std::to_string(q.stageIndex);
+            if (key != qmStageKey) { qmStageKey = key; qmPanels = q.narrative; qmBeat = false; qmReward = 0; qmIdx = 0; }
+          }
+        }
+        // Ship rename (server invite after the intro arc, or a shipwright purchase).
+        mp::RenamePrompt rn = mpClient.consumeRenamePrompt();
+        if (rn.valid) {
+          qNameOpen = true; qNameErr.clear();
+          std::strncpy(qNameBuf, rn.shipName.c_str(), sizeof(qNameBuf) - 1);
+          qNameBuf[sizeof(qNameBuf) - 1] = 0;
+        }
+        mp::ShipNameReply sr = mpClient.consumeShipNameReply();
+        if (sr.valid) { if (sr.ok) qNameOpen = false; else qNameErr = "That name was refused (foul language). Try another."; }
+
+        // ── Quest tracker: the objective checklist (draggable), skip for intro. ──
+        if (q.active) {
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 302.0f, 92.0f), ImGuiCond_FirstUseEver);
+          ImGui::SetNextWindowSizeConstraints(ImVec2(288, 0), ImVec2(288, FLT_MAX));
+          ImGui::Begin("Quest##tracker", nullptr,
+                       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+          ImGui::PushFont(fontTitle);
+          ImGui::TextColored(ImVec4(0.94f, 0.91f, 0.84f, 1.0f), "%s", q.title.c_str());
+          ImGui::PopFont();
+          ImGui::SameLine();
+          ImGui::TextDisabled("%d / %d", q.stageIndex + 1, q.stageCount);
+          ImGui::Separator();
+          for (const auto& o : q.objectives) {
+            bool done = o.done || qAckedHas(o.id);
+            ImGui::TextColored(done ? ImVec4(0.56f, 0.75f, 0.54f, 1.0f) : ImVec4(0.61f, 0.70f, 0.78f, 1.0f),
+                               done ? "[x]" : "[  ]");
+            ImGui::SameLine();
+            ImGui::PushTextWrapPos(280.0f);
+            if (done) ImGui::TextColored(ImVec4(0.56f, 0.75f, 0.54f, 0.85f), "%s", o.label.c_str());
+            else {
+              ImGui::TextWrapped("%s", o.label.c_str());
+              if (!o.hint.empty())
+                ImGui::TextColored(ImVec4(0.62f, 0.69f, 0.75f, 1.0f), "%s", o.hint.c_str());
+              if (o.type == "client_ack" && o.manual) {
+                if (ImGui::SmallButton((std::string("Done \xE2\x9C\x93##") + o.id).c_str())) doAck(o.id);
+              }
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+          }
+          ImGui::Separator();
+          if (q.rewardGold > 0) { ImGui::TextColored(ImVec4(1.0f, 0.83f, 0.47f, 1.0f), "Reward: %d gold", q.rewardGold); ImGui::SameLine(); }
+          if (q.intro) {
+            if (!qSkipConfirm) {
+              if (ImGui::SmallButton("Skip tutorial")) qSkipConfirm = true;
+            } else {
+              if (ImGui::SmallButton("Skip - sure?")) { mpClient.questSkip(); qSkipConfirm = false; }
+              ImGui::SameLine();
+              if (ImGui::SmallButton("Keep")) qSkipConfirm = false;
+            }
+          }
+          ImGui::End();
+        }
+
+        // ── Story modal: atmospheric narrative panels with art, click-through. ──
+        if (!qmPanels.empty()) {
+          ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(6, 10, 16, 205));
+          const mp::QuestPanel& panel = qmPanels[std::min(qmIdx, (int)qmPanels.size() - 1)];
+          float mw = std::min(620.0f, io.DisplaySize.x * 0.92f);
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSizeConstraints(ImVec2(mw, 0), ImVec2(mw, io.DisplaySize.y * 0.9f));
+          ImGui::SetNextWindowFocus();
+          ImGui::Begin("##questmodal", nullptr,
+                       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+          if (!panel.image.empty()) {
+            auto img = menuImage("quests/" + panel.image);
+            if (img.first && img.second.x > 0) {
+              float iw = mw - 24.0f, ih = iw * (img.second.y / img.second.x);
+              ImGui::Image((ImTextureID)img.first, ImVec2(iw, ih));
+              ImGui::Spacing();
+            }
+          }
+          ImGui::PushTextWrapPos(mw - 24.0f);
+          ImGui::TextWrapped("%s", panel.text.c_str());
+          ImGui::PopTextWrapPos();
+          if (qmBeat && qmReward > 0 && qmIdx >= (int)qmPanels.size() - 1)
+            ImGui::TextColored(ImVec4(1.0f, 0.83f, 0.47f, 1.0f), "\xE2\x9A\x9C +%d gold", qmReward);
+          ImGui::Spacing();
+          ImGui::TextDisabled("%d / %d", qmIdx + 1, (int)qmPanels.size());
+          ImGui::SameLine(mw - 130.0f);
+          bool last = qmIdx >= (int)qmPanels.size() - 1;
+          const char* blabel = last ? (qmBeat ? "Onward >" : "Begin >") : "Continue >";
+          if (ImGui::Button(blabel, ImVec2(110, 0))) {
+            if (!last) qmIdx++;
+            else { qmPanels.clear(); qmIdx = 0; qmBeat = false; qmReward = 0; }
+          }
+          ImGui::End();
+        }
+
+        // ── Ship-name modal (name the Saltmeadow after the intro / shipwright buy). ──
+        if (qNameOpen) {
+          ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(6, 10, 16, 180));
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Always);
+          ImGui::SetNextWindowFocus();
+          ImGui::Begin("Name your ship##shipname", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+          ImGui::TextWrapped("A captain's ship deserves a name. What shall she be called?");
+          ImGui::Spacing();
+          ImGui::SetNextItemWidth(-1.0f);
+          bool enter = ImGui::InputText("##shipnameinput", qNameBuf, sizeof(qNameBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+          if (!qNameErr.empty()) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "%s", qNameErr.c_str());
+          ImGui::Spacing();
+          bool save = ImGui::Button("Christen her", ImVec2(140, 0)) || enter;
+          if (save && qNameBuf[0]) mpClient.setShipName(qNameBuf);
+          ImGui::SameLine();
+          if (ImGui::Button("Later", ImVec2(90, 0))) qNameOpen = false;
+          ImGui::End();
+        }
+
+        // ── Silent stage-reward toast. ──
+        if (qToastGold >= 0) {
+          char tb[48]; std::snprintf(tb, sizeof(tb), "\xE2\x9A\x9C +%d gold", qToastGold);
+          ImVec2 ts = ImGui::CalcTextSize(tb);
+          ImVec2 tp(io.DisplaySize.x * 0.5f - ts.x * 0.5f, io.DisplaySize.y * 0.16f);
+          ImDrawList* fdl = ImGui::GetForegroundDrawList();
+          fdl->AddText(ImVec2(tp.x + 1.5f, tp.y + 1.5f), IM_COL32(0, 0, 0, 200), tb);
+          fdl->AddText(tp, IM_COL32(255, 212, 121, 255), tb);
         }
       }
 

@@ -164,6 +164,33 @@ struct TownState {
   std::string shipStatus;                       // ship_bought/ship_error/upgrade_* summary
 };
 
+// ── Intro tutorial / quests (server-authoritative; see server/quest.js) ───────
+// The engine + progress live on the server; the client renders the active stage,
+// auto-detects the trivial UI acks, and confirms/skips. Completion is persisted
+// server-side (User.questState), so a finished/skipped intro is never re-offered.
+struct QuestPanel { std::string image, text; };   // narrative slide: art slot + prose
+struct QuestObjective {
+  std::string id, type, image, label, hint;
+  bool manual = false;   // client_ack shown with a 'Done' button (else auto/server-verified)
+  bool done = false;
+};
+struct QuestUpdate {
+  bool active = false;                        // false => no active quest (hide the tracker)
+  bool intro = false;                         // questId is an intro_* quest (show Skip)
+  std::string questId, title;
+  int stageIndex = 0, stageCount = 0;
+  std::vector<QuestPanel> narrative;          // this stage's intro slides (shown once/stage)
+  std::vector<QuestObjective> objectives;
+  int rewardGold = 0;
+};
+struct QuestNarrative {                        // a stage's closing "beat" (consume-once)
+  bool valid = false;
+  std::vector<QuestPanel> panels;
+  int rewardGold = 0;
+};
+struct RenamePrompt { bool valid = false; std::string shipName; };        // consume-once
+struct ShipNameReply { bool valid = false, ok = true; std::string name; }; // consume-once
+
 class Client {
 public:
   Client();
@@ -201,7 +228,7 @@ public:
   // ── Town economy (dock menu) — fire-and-forget sends; replies land in town(). ──
   TownState town() const;
   void recruitCrew();                          // tavern: hire one sailor
-  void listenRumor();                          // tavern: overhear a treasure-ship rumour
+  void listenRumor();                          // tavern: overhear a treasure-ship rumour (also acks the quest)
   void askPirates();                           // tavern: ask about pirate activity
   void tradeOpen(const std::string& townId);   // trader: request the market quote
   void tradeBuy(const std::string& townId, const std::string& goodId, int qty);
@@ -210,6 +237,17 @@ public:
   void buyShip(const std::string& slug);                   // shipwright: replace the hull
   void buyUpgrade(const std::string& kind);                // shipwright: 'cannon' | 'armor'
   void requestCombatReset();                               // shipwright: hull repair
+
+  // ── Intro tutorial / quests ──
+  QuestUpdate quest() const;                   // current active quest (active=false => none)
+  QuestNarrative consumeQuestNarrative();      // a stage's closing story beat (once)
+  int  consumeQuestReward();                   // silent stage gold for a toast (-1 = none)
+  RenamePrompt consumeRenamePrompt();          // server invited a ship rename (after intro)
+  std::string myShipName() const;              // our own custom ship name
+  ShipNameReply consumeShipNameReply();        // reply to setShipName (ok / profanity-rejected)
+  void questAck(const std::string& objectiveId);           // confirm a client_ack objective
+  void questSkip();                                        // skip the whole intro arc
+  void setShipName(const std::string& name);               // name/rename our vessel
 
   // ── Combat (phase 0 plumbing; consumers land per COMBAT_PLAN.md phases) ──
   // Fire one gun/pellet. The server validates origin (16 m), velocity band per

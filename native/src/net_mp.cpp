@@ -39,6 +39,26 @@ struct Client::Impl {
   std::map<std::string, SalvageCrate> crates;
   SalvageCollected salvaged;
   RepairResult repairRes;
+  // ── Intro tutorial / quests ──
+  QuestUpdate questUpd;          // live-read active quest (active=false => none)
+  QuestNarrative questNarr;      // closing-beat panels (consume-once)
+  int questReward = -1;          // silent stage gold for a toast (-1 = none pending)
+  RenamePrompt renamePrompt;     // server invited a ship rename (consume-once)
+  ShipNameReply shipNameReply;   // reply to a setShipName (consume-once)
+
+  // Null-safe string read: the quest payload sends nullable fields (e.g. an
+  // objective's `image: o.image || null`), and json::value(key, "") THROWS on a
+  // present-but-null field — so read only when it's actually a string.
+  static std::string jstr(const json& j, const char* key) {
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+  }
+  static std::vector<QuestPanel> parsePanels(const json& arr) {
+    std::vector<QuestPanel> v;
+    if (arr.is_array())
+      for (const auto& p : arr) v.push_back({ jstr(p, "image"), jstr(p, "text") });
+    return v;
+  }
 
   static void parseZones(const json& j, CombatZones& z) {
     z.bow       = j.value("bow", z.bow);
@@ -365,6 +385,49 @@ struct Client::Impl {
                                       m.value("callsign", std::string()) });
         }
       }
+    } else if (type == "quest_update") {
+      // Active-quest stage snapshot; questId null => clear the tracker (intro done/skipped).
+      questUpd = QuestUpdate{};
+      if (!msg.value("questId", json()).is_null()) {
+        questUpd.active     = true;
+        questUpd.questId    = jstr(msg, "questId");
+        questUpd.intro      = questUpd.questId.rfind("intro_", 0) == 0;
+        questUpd.title      = jstr(msg, "title");
+        questUpd.stageIndex = msg.value("stageIndex", 0);
+        questUpd.stageCount = msg.value("stageCount", 0);
+        questUpd.narrative  = parsePanels(msg.value("narrative", json::array()));
+        if (msg.contains("objectives") && msg["objectives"].is_array())
+          for (const auto& o : msg["objectives"]) {
+            QuestObjective q;
+            q.id     = jstr(o, "id");
+            q.type   = jstr(o, "type");
+            q.image  = jstr(o, "image");   // nullable on the wire
+            q.label  = jstr(o, "label");
+            q.hint   = jstr(o, "hint");
+            q.manual = o.value("manual", false);
+            q.done   = o.value("done", false);
+            questUpd.objectives.push_back(std::move(q));
+          }
+        if (msg.contains("reward") && msg["reward"].is_object())
+          questUpd.rewardGold = msg["reward"].value("gold", 0);
+      }
+    } else if (type == "quest_narrative") {
+      questNarr.valid = true;
+      questNarr.panels = parsePanels(msg.value("panels", json::array()));
+      questNarr.rewardGold = msg.value("rewardGold", 0);
+    } else if (type == "quest_reward") {
+      questReward = msg.value("gold", 0);
+    } else if (type == "rename_prompt") {
+      renamePrompt.valid = true;
+      std::string sn = jstr(msg, "shipName");
+      renamePrompt.shipName = sn.empty() ? "Saltmeadow" : sn;
+    } else if (type == "ship_name_set") {
+      // Reply to set_ship_name: adopt the accepted name, or flag a profanity rejection.
+      shipNameReply.valid = true;
+      shipNameReply.ok = jstr(msg, "rejected").empty();
+      std::string sn = jstr(msg, "shipName");
+      shipNameReply.name = sn.empty() ? "Saltmeadow" : sn;
+      if (shipNameReply.ok) townSt.shipName = shipNameReply.name;
     }
     // squadron_invited needs no special handling: the server also sends a system
     // chat line ("... invited you ... type /squad accept"), which the chat panel
@@ -542,6 +605,52 @@ void Client::buyUpgrade(const std::string& kind) {
 void Client::requestCombatReset() {
   if (p_->conn.load() != ConnState::Open) return;
   p_->ws.send(json{{"type", "combat_reset"}}.dump());
+}
+
+// ── Intro tutorial / quests ───────────────────────────────────────────────────
+QuestUpdate Client::quest() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->questUpd;
+}
+QuestNarrative Client::consumeQuestNarrative() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  QuestNarrative n = p_->questNarr;
+  p_->questNarr = QuestNarrative{};
+  return n;
+}
+int Client::consumeQuestReward() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  int g = p_->questReward;
+  p_->questReward = -1;
+  return g;
+}
+RenamePrompt Client::consumeRenamePrompt() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  RenamePrompt r = p_->renamePrompt;
+  p_->renamePrompt = RenamePrompt{};
+  return r;
+}
+std::string Client::myShipName() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->townSt.shipName;
+}
+ShipNameReply Client::consumeShipNameReply() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  ShipNameReply r = p_->shipNameReply;
+  p_->shipNameReply = ShipNameReply{};
+  return r;
+}
+void Client::questAck(const std::string& objectiveId) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "quest_ack"}, {"objectiveId", objectiveId}}.dump());
+}
+void Client::questSkip() {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "quest_skip"}}.dump());
+}
+void Client::setShipName(const std::string& name) {
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "set_ship_name"}, {"shipName", name}}.dump());
 }
 
 // ── Combat sends + state accessors ────────────────────────────────────────────

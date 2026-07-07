@@ -3695,6 +3695,7 @@ int main(int argc, char** argv) {
   std::string chatActiveTab;                   // "" = Main, else a DM callsign
   char chatInput[512] = "";
   bool chatFocusInput = false, chatStickBottom = true;
+  bool chatPrefillSlash = false;   // "/" hotkey opened chat with a leading slash → put the cursor after it
   bool chatOpen = false;   // collapsed to a bubble by default (full-restructure HUD)
   int  chatUnread = 0;     // messages arrived while collapsed (badge on the bubble)
 
@@ -5980,6 +5981,11 @@ int main(int argc, char** argv) {
           (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
         chatFocusInput = true; chatOpen = true; chatUnread = 0;
       }
+      // "/" (while not typing) opens the chat prefilled with a slash, ready to type a command (browser hotkey).
+      if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Slash, false)) {
+        chatInput[0] = '/'; chatInput[1] = '\0';
+        chatFocusInput = true; chatOpen = true; chatUnread = 0; chatPrefillSlash = true;
+      }
 
       // Collapsed: a chat-bubble button (bottom-left) with an unread badge.
       if (!chatOpen) {
@@ -6051,8 +6057,18 @@ int main(int argc, char** argv) {
         // commands and rejects unknowns) — except /help, which is answered locally.
         if (chatFocusInput) { ImGui::SetKeyboardFocusHere(); chatFocusInput = false; }
         ImGui::SetNextItemWidth(-30.0f);
+        // When the "/" hotkey prefilled the input, focus normally selects-all — override the cursor to the end
+        // (deselected) so the next keystroke appends the command instead of replacing the slash.
+        auto slashCb = +[](ImGuiInputTextCallbackData* d) -> int {
+          bool* pf = static_cast<bool*>(d->UserData);
+          d->CursorPos = d->BufTextLen; d->SelectionStart = d->SelectionEnd = d->CursorPos;
+          *pf = false;
+          return 0;
+        };
         bool send = ImGui::InputText("##chatin", chatInput, sizeof(chatInput),
-                                     ImGuiInputTextFlags_EnterReturnsTrue);
+                                     ImGuiInputTextFlags_EnterReturnsTrue |
+                                     (chatPrefillSlash ? ImGuiInputTextFlags_CallbackAlways : 0),
+                                     chatPrefillSlash ? slashCb : nullptr, &chatPrefillSlash);
         ImGui::SameLine();
         send = ImGui::Button(ICON_FA_PAPER_PLANE, ImVec2(30.0f, 0.0f)) || send;
         if (send) {

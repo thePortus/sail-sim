@@ -30,7 +30,12 @@ services:
       # forcing a full re-bake. Bind-mounting the host repo dir makes it the single source of truth: the
       # container sees whatever is already generated on the host, and new bakes persist back to the host.
       # (Safe to overlay — the Dockerfile builds NO assets at image-build time; they're all runtime-generated.)
+      # This ALSO persists server/assets/client (the published desktop-client releases + appcast feeds).
       - ./server/assets:/server/assets
+      # Persist the auto-update signing key (Ed25519 private key from `client-release.js keygen`). Without this
+      # mount a rebuild destroys it — and losing it means you can NEVER ship another update to installed clients.
+      # Git-ignored on the host, so it never enters the image; the bind mount is its only home.
+      - ./server/.sparkle:/server/.sparkle
     environment:
       - DB_HOST=mysqldb
       - DB_USER=root

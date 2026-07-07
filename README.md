@@ -170,13 +170,14 @@ Publish writes the signed zip + `appcast-mac.xml` / `appcast-win.xml` into `serv
 **`/client`** — the feed URLs you baked into the builds. Installed clients pick up the update on their next
 launch. Done.
 
-### Important: persist the key + releases across deploys (Docker volumes)
+### Persistence across deploys (already configured)
 
-`server/assets/client/` and `server/.sparkle/` are git-ignored, so they're **not** in the image — they live only
-in the running container. **Mount both as volumes** in your `docker compose` so a `docker compose up --build`
-doesn't wipe your published releases and, critically, your one-and-only signing key. If they're host-mounted
-volumes you can skip the `docker cp` and just run the publish script on the host (with Node installed), pointing
-`--file` straight at the volume path.
+`server/assets/client/` (the releases) and `server/.sparkle/` (your signing key) are git-ignored, so they're
+**not** baked into the image. `docker-compose.yml` bind-mounts both from the host, so `docker compose up --build`
+keeps them — the releases via the existing `./server/assets` mount, the key via `./server/.sparkle`. Because
+they're host paths, you can also skip the `docker cp` and run the publish script on the host (with Node
+installed), pointing `--file` straight at `server/assets/client` on disk. **Back up `server/.sparkle/` off the
+host regardless** — a bind mount protects it from rebuilds, not from the box dying.
 
 # Credits
 

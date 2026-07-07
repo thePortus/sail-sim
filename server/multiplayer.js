@@ -2220,6 +2220,22 @@ function attachMultiplayer(server) {
             }
           }
 
+        } else if (text === '/stuck') {
+          // /stuck — self-rescue: teleport the caller to a nearby patch of open water (unstick from land/shallows/
+          // geometry). Ring-searches outward from the player's authoritative pose for the first non-land spot.
+          const me = players.get(id);
+          const from = me && (me.authPose || me.state);
+          if (!from) { sysReply(me?.ws, 'You must be at sea to use /stuck.'); }
+          else {
+            const spot = findWaterNear(from.x, from.z);
+            if (!spot) { sysReply(me.ws, 'No open water found nearby.'); }
+            else {
+              const heading = (Math.atan2(spot.x - from.x, spot.z - from.z) * 180 / Math.PI + 360) % 360;
+              teleportTo(id, me, spot.x, spot.z, heading);   // faces the open water it moved you toward
+              sysReply(me.ws, `Freed — moved to open water at (${spot.x.toFixed(0)}, ${spot.z.toFixed(0)}).`);
+            }
+          }
+
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
 

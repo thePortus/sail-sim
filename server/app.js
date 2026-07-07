@@ -10,6 +10,7 @@ const express = require('express');
 const cors = require('cors');
 const favicon = require('serve-favicon');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -51,6 +52,30 @@ app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry'), {
     if (filePath.endsWith('.ktx2')) res.setHeader('Content-Type', 'image/ktx2');
   },
 }));
+// Auto-updater feed + binaries (Sparkle on macOS, WinSparkle on Windows). The appcast XML must be revalidated
+// on every update check (no-cache + ETag → 304 when unchanged), while the versioned build artifacts carry
+// unique filenames so they can be cached hard. Populated by server/scripts/client-release.js.
+app.use('/client', express.static(path.join(__dirname, 'assets/client'), {
+  etag: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.xml')) res.setHeader('Cache-Control', 'no-cache');
+    else res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  },
+}));
+
+// Native desktop-client download: stream the newest published build for a platform. Streaming (not a redirect
+// to /client/…) keeps it working behind the reverse proxy, where only /api is routed to Node.
+app.get('/download/:platform', (req, res) => {
+  const platform = req.params.platform === 'win' ? 'win' : req.params.platform === 'mac' ? 'mac' : null;
+  if (!platform) return res.status(404).send('Unknown platform.');
+  const dir = path.join(__dirname, 'assets/client');
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => new RegExp(`^SailSim-.*-${platform}\\.zip$`).test(f)); } catch {}
+  if (!files.length) return res.status(404).send(`No ${platform} build has been published yet.`);
+  files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));   // newest version last
+  res.download(path.join(dir, files[files.length - 1]));
+});
+
 // set API routes
 require('./routes/index')(app);
 

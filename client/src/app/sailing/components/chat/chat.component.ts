@@ -318,7 +318,7 @@ export class ChatComponent implements AfterViewInit, OnDestroy {
   private readonly SERVER_COMMANDS = [
     't', 'friend', 'promote', 'demote', 'kick', 'ban', 'unban', 'reloadassets',
     'godmode', 'teleport', 'teleporto', 'repair', 'crew', 'givegold', 'diplomacy', 'mast', 'squad', 's',
-    'pirates',
+    'pirates', 'stuck',
   ];
 
   sendMessage(): void {

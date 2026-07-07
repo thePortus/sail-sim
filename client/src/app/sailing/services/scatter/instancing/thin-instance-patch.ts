@@ -10,6 +10,10 @@ import { IPatch } from './i-patch';
  */
 export class ThinInstancePatch implements IPatch {
   private baseMesh: Mesh | null = null;
+  /** Optional SECOND clone (cross-dissolve ring) sharing this patch's matrix/colour buffers — see IPatch. */
+  private secondaryMesh: Mesh | null = null;
+  /** Terrain-occlusion state (see setCulled); re-applied to any freshly-cloned mesh in makeClone. */
+  private culled = false;
   private readonly position: Vector3;
   readonly matrixBuffer: Float32Array;
   /** Optional per-instance colour buffer (N × 4 RGBA) — e.g. rock colour variation. */
@@ -22,41 +26,59 @@ export class ThinInstancePatch implements IPatch {
   }
 
   clearInstances(): void {
-    if (this.baseMesh === null) { return; }
-    this.baseMesh.thinInstanceCount = 0;
-    this.baseMesh.dispose();
+    for (const m of [this.baseMesh, this.secondaryMesh]) {
+      if (m) { m.thinInstanceCount = 0; m.dispose(); }
+    }
     this.baseMesh = null;
+    this.secondaryMesh = null;
   }
 
-  createInstances(baseMesh: TransformNode, fraction = 1): void {
+  createInstances(baseMesh: TransformNode, fraction = 1, secondary?: TransformNode): void {
     this.clearInstances();
     if (!(baseMesh instanceof Mesh)) {
       throw new Error('ThinInstancePatch requires a Mesh base (use a HierarchyInstancePatch for TransformNodes).');
     }
-    this.baseMesh = baseMesh.clone(baseMesh.name + '_patch');
-    this.baseMesh.makeGeometryUnique();
-    this.baseMesh.isVisible = true;
-    this.baseMesh.thinInstanceSetBuffer('matrix', this.matrixBuffer, 16);
-    if (this.colorBuffer) { this.baseMesh.thinInstanceSetBuffer('color', this.colorBuffer, 4); }
+    this.baseMesh = this.makeClone(baseMesh, fraction);
+    if (secondary instanceof Mesh) { this.secondaryMesh = this.makeClone(secondary, fraction); }
+  }
+
+  /** Clone a base LoD mesh and bind it to this patch's shared matrix/colour buffers. Both the primary and
+   *  the cross-dissolve secondary go through here. */
+  private makeClone(base: Mesh, fraction: number): Mesh {
+    const mesh = base.clone(base.name + '_patch');
+    mesh.makeGeometryUnique();
+    mesh.isVisible = true;
+    mesh.thinInstanceSetBuffer('matrix', this.matrixBuffer, 16);
+    if (this.colorBuffer) { mesh.thinInstanceSetBuffer('color', this.colorBuffer, 4); }
     // Distant LoD tiers render only a `fraction` of the (pre-shuffled) buffer — a uniform random
     // subsample — so far patches draw far fewer blades. setBuffer reset the count to the full size.
     if (fraction < 1) {
       const total = (this.matrixBuffer.length / 16) | 0;
-      this.baseMesh.thinInstanceCount = Math.max(1, Math.floor(total * fraction));
+      mesh.thinInstanceCount = Math.max(1, Math.floor(total * fraction));
     }
     // The instances live at world positions but the base mesh sits at the origin — refresh the
     // bounding info so it encloses the instances at their REAL world extents. This both stops the
     // patch being wrongly culled by the (offscreen) origin box AND gives it a correct box so the
     // frustum can cull it when it's off-screen — essential for perf, since otherwise the whole 360°
     // ring of patches around the camera draws every frame (only a ~90° wedge is ever visible).
-    this.baseMesh.thinInstanceRefreshBoundingInfo(true);
+    mesh.thinInstanceRefreshBoundingInfo(true);
 
     // A patch never moves once placed: its instances live at fixed world positions and the base mesh
     // itself stays at the origin. So skip the per-frame world-matrix recompute and bounding-info sync, and
     // take it out of picking — pure CPU savings across the hundreds of live patch meshes, no visual change.
-    this.baseMesh.isPickable = false;
-    this.baseMesh.doNotSyncBoundingInfo = true;
-    this.baseMesh.freezeWorldMatrix();
+    mesh.isPickable = false;
+    mesh.doNotSyncBoundingInfo = true;
+    mesh.freezeWorldMatrix();
+    if (this.culled) { mesh.setEnabled(false); }   // re-materialized while occluded → stay hidden until re-tested
+    return mesh;
+  }
+
+  setCulled(occluded: boolean): void {
+    if (occluded === this.culled) { return; }
+    this.culled = occluded;
+    const on = !occluded;
+    if (this.baseMesh) { this.baseMesh.setEnabled(on); }
+    if (this.secondaryMesh) { this.secondaryMesh.setEnabled(on); }
   }
 
   getNbInstances(): number {
@@ -67,6 +89,5 @@ export class ThinInstancePatch implements IPatch {
 
   dispose(): void {
     this.clearInstances();
-    if (this.baseMesh !== null) { this.baseMesh.dispose(); }
   }
 }

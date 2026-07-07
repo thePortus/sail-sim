@@ -213,6 +213,7 @@ uniform float u_shoreMapSize;      // full world-space width covered (metres)
 uniform float u_cloudCoverage;   // 0 = clear, 1 = fully overcast
 uniform float u_sunElevation;    // sin(elevation): −1 night → +1 noon
 uniform float u_rainIntensity;   // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform float u_sunOcclusion;    // 1 = sun visible, 0 = hidden behind terrain/cloud — dims the specular sun glint
 uniform float u_reflectionStrength;  // 1 = RTT reflections on, 0 = analytic-sky only (Reflections setting)
 uniform float u_seabedStrength;      // 1 = shallow-water transparency on, 0 = off (Water-transparency setting)
 uniform int u_normalIter;            // per-LOD fragment normal detail (near hi, far lo)
@@ -381,7 +382,7 @@ float getSun(vec3 dir) {
   // LARGE coherent areas, so the unclamped 210 HDR blew out into blinding white patch fields (worst
   // with reflections off, where the analytic term is 100% of the mirror; still 20% leak with it on —
   // the long-standing "white patches" artifact). Cap the energy: sparkle stays, blowout can't.
-  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2);
+  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2) * u_sunOcclusion;   // dim the glint when the sun is behind terrain/cloud
 }
 
 vec3 aces_tonemap(vec3 color) {
@@ -564,6 +565,12 @@ void main() {
   vec3 reflection = mix(reflectionAnalytic, reflectionRTT, 0.80 * u_reflectionStrength);
   // (u_reflectionStrength = 0 → analytic sky only; the reflection RTT pass is also
   //  stopped on the CPU side so there's no off-screen geometry re-render.)
+  // Sun-glint occlusion (WebGL twin of the FFT ocean-material fix): dim the reflected-sun streak where the
+  // reflected ray R aligns with the real sun (u_sunDir) AND the sun is hidden behind terrain/cloud
+  // (u_sunOcclusion → 0). No-op when the sun is visible (u_sunOcclusion = 1 ⇒ streakDim = 1).
+  float sunAlign  = max(0.0, dot(R, u_sunDir));
+  float streakDim = mix(1.0, u_sunOcclusion, smoothstep(0.55, 0.96, sunAlign));
+  reflection *= streakDim;
 
   // Cloud reflection: when the reflected ray points upward and sky is covered,
   // blend a cloud-grey into the sky portion of the mirror so the water surface
@@ -962,6 +969,7 @@ uniform u_shoreMapSize: f32;
 uniform u_cloudCoverage: f32;
 uniform u_sunElevation: f32;
 uniform u_rainIntensity: f32;      // 0 = dry, 1 = full storm — drives surface rain ripples
+uniform u_sunOcclusion: f32;       // 1 = sun visible, 0 = hidden behind terrain/cloud — dims the specular sun glint
 uniform u_reflectionStrength: f32; // 1 = RTT reflections on, 0 = analytic-sky only
 uniform u_seabedStrength: f32;     // 1 = shallow-water transparency on, 0 = off
 uniform u_normalIter: i32;         // per-LOD fragment normal detail (near hi, far lo)
@@ -1124,7 +1132,7 @@ fn getAtmosphere(dir: vec3f) -> vec3f {
 fn getSun(dir: vec3f) -> f32 {
   // Energy-capped sun glint — see the GLSL twin for why (unclamped 210 HDR blew out into white patch
   // fields on our smooth mesh normals; this was the long-standing "white patches" artifact).
-  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2);
+  return min(pow(max(0.0, dot(dir, getSunDirection())), 720.0) * 210.0, 2.2) * uniforms.u_sunOcclusion;   // dim the glint when the sun is behind terrain/cloud
 }
 
 fn aces_tonemap(color: vec3f) -> vec3f {
@@ -1299,6 +1307,11 @@ fn main(input: FragmentInputs) -> FragmentOutputs {
   let reflStrength = uniforms.u_reflectionStrength;
   // Cloud reflection (same logic as GLSL path above)
   var cloudReflection = mix(reflectionAnalytic, reflectionRTT, vec3f(0.80 * reflStrength));
+  // Sun-glint occlusion (WGSL twin): dim the reflected-sun streak where R aligns with the real sun and the sun
+  // is hidden behind terrain/cloud (u_sunOcclusion → 0). No-op when the sun is visible (= 1 ⇒ streakDim = 1).
+  let sunAlign  = max(0.0, dot(R, uniforms.u_sunDir));
+  let streakDim = mix(1.0, uniforms.u_sunOcclusion, smoothstep(0.55, 0.96, sunAlign));
+  cloudReflection = cloudReflection * streakDim;
   if (R.y > 0.04 && uniforms.u_cloudCoverage > 0.01) {
     let cloudMask  = smoothstep(0.04, 0.50, R.y) * uniforms.u_cloudCoverage;
     let cloudDay   = vec3f(0.82, 0.85, 0.90);
@@ -1856,7 +1869,7 @@ export class OceanService {
           'u_cameraPosition', 'view',
           'u_terrainShadowCenter', 'u_terrainShadowSize', 'u_terrainShadowStrength',
           'u_shoreMapCenter', 'u_shoreMapSize',
-          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunDir', 'u_fishStartle',
+          'u_cloudCoverage', 'u_sunElevation', 'u_rainIntensity', 'u_sunOcclusion', 'u_sunDir', 'u_fishStartle',
           'u_reflectionStrength', 'u_seabedStrength', 'u_normalIter', 'u_waveIter',
           'u_wakePath', 'u_wakeCount', 'u_splashData', 'u_splashCount',
         ],
@@ -1904,6 +1917,7 @@ export class OceanService {
     mat.setFloat('u_cloudCoverage', 0);
     mat.setFloat('u_sunElevation',  0);
     mat.setFloat('u_rainIntensity', 0);
+    mat.setFloat('u_sunOcclusion',  1);   // default: sun fully visible
     mat.setVector4('u_fishStartle', this._fishStartle);
     mat.setFloat('u_reflectionStrength', this.effectiveReflections() ? 1 : 0);
     mat.setFloat('u_seabedStrength',     this.effectiveTransparency() ? 1 : 0);
@@ -2082,6 +2096,7 @@ export class OceanService {
         mat.setFloat('u_cloudCoverage', this._cloudCoverage);
         mat.setFloat('u_sunElevation',  this._sunElevation);
         mat.setFloat('u_rainIntensity', this._rainIntensity);
+        mat.setFloat('u_sunOcclusion', this.sceneService.getSunOcclusion());
         mat.setVector3('u_sunDir', this.sceneService.getSunDirection());
         mat.setVector4('u_fishStartle', this._fishStartle);
         mat.setArray4('u_wakePath', wakePathArr);

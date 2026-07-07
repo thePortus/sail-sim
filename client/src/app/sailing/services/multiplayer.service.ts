@@ -8,7 +8,7 @@ import { WeatherService } from './weather.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
 import { VesselService } from './vessel.service';
 import { ScatterService } from './scatter/scatter.service';
-import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor } from './vessel-controller';
+import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor } from './vessel-controller';
 import { buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { getShipImpostorAtlas, createShipImpostor, updateShipImpostor, ShipImpostor } from './ship-impostor';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
@@ -18,7 +18,7 @@ import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { MastCrackService } from './mast-crack.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
+import { CombatHitMsg, FortStatus, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry, QuestUpdate, QuestNarrative } from '../models';
 import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
@@ -182,6 +182,11 @@ export class MultiplayerService {
   // (set on tutorial completion, on buying a ship, or from the Shipwright's Rename button; null = closed).
   myShipName       = signal<string>('Saltmeadow');
   shipNameModal    = signal<{ current: string; reason: 'tutorial' | 'buy' | 'rename' } | null>(null);
+  // Set when the server REJECTS a rename (e.g. profanity) — the modal shows it and stays open.
+  shipNameError    = signal<string | null>(null);
+  // Per-user CHAT profanity filter (default ON). The server does the masking; this drives the settings toggle.
+  // Persisted per-device in localStorage; the toggle also tells the server (which persists it per-user).
+  profanityFilter  = signal<boolean>((() => { try { return localStorage.getItem('chat_profanity_filter') !== '0'; } catch { return true; } })());
   // The player's own custom flag colour (#rrggbb) — drives the shipwright colour picker + local flags.
   myFlagColor      = signal<string>('#b22222');
   // Set when the player collects salvage — the game overlay shows a transient toast.
@@ -231,6 +236,9 @@ export class MultiplayerService {
   private players      = new Map<string, OtherPlayerEntry>();
   /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
   private remoteZones  = new Map<string, ZoneState>();
+  private fortStates   = new Map<string, FortStatus>();   // harbor-fort HP by fort id (HarborService reads for the HP bar)
+  /** Aggregated harbor-fort status by fort id ("fort_<townId>"), for the overhead HP bar. */
+  getFortStates(): Map<string, FortStatus> { return this.fortStates; }
   private updateTimer: ReturnType<typeof setInterval> | null = null;
   private pingTimer:   ReturnType<typeof setInterval> | null = null;
 
@@ -377,7 +385,16 @@ export class MultiplayerService {
   setShipName(name: string): void {
     const n = (name || '').trim().slice(0, 28);
     if (!n) return;
+    this.shipNameError.set(null);   // clear any prior rejection; the reply (ship_name_set) resolves it
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'set_ship_name', shipName: n }));
+  }
+
+  /** Toggle the player's CHAT profanity filter (default on). The server masks received chat when on; this just
+   *  records the preference (locally + server-side). Does NOT affect the always-on block on profane names. */
+  setProfanityFilter(on: boolean): void {
+    this.profanityFilter.set(on);
+    try { localStorage.setItem('chat_profanity_filter', on ? '1' : '0'); } catch { /* ignore */ }
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'profanity_filter', on }));
   }
 
   /** Open the ship-naming modal (from the Shipwright's "Rename ship" button). */
@@ -653,6 +670,7 @@ export class MultiplayerService {
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
                           String(msg.id), +msg.seq || 0,
                           msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
+      this.players.get(String(msg.id))?.crew?.reactToFire('port');   // (P4) that ship's crew flinch at their own blast (side unused)
 
     } else if (msg.type === 'combat_hit') {
       // Authoritative ship hit. CannonService defers the whole reaction (shudder + cosmetic)
@@ -669,6 +687,13 @@ export class MultiplayerService {
       if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState, maxHp);
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
 
+    } else if (msg.type === 'fort_state') {
+      // Harbor-fort status → aggregate gun HP for HarborService's overhead HP bar.
+      const guns = Array.isArray(msg.guns) ? msg.guns : [];
+      let hp = 0, maxHp = 0, gunsUp = 0;
+      for (const g of guns) { hp += +g.hp || 0; maxHp += +g.maxHp || 0; if ((+g.hp || 0) > 0) gunsUp++; }
+      this.fortStates.set(String(msg.id), { hp, maxHp, gunsUp, gunsTotal: guns.length, neutralized: !!msg.neutralized });
+
     } else if (msg.type === 'mast_repair') {
       // Server armed our mast jury-rig (sent only to us) → run the HUD repair bar over its duration.
       this.combatService.startMastRepair(+msg.ms || 0);
@@ -683,6 +708,9 @@ export class MultiplayerService {
         // A remote ship was sunk → capsize it (its per-zone damage drives which way it rolls/settles).
         const e = this.players.get(String(msg.victimId));
         if (e && !e.sinking) { e.sinking = true; e.sinkElapsed = 0; }
+        e?.crew?.crewPanic(0.85, 30);   // (P4) the sinking ship's crew break and cower
+        if (String(msg.shooterId) === this.myId) this.vesselService.crewCheer();   // (P4) WE sank them → our crew cheer
+        else this.players.get(String(msg.shooterId))?.crew?.reactCheer();          // …else the victor's own crew cheer
       }
 
     } else if (msg.type === 'combat_repair') {
@@ -936,12 +964,22 @@ export class MultiplayerService {
       this.upgradeError.set(String(msg.reason ?? 'upgrade failed'));
 
     } else if (msg.type === 'ship_name_set') {
-      // Server confirmed our rename → update our own readouts and close the modal. (Others see the new name on
-      // the floating label; the local player has no self-label, so there's nothing else to repaint.)
       const n = String(msg.shipName ?? 'Saltmeadow');
-      this.myShipName.set(n);
-      this.localState.vesselName = n;
-      this.shipNameModal.set(null);
+      if (msg.rejected === 'profanity') {
+        // Server refused the name (public label — profanity is never allowed). Keep the modal open, show why.
+        this.shipNameError.set('That name isn’t allowed. Please choose another.');
+      } else {
+        // Server confirmed our rename → update our own readouts and close the modal. (Others see the new name on
+        // the floating label; the local player has no self-label, so there's nothing else to repaint.)
+        this.myShipName.set(n);
+        this.localState.vesselName = n;
+        this.shipNameError.set(null);
+        this.shipNameModal.set(null);
+      }
+
+    } else if (msg.type === 'profanity_filter_set') {
+      // Server echoed our chat-filter preference (or its persisted value) → sync the toggle.
+      this.profanityFilter.set(msg.on !== false);
 
     } else if (msg.type === 'rename_prompt') {
       // The intro tutorial just finished → invite the new captain to name their ship.
@@ -1242,6 +1280,7 @@ export class MultiplayerService {
     const dir = side === 'port' ? 1 : -1;
     e.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
     e.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
+    e.crew?.reactToHit(side);   // (P4) that ship's own deck crew stagger with the hit
   }
 
   /** Shortest-arc difference a→b for angles in radians. */
@@ -1739,6 +1778,8 @@ export class MultiplayerService {
 
     for (const m of rigged.root.getChildMeshes(false)) m.isPickable = false;
     entry.controller = createVesselController(slug, rigged.entries, rigged.root, manifest, scene);
+    // Metal parts reflect the sky LUT so a remote brig's cannon iron reads as dark metal, not a black void.
+    applyShipMetalEnv(entry.controller.getMeshes(), this.sceneService.getSkyEnvTexture());
 
     // Apply the sail state + trim we already know (updates may have arrived pre-build).
     entry.controller.applySailState(entry.sailState, true);   // snap initial pose
@@ -1825,8 +1866,16 @@ export class MultiplayerService {
     const override = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_hullcut')) || '';
     const useStencil = override === 'stencil' || (override === '' && this.sceneService.isWebGPU);
     if (useStencil) {
-      const hull = vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0);
-      if (hull && buildHullStencilProxy(hull, entry.root, scene)) {
+      const rig = rigForSlug(slug);
+      // MIRROR the local vessel's applyHullCut gate (was missing here → the remote brig showed its keel):
+      //  (1) DECKED, deep-draft hulls (brig, merchantman — rig.oceanMask===false) SKIP the proxy entirely —
+      //      masking their big underwater hull REVEALS the keel through the sea. Override ignis_oceanmask_<slug>.
+      //  (2) otherwise clamp the proxy at the hull-local DECK level (maskFloorFor) so it masks only the open
+      //      deck, never the sea in front of the submerged hull — an UNCLAMPED whole-hull proxy revealed the keel.
+      const omo = (typeof localStorage !== 'undefined') ? localStorage.getItem('ignis_oceanmask_' + slug) : null;
+      const oceanMask = omo === 'on' ? true : omo === 'off' ? false : (rig.oceanMask !== false);
+      const hull = oceanMask ? vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0) : null;
+      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig))) {
         this.oceanService.setHullStencilMask(true);
       }
     }

@@ -18,6 +18,8 @@
  * (findByCallsign / roster) are exported for unit tests with stub ws objects.
  */
 
+const { maskText } = require('./profanity');
+
 const MAX_SQUADRON = 4;
 const INVITE_TTL_MS = 60000;   // a pending invite lapses after this
 let seq = 0;
@@ -47,8 +49,15 @@ function sendCleared(p) { jsend(p, { type: 'squadron_state', squadronId: null, l
 
 /** Chat line to every current member of a squadron. */
 function squadronChat(players, sq, text, from = '⚓ System') {
-  const payload = { type: 'chat', chatType: 'squadron', from, text };
-  for (const mid of sq.members) jsend(players.get(mid), payload);
+  // Mask profanity per-recipient (default-on filter; raw for opt-outs). System lines are clean, so `clean===text`
+  // sends the shared text to all — only a member-typed line with profanity takes the per-recipient path.
+  const clean = maskText(text);
+  for (const mid of sq.members) {
+    const p = players.get(mid);
+    if (!p) { continue; }
+    const t = (clean === text || p.filterProfanity === false) ? text : clean;
+    jsend(p, { type: 'chat', chatType: 'squadron', from, text: t });
+  }
 }
 
 /**

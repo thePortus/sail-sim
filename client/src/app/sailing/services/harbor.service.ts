@@ -7,6 +7,8 @@ import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
 import { VesselService } from './vessel.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { MultiplayerService } from './multiplayer.service';
+import { FortStatus } from './combat.constants';
 import { TownImpostorPlugin } from './scatter/town-impostor.plugin';
 import { ImpostorHazePlugin } from './scatter/impostor-haze.plugin';
 import { measureBottomPad } from './scatter/asset-loader';
@@ -35,12 +37,19 @@ export class HarborService {
   private oceanService = inject(OceanService);
   private vesselService = inject(VesselService);
   private assetCache = inject(VesselAssetCacheService);
+  private multiplayerService = inject(MultiplayerService);
+  // Fort combat: world anchor per fort (recorded on stream-in) + the pooled overhead HP-bar billboards.
+  private readonly fortAnchors = new Map<string, { x: number; y: number; z: number; tier: string }>();
+  private readonly fortBars = new Map<string, { plane: Mesh; tex: DynamicTexture; sig: string }>();
 
   private root: TransformNode | null = null;
   // Per-variant yaw (radians) that rotates the model's seaward length-axis onto the parent's +Z, so
   // setting parent.rotation.y = heading then points the pier body seaward. Computed once per variant.
   private readonly seawardOffset = new Map<string, number>();
   private readonly frozenMats = new Set<Material>();
+  // Faction stone-tint material variants (Harbor Forts): shared base material cloned once per faction (textures
+  // are shared — only albedoColor differs), keyed `${baseMatUid}_${faction}`, so all towns of a nation reuse them.
+  private readonly tintMats = new Map<string, PBRMaterial>();
 
   // ONE shared warm light parked at the nearest town's civic square at night. Only ~1 town is streamed
   // at a time, so a single pooled light suffices, and it also reaches the waterfront/pier (the town
@@ -68,6 +77,23 @@ export class HarborService {
   private _townShadowDisc: Mesh | null = null;
   private _townShadowMat: StandardMaterial | null = null;
   private _blobTownId: string | null = null;        // which streamed town currently owns the blobs
+  // REAL building shadows (default): the CLOSEST streamed (mesh, not impostor) town casts into the sun's CSG — its
+  // ground (square/roads) + the terrain RECEIVE, so the town throws directional shadows. To keep it CHEAP the caster
+  // is NOT the real (high-poly, multi-submesh) buildings — that tanked FPS (each ×3 cascades) — but a single merged
+  // BOX PROXY: one axis-aligned box per building (its bounding box), all in ONE ~80-vertex mesh = 1 caster, 1 draw
+  // per cascade for the whole town. The proxy is invisible to the CAMERA via a layerMask outside the camera's mask
+  // (the shadow map has an explicit renderList so it skips the layerMask check — verified in ObjectRenderer), yet
+  // still casts. Just ONE town at a time. Opt-out `ignis_town_shadows='0'` → fall back to the fake blob discs.
+  private readonly townRealShadows = (() => { try { return localStorage.getItem('ignis_town_shadows') !== '0'; } catch { return true; } })();
+  private static readonly SHADOW_PROXY_MASK = 0x10000000;   // bit 28 — outside the default camera mask 0x0FFFFFFF
+  // The real proxy shadow is discarded by the CSG past ~150 m (shadowMaxZ); beyond this the nearest town falls back
+  // to the cheap fake blob discs so its shadows continue out to the full mesh range with NO scene-wide shadow cost.
+  // Biased a little inside the ~150 m cull (camera-vs-ship slack) so the two overlap briefly rather than leaving a
+  // gap where the shadow vanishes on the hand-off. Tunable.
+  private static readonly SHADOW_FAR2 = 120 * 120;
+  private _shadowTownId: string | null = null;       // which streamed town currently casts real shadows
+  private _townShadowProxy: Mesh | null = null;      // its merged box-proxy caster (invisible; sun CSG only)
+  private _townShadowProxyMat: StandardMaterial | null = null;   // shared opaque depth material for the proxy
   private _blobSunAcc = 1;                            // throttles the night-fade alpha recompute
   private readonly _blobQ = Quaternion.Identity();   // identity — the plugin orients the disc in local space
   private readonly _blobPos = new Vector3();
@@ -238,15 +264,12 @@ export class HarborService {
     return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
   }
 
-  /** 0 in daylight → 1 after dark (full night 19:00–05:00, ramped across dusk/dawn). Drives the warm
-   *  pier + square pool lights so they glow at night and switch off when the sun would wash them out. */
+  /** 0 in daylight → 1 after dark. Drives the warm pier + square pool lights so they glow at night and switch
+   *  off when the sun would wash them out. Keyed on the SUN'S ELEVATION (not a fixed clock) so it follows the
+   *  actual day length — including the long summer day — instead of a hardcoded symmetric sunrise/sunset. */
   private nightFactor(): number {
-    const t = this.sceneService.gameTime();
-    let nf = 0;
-    if (t < 5 || t >= 19) nf = 1;
-    else if (t < 7) nf = (7 - t) / 2;
-    else if (t > 17) nf = (t - 17) / 2;
-    return Math.max(0, Math.min(1, nf));
+    const y = this.sceneService.getSunDirection().y;      // −1 midnight … +1 noon
+    return Math.max(0, Math.min(1, (0.12 - y) / 0.22));   // sun ≥ +0.12 → 0 (daylight); ≤ −0.10 → 1 (full night)
   }
 
   /** Per-frame: keep the pool light on the nearest pier + dockable town (every frame), and stream
@@ -260,6 +283,61 @@ export class HarborService {
     if ((f & 3) === 0) { this.updateTownLabels(); }
     if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); this.updateTownBlobs(); }
     this.driveTownBlobSun();   // night-fade the building blobs (throttled internally)
+    if ((f & 3) === 0) { this.updateFortBars(); }   // overhead fort HP bars (only forts that have been engaged)
+  }
+
+  // ── Fort combat HP bars (overhead) ──────────────────────────────────────────────────────────────
+  /** Show a floating HP bar over any fort that's been engaged (MultiplayerService has a fort_state for it):
+   *  aggregate gun HP, "<name>  N/M guns" or "SILENCED". Billboard planes are pooled per fort; hidden when far. */
+  private updateFortBars(): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    const states = this.multiplayerService.getFortStates();
+    const cam = this.vesselService.getPosition();
+    for (const [fid, st] of states) {
+      const a = this.fortAnchors.get(fid);
+      if (!a) continue;
+      const near = (a.x - cam.x) ** 2 + (a.z - cam.z) ** 2 < 1200 * 1200;
+      let bar = this.fortBars.get(fid);
+      if (!near) { if (bar) bar.plane.setEnabled(false); continue; }
+      const lift = a.tier === 'capital' ? 24 : a.tier === 'medium' ? 17 : 13;
+      const sig = `${Math.round(st.hp)}/${st.maxHp}|${st.gunsUp}/${st.gunsTotal}|${st.neutralized}`;
+      if (!bar) {
+        const tex = new DynamicTexture(`fortbar_${fid}`, { width: 384, height: 96 }, scene, true);
+        const mat = new StandardMaterial(`fortbar_${fid}_m`, scene);
+        mat.diffuseTexture = tex; mat.opacityTexture = tex; mat.emissiveColor = new Color3(1, 1, 1);
+        mat.disableLighting = true; mat.backFaceCulling = false;
+        const plane = MeshBuilder.CreatePlane(`fortbar_${fid}_p`, { width: 20, height: 5 }, scene);
+        plane.material = mat; plane.billboardMode = Mesh.BILLBOARDMODE_ALL; plane.isPickable = false;
+        plane.renderingGroupId = 2; plane.parent = this.root;
+        bar = { plane, tex, sig: '' };
+        this.fortBars.set(fid, bar);
+      }
+      bar.plane.setEnabled(true);
+      bar.plane.position.set(a.x, a.y + lift, a.z);
+      if (bar.sig !== sig) { this.drawFortBar(bar.tex, fid, st); bar.sig = sig; }
+    }
+    // Hide bars whose fort no longer reports (out of the state map) — cheap since the map is tiny.
+    for (const [fid, bar] of this.fortBars) if (!states.has(fid)) bar.plane.setEnabled(false);
+  }
+
+  private drawFortBar(tex: DynamicTexture, fid: string, st: FortStatus): void {
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, 384, 96);
+    const frac = st.maxHp > 0 ? Math.max(0, Math.min(1, st.hp / st.maxHp)) : 0;
+    const name = (this.harbors.find((h) => `fort_${h.id}` === fid)?.name) || 'Fort';
+    const label = st.neutralized ? `${name}  —  SILENCED` : `${name}  —  ${st.gunsUp}/${st.gunsTotal} guns`;
+    // bar
+    const bx = 24, bw = 336, by = 54, bh = 26;
+    ctx.fillStyle = 'rgba(10,14,20,0.86)'; ctx.fillRect(bx - 3, by - 3, bw + 6, bh + 6);
+    ctx.fillStyle = st.neutralized ? '#606066' : frac > 0.5 ? '#78c460' : frac > 0.25 ? '#e0bc48' : '#d64836';
+    ctx.fillRect(bx, by, bw * frac, bh);
+    ctx.strokeStyle = 'rgba(220,210,190,0.7)'; ctx.lineWidth = 2; ctx.strokeRect(bx - 3, by - 3, bw + 6, bh + 6);
+    // label
+    ctx.font = 'bold 30px Georgia, serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(6,10,16,0.9)'; ctx.fillText(label, 193, 34);
+    ctx.fillStyle = st.neutralized ? '#b8b8be' : '#ffe1b4'; ctx.fillText(label, 192, 33);
+    tex.update();
   }
 
   // ── Cheap fake building shadows (nearest streamed town only) ─────────────────────────────────────
@@ -268,7 +346,7 @@ export class HarborService {
    *  real meshes are resident (townNodes) are candidates — so blobs never show under the distant LOD impostors. */
   private updateTownBlobs(): void {
     const scene = this.sceneService.scene;
-    if (!scene || !HarborService.TOWN_BLOBS) return;
+    if (!scene) return;
     const p = this.vesselService.getPosition();
     let nearestId: string | null = null, best = Infinity;
     for (const h of this.harbors) {
@@ -276,11 +354,95 @@ export class HarborService {
       const d2 = (h.x - p.x) ** 2 + (h.z - p.z) ** 2;
       if (d2 < best) { best = d2; nearestId = h.id; }
     }
-    // No change AND already built → nothing to do.
-    if (nearestId === this._blobTownId && (nearestId === null || this._townShadowDisc?.isVisible)) return;
-    this._blobTownId = nearestId;
-    if (nearestId) { this.ensureTownShadowAssets(scene); this.buildTownBlobsFor(nearestId); }
+    // Real shadows (default): the nearest streamed town casts a real proxy shadow NEAR (the CSG discards it past
+    // ~150 m), and the cheap fake blob discs fill the FAR band so shadows continue to the full mesh range with no
+    // scene-wide shadow cost. Both run; the distance split (SHADOW_FAR2) keeps them from doubling up much.
+    if (this.townRealShadows && this.sceneService.shadowGenerator) {
+      this.updateTownRealShadows(nearestId);
+      const farTown = (HarborService.TOWN_BLOBS && nearestId && best > HarborService.SHADOW_FAR2) ? nearestId : null;
+      this.setBlobTown(scene, farTown);
+      return;
+    }
+    if (!HarborService.TOWN_BLOBS) return;
+    this.setBlobTown(scene, nearestId);   // blobs-everywhere fallback (real shadows opted out)
+  }
+
+  /** (Re)build the fake blob discs for `blobTown` (or clear when null), skipping the rebuild when unchanged. */
+  private setBlobTown(scene: Scene, blobTown: string | null): void {
+    if (blobTown === this._blobTownId && (blobTown === null || this._townShadowDisc?.isVisible)) return;
+    this._blobTownId = blobTown;
+    if (blobTown) { this.ensureTownShadowAssets(scene); this.buildTownBlobsFor(blobTown); }
     else { this.clearTownBlobs(); }
+  }
+
+  /** Build a cheap box-proxy caster for the nearest streamed town (and unwind the previous town's). Gated so it
+   *  auto-drops past the shadow-distance cull — a resident but far town costs nothing. One town at a time. */
+  private updateTownRealShadows(nearestId: string | null): void {
+    if (nearestId === this._shadowTownId) return;
+    this.detachTownShadowCasters();
+    this._shadowTownId = nearestId;
+    if (!nearestId) return;
+    const node = this.townNodes.get(nearestId);
+    if (!node) { this._shadowTownId = null; return; }
+    const proxy = this.buildTownShadowProxy(node, nearestId);
+    if (proxy) { this._townShadowProxy = proxy; this.sceneService.addGatedShadowCaster(proxy); }
+  }
+
+  /** Pull this town's proxy back out of the sun CSG + dispose it (nearest-town change, eviction, or teardown). */
+  private detachTownShadowCasters(): void {
+    if (this._townShadowProxy) {
+      this.sceneService.removeGatedShadowCaster(this._townShadowProxy);
+      this._townShadowProxy.dispose();
+      this._townShadowProxy = null;
+    }
+    this._shadowTownId = null;
+  }
+
+  /** One merged mesh = an axis-aligned box per building (its world bounding box). Invisible to the camera (layerMask
+   *  outside the camera's mask) but cast into the shadow map — so the whole town is a single low-poly shadow caster
+   *  instead of dozens of high-poly building submeshes ×3 cascades. Verts are built RELATIVE to the town centre and
+   *  the mesh is anchored there, so `absolutePosition` is the town (the gated-caster cull measures the right
+   *  distance) — a mesh at the origin with world-baked verts would be culled whenever the player nears the town. */
+  private buildTownShadowProxy(node: TransformNode, townId: string): Mesh | null {
+    const scene = this.sceneService.scene;
+    if (!scene) return null;
+    // Pass 1: collect each building's world AABB + the town's overall bounds (→ anchor centre).
+    const boxes: { mnx: number; mny: number; mnz: number; mxx: number; mxy: number; mxz: number }[] = [];
+    let lox = Infinity, loz = Infinity, hix = -Infinity, hiz = -Infinity;
+    for (const bp of node.getChildTransformNodes(true)) {
+      if (!bp.name.startsWith('b_')) continue;                       // building parents only (not the ground)
+      const bb = bp.getHierarchyBoundingVectors(true);               // world-space AABB of this building
+      const mn = bb.min, mx = bb.max;
+      if (!(mx.x > mn.x && mx.y > mn.y && mx.z > mn.z)) continue;
+      boxes.push({ mnx: mn.x, mny: mn.y, mnz: mn.z, mxx: mx.x, mxy: mx.y, mxz: mx.z });
+      lox = Math.min(lox, mn.x); loz = Math.min(loz, mn.z); hix = Math.max(hix, mx.x); hiz = Math.max(hiz, mx.z);
+    }
+    if (!boxes.length) return null;
+    const ax = (lox + hix) * 0.5, az = (loz + hiz) * 0.5;            // town-centre anchor (Y stays 0 — verts carry it)
+    const pos: number[] = [], idx: number[] = [];
+    // Box faces (winding irrelevant to the depth-only shadow pass; a closed convex box silhouettes either way).
+    const FACES = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0];
+    let base = 0;
+    for (const b of boxes) {
+      const x0 = b.mnx - ax, x1 = b.mxx - ax, z0 = b.mnz - az, z1 = b.mxz - az, y0 = b.mny, y1 = b.mxy;
+      pos.push(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1,       // bottom 0-3
+               x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1);      // top 4-7
+      for (const v of FACES) idx.push(base + v);
+      base += 8;
+    }
+    const vd = new VertexData();
+    vd.positions = pos; vd.indices = idx;
+    const mesh = new Mesh(`town_shadow_proxy_${townId}`, scene);
+    vd.applyToMesh(mesh, false);
+    mesh.position.set(ax, 0, az);                        // anchor at the town → correct absolutePosition for the cull
+    if (!this._townShadowProxyMat) {                     // shared opaque material (never seen; depth only)
+      this._townShadowProxyMat = new StandardMaterial('town_shadow_proxy_mat', scene);
+      this._townShadowProxyMat.disableLighting = true;
+    }
+    mesh.material = this._townShadowProxyMat;
+    mesh.layerMask = HarborService.SHADOW_PROXY_MASK;   // invisible to the camera; the shadow map ignores the mask
+    mesh.isPickable = false;
+    return mesh;
   }
 
   /** Thin-instance one soft blob under each building of the given (streamed) town, sized to its measured footprint. */
@@ -350,6 +512,9 @@ export class HarborService {
 
     const disc = MeshBuilder.CreateGround('town_shadow_disc', { width: 1, height: 1 }, scene);
     disc.material = mat;
+    disc.renderingGroupId = 2;                            // world layer — else (default group 0) it draws BEFORE the
+                                                          // group-2 terrain and is painted over → invisible (the bug
+                                                          // that made the town blobs never show); mirrors the scatter blobs.
     disc.isPickable = false;
     disc.isVisible = false;
     disc.alwaysSelectAsActiveMesh = true;                // thin-instance AABB isn't tracked → never frustum-cull the template
@@ -457,6 +622,8 @@ export class HarborService {
       if (d2 < build2) {
         inRange.push({ h, d2 });
       } else if (d2 > drop2 && this.townNodes.has(h.id)) {
+        // Unwind real shadow casters BEFORE disposing this town's meshes (else disposed meshes linger in the CSG).
+        if (this._shadowTownId === h.id) this.detachTownShadowCasters();
         // dispose meshes only, NOT materials/textures: they're shared (cloneMaterials=false) via the
         // asset-cache container and reused by every other town that streams the same GLB. Disposing them
         // here would leave later towns with null materials (white). The container owns them (clearCache).
@@ -497,7 +664,127 @@ export class HarborService {
       this.applyBuildingRecipe(node);
     }
     this.buildGround(h, root, padElev);
+    await this.buildWalls(h, root, padElev);
     return root;
+  }
+
+  /** Harbor Forts — WALL-PATH SPIKE. Place PLACEHOLDER box segments along the town's server-derived `walls`
+   *  ring so we can validate the auto-generated path in-engine before the real modular wall kit exists: a thin
+   *  tall curtain box between consecutive nodes, a taller box tower at each corner/bastion, and a low lintel at
+   *  the gate. Parented to the town root so it streams + disposes with the buildings. Cheap StandardMaterial +
+   *  frozen meshes (no shadows/prepass) to stay clear of the WebGPU town light/UBO cap. */
+  private async buildWalls(h: TerrainHarbor, root: TransformNode, padElev: number): Promise<void> {
+    const scene = this.sceneService.scene;
+    const W = h.walls;
+    if (!scene || !W || W.length < 2) return;
+    const MESH_LEN = 6.0, SPACING = 8.0, GATE_W = 8.0, GATE_HALF = 4.0;   // 6 m curtain repeated at ~8 m
+    // The wall base must follow the sloping shore — a single flat elevation leaves pieces floating over the
+    // downslope (even out over water). Drop each piece to the LOWEST ground it spans (min with padElev): it may
+    // sink into the ground/water, but it never floats.
+    const groundY = (x: number, z: number) => Math.min(padElev, this.terrainService.getElevation(x, z));
+    // Curtain: repeat wall_straight along each segment (OPEN polyline — the last→first gap is the harbor mouth),
+    // scaled to fit, oriented so the crenellations (authored -Z) face OUTWARD, away from the town centre.
+    for (let i = 0; i + 1 < W.length; i++) {
+      const a = W[i], b = W[i + 1];
+      const ux0 = b.x - a.x, uz0 = b.z - a.z, len0 = Math.hypot(ux0, uz0);
+      if (len0 < 0.5) continue;
+      const ux = ux0 / len0, uz = uz0 / len0;
+      // Leave a GATE_HALF gap at each end that meets a gate node for the gatehouse.
+      let ax = a.x, az = a.z, bx = b.x, bz = b.z;
+      if (a.tag === 'gate') { ax += ux * GATE_HALF; az += uz * GATE_HALF; }
+      if (b.tag === 'gate') { bx -= ux * GATE_HALF; bz -= uz * GATE_HALF; }
+      const dx = bx - ax, dz = bz - az, len = Math.hypot(dx, dz);
+      if (len < 0.5) continue;
+      const midx = (ax + bx) / 2, midz = (az + bz) / 2;
+      let yaw = Math.atan2(ux, uz) - Math.PI / 2;   // local +X runs along the segment
+      if (uz * (midx - h.x) - ux * (midz - h.z) < 0) yaw += Math.PI;   // -Z faces outward
+      const count = Math.max(1, Math.round(len / SPACING));
+      const half = (len / count) / 2;
+      for (let k = 0; k < count; k++) {
+        const t = (k + 0.5) / count;
+        const cx = ax + dx * t, cz = az + dz * t;
+        const y0 = Math.min(groundY(cx, cz), groundY(cx - ux * half, cz - uz * half),
+                            groundY(cx + ux * half, cz + uz * half));   // lowest ground under the piece → no float
+        const parent = new TransformNode(`fortwall_${h.id}_${i}_${k}`, scene);
+        parent.parent = root;
+        const node = await this.assetCache.instantiate('forts/wall_straight.glb', scene, parent, false);
+        if (!node) { parent.dispose(); continue; }
+        parent.position.set(cx, y0, cz);
+        parent.rotation.y = yaw;
+        parent.scaling.x = (len / count) / MESH_LEN;
+        this.tintFaction(node, h.faction);
+        this.applyBuildingRecipe(node);
+      }
+    }
+    // Harbor fort(s): placement is server-authoritative (deriveForts) so the guns line up with combat — the client
+    // just renders each fort at its given transform. The mesh's authored forward (-Z) faces seaward, so the yaw is
+    // heading + PI to aim -Z along the guns' heading. A tier without an authored GLB (T2/T3) simply fails to load.
+    for (const [fi, f] of (h.forts ?? []).entries()) {
+      const parent = new TransformNode(`fort_${h.id}_${fi}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate(`forts/${f.glb}.glb`, scene, parent, false);
+      if (!node) { parent.dispose(); continue; }
+      // Sink the fort to the LOWEST ground under its footprint (corners + centre) so it never floats over the
+      // sloping shore — matches the wall treatment (part-buried beats part-floating).
+      const hr = (f.heading * Math.PI) / 180;
+      const sdx = Math.sin(hr), sdz = Math.cos(hr), adx = Math.cos(hr), adz = -Math.sin(hr);
+      let fy = Math.min(f.y, this.terrainService.getElevation(f.x, f.z));
+      for (const du of [-1, 1]) for (const dv of [-1, 1])
+        fy = Math.min(fy, this.terrainService.getElevation(f.x + sdx * f.hd * du + adx * f.hw * dv,
+                                                            f.z + sdz * f.hd * du + adz * f.hw * dv));
+      parent.position.set(f.x, fy, f.z);
+      parent.rotation.y = hr + Math.PI;   // -Z faces seaward (guns' heading)
+      this.fortAnchors.set(`fort_${h.id}`, { x: f.x, y: fy, z: f.z, tier: f.tier });   // for the combat HP bar
+      this.tintFaction(node, h.faction);
+      this.applyBuildingRecipe(node);
+      // Faction identity: national ensign at the flagstaff + (T1) the per-nation accent turret. The glTF loader
+      // adds a RH→LH __root__ (negates X/Z), so a fort-local offset becomes (-x, y, -z) under the fort parent.
+      const cc = h.faction === 'english' ? 'en' : h.faction === 'french' ? 'fr' : h.faction === 'dutch' ? 'nl' : 'es';
+      if (f.flag) {
+        const anchor = new TransformNode(`fortflag_${h.id}_${fi}`, scene);
+        anchor.parent = parent; anchor.position.set(-f.flag[0], f.flag[1], -f.flag[2]);
+        const fl = await this.assetCache.instantiate(`forts/flag_${cc}.glb`, scene, anchor, false);
+        if (fl) this.applyBuildingRecipe(fl); else anchor.dispose();   // ensign untinted (its own colours)
+      }
+      if (f.accent) {
+        const ac = await this.assetCache.instantiate(`forts/accent_${cc}.glb`, scene, parent, false);
+        if (ac) { this.tintFaction(ac, h.faction); this.applyBuildingRecipe(ac); }   // stone-tinted to match
+      }
+    }
+    // A tower at each node — except a LAND GATE node, which gets the gatehouse filling the carved curtain gap.
+    for (let i = 0; i < W.length; i++) {
+      const n = W[i];
+      if (n.tag === 'gate') {
+        if (i === 0 || i + 1 >= W.length) continue;
+        const p = W[i - 1], q = W[i + 1];   // neighbours give the wall run
+        const rx0 = q.x - p.x, rz0 = q.z - p.z, rl = Math.hypot(rx0, rz0);
+        if (rl < 0.1) continue;
+        const rx = rx0 / rl, rz = rz0 / rl;
+        let yaw = Math.atan2(rx, rz) - Math.PI / 2;   // local +X along the wall run
+        if (rz * (n.x - h.x) - rx * (n.z - h.z) < 0) yaw += Math.PI;   // -Z faces outward
+        const y0 = Math.min(groundY(n.x, n.z), groundY(n.x - rx * GATE_HALF, n.z - rz * GATE_HALF),
+                            groundY(n.x + rx * GATE_HALF, n.z + rz * GATE_HALF));
+        const parent = new TransformNode(`fortgate_${h.id}_${i}`, scene);
+        parent.parent = root;
+        const node = await this.assetCache.instantiate('forts/wall_gate.glb', scene, parent, false);
+        if (!node) { parent.dispose(); continue; }
+        parent.position.set(n.x, y0, n.z);
+        parent.rotation.y = yaw;
+        parent.scaling.x = (2 * GATE_HALF) / GATE_W;
+        this.tintFaction(node, h.faction);
+        this.applyBuildingRecipe(node);
+        continue;
+      }
+      const parent = new TransformNode(`fortnode_${h.id}_${i}`, scene);
+      parent.parent = root;
+      const node = await this.assetCache.instantiate('forts/wall_tower.glb', scene, parent, false);
+      if (!node) { parent.dispose(); continue; }
+      const s = n.tag === 'bastion' ? 1.25 : 1.0;
+      parent.position.set(n.x, groundY(n.x, n.z), n.z);
+      parent.scaling.set(s, 1, s);
+      this.tintFaction(node, h.faction);
+      this.applyBuildingRecipe(node);
+    }
   }
 
   /** Build the static distant-town impostor layer: for EVERY town's buildings, drop a camera-facing billboard
@@ -681,7 +968,7 @@ export class HarborService {
       const mesh = new Mesh(`roads_${h.id}`, scene);
       vd.applyToMesh(mesh);
       mesh.material = this.roadMat; mesh.parent = root; mesh.renderingGroupId = 2;
-      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+      mesh.isPickable = false; mesh.receiveShadows = this.townRealShadows; mesh.freezeWorldMatrix();
     }
 
     // ── Cobblestone square (on the flat pad; sampled corners + 3 cm above the roads where they meet) ──
@@ -699,7 +986,7 @@ export class HarborService {
       const mesh = new Mesh(`square_${h.id}`, scene);
       vd.applyToMesh(mesh);
       mesh.material = this.squareMat; mesh.parent = root; mesh.renderingGroupId = 2;
-      mesh.isPickable = false; mesh.receiveShadows = false; mesh.freezeWorldMatrix();
+      mesh.isPickable = false; mesh.receiveShadows = this.townRealShadows; mesh.freezeWorldMatrix();
     }
   }
 
@@ -709,6 +996,32 @@ export class HarborService {
    *  the prePass, NOT shadow casters or glow-included (yet), light slots capped, and every optional PBR
    *  feature block disabled. Buildings are inland → also kept out of the ocean-reflection list.
    *  (Shadows + window glow come back in a later polish phase once the budget is profiled.) */
+  /** Faction identity (Harbor Forts): a subtle limestone lean toward the owning nation's hue on the fort/wall
+   *  kit. `instantiate` shares one material across instances, so we swap each mesh to a per-faction CLONE (cached;
+   *  textures shared, only albedoColor differs — which multiplies the albedo texture). Call BEFORE the recipe so
+   *  it freezes the tinted clone. No faction / capital-neutral → left as-is. */
+  private stoneTint(faction?: string): Color3 | null {
+    switch (faction) {
+      case 'english': return new Color3(1.0, 0.85, 0.82);
+      case 'french':  return new Color3(0.82, 0.89, 1.0);
+      case 'spanish': return new Color3(1.0, 0.94, 0.76);
+      case 'dutch':   return new Color3(1.0, 0.87, 0.72);
+      default:        return null;
+    }
+  }
+  private tintFaction(node: TransformNode, faction?: string): void {
+    const tint = this.stoneTint(faction);
+    if (!tint) return;
+    for (const m of node.getChildMeshes(false)) {
+      const mat = m.material;
+      if (!(mat instanceof PBRMaterial)) continue;
+      const key = `${mat.uniqueId}_${faction}`;
+      let tm = this.tintMats.get(key);
+      if (!tm) { tm = mat.clone(`${mat.name}_${faction}`) as PBRMaterial; tm.albedoColor = tint; this.tintMats.set(key, tm); }
+      m.material = tm;
+    }
+  }
+
   private applyBuildingRecipe(node: TransformNode): void {
     for (const m of node.getChildMeshes(false)) {
       m.receiveShadows = false;
@@ -870,6 +1183,7 @@ export class HarborService {
     // The scene teardown disposes these meshes; null our refs + clear caches so a fresh session
     // rebuilds piers (and re-measures the per-variant offsets) cleanly.
     if (this.tickObs) { this.sceneService.scene?.onBeforeRenderObservable.remove(this.tickObs); this.tickObs = null; }
+    this.detachTownShadowCasters();   // pull town buildings out of the sun CSG
     this.squareLight?.dispose();
     this.squareLight = null;
     this.skyEnv = null;   // owned by the procedural sky; just drop our reference
@@ -878,6 +1192,7 @@ export class HarborService {
     this.townLoading.clear();
     this._townShadowDisc?.dispose();   this._townShadowDisc = null;   // own disc + thin-instance buffer
     this._townShadowMat?.dispose(false, true); this._townShadowMat = null;   // own material + gradient texture
+    this._townShadowProxyMat?.dispose(); this._townShadowProxyMat = null;    // shared box-proxy depth material
     this._blobTownId = null;
     for (const { plane } of this.townLabels.values()) plane.dispose(false, true);   // own texture+material
     this.townLabels.clear();
@@ -895,5 +1210,9 @@ export class HarborService {
     this.dockable.set(null);
     this.seawardOffset.clear();
     this.frozenMats.clear();
+    for (const tm of this.tintMats.values()) tm.dispose(false, false);   // clones own no textures (shared) — drop the material only
+    this.tintMats.clear();
+    for (const bar of this.fortBars.values()) { bar.tex.dispose(); bar.plane.material?.dispose(); bar.plane.dispose(); }
+    this.fortBars.clear(); this.fortAnchors.clear();
   }
 }

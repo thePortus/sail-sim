@@ -11,6 +11,11 @@ module.exports = (sequelize, DataTypes) => {
     // When true, login is refused. Set/cleared by Owner/Admin via /ban /unban.
     banned: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
 
+    // Per-user CHAT profanity filter — masks profane words in received chat. DEFAULT ON; the player may opt
+    // out to see raw text. (The hard block on profane usernames/callsigns/ship names is always enforced and
+    // is NOT this setting.)
+    profanityFilter: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+
     // ── Last-known sailing position ──────────────────────────────────────────
     // Persisted on each auto-save (every 30 s), on exit, and on logout.
     // NULL means the player has never sailed — they will spawn at the island default.

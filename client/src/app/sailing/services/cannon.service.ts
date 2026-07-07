@@ -1112,15 +1112,23 @@ export class CannonService {
   private solveLock(side: 'port' | 'stbd', vs: { x: number; z: number; heading: number },
                     beamX: number, beamZ: number, mv: number, muzzleY: number):
                     { dirX: number; dirZ: number; vh: number; vy0: number; lockId: string; px: number; pz: number; cx: number; cz: number } | null {
-    const enemies = this.multiplayerService.otherPlayers();
-    if (!enemies.length) return null;
+    const enemies = this.multiplayerService.otherPlayers() as { id: string; x: number; z: number; heading: number; speed: number }[];
+    // Harbor forts are auto-aim targets too — stationary "enemies" at the fort centre, so a broadside laid on a
+    // fort leads/lobs onto it exactly like a ship. Only ones within reach; the range/arc filter does the rest.
+    const all = enemies.slice();
+    for (const h of this.terrainService.getHarbors()) {
+      for (const f of h.forts ?? []) {
+        if (Math.hypot(f.x - vs.x, f.z - vs.z) < 800) all.push({ id: `fort_${h.id}`, x: f.x, z: f.z, heading: 0, speed: 0 });
+      }
+    }
+    if (!all.length) return null;
     const beamAng = Math.atan2(beamX, beamZ);
     const norm = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));   // → [-π, π]
 
     // Acquire: the enemy whose bearing is closest to the beam, within the arc + range.
     let best: { id: string; x: number; z: number; heading: number; speed: number } | null = null;
     let bestOff = this.LOCK_ARC_DEG * Math.PI / 180;
-    for (const e of enemies) {
+    for (const e of all) {
       const dx = e.x - vs.x, dz = e.z - vs.z, dist = Math.hypot(dx, dz);
       if (dist < 2 || dist > this.LOCK_MAX_RANGE) continue;
       const off = Math.abs(norm(Math.atan2(dx, dz) - beamAng));
@@ -1990,6 +1998,13 @@ export class CannonService {
    * scorch mark, play the splinter/fire cosmetic, and despawn the matching ball.
    */
   private executeShipHit(msg: CombatHitMsg, ball: Ball | null): void {
+    if (msg.fort) {
+      // A ball struck a stone FORT (no ship victim): throw dirt/stone debris at the impact — no shudder/scorch.
+      let vx = 0, vy = -20, vz = 0;
+      if (ball) { vx = ball.vx; vy = ball.vy - G * ball.t; vz = ball.vz; ball.alive = false; ball.mesh.setEnabled(false); }
+      this.onImpact(msg.hx, msg.hz, vx, vy, vz, ball?.kind ?? 'round', Math.max(0.2, msg.hy));
+      return;
+    }
     // Shudder the struck ship — deferred to here so the lurch coincides with the impact.
     const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
     if (msg.victimId === this.multiplayerService.getMyId()) this.vesselService.addHitShudder(side);

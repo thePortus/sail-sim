@@ -1,4 +1,4 @@
-import { AbstractMesh, InstantiatedEntries, Scene, TransformNode } from '@babylonjs/core';
+import { AbstractMesh, Color3, InstantiatedEntries, PBRMaterial, Scene, Texture, TransformNode } from '@babylonjs/core';
 import { RiggedManifest, SailState } from '../models';
 import { SloopController } from './rigged-vessel.controller';
 import { PinnaceController } from './pinnace-vessel.controller';
@@ -185,4 +185,40 @@ export function createVesselController(
   if (kind === 'brig')        return new BrigController(entries, root, manifest, scene);
   if (kind === 'merchantman') return new MerchantmanController(entries, root, manifest, scene);
   return new SloopController(entries, root, manifest, scene);
+}
+
+/**
+ * Give a freshly-loaded ship's METAL materials something to reflect. The brig (and any GLB whose metals are
+ * factor-only — `SHIP_IRON`/`SHIP_BRASS` with metallic=1 and no baked albedo/ORM) reflect the scene environment
+ * for their colour; but sail-sim runs NO scene-wide `environmentTexture` (it makes harbor metals + water read
+ * black — see SceneService.getSkyEnvTexture), so without a per-material reflection those metals render as a flat
+ * BLACK void (the user's "cannons are all black"). Hand each metal material the procedural-sky LUT as a scoped
+ * reflection — same trick as harbor.service.applyEnvReflection — so it catches sky radiance, reads as dark iron
+ * (not a silhouette), and tracks time of day for free. No-op on the WebGL fallback (no LUT) and on non-metals.
+ * Idempotent (skips a material that already has a reflection), and materials are shared across instances so the
+ * fix lands once per unique material.
+ */
+export function applyShipMetalEnv(meshes: AbstractMesh[], env: Texture | null): void {
+  for (const mesh of meshes) {
+    const mat = mesh.material;
+    if (!(mat instanceof PBRMaterial)) continue;
+    if (!/iron|brass|bronze|steel|metal/i.test(mat.name)) continue;
+    // ROOT CAUSE: these are factor-only metals (metallic=1, no baked albedo/ORM). A pure metal has NO diffuse
+    // response, so with no scene environmentTexture it renders BLACK under any light — the sun can't light it.
+    // Reflection alone doesn't save it (and the LUT may not be built yet at ship-load → was null → stayed black).
+    // FIX, env-independent: drop metalness so the sun lights it as dark iron, and floor a near-black albedo to
+    // gunmetal so a cannon barrel reads with form, not as a black cutout.
+    const a = mat.albedoColor;
+    const nearBlack = !a || (a.r < 0.12 && a.g < 0.12 && a.b < 0.12);
+    if (/iron|steel/i.test(mat.name) || nearBlack) {
+      mat.metallic  = 0.45;                                  // enough diffuse for the sun to render dark iron
+      mat.roughness = Math.max(mat.roughness ?? 0.5, 0.5);
+      if (nearBlack) mat.albedoColor = new Color3(0.30, 0.30, 0.33);   // lighter gunmetal (was 0.14 — read too dark)
+    } else {
+      mat.metallic = Math.min(mat.metallic ?? 1, 0.6);       // brass/bronze: keep a goldish sheen, allow diffuse
+    }
+    // Bonus when the sky LUT is ready: a scoped reflection adds highlights and tracks time of day (same trick as
+    // harbor.service.applyEnvReflection). Skipped silently if the sky isn't built yet — the metal is already lit.
+    if (env && !mat.reflectionTexture) { mat.reflectionTexture = env; mat.environmentIntensity = 0.6; }
+  }
 }

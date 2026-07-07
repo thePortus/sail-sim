@@ -1,11 +1,14 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const fs   = require('fs');
+const path = require('path');
 const jwt    = require('jsonwebtoken');
 const config = require('./config/db.config');
 const db   = require('./models');
 const User = db.User;
 const { fn, col, where } = db.Sequelize;
+const { maskText, hasProfanity } = require('./profanity');
 
 // Above this many connected players, suppress join/leave chat announcements to
 // avoid spamming a crowded harbour.
@@ -52,11 +55,15 @@ const weatherState = require('./weather-state');
 
 // ── Server-authoritative ship-to-ship combat ─────────────────────────────────
 const combat = require('./combat');
+const combatConst = require('./combat-constants');
 const movement = require('./movement');
 const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const nav = require('./nav');
+const fortsMod = require('./forts');
+const terrainConfig = require('./config/terrain.config');
 const squadron = require('./squadron');
 const salvage = require('./salvage');
 const factions = require('./factions');
@@ -475,8 +482,11 @@ async function saveCombatState(p) {
 async function loadAndSendWallet(id, p, players) {
   if (!p || !p.auth || p.auth.userId == null) return;
   try {
-    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState'] });
+    const u = await User.findOne({ where: { id: p.auth.userId }, attributes: ['gold', 'cargo', 'tradeLedger', 'combatState', 'marketLedger', 'factionRep', 'ship', 'shipName', 'flagColor', 'cannonUpgrade', 'armorUpgrade', 'crew', 'questState', 'profanityFilter'] });
     if (!u) return;
+    // Chat profanity filter — per-user display preference, DEFAULT ON. Masks profane words in chat the player
+    // RECEIVES; they can opt out to see raw. (Distinct from the always-on hard block on names/callsigns.)
+    p.filterProfanity = u.profanityFilter !== false;
     p.gold = (u.gold == null) ? economy.STARTING_GOLD : (u.gold | 0);
     p.cargo = economy.parseCargo(u.cargo);
     p.tradeLedger = parseLedger(u.tradeLedger);
@@ -521,7 +531,15 @@ async function loadAndSendWallet(id, p, players) {
     // started (so a disconnect mid-panel doesn't restart the story), then push the active quest to the client.
     p.questState = quest.parseState(u.questState);
     if (quest.startIfNew(p.questState)) { saveEconomyState(p); }
-    sendQuest(p);
+    sendQuest(p);   // restores the quest tracker + DOCK-HERE marker + guidance (all driven by the active quest)
+    // Reconnect: restore the tutorial trade SELL-HERE beacon — it's set from the market-state hint (connection
+    // state, lost on disconnect). During the intro_trade SELL stage the hint points at the nearby portB. (The
+    // intro_combat HUNT marker is restored separately by ensureTutorialTarget once the first pose arrives.)
+    const itq = p.questState.intro_trade;
+    if (itq && itq.status === 'active' && itq.stage >= 1) {
+      const pb = quest.resolvePort('tutorial.portB');
+      if (pb && p.ws.readyState === 1) p.ws.send(JSON.stringify({ type: 'sell_hint', townId: pb }));
+    }
 
     sendWallet(p);
     p.ws.send(JSON.stringify({ type: 'ledger', towns: p.ledger }));   // the player's discovered-towns ledger
@@ -611,15 +629,37 @@ function applyQuestEvent(p, eventType, data, players) {
   ensureTutorialTarget(p, players);   // entering intro_combat spawns the weak pinnace
 }
 
-/** Spawn (or respawn) the intro_combat tutorial target while that quest is active and no live one exists. The
- *  tavern rumour marks it; sinking it (the owner) completes the quest. */
+/** True once the player has heard the rumour and is in the HUNT stage (stages: [rumour, hunt]) of intro_combat —
+ *  i.e. the marked pinnace should be shown on their chart. */
+function inTutorialHunt(p) {
+  const qc = p && p.questState && p.questState.intro_combat;
+  return !!(qc && qc.status === 'active' && qc.stage >= 1);
+}
+
+/** (Re)mark the tutorial pinnace on the player's chart. Reuses the tavern-rumour reply the client already handles
+ *  (sets its map TARGET to shipId) — so a respawned pinnace, or a fresh one after reconnect, is marked without a
+ *  new client message type. */
+function sendTutorialMark(p, t) {
+  if (!p || !p.ws || p.ws.readyState !== 1 || !t || !t.state) return;
+  p.ws.send(JSON.stringify({ type: 'rumor_result', ok: true, shipId: t.id, slug: t.state.vesselSlug, from: null, to: 'uncharted waters' }));
+}
+
+/** Spawn (or respawn) the intro_combat tutorial target while that quest is active and no live one exists. Once the
+ *  player is in the hunt stage the pinnace is marked on their chart — and if it was sunk (by another player) or
+ *  lost to a disconnect, the fresh one is re-marked so the map TARGET follows it (the id changes on respawn). */
 function ensureTutorialTarget(p, players) {
   if (!p || !p.questState || !players || !p.authPose) return;
   if (quest.activeQuestId(p.questState) !== 'intro_combat') return;
   const cur = p.tutorialNpcId ? players.get(p.tutorialNpcId) : null;
-  if (cur && !(cur.combat && cur.combat.sunk)) return;   // a live target already exists
+  if (cur && !(cur.combat && cur.combat.sunk)) {
+    // Live target already exists — but after a reconnect the chart mark (connection state) is gone; restore it.
+    if (inTutorialHunt(p) && p.rumorShipId !== cur.id) { p.rumorShipId = cur.id; sendTutorialMark(p, cur); }
+    return;
+  }
   const t = npc.makeTutorialTarget(players, p);
-  if (t) p.tutorialNpcId = t.id;
+  if (!t) return;
+  p.tutorialNpcId = t.id;
+  if (inTutorialHunt(p)) { p.rumorShipId = t.id; sendTutorialMark(p, t); }   // re-point the chart mark at the fresh pinnace
 }
 
 /** Remove a player's tutorial target (on disconnect / skip). A sunk one is left to linger-despawn naturally. */
@@ -913,6 +953,8 @@ function attachMultiplayer(server) {
     const now = Date.now();
     npc.tickNpcs(players, NPC_DT, broadcastLeave, now, fireNpcShot, announceConvoy);   // integrate, despawn sunk, return fire, telegraph
     npc.broadcastInterest(players, now);                  // send only the nearest few merchants to each client
+    fortsMod.tickForts(fortList, players, now, fireFortShot);   // harbor forts: target hostiles + fire; rebuild if neutralised
+    for (const f of fortList) if (f.dirty) { f.dirty = false; broadcastFortState(f); }   // e.g. a rebuilt fort
   }, NPC_DT * 1000);
 
   // ── Authoritative location autosave (every 30 s) ──────────────────────────────
@@ -934,6 +976,57 @@ function attachMultiplayer(server) {
   // loop below, tested against each victim's CURRENT pose. A ship that manoeuvres during
   // the ball's multi-second flight actually dodges it (unlike fire-time prediction).
   const activeShots = [];   // { shooterId, seq, ox,oy,oz, vx,vy,vz, fireTime, lastT }
+
+  // ── Harbor forts (server-authoritative gun batteries) ─────────────────────────
+  // Built once from the baked terrain manifest's harbors[].forts[]. They fire through the same activeShots /
+  // stepShot / resolveHit path as ships, and take sectional damage from ship balls (forts.stepShotForts below).
+  let fortList = [];
+  let respawnPorts = [];   // {x,z,faction,heading} for server-enforced faction-aware respawn
+  try {
+    const mani = JSON.parse(fs.readFileSync(path.join(terrainConfig.outputDir, 'manifest.json'), 'utf8'));
+    fortList = fortsMod.build(mani.harbors || []);
+    respawnPorts = (mani.harbors || []).filter((h) => h.x != null && h.z != null)
+      .map((h) => ({ x: h.x, z: h.z, faction: h.faction || null, heading: h.heading || 0, name: h.name }));
+    console.log(`[forts] ${fortList.length} harbor forts armed (${fortList.reduce((n, f) => n + f.guns.length, 0)} guns).`);
+  } catch (e) { console.warn('[forts] no manifest / build failed:', e.message); }
+
+  /** Pick where a sunk player respawns: a port her captain is on GOOD terms with (faction rep ≥ 0), nearest such;
+   *  if she's hostile to every nation, the LEAST-hostile port. Returns a navigable pose just off that port's
+   *  harbour (snapped to open water), bow toward the town — server-enforced so both clients simply get the jump. */
+  const pickRespawnPort = (me) => {
+    if (!respawnPorts.length) return null;
+    const from = me.authPose || me.state || { x: 0, z: 0 };
+    const repOf = (f) => (f && me.factionRep && Number.isFinite(me.factionRep[f])) ? me.factionRep[f] : 0;
+    let best = null, bestScore = -Infinity;
+    for (const t of respawnPorts) {
+      const rep = repOf(t.faction);
+      const d = Math.hypot(t.x - from.x, t.z - from.z);
+      const score = (rep >= 0 ? 1e9 : 0) + rep * 1e4 - d;   // friendly/neutral first, then nearest; hostile heavily penalised
+      if (score > bestScore) { bestScore = score; best = t; }
+    }
+    if (!best) return null;
+    const hr = best.heading * Math.PI / 180;
+    let sx = best.x + Math.sin(hr) * 55, sz = best.z + Math.cos(hr) * 55;   // step seaward off the pier
+    const sn = nav.snapToNav(nav.worldToCell(sx, sz).cx, nav.worldToCell(sx, sz).cz);   // land on navigable water
+    if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+    return { x: +sx.toFixed(1), z: +sz.toFixed(1), heading: (best.heading + 180) % 360, name: best.name };
+  };
+
+  const broadcastFortState = (fort) => {
+    const msg = JSON.stringify({ type: 'fort_state', ...fortsMod.serialize(fort) });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);
+  };
+
+  /** A fort gun fires: relay the ball to clients and register it (shooterId = fort id, carrying the fort's heavier
+   *  caliber so stepShot damages ships correctly since the fort isn't a `players` entry). */
+  const fireFortShot = (fort, gun, sol) => {
+    const now = Date.now();
+    const seq = (fort.shotSeq = (fort.shotSeq || 0) + 1);
+    const shotData = { ...sol, shotType: 'round' };
+    const msg = JSON.stringify({ type: 'cannon_shot', id: fort.id, seq, ...shotData, fort: true });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(msg);
+    activeShots.push({ shooterId: fort.id, seq, ...shotData, caliber: fort.spec.caliber, fireTime: now, lastT: 0 });
+  };
 
   /** An NPC merchant fires (A3): relay the flight visual to every client and register the shot for the SAME
    *  wait-and-see adjudication a player's shot gets — so the merchant's ball is dodgeable exactly like a
@@ -1091,6 +1184,21 @@ function attachMultiplayer(server) {
     }
   };
 
+  /** A ship ball struck a fort: sectional damage → cosmetic splinter + throttled state broadcast + a shout when
+   *  the last gun falls. A fort kill has NO piracy-rep / plunder side effects (it isn't a `players` sink). */
+  const resolveFortHit = (shot, fh, nowMs) => {
+    const { fort, gunIdx, dmg } = fh;
+    const shooter = players.get(shot.shooterId);
+    fortsMod.markAttacker(fort, shot.shooterId, nowMs);   // shelling a fort makes it return fire (self-defence)
+    const r = fortsMod.applyFortHit(fort, gunIdx, dmg, nowMs);
+    const hitMsg = JSON.stringify({ type: 'combat_hit', shooterId: shot.shooterId, fortId: fort.id, seq: shot.seq,
+      hx: fh.hx, hy: fh.hy, hz: fh.hz, tof: fh.tof, fort: true });
+    for (const [, p] of players) if (!p.isNpc && p.ws.readyState === 1) p.ws.send(hitMsg);
+    if (r.gunDown || r.neutralized || nowMs - (fort._stateMs || 0) > 300) { fort._stateMs = nowMs; broadcastFortState(fort); }
+    if (r.neutralized && shooter && !shooter.isNpc) sysReply(shooter.ws, `You have silenced the guns of ${fort.name}!`);
+    // TODO(capture): a neutralised fort is the hook for capturing/plundering the town — for now it rebuilds slowly.
+  };
+
   // Step every active shot forward in real time and resolve hits / expiries (~30 Hz).
   setInterval(() => {
     if (!activeShots.length) return;
@@ -1099,13 +1207,19 @@ function attachMultiplayer(server) {
       const s = activeShots[i];
       const tNow = (now - s.fireTime) / 1000;
       const result = combat.stepShot(s, s.lastT, tNow, players, now);
-      s.lastT = tNow;
       if (result && result.victimId) {
         resolveHit(s, result);
         activeShots.splice(i, 1);
       } else if (result && result.expired) {
         activeShots.splice(i, 1);
+      } else if (fortList.length && !String(s.shooterId).startsWith('fort_')) {
+        // No ship hit this window — test the same interval against harbor forts (a ship ball battering a fort).
+        const shooter = players.get(s.shooterId);
+        const cal = (shooter && shooter.combat) ? combatConst.caliberFor(shooter.combat.slug, shooter.cannonUpgrade) : 1;
+        const fh = fortsMod.stepShotForts(s, s.lastT, tNow, fortList, cal);
+        if (fh) { resolveFortHit(s, fh, now); activeShots.splice(i, 1); }
       }
+      s.lastT = tNow;
     }
   }, 33);
 
@@ -1465,6 +1579,10 @@ function attachMultiplayer(server) {
           for (const [pid, p] of players) {
             if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
           }
+          // Server-enforced respawn: teleport her to a port her nation-relations favour (both clients just get the
+          // correction — no client-side location pick). Falls back to leaving her put if no port is resolvable.
+          const port = pickRespawnPort(me);
+          if (port) teleportTo(id, me, port.x, port.z, port.heading);
         }
 
       } else if (msg.type === 'recruit_crew') {
@@ -1579,11 +1697,19 @@ function attachMultiplayer(server) {
         const me = players.get(id);
         if (me) {
           const name = sanitizeShipName(msg.shipName) || 'Saltmeadow';
-          me.shipName = name;
-          if (me.state) me.state.vesselName = name;
-          saveEconomyState(me);
-          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
-          if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
+          // HARD block (always on): a ship name is a PUBLIC label, so profane ones are never accepted — keep the
+          // current name and tell the client it was rejected (this is NOT the opt-out chat filter).
+          if (hasProfanity(name)) {
+            if (me.ws.readyState === 1) {
+              me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: me.shipName || 'Saltmeadow', rejected: 'profanity' }));
+            }
+          } else {
+            me.shipName = name;
+            if (me.state) me.state.vesselName = name;
+            saveEconomyState(me);
+            if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'ship_name_set', shipName: name }));
+            if (me.state) broadcastPose(id, me);   // others see the renamed ship at once
+          }
         }
 
       } else if (msg.type === 'set_flag_color') {
@@ -1597,6 +1723,17 @@ function attachMultiplayer(server) {
           saveEconomyState(me);
           if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'flag_color_set', flagColor: color }));
           if (me.state) broadcastPose(id, me);   // others see the new flag colour at once
+        }
+
+      } else if (msg.type === 'profanity_filter') {
+        // Toggle THIS player's chat profanity filter (display-only; default ON). Persisted to their user row so
+        // it survives reconnects. Does NOT affect the always-on hard block on names/callsigns.
+        const me = players.get(id);
+        if (me) {
+          const on = msg.on !== false;
+          me.filterProfanity = on;
+          if (me.auth?.userId) { User.update({ profanityFilter: on }, { where: { id: me.auth.userId } }).catch(() => {}); }
+          if (me.ws.readyState === 1) me.ws.send(JSON.stringify({ type: 'profanity_filter_set', on }));
         }
 
       } else if (msg.type === 'trade_open') {
@@ -1813,17 +1950,19 @@ function attachMultiplayer(server) {
           const { target: targetCallsign, rest: dmText } = parsed;
           if (!dmText || !targetCallsign) return;
 
-          const dmMsg = JSON.stringify({
-            type: 'chat', chatType: 'dm',
-            from: senderCallsign, to: targetCallsign, text: dmText,
+          // Mask profanity per-recipient (filtered unless the recipient opted out).
+          const cleanDm = maskText(dmText);
+          const dmMsg = (p) => JSON.stringify({
+            type: 'chat', chatType: 'dm', from: senderCallsign, to: targetCallsign,
+            text: p.filterProfanity === false ? dmText : cleanDm,
           });
           for (const [, p] of players) {
             if (p.state?.callsign === targetCallsign && p.ws.readyState === 1) {
-              p.ws.send(dmMsg); break;
+              p.ws.send(dmMsg(p)); break;
             }
           }
           const senderEntry = players.get(id);
-          if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg);
+          if (senderEntry?.ws.readyState === 1) senderEntry.ws.send(dmMsg(senderEntry));
 
         } else if (text.startsWith('/promote ') || text.startsWith('/demote ')) {
           // /promote "Red Sail"  → make target an Admin
@@ -2081,6 +2220,22 @@ function attachMultiplayer(server) {
             }
           }
 
+        } else if (text === '/stuck') {
+          // /stuck — self-rescue: teleport the caller to a nearby patch of open water (unstick from land/shallows/
+          // geometry). Ring-searches outward from the player's authoritative pose for the first non-land spot.
+          const me = players.get(id);
+          const from = me && (me.authPose || me.state);
+          if (!from) { sysReply(me?.ws, 'You must be at sea to use /stuck.'); }
+          else {
+            const spot = findWaterNear(from.x, from.z);
+            if (!spot) { sysReply(me.ws, 'No open water found nearby.'); }
+            else {
+              const heading = (Math.atan2(spot.x - from.x, spot.z - from.z) * 180 / Math.PI + 360) % 360;
+              teleportTo(id, me, spot.x, spot.z, heading);   // faces the open water it moved you toward
+              sysReply(me.ws, `Freed — moved to open water at (${spot.x.toFixed(0)}, ${spot.z.toFixed(0)}).`);
+            }
+          }
+
         } else if (text === '/reloadassets') {
           handleReloadAssets(id, senderCallsign, players);
 
@@ -2115,9 +2270,17 @@ function attachMultiplayer(server) {
           sysReply(players.get(id)?.ws, `Command not recognized: ${text.split(' ')[0]}. Type /help for a list.`);
 
         } else {
-          const globalMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });
-          for (const [, p] of players) {
-            if (p.ws.readyState === 1) p.ws.send(globalMsg);
+          // Global chat: mask profanity PER-RECIPIENT — filtered text for players who keep the (default-on)
+          // filter, raw for those who opted out. If the line is clean, one shared message (the common case).
+          const clean = maskText(text);
+          const rawMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text });
+          if (clean === text) {
+            for (const [, p] of players) { if (p.ws.readyState === 1) p.ws.send(rawMsg); }
+          } else {
+            const cleanMsg = JSON.stringify({ type: 'chat', chatType: 'global', from: senderCallsign, text: clean });
+            for (const [, p] of players) {
+              if (p.ws.readyState === 1) p.ws.send(p.filterProfanity === false ? rawMsg : cleanMsg);
+            }
           }
         }
       }

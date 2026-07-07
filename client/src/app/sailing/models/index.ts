@@ -91,6 +91,16 @@ export interface TownRect {
 
 export interface TownStreet { x1: number; z1: number; x2: number; z2: number; width: number; }
 
+/** One node of a town's defensive WALL RING (closed polyline). The client places a straight curtain between
+ *  consecutive nodes and a tower/bastion/gate at each node. World coords; see server deriveWalls(). */
+export interface TownWallNode { x: number; z: number; tag: 'corner' | 'bastion' | 'gate'; }
+
+/** One harbor-fort GUN: muzzle world position + combat spec (server-authoritative; fires from here). */
+export interface TownFortGun { x: number; z: number; y: number; heading: number; range: number; reload: number; damage: number; }
+/** One harbor FORT (Harbor Forts). Placement is server-derived (deriveForts) so both clients agree exactly; the
+ *  client loads `forts/<glb>.glb` at (x,y,z), guns facing seaward (heading). See server deriveForts(). */
+export interface TownFort { glb: string; tier: string; x: number; z: number; y: number; heading: number; hd: number; hw: number; flag: number[] | null; accent: boolean; guns: TownFortGun[]; }
+
 export interface TerrainHarbor {
   id: string;
   name: string;
@@ -105,6 +115,8 @@ export interface TerrainHarbor {
   buildings?: TownBuilding[];
   square?: TownRect | null;
   streets?: TownStreet[];
+  walls?: TownWallNode[];   // Harbor Forts — defensive wall ring (placeholder segments for the spike)
+  forts?: TownFort[];       // Harbor Forts — server-placed forts + gun spec (empty until a tier's GLB is authored)
   // Town Economy — the town's trade specialty (e.g. 'plantation', 'port'). Drives its market prices.
   specialty?: string;
   // Factions — the owning nation (e.g. 'english'); contested border towns also carry a rivalFaction.
@@ -234,6 +246,21 @@ export interface VesselPhysics {
   /** Seconds a fired broadside takes to reload before that side can fire again.
    *  Later modified by crew/morale; a flat per-ship constant for now. */
   reloadWindow?:   number;
+  // ── v2 sailing rig — server-authoritative handling character (see vessels.controller.js). Optional so a
+  //    server without them still type-checks; the client falls back to the hardcoded VESSEL_RIGS when absent. ──
+  /** Drive scale (thrust = forceK·sailAreaFactor·driveC·V_app²). */
+  forceK?:       number;
+  /** Trim tolerance multiplier — a simple rig forgives sloppy sheeting. */
+  trimForgive?:  number;
+  /** Leeway (side-slip) multiplier — deep hulls make less. */
+  leewayK?:      number;
+  /** Point-of-sail polar: [apparentAngleDeg, driveCoeff] breakpoints. */
+  polar?:        [number, number][];
+  /** Hull half-dimensions (m) — buoyancy sample footprint. */
+  hullHalfLen?:  number;
+  hullHalfBeam?: number;
+  /** Buoyancy feel; tiltTau < 0 signals "use the client default smoothing". */
+  buoyancy?:     { pitchScale: number; heaveTau: number; tiltTau: number };
 }
 
 export interface VesselPartParams {

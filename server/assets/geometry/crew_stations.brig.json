@@ -1,6 +1,7 @@
 {
   "ship": "brig",
   "glb": "brig.glb",
+  "wheel_rim": 0.565,
   "schema_version": 1,
   "space": "ship-local GLB coordinates; parent crew to the ship root node",
   "axes": {
@@ -248,7 +249,7 @@
       "pos": [
         0,
         5,
-        -10.4
+        -11.4
       ],
       "heading_deg": 0,
       "clip": "Idle",
@@ -264,7 +265,7 @@
         9
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_fc_port",
       "note": "forecastle bow chaser, port"
     },
@@ -277,7 +278,7 @@
         1.5
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_waist"
     },
     {
@@ -289,7 +290,7 @@
         -6.5
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_qd"
     },
     {
@@ -301,7 +302,7 @@
         -9
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_qd"
     },
     {
@@ -313,7 +314,7 @@
         9
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_fc_stbd",
       "note": "forecastle bow chaser, starboard"
     },
@@ -326,7 +327,7 @@
         1.5
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_waist"
     },
     {
@@ -338,7 +339,7 @@
         -6.5
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_qd"
     },
     {
@@ -350,7 +351,7 @@
         -9
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_qd"
     },
     {
@@ -362,7 +363,7 @@
         6
       ],
       "heading_deg": 0,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_waist_fwd",
       "note": "foremast fife rail / pin rail"
     },
@@ -375,7 +376,7 @@
         -4.9
       ],
       "heading_deg": 180,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_waist_aft",
       "note": "mainmast fife rail"
     },
@@ -388,7 +389,7 @@
         -1
       ],
       "heading_deg": -90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_port_waist",
       "note": "port pin rail"
     },
@@ -401,7 +402,7 @@
         -1
       ],
       "heading_deg": 90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_stbd_waist",
       "note": "starboard pin rail"
     },
@@ -427,7 +428,7 @@
         -5.6
       ],
       "heading_deg": -90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_port_qd",
       "note": "amidships capstan / deck work"
     },

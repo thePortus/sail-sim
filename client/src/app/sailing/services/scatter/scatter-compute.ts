@@ -258,7 +258,7 @@ fn emitClump(px: f32, pz: f32, y: f32) -> bool {
   let beachDens = beachRegion * coreD * beachBand * 0.85;
   let density = max(forestDens, beachDens) * alt * (1.0 - slope * 0.7) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > density) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
 
   if (!emitClump(px, pz, y)) { return; }
   let blades = u32(3.0 + coreD * (BURST - 3.0));
@@ -289,7 +289,7 @@ const RES: f32 = 24.0;
   let bandMul = 0.45 + 0.55 * beach + 0.6 * upland;
   let dens = (0.004 + 0.085 * smoothstep(0.60, 0.82, clump)) * bandMul * (1.0 - slope * 0.4) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 5.0)) { return; }
+  if (dealtAway(px, pz, 3.0)) { return; }
 
   let r = hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0));
   var base = 0.25 + hash2(vec2f(px * 6.1 + 9.0, pz * 6.1 - 9.0)) * 0.4;
@@ -298,7 +298,9 @@ const RES: f32 = 24.0;
   let sx = base * (0.85 + hash2(vec2f(px * 7.7, pz * 1.3)) * 0.35);
   let sy = base * (0.60 + hash2(vec2f(px * 1.3, pz * 7.7)) * 0.40);
   let sz = base * (0.85 + hash2(vec2f(px * 3.7, pz * 9.1)) * 0.35);
-  if (shadow) { emitShadow(px, y, pz, max(sx, sz) * 1.15); return; }
+  // Disc floor (0.8 m) so small rocks still throw a visible skirt, proportional x1.3 for boulders (KEEP IN
+  // SYNC with scatter.service buildRocks). The old flat x1.15 tucked the disc under the rock → looked shadowless.
+  if (shadow) { emitShadow(px, y, pz, max(0.8, max(sx, sz) * 1.3)); return; }
 
   let q = qYawPitchRoll(
     hash2(vec2f(px * 1.11 + 4.0, pz * 1.07 - 4.0)) * TAU,
@@ -328,7 +330,7 @@ const RES: f32 = 20.0;
   let clump = fbm2(vec2f(px / 16.0 + 40.0, pz / 16.0 - 22.0));
   let dens = (0.004 + 0.07 * smoothstep(0.60, 0.82, clump)) * (1.0 - slope * 0.4) * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 5.0)) { return; }
+  if (dealtAway(px, pz, 3.0)) { return; }
 
   let r = hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0));
   var s = 0.45 + hash2(vec2f(px * 6.1 + 9.0, pz * 6.1 - 9.0)) * 0.25;
@@ -365,7 +367,7 @@ const RES: f32 = 16.0;
   let dens = smoothstep(0.46, 0.72, stand) * smoothstep(0.4, 0.62, clearing)
     * (1.0 - slope * 0.8) * 0.18 * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
   if (nearShore(px, pz, 7.0)) { return; }
 
   let s = 0.9 + hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0)) * 0.22;
@@ -388,7 +390,7 @@ const RES: f32 = 14.0;
   let stand = fbm2(vec2f(px / 28.0 + 60.0, pz / 28.0 - 40.0));
   let dens = smoothstep(0.48, 0.80, stand) * (1.0 - slope * 0.6) * 0.95 * params.densityMul;
   if (hash2(vec2f(px * 3.1 + 1.7, pz * 2.9 - 3.3)) > dens) { return; }
-  if (dealtAway(px, pz, 3.0)) { return; }
+  if (dealtAway(px, pz, 2.0)) { return; }
   if (nearShore(px, pz, 7.0)) { return; }
 
   let s = 0.92 + hash2(vec2f(px * 5.3 - 2.0, pz * 4.7 + 8.0)) * 0.16;

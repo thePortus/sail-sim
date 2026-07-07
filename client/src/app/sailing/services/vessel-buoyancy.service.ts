@@ -69,8 +69,11 @@ const PITCH_SCALE = 0.14;
 const MAX_TILT    = 0.20;   // rad (~11.5°) — ceiling on wave-induced pitch/roll
 
 // Scaling constants — tuned for "arcade with dramatic feel"
-const SURF_SCALE    = 0.30;   // max ±30 % speed change from wave slope
-const BROACH_SCALE  = 1.80;   // degrees/s per unit of lateral orbital velocity
+// Surf/broach now derive from the FFT surface SLOPE (central finite differences of getVisualHeightAt), not the
+// old Gerstner WaveEngine. Gains map the (dimensionless) wave-face slope → effect; kept modest + clamped so the
+// real swell nudges rather than throws the boat around ("not overreactive"). Tune these two for surf/broach feel.
+const SURF_SLOPE_GAIN  = 2.5;   // fore-aft slope → speed modifier (clamped to −0.30…+0.20 below)
+const STEER_SLOPE_GAIN = 14;    // cross-slope → broach steering °/s (clamped to ±6 below)
 const PITCH_SMOOTH  = 0.028;  // lerp factor per frame for pitch/roll (lower = smoother)
 const MAX_BEAUFORT  = 8;
 
@@ -194,16 +197,21 @@ export class VesselBuoyancyService {
     const floorAlpha = 1 - Math.exp(-dt / 0.25);
     this.heaveFloorFiltered += (heaveFloor - this.heaveFloorFiltered) * floorAlpha;
 
-    // ── Wave slope → speed modifier ───────────────────────────────────────
-    const slope       = this.waveEngine.getWaveSlopeInHeading(wx, wz, headingRad, t);
-    const beaufortT   = Math.min(1, this.waveEngine.beaufort / MAX_BEAUFORT);
-    const speedMod    = Math.max(-0.30, Math.min(0.20, -slope * SURF_SCALE * beaufortT));
-
-    // ── Lateral orbital velocity → steering bias ──────────────────────────
-    const lateralV    = this.waveEngine.getLateralOrbitalVelocity(wx, wz, headingRad, t);
-    const steeringBias = Math.max(-6, Math.min(6,
-      lateralV * BROACH_SCALE * beaufortT,
-    ));
+    // ── Wave slope + cross-slope from the FFT SURFACE (no Gerstner) ───────────────
+    // Heave/pitch/roll above already sample the FFT (getVisualHeightAt → the FFT height provider). Surf-speed
+    // and broach-steer used to come from the separate Gerstner WaveEngine; derive them from the SAME FFT
+    // surface via central finite differences so EVERY buoyancy input is the real FFT swell. EPS ~ half a hull
+    // so it reads the swell's face, not tiny ripples (also keeps it calm).
+    const EPS = 4.0;
+    const fSlope = (this.oceanService.getVisualHeightAt(wx + sinH * EPS, wz + cosH * EPS, t)
+                  - this.oceanService.getVisualHeightAt(wx - sinH * EPS, wz - cosH * EPS, t)) / (2 * EPS);
+    const rSlope = (this.oceanService.getVisualHeightAt(wx + cosH * EPS, wz - sinH * EPS, t)
+                  - this.oceanService.getVisualHeightAt(wx - cosH * EPS, wz + sinH * EPS, t)) / (2 * EPS);
+    const beaufortT = Math.min(1, this.waveEngine.beaufort / MAX_BEAUFORT);
+    // Uphill ahead (fSlope > 0) → slow; downhill → surf. Gentle + asymmetric clamp (surf less than it brakes).
+    const speedMod = Math.max(-0.30, Math.min(0.20, -fSlope * SURF_SLOPE_GAIN * beaufortT));
+    // Cross-wave tilt nudges the bow (broaching) — small, clamped.
+    const steeringBias = Math.max(-6, Math.min(6, rSlope * STEER_SLOPE_GAIN * beaufortT));
 
     return {
       heave:         this.heaveFiltered,

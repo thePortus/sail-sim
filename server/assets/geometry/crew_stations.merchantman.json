@@ -1,8 +1,11 @@
 {
   "ship": "merchantman",
   "glb": "merchantman.glb",
+  "wheel_rim": 0.66,
+  "gun_grip_up": 1.05,
+  "rope_grip_up": 1.0,
   "schema_version": 1,
-  "space": "ship-local GLB-NATIVE coordinates; crew are parented to the ship GLB root (which the client yaws −90° via baseYawDeg). Author in the GLB's OWN frame so crew sit on the deck regardless of that yaw.",
+  "space": "ship-local GLB-NATIVE coordinates; crew are parented to the ship GLB root (which the client yaws \u221290\u00b0 via baseYawDeg). Author in the GLB's OWN frame so crew sit on the deck regardless of that yaw.",
   "axes": {
     "up": "+Y",
     "bow": "+X",
@@ -14,68 +17,431 @@
   "beam_axis": "z",
   "heading_convention": "yaw deg about +Y (Babylon local): 0 = facing +Z (starboard), 90 = facing +X (BOW), 180 = facing -Z (port), 270 = facing -X (stern). Gun crews face outboard; the helm faces the bow.",
   "deck_levels": {
-    "gun_deck": 5.3,
-    "quarterdeck": 6.7
+    "gun_deck": 5.5,
+    "foremast_deck": 6.2,
+    "quarterdeck": 7.06,
+    "forecastle": 7.8
   },
   "landmarks": {
-    "foremast": [10.9, 5.3, 0],
-    "mainmast": [0.8, 5.3, 0],
-    "mizzenmast": [-8.4, 6.7, 0],
-    "wheel": [-7.0, 6.7, 0],
+    "foremast": [
+      10.9,
+      5.3,
+      0
+    ],
+    "mainmast": [
+      0.8,
+      5.3,
+      0
+    ],
+    "mizzenmast": [
+      -8.4,
+      6.7,
+      0
+    ],
+    "wheel": [
+      -7.0,
+      6.7,
+      0
+    ],
     "bow": 15.4,
     "stern": -16.1,
-    "note": "Fore+main square-rigged on the gun deck (y5.3); the mizzen + wheel are on the raised quarterdeck aft (x<-5, y6.7). Six guns a side at x≈4.1/-2.4/-5.9 (from the B_Lid bones), rails at z≈±3.4."
+    "note": "Fore+main square-rigged on the gun deck (y5.3); the mizzen + wheel are on the raised quarterdeck aft (x<-5, y6.7). Six guns a side at x\u22484.1/-2.4/-5.9 (from the B_Lid bones), rails at z\u2248\u00b13.4."
   },
   "waypoints": {
-    "wp_bow":        [12.5, 5.3, 0],
-    "wp_fore":       [10.9, 5.3, 0],
-    "wp_waist_fwd":  [4.0, 5.3, 0],
-    "wp_main":       [0.8, 5.3, 0],
-    "wp_capstan":    [-1.4, 5.3, 0],
-    "wp_waist_aft":  [-4.0, 5.3, 0],
-    "wp_qd_break":   [-5.2, 5.3, 0],
-    "wp_qd":         [-7.0, 6.7, 0],
-    "wp_helm":       [-9.0, 6.7, 0],
-    "wp_stbd_fwd":   [4.1, 5.3, 2.3],
-    "wp_stbd_mid":   [-2.4, 5.3, 2.3],
-    "wp_port_fwd":   [4.1, 5.3, -2.3],
-    "wp_port_mid":   [-2.4, 5.3, -2.3]
+    "wp_bow": [
+      12.5,
+      7.8,
+      0.0
+    ],
+    "wp_foreS": [
+      10.5,
+      6.2,
+      1.2
+    ],
+    "wp_foreP": [
+      10.5,
+      6.2,
+      -1.2
+    ],
+    "wp_midS": [
+      5.5,
+      5.5,
+      1.2
+    ],
+    "wp_midP": [
+      5.5,
+      5.5,
+      -1.2
+    ],
+    "wp_xf": [
+      2.0,
+      5.5,
+      0.0
+    ],
+    "wp_mainS": [
+      0.8,
+      5.5,
+      1.2
+    ],
+    "wp_mainP": [
+      0.8,
+      5.5,
+      -1.2
+    ],
+    "wp_capS": [
+      -1.4,
+      5.5,
+      1.2
+    ],
+    "wp_capP": [
+      -1.4,
+      5.5,
+      -1.2
+    ],
+    "wp_xa": [
+      -0.5,
+      5.5,
+      0.0
+    ],
+    "wp_stairS_foot": [
+      -3.4,
+      5.5,
+      1.9
+    ],
+    "wp_stairP_foot": [
+      -3.4,
+      5.5,
+      -1.9
+    ],
+    "wp_stairS_top": [
+      -4.9,
+      6.9,
+      1.9
+    ],
+    "wp_stairP_top": [
+      -4.9,
+      6.9,
+      -1.9
+    ],
+    "wp_qdS": [
+      -6.3,
+      7.0,
+      1.4
+    ],
+    "wp_qdP": [
+      -6.3,
+      7.0,
+      -1.4
+    ],
+    "wp_helm": [
+      -7.3,
+      7.06,
+      0.0
+    ]
   },
   "edges": [
-    ["wp_bow", "wp_fore", { "kind": "walk" }],
-    ["wp_fore", "wp_waist_fwd", { "kind": "walk" }],
-    ["wp_waist_fwd", "wp_main", { "kind": "walk" }],
-    ["wp_main", "wp_capstan", { "kind": "walk" }],
-    ["wp_capstan", "wp_waist_aft", { "kind": "walk" }],
-    ["wp_waist_aft", "wp_qd_break", { "kind": "walk" }],
-    ["wp_qd_break", "wp_qd", { "kind": "walk", "note": "ramp up to the raised quarterdeck" }],
-    ["wp_qd", "wp_helm", { "kind": "walk" }],
-    ["wp_waist_fwd", "wp_stbd_fwd", { "kind": "walk" }],
-    ["wp_main", "wp_stbd_mid", { "kind": "walk" }],
-    ["wp_waist_fwd", "wp_port_fwd", { "kind": "walk" }],
-    ["wp_main", "wp_port_mid", { "kind": "walk" }]
+    [
+      "wp_bow",
+      "wp_foreS",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_bow",
+      "wp_foreP",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_foreS",
+      "wp_midS",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_foreP",
+      "wp_midP",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_midS",
+      "wp_mainS",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_midP",
+      "wp_mainP",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_midS",
+      "wp_xf",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_midP",
+      "wp_xf",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_mainS",
+      "wp_capS",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_mainP",
+      "wp_capP",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_capS",
+      "wp_xa",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_capP",
+      "wp_xa",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_capS",
+      "wp_stairS_foot",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_capP",
+      "wp_stairP_foot",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_stairS_foot",
+      "wp_stairS_top",
+      {
+        "kind": "walk",
+        "note": "starboard stair up to the quarterdeck"
+      }
+    ],
+    [
+      "wp_stairP_foot",
+      "wp_stairP_top",
+      {
+        "kind": "walk",
+        "note": "port stair up to the quarterdeck"
+      }
+    ],
+    [
+      "wp_stairS_top",
+      "wp_qdS",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_stairP_top",
+      "wp_qdP",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qdS",
+      "wp_helm",
+      {
+        "kind": "walk"
+      }
+    ],
+    [
+      "wp_qdP",
+      "wp_helm",
+      {
+        "kind": "walk"
+      }
+    ]
   ],
   "stations": [
-    { "id": "helm", "kind": "helm", "pos": [-9.0, 6.7, 0], "heading_deg": 90, "clip": "Idle", "wp": "wp_helm", "note": "abaft the wheel on the quarterdeck, facing the bow" },
-
-    { "id": "gun_S_0", "kind": "cannon", "pos": [4.1, 5.3, 2.9], "heading_deg": 0, "clip": "Work_Cannon", "wp": "wp_stbd_fwd", "note": "starboard fwd gun" },
-    { "id": "gun_S_1", "kind": "cannon", "pos": [-2.4, 5.3, 2.9], "heading_deg": 0, "clip": "Work_Cannon", "wp": "wp_stbd_mid" },
-    { "id": "gun_P_0", "kind": "cannon", "pos": [4.1, 5.3, -2.9], "heading_deg": 180, "clip": "Work_Cannon", "wp": "wp_port_fwd", "note": "port fwd gun" },
-    { "id": "gun_P_1", "kind": "cannon", "pos": [-2.4, 5.3, -2.9], "heading_deg": 180, "clip": "Work_Cannon", "wp": "wp_port_mid" },
-
-    { "id": "ropes_fore", "kind": "ropes", "pos": [10.4, 5.3, -1.2], "heading_deg": 180, "clip": "Work_Ropes", "wp": "wp_fore", "note": "at the foremast fife rail" },
-    { "id": "ropes_main", "kind": "ropes", "pos": [0.8, 5.3, 1.2], "heading_deg": 0, "clip": "Work_Ropes", "wp": "wp_main", "note": "at the mainmast fife rail" },
-    { "id": "ropes_mizzen", "kind": "ropes", "pos": [-8.0, 6.7, 1.0], "heading_deg": 0, "clip": "Work_Ropes", "wp": "wp_qd", "note": "mizzen/spanker, on the quarterdeck" },
-
-    { "id": "capstan_S", "kind": "idle", "pos": [-1.4, 5.3, 0.9], "heading_deg": 180, "clip": "Idle", "wp": "wp_capstan", "note": "at the capstan, facing inboard" },
-    { "id": "capstan_P", "kind": "idle", "pos": [-1.4, 5.3, -0.9], "heading_deg": 0, "clip": "Idle", "wp": "wp_capstan" },
-
-    { "id": "lookout_bow", "kind": "lookout", "pos": [12.5, 5.3, 0], "heading_deg": 90, "clip": "Lookout", "wp": "wp_bow", "note": "at the bow, looking forward" },
-    { "id": "idle_waist", "kind": "idle", "pos": [2.0, 5.3, -1.0], "heading_deg": 270, "clip": "Idle", "wp": "wp_waist_fwd" }
+    {
+      "id": "helm",
+      "kind": "helm",
+      "pos": [
+        -7.3,
+        7.06,
+        0
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "wp_helm",
+      "note": "abaft the ship's wheel (hub root-local -7,7.96,0), ~0.3m behind it on the quarterdeck, facing the bow \u2014 hands IK onto the wheel rim"
+    },
+    {
+      "id": "gun_S_0",
+      "kind": "cannon",
+      "pos": [
+        4.5,
+        5.6,
+        1.1
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_midS",
+      "note": "abaft the starboard fwd gun (breech z~1.5), facing the port/outboard \u2014 hands IK onto the barrel"
+    },
+    {
+      "id": "gun_S_1",
+      "kind": "cannon",
+      "pos": [
+        -2.0,
+        5.47,
+        1.1
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_capS",
+      "note": "abaft the starboard mid gun, hands on the barrel"
+    },
+    {
+      "id": "gun_P_0",
+      "kind": "cannon",
+      "pos": [
+        4.5,
+        5.6,
+        -1.1
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_midP",
+      "note": "abaft the port fwd gun, hands on the barrel"
+    },
+    {
+      "id": "gun_P_1",
+      "kind": "cannon",
+      "pos": [
+        -2.0,
+        5.47,
+        -1.1
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_capP",
+      "note": "abaft the port mid gun, hands on the barrel"
+    },
+    {
+      "id": "ropes_fore",
+      "kind": "ropes",
+      "pos": [
+        10.4,
+        6.2,
+        -1.1
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_foreP",
+      "note": "at the foremast fife rail (port side), FACING the rail (inboard +Z) \u2014 hands IK onto the pins"
+    },
+    {
+      "id": "ropes_main",
+      "kind": "ropes",
+      "pos": [
+        0.8,
+        5.47,
+        1.1
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_mainS",
+      "note": "at the mainmast fife rail (stbd side), facing the rail (inboard -Z) \u2014 hands on the pins"
+    },
+    {
+      "id": "ropes_mizzen",
+      "kind": "ropes",
+      "pos": [
+        -8.0,
+        7.09,
+        1.0
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_qdS",
+      "note": "at the mizzen fife rail (stbd side), facing the rail (inboard -Z) \u2014 hands on the pins"
+    },
+    {
+      "id": "capstan_S",
+      "kind": "idle",
+      "pos": [
+        -1.4,
+        5.47,
+        0.9
+      ],
+      "heading_deg": 180,
+      "clip": "Idle",
+      "wp": "wp_capS",
+      "note": "at the capstan, facing inboard"
+    },
+    {
+      "id": "capstan_P",
+      "kind": "idle",
+      "pos": [
+        -1.4,
+        5.47,
+        -0.9
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_capP"
+    },
+    {
+      "id": "lookout_bow",
+      "kind": "lookout",
+      "pos": [
+        12.5,
+        7.8,
+        0
+      ],
+      "heading_deg": 90,
+      "clip": "Lookout",
+      "wp": "wp_bow",
+      "note": "at the bow, looking forward"
+    },
+    {
+      "id": "idle_waist",
+      "kind": "idle",
+      "pos": [
+        2.0,
+        5.51,
+        -1.0
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "wp_mainP"
+    }
   ],
   "climb_paths": [],
   "notes": [
-    "Authored in the GLB-native frame (bow=+X, beam=Z) because crew parent to the yawed model root; beam_axis='z' tells the crew code the rail axis. Heights (gun_deck 5.3, quarterdeck 6.7) + station positions are derived from the B_Mast / B_Lid / B_Wheel bones and deck bounds — LIVE-TUNE if crew float or clip.",
+    "Authored in the GLB-native frame (bow=+X, beam=Z) because crew parent to the yawed model root; beam_axis='z' tells the crew code the rail axis. Heights (gun_deck 5.3, quarterdeck 6.7) + station positions are derived from the B_Mast / B_Lid / B_Wheel bones and deck bounds \u2014 LIVE-TUNE if crew float or clip.",
     "6 guns/side, helm on the quarterdeck, fife-rail + capstan + lookout work stations. No ladders (the quarterdeck is reached by a walk ramp) so no climb_paths."
   ]
 }

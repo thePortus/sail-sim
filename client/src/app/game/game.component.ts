@@ -38,6 +38,7 @@ import { CannonService }       from '../sailing/services/cannon.service';
 import { CombatService }       from '../sailing/services/combat.service';
 import { MusicService }        from '../sailing/services/music.service';
 import { AuthService }        from '../services/auth.service';
+import { UserService }        from '../services/user.service';
 
 import { HudComponent }            from '../sailing/components/hud/hud.component';
 import { MinimapComponent }        from '../sailing/components/minimap/minimap.component';
@@ -276,7 +277,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <div class="sunk-icon">🌊</div>
               <div class="sunk-title">Your ship was sunk</div>
               <div class="sunk-text">Sent to the depths by {{ combatService.sunkBy() }}.</div>
-              <button class="sunk-btn" (click)="onConfirmSunk()">Respawn at Nearest Port</button>
+              <button class="sunk-btn" (click)="onConfirmSunk()">Respawn at a Friendly Port</button>
             </div>
           </div>
         }
@@ -399,6 +400,7 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   private http               = inject(HttpClient);
   private router             = inject(Router);
   private authService        = inject(AuthService);
+  private userService        = inject(UserService);
   private sceneService       = inject(SceneService);
   private oceanService       = inject(OceanService);
   private oceanFftEngine      = inject(OceanFFTEngine);
@@ -930,6 +932,9 @@ export class GameComponent implements AfterViewInit, OnDestroy {
     this.phase.set('selecting');
     this.authService.flagSessionExpired();   // login screen explains WHY they were bounced here
     this.authService.clearStorage();
+    this.userService.logout();               // drop the in-memory logged-in state too — without this the login
+                                             // page still reads `user.loggedIn` and shows "signed in as X" (with no
+                                             // expired banner) instead of the login form. (home's expireSession does this.)
     this.router.navigate(['/login']);
   }
 
@@ -998,10 +1003,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   /** Acknowledge a sinking → respawn at the nearest harbor town (teleport + full repair). The server
    *  respawn clears our authoritative pose so the teleport isn't clamped by movement validation. */
   onConfirmSunk(): void {
-    const pos = this.vesselService.getPosition();
-    const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
-    this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
+    // Server-enforced respawn: it restores the hull and teleports her to a port her nation-relations favour, which
+    // arrives as a correction. We just ask, then dismiss the overlay + ease the hull up (the correction repositions).
     this.multiplayerService.requestRespawn();
+    this.combatService.clearSunk();
+    this.vesselService.stopSinking();
   }
 
   /** Dock prompt: auto-steer the boat to a tie-up berth alongside the pier, then moor (the town menu

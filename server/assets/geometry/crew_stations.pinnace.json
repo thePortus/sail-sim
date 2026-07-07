@@ -136,7 +136,7 @@
         -0.15
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_zoneC_aft",
       "note": "behind port gun breech, facing outboard +X"
     },
@@ -149,7 +149,7 @@
         0.15
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_zoneC_fore"
     },
     {
@@ -161,7 +161,7 @@
         1.0
       ],
       "heading_deg": 90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_zoneC_fore",
       "note": "port shroud deadeyes / cleats"
     },
@@ -174,7 +174,7 @@
         1.0
       ],
       "heading_deg": -90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_zoneC_fore"
     },
     {
@@ -194,7 +194,7 @@
       "kind": "seat",
       "pos": [
         0.32,
-        0.14,
+        -0.12,
         -1.5
       ],
       "heading_deg": 180,
@@ -207,35 +207,10 @@
       "kind": "seat",
       "pos": [
         -0.32,
-        0.14,
+        -0.12,
         -1.5
       ],
       "heading_deg": 180,
-      "clip": "Sit",
-      "wp": "wp_zoneB"
-    },
-    {
-      "id": "seat_P_strn",
-      "kind": "seat",
-      "pos": [
-        0.32,
-        0.14,
-        -2.5
-      ],
-      "heading_deg": 0,
-      "clip": "Sit",
-      "wp": "wp_zoneB",
-      "note": "face bow"
-    },
-    {
-      "id": "seat_S_strn",
-      "kind": "seat",
-      "pos": [
-        -0.32,
-        0.14,
-        -2.5
-      ],
-      "heading_deg": 0,
       "clip": "Sit",
       "wp": "wp_zoneB"
     }

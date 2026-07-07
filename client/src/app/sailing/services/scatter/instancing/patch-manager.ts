@@ -17,17 +17,23 @@ export class PatchManager {
   private readonly patches: [IPatch, number][] = [];
   private readonly queue: Array<{ newLOD: number; patch: IPatch }> = [];
   private readonly computeLodLevel: (patch: IPatch) => number;
+  /** Optional override for how a patch materializes a LoD level — lets a layer render TWO meshes per patch
+   *  (the tree cross-dissolve ring). When set, it fully owns the createInstances call for that level. */
+  private readonly materializeFn?: (patch: IPatch, level: number) => void;
   private patchUpdateRate = 1;
   private _lodTick = 0;
   /** Re-evaluate distance-based LoD only every Nth frame — a few frames of swap lag is invisible, and the
    *  per-patch distance scan was running every frame for every layer. */
   private readonly lodEvalEvery = 4;
 
-  /** @param lodFractions per-LoD instance fraction (0..1) — thins distant tiers. Defaults to all 1. */
-  constructor(meshesFromLod: Mesh[], computeLodLevel: (patch: IPatch) => number = () => 0, lodFractions?: number[]) {
+  /** @param lodFractions per-LoD instance fraction (0..1) — thins distant tiers. Defaults to all 1.
+   *  @param materializeFn optional custom (patch, level) → render; overrides the default single-mesh swap. */
+  constructor(meshesFromLod: Mesh[], computeLodLevel: (patch: IPatch) => number = () => 0, lodFractions?: number[],
+              materializeFn?: (patch: IPatch, level: number) => void) {
     this.meshesFromLod = meshesFromLod;
     this.computeLodLevel = computeLodLevel;
     this.lodFractions = lodFractions ?? meshesFromLod.map(() => 1);
+    this.materializeFn = materializeFn;
   }
 
   addPatch(patch: IPatch): void {
@@ -74,7 +80,8 @@ export class PatchManager {
     for (let i = 0; i < n; i++) {
       const head = this.queue.shift();
       if (head === undefined) { break; }
-      head.patch.createInstances(this.meshesFromLod[head.newLOD], this.lodFractions[head.newLOD]);
+      if (this.materializeFn) { this.materializeFn(head.patch, head.newLOD); }
+      else { head.patch.createInstances(this.meshesFromLod[head.newLOD], this.lodFractions[head.newLOD]); }
       done++;
     }
     return done;

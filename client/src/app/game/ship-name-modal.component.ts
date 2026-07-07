@@ -28,6 +28,10 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
           <span class="sn-count">{{ name().trim().length }}/28</span>
         </div>
 
+        @if (mp.shipNameError(); as err) {
+          <div class="sn-error">{{ err }}</div>
+        }
+
         <div class="sn-actions">
           <button class="sn-btn sn-keep" (click)="keep(m.reason)">{{ keepLabelFor(m.reason) }}</button>
           <button class="sn-btn sn-confirm" [disabled]="!valid()" (click)="confirm()">Christen her</button>
@@ -55,6 +59,7 @@ import { MultiplayerService } from '../sailing/services/multiplayer.service';
     .sn-input:focus { outline: none; border-color: #c89a4a; box-shadow: 0 0 0 2px rgba(200,154,74,0.25); }
     .sn-row { display: flex; justify-content: flex-end; margin-top: 0.3rem; }
     .sn-count { font-size: 0.72rem; color: #9c8755; font-variant-numeric: tabular-nums; }
+    .sn-error { font-size: 0.82rem; color: #f0b0a0; margin: 0.5rem 0 0; line-height: 1.35; }
     .sn-actions { display: flex; gap: 0.6rem; margin-top: 0.9rem; }
     .sn-btn { flex: 1; padding: 0.55rem; border-radius: 8px; font-family: inherit; font-size: 0.95rem; cursor: pointer; border: 1px solid transparent; }
     .sn-keep { background: #3a2817; border-color: #6e5326; color: #e8d3a0; }

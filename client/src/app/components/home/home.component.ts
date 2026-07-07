@@ -6,10 +6,11 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { AuthService } from './../../services/auth.service';
 import { User, UserService } from './../../services/user.service';
 import { Settings } from '../../app.settings';
+import { DownloadClientComponent } from '../download-client/download-client.component';
 
 @Component({
   selector: 'app-home',
-  imports: [CommonModule, RouterLink],
+  imports: [CommonModule, RouterLink, DownloadClientComponent],
   standalone: true,
   templateUrl: './home.component.html',
   styleUrl: './home.component.scss'

@@ -235,6 +235,8 @@ function renderActive(qs, townName) {
       // manual = a pure narrative acknowledgement (a 'Done' button); the rest are completed by a real action
       // (client-detected steering/trim/look, or a server-verified event), never by clicking.
       manual: o.type === 'client_ack' ? !!o.manual : false,
+      // The resolved destination town for a dock objective (the client marks it on the map). Null otherwise.
+      townId: o.type === 'dock_at' ? resolvePort(o.params.port) : null,
       label: fillNames(o.label, townName), hint: fillNames(o.hint, townName),
       done: st.done.includes(o.id),
     })),

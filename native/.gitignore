@@ -1,0 +1,24 @@
+# CMake build output (includes the fetched WebGPU backend — large)
+build/
+out/
+cmake-build-*/
+
+# transient configure/compile logs
+build-*.log
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Downloaded UI font — re-fetchable at CMake configure (SAILSIM_FONT_URL),
+# embedded into the binary. Never committed (may be license-restricted).
+assets/fonts/
+
+# macOS .app bundle, if ever built outside build/ (which is already ignored)
+*.app/
+
+# ImGui layout, only written if IniFilename is re-enabled
+imgui.ini
+build-bundle/

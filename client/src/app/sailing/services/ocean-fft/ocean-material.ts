@@ -26,6 +26,8 @@ export interface OceanMaterialDeps {
   depthTexture: BaseTexture | null;
   /** Current sun/light direction (world). */
   getSunDir: () => Vector3;
+  /** Sun visibility 1=clear … 0=hidden behind terrain/cloud. Dims the reflected-sun glint streak. */
+  getSunOcclusion?: () => number;
   /** Shared ocean elapsed-time seconds. */
   getTime: () => number;
   /** Planar reflection RTT (skybox + islands + vessels), sampled by screen UV. Null = none. */
@@ -87,7 +89,11 @@ export class OceanFFTMaterial {
     // isn't culled from above by reversed winding. (Revisit once handedness is confirmed.)
     mat.backFaceCulling = false;
 
-    const color = new Vector3(0.011126082368383245, 0.05637409755197975, 0.09868919754109445);
+    // Deep-water base colour (beauty pass 3, Phase C water look): richer tropical SAPPHIRE — blue lifted
+    // (deeper, less muddy) with the teal undertone kept, a hair brighter overall so open water reads vivid
+    // rather than near-black. (was 0.01113, 0.05637, 0.09869.) The sea is most of the screen, so this is the
+    // single highest-impact knob; push B up / G down for more Pacific-blue, up G for more Caribbean-teal.
+    const color = new Vector3(0.01200, 0.05850, 0.11700);
 
     mat.AddUniform('_Color', 'vec3', color);
     mat.AddUniform('_MaxGloss', 'float', 0.91);
@@ -95,7 +101,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_LOD_scale', 'float', 7.13);
 
     mat.AddUniform('_FoamColor', 'vec3', new Vector3(1, 1, 1));
-    mat.AddUniform('_FoamScale', 'float', 2.6);   // whitecap contrast (between demo 2.4 and 2.8)
+    mat.AddUniform('_FoamScale', 'float', 2.78);   // whitecap contrast — nudged up (was 2.6) for slightly crisper, whiter caps
     mat.AddUniform('_ContactFoam', 'float', 0);   // contact foam kept off; the depth tex is used only for the hull-reveal cutoff
     mat.AddUniform('_FoamBiasLOD0', 'float', 0.895);   // caps form on moderate seas
     mat.AddUniform('_FoamBiasLOD1', 'float', 1.905);
@@ -103,7 +109,7 @@ export class OceanFFTMaterial {
     mat.AddUniform('_Choppiness', 'float', 0.3);   // sea state 0..1 — trims foam in heavy seas
 
     mat.AddUniform('_SSSColor', 'vec3', new Vector3(0.1541919, 0.8857628, 0.990566));
-    mat.AddUniform('_SSSStrength', 'float', 0.205);   // back-lit glow (between demo 0.15 and 0.26)
+    mat.AddUniform('_SSSStrength', 'float', 0.255);   // back-lit turquoise wave-glow — up from 0.205 (the tropical signature: sun-through-the-crest)
     mat.AddUniform('_SSSBase', 'float', -0.261);
     mat.AddUniform('_SSSScale', 'float', 4.7);
 
@@ -143,6 +149,9 @@ export class OceanFFTMaterial {
     mat.AddUniform('_TerrainBounds', 'vec4', new Vector4(0, 0, 1, 1));   // minX, minZ, sizeX, sizeZ
     mat.AddUniform('_TerrainTexSize', 'vec2', new Vector2(1, 1));
     mat.AddUniform('_TerrainHasField', 'float', 0);
+    // Sun visibility (1 clear → 0 hidden behind terrain/cloud). Declared unconditionally so the diagnostic
+    // probe + reflected-glint dim can both use it regardless of the reflections toggle.
+    mat.AddUniform('_SunOcclusion', 'float', 1.0);
     if (this._deps.reflectionTexture) {
       mat.AddUniform('_Reflection', 'sampler2D', this._deps.reflectionTexture);
       mat.AddUniform('_ReflStrength', 'float', 0.9);
@@ -854,10 +863,17 @@ export class OceanFFTMaterial {
         // peeking out in screen space). Over-drive the cut so it hits 0 once the water is clearly
         // shallow, while open/deep water (reveal=shallow=0) keeps full reflection.
         float reflCut = clamp(1.0 - max(reveal, shallow) * 1.6, 0.0, 1.0);
-        waterCol += planarRefl * fresnel * _ReflStrength * reflCut;
+        // Sun-glint occlusion. The reflected view ray tells us which pixels mirror the sky toward the
+        // sun; where that aligns with the sun AND the sun is hidden behind terrain/cloud, kill the bright
+        // reflected-sun streak (the planar RTT still shows the sun's sky-glow because the reflected
+        // mountain doesn't occlude it). No-op when the sun is visible (_SunOcclusion = 1 ⇒ streakDim = 1).
+        vec3  reflRay   = reflect(-viewDir, normalW);
+        float sunAlign  = max(0.0, dot(reflRay, lightDirection));
+        float streakDim = mix(1.0, _SunOcclusion, smoothstep(0.55, 0.96, sunAlign));
+        waterCol += planarRefl * fresnel * _ReflStrength * reflCut * streakDim;
         // Analytic sky fallback — fades in as the planar reflection fades out (reflections off / RTT
         // dead) so the water still catches sky light at grazing angles instead of reading flat-dark.
-        waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * reflCut;
+        waterCol += _SkyColor * fresnel * (1.0 - _ReflStrength) * reflCut * streakDim;
       #endif
       #ifdef HAS_SHADOWS
         waterCol *= (1.0 - _waterShadow(vWorldUV) * 0.8);
@@ -894,8 +910,27 @@ export class OceanFFTMaterial {
         // visibly illuminates the surrounding water.
         finalEmissive += _cannonFlashGlow(vWorldUV);
       #endif
+      // ── Sun-glint occlusion (THE fix) ─────────────────────────────────────────────────────────────────
+      // The reflected-sun STREAK is the PBR environment RADIANCE (the IBL reflection of the bright sunset
+      // sun) plus the direct specular. Both are computed by the PBR core just above and summed into finalColor
+      // next — and the flat-green probe proved zeroing this material's output kills the streak. So knock these
+      // two mirror terms straight down by sun visibility: _SunOcclusion = 1 (sun visible) → unchanged;
+      // _SunOcclusion → 0 (hidden behind terrain/cloud) → the glint vanishes. No brightness threshold, no
+      // directional cone (both of which silently missed) — this dims the exact terms that ARE the streak. The
+      // manual planar reflection (in finalEmissive/waterCol) is untouched, so the water keeps its sky sheen.
+      #ifdef REFLECTION
+        finalRadianceScaled *= _SunOcclusion;
+      #endif
+      #ifdef SPECULARTERM
+        finalSpecularScaled *= _SunOcclusion;
+      #endif
     `);
 
+    // Sun-glint occlusion — the REAL fix, applied at the last stage where finalColor holds the fully-composed
+    // pixel (the black-probe test proved this point controls the streak). The streak is the PBR environment
+    // RADIANCE (IBL reflection of the bright sunset sky/sun) — a term neither the manual reflection dim nor the
+    // sun.specular dim touched. Here we knock it down ONLY where the surface mirrors the sun (reflected view ray
+    // aligns with lightDirection) AND the sun is occluded (_SunOcclusion → 0). No-op when the sun is visible.
     // Per-frame uniforms (camera pos, ping-ponged turbulence, time, light dir).
     mat.onBindObservable.add(() => {
       const eff = mat.getEffect();
@@ -910,6 +945,7 @@ export class OceanFFTMaterial {
       }
       eff.setFloat('_Time', this._deps.getTime() / 10);
       eff.setVector3('lightDirection', this._deps.getSunDir());
+      eff.setFloat('_SunOcclusion', this._deps.getSunOcclusion?.() ?? 1.0);
       const fishStartle = this._deps.getFishStartle?.();
       if (fishStartle) { eff.setVector4('_FishStartle', fishStartle); }
       // Sky reflection state — colour the water reflects + planar strength (0 when reflections off).

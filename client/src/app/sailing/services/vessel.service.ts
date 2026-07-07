@@ -2,8 +2,9 @@ import { Injectable, NgZone, effect, inject, signal } from '@angular/core';
 import {
   MeshBuilder, Vector3, Color3, Color4, StandardMaterial, PBRMaterial, Mesh, Material,
   AbstractMesh, TransformNode, DynamicTexture, ParticleSystem, Scene, PointerEventTypes, PointLight,
-  DirectionalLight,
+  DirectionalLight, Ray, Node,
 } from '@babylonjs/core';
+import { ShadowOnlyMaterial } from '@babylonjs/materials/shadowOnly';
 import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoader
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
@@ -11,7 +12,7 @@ import { OceanService }  from './ocean.service';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
-import { VesselController, createVesselController, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor, VesselRig, SailRig } from './vessel-controller';
+import { VesselController, createVesselController, applyShipMetalEnv, rigForSlug, baseYawDegFor, floatDraftFor, maskFloorFor, VesselRig, SailRig } from './vessel-controller';
 import { applyFlagColor, flagColor3, FlagColorHandle } from './flag-color';
 import { CrewService, CrewHandle, crewSeedFrom } from './crew.service';
 import { CombatService } from './combat.service';
@@ -91,6 +92,7 @@ export class VesselService {
   private readonly physDebugOn = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics_debug') === '1');
   private readonly SAIL_FORCE_K   = 0.26;    // drive scale: thrust = K·sailAreaFactor·driveC·V_app²
   private readonly DRAG_K         = 1.0;     // hull drag: F = DRAG_K·v² (quadratic) — sets where drive=drag
+  private readonly LINEAR_DRAG_K  = 2.0;     // viscous/skin drag ∝ speed — bleeds the low-speed coast (quadratic drag vanishes near 0, so a furled ship glided on forever)
   private readonly FORCE_RESPONSE = 0.04;    // accel gain (sets momentum/time-constant; lower = weightier)
   private readonly WEIGHT_REF     = 2800;    // sloop weight → massK = physics.weight / WEIGHT_REF
   private prevSpeedMod = 0;                  // last frame's buoy.speedModifier, fed back as wave-surf accel
@@ -217,6 +219,7 @@ export class VesselService {
     this.hitRollVel += dir * this.HIT_ROLL_IMPULSE;
     this.hitSwayVel += dir * this.HIT_SWAY_IMPULSE;
     this.addShakeTrauma(0.85);   // taking a hit: a big, ringing shake (~2-3 swings)
+    this.crewHandle?.reactToHit(side);   // deck crew stagger/lurch with the impact (P4)
   }
 
   addCannonRecoil(side: 'port' | 'stbd'): void {
@@ -245,6 +248,11 @@ export class VesselService {
   /** A gun on `side` just fired → the deck crew at that side's gun stations work harder for a beat (crew P3). */
   crewGunWork(side: 'port' | 'stbd'): void {
     this.crewHandle?.emphasizeGun(side);
+    this.crewHandle?.reactToFire(side);   // (P4) crew not working that gun flinch at the blast — AFTER emphasizeGun
+  }
+  /** (P4) We sank an enemy → the deck crew cheer. */
+  crewCheer(): void {
+    this.crewHandle?.reactCheer();
   }
   /** True once a side has finished running out (safe to fire). */
   isGunReady(side: 'port' | 'stbd'): boolean {
@@ -352,8 +360,35 @@ export class VesselService {
   private fpEye: Vector3 | null = null;   // vessel-local eye position (from the server vessel def)
   private fpYaw   = 0;   // free-look yaw offset from the bow (deg)
   private fpPitch = 0;   // free-look pitch (deg, + = up)
+  private invertCamY = false;   // invert the vertical look axis (settings toggle 'ignis_invert_camera'); read per-drag
 
-  toggleFirstPerson(): void { this.firstPerson.update(v => !v); }
+  // Deck-walk: while ON DECK (first-person) with the LEFT BUTTON HELD, WASD/arrows walk the eye across the deck.
+  // The eye Y is clamped to a downward raycast onto the ship's deck geometry every frame, so it rides up the
+  // stairs to the quarterdeck and back down to the main deck on ANY ship. Keys are read each frame by updateCamera.
+  private walk = { fwd: false, back: false, left: false, right: false };
+  private deckCamMeshes: AbstractMesh[] | null = null;   // cached ship structural meshes for the walk raycast
+  private readonly WALK_SPEED = 4.5;   // m/s across the deck
+  private readonly WALK_EYE   = 1.65;  // standing eye height above the planks
+
+  private clearWalk(): void { this.walk.fwd = this.walk.back = this.walk.left = this.walk.right = false; }
+
+  // Deck shadow CATCHERS — the ship's PBR material can't `receiveShadows` (it's at the WebGPU 16-varying limit), so
+  // for each STATIC deck/hull mesh we clone a coincident twin with a minimal ShadowOnlyMaterial that DOES receive,
+  // overlaying the crew/furniture shadows onto the deck. Opt-out `localStorage.ignis_deck_shadows='0'` (→ blob crew
+  // shadows instead). Cheap: ~2 static clones per ship, shared material, not cast/reflected.
+  private shadowCatchers: AbstractMesh[] = [];
+  private shadowCatcherMat: ShadowOnlyMaterial | null = null;
+  private readonly realDeckShadows = (() => { try { return localStorage.getItem('ignis_deck_shadows') !== '0'; } catch { return true; } })();
+
+  private clearShadowCatchers(): void {
+    for (const c of this.shadowCatchers) c.dispose(false, false);   // keep the shared geometry + material
+    this.shadowCatchers = [];
+  }
+
+  toggleFirstPerson(): void {
+    this.firstPerson.update(v => !v);
+    if (!this.firstPerson()) this.clearWalk();
+  }
 
   /** Current free-look camera offset in degrees — third-person orbit (azimuth from dead-astern + elevation),
    *  or the first-person look offset when on deck. Used by the intro tutorial to detect "look about your ship". */
@@ -427,18 +462,22 @@ export class VesselService {
   private portEmit  = new Vector3(0, this.WAKE_Y, 0);
   private stbdEmit  = new Vector3(0, this.WAKE_Y, 0);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  async init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): Promise<void> {
-    this.x       = spawnX;
-    this.z       = spawnZ;
-    this.heading = spawnHeading;
-    if (vessel.physics) Object.assign(this.physics, vessel.physics);
-
-    // Resolve the rig (GLB + manifest + orientation + handedness). The server vessel def is authoritative;
-    // fall back to the slug→rig map.
-    this.vesselSlug = vessel.slug;
+  /** Build the vessel rig by layering the SERVER's authoritative sailing physics (vessel.physics: polar,
+   *  forceK/trimForgive/leewayK, hull half-dims, buoyancy) over the hardcoded VESSEL_RIGS base. The base now
+   *  only supplies PRESENTATION (glb/manifest/orientation/hullCut/oceanMask) and a fallback for anything the
+   *  server omits, so a change to a ship's handling is made once, on the server, and both clients follow.
+   *  The sloop's buoyancy uses tiltTau < 0 as a "client default smoothing" sentinel → keep the base buoyancy. */
+  private mergeRig(vessel: Vessel): VesselRig {
     const base = rigForSlug(vessel.slug);
-    this.rig = {
+    const p = vessel.physics;
+    const sail: SailRig | undefined = (p?.polar && p.polar.length)
+      ? { polar: p.polar,
+          forceK:      p.forceK      ?? base.sail?.forceK,
+          trimForgive: p.trimForgive ?? base.sail?.trimForgive,
+          leewayK:     p.leewayK      ?? base.sail?.leewayK }
+      : base.sail;
+    const buoyancy = (p?.buoyancy && p.buoyancy.tiltTau >= 0) ? p.buoyancy : base.buoyancy;
+    return {
       glb:        vessel.glb        ?? base.glb,
       manifest:   vessel.manifest   ?? base.manifest,
       importFlipY: vessel.importFlipY ?? base.importFlipY,
@@ -446,14 +485,27 @@ export class VesselService {
       controller: base.controller,
       floatDraft: base.floatDraft,
       hullCut:    base.hullCut,
-      buoyancy:   base.buoyancy,
-      hullHalfLen:  base.hullHalfLen,
-      hullHalfBeam: base.hullHalfBeam,
+      buoyancy,
+      hullHalfLen:  p?.hullHalfLen  ?? base.hullHalfLen,
+      hullHalfBeam: p?.hullHalfBeam ?? base.hullHalfBeam,
       baseYawDeg:  base.baseYawDeg,
-      sail:        base.sail,
+      sail,
       oceanMask:   base.oceanMask,
       oceanMaskFloorY: base.oceanMaskFloorY,
     };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  async init(vessel: Vessel, spawnX: number, spawnZ: number, spawnHeading = 270): Promise<void> {
+    this.x       = spawnX;
+    this.z       = spawnZ;
+    this.heading = spawnHeading;
+    if (vessel.physics) Object.assign(this.physics, vessel.physics);
+
+    // Resolve the rig (GLB + manifest + orientation + handedness + sailing character). The server vessel def
+    // is authoritative for handling; VESSEL_RIGS only supplies presentation + fallbacks. See mergeRig().
+    this.vesselSlug = vessel.slug;
+    this.rig = this.mergeRig(vessel);
     this.rightSign = this.rig.rightSign;
 
     // Per-vessel gun layout (muzzle offsets per side, vessel-local). Null → CannonService falls back to
@@ -595,17 +647,70 @@ export class VesselService {
     // This helps the square-rigged ships most (the brig has 13 sails + 4 flags = ~17 skinned draws ×3
     // cascades). Opt back in with localStorage.ignis_sailshadows='on'.
     const sailShadows = localStorage.getItem('ignis_sailshadows') === 'on';
+    // Rigging (masts/yards/guns + the standing rig) casts by DEFAULT so the masts throw their shadow on the deck.
+    // The thin standing rigging (ratlines/shrouds) shadow SHIMMERS (sub-texel in the shadow map) — minimised at a
+    // higher Shadows level (2048) — but it's merged with the masts into skinned meshes, so to drop ONLY the
+    // ratlines needs a Blender split. Opt the skinned rigging OUT entirely (no shimmer, but no mast shadow either)
+    // with `ignis_rig_shadows='0'`.
+    const rigShadows = localStorage.getItem('ignis_rig_shadows') !== '0';
     for (const mesh of meshes) {
       this.oceanService.addToRenderList(mesh);
       const isCloth = /sail|flag/i.test(mesh.name);
-      if (!isCloth || sailShadows) sg?.addShadowCaster(mesh, true);
+      const isSkinnedRig = !isCloth && mesh.isVerticesDataPresent('matricesWeights');
+      if (((!isCloth && (!isSkinnedRig || rigShadows)) || (isCloth && sailShadows))) sg?.addShadowCaster(mesh, true);
+      // Do NOT set receiveShadows on the ship's PBR material: it's already at the WebGPU 16 inter-stage-variable
+      // limit (esp. in the ocean-reflection pass), so adding the shadow-receive varyings overflows → the render
+      // pipeline fails to compile → the scene strobes self-healing. Crew get cheap projected blob shadows instead.
       mesh.receiveShadows = false;
       const mat = mesh.material;
       if (mat && !seenMats.has(mat)) {
         seenMats.add(mat);
         mat.fogEnabled = false;
       }
+      // Spawn a shadow-CATCHER twin for the STATIC deck/hull surfaces (no skin weights). Skinned parts (rigging) and
+      // cloth are skipped — crew/furniture shadows land on the deck, which is static. The catcher RECEIVES; the
+      // original keeps receiveShadows=false to dodge the varying overflow.
+      if (this.realDeckShadows && !isCloth && mesh.getTotalVertices() > 0
+          && !mesh.isVerticesDataPresent('matricesWeights')) {
+        this.makeShadowCatcher(mesh);
+      }
     }
+  }
+
+  /** Clone a static deck/hull mesh, coincident, with a minimal ShadowOnlyMaterial that receives the sun's shadows —
+   *  a transparent overlay that paints the crew/furniture shadows onto the deck without touching the ship's PBR
+   *  material (which can't receive: WebGPU varying overflow). Shared material; pulled toward the camera (zOffset) so
+   *  it wins the depth test over its opaque twin; NOT a shadow caster and NOT added to the ocean-reflection list. */
+  private makeShadowCatcher(mesh: AbstractMesh): void {
+    const scene = this.sceneService.scene;
+    if (!this.shadowCatcherMat) {
+      const som = new ShadowOnlyMaterial('deckShadowCatcher', scene);
+      const sun = scene.getLightByName('sun');
+      if (sun) som.activeLight = sun as DirectionalLight;
+      som.shadowColor = new Color3(0, 0, 0);
+      som.alpha = 0.62;           // shader outputs (1−shadow)·alpha → this is the shadow darkness (was full-black)
+      som.fogEnabled = false;
+      // Depth bias toward the camera so the catcher wins the test over its opaque twin on EVERY orientation. The
+      // +0.03 Y-lift below only separates HORIZONTAL faces (deck); on the VERTICAL bulwark/hull the twin stays
+      // coincident → the catcher z-fights and its shadow darkening STROBES (worst on the bright WHITE paint, where
+      // the flicker is most visible). zOffset (polygon offset, orientation-independent) is what kills the vertical fight.
+      // (Restores the -4 documented in [[crew-deck-shadows]] that had been dropped in favour of the Y-lift-only; the
+      // Y-lift handles the deck, zOffset handles the vertical faces — need BOTH.)
+      som.zOffset = -4;
+      this.shadowCatcherMat = som;
+    }
+    const catcher = (mesh as Mesh).clone(`${mesh.name}_shadowcatch`, mesh.parent as Node, true);
+    if (!catcher) return;
+    catcher.material = this.shadowCatcherMat;
+    catcher.receiveShadows = true;
+    catcher.isPickable = false;
+    catcher.renderingGroupId = mesh.renderingGroupId;
+    catcher.alphaIndex = 2;
+    // Lift the twin 2 cm off the real deck. (Polygon zOffset barely separates a near-horizontal deck viewed
+    // top-down — its bias scales with surface slope — so a small physical offset is what actually kills the
+    // z-fight. Imperceptible gap; the crew shadow lands at the same XZ.)
+    catcher.position.y += 0.03;
+    this.shadowCatchers.push(catcher);
   }
 
   /** Live-reload the rigged model after /reloadassets bumped the cache version: dispose the
@@ -622,6 +727,7 @@ export class VesselService {
       // leaks dead refs every reload/refit — wasted shadow-pass work and, eventually, a descriptor-heap crash.
       for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); }
     }
+    this.clearShadowCatchers();   // dispose the deck-shadow twins (they clone the old geometry)
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();   // disposes the old instanced meshes (shared materials are kept)
@@ -643,23 +749,7 @@ export class VesselService {
     // Adopt the new vessel def — mirrors init()'s setup, minus pose/input/loop.
     if (vessel.physics) Object.assign(this.physics, vessel.physics);
     this.vesselSlug = vessel.slug;
-    const base = rigForSlug(vessel.slug);
-    this.rig = {
-      glb:         vessel.glb         ?? base.glb,
-      manifest:    vessel.manifest    ?? base.manifest,
-      importFlipY: vessel.importFlipY ?? base.importFlipY,
-      rightSign:   vessel.rightSign   ?? base.rightSign,
-      controller:  base.controller,
-      floatDraft:  base.floatDraft,
-      hullCut:     base.hullCut,
-      buoyancy:    base.buoyancy,
-      hullHalfLen:  base.hullHalfLen,
-      hullHalfBeam: base.hullHalfBeam,
-      baseYawDeg:  base.baseYawDeg,
-      sail:        base.sail,
-      oceanMask:   base.oceanMask,
-      oceanMaskFloorY: base.oceanMaskFloorY,
-    };
+    this.rig = this.mergeRig(vessel);
     this.rightSign = this.rig.rightSign;
     this.vesselCannons = vessel.cannons ?? null;
     const fp = vessel.firstPersonCam ?? { x: 0.6, y: 2.6, z: -2.8 };
@@ -671,6 +761,7 @@ export class VesselService {
     const sg = this.sceneService.shadowGenerator;
     const oldRoot = this.controller?.root ?? null;
     if (oldRoot) { for (const m of oldRoot.getChildMeshes(false)) { this.oceanService.removeFromRenderList(m); sg?.removeShadowCaster(m, true); } }
+    this.clearShadowCatchers();
     this.controller?.dispose();
     this.controller = null;
     oldRoot?.dispose();
@@ -697,6 +788,10 @@ export class VesselService {
     if (!rigged) { console.warn(`[Vessel] rigged ${this.vesselSlug} failed to load`); return; }
 
     this.controller = createVesselController(this.vesselSlug, rigged.entries, rigged.root, manifest, scene);
+    this.deckCamMeshes = null;   // invalidate the deck-walk raycast cache for the new hull
+    // Metal parts (cannon iron/brass) reflect the sky LUT so they read as dark metal, not a black void — the
+    // scene runs no environmentTexture, so factor-only metals (brig SHIP_IRON) are otherwise unlit/black.
+    applyShipMetalEnv(this.controller.getMeshes(), this.sceneService.getSkyEnvTexture());
     this.controller.applySailState(this.sailState, true);   // initial pose snaps (no furl anim)
 
     // Flag colour — override the baked flag texture with this captain's chosen RGB (per-vessel material).
@@ -869,6 +964,7 @@ export class VesselService {
     this.sinking    = true;
     this.sinkStartT = this.simTime;
     this.speed      = 0;
+    this.crewHandle?.crewPanic(0.85, 30);   // (P4) she's going down → the deck crew break and cower
   }
 
   /** End the sink (on repair / refloat): the hull eases back up to normal buoyancy. */
@@ -1131,6 +1227,7 @@ export class VesselService {
       const rough    = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4);
       const intoSea  = 1 - driveAngle / 180;                                   // 1 dead upwind → 0 downwind
       const drag = this.DRAG_K * this.speed * Math.abs(this.speed)
+                 + this.LINEAR_DRAG_K * this.speed
                  + this.TURN_SCRUB * Math.abs(this.yawRate) * Math.abs(this.speed)
                  + this.SEA_DRAG_K * rough * (0.5 + intoSea) * Math.abs(this.speed);
       const massK  = Math.max(0.2, this.physics.weight / this.WEIGHT_REF);
@@ -1523,6 +1620,31 @@ export class VesselService {
       // Eye = the vessel-local point through the hull's CURRENT world matrix, so it rides with
       // heave/heel/pitch like a real helmsman. (physicsStep set the pose earlier this frame.)
       this.root.computeWorldMatrix(true);
+
+      // Deck-walk: step the local eye in the look direction (in vessel-local space, so it moves with the ship),
+      // then clamp its height to the deck below. Movement only when a walk key is held (the keyHandler sets these
+      // only while ON DECK with the left button down). The deck raycast blocks stepping off the edge or up a wall.
+      const moveLocal = new Vector3(0, 0, 0);
+      if (this.walk.fwd || this.walk.back || this.walk.left || this.walk.right) {
+        const yawR = this.fpYaw * Math.PI / 180;   // look yaw relative to the bow → forward in vessel-local XZ
+        const fwd = new Vector3(Math.sin(yawR), 0, Math.cos(yawR));
+        const rgt = new Vector3(Math.cos(yawR), 0, -Math.sin(yawR));
+        if (this.walk.fwd)   moveLocal.addInPlace(fwd);
+        if (this.walk.back)  moveLocal.subtractInPlace(fwd);
+        if (this.walk.right) moveLocal.addInPlace(rgt);
+        if (this.walk.left)  moveLocal.subtractInPlace(rgt);
+      }
+      const curDeck = this.fpEye.y - this.WALK_EYE;   // current deck (foot) level — the band reference for the raycast
+      if (moveLocal.lengthSquared() > 1e-6) {
+        moveLocal.normalize().scaleInPlace(this.WALK_SPEED * dt);
+        const tx = this.fpEye.x + moveLocal.x, tz = this.fpEye.z + moveLocal.z;
+        // Step only onto deck within a gentle band of the current level (deckLocalHeight enforces it) — this blocks
+        // walking off the rail (big drop) and climbing the rigging/mast (overhead spars are outside the band).
+        if (this.deckLocalHeight(tx, tz, curDeck) !== null) { this.fpEye.x = tx; this.fpEye.z = tz; }
+      }
+      const deckY = this.deckLocalHeight(this.fpEye.x, this.fpEye.z, curDeck);
+      if (deckY !== null) this.fpEye.y = deckY + this.WALK_EYE;   // glue the eye to standing height above the deck
+
       const eye = Vector3.TransformCoordinates(this.fpEye, this.root.getWorldMatrix());
       eye.addInPlace(this.camShakeOffset);
       cam.position.copyFrom(eye);
@@ -1579,6 +1701,49 @@ export class VesselService {
     cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
   }
 
+  /** Ship structural meshes (hull/deck/furniture) to raycast the deck-walk eye onto. Merged ship meshes get
+   *  unpredictable names, so filter by EXCLUSION (water/sails/flags/crew), like the crew deck raycast. Cached per
+   *  vessel; the picking octree is render-selection OFF (else it frustum-culls deck submeshes on the big ships). */
+  private deckCandsCam(): AbstractMesh[] {
+    if (this.deckCamMeshes) return this.deckCamMeshes;
+    const skip = /water|ocean|impostor|sail|flag/i;
+    const out: AbstractMesh[] = [];
+    for (const me of this.root.getChildMeshes(false)) {
+      if (!me.getTotalVertices() || skip.test(me.name) || me.name.startsWith('crew_') || me.name.startsWith('ik_')) continue;
+      if (me.getTotalVertices() > 1500) {
+        try {
+          const om = me as unknown as { createOrUpdateSubmeshesOctree?(c: number, d: number): void; useOctreeForRenderingSelection?: boolean };
+          om.createOrUpdateSubmeshesOctree?.(64, 2);
+          om.useOctreeForRenderingSelection = false;
+        } catch { /* */ }
+      }
+      out.push(me);
+    }
+    this.deckCamMeshes = out;
+    return out;
+  }
+
+  /** Ship-local Y of the deck below a vessel-local XZ, found by a short down-ray in the ship vertical. Accepts only
+   *  a hit within a gentle band of the current foot level `footY` (`[footY-3, footY+0.9]`): this lets the quarterdeck
+   *  stairs through and follows the deck down, but IGNORES overhead spars/booms/yards/mast-tops (so you can't climb
+   *  the rigging) and refuses a big drop off the rail. Returns the highest in-band hit, or null = off the deck. */
+  private deckLocalHeight(lx: number, lz: number, footY: number): number | null {
+    const wm = this.root.getWorldMatrix();
+    const origin = Vector3.TransformCoordinates(new Vector3(lx, footY + 2.2, lz), wm);
+    const down = Vector3.TransformNormal(new Vector3(0, -1, 0), wm).normalize();
+    const ray = new Ray(origin, down, 6);
+    const inv = wm.clone(); inv.invert();
+    let best: number | null = null;
+    for (const me of this.deckCandsCam()) {
+      const pick = ray.intersectsMesh(me as never, false);
+      if (pick.hit && pick.pickedPoint) {
+        const ly = Vector3.TransformCoordinates(pick.pickedPoint, inv).y;
+        if (ly >= footY - 3 && ly <= footY + 0.9 && (best === null || ly > best)) best = ly;
+      }
+    }
+    return best;
+  }
+
   private setupCameraInput(): void {
     const scene  = this.sceneService.scene;
     const canvas = this.sceneService.engine.getRenderingCanvas();
@@ -1593,6 +1758,7 @@ export class VesselService {
             this.isDragging = true;
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
+            this.invertCamY = localStorage.getItem('ignis_invert_camera') === '1';   // refresh per-drag
             if (canvas) canvas.style.cursor = 'grabbing';
           }
           break;
@@ -1602,18 +1768,20 @@ export class VesselService {
             const dy = ev.clientY - this.lastMouseY;
             this.lastMouseX = ev.clientX;
             this.lastMouseY = ev.clientY;
+            const invY = this.invertCamY ? -1 : 1;   // flips the vertical-look axis when enabled
             if (this.firstPerson()) {
               // Free-look from the deck: drag yaws/pitches the view (yaw is free 360°; pitch clamped).
               this.fpYaw   += dx * 0.30;
-              this.fpPitch  = Math.max(-70, Math.min(70, this.fpPitch - dy * 0.25));
+              this.fpPitch  = Math.max(-70, Math.min(70, this.fpPitch - dy * 0.25 * invY));
             } else {
               this.camAzimuth   += dx * 0.45;
-              this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3));
+              this.camElevation  = Math.max(-5, Math.min(85, this.camElevation - dy * 0.3 * invY));
             }
           }
           break;
         case PointerEventTypes.POINTERUP:
           this.isDragging = false;
+          this.clearWalk();   // releasing the button stops deck-walking even if keys are still held
           if (canvas) canvas.style.cursor = 'default';
           break;
       }
@@ -1642,6 +1810,16 @@ export class VesselService {
                          document.activeElement instanceof HTMLTextAreaElement;
     this.keyHandler = (e: KeyboardEvent) => {
       if (e.repeat || typing()) return;   // ignore OS key-repeat: held keys are tracked via keyup below
+      // Deck-walk: while ON DECK (first-person) with the LEFT BUTTON HELD, WASD/arrows walk the camera across the
+      // deck instead of steering/trimming. Set the per-frame boolean and consume the event (no Angular CD needed).
+      if (this.firstPerson() && this.isDragging) {
+        switch (e.code) {
+          case 'KeyW': case 'ArrowUp':    this.walk.fwd = true;   return;
+          case 'KeyS': case 'ArrowDown':  this.walk.back = true;  return;
+          case 'KeyA': case 'ArrowLeft':  this.walk.left = true;  return;
+          case 'KeyD': case 'ArrowRight': this.walk.right = true; return;
+        }
+      }
       // Re-enter the Angular zone so a discrete press refreshes the HUD (sail/anchor/view indicators).
       // The listener itself is registered OUTSIDE the zone (below), so held keys add no per-event CD.
       this.zone.run(() => {
@@ -1669,10 +1847,12 @@ export class VesselService {
     this.keyUpHandler = (e: KeyboardEvent) => {
       if (typing()) return;
       switch (e.code) {   // steering booleans only — read by the render loop, no HUD change → no CD needed
-        case 'ArrowLeft':  case 'KeyA': this.keys.left     = false; break;
-        case 'ArrowRight': case 'KeyD': this.keys.right    = false; break;
+        case 'ArrowLeft':  case 'KeyA': this.keys.left  = false; this.walk.left  = false; break;
+        case 'ArrowRight': case 'KeyD': this.keys.right = false; this.walk.right = false; break;
         case 'KeyQ': this.keys.sheetOut = false; break;
         case 'KeyE': this.keys.sheetIn  = false; break;
+        case 'KeyW': case 'ArrowUp':   this.walk.fwd  = false; break;
+        case 'KeyS': case 'ArrowDown': this.walk.back = false; break;
       }
     };
     // Holding a key fires keydown ~60×/s (OS repeat). Each one reaching an in-zone @HostListener (HUD,

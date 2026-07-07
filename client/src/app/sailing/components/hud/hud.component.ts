@@ -138,10 +138,11 @@ export class HudComponent implements OnInit, OnDestroy {
 
   dayPhaseIcon = computed(() => {
     const h = this.sceneService.gameTime();
-    if (h >= 5.5 && h < 7)  return '🌅';
-    if (h >= 7   && h < 17) return '☀️';
-    if (h >= 17  && h < 19) return '🌇';
-    return '🌙';
+    // Long summer day: sun up 05:00–21:00 (see SceneService.computeSunDir DAY_START/DAY_END).
+    if (h >= 5  && h < 7)  return '🌅';   // sunrise
+    if (h >= 7  && h < 19) return '☀️';   // day
+    if (h >= 19 && h < 21) return '🌇';   // sunset
+    return '🌙';                          // night
   });
 
   /** Crew readout colour: green when well-crewed, amber/red as casualties mount. */

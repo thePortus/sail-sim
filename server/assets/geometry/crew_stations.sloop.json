@@ -209,9 +209,9 @@
       "id": "helm",
       "kind": "helm",
       "pos": [
-        0,
+        0.45,
         2.03,
-        3.9
+        3.45
       ],
       "heading_deg": 180,
       "clip": "Idle",
@@ -227,7 +227,7 @@
         -1.1
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_lane1",
       "note": "aft of port gun 0 (z-1.58)"
     },
@@ -240,7 +240,7 @@
         -2.15
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_lane1"
     },
     {
@@ -252,7 +252,7 @@
         -3.15
       ],
       "heading_deg": -90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_port_lane2"
     },
     {
@@ -264,7 +264,7 @@
         -1.1
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_lane1"
     },
     {
@@ -276,7 +276,7 @@
         -2.15
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_lane1"
     },
     {
@@ -288,7 +288,7 @@
         -3.15
       ],
       "heading_deg": 90,
-      "clip": "Work_Cannon",
+      "clip": "Idle",
       "wp": "wp_stbd_lane2"
     },
     {
@@ -300,7 +300,7 @@
         -0.7
       ],
       "heading_deg": -90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_center_gap",
       "note": "port pin rail"
     },
@@ -313,7 +313,7 @@
         -0.7
       ],
       "heading_deg": 90,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_center_gap"
     },
     {
@@ -325,7 +325,7 @@
         -1.2
       ],
       "heading_deg": 180,
-      "clip": "Work_Ropes",
+      "clip": "Idle",
       "wp": "wp_center_gap",
       "note": "halyards at mast/bitts"
     },

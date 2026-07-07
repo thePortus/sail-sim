@@ -236,15 +236,32 @@ export class TerrainService {
     } : null;
 
     this.clipmap = new TerrainClipmap(cam, scene);
+    // PERF-ISOLATION: `ignis_terrain_density` overrides the clipmap grid resolution (default 32 → gridSize 129).
+    // Halving it (16) quarters the terrain vertex count — a clean terrain-GEOMETRY cost probe.
+    try {
+      const d = parseInt(localStorage.getItem('ignis_terrain_density') ?? '', 10);
+      if (Number.isFinite(d) && d >= 4) { this.clipmap.vertexDensity = d; }
+    } catch { /* no localStorage */ }
     this.clipmap.setMaterial(mat);
     this.clipmap.initializeMeshes();
     this.clipmap.update();
     // Enroll every clipmap mesh in the ocean RTTs (the submerged seabed feeds the depth-based water
     // transparency + refraction + reflection) and exclude from glow. receiveShadows is set in the
     // clipmap; the terrain intentionally does NOT cast shadows (see the old note — self-shadow moiré).
+    // Land shadow-receiving costs ~5 ms/frame near land (the terrain's per-fragment shadow-map sample — profiled:
+    // it's the sample itself, not the map size or terrain geometry). Make it a HIGH-tier feature: ON only at
+    // shadow-quality 3 (High), OFF at Medium/Low → recovers the 5 ms for most users. Explicit `ignis_terrain_shadows`
+    // ('0'/'1') overrides either way. (Ship-on-beach + town-building ground shadows only show at High.)
+    let terrainShadows: boolean;
+    try {
+      const explicit = localStorage.getItem('ignis_terrain_shadows');
+      if (explicit != null) { terrainShadows = explicit !== '0'; }
+      else { const lvl = parseInt(localStorage.getItem('shadow-quality') ?? '2', 10); terrainShadows = (Number.isFinite(lvl) ? lvl : 2) >= 3; }
+    } catch { terrainShadows = false; }
     for (const cm of this.clipmap.allMeshes()) {
       this.oceanService.addToRenderList(cm);
       this.sceneService.excludeFromGlow(cm);
+      if (!terrainShadows) { cm.receiveShadows = false; }
     }
 
     this.clipmapObserver = scene.onBeforeRenderObservable.add(() => this.sceneService.span('clipmap', () => this.clipmap?.update()));

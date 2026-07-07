@@ -31,12 +31,16 @@ export class GrassFadePlugin extends MaterialPluginBase {
   /** Per-material sway multiplier — e.g. seaweed undulates more (in a "current") than stiff grass.
    *  0 disables wind entirely (rocks): the whole sway block is then compiled out of the shader. */
   private readonly swayMul: number;
+  /** This material's draw-radius fade band (by REFERENCE so live updates flow through). Defaults to the shared
+   *  grass band; layers with a DIFFERENT draw radius (e.g. palms reach ~320 m vs grass ~180 m) pass their own. */
+  private readonly _fade: { start: number; end: number };
 
-  constructor(material: Material, swayMul = 1) {
+  constructor(material: Material, swayMul = 1, fade: { start: number; end: number } = GrassFadePlugin.fade) {
     // GRASS_WIND gates the per-vertex sway maths — omitted when swayMul is 0 so static props (rocks)
     // don't pay for wind they never use.
     super(material, 'GrassFade', 210, swayMul > 0 ? { GRASS_FADE: true, GRASS_WIND: true } : { GRASS_FADE: true });
     this.swayMul = swayMul;
+    this._fade = fade;
     this._enable(true);
   }
 
@@ -55,7 +59,7 @@ export class GrassFadePlugin extends MaterialPluginBase {
   }
 
   override bindForSubMesh(uniformBuffer: UniformBuffer, _scene: Scene, _engine: AbstractEngine, _subMesh: SubMesh): void {
-    const c = GrassFadePlugin.camera, f = GrassFadePlugin.fade, w = GrassFadePlugin.wind;
+    const c = GrassFadePlugin.camera, f = this._fade, w = GrassFadePlugin.wind;
     uniformBuffer.updateFloat2('grassCam', c.x, c.z);
     uniformBuffer.updateFloat2('grassFade', f.start, f.end);
     uniformBuffer.updateFloat4('grassWind', w.dirX, w.dirZ, w.strength, w.time);

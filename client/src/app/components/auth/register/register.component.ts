@@ -9,10 +9,11 @@ import { MatSnackBarModule, MatSnackBar } from '@angular/material/snack-bar';
 import { ApiService } from './../../../services/api.service';
 import { AuthService } from './../../../services/auth.service';
 import { User, UserService } from './../../../services/user.service';
+import { DownloadClientComponent } from '../../download-client/download-client.component';
 
 @Component({
   selector: 'app-register',
-  imports: [RouterLink, CommonModule, FormsModule, MatSnackBarModule],
+  imports: [RouterLink, CommonModule, FormsModule, MatSnackBarModule, DownloadClientComponent],
   standalone: true,
   templateUrl: './register.component.html',
   styleUrl: './register.component.scss'

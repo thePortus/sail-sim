@@ -15,6 +15,7 @@
 const nav = require('./nav');
 const economy = require('./economy');
 const quest = require('./quest');   // to shield intro-tutorial players from pirate aggro
+const questAnchors = require('./quest-anchors');   // intro spawn point → keep pirate lairs well clear of it
 const combat = require('./combat');
 const Cc = require('./combat-constants');   // shared ballistic constants (G, HALF_BEAM, TRAVEL_SCALE) for NPC gunnery
 const factions = require('./factions');
@@ -30,16 +31,29 @@ const DEG = Math.PI / 180;
 // WARSHIP, NOT a trade ship — it is deliberately ABSENT here so it only ever sails as a convoy ESCORT
 // (spawnConvoy hard-codes 'brig'), a PIRATE (PIRATE_SLUGS), or a navy HUNTER (makeHunter). Duplicates set the odds.
 const MERCHANT_SLUGS = ['merchantman', 'merchantman', 'merchantman', 'merchantman', 'sloop', 'sloop', 'pinnace'];
-const MERCHANT_NAMES = ['Gull', 'Albatross', 'Petrel', 'Sea Marten', 'Wandering Star', 'Dutch Maid', 'Saltbox',
-  'Tradewind', 'Far Cathay', 'Indiaman', 'Carrack', 'Lateen', 'Fair Profit', 'Doubloon', 'Marianne',
-  'Cormorant', 'Storm Petrel', 'Halcyon', 'Merry Fortune', 'Prosperity', 'Endeavour', 'Resolution',
-  'Industry', 'Diligence', 'Amity', 'Concord', 'Providence', 'Swift Return', 'Golden Hind', 'Silver Fox',
-  'Morning Star', 'Evening Tide', 'Brittania', 'Saint Elmo', 'Notre Dame', 'La Belle', 'Esperanza',
-  'Buena Ventura', 'Santa Lucia', 'Maria Galante', 'Zeelandia', 'Vrijheid', 'Goede Hoop', 'Batavia',
-  'Cinnamon', 'Nutmeg Lass', 'Pepperpot', 'Sugar Isle', 'Molasses', 'Tobacco Maid', 'Cotton Bale',
-  'Rum Runner', 'Salt Cod', 'Whitehaven', 'Bristol Maid', 'Liverpool Belle', 'Plymouth Hope',
-  'Sea Wren', 'Kittiwake', 'Fulmar', 'Shearwater', 'Guillemot', 'Mary Rose', 'Jolly Trader',
-  'Honest Penny', 'Fair Wind', 'Sea Sprite', 'Nimble', 'Patient Jane', 'Bonny Kate', 'Adventure'];
+// Ship names by NATION — every faction-owned vessel (merchant OR navy hunter) is named in its own nation's
+// language, so a Spanish ship reads as Spanish, a Dutch ship as Dutch, etc. Authentic period ship / saint /
+// place / virtue names (NOT thematic stereotypes). Pirates fly no flag and keep their own captain-names below.
+const SHIP_NAMES = {
+  english: ['Endeavour', 'Resolution', 'Adventure', 'Industry', 'Diligence', 'Amity', 'Concord', 'Providence',
+    'Prosperity', 'Sovereign', 'Defiance', 'Triumph', 'Victory', 'Albion', 'Britannia', 'Halcyon', 'Swiftsure',
+    'Vanguard', 'Bellona', 'Argonaut', 'Kingfisher', 'Swallow', 'Pelican', 'Bristol', 'Plymouth', 'Falmouth',
+    'Dover', 'Mary Rose', 'Golden Hind', 'Bonaventure', 'Repulse', 'Warspite'],
+  french: ['Espérance', 'Belle Poule', 'Hermione', 'Fleur de Lys', 'Aigle', 'Soleil Royal', 'Redoutable',
+    'Intrépide', 'Gloire', 'Renommée', 'Marianne', 'Notre-Dame', 'Saint-Michel', 'Sainte-Anne', 'Superbe',
+    'Fortune', 'Aurore', 'Triomphant', 'Bourbon', 'Bretagne', 'Normandie', 'Provence', 'Duguay-Trouin',
+    'Vaillant', 'Bon Espoir', 'Deux Frères', 'Flore', 'Vénus', 'Nantaise', 'Toulonnaise'],
+  spanish: ['Esperanza', 'Buenaventura', 'Santa Lucía', 'Santa María', 'San Felipe', 'San Ildefonso',
+    'Concepción', 'Trinidad', 'Santísima', 'Rayo', 'Glorioso', 'Neptuno', 'San Juan', 'El Fénix', 'Andalucía',
+    'Sevilla', 'Cádiz', 'San José', 'Montañés', 'Argonauta', 'Santa Ana', 'Vencedor', 'La Perla', 'Golondrina',
+    'Estrella', 'Nuestra Señora', 'Bahama', 'Reina', 'Princesa', 'San Nicolás'],
+  dutch: ['Zeelandia', 'Vrijheid', 'Goede Hoop', 'Batavia', 'Eendracht', 'Zeven Provinciën', 'Amsterdam',
+    'Rotterdam', 'Zeehond', 'Prins Willem', 'Gouden Leeuw', 'Zeearend', 'Meermin', 'Witte Leeuw', 'Middelburg',
+    'Fortuyn', 'Hollandia', 'Utrecht', 'Gelderland', 'Zeewolf', 'Duyfken', 'Halve Maen', 'Nachtegaal',
+    'Standvastigheid', 'Vrede', 'Wapen van Hoorn', 'Dolphijn', 'Neptunus', 'Concordia', 'Zeeridder'],
+};
+/** A ship name in the given nation's language (defaults to English for a null/unknown faction). */
+function shipName(faction) { return pick(SHIP_NAMES[faction] || SHIP_NAMES.english); }
 const ARRIVE_M = 45;         // world units: "reached this waypoint"
 const AVOID_R = 140;         // world units: NPC↔NPC separation radius
 // Interest management — a client only RECEIVES (and so only renders) the nearest few merchants. Distant ships
@@ -138,8 +152,8 @@ function targetPirates(townCount) { return Math.max(3, Math.min(8, Math.round(to
 // from the nearest faction town — launched to hunt that specific pirate down. The threshold delay gives a PLAYER
 // first crack at the bounty; the hunter is built to WIN (a brig, veteran skill, a shade faster than the pirate).
 // When its quarry is dead (or gone) it sails back to its home port and vanishes — one hunter per pirate.
-const HUNTER_NAMES = ['Vengeance', 'Retribution', 'Intrepid', 'Vigilant', 'Defiance', 'Sentinel', 'Avenger',
-  'Indomitable', 'Relentless', 'Dauntless', 'Tempest', 'Valiant', 'Conqueror', 'Fury', 'Implacable', 'Resolute'];
+// Navy hunters are named by their launching town's NATION (shipName(town.faction)) — same per-nation pools as
+// the merchants, so a French hunter reads French, a Spanish one Spanish, etc. (was a flat English martial list).
 const PIRATE_SEED_GOLD = 200;      // a pirate spawns with this small purse; its bounty + plundered gold grow as it raids
 const PIRATE_HUNT_THRESHOLD = 4;   // merchant kills before a pirate draws a navy hunter (players get first crack)
 // Respawn cooldown: when a pirate is sunk it does NOT refill instantly — a replacement is scheduled 5–10 min later
@@ -745,6 +759,7 @@ function nearestPrey(pirate, players, maxR2) {
   let best = null, bestD2 = maxR2;
   for (const [, p] of players) {
     if (p === pirate || p.isPirate || !p.state || (p.combat && p.combat.sunk)) continue;
+    if (p.questTag === 'tutorial') continue;   // the intro tutorial's pinnace is the player's prey — pirates leave it be
     if (!p.isNpc && p.questState && quest.inIntro(p.questState)) continue;   // leave brand-new captains alone until the tutorial's done
     const dx = p.state.x - pirate.state.x, dz = p.state.z - pirate.state.z, d2 = dx * dx + dz * dz;
     if (d2 < bestD2) { bestD2 = d2; best = p; }
@@ -1049,7 +1064,7 @@ function makeMerchant(players, town, faction, slug, convoy, skill, combatRole) {
     state: {
       x: sx, z: sz, heading: 0, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
-      vesselName: 'Merchant ' + pick(MERCHANT_NAMES), vesselSlug: slug, callsign: '',
+      vesselName: 'Merchant ' + shipName(faction), vesselSlug: slug, callsign: '',
     },
     authPose: { x: sx, z: sz, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),
@@ -1153,7 +1168,12 @@ function spawnConvoy(players, towns) {
 
 /** Pick a pirate lair: a patch of open, navigable water a fair way out from a random town (where shipping passes,
  *  but not on the pier). Tries several offsets and snaps each to the sea; returns {x,z} or null if none stuck. */
+// Keep pirate lairs this far from the intro-tutorial spawn so a brand-new captain never starts within sight of a
+// raider (> the pirate's leash + its lair-orbit radius, so its whole beat stays clear of the start port).
+const INTRO_SAFE_R2 = 2200 * 2200;
 function pickLair(towns) {
+  const a = questAnchors.getAnchors && questAnchors.getAnchors();
+  const spawn = a && a.spawn;                                // intro new-player spawn point (may be null pre-map)
   for (let attempt = 0; attempt < 12; attempt++) {
     const t = pick(towns);
     const ang = Math.random() * Math.PI * 2;
@@ -1164,6 +1184,7 @@ function pickLair(towns) {
     const w = nav.cellToWorld(sn.cx, sn.cz);
     const dx = w.x - t.x, dz = w.z - t.z;
     if (dx * dx + dz * dz < 350 * 350) continue;            // not right on top of the town
+    if (spawn) { const ex = w.x - spawn.x, ez = w.z - spawn.z; if (ex * ex + ez * ez < INTRO_SAFE_R2) continue; }   // clear of the tutorial start
     return { x: w.x, z: w.z };
   }
   return null;
@@ -1225,7 +1246,7 @@ function makeHunter(players, town, pirate) {
     state: {
       x: sx, z: sz, heading: Math.random() * 360, speed: 0, turnRate: 0, sheetAngle: 0,
       isPortTack: false, anchored: false, sailState: 'full',
-      vesselName: pick(HUNTER_NAMES), vesselSlug: slug, callsign: '',
+      vesselName: shipName(town.faction), vesselSlug: slug, callsign: '',
     },
     authPose: { x: sx, z: sz, heading: 0, speed: 0 },
     combat: combat.newCombatState(slug),

@@ -152,5 +152,14 @@ export function buildNameplate(scene: Scene, name: string, o: NameplateOpts): Me
   // Group 2 = same layer as terrain/ocean-near/vessels — the shared depth buffer keeps it above the hull but
   // hidden behind hills (the default group 0 would let foreground ocean/terrain paint over it).
   plane.renderingGroupId = 2;
+  // WebGPU cold-start guard: a label first built during the intro camera swoop can reach the render loop before
+  // its StandardMaterial effect has finished compiling — bindForSubMesh then binds a NULL effect and the whole
+  // frame throws (`TypeError: Cannot read properties of null (reading 'setFloat4')`, a transparent-pass freeze).
+  // Keep the plane invisible until the effect is actually compiled (forceCompilation pre-warms it off the render
+  // path). Callers gate display via setEnabled — a SEPARATE flag — so this composes cleanly: a label shows only
+  // once both compiled (isVisible) and in-range (isEnabled).
+  mat.allowShaderHotSwapping = false;
+  plane.isVisible = false;
+  mat.forceCompilation(plane, () => { if (!plane.isDisposed()) plane.isVisible = true; });
   return plane;
 }

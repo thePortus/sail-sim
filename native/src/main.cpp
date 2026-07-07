@@ -3133,6 +3133,12 @@ int main(int argc, char** argv) {
   // through mpClient's town-economy protocol.
   bool tiedUp = false;
   int  dockIdx = -1, tiedIdx = -1;   // dockable harbor (this frame) / moored harbor
+  // Docking glide (client vessel.service dockAt): on dock, auto-steer the hull into the berth over a smoothstep
+  // ease (1.4-4 s), input frozen, then pin it tied. dockBerth* is the target pose, dockStart* the pose at trigger.
+  bool  docking = false;
+  float dockElapsed = 0.0f, dockDuration = 0.0f;
+  float dockStartX = 0, dockStartZ = 0, dockStartHdg = 0;   // dockStartHdg in DEGREES (berth math is degrees)
+  float dockBerthX = 0, dockBerthZ = 0, dockBerthHdg = 0;   // dockBerthHdg in DEGREES
   bool menuTavern = false, menuTrader = false, menuShipwright = false, menuGovernor = false;
   std::future<std::vector<props::VesselRow>> swFuture;   // shipwright catalogue (REST /vessels)
   std::vector<props::VesselRow> swShips; bool swRequested = false;
@@ -5313,10 +5319,40 @@ int main(int argc, char** argv) {
         }
         if (tiedUp && tiedIdx < 0) tiedUp = false;   // safety
 
+        // Begin the docking glide: compute the berth (alongside the seaward half of the pier, 3 m off the deck
+        // edge, parallel to it — client harbor.service computeBerth) and auto-steer the hull there.
+        auto startDocking = [&](int idx) {
+          if (docking || tiedUp || idx < 0 || !terrainR.ready) return;
+          const terrain::Harbor& h = terr.manifest().harbors[(size_t)idx];
+          float len = 14.3f, halfW = 1.6f;                       // PIER_DIMS straight
+          if (h.variant == "l" || h.variant == "t") { len = 11.0f; halfW = 6.5f; }
+          float hr = glm::radians(h.heading);
+          float fx = std::sin(hr), fz = std::cos(hr);            // seaward unit
+          float px = fz, pz = -fx;                                // perpendicular (starboard of seaward)
+          float along = glm::clamp((vessel.x - h.x) * fx + (vessel.z - h.z) * fz, len * 0.45f, len * 0.95f);
+          float cx = h.x + fx * along, cz = h.z + fz * along;     // centreline point
+          float side = ((vessel.x - cx) * px + (vessel.z - cz) * pz) >= 0.0f ? 1.0f : -1.0f;
+          float off = halfW + 3.0f;                               // clear of the deck edge
+          dockBerthX = cx + px * side * off; dockBerthZ = cz + pz * side * off;
+          // Berth heading: parallel to the pier, whichever way is closest to the current heading (no 180 spin).
+          float fwdDeg = std::fmod(std::fmod(h.heading, 360.0f) + 360.0f, 360.0f);
+          float aftDeg = std::fmod(fwdDeg + 180.0f, 360.0f);
+          auto angDiff = [](float a, float b) { return std::fabs(std::fmod(std::fmod(a - b, 360.0f) + 540.0f, 360.0f) - 180.0f); };
+          float bhd = glm::degrees(vessel.heading);
+          dockBerthHdg = angDiff(bhd, fwdDeg) <= angDiff(bhd, aftDeg) ? fwdDeg : aftDeg;
+          dockStartX = vessel.x; dockStartZ = vessel.z; dockStartHdg = bhd;
+          float dist = std::hypot(dockBerthX - vessel.x, dockBerthZ - vessel.z);
+          dockDuration = glm::clamp(dist / 6.0f, 1.4f, 4.0f);     // ~6 m/s glide, clamped 1.4-4 s
+          dockElapsed = 0.0f; docking = true; tiedIdx = idx;
+          vessel.speed = 0.0f; vessel.yawRate = 0.0f; vessel.anchored = false;
+        };
+
         // Screenshot-test hooks: SAILSIM_DOCK auto-moors when in range; SAILSIM_MENU
-        // opens one town door (tavern|trader|shipwright|governor).
-        if (!tiedUp && dockIdx >= 0 && std::getenv("SAILSIM_DOCK")) {
-          tiedUp = true; tiedIdx = dockIdx; vessel.speed = 0; vessel.yawRate = 0;
+        // opens one town door (tavern|trader|shipwright|governor). Tests want an instant
+        // moor, so fast-forward the glide to completion this frame.
+        if (!tiedUp && !docking && dockIdx >= 0 && std::getenv("SAILSIM_DOCK")) {
+          startDocking(dockIdx);
+          dockElapsed = dockDuration;   // complete on the next physics tick (skip the animation for determinism)
         }
         static bool menuEnvDone = false;
         if (tiedUp && !menuEnvDone && terrainR.ready) {
@@ -5360,8 +5396,8 @@ int main(int argc, char** argv) {
           return hb.tier == "capital" ? "Governor's Mansion" : "Mayor's House";
         };
 
-        // Dock prompt (bottom-centre) — shown when alongside a pier and not moored.
-        if (!tiedUp && dockIdx >= 0 && terrainR.ready) {
+        // Dock prompt (bottom-centre) — shown when alongside a pier and not moored/mooring.
+        if (!tiedUp && !docking && dockIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)dockIdx];
           ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 46.0f),
                                   ImGuiCond_Always, ImVec2(0.5f, 1.0f));
@@ -5371,12 +5407,23 @@ int main(int argc, char** argv) {
           std::snprintf(lbl, sizeof(lbl), "Dock at %s", hb.name.c_str());
           ImGui::PushFont(fontTitle);
           if (ImGui::Button(lbl, ImVec2(0, 44))) {
-            tiedUp = true; tiedIdx = dockIdx;
-            vessel.speed = 0; vessel.yawRate = 0;
+            startDocking(dockIdx);
             menuTavern = menuTrader = menuShipwright = menuGovernor = false;
           }
           { ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
             guideRects["dock"] = ImVec4(a.x, a.y, b.x - a.x, b.y - a.y); }   // tutorial: "dock here" ring
+          ImGui::PopFont();
+          ImGui::End();
+        }
+        // Mooring indicator (bottom-centre) while the hull glides into the berth (client "⚓ Mooring at …").
+        if (docking && tiedIdx >= 0 && terrainR.ready) {
+          const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 46.0f),
+                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          ImGui::Begin("mooring", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+          ImGui::PushFont(fontTitle);
+          ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.92f, 1.0f), "Mooring at %s...", hb.name.c_str());
           ImGui::PopFont();
           ImGui::End();
         }
@@ -5417,7 +5464,7 @@ int main(int argc, char** argv) {
           if (!hb.faction.empty() && ImGui::Button(titleOf(hb), ImVec2(-1, 0))) menuGovernor = true;
           ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
           if (ImGui::Button("Cast Off", ImVec2(-1, 0))) {
-            tiedUp = false; tiedIdx = -1;
+            tiedUp = false; docking = false; tiedIdx = -1;
             menuTavern = menuTrader = menuShipwright = menuGovernor = false;
           }
           ImGui::End();
@@ -6338,7 +6385,21 @@ int main(int argc, char** argv) {
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /
     // lower sail (furled -> half -> full); P = drop/weigh anchor. While MOORED at
     // a town the boat is pinned to the berth (no input, no drift) until cast off.
-    if (appState == AppState::Sailing && tiedUp) {
+    if (appState == AppState::Sailing && (docking || tiedUp)) {
+      if (docking) {
+        // Auto-steer into the berth: smoothstep-ease position + heading over dockDuration (client dockAt glide).
+        dockElapsed += dt;
+        float u = dockDuration > 0.0f ? std::min(1.0f, dockElapsed / dockDuration) : 1.0f;
+        float e = u * u * (3.0f - 2.0f * u);   // smoothstep ease in/out
+        vessel.x = dockStartX + (dockBerthX - dockStartX) * e;
+        vessel.z = dockStartZ + (dockBerthZ - dockStartZ) * e;
+        float dh = std::fmod(std::fmod(dockBerthHdg - dockStartHdg, 360.0f) + 540.0f, 360.0f) - 180.0f;   // shortest turn
+        vessel.heading = glm::radians(dockStartHdg + dh * e);
+        if (u >= 1.0f) { docking = false; tiedUp = true; }
+      } else {
+        // Tied: pinned exactly at the berth, like an anchor with zero scope.
+        vessel.x = dockBerthX; vessel.z = dockBerthZ; vessel.heading = glm::radians(dockBerthHdg);
+      }
       vessel.speed = 0.0f; vessel.yawRate = 0.0f;
       shipSpeed = 0.0f;
     } else if (appState == AppState::Sailing) {
@@ -6692,6 +6753,13 @@ int main(int argc, char** argv) {
     if (std::getenv("SAILSIM_CLOUDLOOK")) {   // debug: aim up and AWAY from the sun (front-lit clouds)
       glm::vec3 away = glm::normalize(glm::vec3(-sunDir.x, 0.0f, -sunDir.z) + glm::vec3(0.0f, 1.4f, 0.0f));
       lookTarget = eye + away;
+    }
+    // Keep the chase camera above the ground (client updateCamera terrain clamp): sample the terrain elevation
+    // under the eye and hold Y to a 3 m clearance, so orbiting/panning can't dip the view below a hill or the
+    // seabed. First-person rides the deck via its own raycast, so it's exempt.
+    if (!firstPerson && terrainR.ready) {
+      float groundY = terr.elevation(eye.x, eye.z);
+      if (eye.y < groundY + 3.0f) eye.y = groundY + 3.0f;
     }
     glm::mat4 viewM = glm::lookAt(eye, lookTarget, lookUp);
     glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 2.0f, 40000.0f);

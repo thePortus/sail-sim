@@ -1952,9 +1952,10 @@ static void uploadShipImpostors(WGPUDevice device, WGPUQueue queue, ShipImpRende
   for (const auto& [slug, a] : ships) {
     ShipImpSlug s;
     s.size = a.size; s.centerY = a.centerY; s.n = a.n; s.cols = a.cols;
-    // Per-slug bow calibration (client CALIB_DEG_BY_SLUG): GLBs baked with a
-    // different bow convention read "sailing backwards" without it.
-    s.calib = slug == "brig" ? glm::pi<float>() : slug == "merchantman" ? glm::half_pi<float>() : 0.0f;
+    // Per-slug bow calibration (client CALIB_DEG_BY_SLUG): the atlas bakes the RAW GLB, so a hull whose authored
+    // bow isn't +Z needs a correction. Only the merchantman is off (+X bow → 90°); the brig's bow is +Z, so it
+    // needs NO correction — the old 180° flipped the brigantine bow-for-stern (read "sailing backwards").
+    s.calib = slug == "merchantman" ? glm::half_pi<float>() : 0.0f;
     s.tex = makeSampledRGBA(device, queue, (uint32_t)a.img.w, (uint32_t)a.img.h, a.img.rgba.data(), true);
     s.view = wgpuTextureCreateView(s.tex, nullptr);
     WGPUBindGroupEntry be[3] = {};

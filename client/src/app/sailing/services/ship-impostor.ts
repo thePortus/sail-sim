@@ -32,7 +32,7 @@ const CALIB_DIR = +(localStorage.getItem('ignis_shipimp_dir') ?? '1') < 0 ? -1 :
 // merchantman: the 16-view re-bake now renders it from its (decompressed) GLB like the others — NOT the old
 // .blend — which flips the bow convention a half-turn, so its impostor read "backwards". +90 (the old −90 plus
 // that 180°) puts the bow right. Tune live via ignis_shipimp_calib_merchantman if it's still off.
-const CALIB_DEG_BY_SLUG: Record<string, number> = { brig: 180, merchantman: 90 };
+const CALIB_DEG_BY_SLUG: Record<string, number> = { merchantman: 90 };   // brig bow is +Z (no correction); 180 flipped it bow-for-stern
 function calibRadFor(slug: string): number {
   const per = localStorage.getItem('ignis_shipimp_calib_' + slug);
   const deg = per !== null ? +per : CALIB_DEG + (CALIB_DEG_BY_SLUG[slug] ?? 0);

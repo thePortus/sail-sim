@@ -21,3 +21,4 @@ assets/fonts/
 
 # ImGui layout, only written if IniFilename is re-enabled
 imgui.ini
+build-bundle/

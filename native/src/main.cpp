@@ -61,6 +61,7 @@
 #include "net_mp.hpp"
 #include "asset_cache.hpp"
 #include "paths.hpp"
+#include "updater.hpp"
 #include "combat.hpp"
 #include "combat_constants.hpp"
 #include "cannon.hpp"
@@ -3725,6 +3726,10 @@ int main(int argc, char** argv) {
     int port = kPort;
     authFuture = std::async(std::launch::async, net::me, host, port, tok);
   }
+
+  // Start the auto-updater (Sparkle on the macOS bundle; no-op otherwise). Runs once; its scheduled checks are
+  // serviced by the Cocoa run loop that glfwPollEvents pumps below.
+  updater::start();
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {

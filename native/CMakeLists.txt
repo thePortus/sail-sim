@@ -18,6 +18,11 @@ project(sailsim_native LANGUAGES C CXX)
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
 set(SAILSIM_VERSION "0.1.0")
 
+# Auto-update config baked into the macOS bundle Info.plist. Override the feed URL for your deployment
+# (Sparkle requires https in production); the public key is printed by `server/scripts/client-release.js keygen`.
+set(SAILSIM_SPARKLE_FEED_URL "https://CHANGEME.example/client/appcast-mac.xml" CACHE STRING "Sparkle appcast feed URL")
+set(SAILSIM_SPARKLE_PUBKEY   "tRLH7wCxtVSWI6d2lwbwliBgNoJGizATw2qG4XQSfvo=" CACHE STRING "Sparkle Ed25519 public key (SUPublicEDKey)")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -385,18 +390,46 @@ else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# ── macOS: package as a .app bundle ──────────────────────────────────────────
-# Off by default so the dev/CI loop keeps running ./build/bin/sailsim_native.
-# Turn on with -DSAILSIM_MACOS_BUNDLE=ON to get build/bin/sailsim_native.app —
-# a proper Cocoa app with an Info.plist (Retina-capable, dock name, bundle id).
+# ── macOS: package as a .app bundle + Sparkle auto-updater ───────────────────
+# Off by default so the dev/CI loop keeps running ./build/bin/sailsim_native (a bare executable with a no-op
+# updater). Turn on with -DSAILSIM_MACOS_BUNDLE=ON to get build/bin/sailsim_native.app — a proper Cocoa app
+# with an Info.plist that self-updates via Sparkle. The updater impl is picked to match: Sparkle for the
+# bundle, a no-op stub otherwise.
 option(SAILSIM_MACOS_BUNDLE "Build a macOS .app bundle instead of a bare executable" OFF)
 if (APPLE AND SAILSIM_MACOS_BUNDLE)
+  # Prebuilt (universal arm64+x86_64) Sparkle framework — a binary release, so just download + extract.
+  include(FetchContent)
+  FetchContent_Declare(sparkle
+    URL https://github.com/sparkle-project/Sparkle/releases/download/2.6.4/Sparkle-2.6.4.tar.xz)
+  FetchContent_MakeAvailable(sparkle)   # binary release, no CMakeLists — just populates ${sparkle_SOURCE_DIR}
+
+  # Generate the Info.plist (bundle keys + the Sparkle feed/key set above).
+  set(MACOSX_BUNDLE_EXECUTABLE_NAME "sailsim_native")
+  set(MACOSX_BUNDLE_GUI_IDENTIFIER "us.theport.sailsim")
+  set(MACOSX_BUNDLE_BUNDLE_NAME "Sail-Sim")
+  set(MACOSX_BUNDLE_SHORT_VERSION_STRING "${SAILSIM_VERSION}")
+  set(MACOSX_BUNDLE_BUNDLE_VERSION "${SAILSIM_VERSION}")
+  set(MACOSX_BUNDLE_COPYRIGHT "© thePortus")
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
+                 "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
+
   set_target_properties(sailsim_native PROPERTIES
     MACOSX_BUNDLE ON
-    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
-    MACOSX_BUNDLE_BUNDLE_NAME "Sail-Sim"
-    MACOSX_BUNDLE_GUI_IDENTIFIER "us.theport.sailsim"
-    MACOSX_BUNDLE_BUNDLE_VERSION "${SAILSIM_VERSION}"
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "${SAILSIM_VERSION}"
-    MACOSX_BUNDLE_COPYRIGHT "© thePortus")
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    INSTALL_RPATH "@executable_path/../Frameworks"
+    BUILD_WITH_INSTALL_RPATH ON)
+
+  # Sparkle: the Obj-C++ shim (ARC + framework header search path), link the framework, and embed it in the
+  # bundle's Contents/Frameworks (ditto preserves the framework's version symlinks) so @rpath resolves at run.
+  target_sources(sailsim_native PRIVATE src/updater_mac.mm)
+  set_source_files_properties(src/updater_mac.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc -F${sparkle_SOURCE_DIR}")
+  target_compile_definitions(sailsim_native PRIVATE SAILSIM_SPARKLE=1)
+  target_link_libraries(sailsim_native PRIVATE "-F${sparkle_SOURCE_DIR}" "-framework Sparkle")
+  add_custom_command(TARGET sailsim_native POST_BUILD
+    COMMAND ditto "${sparkle_SOURCE_DIR}/Sparkle.framework"
+                  "$<TARGET_BUNDLE_CONTENT_DIR:sailsim_native>/Frameworks/Sparkle.framework"
+    COMMENT "Embedding Sparkle.framework into the app bundle")
+else()
+  target_sources(sailsim_native PRIVATE src/updater_stub.cpp)
 endif()

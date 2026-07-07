@@ -3282,14 +3282,13 @@ int main(int argc, char** argv) {
   if (std::getenv("SAILSIM_NOREFL")) userCfg.gfx.reflections = false;
   // TAA (experimental, opt-in): SAILSIM_TAA enables it; SAILSIM_TAA_FEEDBACK tunes the history
   // blend (0.9 = strong smoothing). Gated on its own bool so it doesn't touch the FXAA/SMAA combo.
-  const bool  taaEnabled  = std::getenv("SAILSIM_TAA") != nullptr;
+  // TAA on/off + upscale ratio are persisted settings (ImGui-toggleable); the env vars act as a
+  // startup override. Feedback/sharpen/clamp stay env-only (advanced tuning; baked defaults otherwise).
+  if (std::getenv("SAILSIM_TAA")) userCfg.gfx.taa = true;
+  if (const char* uenv = std::getenv("SAILSIM_TAA_UPSCALE")) userCfg.gfx.taaUpscale = std::clamp((float)atof(uenv), 0.5f, 1.0f);
   const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.8f;
   const float taaSharpen  = std::getenv("SAILSIM_TAA_SHARPEN")  ? (float)atof(std::getenv("SAILSIM_TAA_SHARPEN"))  : 0.35f;
   const float taaClamp    = std::getenv("SAILSIM_TAA_CLAMP")    ? (float)atof(std::getenv("SAILSIM_TAA_CLAMP"))    : 0.4f;   // variance-clip gamma (tight — busy ocean)
-  // B2 temporal upscaling: render the scene at this fraction of output res and let TAA reconstruct to
-  // full res (history + resolve run at OUTPUT res). 1.0 = native-res TAA (no upscale). E.g. 0.67 ≈ FSR
-  // "Quality". Needs TAA on. Clamped to a sane range.
-  const float taaUpscale  = std::getenv("SAILSIM_TAA_UPSCALE")  ? std::clamp((float)atof(std::getenv("SAILSIM_TAA_UPSCALE")), 0.5f, 1.0f) : 1.0f;
   const float cloudDenoiseBypass = std::getenv("SAILSIM_NODENOISE") ? 1.0f : 0.0f;  // debug: skip the cloud blur
   // Cloud tonemap exposure (0.5) + sun gain (15.0), env-tunable for tuning. The bright sun
   // term used to slam into a hard 1.1 exposure and wash all internal billow detail to flat
@@ -3447,9 +3446,9 @@ int main(int argc, char** argv) {
   float adaptiveFactor = 1.0f;
   // renderScale (<=1, perf downscale) x SSAA (>=1, quality upscale) x adaptive nudge.
   auto effScale = [&]() {
-    // When TAA temporal upscaling is on, the scene renders at taaUpscale× res and TAA reconstructs to
+    // When TAA temporal upscaling is on, the scene renders at userCfg.gfx.taaUpscale× res and TAA reconstructs to
     // full res — so the internal render resolution drops (the perf win) while the history stays native.
-    const float up = taaEnabled ? taaUpscale : 1.0f;
+    const float up = userCfg.gfx.taa ? userCfg.gfx.taaUpscale : 1.0f;
     return glm::clamp(userCfg.gfx.renderScale * settings::ssaaFactor(userCfg.gfx.ssaa) * adaptiveFactor * up,
                       0.3f, 2.0f);
   };
@@ -4474,6 +4473,18 @@ int main(int argc, char** argv) {
         if (g.ssaa > 0 && ImGui::IsItemHovered())
           ImGui::SetTooltip("SSAA renders at %.2fx the pixels then downsamples. Best quality, high GPU cost.",
                             (double)settings::ssaaFactor(g.ssaa) * settings::ssaaFactor(g.ssaa));
+        // Temporal AA (experimental): jitter + reprojected history + ship motion vectors. Overrides
+        // the AA method above when on. Its upscale slider renders the scene below native and
+        // reconstructs (FSR-style perf) — 1.0 = native-res TAA.
+        if (ImGui::Checkbox("Temporal AA (TAA, experimental)", &g.taa)) { custom(); gsave(); }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Temporal anti-aliasing + the foundation for temporal upscaling.\nBest AA for thin rigging; may soften/ghost slightly in motion.");
+        if (g.taa) {
+          ImGui::SetNextItemWidth(160.0f);
+          if (ImGui::SliderFloat("TAA render scale", &g.taaUpscale, 0.5f, 1.0f, "%.2f")) { custom(); gsave(); }
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Render below native and reconstruct to full res (temporal upscaling).\n1.00 = native. 0.67 ≈ Quality. 0.50 ≈ Performance (biggest FPS gain).");
+        }
         // Shadows: 0 turns the sun cascades off; 1-3 select the map resolution.
         ImGui::SetNextItemWidth(160.0f);
         if (ImGui::Combo("Shadows", &g.shadows, "Off\0Low\0Medium\0High\0Ultra\0")) { custom(); gsave(); }
@@ -7090,7 +7101,7 @@ int main(int argc, char** argv) {
     // reversing apparent A/D turn direction. Safe: every pipeline culls None.
     proj[0][0] = -proj[0][0];
     glm::mat4 taaCurVP = proj * viewM;   // UNJITTERED view-proj (TAA camera-motion reprojection)
-    if (taaEnabled) {
+    if (userCfg.gfx.taa) {
       // Sub-pixel Halton(2,3) jitter on the projection: shifts the sample grid ±0.5px each frame so
       // the history feedback averages the jittered samples into anti-aliasing. Reprojection below
       // uses the UNjittered matrices, so the jitter never pollutes motion — only the sample pattern.
@@ -8275,7 +8286,7 @@ int main(int argc, char** argv) {
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
-        if (firstShip && taaEnabled) {   // player ship (slot 0): TAA motion-vector matrices (unjittered)
+        if (firstShip && userCfg.gfx.taa) {   // player ship (slot 0): TAA motion-vector matrices (unjittered)
           mu.mvpCur  = taaCurVP * s.model;
           mu.mvpPrev = taaPrevVP * taaPrevPlayerModel;
           taaPrevPlayerModel = s.model;   // for next frame
@@ -9031,7 +9042,7 @@ int main(int argc, char** argv) {
     // ── TAA velocity pass: re-draw the player ship into the velocity buffer (cleared to a sentinel
     //    ~99), depth-tested read-only so only its visible surface writes screen-UV motion vectors.
     //    The resolve reads these to reproject the MOVING ship (camera-only depth reproj can't). ──
-    if (taaEnabled && sailing && ownMesh && ownMesh->velocityPipeline) {
+    if (userCfg.gfx.taa && sailing && ownMesh && ownMesh->velocityPipeline) {
       WGPURenderPassColorAttachment vca = {};
       vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
       vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
@@ -9053,7 +9064,7 @@ int main(int argc, char** argv) {
     // ── Resolve + UI pass (swapchain): AA the LDR intermediate onto the swapchain
     //    (SMAA = 3 passes, FXAA = 1, or a straight passthrough when AA is off),
     //    then Dear ImGui on top. ──
-    if (taaEnabled) {
+    if (userCfg.gfx.taa) {
       // TAA: resolve current LDR + reprojected history into hist[taaCur] (render res), then blit that
       // to the swapchain (fxaa passthrough) + UI. Reprojection uses the UNjittered matrices; the
       // shader's neighborhood clamp rejects ghosting. History ping-pongs; first frame has none.

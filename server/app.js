@@ -10,6 +10,7 @@ const express = require('express');
 const cors = require('cors');
 const favicon = require('serve-favicon');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -61,6 +62,19 @@ app.use('/client', express.static(path.join(__dirname, 'assets/client'), {
     else res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
   },
 }));
+
+// Native desktop-client download: stream the newest published build for a platform. Streaming (not a redirect
+// to /client/…) keeps it working behind the reverse proxy, where only /api is routed to Node.
+app.get('/download/:platform', (req, res) => {
+  const platform = req.params.platform === 'win' ? 'win' : req.params.platform === 'mac' ? 'mac' : null;
+  if (!platform) return res.status(404).send('Unknown platform.');
+  const dir = path.join(__dirname, 'assets/client');
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => new RegExp(`^SailSim-.*-${platform}\\.zip$`).test(f)); } catch {}
+  if (!files.length) return res.status(404).send(`No ${platform} build has been published yet.`);
+  files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));   // newest version last
+  res.download(path.join(dir, files[files.length - 1]));
+});
 
 // set API routes
 require('./routes/index')(app);

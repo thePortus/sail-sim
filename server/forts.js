@@ -38,7 +38,7 @@ const FORT = {
   // in-game playtest pass (watch: is T1 too easy? is T3 an instant delete? tune gunHp/caliber/reload/spread).
   // Per-shot caliber kept BELOW a brig's (1.7): a fort ball is already faster (more speed-damage) and tends to
   // strike the waterline (bonus), so high caliber made T2/T3 2-shot a brig. T1's lone gun keeps some punch.
-  small:   { gunHp: 700, reloadMs: 5000, range: 450, muzzleV: 68, caliber: 1.10, spread: 0.016, height: 8  },
+  small:   { gunHp: 900, reloadMs: 4600, range: 450, muzzleV: 68, caliber: 1.30, spread: 0.016, height: 8  },
   medium:  { gunHp: 420, reloadMs: 6500, range: 550, muzzleV: 75, caliber: 0.75, spread: 0.016, height: 10 },
   capital: { gunHp: 440, reloadMs: 6000, range: 650, muzzleV: 82, caliber: 0.80, spread: 0.014, height: 14 },
 };

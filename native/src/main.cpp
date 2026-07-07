@@ -3250,6 +3250,10 @@ int main(int argc, char** argv) {
   const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.8f;
   const float taaSharpen  = std::getenv("SAILSIM_TAA_SHARPEN")  ? (float)atof(std::getenv("SAILSIM_TAA_SHARPEN"))  : 0.35f;
   const float taaClamp    = std::getenv("SAILSIM_TAA_CLAMP")    ? (float)atof(std::getenv("SAILSIM_TAA_CLAMP"))    : 0.4f;   // variance-clip gamma (tight — busy ocean)
+  // B2 temporal upscaling: render the scene at this fraction of output res and let TAA reconstruct to
+  // full res (history + resolve run at OUTPUT res). 1.0 = native-res TAA (no upscale). E.g. 0.67 ≈ FSR
+  // "Quality". Needs TAA on. Clamped to a sane range.
+  const float taaUpscale  = std::getenv("SAILSIM_TAA_UPSCALE")  ? std::clamp((float)atof(std::getenv("SAILSIM_TAA_UPSCALE")), 0.5f, 1.0f) : 1.0f;
   const float cloudDenoiseBypass = std::getenv("SAILSIM_NODENOISE") ? 1.0f : 0.0f;  // debug: skip the cloud blur
   // Cloud tonemap exposure (0.5) + sun gain (15.0), env-tunable for tuning. The bright sun
   // term used to slam into a hard 1.1 exposure and wash all internal billow detail to flat
@@ -3406,7 +3410,10 @@ int main(int argc, char** argv) {
   float adaptiveFactor = 1.0f;
   // renderScale (<=1, perf downscale) x SSAA (>=1, quality upscale) x adaptive nudge.
   auto effScale = [&]() {
-    return glm::clamp(userCfg.gfx.renderScale * settings::ssaaFactor(userCfg.gfx.ssaa) * adaptiveFactor,
+    // When TAA temporal upscaling is on, the scene renders at taaUpscale× res and TAA reconstructs to
+    // full res — so the internal render resolution drops (the perf win) while the history stays native.
+    const float up = taaEnabled ? taaUpscale : 1.0f;
+    return glm::clamp(userCfg.gfx.renderScale * settings::ssaaFactor(userCfg.gfx.ssaa) * adaptiveFactor * up,
                       0.3f, 2.0f);
   };
   double adaptAccumMs = 0.0; int adaptFrames = 0; double adaptLastT = glfwGetTime();
@@ -3559,7 +3566,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 2; ++i) {
       if (taaHistView[i]) wgpuTextureViewRelease(taaHistView[i]);
       if (taaHistTex[i])  wgpuTextureRelease(taaHistTex[i]);
-      taaHistTex[i]  = makeColorRTT(device, rW, rH, kSceneFormat);
+      taaHistTex[i]  = makeColorRTT(device, curW, curH, kSceneFormat);   // OUTPUT res (temporal upscaling target)
       taaHistView[i] = wgpuTextureCreateView(taaHistTex[i], nullptr);
     }
     for (int i = 0; i < 2; ++i) {

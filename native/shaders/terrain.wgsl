@@ -254,8 +254,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let sandC = clamp(sandRaw * vec3<f32>(1.20, 1.08, 0.80), vec3<f32>(0.0), vec3<f32>(1.0));
   // Grass — 20 m fine blending grass <-> grass2 + 75 m coarse XZ tonal anchor.
   let grassFine = mix(tri(grassTex, wp, 0.050, triW), tri(grass2Tex, wp, 0.044, triW), gMix);
-  let grassC = grassFine * 0.65
-             + textureSample(grassTex, tileSamp, wp.xz * 0.013).rgb * 0.35;
+  let grassRaw = grassFine * 0.65
+               + textureSample(grassTex, tileSamp, wp.xz * 0.013).rgb * 0.35;
+  // Tame the vivid, plasticy green: desaturate toward an olive luminance + dim a touch, so grasslands read as
+  // natural matte turf rather than bright plastic.
+  let grassLum = dot(grassRaw, vec3<f32>(0.36, 0.5, 0.14));
+  let grassC = mix(grassRaw, vec3<f32>(grassLum) * vec3<f32>(0.86, 0.94, 0.62), 0.32) * 0.90;
   // Gravel — 25 m fine + 50 m coarse ROCK tri (cross-texture macro).
   let gravC = tri(gravelTex, wp, 0.040, triW) * 0.55
             + tri(rockTex,   wp, 0.020, triW) * 0.45;
@@ -320,7 +324,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let rnW = triNor(rockNor,  wp, 0.083, triW);
   let tileNorm = normalize(snW * wSand + gnW * wGrass + rnW * (wGravel + wRock + wSnow));
   // Stronger on steep slopes so cliffs read craggy; forests keep their canopy lumps.
-  let tnStrength = (0.40 + 0.45 * smoothstep(0.25, 0.65, slope)) * (1.0 - forestF);
+  // Ease grass's normal perturbation (× (1 - 0.4·wGrass)) so flat turf reads matte, not bumpy-plasticy.
+  let tnStrength = (0.40 + 0.45 * smoothstep(0.25, 0.65, slope)) * (1.0 - forestF) * (1.0 - 0.40 * wGrass);
   N = normalize(N + tileNorm * tnStrength);
 
   // ── Fallback path: height-band colours until the biome textures arrive ──────

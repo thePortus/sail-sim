@@ -34,6 +34,7 @@ struct Client::Impl {
   std::vector<std::string> repairedIn;
   std::map<std::string, CombatShipState> combat;
   std::map<std::string, FortState> forts;
+  std::map<std::string, std::map<std::string, std::string>> diplo;   // faction relation matrix (diplomacy_state)
   std::map<std::string, std::pair<int, int>> crewBy;   // playerId -> {crew, maxCrew}
   float mastRepairMs = 0;                              // armed jury-rig duration (0 = none)
   std::map<std::string, std::pair<int, int>> gunBy;    // playerId -> {port, stbd} deploy targets
@@ -214,6 +215,14 @@ struct Client::Impl {
           fs.hp += hp; fs.maxHp += mx; fs.gunsTotal++; if (hp > 0.0f) fs.gunsUp++;
         }
         forts[fid] = fs;
+      }
+    } else if (type == "diplomacy_state") {
+      if (msg.contains("matrix") && msg["matrix"].is_object()) {
+        diplo.clear();
+        for (auto& [a, row] : msg["matrix"].items())
+          if (row.is_object())
+            for (auto& [b, rel] : row.items())
+              if (rel.is_string()) diplo[a][b] = rel.get<std::string>();
       }
     } else if (type == "mast_repair") {
       mastRepairMs = msg.value("ms", 60000.0f);
@@ -736,6 +745,14 @@ std::map<std::string, CombatShipState> Client::combatStates() const {
 std::map<std::string, FortState> Client::fortStates() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
   return p_->forts;
+}
+std::map<std::string, std::map<std::string, std::string>> Client::diplomacyMatrix() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->diplo;
+}
+std::map<std::string, float> Client::factionRep() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->townSt.factionRep;
 }
 std::map<std::string, std::pair<int, int>> Client::crews() const {
   std::lock_guard<std::mutex> lock(p_->mtx);

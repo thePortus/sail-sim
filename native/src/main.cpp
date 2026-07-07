@@ -3563,6 +3563,7 @@ int main(int argc, char** argv) {
   // client's admin-panel.component). Weather/time overrides are server-authoritative:
   // the server broadcasts the change to every player; we only send the request.
   bool  adminOpen = std::getenv("SAILSIM_ADMIN_PANEL") != nullptr, prevBacktick = false;   // env = open at start (screenshot tests)
+  bool  diploOpen = std::getenv("SAILSIM_DIPLO") != nullptr, prevK = false;   // Diplomacy panel (K) — faction relations + standing
   float admWindSpeed = 10.0f, admWindDir = 0.0f, admCloud = 0.25f, admHour = 12.0f;
   float admTpX = 0.0f, admTpZ = 0.0f;
   std::string admStatus, admVerb;              // last result line + in-flight action name
@@ -4894,7 +4895,19 @@ int main(int argc, char** argv) {
           if (f == "dutch")   return IM_COL32(134, 74, 25, 240);
           return IM_COL32(58, 66, 75, 240);
         };
-        // Remote ships: CALLSIGN over ship name (client LABEL_MAX_DIST 1080, scale pow 0.72/near 200/cap 13).
+        // A small skull-and-crossbones (drawn — the ImGui font has no ☠ glyph) flanking a pirate's plaque.
+        auto drawSkull = [&](ImVec2 c, float r) {
+          const ImU32 bone = IM_COL32(238, 232, 220, 255), dark = IM_COL32(26, 8, 8, 255);
+          wdl->AddLine(ImVec2(c.x - r * 1.25f, c.y - r * 0.85f), ImVec2(c.x + r * 1.25f, c.y + r * 1.05f), bone, r * 0.34f);
+          wdl->AddLine(ImVec2(c.x - r * 1.25f, c.y + r * 1.05f), ImVec2(c.x + r * 1.25f, c.y - r * 0.85f), bone, r * 0.34f);
+          wdl->AddCircleFilled(c, r, bone);
+          wdl->AddRectFilled(ImVec2(c.x - r * 0.42f, c.y + r * 0.55f), ImVec2(c.x + r * 0.42f, c.y + r * 1.05f), bone, r * 0.2f);
+          wdl->AddCircleFilled(ImVec2(c.x - r * 0.4f, c.y - r * 0.08f), r * 0.27f, dark);
+          wdl->AddCircleFilled(ImVec2(c.x + r * 0.4f, c.y - r * 0.08f), r * 0.27f, dark);
+          wdl->AddTriangleFilled(ImVec2(c.x, c.y + r * 0.1f), ImVec2(c.x - r * 0.15f, c.y + r * 0.5f), ImVec2(c.x + r * 0.15f, c.y + r * 0.5f), dark);
+        };
+        // Remote ships: CALLSIGN over ship name (client LABEL_MAX_DIST 1080). Pirates get a black/red skull plaque,
+        // navy hunters a steel one, everything else the brass plate — mirroring the Angular nameplate roles.
         for (const mp::RemotePlayer& rp : mpClient.players()) {
           float d = std::hypot(rp.x - lastEye.x, rp.z - lastEye.z);
           if (d > 1080.0f) continue;
@@ -4906,9 +4919,17 @@ int main(int argc, char** argv) {
           if (ph <= 0.0f) continue;
           std::string title = rp.callsign.empty() ? rp.vesselName : rp.callsign;
           for (char& ch : title) ch = (char)std::toupper((unsigned char)ch);
-          plaque(cpx, ph, title.c_str(),
-                 rp.vesselName.empty() ? nullptr : rp.vesselName.c_str(),
-                 IM_COL32(18, 27, 44, 240), IM_COL32(200, 161, 60, 255), false);
+          if (rp.role == "pirate") {
+            plaque(cpx, ph, title.c_str(), "PIRATE", IM_COL32(30, 8, 8, 244), IM_COL32(214, 40, 36, 255), false);
+            float pw = std::min(ph, 170.0f) * 3.6f, sr = std::min(ph, 170.0f) * 0.30f;
+            drawSkull(ImVec2(cpx.x - pw * 0.5f - sr * 1.4f, cpx.y), sr);
+            drawSkull(ImVec2(cpx.x + pw * 0.5f + sr * 1.4f, cpx.y), sr);
+          } else if (rp.role == "hunter") {
+            plaque(cpx, ph, title.c_str(), "NAVY - HUNTER", IM_COL32(24, 30, 40, 244), IM_COL32(196, 206, 220, 255), false);
+          } else {
+            plaque(cpx, ph, title.c_str(), rp.vesselName.empty() ? nullptr : rp.vesselName.c_str(),
+                   IM_COL32(18, 27, 44, 240), IM_COL32(200, 161, 60, 255), false);
+          }
         }
         // Harbour towns: name over "NATION TIER" (client LBL_SHOW 2000, pow 0.6/near 350/cap 7, lift 18).
         if (terrainR.ready) {
@@ -4959,6 +4980,88 @@ int main(int argc, char** argv) {
             wdl->AddText(ImGui::GetFont(), ts, ImVec2(tp.x + 1, tp.y + 1), IM_COL32(6, 10, 16, 230), lbl);
             wdl->AddText(ImGui::GetFont(), ts, tp, fs.neutralized ? IM_COL32(184, 184, 190, 255) : IM_COL32(255, 225, 180, 255), lbl);
           }
+        }
+      }
+
+      // ── Day/night clock (top-centre): 12-h time + a drawn sun/moon (mirrors the Angular HUD clock). ──
+      {
+        mp::WaveState wvt = mpClient.wave();
+        double epoch = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        double wall = std::fmod(epoch + wvt.timeOffsetSec, 1440.0); if (wall < 0) wall += 1440.0;
+        float gh = (float)(wall / 60.0);
+        if (const char* th = std::getenv("SAILSIM_HOUR")) gh = (float)std::atof(th);
+        int hrs = (int)gh, mins = (int)((gh - (float)hrs) * 60.0f);
+        int h12 = (hrs % 12) == 0 ? 12 : hrs % 12;
+        char clk[24]; std::snprintf(clk, sizeof(clk), "%d:%02d %s", h12, mins, hrs < 12 ? "AM" : "PM");
+        ImVec2 ts = ImGui::CalcTextSize(clk);
+        const float pad = 8.0f, iconW = 24.0f, w = ts.x + iconW + pad * 3.0f, h = ts.y + pad * 1.4f;
+        ImVec2 p0(io.DisplaySize.x * 0.5f - w * 0.5f, 84.0f);   // just below the top toolbar
+        ImDrawList* fdl = ImGui::GetForegroundDrawList();
+        fdl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(14, 20, 28, 205), 6.0f);
+        fdl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(120, 130, 145, 130), 6.0f, 0, 1.2f);
+        ImVec2 ic(p0.x + pad + iconW * 0.5f, p0.y + h * 0.5f);
+        if (gh >= 6.5f && gh < 19.5f) {   // sun
+          fdl->AddCircleFilled(ic, 6.0f, IM_COL32(255, 214, 92, 255));
+          for (int k = 0; k < 8; ++k) { float a = (float)k * 0.7853982f;
+            fdl->AddLine(ImVec2(ic.x + std::cos(a) * 8.0f, ic.y + std::sin(a) * 8.0f),
+                         ImVec2(ic.x + std::cos(a) * 10.5f, ic.y + std::sin(a) * 10.5f), IM_COL32(255, 214, 92, 255), 1.6f); }
+        } else {   // crescent moon
+          fdl->AddCircleFilled(ic, 6.5f, IM_COL32(214, 220, 233, 255));
+          fdl->AddCircleFilled(ImVec2(ic.x + 2.8f, ic.y - 1.6f), 5.6f, IM_COL32(14, 20, 28, 205));
+        }
+        fdl->AddText(ImVec2(p0.x + pad * 2.0f + iconW, p0.y + (h - ts.y) * 0.5f), IM_COL32(232, 224, 207, 255), clk);
+      }
+
+      // ── Diplomacy panel (K): each nation's wars/alliances + YOUR standing (ports the Angular Diplomacy screen). ──
+      {
+        bool kNow = glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS;
+        if (kNow && !prevK && !io.WantTextInput) diploOpen = !diploOpen;
+        prevK = kNow;
+        if (diploOpen) {
+          auto diplo = mpClient.diplomacyMatrix();
+          auto rep = mpClient.factionRep();
+          struct FF { const char* id; const char* name; ImVec4 col; };
+          static const FF FS[] = {
+            { "english", "English", ImVec4(0.80f, 0.30f, 0.30f, 1) }, { "french", "French", ImVec4(0.34f, 0.55f, 0.88f, 1) },
+            { "spanish", "Spanish", ImVec4(0.91f, 0.79f, 0.34f, 1) }, { "dutch", "Dutch", ImVec4(0.90f, 0.55f, 0.26f, 1) },
+          };
+          auto tier = [](int v) -> const char* {
+            if (v >= 85) return "Beloved"; if (v >= 65) return "Honored"; if (v >= 45) return "Respected";
+            if (v >= 25) return "Liked"; if (v >= 10) return "Accepted"; if (v >= -9) return "Neutral";
+            if (v >= -25) return "Wary"; if (v >= -40) return "Disliked"; if (v >= -55) return "Hostile";
+            if (v >= -70) return "Despised"; if (v >= -88) return "Loathed"; return "Hated"; };
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_Appearing);
+          ImGui::Begin("Diplomacy##diplo", &diploOpen, ImGuiWindowFlags_NoCollapse);
+          ImGui::PushTextWrapPos(0.0f);
+          ImGui::TextDisabled("Attack a nation's shipping and its enemies warm to you while its allies turn cold.");
+          ImGui::PopTextWrapPos();
+          ImGui::Separator();
+          for (const FF& f : FS) {
+            ImGui::PushFont(fontTitle);
+            ImGui::TextColored(f.col, "%s", f.name);
+            ImGui::PopFont();
+            int v = rep.count(f.id) ? (int)std::lround(rep.at(f.id)) : 0;
+            ImVec4 tc = v >= 10 ? ImVec4(0.56f, 0.75f, 0.54f, 1) : v <= -10 ? ImVec4(0.88f, 0.47f, 0.42f, 1) : ImVec4(0.72f, 0.72f, 0.72f, 1);
+            ImGui::SameLine(); ImGui::TextColored(tc, "  -  %s (%+d)", tier(v), v);
+            std::string wars, allies;
+            auto it = diplo.find(f.id);
+            if (it != diplo.end())
+              for (const FF& o : FS) {
+                if (std::string(o.id) == f.id) continue;
+                auto r = it->second.find(o.id);
+                if (r == it->second.end()) continue;
+                if (r->second == "war") { if (!wars.empty()) wars += ", "; wars += o.name; }
+                else if (r->second == "alliance") { if (!allies.empty()) allies += ", "; allies += o.name; }
+              }
+            if (!wars.empty())   ImGui::TextColored(ImVec4(0.90f, 0.42f, 0.36f, 1), "    War: %s", wars.c_str());
+            if (!allies.empty()) ImGui::TextColored(ImVec4(0.46f, 0.73f, 0.51f, 1), "    Allied: %s", allies.c_str());
+            if (wars.empty() && allies.empty()) ImGui::TextDisabled("    at peace with all");
+            ImGui::Spacing();
+          }
+          ImGui::Separator();
+          ImGui::TextDisabled("Relations shift rarely - watch the chat for declarations. (K to close)");
+          ImGui::End();
         }
       }
 

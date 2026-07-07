@@ -281,6 +281,8 @@ public:
   // Zone HP per ship, keyed by playerId (self included). Copies.
   std::map<std::string, CombatShipState> combatStates() const;
   std::map<std::string, FortState> fortStates() const;        // harbor-fort HP, keyed by fort id
+  std::map<std::string, std::map<std::string, std::string>> diplomacyMatrix() const;   // faction relations a->b: war|peace|alliance
+  std::map<std::string, float> factionRep() const;            // our standing per faction (copy)
   std::map<std::string, std::pair<int, int>> crews() const;   // playerId -> {crew, maxCrew}
   // Jury-rig timer: >0 ms while the server has our demasting repair armed
   // (cleared when a combat_state shows masts back above 0).

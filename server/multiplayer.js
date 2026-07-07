@@ -61,6 +61,7 @@ const moveConst = require('./movement-constants');
 const terrainMask = require('./terrain-mask');
 const economy = require('./economy');
 const npc = require('./npc');
+const nav = require('./nav');
 const fortsMod = require('./forts');
 const terrainConfig = require('./config/terrain.config');
 const squadron = require('./squadron');
@@ -980,11 +981,36 @@ function attachMultiplayer(server) {
   // Built once from the baked terrain manifest's harbors[].forts[]. They fire through the same activeShots /
   // stepShot / resolveHit path as ships, and take sectional damage from ship balls (forts.stepShotForts below).
   let fortList = [];
+  let respawnPorts = [];   // {x,z,faction,heading} for server-enforced faction-aware respawn
   try {
     const mani = JSON.parse(fs.readFileSync(path.join(terrainConfig.outputDir, 'manifest.json'), 'utf8'));
     fortList = fortsMod.build(mani.harbors || []);
+    respawnPorts = (mani.harbors || []).filter((h) => h.x != null && h.z != null)
+      .map((h) => ({ x: h.x, z: h.z, faction: h.faction || null, heading: h.heading || 0, name: h.name }));
     console.log(`[forts] ${fortList.length} harbor forts armed (${fortList.reduce((n, f) => n + f.guns.length, 0)} guns).`);
   } catch (e) { console.warn('[forts] no manifest / build failed:', e.message); }
+
+  /** Pick where a sunk player respawns: a port her captain is on GOOD terms with (faction rep ≥ 0), nearest such;
+   *  if she's hostile to every nation, the LEAST-hostile port. Returns a navigable pose just off that port's
+   *  harbour (snapped to open water), bow toward the town — server-enforced so both clients simply get the jump. */
+  const pickRespawnPort = (me) => {
+    if (!respawnPorts.length) return null;
+    const from = me.authPose || me.state || { x: 0, z: 0 };
+    const repOf = (f) => (f && me.factionRep && Number.isFinite(me.factionRep[f])) ? me.factionRep[f] : 0;
+    let best = null, bestScore = -Infinity;
+    for (const t of respawnPorts) {
+      const rep = repOf(t.faction);
+      const d = Math.hypot(t.x - from.x, t.z - from.z);
+      const score = (rep >= 0 ? 1e9 : 0) + rep * 1e4 - d;   // friendly/neutral first, then nearest; hostile heavily penalised
+      if (score > bestScore) { bestScore = score; best = t; }
+    }
+    if (!best) return null;
+    const hr = best.heading * Math.PI / 180;
+    let sx = best.x + Math.sin(hr) * 55, sz = best.z + Math.cos(hr) * 55;   // step seaward off the pier
+    const sn = nav.snapToNav(nav.worldToCell(sx, sz).cx, nav.worldToCell(sx, sz).cz);   // land on navigable water
+    if (sn) { const w = nav.cellToWorld(sn.cx, sn.cz); sx = w.x; sz = w.z; }
+    return { x: +sx.toFixed(1), z: +sz.toFixed(1), heading: (best.heading + 180) % 360, name: best.name };
+  };
 
   const broadcastFortState = (fort) => {
     const msg = JSON.stringify({ type: 'fort_state', ...fortsMod.serialize(fort) });
@@ -1553,6 +1579,10 @@ function attachMultiplayer(server) {
           for (const [pid, p] of players) {
             if (pid !== id && p.ws.readyState === 1) p.ws.send(repaired);
           }
+          // Server-enforced respawn: teleport her to a port her nation-relations favour (both clients just get the
+          // correction — no client-side location pick). Falls back to leaving her put if no port is resolvable.
+          const port = pickRespawnPort(me);
+          if (port) teleportTo(id, me, port.x, port.z, port.heading);
         }
 
       } else if (msg.type === 'recruit_crew') {

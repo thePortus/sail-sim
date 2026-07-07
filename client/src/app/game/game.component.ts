@@ -277,7 +277,7 @@ type GamePhase = 'selecting' | 'initializing' | 'sailing';
               <div class="sunk-icon">🌊</div>
               <div class="sunk-title">Your ship was sunk</div>
               <div class="sunk-text">Sent to the depths by {{ combatService.sunkBy() }}.</div>
-              <button class="sunk-btn" (click)="onConfirmSunk()">Respawn at Nearest Port</button>
+              <button class="sunk-btn" (click)="onConfirmSunk()">Respawn at a Friendly Port</button>
             </div>
           </div>
         }
@@ -1003,10 +1003,11 @@ export class GameComponent implements AfterViewInit, OnDestroy {
   /** Acknowledge a sinking → respawn at the nearest harbor town (teleport + full repair). The server
    *  respawn clears our authoritative pose so the teleport isn't clamped by movement validation. */
   onConfirmSunk(): void {
-    const pos = this.vesselService.getPosition();
-    const s = this.terrainService.nearestHarborSpawn(pos.x, pos.z);
-    this.vesselService.respawnAt(s.spawnX, s.spawnZ, s.heading);
+    // Server-enforced respawn: it restores the hull and teleports her to a port her nation-relations favour, which
+    // arrives as a correction. We just ask, then dismiss the overlay + ease the hull up (the correction repositions).
     this.multiplayerService.requestRespawn();
+    this.combatService.clearSunk();
+    this.vesselService.stopSinking();
   }
 
   /** Dock prompt: auto-steer the boat to a tie-up berth alongside the pier, then moor (the town menu

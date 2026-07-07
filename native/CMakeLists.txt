@@ -16,7 +16,7 @@ project(sailsim_native LANGUAGES C CXX)
 
 # Single source of truth for the client version — feeds the compiled-in SAILSIM_VERSION string (shown by
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
-set(SAILSIM_VERSION "0.1.0")
+set(SAILSIM_VERSION "0.1.1")
 
 # Auto-update config: the per-platform appcast feed URLs (override for your deployment — Sparkle/WinSparkle
 # require https in production) and the shared Ed25519 public key (printed by `client-release.js keygen`; the one
@@ -381,6 +381,9 @@ add_executable(sailsim_native
 # The Basis transcoder TU is third-party; don't fail it on our -Werror-ish flags.
 set_source_files_properties("${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
   PROPERTIES COMPILE_OPTIONS "-w")
+# stb_impl.cpp is nothing but third-party stb headers (stb_image_resize2.h floods the log with hundreds of
+# -Wc99-extensions notes for its NEON compound literals); silence it like the transcoder above.
+set_source_files_properties(src/stb_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 set_source_files_properties(src/ktx2.cpp
   PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=0")
 target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
@@ -465,6 +468,18 @@ if (APPLE AND SAILSIM_MACOS_BUNDLE)
     COMMAND ditto "${sparkle_SOURCE_DIR}/Sparkle.framework"
                   "$<TARGET_BUNDLE_CONTENT_DIR:sailsim_native>/Frameworks/Sparkle.framework"
     COMMENT "Embedding Sparkle.framework into the app bundle")
+
+  # Deep-sign the finished bundle AFTER the framework is embedded. The linker only ad-hoc-signs the inner
+  # Mach-O; the bundle itself (Info.plist, CodeResources) and the embedded Sparkle.framework stay unsealed,
+  # so an Apple-Silicon *download* is rejected as "damaged", and Sparkle's nested helpers/XPC services won't
+  # launch (arm64 refuses unsigned code). --deep seals inside-out: Sparkle's Autoupdate/Updater.app/XPC, the
+  # framework, then the .app. Identity defaults to "-" (ad-hoc). Set SAILSIM_MACOS_SIGN_IDENTITY to a
+  # "Developer ID Application: …" identity (and add --options runtime) when moving to a notarized build.
+  set(SAILSIM_MACOS_SIGN_IDENTITY "-" CACHE STRING "codesign identity for the .app bundle (\"-\" = ad-hoc)")
+  add_custom_command(TARGET sailsim_native POST_BUILD
+    COMMAND codesign --force --deep --timestamp=none
+            --sign "${SAILSIM_MACOS_SIGN_IDENTITY}" "$<TARGET_BUNDLE_DIR:sailsim_native>"
+    COMMENT "Deep-signing the app bundle (identity: ${SAILSIM_MACOS_SIGN_IDENTITY})")
 
 elseif (WIN32)
   # Windows always ships the updater (the .exe IS the distributable — no bundle concept). WinSparkle 0.9.3+

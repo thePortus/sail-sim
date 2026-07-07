@@ -36,11 +36,13 @@ const FORT = {
   // T1 has a lone gun (vs a brig's 4), so it leans on HP to make a single brig a real fight; T2/T3 lean on
   // gun count. STARTING POINTS — the 3-brigs-can't-take-a-capital / 1-brig-barely-takes-a-battery feel needs an
   // in-game playtest pass (watch: is T1 too easy? is T3 an instant delete? tune gunHp/caliber/reload/spread).
-  small:   { gunHp: 1000, reloadMs: 4800, range: 450, muzzleV: 68, caliber: 1.9, spread: 0.012, height: 8  },
-  medium:  { gunHp: 620,  reloadMs: 5200, range: 550, muzzleV: 75, caliber: 2.0, spread: 0.010, height: 10 },
-  capital: { gunHp: 620,  reloadMs: 5000, range: 650, muzzleV: 82, caliber: 2.2, spread: 0.009, height: 14 },
+  // Per-shot caliber kept BELOW a brig's (1.7): a fort ball is already faster (more speed-damage) and tends to
+  // strike the waterline (bonus), so high caliber made T2/T3 2-shot a brig. T1's lone gun keeps some punch.
+  small:   { gunHp: 700, reloadMs: 5000, range: 450, muzzleV: 68, caliber: 1.10, spread: 0.016, height: 8  },
+  medium:  { gunHp: 420, reloadMs: 6500, range: 550, muzzleV: 75, caliber: 0.75, spread: 0.016, height: 10 },
+  capital: { gunHp: 440, reloadMs: 6000, range: 650, muzzleV: 82, caliber: 0.80, spread: 0.014, height: 14 },
 };
-const FORT_DMG_MULT   = 1.0;              // ship-ball damage to a fort gun-section (tune together with gunHp)
+const FORT_DMG_MULT   = 1.4;              // ship-ball damage to a fort gun-section (bumped so forts aren't a slog)
 const FORT_HOSTILE_REP = -25;            // a player at/below this standing with the fort's nation is a target on sight
 const REPAIR_MS       = 12 * 60 * 1000;  // interim: a neutralised fort rebuilds after this (until capture lands)
 const GRUDGE_MS       = 90 * 1000;       // a fort returns fire on anyone who shells it for this long (self-defence)

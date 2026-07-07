@@ -245,6 +245,11 @@ void Guns::update(float dt, const ShipPose& pose, const std::vector<Enemy>& enem
   crewFactor_ = std::clamp(crewFactor, 0.5f, 1.0f);
   enemies_ = enemies;
 
+  // Guard against running before configure(): until the vessel slug resolves the gun layout is empty, and the
+  // per-side muzzle lookup below (`layout_.port[0]`) would dereference an empty vector — UB that reads a null
+  // hull in some builds. No layout means no battery to aim or fire, so simply wait.
+  if (layout_.port.empty() || layout_.stbd.empty()) return;
+
   for (int s = 0; s < 2; ++s) {
     Side& g = side_[s];
     // Deploy ease (the client's controller-side GUN_DEPLOY_RATE) + recoil decay.

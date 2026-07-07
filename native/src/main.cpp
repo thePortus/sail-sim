@@ -5901,6 +5901,14 @@ int main(int argc, char** argv) {
       std::vector<combat::Enemy> enemies;
       for (const mp::RemotePlayer& rp : mpClient.players())
         enemies.push_back({ rp.id, rp.x, rp.z, rp.heading, rp.speed });
+      // Harbor forts are auto-aim targets too — stationary "enemies" at the fort centre so a broadside laid on a
+      // fort leads/lobs onto it exactly like a ship. (Only ones in reach; solveLock range/arc-filters anyway.)
+      if (terrainR.ready)
+        for (const terrain::Harbor& hb : terr.manifest().harbors)
+          for (const terrain::Fort& ft : hb.forts) {
+            if (std::hypot(ft.x - vessel.x, ft.z - vessel.z) < 800.0f)
+              enemies.push_back({ "fort_" + hb.id, ft.x, ft.z, 0.0f, 0.0f });
+          }
       mp::TownState cts = mpClient.town();
       const float crewFactor = cts.maxCrew > 0
           ? 0.5f + 0.5f * glm::clamp((float)cts.crew / (float)cts.maxCrew, 0.0f, 1.0f) : 1.0f;

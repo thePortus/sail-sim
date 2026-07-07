@@ -92,6 +92,7 @@ export class VesselService {
   private readonly physDebugOn = (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_physics_debug') === '1');
   private readonly SAIL_FORCE_K   = 0.26;    // drive scale: thrust = K·sailAreaFactor·driveC·V_app²
   private readonly DRAG_K         = 1.0;     // hull drag: F = DRAG_K·v² (quadratic) — sets where drive=drag
+  private readonly LINEAR_DRAG_K  = 2.0;     // viscous/skin drag ∝ speed — bleeds the low-speed coast (quadratic drag vanishes near 0, so a furled ship glided on forever)
   private readonly FORCE_RESPONSE = 0.04;    // accel gain (sets momentum/time-constant; lower = weightier)
   private readonly WEIGHT_REF     = 2800;    // sloop weight → massK = physics.weight / WEIGHT_REF
   private prevSpeedMod = 0;                  // last frame's buoy.speedModifier, fed back as wave-surf accel
@@ -1226,6 +1227,7 @@ export class VesselService {
       const rough    = Math.min(1, this.currentSea.choppiness * 0.7 + this.currentSea.waveHeight / 4);
       const intoSea  = 1 - driveAngle / 180;                                   // 1 dead upwind → 0 downwind
       const drag = this.DRAG_K * this.speed * Math.abs(this.speed)
+                 + this.LINEAR_DRAG_K * this.speed
                  + this.TURN_SCRUB * Math.abs(this.yawRate) * Math.abs(this.speed)
                  + this.SEA_DRAG_K * rough * (0.5 + intoSea) * Math.abs(this.speed);
       const massK  = Math.max(0.2, this.physics.weight / this.WEIGHT_REF);

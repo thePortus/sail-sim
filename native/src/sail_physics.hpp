@@ -134,6 +134,8 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
   const float DEG = glm::pi<float>() / 180.0f;
   const float HEEL_K = 0.22f, COMFORT_HEEL = 16.0f, SPILL_RANGE = 14.0f, SPILL_MAX = 0.75f, MAX_HEEL = 26.0f;
   const float DRAG_K = 1.0f, TURN_SCRUB = 0.06f, SEA_DRAG_K = 0.06f, FORCE_RESPONSE = 0.04f, WEIGHT_REF = 2800.0f;
+  const float LINEAR_DRAG_K = 2.0f;   // viscous/skin drag ∝ speed — bleeds the low-speed coast (quadratic drag
+                                      // alone vanishes near 0, so a furled ship glided on forever). Water resistance.
   const float YAW_RESPONSE = 4.0f, IRONS_FALLOFF = 6.0f;
 
   float hr = v.heading;
@@ -173,8 +175,11 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
   float driveC = eff * (1.0f - SPILL_MAX * heelSpill);
   float thrust = r.forceK * r.sailAreaFactor * driveC * appWind * appWind * v.driveMult;
   float intoSea = 1.0f - driveAngle / 180.0f;
+  // yawRate is RAD/s here, but TURN_SCRUB was tuned against the client's DEG/s yaw — so scrub in degrees, else a
+  // hard turn barely bleeds speed (the port's ~57× unit mismatch). Turning now scrubs way like the Angular client.
   float drag = DRAG_K * v.speed * std::fabs(v.speed)
-             + TURN_SCRUB * std::fabs(v.yawRate) * std::fabs(v.speed)
+             + LINEAR_DRAG_K * v.speed
+             + TURN_SCRUB * std::fabs(glm::degrees(v.yawRate)) * std::fabs(v.speed)
              + SEA_DRAG_K * seaRough * (0.5f + intoSea) * std::fabs(v.speed);
   float massK = std::max(0.2f, r.weight / WEIGHT_REF);
   v.speed += (thrust - drag) * FORCE_RESPONSE / massK * dt;

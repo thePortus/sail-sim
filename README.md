@@ -64,8 +64,8 @@ node server/scripts/client-release.js keygen
 ```
 
 This creates an Ed25519 key pair in `server/.sparkle/` (already git-ignored, like `.env`) and prints your
-**public key** — a short base64 string. Copy it somewhere; you'll paste it into the client build config when the
-updater is wired in (macOS `Info.plist` `SUPublicEDKey`, Windows `win_sparkle_set_eddsa_public_key`).
+**public key** — a short base64 string. You pass it to the client build via the `SAILSIM_SPARKLE_PUBKEY` CMake
+option (see *Building & releasing* below). The one key signs **both** macOS and Windows.
 
 **2. Two rules — treat the private key like a password, or worse:**
 
@@ -86,8 +86,54 @@ node server/scripts/client-release.js publish \
 ```
 
 That signs the build and writes the update feed the clients poll. See
-[`server/assets/client/README.md`](server/assets/client/README.md) for the full artifact layout and the Windows
-command.
+[`server/assets/client/README.md`](server/assets/client/README.md) for the full artifact layout.
+
+## Building & releasing the desktop client
+
+Each build **bakes in** the update feed URL + your public key from the step above, then you zip it and publish it
+to the server. Build macOS on a Mac, Windows on a Windows machine. Feed URLs must be **HTTPS** in production
+(Sparkle/WinSparkle refuse plain http); the pubkey defaults to the committed dev key, so override it with your
+own.
+
+### macOS (`.app` bundle)
+
+``` sh
+cd native
+cmake -S . -B build-mac -DSAILSIM_MACOS_BUNDLE=ON \
+  -DSAILSIM_SPARKLE_FEED_URL=https://your.server/client/appcast-mac.xml \
+  -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
+cmake --build build-mac
+# → build-mac/bin/sailsim_native.app  (Sparkle.framework already embedded)
+cd build-mac/bin && ditto -c -k --keepParent sailsim_native.app SailSim-<ver>-mac.zip
+```
+
+### Windows (`.exe`) — Visual Studio + CMake
+
+``` sh
+cd native
+cmake -S . -B build-win -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
+cmake --build build-win --config Release
+# → the build output folder (e.g. build-win\bin\Release) holds sailsim_native.exe AND WinSparkle.dll.
+# Zip that whole folder (the .exe + WinSparkle.dll MUST travel together) as SailSim-<ver>-win.zip.
+```
+
+### Where the release files go on the live server
+
+You don't copy them into place by hand — **the publish script does it**. Copy each zip to the machine running
+the Node server, then run (once per platform per release):
+
+``` sh
+node server/scripts/client-release.js publish --platform mac --version <ver> --file SailSim-<ver>-mac.zip --base-url https://your.server/client
+node server/scripts/client-release.js publish --platform win --version <ver> --file SailSim-<ver>-win.zip --base-url https://your.server/client
+```
+
+This writes into **`server/assets/client/`** — served at **`/client`** — the signed zips plus `appcast-mac.xml`
+and `appcast-win.xml` (the feeds the installed clients poll). That folder is git-ignored (built artifacts), so a
+fresh checkout/deploy starts empty and is filled by publishing.
+
+**Docker:** `server/assets/client/` (the releases) and `server/.sparkle/` (your signing key) live inside the
+container. Mount both as **volumes** so they survive container rebuilds — otherwise every redeploy wipes your
+published releases and, critically, your signing key.
 
 # Credits
 

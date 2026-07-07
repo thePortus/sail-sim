@@ -213,31 +213,23 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let shadow = sunShadow(in.worldPos, Ngeom);
     let Lo = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
 
-    // ── Image-based lighting (A1): analytic sky dome from sun elevation (u.sun.y) + daylight
-    //    (dayK). STRICTLY ADDITIVE — the original neutral ambient stays as a floor so nothing gets
-    //    darker than before; we ADD directional sky-hemisphere tint + a Fresnel-weighted specular
-    //    sky reflection on top, so surfaces pick up the sky's hue/direction and wet decks/metal
-    //    reflect the world. Bright grazing reflections exceed 1.0 and bloom (the A0 HDR fix). ──
+    // ── Image-based lighting (A1): analytic sky dome from sun elevation (u.sun.y) + daylight (dayK).
+    //    STRICTLY ADDITIVE diffuse hemisphere irradiance — the original neutral ambient stays as a
+    //    floor (nothing gets darker) and a directional sky tint is added on top, so surfaces pick up
+    //    the sky's hue and direction. Metals get only the floor (× (1-metallic)). There is NO specular
+    //    sky reflection here: an analytic one blew the ship's smooth brass/metalwork out to white
+    //    through the tonemap — proper environment reflection returns with SSR (A2), which is built to
+    //    handle smooth surfaces. ──
     let el = max(u.sun.y, 0.0);
     let envAmp = 0.35 + 0.9 * el;
     let skyZenith = mix(vec3<f32>(0.03, 0.04, 0.07),  vec3<f32>(0.20, 0.40, 0.70), dayK) * envAmp;  // blue up
     let skyHoriz  = mix(vec3<f32>(0.05, 0.055, 0.075), vec3<f32>(0.62, 0.68, 0.78), dayK) * envAmp;  // pale horizon
-
-    // Original neutral ambient floor (unchanged) + a directional sky-hemisphere tint added on top.
     let up = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
     let skyIrr = mix(skyHoriz, skyZenith, up);
     let ambientFloor = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
-    let ambient = ambientFloor + skyIrr * albedo * 0.32;   // additive → never darker than before
+    let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
-    // Specular sky reflection: sample the dome along the reflection vector, roughness-aware
-    // Fresnel (grazing angles reflect most → wet-deck rim sheen; high-F0 metal picks up the sky).
-    let R = reflect(-V, N);
-    let envRefl = mix(skyHoriz, skyZenith, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));
-    let NdotV = max(dot(N, V), 0.0);
-    let Fenv = F0 + (max(vec3<f32>(1.0 - roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
-    let envSpec = envRefl * Fenv * (1.0 - roughness * 0.5) * 1.5;
-
-    let color = ambient + Lo + envSpec;
+    let color = ambient + Lo;
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-

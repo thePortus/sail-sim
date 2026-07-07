@@ -11,8 +11,11 @@ Everything here except this README is **generated** (and git-ignored) — produc
 appcast-mac.xml            # Sparkle feed (macOS)   — SUFeedURL in the .app's Info.plist
 appcast-win.xml            # WinSparkle feed (Windows)
 SailSim-<ver>-mac.zip      # zipped .app bundle (the enclosure)
-SailSim-<ver>-win.zip      # zipped .exe / installer (the enclosure)
+SailSim-<ver>-win.zip      # zipped .exe + WinSparkle.dll (the enclosure)
 ```
+
+> Windows: the zip must contain **`WinSparkle.dll`** alongside `sailsim_native.exe` — the CMake build copies it
+> next to the executable, so zip that whole output folder.
 
 ## One-time setup
 

@@ -18,10 +18,12 @@ project(sailsim_native LANGUAGES C CXX)
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
 set(SAILSIM_VERSION "0.1.0")
 
-# Auto-update config baked into the macOS bundle Info.plist. Override the feed URL for your deployment
-# (Sparkle requires https in production); the public key is printed by `server/scripts/client-release.js keygen`.
-set(SAILSIM_SPARKLE_FEED_URL "https://CHANGEME.example/client/appcast-mac.xml" CACHE STRING "Sparkle appcast feed URL")
-set(SAILSIM_SPARKLE_PUBKEY   "tRLH7wCxtVSWI6d2lwbwliBgNoJGizATw2qG4XQSfvo=" CACHE STRING "Sparkle Ed25519 public key (SUPublicEDKey)")
+# Auto-update config: the per-platform appcast feed URLs (override for your deployment — Sparkle/WinSparkle
+# require https in production) and the shared Ed25519 public key (printed by `client-release.js keygen`; the one
+# key signs BOTH macOS and Windows builds). macOS bakes these into the Info.plist; Windows into compile defs.
+set(SAILSIM_SPARKLE_FEED_URL     "https://CHANGEME.example/client/appcast-mac.xml" CACHE STRING "Sparkle (macOS) appcast feed URL")
+set(SAILSIM_SPARKLE_FEED_URL_WIN "https://CHANGEME.example/client/appcast-win.xml" CACHE STRING "WinSparkle appcast feed URL")
+set(SAILSIM_SPARKLE_PUBKEY       "tRLH7wCxtVSWI6d2lwbwliBgNoJGizATw2qG4XQSfvo=" CACHE STRING "Ed25519 public key (SUPublicEDKey / WinSparkle EdDSA)")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -430,6 +432,33 @@ if (APPLE AND SAILSIM_MACOS_BUNDLE)
     COMMAND ditto "${sparkle_SOURCE_DIR}/Sparkle.framework"
                   "$<TARGET_BUNDLE_CONTENT_DIR:sailsim_native>/Frameworks/Sparkle.framework"
     COMMENT "Embedding Sparkle.framework into the app bundle")
+
+elseif (WIN32)
+  # Windows always ships the updater (the .exe IS the distributable — no bundle concept). WinSparkle 0.9.3+
+  # shares Sparkle's appcast format + Ed25519 signatures, so the same signing key covers both platforms.
+  include(FetchContent)
+  FetchContent_Declare(winsparkle
+    URL https://github.com/vslavik/winsparkle/releases/download/v0.9.3/WinSparkle-0.9.3.zip)
+  FetchContent_MakeAvailable(winsparkle)   # prebuilt DLL/import-lib, no CMakeLists — just populates
+  # The zip carries a versioned top dir; tolerate CMake stripping it or not.
+  set(_ws "${winsparkle_SOURCE_DIR}")
+  if (EXISTS "${_ws}/WinSparkle-0.9.3/include/winsparkle.h")
+    set(_ws "${_ws}/WinSparkle-0.9.3")
+  endif()
+  # Arch subdir in the release zip: x64/Release (default), ARM64/Release, or Release (32-bit x86).
+  set(SAILSIM_WINSPARKLE_ARCHDIR "x64/Release" CACHE STRING "WinSparkle prebuilt arch subdir")
+
+  target_sources(sailsim_native PRIVATE src/updater_win.cpp)
+  target_compile_definitions(sailsim_native PRIVATE SAILSIM_WINSPARKLE=1
+    SAILSIM_SPARKLE_FEED_URL_WIN="${SAILSIM_SPARKLE_FEED_URL_WIN}"
+    SAILSIM_SPARKLE_PUBKEY="${SAILSIM_SPARKLE_PUBKEY}")
+  target_include_directories(sailsim_native PRIVATE "${_ws}/include")
+  target_link_libraries(sailsim_native PRIVATE "${_ws}/${SAILSIM_WINSPARKLE_ARCHDIR}/WinSparkle.lib")
+  add_custom_command(TARGET sailsim_native POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_ws}/${SAILSIM_WINSPARKLE_ARCHDIR}/WinSparkle.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+    COMMENT "Copying WinSparkle.dll next to the executable")
+
 else()
   target_sources(sailsim_native PRIVATE src/updater_stub.cpp)
 endif()

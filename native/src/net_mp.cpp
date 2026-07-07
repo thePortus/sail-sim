@@ -89,6 +89,7 @@ struct Client::Impl {
     r.isPortTack = j.value("isPortTack", false);
     r.anchored   = j.value("anchored", false);
     r.anchorSide = j.value("anchorSide", std::string("S"));
+    r.flagColor  = j.value("flagColor", std::string());
     return r;
   }
 
@@ -143,6 +144,7 @@ struct Client::Impl {
       townSt.capacity = msg.value("capacity", townSt.capacity);
       townSt.ship     = msg.value("ship", townSt.ship);
       townSt.shipName = msg.value("shipName", townSt.shipName);
+      townSt.flagColor = msg.value("flagColor", townSt.flagColor);
       townSt.cannonUpgrade = msg.value("cannonUpgrade", townSt.cannonUpgrade);
       townSt.armorUpgrade  = msg.value("armorUpgrade", townSt.armorUpgrade);
       if (msg.contains("cargo") && msg["cargo"].is_object()) {
@@ -455,6 +457,10 @@ struct Client::Impl {
       std::string sn = jstr(msg, "shipName");
       shipNameReply.name = sn.empty() ? "Saltmeadow" : sn;
       if (shipNameReply.ok) townSt.shipName = shipNameReply.name;
+    } else if (type == "flag_color_set") {
+      // Reply to set_flag_color: adopt the server-sanitised colour for our own flags + the picker.
+      std::string fc = jstr(msg, "flagColor");
+      if (!fc.empty()) townSt.flagColor = fc;
     }
     // squadron_invited needs no special handling: the server also sends a system
     // chat line ("... invited you ... type /squad accept"), which the chat panel
@@ -678,6 +684,18 @@ void Client::questSkip() {
 void Client::setShipName(const std::string& name) {
   if (p_->conn.load() != ConnState::Open) return;
   p_->ws.send(json{{"type", "set_ship_name"}, {"shipName", name}}.dump());
+}
+void Client::setFlagColor(const std::string& hex) {
+  {
+    std::lock_guard<std::mutex> lock(p_->mtx);
+    p_->townSt.flagColor = hex;   // optimistic; the server echoes the sanitised value via flag_color_set
+  }
+  if (p_->conn.load() != ConnState::Open) return;
+  p_->ws.send(json{{"type", "set_flag_color"}, {"flagColor", hex}}.dump());
+}
+std::string Client::myFlagColor() const {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  return p_->townSt.flagColor;
 }
 
 // ── Combat sends + state accessors ────────────────────────────────────────────

@@ -65,6 +65,7 @@ struct RigSubmesh {
   uint32_t indexCount = 0;
   int baseColor = -1, normal = -1, metalRough = -1;   // into textures
   std::string name;                   // owning NODE name (semantic)
+  std::string material;               // glTF material name (e.g. SHIP_FLAG) — flag tint keys off this
   int node = -1;
   bool skinned = false;
 };

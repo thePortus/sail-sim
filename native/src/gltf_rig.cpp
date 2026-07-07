@@ -233,6 +233,7 @@ RiggedData loadGltfRigged(const char* path) {
       sm.indexCount = (uint32_t)out.indices.size() - indexOffset;
       sm.baseColor = baseColorTex; sm.normal = normalTex; sm.metalRough = metalRoughTex;
       sm.name = nd.name ? nd.name : (nd.mesh->name ? nd.mesh->name : "");
+      sm.material = (prim.material && prim.material->name) ? prim.material->name : "";
       sm.node = (int)ni;
       sm.skinned = skinned;
       const int smIndex = (int)out.submeshes.size();
@@ -320,7 +321,7 @@ RiggedData makeRiggedCube() {
   }
   m.indices = cube.indices;
   for (const Submesh& sm : cube.submeshes)
-    m.submeshes.push_back({ sm.indexOffset, sm.indexCount, sm.baseColor, sm.normal, sm.metalRough, sm.name, 0, false });
+    m.submeshes.push_back({ sm.indexOffset, sm.indexCount, sm.baseColor, sm.normal, sm.metalRough, sm.name, std::string(), 0, false });
   m.nodes.push_back({ "root", -1 });
   m.restPalette.assign(1, glm::mat4(1.0f));
   for (int c = 0; c < 3; ++c) { m.bbMin[c] = cube.bbMin[c]; m.bbMax[c] = cube.bbMax[c]; }

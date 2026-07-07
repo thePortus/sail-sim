@@ -216,6 +216,37 @@ static constexpr uint32_t kMaxShipInstances = 128;
 // per-instance MeshUniforms — every vessel instance animates independently.
 static constexpr uint32_t kMaxMorphWeights = 64;
 static constexpr uint32_t kPaletteStride = kMaxPaletteSlots * sizeof(glm::mat4) + kMaxMorphWeights * sizeof(glm::vec4);
+// Custom flag colour: the flag submesh is tagged with this tint slot (subInfo.w bits 0-3), and each vessel
+// instance writes its player-chosen flag colour into pal.w[31 + kFlagTintSlot]. The mesh shader then does
+// albedo = pal.w[slot].rgb * baseTex on that submesh (same path as crew garment tints). Slot 9 -> pal.w[40],
+// clear of the ship morph-weight floats (w[0..15]) and the crew tint slots (w[32..39]). 1,1,1 = untinted.
+static constexpr uint32_t kFlagTintSlot = 9u;
+static const std::string kDefaultFlagColor = "#b22222";
+
+// "#rrggbb" -> linear-ish RGB in [0,1] (matches the client's flat StandardMaterial diffuse). Bad input -> the
+// default crimson so a ship never flies a black flag by accident.
+static glm::vec3 parseFlagColor(const std::string& hex) {
+  auto hx = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  if (hex.size() == 7 && hex[0] == '#') {
+    int r0 = hx(hex[1]), r1 = hx(hex[2]), g0 = hx(hex[3]), g1 = hx(hex[4]), b0 = hx(hex[5]), b1 = hx(hex[6]);
+    if ((r0 | r1 | g0 | g1 | b0 | b1) >= 0)
+      return glm::vec3((r0 * 16 + r1) / 255.0f, (g0 * 16 + g1) / 255.0f, (b0 * 16 + b1) / 255.0f);
+  }
+  return glm::vec3(0.698f, 0.133f, 0.133f);   // #b22222
+}
+
+// Write a vessel instance's flag colour into its palette blob at pal.w[31 + kFlagTintSlot], where the mesh
+// shader reads it for flag-tagged submeshes. `blob` is a kPaletteStride byte slot about to be uploaded.
+static void writeFlagTint(std::vector<uint8_t>& blob, const glm::vec3& color) {
+  const glm::vec4 c(color, 1.0f);
+  const size_t off = (size_t)kMaxPaletteSlots * sizeof(glm::mat4) + (size_t)(31u + kFlagTintSlot) * sizeof(glm::vec4);
+  if (off + sizeof(glm::vec4) <= blob.size()) std::memcpy(blob.data() + off, &c, sizeof(glm::vec4));
+}
 
 struct Mesh {
   WGPURenderPipeline           pipeline;
@@ -497,6 +528,11 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     std::vector<glm::mat4> pal(kMaxPaletteSlots, glm::mat4(1.0f));
     for (size_t i = 0; i < data.restPalette.size() && i < pal.size(); ++i) pal[i] = data.restPalette[i];
     std::memcpy(slot.data(), pal.data(), pal.size() * sizeof(glm::mat4));
+    // Default the flag tint slot to white (untinted) so any flag-tagged submesh whose instance never writes a
+    // colour (e.g. a static town flag) renders from its own texture instead of black.
+    const glm::vec4 noTint(1.0f);
+    std::memcpy(slot.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4) + (size_t)(31u + kFlagTintSlot) * sizeof(glm::vec4),
+                &noTint, sizeof(glm::vec4));
     for (uint32_t i = 0; i < kMaxShipInstances; ++i)
       wgpuQueueWriteBuffer(queue, mesh.paletteBuf, (uint64_t)i * kPaletteStride, slot.data(), kPaletteStride);
   }
@@ -519,6 +555,15 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
         for (const glm::vec3& d : m.dpos) { deltas.push_back(d.x); deltas.push_back(d.y); deltas.push_back(d.z); }
         infos[si].cnt++;
       }
+      // Tag flag/ensign/pennant submeshes with the flag tint slot (subInfo.w bits 0-3) so the shader tints them
+      // by pal.w[31 + kFlagTintSlot] — the per-instance player flag colour (client flag-color.ts parity).
+      // Ships pack the flag as a PRIMITIVE with material SHIP_FLAG inside a merged rigging mesh, so key off the
+      // material name (client flag-color.ts parity); the node name catches the town/fort ensign submeshes.
+      std::string nm = data.submeshes[si].name + " " + data.submeshes[si].material;
+      std::transform(nm.begin(), nm.end(), nm.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+      if (nm.find("flag") != std::string::npos || nm.find("ensign") != std::string::npos ||
+          nm.find("pennant") != std::string::npos || nm.find("burgee") != std::string::npos)
+        infos[si].pad = (infos[si].pad & ~0xFu) | kFlagTintSlot;
     }
     if (deltas.empty()) deltas.assign(3, 0.0f);             // dummy for morph-free meshes
     if (tableData.empty()) tableData.assign(2, 0u);
@@ -3091,6 +3136,8 @@ int main(int argc, char** argv) {
   bool menuTavern = false, menuTrader = false, menuShipwright = false, menuGovernor = false;
   std::future<std::vector<props::VesselRow>> swFuture;   // shipwright catalogue (REST /vessels)
   std::vector<props::VesselRow> swShips; bool swRequested = false;
+  float swFlagPick[3] = { 0.698f, 0.133f, 0.133f };     // shipwright flag-colour picker (RGB)
+  std::string swFlagSynced;                              // townSt.flagColor the picker was last synced from
   // Menu illustrations (the browser client's /images/*.png), lazily loaded from the repo.
   std::map<std::string, std::pair<WGPUTextureView, ImVec2>> menuImgs;
   auto menuImage = [&](const std::string& name) -> std::pair<WGPUTextureView, ImVec2> {
@@ -5500,6 +5547,25 @@ int main(int argc, char** argv) {
               if (ImGui::Button(au, ImVec2(-1, 0))) mpClient.buyUpgrade("armor");
               ImGui::EndDisabled();
               ImGui::Separator();
+              // ── Flag colour (client shipwright parity): pick a colour for this ship's ensign/pennants. ──
+              if (swFlagSynced != ts.flagColor) {          // adopt the server's stored colour when it changes
+                glm::vec3 c = parseFlagColor(ts.flagColor.empty() ? kDefaultFlagColor : ts.flagColor);
+                swFlagPick[0] = c.r; swFlagPick[1] = c.g; swFlagPick[2] = c.b;
+                swFlagSynced = ts.flagColor;
+              }
+              ImGui::Text("Flag colour");
+              ImGui::ColorEdit3("##flagcol", swFlagPick,
+                                ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_PickerHueBar);
+              ImGui::SameLine();
+              if (ImGui::Button("Fly this flag")) {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "#%02x%02x%02x",
+                              (int)std::lround(glm::clamp(swFlagPick[0], 0.0f, 1.0f) * 255.0f),
+                              (int)std::lround(glm::clamp(swFlagPick[1], 0.0f, 1.0f) * 255.0f),
+                              (int)std::lround(glm::clamp(swFlagPick[2], 0.0f, 1.0f) * 255.0f));
+                mpClient.setFlagColor(hex);
+              }
+              ImGui::Separator();
               if (swShips.empty()) {
                 ImGui::TextDisabled("The yard's ledger is being fetched...");
               } else if (ImGui::BeginTable("hulls", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
@@ -7719,6 +7785,7 @@ int main(int argc, char** argv) {
       const auto& mw = ownAnim->morphWeights();
       std::memcpy(blob.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4), mw.data(),
                   std::min(mw.size(), (size_t)kMaxMorphWeights) * sizeof(float));
+      writeFlagTint(blob, parseFlagColor(mpClient.myFlagColor()));
       wgpuQueueWriteBuffer(queue, ownMesh->paletteBuf, 0, blob.data(), kPaletteStride);
     }
     // Remote vessels: one controller each, driven from the broadcast rig state
@@ -7787,6 +7854,7 @@ int main(int argc, char** argv) {
         const auto& rmw = ctl->morphWeights();
         std::memcpy(blob.data() + (size_t)kMaxPaletteSlots * sizeof(glm::mat4), rmw.data(),
                     std::min(rmw.size(), (size_t)kMaxMorphWeights) * sizeof(float));
+        writeFlagTint(blob, parseFlagColor(si.rp.flagColor));
         wgpuQueueWriteBuffer(queue, si.mesh->paletteBuf, (uint64_t)idx * kPaletteStride, blob.data(), kPaletteStride);
       }
       // Prune controllers for ships gone / swapped to impostors (they re-create

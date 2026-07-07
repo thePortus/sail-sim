@@ -29,6 +29,7 @@ struct RemotePlayer {
   double arrivedMs = 0;      // steady-clock receipt time of that update (ms)
   bool isPortTack = false, anchored = false;
   std::string anchorSide = "S";
+  std::string flagColor;     // "#rrggbb" player flag colour (empty -> default crimson at render)
 };
 
 // Minimap intel (npc.js broadcasts): lane hotspots for everyone; the full
@@ -160,6 +161,7 @@ struct TownState {
   std::map<std::string, std::string> catalog;   // goodId -> display name
   std::map<std::string, float> factionRep;      // faction id -> standing
   std::string ship, shipName;
+  std::string flagColor = "#b22222";            // our own flag colour (wallet + shipwright picker)
   bool cannonUpgrade = false, armorUpgrade = false;
   int crew = 0, maxCrew = 0;
   std::string hintTownId;                       // market demand hint target (map SELL-HERE beacon)
@@ -259,6 +261,8 @@ public:
   void questAck(const std::string& objectiveId);           // confirm a client_ack objective
   void questSkip();                                        // skip the whole intro arc
   void setShipName(const std::string& name);               // name/rename our vessel
+  void setFlagColor(const std::string& hex);               // shipwright: pick the flag colour ("#rrggbb")
+  std::string myFlagColor() const;                         // our own flag colour (wallet/flag_color_set)
 
   // ── Combat (phase 0 plumbing; consumers land per COMBAT_PLAN.md phases) ──
   // Fire one gun/pellet. The server validates origin (16 m), velocity band per

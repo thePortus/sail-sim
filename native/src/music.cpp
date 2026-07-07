@@ -18,6 +18,7 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include "asset_cache.hpp"
 
 namespace music {
 namespace {
@@ -205,22 +206,22 @@ void Manager::init(const std::string& host, int port, audio::System* audio,
   impl->fetchJob = std::async(std::launch::async, [this, host, port] {
     httplib::Client cli(host, port);
     cli.set_read_timeout(20, 0);
-    auto res = cli.Get("/music");
-    if (!res || res->status != 200) {
+    auto res = assetcache::get(cli, "/music");
+    if (!res.ok) {
       std::fprintf(stderr, "[music] could not fetch track list\n");
       return false;
     }
     try {
-      for (const auto& j : nlohmann::json::parse(res->body)) {
+      for (const auto& j : nlohmann::json::parse(res.bytes)) {
         impl->fetchedTracks.push_back({ j.value("filename", ""), j.value("name", "") });
       }
     } catch (...) { return false; }
     // Preload + parse every MIDI file (client midiCache prefill).
     for (const Track& t : impl->fetchedTracks) {
-      auto f = cli.Get("/music/" + t.filename);
-      if (!f || f->status != 200) continue;
+      auto f = assetcache::get(cli, "/music/" + t.filename);
+      if (!f.ok) continue;
       audio::MusicProgram prog;
-      if (buildProgram(f->body, prog)) impl->fetchedCache[t.filename] = std::move(prog);
+      if (buildProgram(f.bytes, prog)) impl->fetchedCache[t.filename] = std::move(prog);
       else std::fprintf(stderr, "[music] failed to parse %s\n", t.filename.c_str());
     }
     return !impl->fetchedCache.empty();

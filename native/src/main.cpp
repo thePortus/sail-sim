@@ -59,6 +59,7 @@
 #include "net_admin.hpp"
 #include "net_auth.hpp"
 #include "net_mp.hpp"
+#include "asset_cache.hpp"
 #include "combat.hpp"
 #include "combat_constants.hpp"
 #include "cannon.hpp"
@@ -807,17 +808,75 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   return mesh;
 }
 
+// Vessel slug -> GLB path (mirrors server/controllers/vessels.controller.js). The ship GLBs sit beside the
+// baked SAILSIM_SHIP_MODEL (…/server/assets/geometry/).
+static std::string geometryDir() {
+  std::string m = SAILSIM_SHIP_MODEL;
+  size_t slash = m.find_last_of('/');
+  return slash == std::string::npos ? std::string(".") : m.substr(0, slash);
+}
+// Server the client streams assets from (set once at startup from kHost/kPort). Every GLB / manifest /
+// texture is resolved through the ETag disk cache (assetcache), falling back to the bundled geometryDir copy
+// when the server is unreachable — so dev keeps working offline while a real Mac/Windows client streams+stores.
+static std::string g_assetHost = "localhost";
+static int         g_assetPort = 9080;
+// Resolve a geometry asset (path relative to /geometry, e.g. "brig.glb" or "harbors/dwelling.glb") to a local
+// file: fetch-through-cache, else the bundled copy. Path-based loaders (glTF/JSON readers) read the result.
+static std::string geomAsset(const std::string& rel) {
+  return assetcache::localPath(g_assetHost, g_assetPort, "/geometry/" + rel, geometryDir() + "/" + rel);
+}
+static std::string glbFileForSlug(const std::string& slug) {
+  return slug == "sloop"       ? "bermuda_sloop_rigged.glb" :
+         slug == "brig"        ? "brig.glb" :
+         slug == "merchantman" ? "merchantman.glb" :
+         slug == "pinnace"     ? "pinnace.glb" :
+                                 "pinnace.glb";   // starter hull is the safe fallback
+}
+static std::string glbForSlug(const std::string& slug) {
+  return geometryDir() + "/" + glbFileForSlug(slug);
+}
+
+// Release every GPU resource a streamed Mesh owns (same set the shutdown path frees, plus the morph/palette
+// buffers). Used by the live /reloadassets rebuild to drop the old hull/prop before it re-streams. Dawn keeps
+// each handle alive until in-flight GPU work finishes, so releasing at frame top (after the last submit) is safe.
+static void releaseMesh(Mesh& m) {
+  if (m.pipeline)        wgpuRenderPipelineRelease(m.pipeline);
+  if (m.shadowPipeline)  wgpuRenderPipelineRelease(m.shadowPipeline);
+  for (WGPUBindGroup bg : m.bindGroups) if (bg) wgpuBindGroupRelease(bg);
+  if (m.stencilBind)     wgpuBindGroupRelease(m.stencilBind);
+  for (WGPUTextureView v : m.views) if (v) wgpuTextureViewRelease(v);
+  for (WGPUTexture t : m.textures) if (t) wgpuTextureRelease(t);
+  if (m.sampler)         wgpuSamplerRelease(m.sampler);
+  if (m.vbuf)            wgpuBufferRelease(m.vbuf);
+  if (m.ibuf)            wgpuBufferRelease(m.ibuf);
+  if (m.uniformBuf)      wgpuBufferRelease(m.uniformBuf);
+  if (m.paletteBuf)      wgpuBufferRelease(m.paletteBuf);
+  if (m.morphDeltaBuf)   wgpuBufferRelease(m.morphDeltaBuf);
+  if (m.morphTableBuf)   wgpuBufferRelease(m.morphTableBuf);
+  if (m.submeshInfoBuf)  wgpuBufferRelease(m.submeshInfoBuf);
+  if (m.module)          wgpuShaderModuleRelease(m.module);
+}
+
 // Load a vessel GLB and derive its on-water placement from the per-vessel spec:
 // scale to the hull's real length (so vessels differ in size), the keel origin
 // (X/Z centred, lowest point to y=0), a beam-based draught, and the bow-yaw that
 // aligns the model's authored forward axis with +Z travel. Falls back to a cube.
 static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt,
                        const std::string& path, const std::string& slug) {
-  RiggedData data = loadGltfRigged(path.c_str());
-  if (!data.ok) data = makeRiggedCube();
-  std::string manifestPath = path;
+  // A standard geometry GLB streams through the ETag cache (so an edited hull re-downloads on /reloadassets);
+  // an arbitrary CLI/env model override (path outside geometryDir) just loads from disk. The companion
+  // .manifest.json is resolved the same way so it sits beside the GLB the rig controller will read.
+  std::string glbPath = path, manifestPath = path;
   if (manifestPath.size() > 4 && manifestPath.substr(manifestPath.size() - 4) == ".glb")
     manifestPath = manifestPath.substr(0, manifestPath.size() - 4) + ".manifest.json";
+  if (path.rfind(geometryDir() + "/", 0) == 0) {
+    std::string rel = path.substr(geometryDir().size() + 1);                     // e.g. "brig.glb"
+    std::string manRel = rel.substr(0, rel.size() - 4) + ".manifest.json";
+    glbPath = geomAsset(rel);
+    manifestPath = geomAsset(manRel);
+  }
+  RiggedData data = loadGltfRigged(glbPath.c_str());
+  if (!data.ok) data = makeRiggedCube();
   glm::vec3 bbMin(data.bbMin[0], data.bbMin[1], data.bbMin[2]);
   glm::vec3 bbMax(data.bbMax[0], data.bbMax[1], data.bbMax[2]);
   glm::vec3 center = 0.5f * (bbMin + bbMax);
@@ -899,21 +958,6 @@ static float deckLocalHeight(const Mesh& m, float lx, float lz, float footY) {
 
 // Vessel slug -> GLB path (mirrors server/controllers/vessels.controller.js). The
 // ship GLBs sit beside the baked SAILSIM_SHIP_MODEL (…/server/assets/geometry/).
-static std::string geometryDir() {
-  std::string m = SAILSIM_SHIP_MODEL;
-  size_t slash = m.find_last_of('/');
-  return slash == std::string::npos ? std::string(".") : m.substr(0, slash);
-}
-static std::string glbForSlug(const std::string& slug) {
-  std::string file =
-      slug == "sloop"       ? "bermuda_sloop_rigged.glb" :
-      slug == "brig"        ? "brig.glb" :
-      slug == "merchantman" ? "merchantman.glb" :
-      slug == "pinnace"     ? "pinnace.glb" :
-                              "pinnace.glb";   // starter hull is the safe fallback
-  return geometryDir() + "/" + file;
-}
-
 // Ocean camera uniform (shared by the ocean surface).
 struct OceanCamera {
   glm::mat4 viewProj;
@@ -3118,7 +3162,7 @@ int main(int argc, char** argv) {
   auto townMeshFor = [&](const std::string& file) -> Mesh* {
     auto it = townMeshes.find(file);
     if (it != townMeshes.end()) return it->second.vbuf ? &it->second : nullptr;
-    std::string path = geometryDir() + "/harbors/" + file;
+    std::string path = geomAsset("harbors/" + file);   // ETag cache (normalises ../forts/…), local fallback
     RiggedData md = loadGltfRigged(path.c_str());
     if (!md.ok) { townMeshes.emplace(file, Mesh{}); return nullptr; }   // cache the failure
     Mesh m = createMesh(device, queue, kSceneFormat, std::move(md));
@@ -3600,6 +3644,7 @@ int main(int argc, char** argv) {
   AppState appState = AppState::Login;
   const std::string kHost = "localhost";
   const int         kPort = 9080;
+  g_assetHost = kHost; g_assetPort = kPort;   // asset streaming target for the disk cache (geomAsset/assetcache)
   char uiUser[64] = "", uiPass[64] = "", uiCallsign[64] = "";
   bool uiRegisterMode = false, uiRemember = false;
   std::string uiError, authToken, authCallsign, authUsername, authRole;
@@ -6382,6 +6427,22 @@ int main(int argc, char** argv) {
         sentProfPref = true;
       }
     }
+    // ── Admin /reloadassets (server broadcast): wipe the on-disk asset cache and rebuild the streamed meshes
+    //    live, so edited GLBs re-stream without a relaunch (client parity). Runs before any mesh is fetched
+    //    this frame; the lazy loaders (vesselFor/townMeshFor) then re-create from the fresh, cache-busted GLBs.
+    if (uint64_t rv = mpClient.consumeAssetReload()) {
+      assetcache::setVersion(rv);
+      assetcache::invalidateAll();
+      for (auto& kv : vessels) releaseMesh(kv.second);
+      vessels.clear();
+      for (auto& kv : townMeshes) if (kv.second.vbuf) releaseMesh(kv.second);
+      townMeshes.clear();
+      // Controllers hold shared rig pointers into the freed meshes — drop them so they rebuild next frame.
+      ownAnim.reset(); ownAnimSlug.clear();
+      remoteAnims.clear(); remoteAnimSlugs.clear();
+      std::printf("[cache] /reloadassets v%llu applied: meshes rebuilding from fresh GLBs\n",
+                  (unsigned long long)rv);
+    }
     // Sailing input + ported force physics. A/D (or arrows) = helm; W/S = raise /
     // lower sail (furled -> half -> full); P = drop/weigh anchor. While MOORED at
     // a town the boat is pinned to the berth (no input, no drift) until cast off.
@@ -7952,7 +8013,7 @@ int main(int argc, char** argv) {
     if (crewEnabled && sailing && ownMesh) {
       if (!crewTried) {
         crewTried = true;
-        std::string cpath = geometryDir() + "/crew_spike.glb";
+        std::string cpath = geomAsset("crew_spike.glb");
         RiggedData crd = loadGltfRigged(cpath.c_str());
         if (crd.ok) {
           crewMesh = std::make_unique<Mesh>(createMesh(device, queue, kSceneFormat, std::move(crd)));
@@ -8007,7 +8068,7 @@ int main(int argc, char** argv) {
           crewInner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
           crewInner = glm::scale(crewInner, glm::vec3(ownMesh->shipScale));
           crewInner = glm::translate(crewInner, -ownMesh->keelCenter);
-          const std::string layoutPath = geometryDir() + "/crew_stations." + ownVesselSlug + ".json";
+          const std::string layoutPath = geomAsset("crew_stations." + ownVesselSlug + ".json");
           const uint32_t seed = 0xC4E0u ^ (uint32_t)std::hash<std::string>{}(ownVesselSlug);
           auto d = std::make_unique<crew::Deck>(crewMesh->rig, layoutPath, seed, want,
                                                 crewInner, ownMesh->deckTris, ownMesh->bowYaw, 1.2f);
@@ -8046,7 +8107,7 @@ int main(int argc, char** argv) {
           const glm::mat4 rin = innerFor(*si.mesh);
           auto& d = remoteCrewDecks[si.rp.id];
           if (!d || remoteCrewSlugs[si.rp.id] != slug) {
-            const std::string lp = geometryDir() + "/crew_stations." + slug + ".json";
+            const std::string lp = geomAsset("crew_stations." + slug + ".json");
             d = std::make_unique<crew::Deck>(crewMesh->rig, lp, (uint32_t)std::hash<std::string>{}(si.rp.id),
                                              countFor(slug), rin, si.mesh->deckTris, si.mesh->bowYaw, 1.2f);
             remoteCrewSlugs[si.rp.id] = slug;

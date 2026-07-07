@@ -4,21 +4,22 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include "asset_cache.hpp"    // ETag disk cache (stream once, revalidate on later loads)
 #include "stb_image.h"        // implementation lives in stb_impl.cpp
 
 namespace props {
 
 static Image fetchImage(httplib::Client& cli, const std::string& path) {
   Image out;
-  auto res = cli.Get(path.c_str());
-  if (!res || res->status != 200) {
-    std::printf("[props] fetch %s failed (%d)\n", path.c_str(), res ? res->status : 0);
+  auto res = assetcache::get(cli, path);
+  if (!res.ok) {
+    std::printf("[props] fetch %s failed\n", path.c_str());
     return out;
   }
   int w = 0, h = 0, comp = 0;
   unsigned char* pix = stbi_load_from_memory(
-      reinterpret_cast<const unsigned char*>(res->body.data()),
-      (int)res->body.size(), &w, &h, &comp, 4);
+      reinterpret_cast<const unsigned char*>(res.bytes.data()),
+      (int)res.bytes.size(), &w, &h, &comp, 4);
   if (!pix) {
     std::printf("[props] decode %s failed: %s\n", path.c_str(), stbi_failure_reason());
     return out;
@@ -49,9 +50,9 @@ Set fetchAll(const std::string& host, int port) {
   bool all = true;
 
   // ── Ship impostor atlases ──
-  if (auto res = cli.Get("/geometry/ship_impostors/ship_impostors_manifest.json");
-      res && res->status == 200) {
-    auto j = nlohmann::json::parse(res->body, nullptr, false);
+  if (auto res = assetcache::get(cli, "/geometry/ship_impostors/ship_impostors_manifest.json");
+      res.ok) {
+    auto j = nlohmann::json::parse(res.bytes, nullptr, false);
     if (!j.is_discarded() && j.contains("ships")) {
       auto num = [](const nlohmann::json& o, const char* k, float dflt) -> float {
         auto it = o.find(k);
@@ -69,9 +70,9 @@ Set fetchAll(const std::string& host, int port) {
   } else { all = false; }
 
   // ── Town building impostors ──
-  if (auto res = cli.Get("/geometry/harbors/impostors/impostors_manifest.json");
-      res && res->status == 200) {
-    auto j = nlohmann::json::parse(res->body, nullptr, false);
+  if (auto res = assetcache::get(cli, "/geometry/harbors/impostors/impostors_manifest.json");
+      res.ok) {
+    auto j = nlohmann::json::parse(res.bytes, nullptr, false);
     if (!j.is_discarded() && j.contains("buildings")) {
       auto num = [](const nlohmann::json& o, const char* k, float dflt) -> float {
         auto it = o.find(k);

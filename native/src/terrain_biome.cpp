@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include <httplib.h>          // header-only; plain HTTP (dev server is http://localhost:9080)
+#include "asset_cache.hpp"    // ETag disk cache (stream once, revalidate on later loads)
 #include "stb_image.h"        // decode; implementation lives in stb_impl.cpp
 #include "stb_image_resize2.h"
 
@@ -13,15 +14,15 @@ namespace biome {
 // would bend the vectors).
 static Image fetchOne(httplib::Client& cli, const std::string& path, int maxW, bool srgb) {
   Image out;
-  auto res = cli.Get(path.c_str());
-  if (!res || res->status != 200) {
-    std::printf("[biome] fetch %s failed (%d)\n", path.c_str(), res ? res->status : 0);
+  auto res = assetcache::get(cli, path);
+  if (!res.ok) {
+    std::printf("[biome] fetch %s failed\n", path.c_str());
     return out;
   }
   int w = 0, h = 0, comp = 0;
   unsigned char* pix = stbi_load_from_memory(
-      reinterpret_cast<const unsigned char*>(res->body.data()),
-      (int)res->body.size(), &w, &h, &comp, 4);   // force RGBA
+      reinterpret_cast<const unsigned char*>(res.bytes.data()),
+      (int)res.bytes.size(), &w, &h, &comp, 4);   // force RGBA
   if (!pix) {
     std::printf("[biome] decode %s failed: %s\n", path.c_str(), stbi_failure_reason());
     return out;

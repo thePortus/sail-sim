@@ -7,6 +7,8 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "asset_cache.hpp"
+
 using json = nlohmann::json;
 
 namespace terrain {
@@ -16,13 +18,13 @@ bool Terrain::load(const std::string& host, int port) {
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(15, 0);
 
-  // ── Manifest ──
-  auto mres = cli.Get("/terrain/manifest");
-  if (!mres || mres->status != 200) {
-    std::printf("[terrain] manifest fetch failed (%d)\n", mres ? mres->status : 0);
+  // ── Manifest (through the ETag disk cache) ──
+  auto mres = assetcache::get(cli, "/terrain/manifest");
+  if (!mres.ok) {
+    std::printf("[terrain] manifest fetch failed\n");
     return false;
   }
-  json j = json::parse(mres->body, nullptr, false);
+  json j = json::parse(mres.bytes, nullptr, false);
   if (j.is_discarded() || !j.is_object()) { std::printf("[terrain] manifest parse failed\n"); return false; }
 
   m_.width       = j.value("width", 0);
@@ -135,12 +137,12 @@ bool Terrain::load(const std::string& host, int port) {
   for (int cz = 0; cz < m_.chunkCountZ; ++cz) {
     for (int cx = 0; cx < m_.chunkCountX; ++cx) {
       std::string path = "/terrain/chunk/" + std::to_string(cz) + "/" + std::to_string(cx);
-      auto cres = cli.Get(path.c_str());
-      if (!cres || cres->status != 200) {
-        std::printf("[terrain] chunk %d/%d fetch failed (%d)\n", cz, cx, cres ? cres->status : 0);
+      auto cres = assetcache::get(cli, path);
+      if (!cres.ok) {
+        std::printf("[terrain] chunk %d/%d fetch failed\n", cz, cx);
         return false;
       }
-      const std::string& body = cres->body;
+      const std::string& body = cres.bytes;
       const int x0 = cx * cs, z0 = cz * cs;
       const int cw = std::min(cs, m_.width - x0);
       const int ch = std::min(cs, m_.height - z0);

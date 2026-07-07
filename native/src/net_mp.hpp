@@ -255,6 +255,7 @@ public:
   QuestUpdate quest() const;                   // current active quest (active=false => none)
   QuestNarrative consumeQuestNarrative();      // a stage's closing story beat (once)
   int  consumeQuestReward();                   // silent stage gold for a toast (-1 = none)
+  uint64_t consumeAssetReload();               // /reloadassets cache-bust version to apply (0 = none pending)
   RenamePrompt consumeRenamePrompt();          // server invited a ship rename (after intro)
   std::string myShipName() const;              // our own custom ship name
   ShipNameReply consumeShipNameReply();        // reply to setShipName (ok / profanity-rejected)

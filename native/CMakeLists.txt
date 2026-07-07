@@ -328,6 +328,7 @@ add_executable(sailsim_native
   src/net_admin.cpp
   src/net_auth.cpp
   src/net_mp.cpp
+  src/asset_cache.cpp
   src/session.cpp
   src/props_assets.cpp
   src/scatter.cpp

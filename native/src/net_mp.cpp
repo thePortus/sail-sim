@@ -47,6 +47,7 @@ struct Client::Impl {
   int questReward = -1;          // silent stage gold for a toast (-1 = none pending)
   RenamePrompt renamePrompt;     // server invited a ship rename (consume-once)
   ShipNameReply shipNameReply;   // reply to a setShipName (consume-once)
+  uint64_t assetReloadVer = 0;   // /reloadassets cache-bust version to apply (0 = none pending; consume-once)
 
   // Null-safe string read: the quest payload sends nullable fields (e.g. an
   // objective's `image: o.image || null`), and json::value(key, "") THROWS on a
@@ -461,6 +462,11 @@ struct Client::Impl {
       // Reply to set_flag_color: adopt the server-sanitised colour for our own flags + the picker.
       std::string fc = jstr(msg, "flagColor");
       if (!fc.empty()) townSt.flagColor = fc;
+    } else if (type == "reload_assets") {
+      // Admin /reloadassets broadcast (server multiplayer.js): a cache-bust version. The main loop consumes
+      // it, invalidates the on-disk asset cache, and live-rebuilds the vessels from the freshly-fetched GLBs.
+      assetReloadVer = (uint64_t)msg.value("version", 0.0);
+      if (assetReloadVer == 0) assetReloadVer = 1;   // ensure a non-zero "pending" marker even if version was 0
     }
     // squadron_invited needs no special handling: the server also sends a system
     // chat line ("... invited you ... type /squad accept"), which the chat panel
@@ -656,6 +662,12 @@ int Client::consumeQuestReward() {
   int g = p_->questReward;
   p_->questReward = -1;
   return g;
+}
+uint64_t Client::consumeAssetReload() {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  uint64_t v = p_->assetReloadVer;
+  p_->assetReloadVer = 0;
+  return v;
 }
 RenamePrompt Client::consumeRenamePrompt() {
   std::lock_guard<std::mutex> lock(p_->mtx);

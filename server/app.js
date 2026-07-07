@@ -51,6 +51,17 @@ app.use('/geometry', express.static(path.join(__dirname, 'assets/geometry'), {
     if (filePath.endsWith('.ktx2')) res.setHeader('Content-Type', 'image/ktx2');
   },
 }));
+// Auto-updater feed + binaries (Sparkle on macOS, WinSparkle on Windows). The appcast XML must be revalidated
+// on every update check (no-cache + ETag → 304 when unchanged), while the versioned build artifacts carry
+// unique filenames so they can be cached hard. Populated by server/scripts/client-release.js.
+app.use('/client', express.static(path.join(__dirname, 'assets/client'), {
+  etag: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.xml')) res.setHeader('Cache-Control', 'no-cache');
+    else res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  },
+}));
+
 // set API routes
 require('./routes/index')(app);
 

@@ -13,6 +13,19 @@ certbot/
 .env.*
 !.env.example
 
+# Sparkle/WinSparkle update-signing key. The Ed25519 PRIVATE key must never be committed — back it up
+# securely; losing it breaks auto-updates for every installed client. The public key is safe (it ships in the
+# client build), but the whole dir is ignored for simplicity.
+server/.sparkle/
+
+# Built client release artifacts served at /client (large binaries + the generated appcast feeds, produced by
+# server/scripts/client-release.js). The dir scaffolding (README) is tracked; the outputs are not.
+server/assets/client/*.zip
+server/assets/client/*.dmg
+server/assets/client/*.exe
+server/assets/client/*.tar.gz
+server/assets/client/appcast-*.xml
+
 # generated terrain files
 server/assets/terrain/
 server/assets/geometry/terrain/biome/

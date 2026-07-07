@@ -214,7 +214,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let Lo = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
 
     let ambient = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
-    var color = ambient + Lo;
-    color = color / (color + vec3<f32>(1.0));       // Reinhard tonemap (sRGB target does gamma)
+    let color = ambient + Lo;
+    // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
+    // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
+    // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-
+    // tonemapped (flat) and never reached the bloom bright-pass; leaving them linear fixes both.
     return vec4<f32>(color, 1.0);
 }

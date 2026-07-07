@@ -3,11 +3,13 @@
 // derived from screen-space derivatives (no TANGENT attribute needed).
 
 struct Uniforms {
-    mvp   : mat4x4<f32>,
-    model : mat4x4<f32>,
-    eye   : vec4<f32>,      // world-space camera position (xyz)
-    sun   : vec4<f32>,      // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
-    misc  : vec4<f32>,      // x = hull-local mask floor Y (used by the stencil stamp, not here)
+    mvp    : mat4x4<f32>,
+    model  : mat4x4<f32>,
+    eye    : vec4<f32>,     // world-space camera position (xyz)
+    sun    : vec4<f32>,     // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
+    misc   : vec4<f32>,     // x = hull-local mask floor Y (used by the stencil stamp, not here)
+    mvpCur : mat4x4<f32>,   // UNJITTERED current-frame clip (this ship) — TAA velocity only
+    mvpPrev: mat4x4<f32>,   // UNJITTERED previous-frame clip (this ship's prev model) — TAA velocity only
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
@@ -125,6 +127,35 @@ fn vs_main(@builtin(vertex_index) vid : u32,
     out.mr       = inMR;
     out.uv       = inUV;
     return out;
+}
+
+// ── TAA motion vectors: re-draw the ship into the velocity buffer with its previous-frame model,
+//    outputting per-pixel screen-UV motion so the TAA resolve reprojects the moving ship correctly
+//    (camera-only depth reprojection can't — that's what ghosts the sails). Skinned identically to
+//    vs_main so depths match the main pass (depth-test LessEqual, no write → only visible surface). ──
+struct VelOut {
+    @builtin(position) position : vec4<f32>,
+    @location(0)       curClip  : vec4<f32>,
+    @location(1)       prevClip : vec4<f32>,
+};
+@vertex
+fn vs_velocity(@builtin(vertex_index) vid : u32,
+              @location(0) inPos     : vec3<f32>,
+              @location(5) inJoints  : vec4<f32>,
+              @location(6) inWeights : vec4<f32>) -> VelOut {
+    let lp = skinLocal(vid, inPos, inJoints, inWeights);
+    var o : VelOut;
+    o.position = u.mvp * lp;        // JITTERED clip — matches the main pass so the depth test lines up
+    o.curClip  = u.mvpCur * lp;     // unjittered current
+    o.prevClip = u.mvpPrev * lp;    // unjittered previous (this ship's previous-frame model)
+    return o;
+}
+@fragment
+fn fs_velocity(in : VelOut) -> @location(0) vec4<f32> {
+    let cur  = in.curClip.xy / in.curClip.w;
+    let prev = in.prevClip.xy / in.prevClip.w;
+    let velUV = (cur - prev) * vec2<f32>(0.5, -0.5);   // NDC delta → screen-UV delta (y flipped)
+    return vec4<f32>(velUV, 0.0, 1.0);
 }
 
 const PI : f32 = 3.14159265359;

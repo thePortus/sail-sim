@@ -21,6 +21,7 @@ struct TaaU {
 @group(0) @binding(2) var linSamp  : sampler;
 @group(0) @binding(3) var depthTex : texture_depth_2d;  // this frame scene depth (render res)
 @group(0) @binding(4) var histTex  : texture_2d<f32>;   // previous frame's TAA output
+@group(0) @binding(5) var velTex   : texture_2d<f32>;   // ship motion vectors (screen-UV); sentinel elsewhere
 
 struct VSOut { @builtin(position) position : vec4<f32>, @location(0) uv : vec2<f32> };
 
@@ -42,16 +43,22 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   let res = vec2<i32>(i32(1.0 / u.texel.x + 0.5), i32(1.0 / u.texel.y + 0.5));
   let pix = clamp(vec2<i32>(i32(uv.x * f32(res.x)), i32(uv.y * f32(res.y))), vec2<i32>(0), res - vec2<i32>(1));
-  let d = textureLoad(depthTex, pix, 0);
-
-  // Reconstruct world position, reproject into the previous frame.
-  let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
-  let wH = u.invVP * ndc;
-  let world = wH.xyz / wH.w;
-  let pc = u.prevVP * vec4<f32>(world, 1.0);
-  if (pc.w <= 0.0) { return vec4<f32>(cur, 1.0); }
-  let pndc = pc.xy / pc.w;
-  let puv = vec2<f32>(pndc.x * 0.5 + 0.5, 0.5 - pndc.y * 0.5);
+  // Reproject into the previous frame. Prefer a per-object motion vector (the ship writes one; the
+  // rest of the screen is the sentinel ~99), which tracks the MOVING ship correctly. Where there's no
+  // motion vector, fall back to camera-motion reprojection reconstructed from depth.
+  let mv = textureLoad(velTex, pix, 0).xy;
+  var puv : vec2<f32>;
+  if (abs(mv.x) < 10.0 && abs(mv.y) < 10.0) {
+    puv = uv - mv;
+  } else {
+    let d = textureLoad(depthTex, pix, 0);
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    let wH = u.invVP * ndc;
+    let world = wH.xyz / wH.w;
+    let pc = u.prevVP * vec4<f32>(world, 1.0);
+    if (pc.w <= 0.0) { return vec4<f32>(cur, 1.0); }
+    puv = vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+  }
   if (puv.x < 0.0 || puv.x > 1.0 || puv.y < 0.0 || puv.y > 1.0) { return vec4<f32>(cur, 1.0); }
 
   var hist = textureSampleLevel(histTex, linSamp, puv, 0.0).rgb;

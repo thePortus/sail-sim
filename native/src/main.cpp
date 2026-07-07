@@ -206,6 +206,8 @@ struct MeshUniforms {
   glm::vec4 eye;
   glm::vec4 sun;    // xyz = light dir (sun by day, moon by night); w = daylight [0..1]
   glm::vec4 misc;   // x = hull-local mask floor Y (stencil clamp; big negative = whole hull)
+  glm::mat4 mvpCur{1.0f};   // UNJITTERED current clip (TAA velocity; only the player ship fills it)
+  glm::mat4 mvpPrev{1.0f};  // UNJITTERED previous clip (prev model) for TAA velocity
 };
 
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
@@ -256,6 +258,7 @@ static void writeFlagTint(std::vector<uint8_t>& blob, const glm::vec3& color) {
 struct Mesh {
   WGPURenderPipeline           pipeline;
   WGPURenderPipeline           shadowPipeline = nullptr;   // vs_shadow, depth-only cascade draw
+  WGPURenderPipeline           velocityPipeline = nullptr; // vs_velocity, motion vectors into the TAA velocity buffer
   WGPUBuffer                   vbuf, ibuf, uniformBuf;
   WGPUBuffer                   paletteBuf;   // per-instance palette+morph slots (kPaletteStride each)
   WGPUBuffer                   morphDeltaBuf, morphTableBuf, submeshInfoBuf;   // static morph data
@@ -716,6 +719,37 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     wgpuPipelineLayoutRelease(spl);
   }
 
+  // TAA velocity pipeline: vs_velocity/fs_velocity re-draw the ship (identical skin) into the
+  // velocity buffer, depth-tested LessEqual with NO write, so only the visible surface writes motion
+  // vectors. Group0 only (uniform+palette+morph); RGBA16F target.
+  {
+    WGPUPipelineLayoutDescriptor vpld = {};
+    vpld.bindGroupLayoutCount = 1; vpld.bindGroupLayouts = &bgl;
+    WGPUPipelineLayout vpl = wgpuDeviceCreatePipelineLayout(device, &vpld);
+    WGPUDepthStencilState vds = {};
+    vds.format = kDepthFormat;
+    vds.depthWriteEnabled = false;
+    vds.depthCompare = WGPUCompareFunction_LessEqual;
+    vds.stencilFront.compare = WGPUCompareFunction_Always;
+    vds.stencilBack.compare = WGPUCompareFunction_Always;
+    vds.stencilReadMask = 0xFFFFFFFFu; vds.stencilWriteMask = 0xFFFFFFFFu;
+    WGPUColorTargetState vtarget = {}; vtarget.format = kSceneFormat; vtarget.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState vfrag = {}; vfrag.module = mesh.module; vfrag.entryPoint = "fs_velocity";
+    vfrag.targetCount = 1; vfrag.targets = &vtarget;
+    WGPURenderPipelineDescriptor vrpd = {};
+    vrpd.layout = vpl;
+    vrpd.vertex.module = mesh.module; vrpd.vertex.entryPoint = "vs_velocity";
+    vrpd.vertex.bufferCount = 1; vrpd.vertex.buffers = &vbl;
+    vrpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    vrpd.primitive.frontFace = WGPUFrontFace_CCW;
+    vrpd.primitive.cullMode = WGPUCullMode_None;
+    vrpd.depthStencil = &vds;
+    vrpd.multisample.count = 1; vrpd.multisample.mask = 0xFFFFFFFFu;
+    vrpd.fragment = &vfrag;
+    mesh.velocityPipeline = wgpuDeviceCreateRenderPipeline(device, &vrpd);
+    wgpuPipelineLayoutRelease(vpl);
+  }
+
   // linear, repeating sampler
   WGPUSamplerDescriptor sd = {};
   sd.addressModeU = WGPUAddressMode_Repeat;
@@ -846,6 +880,7 @@ static std::string glbForSlug(const std::string& slug) {
 static void releaseMesh(Mesh& m) {
   if (m.pipeline)        wgpuRenderPipelineRelease(m.pipeline);
   if (m.shadowPipeline)  wgpuRenderPipelineRelease(m.shadowPipeline);
+  if (m.velocityPipeline) wgpuRenderPipelineRelease(m.velocityPipeline);
   for (WGPUBindGroup bg : m.bindGroups) if (bg) wgpuBindGroupRelease(bg);
   if (m.stencilBind)     wgpuBindGroupRelease(m.stencilBind);
   for (WGPUTextureView v : m.views) if (v) wgpuTextureViewRelease(v);
@@ -1636,13 +1671,14 @@ static PostFx createPostFx(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   // previous history. Resolves at render res into a history target (kSceneFormat), not the swapchain.
   fx.taaModule = makeWGSL(device, TAA_WGSL);
   {
-    WGPUBindGroupLayoutEntry ble[5] = {};
+    WGPUBindGroupLayoutEntry ble[6] = {};
     ble[0].binding = 0; ble[0].visibility = WGPUShaderStage_Fragment; ble[0].buffer.type = WGPUBufferBindingType_Uniform;
     ble[1].binding = 1; ble[1].visibility = WGPUShaderStage_Fragment; ble[1].texture.sampleType = WGPUTextureSampleType_Float; ble[1].texture.viewDimension = WGPUTextureViewDimension_2D;
     ble[2].binding = 2; ble[2].visibility = WGPUShaderStage_Fragment; ble[2].sampler.type = WGPUSamplerBindingType_Filtering;
     ble[3].binding = 3; ble[3].visibility = WGPUShaderStage_Fragment; ble[3].texture.sampleType = WGPUTextureSampleType_Depth; ble[3].texture.viewDimension = WGPUTextureViewDimension_2D;
     ble[4].binding = 4; ble[4].visibility = WGPUShaderStage_Fragment; ble[4].texture.sampleType = WGPUTextureSampleType_Float; ble[4].texture.viewDimension = WGPUTextureViewDimension_2D;
-    WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 5; bgld.entries = ble;
+    ble[5].binding = 5; ble[5].visibility = WGPUShaderStage_Fragment; ble[5].texture.sampleType = WGPUTextureSampleType_Float; ble[5].texture.viewDimension = WGPUTextureViewDimension_2D;
+    WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 6; bgld.entries = ble;
     fx.taaBGL = wgpuDeviceCreateBindGroupLayout(device, &bgld);
   }
   fx.taaPipe = makePipe(fx.taaModule, "fs_main", fx.taaBGL, kSceneFormat, false);
@@ -3350,6 +3386,7 @@ int main(int argc, char** argv) {
   // TAA reprojection state: previous frame's UNJITTERED view-proj, history ping-pong index, and a
   // frame counter driving the Halton(2,3) sub-pixel jitter. taaHistValid gates the first frame.
   glm::mat4 taaPrevVP(1.0f);
+  glm::mat4 taaPrevPlayerModel(1.0f);   // player ship's previous-frame model matrix (motion vectors)
   bool taaHistValid = false;
   int  taaCur = 0;
   uint32_t taaJitterIdx = 0;
@@ -3530,6 +3567,10 @@ int main(int argc, char** argv) {
   // the swapchain. RGBA16F keeps the graded values lossless for the AA blend.
   WGPUTexture ldrTex = makeColorRTT(device, rW, rH, kSceneFormat);
   WGPUTextureView ldrView = wgpuTextureCreateView(ldrTex, nullptr);
+  // TAA velocity buffer (render res): the ship writes screen-UV motion vectors here; cleared to a
+  // sentinel (~99) elsewhere so the resolve knows to fall back to camera-motion depth reprojection.
+  WGPUTexture taaVelTex = makeColorRTT(device, rW, rH, kSceneFormat);
+  WGPUTextureView taaVelView = wgpuTextureCreateView(taaVelTex, nullptr);
   WGPUTexture bloomATex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
   WGPUTextureView bloomAView = wgpuTextureCreateView(bloomATex, nullptr);
   WGPUTexture bloomBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
@@ -3571,13 +3612,14 @@ int main(int argc, char** argv) {
     }
     for (int i = 0; i < 2; ++i) {
       if (taaBind[i]) wgpuBindGroupRelease(taaBind[i]);
-      WGPUBindGroupEntry e[5] = {};
+      WGPUBindGroupEntry e[6] = {};
       e[0].binding = 0; e[0].buffer = postFx.taaUbuf; e[0].size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);
       e[1].binding = 1; e[1].textureView = ldrView;
       e[2].binding = 2; e[2].sampler = postFx.samp;
       e[3].binding = 3; e[3].textureView = depthReadView;
       e[4].binding = 4; e[4].textureView = taaHistView[1 - i];
-      WGPUBindGroupDescriptor d = {}; d.layout = postFx.taaBGL; d.entryCount = 5; d.entries = e;
+      e[5].binding = 5; e[5].textureView = taaVelView;
+      WGPUBindGroupDescriptor d = {}; d.layout = postFx.taaBGL; d.entryCount = 6; d.entries = e;
       taaBind[i] = wgpuDeviceCreateBindGroup(device, &d);
 
       if (taaBlitBind[i]) wgpuBindGroupRelease(taaBlitBind[i]);
@@ -3957,6 +3999,9 @@ int main(int argc, char** argv) {
       wgpuTextureViewRelease(ldrView); wgpuTextureRelease(ldrTex);
       ldrTex = makeColorRTT(device, rW, rH, kSceneFormat);
       ldrView = wgpuTextureCreateView(ldrTex, nullptr);
+      wgpuTextureViewRelease(taaVelView); wgpuTextureRelease(taaVelTex);
+      taaVelTex = makeColorRTT(device, rW, rH, kSceneFormat);
+      taaVelView = wgpuTextureCreateView(taaVelTex, nullptr);
       rebuildFxaaBind();
       rebuildSmaaTargets();
       rebuildTaaTargets();
@@ -8224,14 +8269,21 @@ int main(int argc, char** argv) {
     // ordering as the draw loop below, so slot indices line up).
     {
       std::map<Mesh*, uint32_t> slot;
+      bool firstShip = true;
       for (const ShipInst& s : ships) {
         uint32_t idx = slot[s.mesh];
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
+        if (firstShip && taaEnabled) {   // player ship (slot 0): TAA motion-vector matrices (unjittered)
+          mu.mvpCur  = taaCurVP * s.model;
+          mu.mvpPrev = taaPrevVP * taaPrevPlayerModel;
+          taaPrevPlayerModel = s.model;   // for next frame
+        }
         wgpuQueueWriteBuffer(queue, s.mesh->uniformBuf,
                              (uint64_t)idx * s.mesh->uniformStride, &mu, sizeof(mu));
         slot[s.mesh] = idx + 1;
+        firstShip = false;
       }
     }
     // ── Crew (Phase 1): N members on the own deck. Lazy-load the shared crew rig,
@@ -8975,6 +9027,28 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderDraw(fp, 3, 1, 0, 0);
       wgpuRenderPassEncoderEnd(fp);
       wgpuRenderPassEncoderRelease(fp);
+    }
+    // ── TAA velocity pass: re-draw the player ship into the velocity buffer (cleared to a sentinel
+    //    ~99), depth-tested read-only so only its visible surface writes screen-UV motion vectors.
+    //    The resolve reads these to reproject the MOVING ship (camera-only depth reproj can't). ──
+    if (taaEnabled && sailing && ownMesh && ownMesh->velocityPipeline) {
+      WGPURenderPassColorAttachment vca = {};
+      vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
+      vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
+      WGPURenderPassDepthStencilAttachment vda = {};
+      vda.view = depthView; vda.depthReadOnly = true; vda.stencilReadOnly = true;
+      WGPURenderPassDescriptor vpd = {}; vpd.colorAttachmentCount = 1; vpd.colorAttachments = &vca; vpd.depthStencilAttachment = &vda;
+      WGPURenderPassEncoder vp = wgpuCommandEncoderBeginRenderPass(encoder, &vpd);
+      uint32_t zeroOffs[2] = { 0, 0 };
+      wgpuRenderPassEncoderSetPipeline(vp, ownMesh->velocityPipeline);
+      wgpuRenderPassEncoderSetVertexBuffer(vp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(vp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+      for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
+        wgpuRenderPassEncoderSetBindGroup(vp, 0, ownMesh->bindGroups[i], 2, zeroOffs);
+        wgpuRenderPassEncoderDrawIndexed(vp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
+      }
+      wgpuRenderPassEncoderEnd(vp);
+      wgpuRenderPassEncoderRelease(vp);
     }
     // ── Resolve + UI pass (swapchain): AA the LDR intermediate onto the swapchain
     //    (SMAA = 3 passes, FXAA = 1, or a straight passthrough when AA is off),

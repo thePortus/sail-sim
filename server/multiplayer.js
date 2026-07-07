@@ -1163,6 +1163,7 @@ function attachMultiplayer(server) {
   const resolveFortHit = (shot, fh, nowMs) => {
     const { fort, gunIdx, dmg } = fh;
     const shooter = players.get(shot.shooterId);
+    fortsMod.markAttacker(fort, shot.shooterId, nowMs);   // shelling a fort makes it return fire (self-defence)
     const r = fortsMod.applyFortHit(fort, gunIdx, dmg, nowMs);
     const hitMsg = JSON.stringify({ type: 'combat_hit', shooterId: shot.shooterId, fortId: fort.id, seq: shot.seq,
       hx: fh.hx, hy: fh.hy, hz: fh.hz, tof: fh.tof, fort: true });

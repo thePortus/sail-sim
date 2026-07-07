@@ -41,8 +41,9 @@ const FORT = {
   capital: { gunHp: 620,  reloadMs: 5000, range: 650, muzzleV: 82, caliber: 2.2, spread: 0.009, height: 14 },
 };
 const FORT_DMG_MULT   = 1.0;              // ship-ball damage to a fort gun-section (tune together with gunHp)
-const FORT_HOSTILE_REP = -25;            // a player at/below this standing with the fort's nation is a target
+const FORT_HOSTILE_REP = -25;            // a player at/below this standing with the fort's nation is a target on sight
 const REPAIR_MS       = 12 * 60 * 1000;  // interim: a neutralised fort rebuilds after this (until capture lands)
+const GRUDGE_MS       = 90 * 1000;       // a fort returns fire on anyone who shells it for this long (self-defence)
 
 // ── Build the fort registry from the terrain manifest ───────────────────────────────────────────────────────
 function build(harbors) {
@@ -66,14 +67,21 @@ function build(harbors) {
 
 const gauss = (sigma) => sigma * (Math.random() + Math.random() + Math.random() + Math.random() - 2) * 0.7071;
 
-// Would this fort open fire on player/NPC `p`? Faction-hostile on sight; new captains shielded.
-function isHostile(fort, p) {
+// Would this fort open fire on `p` (id `pid`)? Faction-hostile on sight, OR anyone who has SHELLED it recently
+// (self-defence — regardless of standing). New captains are always shielded; pirates are always fair game.
+function isTarget(fort, pid, p, nowMs) {
   if (!p.state || (p.combat && p.combat.sunk) || p.godmode) return false;
   if (p.isNpc) return !!p.isPirate;                                   // forts shell pirates, ignore honest traders
-  if (!fort.faction) return false;
   if (p.questState && quest.inIntro(p.questState)) return false;      // brand-new captain — leave them be
-  const rep = (p.factionRep && p.factionRep[fort.faction]) || 0;
-  return rep <= FORT_HOSTILE_REP;
+  if (fort.grudges && fort.grudges.get(pid) > nowMs) return true;     // it fired on us → we fire back
+  if (!fort.faction) return false;
+  return ((p.factionRep && p.factionRep[fort.faction]) || 0) <= FORT_HOSTILE_REP;
+}
+
+/** Record that `shooterId` shelled this fort → it returns fire for GRUDGE_MS even at neutral standing. */
+function markAttacker(fort, shooterId, nowMs) {
+  if (!shooterId || String(shooterId).startsWith('fort_')) return;
+  (fort.grudges || (fort.grudges = new Map())).set(shooterId, nowMs + GRUDGE_MS);
 }
 
 /** Leading ballistic solution from a fixed gun muzzle to a moving target, tight scatter. Returns
@@ -114,8 +122,8 @@ function tickForts(forts, players, nowMs, fireShot) {
       continue;
     }
     let target = null, bd = fort.spec.range * fort.spec.range;
-    for (const [, p] of players) {
-      if (!isHostile(fort, p)) continue;
+    for (const [pid, p] of players) {
+      if (!isTarget(fort, pid, p, nowMs)) continue;
       const dx = p.state.x - fort.x, dz = p.state.z - fort.z, d2 = dx * dx + dz * dz;
       if (d2 < bd) { bd = d2; target = p; }
     }
@@ -178,4 +186,4 @@ function serialize(fort) {
   };
 }
 
-module.exports = { build, tickForts, stepShotForts, applyFortHit, isHostile, serialize, FORT, FORT_HOSTILE_REP };
+module.exports = { build, tickForts, stepShotForts, applyFortHit, markAttacker, isTarget, serialize, FORT, FORT_HOSTILE_REP };

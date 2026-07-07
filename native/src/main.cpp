@@ -6259,8 +6259,33 @@ int main(int argc, char** argv) {
         return terr.loaded() ? terr.elevation(x, z) : 0.0f;
       }, impacts);
       for (const combat::ImpactEvent& ie : impacts) {
-        const glm::vec3 ip(ie.x, ie.y, ie.z);
+        glm::vec3 ip(ie.x, ie.y, ie.z);
         const glm::vec3 iv(ie.vx, ie.vy, ie.vz);
+        // Snap a ship hit onto the drawn hull/mast. The server reports the ball's position inside the (per-ship)
+        // hitbox; for a 'masts' hit that sits above the deck and often to one side of the thin visible mast, so
+        // the burst read as open air. Resolve the hit in the victim's local frame, pull a mast hit onto the
+        // centreline + cap it at the masthead, and re-project — so the explosion lands on the timbers/rig.
+        float vLat = 0, vLon = 0, vY = ie.y; bool vHave = false, vIsMe = false;
+        if (ie.shipHit && !ie.hit.fort) {
+          float vx2 = 0, vz2 = 0, vh2 = 0; std::string vslug;
+          if (ie.hit.victimId == meId) { vx2 = vessel.x; vz2 = vessel.z; vh2 = vessel.heading; vslug = ownVesselSlug; vHave = vIsMe = true; }
+          else {
+            for (const mp::RemotePlayer& rp : mpClient.players())
+              if (rp.id == ie.hit.victimId) { vx2 = rp.x; vz2 = rp.z; vh2 = glm::radians(rp.heading); vslug = rp.vesselSlug; vHave = true; break; }
+          }
+          if (vHave) {
+            const float c = std::cos(vh2), s = std::sin(vh2);
+            const float rx = ie.x - vx2, rz = ie.z - vz2;
+            vLat = rx * c + rz * s;                 // vessel-local beam (+starboard)
+            vLon = -rx * s + rz * c;                // vessel-local fore-aft (+bow)
+            if (ie.hit.zone == "masts") {
+              vLat = 0.0f;                          // onto the mast centreline (the visible rig)
+              const float top = vslug.empty() ? 18.0f : vesselFor(vslug).mastTop;
+              vY = glm::clamp(vY, 3.0f, std::max(4.0f, top));
+            }
+            ip = glm::vec3(vx2 + vLat * c - vLon * s, vY, vz2 + vLat * s + vLon * c);   // local → world
+          }
+        }
         const float d = glm::distance(lastEye, ip);
         if (ie.shipHit && !ie.hit.fort) {   // a fort hit falls through to the land branch → stone debris, not wood
           glm::vec3 dir = iv;
@@ -6279,24 +6304,16 @@ int main(int argc, char** argv) {
             if (camTrauma < 0.01f) camShakeTime = 0.0f;
             camTrauma = std::min(1.0f, camTrauma + 0.85f);   // taking a hit: a big, ringing shake
           }
-          // Scorch decal (non-grape): stored vessel-local (yaw frame) so it rides the hull.
-          if (!ie.hit.grape) {
-            float vx2 = 0, vz2 = 0, vh2 = 0;
-            bool have = false;
-            if (ie.hit.victimId == meId) { vx2 = vessel.x; vz2 = vessel.z; vh2 = vessel.heading; have = true; }
-            else {
-              for (const mp::RemotePlayer& rp : mpClient.players())
-                if (rp.id == ie.hit.victimId) { vx2 = rp.x; vz2 = rp.z; vh2 = glm::radians(rp.heading); have = true; break; }
-            }
-            if (have) {
-              const float ch = std::cos(-vh2), sh = std::sin(-vh2);
-              const glm::vec3 rel(ie.x - vx2, ie.y, ie.z - vz2);
+          // Scorch decal (non-grape): stored vessel-local (yaw frame) so it rides the hull. Uses the same
+          // snapped local coords as the burst, so the char sits on the mast/timbers, not floating beside them.
+          if (!ie.hit.grape && vHave) {
+            {
               HullDecal dcl;
-              dcl.local = glm::vec3(rel.x * ch - rel.z * sh, rel.y, rel.x * sh + rel.z * ch);
+              dcl.local = glm::vec3(vLat, vY, vLon);
               dcl.size = (ie.hit.zone == "masts" ? 0.55f : 1.35f) * (0.82f + 0.36f * (float)(rand() % 100) / 100.0f);
               dcl.ang = (float)(rand() % 628) / 100.0f;
               dcl.seed = (uint32_t)rand();
-              auto& list = shipDecals[ie.hit.victimId == meId ? std::string() : ie.hit.victimId];
+              auto& list = shipDecals[vIsMe ? std::string() : ie.hit.victimId];
               list.push_back(dcl);
               while (list.size() > (size_t)combat::kDecalMaxPerShip) list.erase(list.begin());
             }

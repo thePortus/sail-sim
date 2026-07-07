@@ -7,15 +7,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include "paths.hpp"
+
 namespace settings {
 namespace {
 
-std::string path() {
-  const char* home = std::getenv("HOME");
-  if (!home) home = std::getenv("USERPROFILE");   // Windows
-  std::string dir = home ? home : ".";
-  return dir + "/.sailsim_settings";
-}
+std::string path() { return paths::dataFile("settings.json"); }
 
 float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
 

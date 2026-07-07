@@ -8,6 +8,8 @@
 #include <mutex>
 #include <system_error>
 
+#include "paths.hpp"
+
 namespace fs = std::filesystem;
 
 namespace assetcache {
@@ -15,12 +17,6 @@ namespace {
 
 std::atomic<uint64_t> g_version{0};
 std::mutex g_mutex;   // serialises invalidateAll() against the cache-root creation
-
-std::string homeDir() {
-  const char* home = std::getenv("HOME");
-  if (!home) home = std::getenv("USERPROFILE");   // Windows
-  return home ? home : ".";
-}
 
 // Canonical request path: drop any query string and lexically resolve '.'/'..' (so "/geometry/harbors/../
 // forts/x.glb" -> "/geometry/forts/x.glb", matching how the server normalises it and giving a clean cache key).
@@ -68,15 +64,7 @@ bool writeFileAtomic(const fs::path& path, const std::string& bytes) {
 
 }  // namespace
 
-std::string cacheDir() {
-  static std::string dir = [] {
-    std::string d = homeDir() + "/.sailsim_cache";
-    std::error_code ec;
-    fs::create_directories(d, ec);
-    return d;
-  }();
-  return dir;
-}
+std::string cacheDir() { return paths::cacheDir(); }
 
 void setVersion(uint64_t v) { g_version.store(v); }
 uint64_t version() { return g_version.load(); }

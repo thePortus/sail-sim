@@ -14,6 +14,10 @@ cmake_minimum_required(VERSION 3.24)
 
 project(sailsim_native LANGUAGES C CXX)
 
+# Single source of truth for the client version — feeds the compiled-in SAILSIM_VERSION string (shown by
+# --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
+set(SAILSIM_VERSION "0.1.0")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -329,6 +333,7 @@ add_executable(sailsim_native
   src/net_auth.cpp
   src/net_mp.cpp
   src/asset_cache.cpp
+  src/paths.cpp
   src/session.cpp
   src/props_assets.cpp
   src/scatter.cpp
@@ -360,6 +365,7 @@ get_filename_component(SAILSIM_SHIP_MODEL_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
 target_compile_definitions(sailsim_native PRIVATE
   SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
+  SAILSIM_VERSION="${SAILSIM_VERSION}"
   SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}")
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json ixwebsocket)
 
@@ -390,7 +396,7 @@ if (APPLE AND SAILSIM_MACOS_BUNDLE)
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
     MACOSX_BUNDLE_BUNDLE_NAME "Sail-Sim"
     MACOSX_BUNDLE_GUI_IDENTIFIER "us.theport.sailsim"
-    MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${SAILSIM_VERSION}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${SAILSIM_VERSION}"
     MACOSX_BUNDLE_COPYRIGHT "© thePortus")
 endif()

@@ -60,6 +60,7 @@
 #include "net_auth.hpp"
 #include "net_mp.hpp"
 #include "asset_cache.hpp"
+#include "paths.hpp"
 #include "combat.hpp"
 #include "combat_constants.hpp"
 #include "cannon.hpp"
@@ -2716,6 +2717,23 @@ static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
 int main(int argc, char** argv) {
   // Flush per line so `[spike] …` progress shows even when piped or killed.
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+  // Management CLI flags — handled before the game starts. --uninstall wipes the settings + cache (the "clean
+  // uninstall" path); --version prints the compiled-in build (what the auto-updater will compare to the appcast).
+  for (int ai = 1; ai < argc; ++ai) {
+    const std::string a = argv[ai];
+    if (a == "--version" || a == "-v") {
+      std::printf("sail-sim native %s\n", SAILSIM_VERSION);
+      return EXIT_SUCCESS;
+    }
+    if (a == "--uninstall") {
+      const bool ok = paths::wipeAll();
+      std::printf("SailSim data + cache removed (%s).\n", ok ? "clean" : "some items remained");
+      return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
+  // One-time move of any legacy ~/.sailsim_* files into the OS-standard data/cache dirs (idempotent).
+  paths::migrateLegacy();
 
   // Model to draw: argv[1] > $SAILSIM_MODEL > the ship (default) > rock > cube.
   const char* modelArg = (argc > 1) ? argv[1] : std::getenv("SAILSIM_MODEL");

@@ -4,14 +4,11 @@
 #include <cstdlib>
 #include <fstream>
 
+#include "paths.hpp"
+
 namespace {
 
-std::string sessionPath() {
-  const char* home = std::getenv("HOME");
-  if (!home) home = std::getenv("USERPROFILE");   // Windows
-  std::string dir = home ? home : ".";
-  return dir + "/.sailsim_session";
-}
+std::string sessionPath() { return paths::dataFile("session"); }
 
 } // namespace
 

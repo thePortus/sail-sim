@@ -18,7 +18,7 @@ net::AuthResult postJson(const std::string& host, int port,
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
 
-  auto res = cli.Post(path, body.dump(), "application/json");
+  auto res = cli.Post(netcfg::apiPath(path), body.dump(), "application/json");
   if (!res) {
     r.error = "Cannot reach server at " + host + ":" + std::to_string(port);
     return r;
@@ -59,7 +59,7 @@ AuthResult me(const std::string& host, int port, const std::string& token) {
   cli.set_read_timeout(5, 0);
 
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
-  auto res = cli.Get("/user/me", headers);
+  auto res = cli.Get(netcfg::apiPath("/user/me"), headers);
   if (!res) {
     r.error = "Cannot reach server at " + host + ":" + std::to_string(port);
     return r;
@@ -89,7 +89,7 @@ LocationResult playerLocation(const std::string& host, int port, const std::stri
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
   // The controller keys off the JWT user id and ignores the :callsign path param,
   // so a fixed safe segment avoids URL-encoding a callsign that may hold spaces.
-  auto res = cli.Get("/player-location/self", headers);
+  auto res = cli.Get(netcfg::apiPath("/player-location/self"), headers);
   if (!res) return r;                               // unreachable -> harbour fallback
   r.status = res->status;
   if (res->status < 200 || res->status >= 300) return r;   // 404 none/stale -> fallback
@@ -113,7 +113,7 @@ VesselPhysics vesselPhysics(const std::string& host, int port, const std::string
   cli.set_read_timeout(5, 0);
   httplib::Headers headers;
   if (!token.empty()) headers.emplace("Authorization", "Bearer " + token);
-  auto res = cli.Get(("/vessels/" + slug).c_str(), headers);
+  auto res = cli.Get(netcfg::apiPath("/vessels/" + slug).c_str(), headers);
   if (!res) return r;                                       // unreachable -> caller uses hardcoded fallback
   r.status = res->status;
   if (res->status < 200 || res->status >= 300) return r;    // 404 unknown slug -> fallback

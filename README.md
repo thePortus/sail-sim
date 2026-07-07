@@ -82,7 +82,7 @@ production):
 ``` sh
 node server/scripts/client-release.js publish \
   --platform mac --version 0.2.0 --file /path/to/SailSim-0.2.0-mac.zip \
-  --base-url https://your.server/client --notes "What changed"
+  --base-url https://your.server/api/client --notes "What changed"
 ```
 
 That signs the build and writes the update feed the clients poll. See
@@ -110,6 +110,12 @@ build options below:
 - `SAILSIM_SERVER_HOST` / `SAILSIM_SERVER_PORT` — your backend's public host + port (default `localhost:9080`).
 - `SAILSIM_SERVER_TLS=ON` — connect over **TLS** (`wss://` + `https://`). Use this for any public server; a plain
   `ws://` login sends the auth token in the clear.
+- `SAILSIM_SERVER_PATH=/api` — HTTP base path when a reverse proxy (nginx) serves the API + assets under a
+  prefix. Set this to **`/api`** to match the production web client (`environment.prod.ts` uses `apiUrl: '/api/'`)
+  so all the native client's HTTP flows through your existing `/api/ → Node` proxy rule. The WebSocket is never
+  prefixed — it connects at the root (`wss://host/`), matching `wsUrl`. Leave empty when talking straight to Node.
+  (The auto-update feed URLs below use `…/api/client/…` for the same reason — the appcast + downloads route
+  through the `/api` proxy too, so nginx needs no extra rule for updates.)
 - `SAILSIM_TLS` (default `ON`) — compiles TLS support in; **requires OpenSSL** (`brew install openssl` on macOS,
   `apt install libssl-dev` on Ubuntu, an OpenSSL install/vcpkg on Windows). Build with `-DSAILSIM_TLS=OFF` for an
   http/ws-only client with no OpenSSL dependency.
@@ -124,8 +130,8 @@ baked-in values at launch.)
 ``` sh
 cd native
 cmake -S . -B build-mac -DSAILSIM_MACOS_BUNDLE=ON \
-  -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON \
-  -DSAILSIM_SPARKLE_FEED_URL=https://your.server/client/appcast-mac.xml \
+  -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON -DSAILSIM_SERVER_PATH=/api \
+  -DSAILSIM_SPARKLE_FEED_URL=https://your.server/api/client/appcast-mac.xml \
   -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-mac
 # Zip the .app (ditto preserves the bundle's symlinks — a plain zip can corrupt it):
@@ -137,7 +143,7 @@ cd build-mac/bin && ditto -c -k --keepParent sailsim_native.app SailSim-<ver>-ma
 
 ``` powershell
 cd native
-cmake -S . -B build-win -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
+cmake -S . -B build-win -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON -DSAILSIM_SERVER_PATH=/api -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/api/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-win --config Release
 # Zip the whole output folder (.exe + WinSparkle.dll):
 Compress-Archive -Path build-win\bin\Release\* -DestinationPath SailSim-<ver>-win.zip
@@ -171,13 +177,13 @@ docker cp /tmp/SailSim-<ver>-mac.zip sail-sim-nodejs:/tmp/
 docker exec -it sail-sim-nodejs \
   node server/scripts/client-release.js publish \
     --platform mac --version <ver> --file /tmp/SailSim-<ver>-mac.zip \
-    --base-url https://your.server/client
+    --base-url https://your.server/api/client
 
 docker cp /tmp/SailSim-<ver>-win.zip sail-sim-nodejs:/tmp/
 docker exec -it sail-sim-nodejs \
   node server/scripts/client-release.js publish \
     --platform win --version <ver> --file /tmp/SailSim-<ver>-win.zip \
-    --base-url https://your.server/client
+    --base-url https://your.server/api/client
 ```
 
 Publish writes the signed zip + `appcast-mac.xml` / `appcast-win.xml` into `server/assets/client/`, served at

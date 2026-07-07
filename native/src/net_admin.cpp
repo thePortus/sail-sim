@@ -36,7 +36,7 @@ net::AdminResult postJson(const std::string& host, int port, const std::string& 
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
-  return fromResponse(cli.Post(path, headers, body.dump(), "application/json"), host, port);
+  return fromResponse(cli.Post(netcfg::apiPath(path), headers, body.dump(), "application/json"), host, port);
 }
 
 net::AdminResult del(const std::string& host, int port, const std::string& token,
@@ -45,7 +45,7 @@ net::AdminResult del(const std::string& host, int port, const std::string& token
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
-  return fromResponse(cli.Delete(path, headers), host, port);
+  return fromResponse(cli.Delete(netcfg::apiPath(path), headers), host, port);
 }
 
 } // namespace

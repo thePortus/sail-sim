@@ -15,6 +15,12 @@ const std::string& host();
 int  port();
 bool tls();   // always false in a build without TLS support (SAILSIM_TLS=OFF)
 
+// Reverse-proxy base path for HTTP requests: "" when talking straight to Node, or e.g. "/api" when a proxy
+// (nginx) routes the API + assets under a prefix. The gameplay WebSocket is NOT prefixed (it stays at "/").
+const std::string& serverPath();
+// Prefix an HTTP request path with serverPath() — e.g. apiPath("/geometry/x") -> "/api/geometry/x".
+std::string apiPath(const std::string& p);
+
 // "http://h:p" or "https://h:p" — pass to an httplib::Client (scheme picks plain vs SSL).
 std::string baseUrl(const std::string& h, int p);
 // "ws" or "wss" for the gameplay WebSocket URL.

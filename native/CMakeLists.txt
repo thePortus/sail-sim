@@ -29,6 +29,9 @@ set(SAILSIM_SPARKLE_PUBKEY       "tRLH7wCxtVSWI6d2lwbwliBgNoJGizATw2qG4XQSfvo=" 
 # never types a server address. SAILSIM_HOST/SAILSIM_PORT/SAILSIM_TLS env vars override at runtime (for dev).
 set(SAILSIM_SERVER_HOST "localhost" CACHE STRING "Default backend host the client connects to")
 set(SAILSIM_SERVER_PORT "9080"      CACHE STRING "Default backend port")
+# Reverse-proxy base path for HTTP (e.g. "/api" when nginx routes the API+assets under a prefix). Empty = talk
+# straight to Node. The WebSocket is never prefixed. Set to /api to match the production Angular client's apiUrl.
+set(SAILSIM_SERVER_PATH ""          CACHE STRING "HTTP base path (e.g. /api behind a reverse proxy)")
 option(SAILSIM_SERVER_TLS "Default to TLS (https/wss) at runtime" OFF)
 # Compile TLS support (https/wss) — needs OpenSSL. On: one build speaks both http/ws and https/wss, scheme
 # chosen at runtime by SAILSIM_SERVER_TLS / $SAILSIM_TLS. Off: http/ws only, no OpenSSL dependency.
@@ -392,7 +395,8 @@ target_compile_definitions(sailsim_native PRIVATE
   SAILSIM_VERSION="${SAILSIM_VERSION}"
   SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}"
   SAILSIM_SERVER_HOST="${SAILSIM_SERVER_HOST}"
-  SAILSIM_SERVER_PORT=${SAILSIM_SERVER_PORT})
+  SAILSIM_SERVER_PORT=${SAILSIM_SERVER_PORT}
+  SAILSIM_SERVER_PATH="${SAILSIM_SERVER_PATH}")
 # TLS: compile OpenSSL support into httplib (globally, so every TU sees the same Client layout) + link OpenSSL.
 # The runtime default scheme is SAILSIM_SERVER_TLS ($<BOOL> -> 0/1); env $SAILSIM_TLS overrides it per launch.
 if (SAILSIM_TLS)

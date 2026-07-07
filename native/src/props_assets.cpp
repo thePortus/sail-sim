@@ -101,7 +101,7 @@ std::vector<VesselRow> fetchVessels(const std::string& host, int port) {
   httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(15, 0);
-  auto res = cli.Get("/vessels");
+  auto res = cli.Get(netcfg::apiPath("/vessels"));
   if (!res || res->status != 200) { std::printf("[props] /vessels failed (%d)\n", res ? res->status : 0); return out; }
   auto j = nlohmann::json::parse(res->body, nullptr, false);
   if (j.is_discarded() || !j.is_array()) return out;

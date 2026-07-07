@@ -94,7 +94,9 @@ Result get(httplib::Client& cli, const std::string& urlPath) {
   httplib::Headers headers;
   if (haveCache && !storedEtag.empty()) headers.emplace("If-None-Match", storedEtag);
 
-  auto res = cli.Get(reqPath.c_str(), headers);
+  // Cache key stays the logical path (relPathFor above); the wire request gets the reverse-proxy prefix (/api).
+  const std::string wirePath = netcfg::apiPath(reqPath);
+  auto res = cli.Get(wirePath.c_str(), headers);
 
   if (!res) {   // network/transport error — serve the last good copy if we have one
     if (haveCache) { r.bytes = readFile(cacheFile.string()); r.ok = true; r.fromCache = true; }

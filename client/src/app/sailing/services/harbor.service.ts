@@ -7,6 +7,8 @@ import { TerrainService } from './terrain.service';
 import { OceanService } from './ocean.service';
 import { VesselService } from './vessel.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
+import { MultiplayerService } from './multiplayer.service';
+import { FortStatus } from './combat.constants';
 import { TownImpostorPlugin } from './scatter/town-impostor.plugin';
 import { ImpostorHazePlugin } from './scatter/impostor-haze.plugin';
 import { measureBottomPad } from './scatter/asset-loader';
@@ -35,6 +37,10 @@ export class HarborService {
   private oceanService = inject(OceanService);
   private vesselService = inject(VesselService);
   private assetCache = inject(VesselAssetCacheService);
+  private multiplayerService = inject(MultiplayerService);
+  // Fort combat: world anchor per fort (recorded on stream-in) + the pooled overhead HP-bar billboards.
+  private readonly fortAnchors = new Map<string, { x: number; y: number; z: number; tier: string }>();
+  private readonly fortBars = new Map<string, { plane: Mesh; tex: DynamicTexture; sig: string }>();
 
   private root: TransformNode | null = null;
   // Per-variant yaw (radians) that rotates the model's seaward length-axis onto the parent's +Z, so
@@ -277,6 +283,61 @@ export class HarborService {
     if ((f & 3) === 0) { this.updateTownLabels(); }
     if ((f % 20) === 0) { this.streamPiers(); this.streamTowns(); this.streamTownLabels(); this.updateTownBlobs(); }
     this.driveTownBlobSun();   // night-fade the building blobs (throttled internally)
+    if ((f & 3) === 0) { this.updateFortBars(); }   // overhead fort HP bars (only forts that have been engaged)
+  }
+
+  // ── Fort combat HP bars (overhead) ──────────────────────────────────────────────────────────────
+  /** Show a floating HP bar over any fort that's been engaged (MultiplayerService has a fort_state for it):
+   *  aggregate gun HP, "<name>  N/M guns" or "SILENCED". Billboard planes are pooled per fort; hidden when far. */
+  private updateFortBars(): void {
+    const scene = this.sceneService.scene;
+    if (!scene) return;
+    const states = this.multiplayerService.getFortStates();
+    const cam = this.vesselService.getPosition();
+    for (const [fid, st] of states) {
+      const a = this.fortAnchors.get(fid);
+      if (!a) continue;
+      const near = (a.x - cam.x) ** 2 + (a.z - cam.z) ** 2 < 1200 * 1200;
+      let bar = this.fortBars.get(fid);
+      if (!near) { if (bar) bar.plane.setEnabled(false); continue; }
+      const lift = a.tier === 'capital' ? 24 : a.tier === 'medium' ? 17 : 13;
+      const sig = `${Math.round(st.hp)}/${st.maxHp}|${st.gunsUp}/${st.gunsTotal}|${st.neutralized}`;
+      if (!bar) {
+        const tex = new DynamicTexture(`fortbar_${fid}`, { width: 384, height: 96 }, scene, true);
+        const mat = new StandardMaterial(`fortbar_${fid}_m`, scene);
+        mat.diffuseTexture = tex; mat.opacityTexture = tex; mat.emissiveColor = new Color3(1, 1, 1);
+        mat.disableLighting = true; mat.backFaceCulling = false;
+        const plane = MeshBuilder.CreatePlane(`fortbar_${fid}_p`, { width: 20, height: 5 }, scene);
+        plane.material = mat; plane.billboardMode = Mesh.BILLBOARDMODE_ALL; plane.isPickable = false;
+        plane.renderingGroupId = 2; plane.parent = this.root;
+        bar = { plane, tex, sig: '' };
+        this.fortBars.set(fid, bar);
+      }
+      bar.plane.setEnabled(true);
+      bar.plane.position.set(a.x, a.y + lift, a.z);
+      if (bar.sig !== sig) { this.drawFortBar(bar.tex, fid, st); bar.sig = sig; }
+    }
+    // Hide bars whose fort no longer reports (out of the state map) — cheap since the map is tiny.
+    for (const [fid, bar] of this.fortBars) if (!states.has(fid)) bar.plane.setEnabled(false);
+  }
+
+  private drawFortBar(tex: DynamicTexture, fid: string, st: FortStatus): void {
+    const ctx = tex.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, 384, 96);
+    const frac = st.maxHp > 0 ? Math.max(0, Math.min(1, st.hp / st.maxHp)) : 0;
+    const name = (this.harbors.find((h) => `fort_${h.id}` === fid)?.name) || 'Fort';
+    const label = st.neutralized ? `${name}  —  SILENCED` : `${name}  —  ${st.gunsUp}/${st.gunsTotal} guns`;
+    // bar
+    const bx = 24, bw = 336, by = 54, bh = 26;
+    ctx.fillStyle = 'rgba(10,14,20,0.86)'; ctx.fillRect(bx - 3, by - 3, bw + 6, bh + 6);
+    ctx.fillStyle = st.neutralized ? '#606066' : frac > 0.5 ? '#78c460' : frac > 0.25 ? '#e0bc48' : '#d64836';
+    ctx.fillRect(bx, by, bw * frac, bh);
+    ctx.strokeStyle = 'rgba(220,210,190,0.7)'; ctx.lineWidth = 2; ctx.strokeRect(bx - 3, by - 3, bw + 6, bh + 6);
+    // label
+    ctx.font = 'bold 30px Georgia, serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(6,10,16,0.9)'; ctx.fillText(label, 193, 34);
+    ctx.fillStyle = st.neutralized ? '#b8b8be' : '#ffe1b4'; ctx.fillText(label, 192, 33);
+    tex.update();
   }
 
   // ── Cheap fake building shadows (nearest streamed town only) ─────────────────────────────────────
@@ -673,6 +734,7 @@ export class HarborService {
                                                             f.z + sdz * f.hd * du + adz * f.hw * dv));
       parent.position.set(f.x, fy, f.z);
       parent.rotation.y = hr + Math.PI;   // -Z faces seaward (guns' heading)
+      this.fortAnchors.set(`fort_${h.id}`, { x: f.x, y: fy, z: f.z, tier: f.tier });   // for the combat HP bar
       this.tintFaction(node, h.faction);
       this.applyBuildingRecipe(node);
       // Faction identity: national ensign at the flagstaff + (T1) the per-nation accent turret. The glTF loader
@@ -1150,5 +1212,7 @@ export class HarborService {
     this.frozenMats.clear();
     for (const tm of this.tintMats.values()) tm.dispose(false, false);   // clones own no textures (shared) — drop the material only
     this.tintMats.clear();
+    for (const bar of this.fortBars.values()) { bar.tex.dispose(); bar.plane.material?.dispose(); bar.plane.dispose(); }
+    this.fortBars.clear(); this.fortAnchors.clear();
   }
 }

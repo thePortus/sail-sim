@@ -1990,6 +1990,13 @@ export class CannonService {
    * scorch mark, play the splinter/fire cosmetic, and despawn the matching ball.
    */
   private executeShipHit(msg: CombatHitMsg, ball: Ball | null): void {
+    if (msg.fort) {
+      // A ball struck a stone FORT (no ship victim): throw dirt/stone debris at the impact — no shudder/scorch.
+      let vx = 0, vy = -20, vz = 0;
+      if (ball) { vx = ball.vx; vy = ball.vy - G * ball.t; vz = ball.vz; ball.alive = false; ball.mesh.setEnabled(false); }
+      this.onImpact(msg.hx, msg.hz, vx, vy, vz, ball?.kind ?? 'round', Math.max(0.2, msg.hy));
+      return;
+    }
     // Shudder the struck ship — deferred to here so the lurch coincides with the impact.
     const side: 'port' | 'stbd' = msg.side === 'port' ? 'port' : 'stbd';
     if (msg.victimId === this.multiplayerService.getMyId()) this.vesselService.addHitShudder(side);

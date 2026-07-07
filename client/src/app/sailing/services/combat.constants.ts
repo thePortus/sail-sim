@@ -47,7 +47,19 @@ export interface CombatHitMsg {
   side: 'port' | 'stbd';                // struck side (for the shudder)
   tof?: number;                         // server time-of-flight (s) — defer the hit FX to ball arrival
   grape?: boolean;                      // grapeshot pellet (anti-crew) — no hull damage, no scorch, light shudder
+  fort?: boolean;                       // struck a harbor fort (stone debris, not wood) — victimId empty, fortId set
+  fortId?: string;
 }
+
+/** Server → all clients: a harbor fort's combat status (per gun-section HP). */
+export interface FortStateMsg {
+  type: 'fort_state';
+  id: string;                           // fort id ("fort_<townId>")
+  guns: { hp: number; maxHp: number }[];
+  neutralized?: boolean;
+}
+/** Aggregated fort status the client keeps for the overhead HP bar. */
+export interface FortStatus { hp: number; maxHp: number; gunsUp: number; gunsTotal: number; neutralized: boolean; }
 
 /** Server → ALL clients: a ship's authoritative hull state. Drives the victim's HUD
  *  diagram and every client's damage-listing tilt for that ship. */

@@ -18,7 +18,7 @@ import { SalvageService } from './salvage.service';
 import { SfxService } from './sfx.service';
 import { MastCrackService } from './mast-crack.service';
 import { TelemetryService } from './telemetry.service';
-import { CombatHitMsg, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
+import { CombatHitMsg, FortStatus, ZoneState, listingFor, capsizeFor, zoneHpFor, sinkProgress, SINK_DEPTH, SINK_REVEAL_MS, mastHealth } from './combat.constants';
 import { OtherPlayer, SailState, ChatMessage, MarketState, MarketHint, LedgerEntry, QuestUpdate, QuestNarrative } from '../models';
 import { factionColor, factionName } from '../faction.config';
 import { Settings } from '../../app.settings';
@@ -236,6 +236,9 @@ export class MultiplayerService {
   private players      = new Map<string, OtherPlayerEntry>();
   /** Last authoritative hull state per remote ship (drives its damage-listing tilt). */
   private remoteZones  = new Map<string, ZoneState>();
+  private fortStates   = new Map<string, FortStatus>();   // harbor-fort HP by fort id (HarborService reads for the HP bar)
+  /** Aggregated harbor-fort status by fort id ("fort_<townId>"), for the overhead HP bar. */
+  getFortStates(): Map<string, FortStatus> { return this.fortStates; }
   private updateTimer: ReturnType<typeof setInterval> | null = null;
   private pingTimer:   ReturnType<typeof setInterval> | null = null;
 
@@ -683,6 +686,13 @@ export class MultiplayerService {
       const maxHp = (msg as { maxHp?: ZoneState }).maxHp;
       if (!pid || pid === this.myId) this.combatService.setLocalZones(msg.zones as ZoneState, maxHp);
       else                            this.remoteZones.set(pid, msg.zones as ZoneState);
+
+    } else if (msg.type === 'fort_state') {
+      // Harbor-fort status → aggregate gun HP for HarborService's overhead HP bar.
+      const guns = Array.isArray(msg.guns) ? msg.guns : [];
+      let hp = 0, maxHp = 0, gunsUp = 0;
+      for (const g of guns) { hp += +g.hp || 0; maxHp += +g.maxHp || 0; if ((+g.hp || 0) > 0) gunsUp++; }
+      this.fortStates.set(String(msg.id), { hp, maxHp, gunsUp, gunsTotal: guns.length, neutralized: !!msg.neutralized });
 
     } else if (msg.type === 'mast_repair') {
       // Server armed our mast jury-rig (sent only to us) → run the HUD repair bar over its duration.

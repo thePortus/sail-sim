@@ -90,12 +90,23 @@ That signs the build and writes the update feed the clients poll. See
 
 ## Building & releasing the desktop client
 
-Each build **bakes in** the update feed URL + your public key from the step above, then you zip it and publish it
-to the server. Build macOS on a Mac, Windows on a Windows machine. Feed URLs must be **HTTPS** in production
-(Sparkle/WinSparkle refuse plain http); the pubkey defaults to the committed dev key, so override it with your
-own.
+The desktop client is built **on the OS it targets** (macOS on a Mac, Windows on a Windows PC), then the build is
+**uploaded to the live Ubuntu server** over SSH, where the publish script **signs it and updates the feed** that
+installed clients poll.
 
-### macOS (`.app` bundle)
+Key idea: your **signing key stays on the server** (`server/.sparkle/`, from the keygen step above). Your dev
+machines only ever upload the *unsigned* build zip — the private key never travels. So each release is three
+steps: **build → upload → publish**.
+
+Throughout, replace the placeholders: `<ver>` = the release version (e.g. `0.2.0`; must match `SAILSIM_VERSION`
+in `native/CMakeLists.txt`), `you@your.server` = your SSH login to the Ubuntu box, `https://your.server` = your
+public HTTPS site, `<your-public-key>` = the base64 key printed by keygen, and `sail-sim-nodejs` = your Node
+container's name (from `docker compose`). Feed URLs **must be HTTPS** in production (Sparkle/WinSparkle refuse
+plain http). One SSH key from each dev machine to the server makes `scp` passwordless.
+
+### Step 1 — Build the client
+
+**On a Mac** (produces the `.app` bundle, Sparkle embedded):
 
 ``` sh
 cd native
@@ -103,37 +114,69 @@ cmake -S . -B build-mac -DSAILSIM_MACOS_BUNDLE=ON \
   -DSAILSIM_SPARKLE_FEED_URL=https://your.server/client/appcast-mac.xml \
   -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-mac
-# → build-mac/bin/sailsim_native.app  (Sparkle.framework already embedded)
+# Zip the .app (ditto preserves the bundle's symlinks — a plain zip can corrupt it):
 cd build-mac/bin && ditto -c -k --keepParent sailsim_native.app SailSim-<ver>-mac.zip
 ```
 
-### Windows (`.exe`) — Visual Studio + CMake
+**On a Windows PC** (Visual Studio + CMake installed; run in PowerShell). The build drops
+`sailsim_native.exe` **and** `WinSparkle.dll` into the output folder — they must ship together:
 
-``` sh
+``` powershell
 cd native
 cmake -S . -B build-win -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-win --config Release
-# → the build output folder (e.g. build-win\bin\Release) holds sailsim_native.exe AND WinSparkle.dll.
-# Zip that whole folder (the .exe + WinSparkle.dll MUST travel together) as SailSim-<ver>-win.zip.
+# Zip the whole output folder (.exe + WinSparkle.dll):
+Compress-Archive -Path build-win\bin\Release\* -DestinationPath SailSim-<ver>-win.zip
 ```
 
-### Where the release files go on the live server
+### Step 2 — Upload the zip to the Ubuntu server (SSH)
 
-You don't copy them into place by hand — **the publish script does it**. Copy each zip to the machine running
-the Node server, then run (once per platform per release):
+Copy the zip into a scratch dir on the server. `scp` ships with macOS and with Windows 10/11 (the built-in
+OpenSSH client, so it works in PowerShell too):
 
 ``` sh
-node server/scripts/client-release.js publish --platform mac --version <ver> --file SailSim-<ver>-mac.zip --base-url https://your.server/client
-node server/scripts/client-release.js publish --platform win --version <ver> --file SailSim-<ver>-win.zip --base-url https://your.server/client
+# from the Mac:
+scp build-mac/bin/SailSim-<ver>-mac.zip you@your.server:/tmp/
+```
+``` powershell
+# from Windows (PowerShell):
+scp native\SailSim-<ver>-win.zip you@your.server:/tmp/
+```
+(Prefer a GUI on Windows? **WinSCP** does the same drag-and-drop. `rsync` works too if you have WSL.) Nothing
+extra is needed on the server beyond the SSH access it already has.
+
+### Step 3 — Publish on the server
+
+Your Node server runs in Docker, so `server/.sparkle/` (the key) and `server/assets/client/` (the releases) live
+*inside* the container. Copy the uploaded zip into the container and run the publish script there — it signs the
+zip and writes the feed:
+
+``` sh
+# on the Ubuntu host, for each platform you uploaded:
+docker cp /tmp/SailSim-<ver>-mac.zip sail-sim-nodejs:/tmp/
+docker exec -it sail-sim-nodejs \
+  node server/scripts/client-release.js publish \
+    --platform mac --version <ver> --file /tmp/SailSim-<ver>-mac.zip \
+    --base-url https://your.server/client
+
+docker cp /tmp/SailSim-<ver>-win.zip sail-sim-nodejs:/tmp/
+docker exec -it sail-sim-nodejs \
+  node server/scripts/client-release.js publish \
+    --platform win --version <ver> --file /tmp/SailSim-<ver>-win.zip \
+    --base-url https://your.server/client
 ```
 
-This writes into **`server/assets/client/`** — served at **`/client`** — the signed zips plus `appcast-mac.xml`
-and `appcast-win.xml` (the feeds the installed clients poll). That folder is git-ignored (built artifacts), so a
-fresh checkout/deploy starts empty and is filled by publishing.
+Publish writes the signed zip + `appcast-mac.xml` / `appcast-win.xml` into `server/assets/client/`, served at
+**`/client`** — the feed URLs you baked into the builds. Installed clients pick up the update on their next
+launch. Done.
 
-**Docker:** `server/assets/client/` (the releases) and `server/.sparkle/` (your signing key) live inside the
-container. Mount both as **volumes** so they survive container rebuilds — otherwise every redeploy wipes your
-published releases and, critically, your signing key.
+### Important: persist the key + releases across deploys (Docker volumes)
+
+`server/assets/client/` and `server/.sparkle/` are git-ignored, so they're **not** in the image — they live only
+in the running container. **Mount both as volumes** in your `docker compose` so a `docker compose up --build`
+doesn't wipe your published releases and, critically, your one-and-only signing key. If they're host-mounted
+volumes you can skip the `docker cp` and just run the publish script on the host (with Node installed), pointing
+`--file` straight at the volume path.
 
 # Credits
 

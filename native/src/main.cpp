@@ -1665,7 +1665,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   fx.blurHUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   fx.blurVUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   fx.fxaaUbuf = wgpuDeviceCreateBuffer(device, &ubd);
-  ubd.size = 2 * sizeof(glm::mat4) + sizeof(glm::vec4);   // TAA: invVP + prevVP + texel/params
+  ubd.size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);   // TAA: invVP + prevVP + texel + params
   fx.taaUbuf = wgpuDeviceCreateBuffer(device, &ubd);
 
   // ── SMAA setup ──────────────────────────────────────────────────────────────
@@ -3247,7 +3247,9 @@ int main(int argc, char** argv) {
   // TAA (experimental, opt-in): SAILSIM_TAA enables it; SAILSIM_TAA_FEEDBACK tunes the history
   // blend (0.9 = strong smoothing). Gated on its own bool so it doesn't touch the FXAA/SMAA combo.
   const bool  taaEnabled  = std::getenv("SAILSIM_TAA") != nullptr;
-  const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.9f;
+  const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.8f;
+  const float taaSharpen  = std::getenv("SAILSIM_TAA_SHARPEN")  ? (float)atof(std::getenv("SAILSIM_TAA_SHARPEN"))  : 0.35f;
+  const float taaClamp    = std::getenv("SAILSIM_TAA_CLAMP")    ? (float)atof(std::getenv("SAILSIM_TAA_CLAMP"))    : 0.4f;   // variance-clip gamma (tight — busy ocean)
   const float cloudDenoiseBypass = std::getenv("SAILSIM_NODENOISE") ? 1.0f : 0.0f;  // debug: skip the cloud blur
   // Cloud tonemap exposure (0.5) + sun gain (15.0), env-tunable for tuning. The bright sun
   // term used to slam into a hard 1.1 exposure and wash all internal billow detail to flat
@@ -3563,7 +3565,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 2; ++i) {
       if (taaBind[i]) wgpuBindGroupRelease(taaBind[i]);
       WGPUBindGroupEntry e[5] = {};
-      e[0].binding = 0; e[0].buffer = postFx.taaUbuf; e[0].size = 2 * sizeof(glm::mat4) + sizeof(glm::vec4);
+      e[0].binding = 0; e[0].buffer = postFx.taaUbuf; e[0].size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);
       e[1].binding = 1; e[1].textureView = ldrView;
       e[2].binding = 2; e[2].sampler = postFx.samp;
       e[3].binding = 3; e[3].textureView = depthReadView;
@@ -8974,10 +8976,11 @@ int main(int argc, char** argv) {
       // TAA: resolve current LDR + reprojected history into hist[taaCur] (render res), then blit that
       // to the swapchain (fxaa passthrough) + UI. Reprojection uses the UNjittered matrices; the
       // shader's neighborhood clamp rejects ghosting. History ping-pongs; first frame has none.
-      struct TaaUC { glm::mat4 invVP; glm::mat4 prevVP; glm::vec4 texel; } tu;
+      struct TaaUC { glm::mat4 invVP; glm::mat4 prevVP; glm::vec4 texel; glm::vec4 params; } tu;
       tu.invVP  = glm::inverse(taaCurVP);
       tu.prevVP = taaPrevVP;
       tu.texel  = glm::vec4(1.0f / (float)rW, 1.0f / (float)rH, taaFeedback, taaHistValid ? 1.0f : 0.0f);
+      tu.params = glm::vec4(taaSharpen, taaClamp, 0.0f, 0.0f);
       wgpuQueueWriteBuffer(queue, postFx.taaUbuf, 0, &tu, sizeof(tu));
       {
         WGPURenderPassColorAttachment ca = {};

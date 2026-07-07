@@ -13,7 +13,8 @@
 struct TaaU {
   invVP  : mat4x4<f32>,   // current unjittered inverse view-proj (NDC -> world)
   prevVP : mat4x4<f32>,   // previous frame unjittered view-proj (world -> prev NDC)
-  texel  : vec4<f32>,     // x,y = 1/w,1/h ; z = history feedback (0.9) ; w = 1 if history valid
+  texel  : vec4<f32>,     // x,y = 1/w,1/h ; z = history feedback ; w = 1 if history valid
+  params : vec4<f32>,     // x = sharpen amount ; y = variance-clip gamma ; z,w reserved
 };
 @group(0) @binding(0) var<uniform> u : TaaU;
 @group(0) @binding(1) var curTex   : texture_2d<f32>;   // this frame, post-graded (render res)
@@ -55,18 +56,28 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   var hist = textureSampleLevel(histTex, linSamp, puv, 0.0).rgb;
 
-  // Neighborhood clamp: bound history to the current 3x3 colour AABB — the standard TAA ghosting
-  // reject for disocclusion and moving objects (which camera-only reprojection gets wrong).
-  var mn = cur;
-  var mx = cur;
+  // Variance clipping (Salvi): clip history to the current 3x3 colour distribution's mean ± gamma*
+  // stddev, NOT its min/max AABB. On high-variance regions (foam/glints/sail-vs-water edges) the AABB
+  // is huge and lets stale history smear into rainbow trails; mean±sigma is far tighter, so it rejects
+  // the ghosting camera-only reprojection can't. gamma (params.y) tunes tightness — lower = crisper,
+  // less ghosting, more shimmer.
+  var m1 = vec3<f32>(0.0);
+  var m2 = vec3<f32>(0.0);
   for (var dy = -1; dy <= 1; dy = dy + 1) {
     for (var dx = -1; dx <= 1; dx = dx + 1) {
       let s = textureSampleLevel(curTex, linSamp, uv + vec2<f32>(f32(dx), f32(dy)) * u.texel.xy, 0.0).rgb;
-      mn = min(mn, s);
-      mx = max(mx, s);
+      m1 = m1 + s;
+      m2 = m2 + s * s;
     }
   }
-  hist = clamp(hist, mn, mx);
+  let mean  = m1 * (1.0 / 9.0);
+  let sigma = sqrt(max(m2 * (1.0 / 9.0) - mean * mean, vec3<f32>(0.0)));
+  let gamma = u.params.y;
+  hist = clamp(hist, mean - gamma * sigma, mean + gamma * sigma);
 
-  return vec4<f32>(mix(cur, hist, u.texel.z), 1.0);
+  var outc = mix(cur, hist, u.texel.z);
+  // Sharpen: unsharp-mask against the 3x3 mean to claw back the softening from bilinear history
+  // resampling (the classic TAA blur). params.x = amount; 0 disables.
+  outc = max(outc + (outc - mean) * u.params.x, vec3<f32>(0.0));
+  return vec4<f32>(outc, 1.0);
 }

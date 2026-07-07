@@ -1182,7 +1182,9 @@ export class VolumetricCloudsPlugin {
     }
     this.loadTextures(
       options.weatherTextureUrl ?? 'https://celeste-twinkle.github.io/Babylon-App-Show/clouds/pebbles.png',
-      options.volumeNoiseUrl    ?? 'https://celeste-twinkle.github.io/Babylon-App-Show/clouds/greyNoise3D.bin',
+      // No default URL: the 3D noise volume is generated locally (buildNoiseVolume3D) so the
+      // client has no external asset dependency. Pass volumeNoiseUrl only to override it.
+      options.volumeNoiseUrl,
     );
   }
 
@@ -1405,7 +1407,9 @@ export class VolumetricCloudsPlugin {
     // Direct sun beam — golden/orange near the horizon (sunrise & sunset), cooling to a
     // bright near-white at noon. Values >1 at noon (HDR) so lit cloud reads bright through
     // ACES. The blue & green channels drop hardest at low sun, giving warm low-angle light.
-    const sunBright = 0.05 + 1.7 * el;
+    // Bumped 1.7 → 2.0: the authored grey-noise volume gives enough internal structure that
+    // brighter sunlit faces read as luminous billows rather than washing to a flat blob.
+    const sunBright = 0.05 + 2.0 * el;
     const sunColor = new Vector3(
       sunBright,
       sunBright * (0.52 + 0.48 * el),
@@ -1516,7 +1520,7 @@ export class VolumetricCloudsPlugin {
 
   // ── Texture loading ───────────────────────────────────────────────────────
 
-  private loadTextures(weatherUrl: string, noiseUrl: string): void {
+  private loadTextures(weatherUrl: string, noiseUrl?: string): void {
     // 2-D coverage / weather texture.
     if (this.useGreyNoiseWeather) {
       // Procedural smooth value-noise FBM — matches the character of the Shadertoy's
@@ -1534,21 +1538,30 @@ export class VolumetricCloudsPlugin {
       this.weatherTex.wrapV = Texture.MIRROR_ADDRESSMODE;
     }
 
-    // 3-D grey-noise bin → repacked as 2-D atlas.
-    fetch(noiseUrl)
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.arrayBuffer();
-      })
-      .then(buf => {
-        this.noiseTex = this.buildNoiseAtlas(buf);
-        console.log(
-          `[VolumetricClouds] 3D noise atlas ready (${this.noiseDim}³ → ${this.atlasW}×${this.atlasH})`,
-        );
-      })
-      .catch(err => {
-        console.warn('[VolumetricClouds] Could not load 3D noise:', err);
-      });
+    // 3-D noise volume. Default: generated locally (no external asset). An explicit
+    // volumeNoiseUrl overrides it with a fetched grey-noise .bin.
+    if (noiseUrl) {
+      fetch(noiseUrl)
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.arrayBuffer();
+        })
+        .then(buf => {
+          this.noiseTex = this.buildNoiseAtlas(buf);
+          console.log(
+            `[VolumetricClouds] 3D noise atlas ready (${this.noiseDim}³ → ${this.atlasW}×${this.atlasH})`,
+          );
+        })
+        .catch(err => {
+          console.warn('[VolumetricClouds] Could not load 3D noise, falling back to local:', err);
+          this.noiseTex = this.buildNoiseVolume3D(this.noiseDim);
+        });
+    } else {
+      this.noiseTex = this.buildNoiseVolume3D(this.noiseDim);
+      console.log(
+        `[VolumetricClouds] 3D noise atlas generated locally (${this.noiseDim}³ → ${this.atlasW}×${this.atlasH})`,
+      );
+    }
   }
 
   /**
@@ -1676,9 +1689,13 @@ export class VolumetricCloudsPlugin {
     const h  = dv.getInt32(8,  true);
     const d  = dv.getInt32(12, true);
     const src = new Uint8Array(buf, 20);
+    return this.packNoiseAtlas(src, w, h, d);   // assume w === h (square slices)
+  }
 
+  /** Packs a w×h×d single-channel voxel volume into the 2-D atlas (cols = ATLAS_COLS) RawTexture. */
+  private packNoiseAtlas(src: Uint8Array, w: number, h: number, d: number): RawTexture {
     // Record actual dimensions for the shader uniforms.
-    this.noiseDim   = w;   // assume w === h (square slices)
+    this.noiseDim   = w;
     this.noiseDepth = d;
 
     // Choose an atlas grid that fits all d slices.
@@ -1717,6 +1734,73 @@ export class VolumetricCloudsPlugin {
     tex.wrapU = Texture.WRAP_ADDRESSMODE;
     tex.wrapV = Texture.WRAP_ADDRESSMODE;
     return tex;
+  }
+
+  /**
+   * Generates a seamless tiling dim³ grey-noise volume locally — no external asset. A smooth
+   * value-noise base carries the large-scale cloud shape; Worley (cellular) octaves add the
+   * crisp high-frequency structure the density erosion bites into. Mirrors the native client's
+   * baked noise so both stay consistent. All octave periods divide `dim`, so the volume tiles.
+   */
+  private buildNoiseVolume3D(dim: number): RawTexture {
+    // Integer-lattice hash, periodic in P (Math.imul keeps the mixing 32-bit under JS doubles).
+    const hash = (x: number, y: number, z: number, P: number): number => {
+      x = ((x % P) + P) % P; y = ((y % P) + P) % P; z = ((z % P) + P) % P;
+      let n = (Math.imul(x, 73856093) ^ Math.imul(y, 19349663) ^ Math.imul(z, 83492791)) >>> 0;
+      n = (n ^ (n << 13)) >>> 0;
+      n = (Math.imul(n, (Math.imul(Math.imul(n, n), 15731) + 789221) | 0) + 1376312589) >>> 0;
+      return (n & 0x7fffffff) / 0x7fffffff;
+    };
+    const smooth = (t: number): number => t * t * (3 - 2 * t);
+    const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+
+    // Trilinear value noise on a lattice of period P.
+    const valueNoise = (fx: number, fy: number, fz: number, P: number): number => {
+      const ux = fx * P, uy = fy * P, uz = fz * P;
+      const ix = Math.floor(ux), iy = Math.floor(uy), iz = Math.floor(uz);
+      const tx = smooth(ux - ix), ty = smooth(uy - iy), tz = smooth(uz - iz);
+      const L = (dx: number, dy: number, dz: number): number => hash(ix + dx, iy + dy, iz + dz, P);
+      const c00 = lerp(L(0, 0, 0), L(1, 0, 0), tx), c10 = lerp(L(0, 1, 0), L(1, 1, 0), tx);
+      const c01 = lerp(L(0, 0, 1), L(1, 0, 1), tx), c11 = lerp(L(0, 1, 1), L(1, 1, 1), tx);
+      return lerp(lerp(c00, c10, ty), lerp(c01, c11, ty), tz);
+    };
+
+    // Tiling 3-D Worley (cellular) noise, period P: 1 - distance to the nearest feature point.
+    const worley = (fx: number, fy: number, fz: number, P: number): number => {
+      const ux = fx * P, uy = fy * P, uz = fz * P;
+      const ix = Math.floor(ux), iy = Math.floor(uy), iz = Math.floor(uz);
+      let best = 3.0;
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const cx = ix + dx, cy = iy + dy, cz = iz + dz;
+            const px = cx + hash(cx, cy, cz, P);          // hash wraps at P → seamless tile
+            const py = cy + hash(cx + 17, cy + 43, cz + 7, P);
+            const pz = cz + hash(cx + 101, cy + 71, cz + 131, P);
+            const d2 = (px - ux) * (px - ux) + (py - uy) * (py - uy) + (pz - uz) * (pz - uz);
+            if (d2 < best) best = d2;
+          }
+        }
+      }
+      return Math.max(0, Math.min(1, 1 - Math.sqrt(best)));
+    };
+
+    const vol = new Uint8Array(dim * dim * dim);
+    for (let z = 0; z < dim; z++) {
+      for (let y = 0; y < dim; y++) {
+        for (let x = 0; x < dim; x++) {
+          const fx = x / dim, fy = y / dim, fz = z / dim;
+          const base = 0.55 * valueNoise(fx, fy, fz, 4)
+                     + 0.30 * valueNoise(fx, fy, fz, 8)
+                     + 0.15 * valueNoise(fx, fy, fz, 16);
+          const detail = 0.55 * worley(fx, fy, fz, 8)
+                       + 0.45 * worley(fx, fy, fz, 16);
+          const f = base * 0.72 + detail * 0.28;   // mostly base (shape) + a detail layer
+          vol[z * dim * dim + y * dim + x] = Math.max(0, Math.min(255, Math.round(f * 255)));
+        }
+      }
+    }
+    return this.packNoiseAtlas(vol, dim, dim, dim);
   }
 
   // ── Public API ────────────────────────────────────────────────────────────

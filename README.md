@@ -104,6 +104,19 @@ public HTTPS site, `<your-public-key>` = the base64 key printed by keygen, and `
 container's name (from `docker compose`). Feed URLs **must be HTTPS** in production (Sparkle/WinSparkle refuse
 plain http). One SSH key from each dev machine to the server makes `scp` passwordless.
 
+**Where the client connects is baked into the build** — a player never types a server address. Set it with the
+build options below:
+
+- `SAILSIM_SERVER_HOST` / `SAILSIM_SERVER_PORT` — your backend's public host + port (default `localhost:9080`).
+- `SAILSIM_SERVER_TLS=ON` — connect over **TLS** (`wss://` + `https://`). Use this for any public server; a plain
+  `ws://` login sends the auth token in the clear.
+- `SAILSIM_TLS` (default `ON`) — compiles TLS support in; **requires OpenSSL** (`brew install openssl` on macOS,
+  `apt install libssl-dev` on Ubuntu, an OpenSSL install/vcpkg on Windows). Build with `-DSAILSIM_TLS=OFF` for an
+  http/ws-only client with no OpenSSL dependency.
+
+(For local testing you don't rebuild — `SAILSIM_HOST` / `SAILSIM_PORT` / `SAILSIM_TLS` env vars override the
+baked-in values at launch.)
+
 ### Step 1 — Build the client
 
 **On a Mac** (produces the `.app` bundle, Sparkle embedded):
@@ -111,6 +124,7 @@ plain http). One SSH key from each dev machine to the server makes `scp` passwor
 ``` sh
 cd native
 cmake -S . -B build-mac -DSAILSIM_MACOS_BUNDLE=ON \
+  -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON \
   -DSAILSIM_SPARKLE_FEED_URL=https://your.server/client/appcast-mac.xml \
   -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-mac
@@ -123,7 +137,7 @@ cd build-mac/bin && ditto -c -k --keepParent sailsim_native.app SailSim-<ver>-ma
 
 ``` powershell
 cd native
-cmake -S . -B build-win -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
+cmake -S . -B build-win -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
 cmake --build build-win --config Release
 # Zip the whole output folder (.exe + WinSparkle.dll):
 Compress-Archive -Path build-win\bin\Release\* -DestinationPath SailSim-<ver>-win.zip

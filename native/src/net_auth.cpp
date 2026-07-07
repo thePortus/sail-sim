@@ -1,6 +1,7 @@
 #include "net_auth.hpp"
 
 #include <httplib.h>          // header-only; plain HTTP (dev server is http://localhost:9080)
+#include "netcfg.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
 
@@ -13,7 +14,7 @@ namespace {
 net::AuthResult postJson(const std::string& host, int port,
                          const std::string& path, const json& body) {
   net::AuthResult r;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
 
@@ -53,7 +54,7 @@ AuthResult login(const std::string& host, int port,
 
 AuthResult me(const std::string& host, int port, const std::string& token) {
   AuthResult r;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
 
@@ -82,7 +83,7 @@ AuthResult me(const std::string& host, int port, const std::string& token) {
 
 LocationResult playerLocation(const std::string& host, int port, const std::string& token) {
   LocationResult r;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
@@ -107,7 +108,7 @@ LocationResult playerLocation(const std::string& host, int port, const std::stri
 VesselPhysics vesselPhysics(const std::string& host, int port, const std::string& slug,
                             const std::string& token) {
   VesselPhysics r;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers;

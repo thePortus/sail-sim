@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include <httplib.h>
+#include "netcfg.hpp"
 #include <nlohmann/json.hpp>
 #include "asset_cache.hpp"    // ETag disk cache (stream once, revalidate on later loads)
 #include "stb_image.h"        // implementation lives in stb_impl.cpp
@@ -44,7 +45,7 @@ static float bottomPad(const Image& img) {
 
 Set fetchAll(const std::string& host, int port) {
   Set s;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(30, 0);
   bool all = true;
@@ -97,7 +98,7 @@ Set fetchAll(const std::string& host, int port) {
 
 std::vector<VesselRow> fetchVessels(const std::string& host, int port) {
   std::vector<VesselRow> out;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(15, 0);
   auto res = cli.Get("/vessels");

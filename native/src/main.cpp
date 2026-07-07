@@ -60,6 +60,7 @@
 #include "net_auth.hpp"
 #include "net_mp.hpp"
 #include "asset_cache.hpp"
+#include "netcfg.hpp"
 #include "paths.hpp"
 #include "updater.hpp"
 #include "combat.hpp"
@@ -2735,6 +2736,8 @@ int main(int argc, char** argv) {
   }
   // One-time move of any legacy ~/.sailsim_* files into the OS-standard data/cache dirs (idempotent).
   paths::migrateLegacy();
+  // Resolve the backend address + scheme (compiled defaults, overridable by SAILSIM_HOST/PORT/TLS env).
+  netcfg::init();
 
   // Model to draw: argv[1] > $SAILSIM_MODEL > the ship (default) > rock > cube.
   const char* modelArg = (argc > 1) ? argv[1] : std::getenv("SAILSIM_MODEL");
@@ -2753,9 +2756,8 @@ int main(int argc, char** argv) {
   // no window. SAILSIM_AUTH_TEST=login|register, SAILSIM_AUTH_USER / _PASS / _CALLSIGN.
   // With no user set it posts a bogus login to verify connectivity + error parsing.
   if (const char* authMode = std::getenv("SAILSIM_AUTH_TEST")) {
-    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
-    const char* portEnv = std::getenv("SAILSIM_PORT");
-    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const std::string host = netcfg::host();
+    const int port = netcfg::port();
     const char* u  = std::getenv("SAILSIM_AUTH_USER");
     const char* p  = std::getenv("SAILSIM_AUTH_PASS");
     const char* cs = std::getenv("SAILSIM_AUTH_CALLSIGN");
@@ -2767,7 +2769,7 @@ int main(int argc, char** argv) {
       : (std::string(authMode) == "me")       ? net::me(host, port, tok ? tok : "")
       :                                          net::login(host, port, user, pass);
     std::printf("[auth-test] %s %s:%d user=%s -> ok=%d status=%d\n",
-                authMode, host, port, user.c_str(), (int)r.ok, r.status);
+                authMode, host.c_str(), port, user.c_str(), (int)r.ok, r.status);
     if (r.ok) std::printf("[auth-test] callsign=%s role=%s token=%.16s...\n",
                           r.callsign.c_str(), r.role.c_str(), r.token.c_str());
     else      std::printf("[auth-test] error=\"%s\"\n", r.error.c_str());
@@ -2777,9 +2779,8 @@ int main(int argc, char** argv) {
   // Headless WebSocket gameplay test: login, open the socket, exchange a few
   // messages, report what came back. SAILSIM_WS_TEST=1 (+ SAILSIM_AUTH_USER/_PASS).
   if (std::getenv("SAILSIM_WS_TEST")) {
-    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
-    const char* portEnv = std::getenv("SAILSIM_PORT");
-    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const std::string host = netcfg::host();
+    const int port = netcfg::port();
     const char* u = std::getenv("SAILSIM_AUTH_USER");
     const char* p = std::getenv("SAILSIM_AUTH_PASS");
     net::AuthResult lr = net::login(host, port, u ? u : "native_probe_01", p ? p : "testpass123");
@@ -2814,9 +2815,8 @@ int main(int argc, char** argv) {
   // wave_state pins to it, then clear it and check the teleport gate.
   // SAILSIM_ADMIN_TEST=1 (+ SAILSIM_AUTH_USER/_PASS — needs role admin|owner).
   if (std::getenv("SAILSIM_ADMIN_TEST")) {
-    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
-    const char* portEnv = std::getenv("SAILSIM_PORT");
-    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const std::string host = netcfg::host();
+    const int port = netcfg::port();
     const char* u = std::getenv("SAILSIM_AUTH_USER");
     const char* p = std::getenv("SAILSIM_AUTH_PASS");
     net::AuthResult lr = net::login(host, port, u ? u : "sail-sim-owner", p ? p : "password");
@@ -2854,9 +2854,8 @@ int main(int argc, char** argv) {
 
   // Headless terrain-data test: fetch + decode the heightfield and sample it.
   if (std::getenv("SAILSIM_TERRAIN_TEST")) {
-    const char* host = std::getenv("SAILSIM_HOST"); if (!host) host = "localhost";
-    const char* portEnv = std::getenv("SAILSIM_PORT");
-    const int port = portEnv ? std::atoi(portEnv) : 9080;
+    const std::string host = netcfg::host();
+    const int port = netcfg::port();
     terrain::Terrain terr;
     if (!terr.load(host, port)) return EXIT_FAILURE;
     const terrain::Manifest& m = terr.manifest();
@@ -3120,18 +3119,18 @@ int main(int argc, char** argv) {
   // Celestial textures (moon colour map + all-sky star map) fetched + decoded off
   // the render thread; uploaded and wired into the sky bind group once ready.
   std::future<sky::Image> moonFuture = std::async(std::launch::async,
-      [kHost = std::string("localhost"), kPortSky = 9080] { return sky::fetch(kHost, kPortSky, "moon"); });
+      [kHost = netcfg::host(), kPortSky = netcfg::port()] { return sky::fetch(kHost, kPortSky, "moon"); });
   std::future<sky::Image> starsFuture = std::async(std::launch::async,
-      [kHost = std::string("localhost"), kPortSky = 9080] { return sky::fetch(kHost, kPortSky, "stars", 4096); });
+      [kHost = netcfg::host(), kPortSky = netcfg::port()] { return sky::fetch(kHost, kPortSky, "stars", 4096); });
   // Biome tiles + splat map (the Angular terrain skinning textures), off-thread.
   std::future<biome::Set> biomeFuture = std::async(std::launch::async,
-      [kHost = std::string("localhost"), kPortSky = 9080] { return biome::fetchAll(kHost, kPortSky); });
+      [kHost = netcfg::host(), kPortSky = netcfg::port()] { return biome::fetchAll(kHost, kPortSky); });
   bool biomeReady = false;
 
   // LOD impostor atlases (ships + town buildings), off-thread. Uploaded when both
   // the fetch AND the terrain manifest (for building placements) have landed.
   std::future<props::Set> propsFuture = std::async(std::launch::async,
-      [kHost = std::string("localhost"), kPortSky = 9080] { return props::fetchAll(kHost, kPortSky); });
+      [kHost = netcfg::host(), kPortSky = netcfg::port()] { return props::fetchAll(kHost, kPortSky); });
   props::Set propsSet; bool propsFetched = false, propsUploaded = false;
   ShipImpRender shipImp = createShipImpRender(device, kSceneFormat);
   TownImpRender townImp = createTownImpRender(device, kSceneFormat);
@@ -3170,7 +3169,7 @@ int main(int argc, char** argv) {
   if (!headlessMute && audioSys.init()) {
     // SAILSIM_VOLUME (debug) beats the saved setting; otherwise restore it.
     if (!std::getenv("SAILSIM_VOLUME")) audioSys.setMasterVolume(userCfg.sfxVolume);
-    musicMgr.init("localhost", 9080, &audioSys, userCfg.musicEnabled, userCfg.musicVolume);
+    musicMgr.init(netcfg::host(), netcfg::port(), &audioSys, userCfg.musicEnabled, userCfg.musicVolume);
   }
   // Escape menu / settings page state.
   bool escMenu = false, settingsOpen = false, prevEscKey = false;
@@ -3661,8 +3660,8 @@ int main(int argc, char** argv) {
   // App state: sign in first, then sail. The ocean scene renders behind the login.
   enum class AppState { Login, Connecting, Sailing };
   AppState appState = AppState::Login;
-  const std::string kHost = "localhost";
-  const int         kPort = 9080;
+  const std::string kHost = netcfg::host();
+  const int         kPort = netcfg::port();
   g_assetHost = kHost; g_assetPort = kPort;   // asset streaming target for the disk cache (geomAsset/assetcache)
   char uiUser[64] = "", uiPass[64] = "", uiCallsign[64] = "";
   bool uiRegisterMode = false, uiRemember = false;

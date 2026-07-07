@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include <httplib.h>
+#include "netcfg.hpp"
 #include <nlohmann/json.hpp>
 
 #include "asset_cache.hpp"
@@ -14,7 +15,7 @@ using json = nlohmann::json;
 namespace terrain {
 
 bool Terrain::load(const std::string& host, int port) {
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(15, 0);
 

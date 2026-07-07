@@ -1,6 +1,7 @@
 #include "net_admin.hpp"
 
 #include <httplib.h>          // header-only; plain HTTP (dev server is http://localhost:9080)
+#include "netcfg.hpp"
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -31,7 +32,7 @@ net::AdminResult fromResponse(const httplib::Result& res,
 
 net::AdminResult postJson(const std::string& host, int port, const std::string& token,
                           const std::string& path, const json& body) {
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};
@@ -40,7 +41,7 @@ net::AdminResult postJson(const std::string& host, int port, const std::string& 
 
 net::AdminResult del(const std::string& host, int port, const std::string& token,
                      const std::string& path) {
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(5, 0);
   cli.set_read_timeout(5, 0);
   httplib::Headers headers = {{ "Authorization", "Bearer " + token }};

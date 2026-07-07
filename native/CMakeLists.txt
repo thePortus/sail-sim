@@ -25,6 +25,18 @@ set(SAILSIM_SPARKLE_FEED_URL     "https://CHANGEME.example/client/appcast-mac.xm
 set(SAILSIM_SPARKLE_FEED_URL_WIN "https://CHANGEME.example/client/appcast-win.xml" CACHE STRING "WinSparkle appcast feed URL")
 set(SAILSIM_SPARKLE_PUBKEY       "tRLH7wCxtVSWI6d2lwbwliBgNoJGizATw2qG4XQSfvo=" CACHE STRING "Ed25519 public key (SUPublicEDKey / WinSparkle EdDSA)")
 
+# Backend the client connects to (login + gameplay WebSocket + asset streaming). Baked into the build; a player
+# never types a server address. SAILSIM_HOST/SAILSIM_PORT/SAILSIM_TLS env vars override at runtime (for dev).
+set(SAILSIM_SERVER_HOST "localhost" CACHE STRING "Default backend host the client connects to")
+set(SAILSIM_SERVER_PORT "9080"      CACHE STRING "Default backend port")
+option(SAILSIM_SERVER_TLS "Default to TLS (https/wss) at runtime" OFF)
+# Compile TLS support (https/wss) — needs OpenSSL. On: one build speaks both http/ws and https/wss, scheme
+# chosen at runtime by SAILSIM_SERVER_TLS / $SAILSIM_TLS. Off: http/ws only, no OpenSSL dependency.
+option(SAILSIM_TLS "Compile TLS (https/wss) support — requires OpenSSL" ON)
+if (SAILSIM_TLS)
+  find_package(OpenSSL REQUIRED)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -225,16 +237,20 @@ set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ── IXWebSocket (raw WebSocket client for gameplay) ──────────────────────────
-# TLS off for now (dev server is ws://localhost); for the wss:// production
-# endpoint, rebuild with -DUSE_TLS=ON (SecureTransport on macOS, OpenSSL/mbedTLS
-# elsewhere). zlib off to avoid the dependency (permessage-deflate is optional).
+# TLS follows SAILSIM_TLS: on -> wss:// via OpenSSL (same backend as httplib, cross-platform); off -> ws:// only.
+# zlib off to avoid the dependency (permessage-deflate is optional).
 FetchContent_Declare(
   ixwebsocket
   GIT_REPOSITORY https://github.com/machinezone/IXWebSocket
   GIT_TAG        v11.4.5
   GIT_SHALLOW    ON
 )
-set(USE_TLS OFF CACHE BOOL "" FORCE)
+if (SAILSIM_TLS)
+  set(USE_TLS ON CACHE BOOL "" FORCE)
+  set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
+else()
+  set(USE_TLS OFF CACHE BOOL "" FORCE)
+endif()
 set(USE_ZLIB OFF CACHE BOOL "" FORCE)
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ixwebsocket)
@@ -340,6 +356,7 @@ add_executable(sailsim_native
   src/net_auth.cpp
   src/net_mp.cpp
   src/asset_cache.cpp
+  src/netcfg.cpp
   src/paths.cpp
   src/session.cpp
   src/props_assets.cpp
@@ -373,7 +390,19 @@ get_filename_component(SAILSIM_SHIP_MODEL_PATH
 target_compile_definitions(sailsim_native PRIVATE
   SAILSIM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
   SAILSIM_VERSION="${SAILSIM_VERSION}"
-  SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}")
+  SAILSIM_SHIP_MODEL="${SAILSIM_SHIP_MODEL_PATH}"
+  SAILSIM_SERVER_HOST="${SAILSIM_SERVER_HOST}"
+  SAILSIM_SERVER_PORT=${SAILSIM_SERVER_PORT})
+# TLS: compile OpenSSL support into httplib (globally, so every TU sees the same Client layout) + link OpenSSL.
+# The runtime default scheme is SAILSIM_SERVER_TLS ($<BOOL> -> 0/1); env $SAILSIM_TLS overrides it per launch.
+if (SAILSIM_TLS)
+  target_compile_definitions(sailsim_native PRIVATE
+    SAILSIM_HAVE_TLS=1 CPPHTTPLIB_OPENSSL_SUPPORT=1
+    SAILSIM_SERVER_TLS_DEFAULT=$<BOOL:${SAILSIM_SERVER_TLS}>)
+  target_link_libraries(sailsim_native PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+else()
+  target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_TLS=0 SAILSIM_SERVER_TLS_DEFAULT=0)
+endif()
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json ixwebsocket)
 
 # The distribution defines WEBGPU_BACKEND_DAWN / _WGPU so source can branch on

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <httplib.h>
+#include "netcfg.hpp"
 #include <nlohmann/json.hpp>
 #include "asset_cache.hpp"
 
@@ -204,7 +205,7 @@ void Manager::init(const std::string& host, int port, audio::System* audio,
   enabled_ = enabled;
   volume_ = std::max(0.0f, std::min(1.0f, volume));
   impl->fetchJob = std::async(std::launch::async, [this, host, port] {
-    httplib::Client cli(host, port);
+    httplib::Client cli(netcfg::baseUrl(host, port));
     cli.set_read_timeout(20, 0);
     auto res = assetcache::get(cli, "/music");
     if (!res.ok) {

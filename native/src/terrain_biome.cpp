@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include <httplib.h>          // header-only; plain HTTP (dev server is http://localhost:9080)
+#include "netcfg.hpp"
 #include "asset_cache.hpp"    // ETag disk cache (stream once, revalidate on later loads)
 #include "stb_image.h"        // decode; implementation lives in stb_impl.cpp
 #include "stb_image_resize2.h"
@@ -46,7 +47,7 @@ static Image fetchOne(httplib::Client& cli, const std::string& path, int maxW, b
 
 Set fetchAll(const std::string& host, int port, int tileW) {
   Set s;
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(30, 0);
 

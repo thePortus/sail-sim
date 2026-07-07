@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include "paths.hpp"
+#include "netcfg.hpp"
 
 namespace fs = std::filesystem;
 
@@ -121,7 +122,7 @@ Result get(httplib::Client& cli, const std::string& urlPath) {
 }
 
 Result get(const std::string& host, int port, const std::string& urlPath) {
-  httplib::Client cli(host, port);
+  httplib::Client cli(netcfg::baseUrl(host, port));
   cli.set_connection_timeout(8, 0);
   cli.set_read_timeout(30, 0);
   return get(cli, urlPath);

@@ -8,6 +8,8 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <nlohmann/json.hpp>
 
+#include "netcfg.hpp"
+
 using json = nlohmann::json;
 
 namespace mp {
@@ -485,7 +487,8 @@ Client::~Client() {
 void Client::connect(const std::string& host, int port, const std::string& token) {
   // Explicit "/" path so the query survives (raw clients don't normalise an empty
   // path the way browsers do). JWT is base64url, so it needs no percent-encoding.
-  p_->ws.setUrl("ws://" + host + ":" + std::to_string(port) + "/?token=" + token);
+  // Scheme (ws/wss) follows the build's TLS config via netcfg (ixwebsocket needs USE_TLS for wss).
+  p_->ws.setUrl(std::string(netcfg::wsScheme()) + "://" + host + ":" + std::to_string(port) + "/?token=" + token);
   p_->conn = ConnState::Connecting;
 
   Impl* impl = p_.get();

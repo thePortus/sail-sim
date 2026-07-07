@@ -1,5 +1,6 @@
 # CMake build output (includes the fetched WebGPU backend — large)
 build/
+build-mac/
 out/
 cmake-build-*/
 

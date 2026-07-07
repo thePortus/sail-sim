@@ -2563,6 +2563,7 @@ struct CloudU {
   glm::vec4 sunCol; glm::vec4 skyCol; glm::vec4 groundCol;
   glm::vec4 slab;   // cloudBase, cloudTop, coverage, type
   glm::vec4 anim;   // time, driftX, driftZ, farZ
+  glm::vec4 dbg;    // sunGain, tonemapExposure, _, _  (env-tunable, debug)
 };
 struct Clouds {
   WGPURenderPipeline pipeline; WGPUShaderModule module; WGPUBuffer uniformBuf;
@@ -2595,17 +2596,77 @@ static float cn_valueNoise3(float fx, float fy, float fz, int P) {
   return cn_lerp(cn_lerp(c00, c10, ty), cn_lerp(c01, c11, ty), tz);
 }
 
+// Tiling 3-D Worley (cellular) noise, period P: 1 - distance to the nearest hashed
+// feature point. Value noise smoothed on a 32-voxel lattice can only carry detail down
+// to a ~2-texel wavelength (and a finer octave that tiles at 32 would be pure per-voxel
+// white noise). Worley gives crisp *structured* per-cell edges at P=8/16 — the cauliflower
+// billow detail the reference gets from its authored grey-noise volume.
+static float cn_worley3(float fx, float fy, float fz, int P) {
+  float ux = fx * P, uy = fy * P, uz = fz * P;
+  int ix = (int)std::floor(ux), iy = (int)std::floor(uy), iz = (int)std::floor(uz);
+  float best = 3.0f;
+  for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+      for (int dx = -1; dx <= 1; ++dx) {
+        int cx = ix + dx, cy = iy + dy, cz = iz + dz;
+        // Feature point = cell corner + a hashed [0,1) offset. cn_lattice wraps its coords
+        // at P, so cell -1 hashes identically to P-1 → the field tiles seamlessly at 32.
+        float ox = cn_lattice(cx, cy, cz, P);
+        float oy = cn_lattice(cx + 17, cy + 43, cz + 7, P);
+        float oz = cn_lattice(cx + 101, cy + 71, cz + 131, P);
+        float px = (float)cx + ox, py = (float)cy + oy, pz = (float)cz + oz;
+        float d2 = (px - ux) * (px - ux) + (py - uy) * (py - uy) + (pz - uz) * (pz - uz);
+        best = std::min(best, d2);
+      }
+  return glm::clamp(1.0f - std::sqrt(best), 0.0f, 1.0f);
+}
+
+// Fetch the authored 3-D grey-noise volume our server vendors (/clouds/greyNoise3D.bin, via
+// `npm run download:cloud-noise`) — the same asset the Angular client uses, so both match. Format:
+// 20-byte header ("BIN" + w,h,d,channels as int32 LE) then w*h*d grey bytes (z-major). Returns the
+// 32³ voxels on success, or empty on any failure (offline / not downloaded) so the caller bakes noise.
+static std::vector<uint8_t> cn_fetchNoiseVolume() {
+  std::vector<uint8_t> out;
+  auto res = assetcache::get(netcfg::host(), netcfg::port(), "/clouds/greyNoise3D.bin");
+  if (!res.ok || res.bytes.size() < 20) return out;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(res.bytes.data());
+  auto rd32 = [&](int o) {
+    return (int)((uint32_t)p[o] | ((uint32_t)p[o + 1] << 8) | ((uint32_t)p[o + 2] << 16) | ((uint32_t)p[o + 3] << 24));
+  };
+  int w = rd32(4), h = rd32(8), d = rd32(12);
+  if (w != 32 || h != 32 || d != 32) return out;   // the atlas packing below assumes 32³
+  size_t need = 20 + (size_t)w * h * d;
+  if (res.bytes.size() < need) return out;
+  out.assign(res.bytes.begin() + 20, res.bytes.begin() + need);
+  return out;
+}
+
 static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat) {
   Clouds c;
-  // 3-D noise atlas: 32^3 tiling value noise packed 8x4 into 256x128 R8.
+  // 3-D noise atlas (32^3 packed 8x4 into 256x128 R8). Prefer the authored grey-noise volume
+  // served by our server (matches the Angular client); fall back to a locally-baked value+Worley
+  // volume when it's absent (offline / not downloaded) so clouds always have a noise texture.
   std::vector<uint8_t> atlas((size_t)256 * 128, 0);
+  std::vector<uint8_t> vol = cn_fetchNoiseVolume();          // 32³ z-major bytes, or empty
+  const bool haveVol = vol.size() == (size_t)32 * 32 * 32;
+  std::printf("[clouds] 3D noise volume: %s\n", haveVol ? "authored (/clouds/greyNoise3D.bin)" : "locally baked (value+Worley fallback)");
   for (int z = 0; z < 32; ++z) {
     int col = z % 8, row = z / 8;
     for (int y = 0; y < 32; ++y)
       for (int x = 0; x < 32; ++x) {
-        float f = 0.55f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 4)
-                + 0.30f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 8)
-                + 0.15f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 16);
+        float f;
+        if (haveVol) {
+          f = vol[(size_t)z * 32 * 32 + (size_t)y * 32 + x] / 255.0f;   // same packing as buildNoiseAtlas
+        } else {
+          // Smooth value-noise base carries the large-scale shape (coverage/silhouette)...
+          float base = 0.55f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 4)
+                     + 0.30f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 8)
+                     + 0.15f * cn_valueNoise3(x / 32.0f, y / 32.0f, z / 32.0f, 16);
+          // ...and Worley cells add the crisp high-frequency detail the erosion bites into.
+          float detail = 0.55f * cn_worley3(x / 32.0f, y / 32.0f, z / 32.0f, 8)
+                       + 0.45f * cn_worley3(x / 32.0f, y / 32.0f, z / 32.0f, 16);
+          f = base * 0.72f + detail * 0.28f;   // mostly base (shape) + a modest detail layer
+        }
         atlas[(size_t)(row * 32 + y) * 256 + (col * 32 + x)] = (uint8_t)(glm::clamp(f, 0.0f, 1.0f) * 255.0f);
       }
   }
@@ -3160,6 +3221,13 @@ int main(int argc, char** argv) {
   if (const char* aaEnv = std::getenv("SAILSIM_AA")) userCfg.gfx.aa = std::max(0, std::min(2, atoi(aaEnv)));
   if (const char* ssEnv = std::getenv("SAILSIM_SSAA")) userCfg.gfx.ssaa = std::max(0, std::min(2, atoi(ssEnv)));
   if (std::getenv("SAILSIM_NOREFL")) userCfg.gfx.reflections = false;
+  const float cloudDenoiseBypass = std::getenv("SAILSIM_NODENOISE") ? 1.0f : 0.0f;  // debug: skip the cloud blur
+  // Cloud tonemap exposure (0.5) + sun gain (15.0), env-tunable for tuning. The bright sun
+  // term used to slam into a hard 1.1 exposure and wash all internal billow detail to flat
+  // white; 0.5 keeps the sunlit faces out of saturation so the density/self-shadow gradient
+  // (and the Worley detail in the noise volume) stays visible — the "billowed form".
+  const float cloudSunGain  = std::getenv("SAILSIM_CLOUD_SUNGAIN")  ? (float)atof(std::getenv("SAILSIM_CLOUD_SUNGAIN"))  : 15.0f;
+  const float cloudExposure = std::getenv("SAILSIM_CLOUD_EXPOSURE") ? (float)atof(std::getenv("SAILSIM_CLOUD_EXPOSURE")) : 0.5f;
   // Shadow-map resolution from the saved quality dial (applied here, at texture
   // creation, so it survives for the session; 0 = off keeps a small valid map).
   g_shadowRes = userCfg.gfx.shadows > 0 ? (uint32_t)settings::shadowRes(userCfg.gfx.shadows) : 1024u;
@@ -3382,7 +3450,7 @@ int main(int argc, char** argv) {
     reflDenoiseU = wgpuDeviceCreateBuffer(device, &bd);
   }
   auto writeReflDenoiseU = [&]() {
-    float dsz[4] = { (float)reflW, (float)reflH, 0.0f, 0.0f };
+    float dsz[4] = { (float)reflW, (float)reflH, cloudDenoiseBypass, 0.0f };
     wgpuQueueWriteBuffer(queue, reflDenoiseU, 0, dsz, sizeof(dsz));
   };
   writeReflDenoiseU();
@@ -7736,7 +7804,7 @@ int main(int argc, char** argv) {
       // Bright enough that the sunlit cloud faces saturate to white (the tops SHOULD be
       // white); paired with the low ambient above, that gives strong white-top ↔
       // dark-shadow contrast rather than a flat blob.
-      float sunBright = 0.05f + 1.5f * el;
+      float sunBright = 0.05f + 1.6f * el;
       glm::vec3 dayLit(sunBright, sunBright * (0.52f + 0.48f * el), sunBright * (0.34f + 0.62f * el));
       glm::vec3 moonLit = glm::vec3(0.28f, 0.34f, 0.50f) * (0.25f + 0.75f * el);   // dim silver
       glm::vec3 sunCol = glm::mix(moonLit, dayLit, dayK);
@@ -7748,7 +7816,8 @@ int main(int argc, char** argv) {
       cu = CloudU{ glm::inverse(viewProj), glm::vec4(eye, 1.0f), glm::vec4(sd, 0.0f),
                  glm::vec4(sunCol, 0.0f), glm::vec4(skyC, 0.0f), glm::vec4(grndC, 0.0f),
                  glm::vec4(cloudBase, cloudTop, cov, ctype),
-                 glm::vec4(t, cloudDrift.x, cloudDrift.y, 120000.0f) };
+                 glm::vec4(t, cloudDrift.x, cloudDrift.y, 120000.0f),
+                 glm::vec4(cloudSunGain, cloudExposure, 0.0f, 0.0f) };
       wgpuQueueWriteBuffer(queue, clouds.uniformBuf, 0, &cu, sizeof(cu));
     }
 
@@ -8721,7 +8790,7 @@ int main(int argc, char** argv) {
     // ── Cloud pass: ray-march into the offscreen RGBA16F buffer, occluded by the
     //    scene depth (load, no write). Only while sailing. ──
     if (sailing) {
-      float dsz[4] = { (float)curW, (float)curH, 0.0f, 0.0f };
+      float dsz[4] = { (float)curW, (float)curH, cloudDenoiseBypass, 0.0f };
       wgpuQueueWriteBuffer(queue, clouds.denoiseUniform, 0, dsz, sizeof(dsz));
       WGPURenderPassColorAttachment ca = {};
       ca.view = cloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;

@@ -3,7 +3,7 @@
 // Operates on the offscreen (premultiplied) cloud buffer; the whole RGBA is
 // filtered together, then blended over the scene.
 
-struct DU { screenSize : vec2<f32>, pad : vec2<f32> };
+struct DU { screenSize : vec2<f32>, bypass : f32, pad : f32 };
 @group(0) @binding(0) var<uniform> u : DU;
 @group(0) @binding(1) var cloudTex  : texture_2d<f32>;
 @group(0) @binding(2) var cloudSamp : sampler;
@@ -30,6 +30,7 @@ fn vs_main(@builtin(vertex_index) vid : u32) -> VSOut {
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let px = 1.0 / u.screenSize;
   let center = textureSampleLevel(cloudTex, cloudSamp, in.uv, 0.0);
+  if (u.bypass > 0.5) { return center; }   // SAILSIM_NODENOISE: composite the raw cloud buffer (debug A/B)
   let cl = vc_tone(center.rgb);
   var sum = vec4<f32>(0.0);
   var wt = 0.0;

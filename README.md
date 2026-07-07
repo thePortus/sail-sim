@@ -138,6 +138,21 @@ cmake --build build-mac
 cd build-mac/bin && ditto -c -k --keepParent sailsim_native.app SailSim-<ver>-mac.zip
 ```
 
+The build **deep-signs the bundle ad-hoc** (`codesign --sign -`, over the whole `.app` after Sparkle is embedded)
+— without a sealed signature an Apple-Silicon Mac rejects a *downloaded* build as *"is damaged and can't be
+opened,"* and Sparkle's helper tools won't launch. This makes the app run when copied locally, **but ad-hoc is not
+notarized**, so a copy downloaded from the web still carries Apple's quarantine flag and shows the same "damaged"
+dialog. Until you notarize (below), each downloaded copy must have the flag stripped once:
+
+``` sh
+xattr -dr com.apple.quarantine /path/to/sailsim_native.app   # then open normally
+```
+
+Fine for you and testers; **not viable for the public** — that needs notarization. When you're ready, get an Apple
+Developer ID, then rebuild with `-DSAILSIM_MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"`
+(and add `--options runtime` to the codesign step in `native/CMakeLists.txt`), and run `notarytool` + `stapler` on
+the zip before uploading. A notarized build double-clicks cleanly with no `xattr` step.
+
 **On a Windows PC** (Visual Studio + CMake installed; run in PowerShell). The build drops
 `sailsim_native.exe` **and** `WinSparkle.dll` into the output folder — they must ship together:
 

@@ -16,6 +16,8 @@ const G            = 9.81;   // cannonball gravity (world units/s^2) — matches
 const TRAVEL_SCALE = 3.0;    // ship world-velocity = speed * TRAVEL_SCALE along heading
 
 // ── Hull zone geometry (oriented box in vessel-local space) ───────────────────
+// Legacy generic box (sloop/brig-sized) — kept as the fallback default. Per-ship boxes below hug each hull's
+// real size so hits register on the visible timbers, not in the airspace around a one-size-fits-all box.
 const HALF_LEN  = 9.0;    // fore-aft half-length (|lon| <= HALF_LEN)
 const HALF_BEAM = 3.5;    // beam half-width   (|lat| <= HALF_BEAM)
 const DECK_Y    = 3.0;    // top of the hull band (waterline 0 .. deck)
@@ -23,6 +25,22 @@ const BOW_LON   = 4.5;    // |lon| beyond this (toward the relevant end) = bow /
 const MAST_LAT  = 1.2;    // centreline half-width for the mast column
 const MAST_LON  = 5.0;    // mast column fore-aft half-extent
 const MAST_Y_TOP = 22.0;  // top of the mast column
+
+// Per-ship hull box, sized to each vessel's rendered hull (client shipScale ≈ 2·hullHalfLen). The mast column
+// top is pulled down to roughly the real masthead per hull (was a flat 22 m for everyone — a tall pillar of
+// empty air above the small ships), and its width kept tight so a 'masts' hit means the ball actually crossed
+// the rig, not open sky beside it. halfBeam/deckY/bowLon scale with the hull too.
+const HULL_DIMS_BY_SLUG = {
+  //             halfLen halfBeam deckY  bowLon mastLat mastLon mastYTop
+  pinnace:     { halfLen: 5.0,  halfBeam: 2.2, deckY: 2.4, bowLon: 2.8, mastLat: 1.0, mastLon: 3.0, mastYTop: 12.0 },
+  sloop:       { halfLen: 8.0,  halfBeam: 3.0, deckY: 2.8, bowLon: 4.0, mastLat: 1.1, mastLon: 4.0, mastYTop: 16.0 },
+  brig:        { halfLen: 13.0, halfBeam: 3.8, deckY: 3.2, bowLon: 6.5, mastLat: 1.3, mastLon: 6.0, mastYTop: 21.0 },
+  merchantman: { halfLen: 16.0, halfBeam: 4.2, deckY: 3.4, bowLon: 8.0, mastLat: 1.3, mastLon: 7.0, mastYTop: 23.0 },
+};
+const HULL_DIMS_DEFAULT = { halfLen: HALF_LEN, halfBeam: HALF_BEAM, deckY: DECK_Y, bowLon: BOW_LON, mastLat: MAST_LAT, mastLon: MAST_LON, mastYTop: MAST_Y_TOP };
+function hullDimsFor(slug) { return HULL_DIMS_BY_SLUG[slug] || HULL_DIMS_DEFAULT; }
+// Widest hull half-length (merchantman) — the broad-phase reject pad is sized off this so no ship is missed.
+const HULL_MAX_HALF_LEN = 16.0;
 
 // Zone names. 'masts' is tracked but exempt from the sink rule and has no effect yet.
 const ZONES = ['bow', 'stern', 'port', 'starboard', 'masts'];
@@ -173,6 +191,7 @@ const GRAPE_RATE_MAX = 72;
 module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
+  HULL_DIMS_BY_SLUG, hullDimsFor, HULL_MAX_HALF_LEN,
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL, ARMOR_UPGRADE_MULT, ARMOR_ZONES,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, CALIBER_UPGRADED_BY_SLUG, caliberFor,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,

@@ -41,17 +41,18 @@ function newCombatState(slug, armorUpgrade) {
            shotTimes: [], gunsPerSide: gunsPerSideFor(slug), load: {} };
 }
 
-/** Which hull zone (if any) contains a point in vessel-local space. null = no hit. */
-function zoneAtLocal(lat, lon, y) {
-  if (y > C.DECK_Y) {
+/** Which hull zone (if any) contains a point in vessel-local space, for a hull with box dims `d`
+ *  (C.hullDimsFor(slug)). null = no hit. */
+function zoneAtLocal(lat, lon, y, d) {
+  if (y > d.deckY) {
     // Above the deck: only the centreline mast column counts; otherwise it flies over.
-    if (Math.abs(lat) < C.MAST_LAT && Math.abs(lon) < C.MAST_LON && y < C.MAST_Y_TOP) return 'masts';
+    if (Math.abs(lat) < d.mastLat && Math.abs(lon) < d.mastLon && y < d.mastYTop) return 'masts';
     return null;
   }
   if (y < -0.5) return null;                                  // well underwater — miss
-  if (Math.abs(lon) > C.HALF_LEN || Math.abs(lat) > C.HALF_BEAM) return null;
-  if (lon >  C.BOW_LON) return 'bow';
-  if (lon < -C.BOW_LON) return 'stern';
+  if (Math.abs(lon) > d.halfLen || Math.abs(lat) > d.halfBeam) return null;
+  if (lon >  d.bowLon) return 'bow';
+  if (lon < -d.bowLon) return 'stern';
   return lat < 0 ? 'port' : 'starboard';
 }
 
@@ -126,11 +127,12 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
   for (const [pid, p] of players) {
     if (pid === shot.shooterId || !p.state || !p.combat || p.combat.sunk) continue;
     const lag = Math.min(0.2, Math.max(0, (nowMs - (p.lastUpdateMs || nowMs)) / 1000));
-    victims.push({ pid, pose: deadReckon(p.state, lag) });
+    victims.push({ pid, pose: deadReckon(p.state, lag), dims: C.hullDimsFor(p.combat.slug) });
   }
 
   const { ox, oy, oz, vx, vy, vz } = shot;
-  const reach2 = (C.HALF_LEN + C.BROADPHASE_PAD) * (C.HALF_LEN + C.BROADPHASE_PAD);
+  // Broad-phase reject radius sized off the WIDEST hull so no ship is missed; the exact per-ship box test follows.
+  const reach2 = (C.HULL_MAX_HALF_LEN + C.BROADPHASE_PAD) * (C.HULL_MAX_HALF_LEN + C.BROADPHASE_PAD);
   // Cannon CALIBER of the SHOOTER (heavier ships hit harder) — looked up once per shot from its combat slug, with
   // the shooter's once-per-hull CANNON upgrade applied (a player who bought it at the shipwright hits harder).
   const shooter = players.get(shot.shooterId);
@@ -152,7 +154,7 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
       if (ddx * ddx + ddz * ddz > reach2) continue;                // broad-phase reject
       const lat = ddx * Math.cos(pose.hr) - ddz * Math.sin(pose.hr);
       const lon = ddx * Math.sin(pose.hr) + ddz * Math.cos(pose.hr);
-      const zone = zoneAtLocal(lat, lon, by);
+      const zone = zoneAtLocal(lat, lon, by, v.dims);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
       const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType) * caliber;

@@ -4385,6 +4385,16 @@ int main(int argc, char** argv) {
 
       if (wv.valid) ImGui::Text(ICON_FA_WIND "  %.0f kn   B%d", wv.windSpeed, wv.beaufort);
       ImGui::Text(ICON_FA_GAUGE_HIGH "  %.1f kn", shipSpeed);
+      // Crew complement (server-authoritative: grape attrition thins it, tavern hires refill it). Fewer hands →
+      // slower reloads / mast repair (crewFactor). Dim when short-handed.
+      {
+        mp::TownState ct = mpClient.town();
+        if (ct.maxCrew > 0) {
+          const bool full = ct.crew >= ct.maxCrew;
+          ImGui::TextColored(full ? ImVec4(0.80f, 0.82f, 0.86f, 1.0f) : ImVec4(0.95f, 0.72f, 0.42f, 1.0f),
+                             ICON_FA_USERS "  Crew %d/%d", ct.crew, ct.maxCrew);
+        }
+      }
       if (vessel.anchored)
         ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.45f, 1.0f), ICON_FA_ANCHOR "  Anchored");
       else

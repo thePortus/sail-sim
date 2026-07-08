@@ -36,6 +36,14 @@ std::string relPathFor(const std::string& cleanPath) {
   p.erase(0, i);
   for (size_t pos = p.find(".."); pos != std::string::npos; pos = p.find("..", pos))
     p.replace(pos, 2, "__");
+  // A path whose final segment has no extension (e.g. "/music", "/terrain/manifest") may ALSO be the
+  // directory prefix of other assets ("/music/anglers_reel.mid"). Stored as a plain file it would block
+  // the sibling directory those assets need (and vice-versa), so give extension-less leaves a reserved
+  // suffix that can never collide with a directory name. Assets loaded by on-disk path (geometry .glb)
+  // always carry an extension, so they're unaffected.
+  const size_t slash = p.find_last_of('/');
+  const std::string leaf = (slash == std::string::npos) ? p : p.substr(slash + 1);
+  if (!leaf.empty() && leaf.find('.') == std::string::npos) p += ".idx";
   return p;
 }
 
@@ -50,6 +58,17 @@ std::string readFile(const std::string& path) {
 bool writeFileAtomic(const fs::path& path, const std::string& bytes) {
   std::error_code ec;
   fs::create_directories(path.parent_path(), ec);
+  if (ec) {
+    // A stale cache file left by an older layout may occupy a path we now need as a directory (e.g. an
+    // old "/music" leaf blocking the "/music/" tree). Remove the offending ancestor file and retry once.
+    for (fs::path anc = path.parent_path(); !anc.empty() && anc != anc.root_path(); anc = anc.parent_path()) {
+      std::error_code e2;
+      if (fs::is_regular_file(anc, e2)) { fs::remove(anc, e2); fs::remove(fs::path(anc).concat(".etag"), e2); break; }
+    }
+    ec.clear();
+    fs::create_directories(path.parent_path(), ec);
+    if (ec) return false;
+  }
   fs::path tmp = path;
   tmp += ".tmp";
   {

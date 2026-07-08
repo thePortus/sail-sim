@@ -7345,7 +7345,9 @@ int main(int argc, char** argv) {
         sprayBowCd -= dt; sprayGreenCd -= dt;
         if (greenBest > 0.0f && sprayGreenCd <= 0.0f) {
           sprayGreenCd = 0.6f;
-          cannonFx.spray(greenHit, glm::vec3(fwd.x, 0.0f, fwd.y) * -1.5f, glm::min(1.0f, greenBest * 1.5f));
+          cannonFx.spray(greenHit, glm::vec3(fwd.x, 0.0f, fwd.y) * -1.5f, glm::min(1.0f, greenBest * 1.5f),
+                         0.5f);   // deck wash dumps aboard low, it doesn't jet
+
         }
         {
           // Bow spray fires on IMPACT: the sea height against the bow (sampled just ahead of the stem)
@@ -7355,12 +7357,18 @@ int main(int argc, char** argv) {
           const float bowRel = fftHeight(sampX, sampZ) - wetWaterlineY;
           const float bowRise = (bowRel - bowRelPrev) / std::max(dt, 1e-4f);   // m/s the wave climbs the bow
           bowRelPrev = bowRel;
-          if (sprayBowCd <= 0.0f && shipSpeed > 1.0f && bowRel > 0.30f && bowRise > 0.7f) {
-            sprayBowCd = 0.5f;
+          // Speed-driven character: a fast hull slams more readily (lower thresholds), sprays more often
+          // (shorter cooldown), and throws the spray high and far (energy); a slow one gets occasional
+          // low, lazy plumes.
+          const float spdN = glm::clamp(shipSpeed / 5.0f, 0.0f, 1.0f);
+          if (sprayBowCd <= 0.0f && shipSpeed > 0.8f &&
+              bowRel > 0.38f - 0.14f * spdN && bowRise > 0.95f - 0.45f * spdN) {
+            sprayBowCd = 0.9f - 0.6f * spdN;
             const float bowX = shipX + fwd.x * halfLen * 0.75f, bowZ = shipZ + fwd.y * halfLen * 0.75f;
             cannonFx.spray(glm::vec3(bowX, wetWaterlineY + bowRel * 0.7f + 0.3f, bowZ),
                            glm::vec3(fwd.x, 0.0f, fwd.y) * (0.8f + 0.5f * shipSpeed),
-                           glm::clamp(0.35f + bowRise * 0.35f + shipSpeed * 0.08f, 0.3f, 1.0f));
+                           glm::clamp(0.35f + bowRise * 0.35f + spdN * 0.4f, 0.3f, 1.0f),
+                           0.15f + 0.85f * spdN);
           }
         }
         // Rain doesn't wet the deck evenly — it POOLS in the low spots. Small, localized puddles: one

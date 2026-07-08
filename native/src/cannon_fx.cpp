@@ -333,7 +333,7 @@ struct System::Impl {
 
   // Burst n particles in a direction box (client direction1..direction2 cones).
   void burst(int sys, int n, const glm::vec3& at, const glm::vec3& box,
-             const glm::vec3& dir1, const glm::vec3& dir2, float sizeScale = 1.0f) {
+             const glm::vec3& dir1, const glm::vec3& dir2, float sizeScale = 1.0f, float powScale = 1.0f) {
     const SysDef& d = kSys[sys];
     for (int i = 0; i < n; ++i) {
       Particle& q = *freeParticle();
@@ -345,7 +345,7 @@ struct System::Impl {
       glm::vec3 dir(frand(dir1.x, dir2.x), frand(dir1.y, dir2.y), frand(dir1.z, dir2.z));
       float len = glm::length(dir);
       if (len > 1e-4f) dir /= len;
-      q.v = dir * frand(d.powMin, d.powMax);
+      q.v = dir * frand(d.powMin, d.powMax) * powScale;
       q.size0 = frand(d.size0Min, d.size0Max) * sizeScale;
       q.size1 = frand(d.size1Min, d.size1Max) * sizeScale;
     }
@@ -514,11 +514,15 @@ void System::waterSplash(const glm::vec3& p, const glm::vec3& velIn) {
             r * 2.0f + glm::vec3(-2, 5, -2), r * 2.0f + glm::vec3(2, 10, 2));
 }
 
-void System::spray(const glm::vec3& p, const glm::vec3& velIn, float strength) {
+void System::spray(const glm::vec3& p, const glm::vec3& velIn, float strength, float energy) {
   // Many SMALL droplets (0.4x the cannonball-splash particle size) — fine mist, not a few blobs.
-  const int n = 150 + (int)(170.0f * glm::clamp(strength, 0.0f, 1.0f));
+  // energy [0,1] scales the launch power: low = a lazy plume that barely clears the rail, high = spray
+  // thrown high and far. Count scales with both the impact strength and the energy.
+  const float e = glm::clamp(energy, 0.0f, 1.0f);
+  const int n = (int)((110.0f + 190.0f * glm::clamp(strength, 0.0f, 1.0f)) * (0.6f + 0.5f * e));
   p_->burst(SPLASH, n, p, glm::vec3(0.5f, 0.2f, 0.5f),
-            velIn + glm::vec3(-1.5f, 2.0f, -1.5f), velIn + glm::vec3(1.5f, 4.5f, 1.5f), 0.4f);
+            velIn + glm::vec3(-1.5f, 2.0f, -1.5f), velIn + glm::vec3(1.5f, 4.5f, 1.5f),
+            0.4f, 0.4f + 0.85f * e);
 }
 
 void System::landHit(const glm::vec3& p, const glm::vec3& velIn) {

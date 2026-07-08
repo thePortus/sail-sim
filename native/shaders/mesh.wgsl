@@ -261,9 +261,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     let color = ambient + Lo;
+    // ── Reflectivity mask (scene alpha): a per-fragment "wetness" [0,1] the SSR pass reads to gate
+    //    reflections. Dry opaque surfaces (terrain/foliage) write 0; the ship writes its wetness here.
+    //    Phase 1 replaces this 0 with the analytic waterline/bow wetness. ──
+    let wetness = 0.0;
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-
     // tonemapped (flat) and never reached the bloom bright-pass; leaving them linear fixes both.
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(color, wetness);
 }

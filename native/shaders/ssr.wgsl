@@ -39,7 +39,11 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let uv = in.uv;
   let dims = vec2<f32>(textureDimensions(sceneTex, 0));
   let texel = 1.0 / dims;
-  var col = textureSampleLevel(sceneTex, samp, uv, 0.0).rgb;
+  let scene0 = textureSampleLevel(sceneTex, samp, uv, 0.0);
+  var col = scene0.rgb;
+  // Reflectivity mask (scene alpha): wet ship surfaces write >0, dry surfaces (terrain/foliage) write
+  // 0. A wet spot reflects the scene even head-on, on top of the usual Fresnel grazing reflection.
+  let refl = scene0.a;
 
   let ip = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
   let d = textureLoad(depthTex, ip, 0);
@@ -56,7 +60,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let V = normalize(u.eye.xyz - P);
     if (dot(N, V) < 0.0) { N = -N; }
     let fres = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 4.0);   // grazing reflects most
-    if (fres >= 0.03) {
+    let reflW = max(fres, refl);   // wet surfaces reflect at 'refl' regardless of view angle
+    if (reflW >= 0.03) {
       let R = reflect(-V, N);
       let steps = i32(u.params.z);
       let stepLen = u.params.y / f32(steps);
@@ -72,7 +77,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         let sd = textureLoad(depthTex, sp, 0);
         if (sndc.z > sd + 0.00002 && sndc.z < sd + 0.004) {   // hit (behind surface, within thickness)
           let edge = min(min(suv.x, 1.0 - suv.x), min(suv.y, 1.0 - suv.y));
-          col = col + textureSampleLevel(sceneTex, samp, suv, 0.0).rgb * smoothstep(0.0, 0.08, edge) * fres * u.params.x;
+          col = col + textureSampleLevel(sceneTex, samp, suv, 0.0).rgb * smoothstep(0.0, 0.08, edge) * reflW * u.params.x;
           break;
         }
       }

@@ -234,7 +234,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let hd = distance(u.eye.xyz, in.worldPos);
   let haze = 1.0 - exp(-pow(hd * 0.00009, 2.0));
   col = mix(col, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
-  return vec4<f32>(col, 1.0);
+  return vec4<f32>(col, 0.0);   // alpha = SSR reflectivity mask (foliage is dry)
 }
 
 // Depth-only shadow caster WITH alpha test: sample the frond/leaf texture and

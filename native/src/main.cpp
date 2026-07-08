@@ -1491,7 +1491,10 @@ static Godrays createGodrays(WGPUDevice device, WGPUTextureFormat colorFormat, W
     WGPUBlendState blend = {};
     blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_One; blend.color.operation = WGPUBlendOperation_Add;
     blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_One; blend.alpha.operation = WGPUBlendOperation_Add;
-    WGPUColorTargetState target = {}; target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All; target.blend = &blend;
+    // RGB only: this fullscreen composite must NOT touch scene alpha — that channel carries the SSR
+    // reflectivity mask written by the opaque pass.
+    WGPUColorTargetState target = {}; target.format = colorFormat;
+    target.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue; target.blend = &blend;
     WGPUDepthStencilState ds = {};
     ds.format = kDepthFormat; ds.depthWriteEnabled = false; ds.depthCompare = WGPUCompareFunction_Always;
     ds.stencilFront.compare = WGPUCompareFunction_Always; ds.stencilBack.compare = WGPUCompareFunction_Always;
@@ -2945,7 +2948,9 @@ static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   WGPUBlendState dblend = {};
   dblend.color.srcFactor = WGPUBlendFactor_One; dblend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha; dblend.color.operation = WGPUBlendOperation_Add;
   dblend.alpha = dblend.color;
-  WGPUColorTargetState dtarget = {}; dtarget.format = colorFormat; dtarget.writeMask = WGPUColorWriteMask_All; dtarget.blend = &dblend;
+  // RGB only: the cloud composite must NOT touch scene alpha (the SSR reflectivity mask lives there).
+  WGPUColorTargetState dtarget = {}; dtarget.format = colorFormat;
+  dtarget.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue; dtarget.blend = &dblend;
   WGPUDepthStencilState dds = {}; dds.format = kDepthFormat; dds.depthWriteEnabled = false; dds.depthCompare = WGPUCompareFunction_Always;
   dds.stencilFront.compare = WGPUCompareFunction_Always; dds.stencilBack.compare = WGPUCompareFunction_Always;
   dds.stencilReadMask = 0xFFFFFFFFu; dds.stencilWriteMask = 0xFFFFFFFFu;

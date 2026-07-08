@@ -440,7 +440,7 @@ struct SunShadow {
   WGPUTextureView reflView = nullptr;
   WGPUBindGroup recvBGNoRefl = nullptr;   // receiver group with binding 6 = placeholder — for the reflection pass (reflView is the target there)
 };
-static constexpr uint32_t kDeckMapN = 64;   // deck puddle-map resolution
+static constexpr uint32_t kDeckMapN = 128;  // deck puddle-map resolution (crisp ~0.3 m puddles on big hulls)
 static constexpr uint32_t kSeaMapN  = 32;   // hull-local sea-height map resolution
 static const uint32_t kShadowRes = 2048;
 // Live shadow-map resolution (settings-driven; the cascade textures size from
@@ -3503,6 +3503,7 @@ int main(int argc, char** argv) {
   if (std::getenv("SAILSIM_GRADE")) userCfg.gfx.grade = true;             // startup override for cinematic grade
   if (std::getenv("SAILSIM_CONTACT")) userCfg.gfx.contactShadows = true;  // startup override for contact shadows
   if (std::getenv("SAILSIM_LUT")) userCfg.gfx.lut = true;                 // startup override for the 3D-LUT grade
+  if (std::getenv("SAILSIM_NOWET")) userCfg.gfx.hullWetness = false;      // disable hull/deck wetness
   const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.8f;
   const float taaSharpen  = std::getenv("SAILSIM_TAA_SHARPEN")  ? (float)atof(std::getenv("SAILSIM_TAA_SHARPEN"))  : 0.35f;
   const float taaClamp    = std::getenv("SAILSIM_TAA_CLAMP")    ? (float)atof(std::getenv("SAILSIM_TAA_CLAMP"))    : 0.4f;   // variance-clip gamma (tight — busy ocean)
@@ -4064,6 +4065,7 @@ int main(int argc, char** argv) {
   float wetTopY = -1.0e6f, wetWaterlineY = -1.0e6f, wetBowBoost = 0.0f;
   float frameBeau = 3.0f;   // this frame's Beaufort (captured from the weather block for sea-state scaling)
   float rainWet = 0.0f;     // rain/drizzle deck+hull wetness (rises fast, drains slow after the rain passes)
+  float sprayBowCd = 0.0f, sprayGreenCd = 0.0f;   // spray-burst cooldowns (bow slam / green water)
   // Deck puddle map (Phase 3): a hull-local top-down grid of standing water on the player's deck. Green
   // water stamps it, it evaporates + drains toward the rail (scuppers), and it uploads to SunShadow.deckMap.
   std::vector<float>   deckWet((size_t)kDeckMapN * kDeckMapN, 0.0f);
@@ -4864,6 +4866,9 @@ int main(int argc, char** argv) {
         if (ImGui::Checkbox("Contact shadows", &g.contactShadows)) { custom(); gsave(); }
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Screen-space short-range sun occlusion: grounds rigging + the ship's shadow on the water.\nNeeds daylight; adds a depth-march pass.");
+        if (ImGui::Checkbox("Hull & deck wetness", &g.hullWetness)) { custom(); gsave(); }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Waves wet the hull at the waterline, rain soaks the decks, and small puddles\ncollect and drain — with raindrop ripples and sky reflections in the standing water.");
         ImGui::End();
       }
 
@@ -7277,7 +7282,7 @@ int main(int argc, char** argv) {
     // ── Hull wetness state (Phase 1). The waterline is the wave height at the hull; a splash band
     //    scales with sea state; the wet reach rises to that instantly and drains slowly so the hull
     //    stays wet "for a bit" after a wave. Bow-spray boost grows with speed × sea state. ──
-    if (sailing) {
+    if (sailing && userCfg.gfx.hullWetness) {
       wetWaterlineY = fftHeight(shipX, shipZ);
       wetTopY = 0.35f + 0.12f * frameBeau;                             // splash reach above the LOCAL sea (m)
       wetBowBoost = glm::clamp(shipSpeed / 5.0f, 0.0f, 1.0f) * (0.35f + 0.09f * frameBeau);
@@ -7314,20 +7319,41 @@ int main(int argc, char** argv) {
         const float deckThresh = wetWaterlineY + 0.8f;   // freeboard: crest above this washes the deck
         const float speedN = glm::clamp(shipSpeed / 4.0f, 0.0f, 1.0f);
         const float bowSprayRate = speedN * (0.25f + 0.10f * frameBeau);   // spray onto the foredeck
-        const int DS = 2;                                // detection stride (cost control)
+        const int DS = 4;                                // detection stride (cost control; same sample count at 128)
+        glm::vec3 greenHit(0.0f); float greenBest = 0.0f;   // strongest green-water cell this frame (spray VFX)
         for (int j = 0; j < N; j += DS) {
           for (int i = 0; i < N; i += DS) {
             const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
             const float across = (uu - 0.5f) * 2.0f * halfBeam, along = (ww - 0.5f) * 2.0f * halfLen;
             const float cx = shipX + fwd.x * along + rgt.x * across;
             const float cz = shipZ + fwd.y * along + rgt.y * across;
-            if (fftHeight(cx, cz) > deckThresh) {   // green water: paint a soft disc
-              for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
+            const float crest = fftHeight(cx, cz);
+            if (crest > deckThresh) {   // green water: paint a soft disc (±2 covers the stride-4 gaps)
+              for (int dj = -2; dj <= 2; ++dj) for (int di = -2; di <= 2; ++di) {
                 const int ii = i + di, jj = j + dj;
                 if (ii < 0 || ii >= N || jj < 0 || jj >= N) continue;
                 deckWet[(size_t)jj * N + ii] = std::min(1.0f, deckWet[(size_t)jj * N + ii] + 5.0f * dt);
               }
+              if (crest - deckThresh > greenBest) { greenBest = crest - deckThresh; greenHit = glm::vec3(cx, crest, cz); }
             }
+          }
+        }
+        // ── Contact spray (VFX): a burst of sea mist where water actually comes aboard, so the wetness
+        //    that follows reads as caused. Green water sprays at the strongest boarding cell; a bow slam
+        //    sprays at the stem when the sea rises against it at speed. Both throttled. ──
+        sprayBowCd -= dt; sprayGreenCd -= dt;
+        if (greenBest > 0.0f && sprayGreenCd <= 0.0f) {
+          sprayGreenCd = 0.6f;
+          cannonFx.spray(greenHit, glm::vec3(fwd.x, 0.0f, fwd.y) * -1.5f, glm::min(1.0f, greenBest * 1.5f));
+        }
+        if (sprayBowCd <= 0.0f && shipSpeed > 1.2f) {
+          const float bowX = shipX + fwd.x * halfLen, bowZ = shipZ + fwd.y * halfLen;
+          const float bowSea = fftHeight(bowX, bowZ);
+          if (bowSea > wetWaterlineY + 0.45f) {   // the sea stands high against the stem
+            sprayBowCd = 0.8f;
+            cannonFx.spray(glm::vec3(bowX, bowSea + 0.3f, bowZ),
+                           glm::vec3(fwd.x, 0.0f, fwd.y) * (0.8f + 0.5f * shipSpeed),
+                           glm::clamp(shipSpeed / 4.0f, 0.3f, 1.0f));
           }
         }
         // Rain doesn't wet the deck evenly — it POOLS in the low spots. Small, localized puddles: one
@@ -8777,8 +8803,8 @@ int main(int argc, char** argv) {
         // Rain wets every ship's deck/hull from above (wet0.w). The waterline/bow-spray band is the
         // player's own ship only (firstShip); every other mesh keeps the dry -1e6 sentinel for it.
         // Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
-        mu.wet0.w = rainWet;
-        if (firstShip) {
+        mu.wet0.w = userCfg.gfx.hullWetness ? rainWet : 0.0f;
+        if (firstShip && userCfg.gfx.hullWetness) {
           mu.wet0 = glm::vec4(wetTopY, (float)rW, wetBowBoost, rainWet);   // x = splash reach ; y = render width (reflection UV)
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
           mu.wet2 = glm::vec4(std::max(vrig.hullHalfLen, 2.0f), std::max(vrig.hullHalfBeam, 1.0f), 1.0f,

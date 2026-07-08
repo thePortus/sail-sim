@@ -514,6 +514,12 @@ void System::waterSplash(const glm::vec3& p, const glm::vec3& velIn) {
             r * 2.0f + glm::vec3(-2, 5, -2), r * 2.0f + glm::vec3(2, 10, 2));
 }
 
+void System::spray(const glm::vec3& p, const glm::vec3& velIn, float strength) {
+  const int n = 50 + (int)(90.0f * glm::clamp(strength, 0.0f, 1.0f));
+  p_->burst(SPLASH, n, p, glm::vec3(0.5f, 0.2f, 0.5f),
+            velIn + glm::vec3(-1.5f, 2.0f, -1.5f), velIn + glm::vec3(1.5f, 4.5f, 1.5f));
+}
+
 void System::landHit(const glm::vec3& p, const glm::vec3& velIn) {
   glm::vec3 r = -velIn;
   float len = glm::length(r);

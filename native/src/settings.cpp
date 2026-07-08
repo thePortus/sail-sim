@@ -52,6 +52,7 @@ Values load() {
       x.grade = g.value("grade", x.grade);
       x.contactShadows = g.value("contactShadows", x.contactShadows);
       x.lut = g.value("lut", x.lut);
+      x.hullWetness = g.value("hullWetness", x.hullWetness);
       x.waterTransparency = g.value("waterTransparency", x.waterTransparency);
       x.scatter = std::max(0, std::min(4, g.value("scatter", x.scatter)));
     }
@@ -74,7 +75,7 @@ void save(const Values& v) {
       { "ssaa", g.ssaa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
       { "bloom", g.bloom }, { "reflections", g.reflections }, { "ssr", g.ssr }, { "fog", g.fog },
       { "volumetric", g.volumetric }, { "autoExposure", g.autoExposure }, { "grade", g.grade },
-      { "contactShadows", g.contactShadows }, { "lut", g.lut },
+      { "contactShadows", g.contactShadows }, { "lut", g.lut }, { "hullWetness", g.hullWetness },
       { "waterTransparency", g.waterTransparency }, { "scatter", g.scatter },
     } },
   };
@@ -95,18 +96,18 @@ void applyPreset(Graphics& g, int preset) {
   // native systems: render scale, shadows, AA, SSAO, DOF, bloom, reflections,
   // water transparency, scatter. (The native folds SSAO/DOF/bloom into the tier
   // the way the client's presets fold clouds/wildlife.)
-  struct P { float render; int shadows, aa, ssaa; bool ssao, dof, bloom, refl, transp; int scatter; };
+  struct P { float render; int shadows, aa, ssaa; bool ssao, dof, bloom, refl, transp; int scatter; bool wet; };
   static const P table[5] = {
     // Potato
-    { 0.50f, 0, 0, 0, false, false, false, false, false, 0 },
+    { 0.50f, 0, 0, 0, false, false, false, false, false, 0, false },
     // Low
-    { 0.65f, 1, 1, 0, false, false, true,  false, false, 1 },
+    { 0.65f, 1, 1, 0, false, false, true,  false, false, 1, false },
     // Medium
-    { 0.80f, 2, 1, 0, true,  false, true,  false, true,  2 },
+    { 0.80f, 2, 1, 0, true,  false, true,  false, true,  2, true  },
     // High
-    { 1.00f, 2, 1, 0, true,  true,  true,  true,  true,  3 },
+    { 1.00f, 2, 1, 0, true,  true,  true,  true,  true,  3, true  },
     // Ultra — full render scale + 2x supersampling + the 8192 shadow tier.
-    { 1.00f, 4, 1, 2, true,  true,  true,  true,  true,  4 },
+    { 1.00f, 4, 1, 2, true,  true,  true,  true,  true,  4, true  },
   };
   if (preset < 0 || preset > 4) return;
   const P& p = table[preset];
@@ -114,6 +115,7 @@ void applyPreset(Graphics& g, int preset) {
   g.renderScale = p.render; g.shadows = p.shadows; g.aa = p.aa; g.ssaa = p.ssaa;
   g.ssao = p.ssao; g.dof = p.dof; g.bloom = p.bloom;
   g.reflections = p.refl; g.waterTransparency = p.transp; g.scatter = p.scatter;
+  g.hullWetness = p.wet;
 }
 
 }  // namespace settings

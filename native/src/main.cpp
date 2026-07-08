@@ -8773,7 +8773,7 @@ int main(int argc, char** argv) {
           mu.wet0 = glm::vec4(wetTopY, (float)rW, wetBowBoost, rainWet);   // x = splash reach ; y = render width (reflection UV)
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
           mu.wet2 = glm::vec4(std::max(vrig.hullHalfLen, 2.0f), std::max(vrig.hullHalfBeam, 1.0f), 1.0f,
-                              std::getenv("SAILSIM_DECKVIZ") ? 1.0f : 0.0f);   // deck-map debug tint
+                              std::fmod(t, 600.0f));   // w = animation time (s, wrapped) for puddle ripples
         }
         // TAA motion vectors for MOVING ships (own + remote players; forts/towns are static → the
         // resolve's camera reprojection covers them). Previous model tracked per-ship by id.

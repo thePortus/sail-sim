@@ -205,6 +205,29 @@ fn fresnelSchlick(cosT : f32, F0 : vec3<f32>) -> vec3<f32> {
     return F0 + (vec3<f32>(1.0) - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
+fn hash21(p : vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+
+// Water-surface ripple displacement (xy) at a hull-local metre position, animated by time. Combines a
+// gentle always-on capillary shimmer with a few expanding rain-droplet rings (scaled by rain amount).
+fn puddleRipple(pm : vec2<f32>, t : f32, rain : f32) -> vec2<f32> {
+    var r = vec2<f32>(0.0);
+    r += vec2<f32>(sin(pm.x * 3.1 + t * 2.0), cos(pm.y * 2.7 - t * 1.7)) * 0.5;
+    r += vec2<f32>(cos(pm.y * 5.3 - t * 2.4), sin(pm.x * 4.6 + t * 3.1)) * 0.28;
+    // Rain droplets: each spawns an expanding ring that fades as it grows.
+    for (var d = 0; d < 3; d = d + 1) {
+        let fd = f32(d);
+        let slot = floor(t * 2.0 + fd * 0.41);
+        let c = (vec2<f32>(hash21(vec2<f32>(slot, fd)), hash21(vec2<f32>(slot + 5.0, fd + 2.0))) - 0.5) * 24.0;
+        let age = fract(t * 2.0 + fd * 0.41);
+        let dd = length(pm - c);
+        let ring = sin(dd * 9.0 - age * 20.0) * exp(-dd * 1.1) * (1.0 - age) * 3.0;
+        r += normalize(pm - c + vec2<f32>(1e-4, 1e-4)) * ring;
+    }
+    return r * (0.6 + rain * 1.6);
+}
+
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let baseTex = textureSample(baseColorTex, texSamp, in.uv).rgb;
@@ -304,26 +327,31 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     var color = ambient + Lo;
-    // ── Deck puddles mirror the sky. A puddle samples the SAME planar reflection the ocean uses (the
-    //    scene mirrored across the water plane → correct for the far sky/clouds, which is what reads as
-    //    water) at its own screen position, rippled slightly by the surface normal. Blended by the
-    //    puddle strength and a Fresnel term so it brightens toward grazing angles. wet0.y = render width,
-    //    eye.w = render height (for the screen UV). ──
-    if (puddle > 0.01 && u.wet0.y > 1.0) {
-        let ripple = N.xz * 0.03;
-        let screenUV = clamp(in.position.xy / vec2<f32>(u.wet0.y, u.eye.w) + ripple, vec2<f32>(0.002), vec2<f32>(0.998));
+    // ── Deck puddles: an actual (shallow) water surface, not just a shiny patch. A pool samples the same
+    //    planar sky/cloud reflection the ocean uses, its surface RIPPLING from a capillary shimmer + rain
+    //    droplet rings (screen-UV distortion), and the wet wood shows THROUGH the water (refraction) at
+    //    steep angles while the sky mirror takes over toward grazing — a real shallow-water look. Gated to
+    //    deep puddles so only standing water does this. wet0.y/eye.w = render size ; wet2.w = time. ──
+    let puddleDeep = smoothstep(0.35, 0.85, puddle);
+    if (puddleDeep > 0.001 && u.wet0.y > 1.0) {
+        let pm = (hullUV - 0.5) * vec2<f32>(u.wet2.x, u.wet2.y) * 2.0;   // hull-local metres
+        let rip = puddleRipple(pm, u.wet2.w, u.wet0.w);
+        // The rippling surface distorts the reflection → a moving water surface, not a flat shiny patch.
+        let base = in.position.xy / vec2<f32>(u.wet0.y, u.eye.w);
+        let screenUV = clamp(base + rip * 0.016, vec2<f32>(0.002), vec2<f32>(0.998));
         let reflC = textureSampleLevel(reflTex, deckSamp, screenUV, 0.0).rgb;
+        // Keep the strong sky mirror (the shininess), brightening toward grazing.
         let fresV = pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 4.0);
-        // Only a real (deep) puddle mirrors the sky; shallow damp just darkens. Strong reflection so it
-        // reads as standing water, brightening toward grazing angles.
-        let mixA = clamp(smoothstep(0.35, 0.85, puddle) * (0.6 + 0.35 * fresV), 0.0, 0.92);
+        let mixA = clamp(puddleDeep * (0.62 + 0.33 * fresV), 0.0, 0.94);
         color = mix(color, reflC, mixA);
+        // Rain-droplet sparkle: bright specks where a ripple crest catches the light.
+        let glint = pow(clamp(0.5 + 0.5 * rip.y, 0.0, 1.0), 10.0) * u.wet0.w * puddleDeep;
+        color = color + vec3<f32>(0.9, 0.95, 1.0) * glint * 0.5;
     }
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-
     // tonemapped (flat) and never reached the bloom bright-pass; leaving them linear fixes both.
     // Alpha carries the wetness = the SSR reflectivity mask (Phase 0 channel).
-    if (u.wet2.w > 0.5) { return vec4<f32>(color + vec3<f32>(0.0, 0.6, 0.9) * wetDeck, wet); }   // deck-map debug tint (SAILSIM_DECKVIZ)
     return vec4<f32>(color, wet);
 }

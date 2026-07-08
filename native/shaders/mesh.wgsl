@@ -48,6 +48,7 @@ struct ShadowU {
 @group(1) @binding(2) var shadowS : sampler_comparison;
 @group(1) @binding(3) var deckMap : texture_2d<f32>;   // hull-local top-down puddle map (player ship)
 @group(1) @binding(4) var deckSamp : sampler;
+@group(1) @binding(5) var seaMap : texture_2d<f32>;    // hull-local FFT sea-height map (real waterline)
 
 // Morph + skin a vertex to model-local space (shared by both vertex entries).
 fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec4<f32>) -> vec4<f32> {
@@ -220,40 +221,41 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let metallic = clamp(in.mr.x * mrTex.b, 0.0, 1.0);
     let roughness = clamp(in.mr.y * mrTex.g, 0.05, 1.0);
 
-    // ── Hull wetness (analytic): fragments at/just-above the instantaneous waterline are wet — darker,
-    //    glossier, more reflective (SSR reads the wetness out of scene alpha below). wet0 = (waterlineY,
-    //    wet-reach Y, bow-spray boost); wet1 = (centre XZ, forward XZ). Dry meshes pass Y = -1e6 -> 0. ──
-    var wetTopY = u.wet0.y;
-    let toFrag = normalize(vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y) + vec2<f32>(1e-5, 1e-5));
-    let fwdness = dot(toFrag, u.wet1.zw);                       // +1 at the bow, -1 at the stern
-    wetTopY = wetTopY + u.wet0.z * clamp(fwdness, 0.0, 1.0);    // bow spray raises the reach forward
-    let wetWL = clamp(1.0 - smoothstep(u.wet0.x - 0.15, wetTopY, in.worldPos.y), 0.0, 1.0);
-    // Rain wets from ABOVE: strongest on up-facing surfaces (decks, rails), less on the sides, dry
-    // underneath. wet0.w = rain wetness [0,1]. Combined with the waterline band by the wetter of the two.
+    // ── Hull wetness. The waterline follows the ACTUAL local sea surface: a hull-local map of the FFT
+    //    wave height (seaMap) is sampled per fragment, so the wet line rises and falls with the real
+    //    waves against each part of the hull — not a flat plane. wet0 = (splash reach, unused, bow-spray
+    //    boost, rain) ; wet1 = (centre XZ, forward XZ) ; wet2 = (half-len, half-beam, enabled). ──
     let nUp = normalize(in.normal).y;
-    let rainUp = clamp(nUp * 0.4 + 0.68, 0.0, 1.0);            // deck ~1, walls/sides ~0.68, underside ~0.28
-    // Deck puddles (player ship only, wet2.z): sample the hull-local top-down paint-map on up-facing
-    // surfaces above the waterline. wet2 = (half-length, half-beam, enabled). along = bow→stern (v),
-    // across = port→stbd (u); right = perpendicular to forward in XZ.
+    // Hull-local coordinates (horizontal projection): along = bow..stern, across = port..stbd, in [0,1].
+    let right = vec2<f32>(u.wet1.w, -u.wet1.z);
+    let dxz = vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y);
+    let along  = dot(dxz, u.wet1.zw) / (2.0 * u.wet2.x) + 0.5;
+    let across = dot(dxz, right)     / (2.0 * u.wet2.y) + 0.5;
+    let hullUV = clamp(vec2<f32>(across, along), vec2<f32>(0.0), vec2<f32>(1.0));
+
+    var wetWL = 0.0;
     var wetDeck = 0.0;
-    // Deck level only: up-facing, above the waterline, and within ~4 m of it — excludes the high yards
-    // and rigging that share the hull's XZ column but aren't deck.
-    if (u.wet2.z > 0.5 && nUp > 0.25 && in.worldPos.y > u.wet0.x && in.worldPos.y < u.wet0.x + 4.0) {
-        let right = vec2<f32>(u.wet1.w, -u.wet1.z);
-        let d = vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y);
-        let along  = dot(d, u.wet1.zw) / (2.0 * u.wet2.x) + 0.5;
-        let across = dot(d, right)     / (2.0 * u.wet2.y) + 0.5;
-        if (along > 0.0 && along < 1.0 && across > 0.0 && across < 1.0) {
-            wetDeck = textureSampleLevel(deckMap, deckSamp, vec2<f32>(across, along), 0.0).r * clamp(nUp, 0.0, 1.0);
+    var localSea = -1.0e6;
+    if (u.wet2.z > 0.5) {   // player ship: real wave-following waterline + deck puddles
+        localSea = textureSampleLevel(seaMap, deckSamp, hullUV, 0.0).r;   // raw sea height (m)
+        // Splash reach (m) above the local sea surface, raised on the forward hull (bow spray).
+        let fwdness = clamp(dot(normalize(dxz + vec2<f32>(1e-5, 1e-5)), u.wet1.zw), 0.0, 1.0);
+        let reach = u.wet0.x + u.wet0.z * fwdness;
+        wetWL = clamp(1.0 - smoothstep(localSea - 0.05, localSea + reach, in.worldPos.y), 0.0, 1.0);
+        // Deck puddles: up-facing surfaces from just above the local sea up to ~4 m (excludes high yards).
+        if (nUp > 0.25 && in.worldPos.y > localSea && in.worldPos.y < localSea + 4.0) {
+            wetDeck = textureSampleLevel(deckMap, deckSamp, hullUV, 0.0).r * clamp(nUp, 0.0, 1.0);
         }
     }
-    let damp = max(wetWL, u.wet0.w * rainUp);   // general damp: waterline band + rain film
+    // Rain wets from ABOVE: strongest on up-facing surfaces, less on the sides, dry underneath.
+    let rainUp = clamp(nUp * 0.45 + 0.5, 0.0, 1.0);
+    let damp = max(wetWL, u.wet0.w * rainUp);   // waterline band + rain film
     let puddle = wetDeck;                        // standing water pooled on the deck
     let wet = max(damp, puddle);                 // feeds the SSR reflectivity mask (scene alpha)
-    // Damp reads as a slightly glossy film; a puddle reads as near-mirror standing water — darker and
-    // much smoother — so it stands out against the merely-damp deck and mirrors the rigging via SSR.
-    albedo = albedo * mix(mix(1.0, 0.62, damp), 0.28, puddle);
-    let roughW = mix(mix(roughness, 0.09, damp), 0.02, puddle);
+    // A wet film darkens the diffuse and drops roughness (sharper highlights); a puddle goes near-mirror.
+    // The environment reflection is left to SSR (the real scene) — no flat analytic sky tint.
+    albedo = albedo * mix(mix(1.0, 0.68, damp), 0.38, puddle);
+    let roughW = mix(mix(roughness, 0.12, damp), 0.04, puddle);
 
     let Ngeom = normalize(in.normal);
     let texN = normalize(textureSample(normalTex, texSamp, in.uv).xyz * 2.0 - vec3<f32>(1.0));
@@ -301,15 +303,14 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     var color = ambient + Lo;
-    // ── Wet-surface sky glint: wet surfaces catch a Fresnel-weighted analytic-sky reflection, so they
-    //    SHINE (a puddle catches the sky) instead of only darkening. Gated on `wet`, so dry metalwork is
-    //    untouched (why A1's specular env was removed globally). Puddles (smoother) get a stronger,
-    //    sharper glint on top of the SSR scene reflection. ──
-    if (wet > 0.01) {
+    // ── Puddle sky sheen: ONLY actual standing water on the deck (puddle) catches a faint, Fresnel-
+    //    weighted sky reflection, so a real puddle glints without tinting the whole hull. The damp hull
+    //    and waterline rely on darkening + the SSR scene reflection instead of any flat sky tint. ──
+    if (puddle > 0.01) {
         let Rv = reflect(-V, N);
         let skyRefl = mix(skyHoriz, skyZenith, clamp(Rv.y * 0.5 + 0.5, 0.0, 1.0));
-        let fresW = 0.04 + 0.96 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 5.0);
-        color = color + skyRefl * fresW * wet * (0.6 + 2.2 * puddle);
+        let fresW = 0.03 + 0.6 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 4.0);
+        color = color + skyRefl * fresW * puddle * 0.8;
     }
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing

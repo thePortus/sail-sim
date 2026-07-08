@@ -432,8 +432,12 @@ struct SunShadow {
   // shared receiver group so every mesh draw can sample it (only the player ship applies it). Uploaded
   // from a CPU grid each frame; the recv bind group carries its view + a linear sampler.
   WGPUTexture deckMap = nullptr;   WGPUTextureView deckMapView = nullptr;   WGPUSampler deckSampler = nullptr;
+  // Hull-local sea-height map: the FFT wave height sampled over the hull footprint (CPU), so the mesh
+  // shader can read the ACTUAL local sea surface per hull fragment and follow it — a real, wavy waterline.
+  WGPUTexture seaMap = nullptr;   WGPUTextureView seaMapView = nullptr;
 };
 static constexpr uint32_t kDeckMapN = 64;   // deck puddle-map resolution
+static constexpr uint32_t kSeaMapN  = 32;   // hull-local sea-height map resolution
 static const uint32_t kShadowRes = 2048;
 // Live shadow-map resolution (settings-driven; the cascade textures size from
 // this at first creation, so the Shadows quality dial applies on the next
@@ -490,9 +494,15 @@ static SunShadow& sunShadow(WGPUDevice device) {
     sd.magFilter = WGPUFilterMode_Linear; sd.minFilter = WGPUFilterMode_Linear;
     sd.mipmapFilter = WGPUMipmapFilterMode_Nearest; sd.maxAnisotropy = 1;
     s.deckSampler = wgpuDeviceCreateSampler(device, &sd);
+    WGPUTextureDescriptor std_ = {};
+    std_.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    std_.dimension = WGPUTextureDimension_2D; std_.size = { kSeaMapN, kSeaMapN, 1 };
+    std_.format = WGPUTextureFormat_R16Float; std_.mipLevelCount = 1; std_.sampleCount = 1;   // raw sea height (half float)
+    s.seaMap = wgpuDeviceCreateTexture(device, &std_);
+    s.seaMapView = wgpuTextureCreateView(s.seaMap, nullptr);
   }
   {
-    WGPUBindGroupLayoutEntry e[5] = {};
+    WGPUBindGroupLayoutEntry e[6] = {};
     e[0].binding = 0; e[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     e[0].buffer.type = WGPUBufferBindingType_Uniform; e[0].buffer.minBindingSize = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].visibility = WGPUShaderStage_Fragment;
@@ -505,7 +515,10 @@ static SunShadow& sunShadow(WGPUDevice device) {
     e[3].texture.viewDimension = WGPUTextureViewDimension_2D;
     e[4].binding = 4; e[4].visibility = WGPUShaderStage_Fragment;
     e[4].sampler.type = WGPUSamplerBindingType_Filtering;
-    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 5; d.entries = e;
+    e[5].binding = 5; e[5].visibility = WGPUShaderStage_Fragment;   // hull-local sea-height map
+    e[5].texture.sampleType = WGPUTextureSampleType_Float;
+    e[5].texture.viewDimension = WGPUTextureViewDimension_2D;
+    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 6; d.entries = e;
     s.recvBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
   }
   auto mkCastBG = [&](WGPUBuffer buf) {
@@ -518,13 +531,14 @@ static SunShadow& sunShadow(WGPUDevice device) {
   s.castBG1 = mkCastBG(s.castU1);
   s.castBG2 = mkCastBG(s.castU2);
   {
-    WGPUBindGroupEntry e[5] = {};
+    WGPUBindGroupEntry e[6] = {};
     e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].textureView = s.view0;
     e[2].binding = 2; e[2].sampler = s.cmp;
     e[3].binding = 3; e[3].textureView = s.deckMapView;
     e[4].binding = 4; e[4].sampler = s.deckSampler;
-    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 5; d.entries = e;
+    e[5].binding = 5; e[5].textureView = s.seaMapView;
+    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 6; d.entries = e;
     s.recvBG = wgpuDeviceCreateBindGroup(device, &d);
   }
   return s;
@@ -4024,6 +4038,16 @@ int main(int argc, char** argv) {
   // water stamps it, it evaporates + drains toward the rail (scuppers), and it uploads to SunShadow.deckMap.
   std::vector<float>   deckWet((size_t)kDeckMapN * kDeckMapN, 0.0f);
   std::vector<uint8_t> deckWetU8((size_t)kDeckMapN * kDeckMapN, 0);
+  std::vector<uint16_t> seaMapU16((size_t)kSeaMapN * kSeaMapN, 0);   // hull-local FFT sea height (R16Float, raw m)
+  auto f32tof16 = [](float f) -> uint16_t {                          // minimal IEEE half encode (normal range)
+    uint32_t x; std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0)  return (uint16_t)sign;                 // underflow -> 0
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);     // overflow -> inf
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+  };
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
@@ -7224,12 +7248,28 @@ int main(int argc, char** argv) {
     //    stays wet "for a bit" after a wave. Bow-spray boost grows with speed × sea state. ──
     if (sailing) {
       wetWaterlineY = fftHeight(shipX, shipZ);
-      const float wetBand = 0.35f + 0.10f * frameBeau;                 // splash band above the waterline (m)
+      wetTopY = 0.35f + 0.12f * frameBeau;                             // splash reach above the LOCAL sea (m)
       wetBowBoost = glm::clamp(shipSpeed / 5.0f, 0.0f, 1.0f) * (0.35f + 0.09f * frameBeau);
-      const float instTop = wetWaterlineY + wetBand;
-      const float kWetDrain = 0.5f;                                    // m/s the high-water mark recedes
-      if (wetTopY < -1.0e5f) wetTopY = instTop;                        // first frame: no memory yet
-      wetTopY = std::max(instTop, wetTopY - kWetDrain * dt);
+
+      // ── Sea-height map: the FFT wave height sampled over the hull footprint (hull-local), so the mesh
+      //    shader reads the ACTUAL local sea surface per hull fragment and the waterline follows the real
+      //    waves against each part of the hull. Encoded R16Unorm over +-5 m. ──
+      {
+        const int M = (int)kSeaMapN;
+        const float hl = std::max(vrig.hullHalfLen, 2.0f), hb = std::max(vrig.hullHalfBeam, 1.0f);
+        const float sH = std::sin(shipHeading), cH = std::cos(shipHeading);
+        const glm::vec2 fwd(sH, cH), rgt(cH, -sH);
+        for (int j = 0; j < M; ++j) for (int i = 0; i < M; ++i) {
+          const float across = ((i + 0.5f) / M - 0.5f) * 2.0f * hb, along = ((j + 0.5f) / M - 0.5f) * 2.0f * hl;
+          const float cx = shipX + fwd.x * along + rgt.x * across;
+          const float cz = shipZ + fwd.y * along + rgt.y * across;
+          seaMapU16[(size_t)j * M + i] = f32tof16(fftHeight(cx, cz));
+        }
+        WGPUImageCopyTexture d = {}; d.texture = sunShadow(device).seaMap; d.mipLevel = 0;
+        WGPUTextureDataLayout dl = {}; dl.bytesPerRow = (uint32_t)(M * 2); dl.rowsPerImage = (uint32_t)M;
+        WGPUExtent3D ext = { (uint32_t)M, (uint32_t)M, 1 };
+        wgpuQueueWriteTexture(queue, &d, seaMapU16.data(), seaMapU16.size() * 2, &dl, &ext);
+      }
 
       // ── Deck puddle map — where standing water collects on the deck. Sources: RAIN pools across the
       //    deck (the common case), GREEN WATER stamps where a crest tops the deck, and BOW SPRAY dampens
@@ -8688,7 +8728,7 @@ int main(int argc, char** argv) {
         // Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
         mu.wet0.w = rainWet;
         if (firstShip) {
-          mu.wet0 = glm::vec4(wetWaterlineY, wetTopY, wetBowBoost, rainWet);
+          mu.wet0 = glm::vec4(wetTopY, 0.0f, wetBowBoost, rainWet);   // x = splash reach above local sea
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
           mu.wet2 = glm::vec4(std::max(vrig.hullHalfLen, 2.0f), std::max(vrig.hullHalfBeam, 1.0f), 1.0f,
                               std::getenv("SAILSIM_DECKVIZ") ? 1.0f : 0.0f);   // deck-map debug tint

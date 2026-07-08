@@ -126,11 +126,12 @@ import { MultiplayerService } from '../../services/multiplayer.service';
             <span class="q-label">Anti-aliasing</span>
             <span class="q-value">{{ aaLabels[aaQuality] }}</span>
           </div>
-          <input type="range" min="0" max="3" step="1"
+          <input type="range" min="0" max="4" step="1"
                  [value]="aaQuality"
                  (input)="onAaQuality($event)"
                  class="q-slider" />
-          <div class="q-ticks"><span>Off</span><span>FXAA</span><span>2×</span><span>4×</span></div>
+          <div class="q-ticks"><span>Off</span><span>FXAA</span><span>2×</span><span>4×</span><span>TAA</span></div>
+          <div class="q-hint" *ngIf="aaQuality === 4">TAA (beta): temporal anti-aliasing — smoothest rigging, but fast motion can ghost slightly.</div>
 
           <div class="q-row" style="margin-top:0.8rem">
             <span class="q-label">Reflections</span>
@@ -138,6 +139,13 @@ import { MultiplayerService } from '../../services/multiplayer.service';
                     (click)="toggleReflections()">{{ reflectionsOn ? 'On' : 'Off' }}</button>
           </div>
           <div class="q-hint">Water mirror reflections. Off is faster — drops a full mirrored scene render.</div>
+
+          <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">Screen-Space Reflections</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="ssrOn"
+                    (click)="toggleSsr()">{{ ssrOn ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">Glossy surfaces reflect the scene (beta). Terrain, towns and props only — adds a screen-space march.</div>
 
           <div class="q-row" style="margin-top:0.7rem">
             <span class="q-label">Water Transparency</span>
@@ -285,7 +293,7 @@ export class SettingsMenuComponent {
   readonly shadowLabels = ['Off', 'Low', 'Medium', 'High'];
   readonly cloudLabels  = ['Low', 'Medium', 'High', 'Ultra'];
   readonly oceanLabels  = ['Cheap', 'High (FFT)', 'Ultra (FFT)'];
-  readonly aaLabels     = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×'];
+  readonly aaLabels     = ['Off', 'FXAA', 'MSAA 2×', 'MSAA 4×', 'TAA (beta)'];
   readonly grassLabels  = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
   readonly wildlifeLabels = ['Off', 'Low', 'Medium', 'High', 'Ultra'];
 
@@ -297,6 +305,7 @@ export class SettingsMenuComponent {
   renderScale   = this.sceneSvc.getRenderScale();
   adaptiveRes   = this.sceneSvc.isAdaptiveResolution();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
+  ssrOn          = this.sceneSvc.isSsrEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
   terrainPbrOn   = this.terrain.isTerrainPBREnabled();
   oceanQuality   = this.ocean.getOceanQuality();
@@ -368,6 +377,11 @@ export class SettingsMenuComponent {
   toggleReflections(): void {
     this.reflectionsOn = !this.reflectionsOn;
     this.ocean.setReflectionsEnabled(this.reflectionsOn);
+    this.markCustom();
+  }
+  toggleSsr(): void {
+    this.ssrOn = !this.ssrOn;
+    this.sceneSvc.setSsrEnabled(this.ssrOn);
     this.markCustom();
   }
   toggleTransparency(): void {

@@ -291,6 +291,7 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/taa.wgsl"              TAA_WGSL 
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssr.wgsl"              SSR_WGSL              "${WGSL_GEN_DIR}/ssr_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/volumetric.wgsl"       VOLUMETRIC_WGSL       "${WGSL_GEN_DIR}/volumetric_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/lumadapt.wgsl"         LUMADAPT_WGSL         "${WGSL_GEN_DIR}/lumadapt_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/contact.wgsl"          CONTACT_WGSL          "${WGSL_GEN_DIR}/contact_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/bloom.wgsl"            BLOOM_WGSL            "${WGSL_GEN_DIR}/bloom_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssao.wgsl"             SSAO_WGSL             "${WGSL_GEN_DIR}/ssao_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/dof.wgsl"              DOF_WGSL              "${WGSL_GEN_DIR}/dof_wgsl.h")

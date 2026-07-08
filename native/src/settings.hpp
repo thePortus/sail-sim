@@ -25,6 +25,8 @@ struct Graphics {
   bool  volumetric = false;      // volumetric sun shafts (shadow-marched god-rays; opt-in)
   bool  autoExposure = false;    // metered + eye-adapted auto-exposure (self-levelling; opt-in)
   bool  grade = false;           // cinematic colour grade (gentle saturation push; opt-in)
+  bool  contactShadows = false;  // screen-space contact shadows (short-range sun occlusion; opt-in)
+  bool  lut = false;             // 3D-LUT colour grade (filmic split-tone; opt-in)
   bool  waterTransparency = true;// shallow-water see-through
   int   scatter = 3;             // 0 Off, 1 Low .. 4 Ultra (foliage density + draw distance)
 };

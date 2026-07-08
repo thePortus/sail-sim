@@ -50,6 +50,8 @@ Values load() {
       x.volumetric = g.value("volumetric", x.volumetric);
       x.autoExposure = g.value("autoExposure", x.autoExposure);
       x.grade = g.value("grade", x.grade);
+      x.contactShadows = g.value("contactShadows", x.contactShadows);
+      x.lut = g.value("lut", x.lut);
       x.waterTransparency = g.value("waterTransparency", x.waterTransparency);
       x.scatter = std::max(0, std::min(4, g.value("scatter", x.scatter)));
     }
@@ -72,6 +74,7 @@ void save(const Values& v) {
       { "ssaa", g.ssaa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
       { "bloom", g.bloom }, { "reflections", g.reflections }, { "ssr", g.ssr }, { "fog", g.fog },
       { "volumetric", g.volumetric }, { "autoExposure", g.autoExposure }, { "grade", g.grade },
+      { "contactShadows", g.contactShadows }, { "lut", g.lut },
       { "waterTransparency", g.waterTransparency }, { "scatter", g.scatter },
     } },
   };

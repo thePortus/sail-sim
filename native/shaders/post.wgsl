@@ -14,6 +14,7 @@ struct PostU {
     zp    : vec4<f32>,   // x = proj[2][2]; y = proj[3][2]; z = SSAO enabled; w unused
     tele  : vec4<f32>,   // telescope lens: xy = centre (uv); z = radius, Y-normalized (0 = off); w = zoom
     ae    : vec4<f32>,   // auto-exposure/grade: x = AE enabled; y = key (mid-grey target); z = min mul; w = max mul
+    lut   : vec4<f32>,   // 3D-LUT grade: x = LUT enabled; y = amount [0..1]; z,w unused
 };
 @group(0) @binding(0) var<uniform> u : PostU;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -23,6 +24,7 @@ struct PostU {
 @group(0) @binding(5) var dofTex   : texture_2d<f32>;   // half-res CoC-blurred scene
 @group(0) @binding(6) var depthT   : texture_depth_2d;  // scene depth (read-only bound)
 @group(0) @binding(7) var lumTex   : texture_2d<f32>;   // 1x1 adapted luminance (auto-exposure)
+@group(0) @binding(8) var lut3d    : texture_3d<f32>;   // 32^3 colour-grade LUT
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -305,6 +307,16 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         if (u.zp.w > 0.001) {
             let luma = dot(rgbG, vec3<f32>(0.2126, 0.7152, 0.0722));
             rgbG = max(mix(vec3<f32>(luma), rgbG, 1.0 + u.zp.w), vec3<f32>(0.0));
+        }
+        // ── 3D-LUT colour grade: remap the display-space colour through a 32^3 grade LUT (filmic
+        //    split-tone), half-texel-corrected so the trilinear fetch lands on cell centres. lut.y
+        //    blends between the ungraded and graded look. ──
+        if (u.lut.x > 0.5) {
+            let N = 32.0;
+            let c = clamp(rgbG, vec3<f32>(0.0), vec3<f32>(1.0));
+            let uvw = c * ((N - 1.0) / N) + (0.5 / N);
+            let graded = textureSampleLevel(lut3d, samp, uvw, 0.0).rgb;
+            rgbG = max(mix(rgbG, graded, u.lut.y), vec3<f32>(0.0));
         }
         // ── Film grain (gamma space, like Babylon's grain pass): animated when
         //    fx.y > 0.5, static otherwise. ──

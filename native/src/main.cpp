@@ -212,6 +212,9 @@ struct MeshUniforms {
   glm::vec4 misc;   // x = hull-local mask floor Y (stencil clamp; big negative = whole hull)
   glm::mat4 mvpCur{1.0f};   // UNJITTERED current clip (TAA velocity; only the player ship fills it)
   glm::mat4 mvpPrev{1.0f};  // UNJITTERED previous clip (prev model) for TAA velocity
+  // Hull wetness (only the player ship fills these; the -1e6 sentinel means "dry" for every other mesh).
+  glm::vec4 wet0{-1.0e6f, -1.0e6f, 0.0f, 0.0f};   // x = waterline Y ; y = wet-reach Y ; z = bow-spray boost
+  glm::vec4 wet1{0.0f};                            // xy = ship centre XZ ; zw = ship forward XZ
 };
 
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
@@ -3975,6 +3978,11 @@ int main(int argc, char** argv) {
   const double kInterpDelayMs = 110.0, kExtrapolateMaxMs = 1000.0;
   const float kReconcile = 0.25f;   // per-frame @60fps ease toward the target
   glm::vec3 ownBuoy(0.0f);   // heave, pitch, roll for the local hull
+  // Hull wetness (Phase 1): the wet-reach world Y persists across frames — it jumps up to the
+  // instantaneous waterline+splash and drains slowly (the "wet for a bit" high-water mark). The
+  // waterline + bow-spray boost are recomputed each frame and read by the ship-uniform fill.
+  float wetTopY = -1.0e6f, wetWaterlineY = -1.0e6f, wetBowBoost = 0.0f;
+  float frameBeau = 3.0f;   // this frame's Beaufort (captured from the weather block for sea-state scaling)
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
@@ -7122,6 +7130,7 @@ int main(int argc, char** argv) {
       float beau = wv.valid ? (float)wv.beaufort : 3.0f;
       bool  beauDbg = false;
       if (const char* bo = std::getenv("SAILSIM_BEAUFORT")) { beau = (float)std::atof(bo); beauDbg = true; }   // debug override
+      frameBeau = beau;   // hull-wetness sea-state scaling reads this outside the block
       // Cloud cover comes straight from the server's weather state (which is what the
       // admin override pins); only the offline/debug fallback derives it from Beaufort.
       float targetCloud = (wv.valid && !beauDbg) ? wv.cloudiness
@@ -7167,6 +7176,21 @@ int main(int argc, char** argv) {
     if (sailing) {
       sail::Buoy b = sail::buoyancy(vessel, vrig, dt, [&](float x, float z) { return fftHeight(x, z); });
       ownBuoy = glm::vec3(b.heave, b.pitchRad, b.rollRad);
+    }
+
+    // ── Hull wetness state (Phase 1). The waterline is the wave height at the hull; a splash band
+    //    scales with sea state; the wet reach rises to that instantly and drains slowly so the hull
+    //    stays wet "for a bit" after a wave. Bow-spray boost grows with speed × sea state. ──
+    if (sailing) {
+      wetWaterlineY = fftHeight(shipX, shipZ);
+      const float wetBand = 0.35f + 0.10f * frameBeau;                 // splash band above the waterline (m)
+      wetBowBoost = glm::clamp(shipSpeed / 5.0f, 0.0f, 1.0f) * (0.35f + 0.09f * frameBeau);
+      const float instTop = wetWaterlineY + wetBand;
+      const float kWetDrain = 0.5f;                                    // m/s the high-water mark recedes
+      if (wetTopY < -1.0e5f) wetTopY = instTop;                        // first frame: no memory yet
+      wetTopY = std::max(instTop, wetTopY - kWetDrain * dt);
+    } else {
+      wetTopY = -1.0e6f; wetWaterlineY = -1.0e6f; wetBowBoost = 0.0f;
     }
 
     // Camera input: hold LMB + drag to orbit, wheel to zoom.
@@ -8564,6 +8588,12 @@ int main(int argc, char** argv) {
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
+        // Hull wetness on the player's own ship only (firstShip); every other mesh keeps the dry
+        // sentinel. Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
+        if (firstShip) {
+          mu.wet0 = glm::vec4(wetWaterlineY, wetTopY, wetBowBoost, 0.0f);
+          mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
+        }
         // TAA motion vectors for MOVING ships (own + remote players; forts/towns are static → the
         // resolve's camera reprojection covers them). Previous model tracked per-ship by id.
         const bool moving = firstShip || s.remote;

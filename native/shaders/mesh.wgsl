@@ -10,6 +10,8 @@ struct Uniforms {
     misc   : vec4<f32>,     // x = hull-local mask floor Y (used by the stencil stamp, not here)
     mvpCur : mat4x4<f32>,   // UNJITTERED current-frame clip (this ship) — TAA velocity only
     mvpPrev: mat4x4<f32>,   // UNJITTERED previous-frame clip (this ship's prev model) — TAA velocity only
+    wet0   : vec4<f32>,     // hull wetness: x = waterline world Y ; y = wet-reach world Y (high-water mark) ; z = bow-spray boost ; w unused
+    wet1   : vec4<f32>,     // xy = ship centre world XZ ; zw = ship forward dir world XZ (for bow-spray localisation)
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
@@ -215,6 +217,18 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let metallic = clamp(in.mr.x * mrTex.b, 0.0, 1.0);
     let roughness = clamp(in.mr.y * mrTex.g, 0.05, 1.0);
 
+    // ── Hull wetness (analytic): fragments at/just-above the instantaneous waterline are wet — darker,
+    //    glossier, more reflective (SSR reads the wetness out of scene alpha below). wet0 = (waterlineY,
+    //    wet-reach Y, bow-spray boost); wet1 = (centre XZ, forward XZ). Dry meshes pass Y = -1e6 -> 0. ──
+    var wetTopY = u.wet0.y;
+    let toFrag = normalize(vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y) + vec2<f32>(1e-5, 1e-5));
+    let fwdness = dot(toFrag, u.wet1.zw);                       // +1 at the bow, -1 at the stern
+    wetTopY = wetTopY + u.wet0.z * clamp(fwdness, 0.0, 1.0);    // bow spray raises the reach forward
+    let wet = clamp(1.0 - smoothstep(u.wet0.x - 0.15, wetTopY, in.worldPos.y), 0.0, 1.0);
+    // A wet film darkens the diffuse and drops the roughness toward a mirror; keep metals as-is.
+    albedo = albedo * mix(1.0, 0.62, wet);
+    let roughW = mix(roughness, 0.06, wet);
+
     let Ngeom = normalize(in.normal);
     let texN = normalize(textureSample(normalTex, texSamp, in.uv).xyz * 2.0 - vec3<f32>(1.0));
     let N = perturbNormal(Ngeom, in.worldPos, in.uv, texN);
@@ -229,8 +243,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let dayK = u.sun.w;
     let radiance = mix(vec3<f32>(0.42, 0.50, 0.76), vec3<f32>(3.0), dayK);   // night floor raised with the scene
 
-    let NDF = distributionGGX(N, H, roughness);
-    let G = geometrySmith(N, V, L, roughness);
+    let NDF = distributionGGX(N, H, roughW);
+    let G = geometrySmith(N, V, L, roughW);
     let F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
     let numerator = NDF * G * F;
@@ -261,13 +275,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     let color = ambient + Lo;
-    // ── Reflectivity mask (scene alpha): a per-fragment "wetness" [0,1] the SSR pass reads to gate
-    //    reflections. Dry opaque surfaces (terrain/foliage) write 0; the ship writes its wetness here.
-    //    Phase 1 replaces this 0 with the analytic waterline/bow wetness. ──
-    let wetness = 0.0;
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-
     // tonemapped (flat) and never reached the bloom bright-pass; leaving them linear fixes both.
-    return vec4<f32>(color, wetness);
+    // Alpha carries the wetness = the SSR reflectivity mask (Phase 0 channel).
+    return vec4<f32>(color, wet);
 }

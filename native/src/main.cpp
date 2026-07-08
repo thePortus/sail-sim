@@ -7338,10 +7338,10 @@ int main(int argc, char** argv) {
                   + std::sin(u * 11.0f + 1.7f) * std::sin(v * 9.0f + 0.5f) * 0.35f
                   + std::cos((u + v) * 6.0f) * 0.15f;
           float m = glm::clamp(0.5f + 0.5f * n, 0.0f, 1.0f);
-          return glm::smoothstep(0.5f, 0.72f, m);   // ~1 in a pool, 0 on the high planking
+          return glm::smoothstep(0.42f, 0.62f, m);   // ~1 in a pool, 0 on the high planking (generous coverage)
         };
-        const float rainFill = rainWet * 1.1f;    // rain feeds the pools
-        const float evap = std::exp(-0.30f * dt);
+        const float rainFill = rainWet * 1.5f;    // rain feeds the pools
+        const float evap = std::exp(-0.10f * dt);  // slow evaporation: puddles linger well after the rain
         for (int j = 0; j < N; ++j) for (int i = 0; i < N; ++i) {
           const size_t k = (size_t)j * N + i;
           const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
@@ -7349,8 +7349,10 @@ int main(int argc, char** argv) {
           float v = deckWet[k] + rainFill * pool * dt;   // rain collects in the pool low spots
           if (ww > 0.55f) v += bowSprayRate * pool * dt * (ww - 0.55f) / 0.45f;   // bow spray -> foredeck pools
           v *= evap;
+          // Scuppers: multiplicative decay near the rail so the drain ALWAYS beats the fill there (an
+          // absolute-rate drain lost to a heavy fill and left a standing band of water along the rail).
           const float edge = 1.0f - std::min(std::min(uu, 1.0f - uu), std::min(ww, 1.0f - ww)) / 0.15f;
-          if (edge > 0.0f) v -= 0.9f * dt * edge;   // scuppers drain the rail
+          if (edge > 0.0f) v *= std::exp(-5.0f * edge * dt);
           deckWet[k] = std::max(0.0f, std::min(1.0f, v));
           deckWetU8[k] = (uint8_t)(deckWet[k] * 255.0f + 0.5f);
         }

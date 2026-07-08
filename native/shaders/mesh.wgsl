@@ -269,7 +269,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // Flatness: fwidth(worldY) ~ 0 on a flat horizontal deck (any view angle), large on curved or narrow
     // surfaces (barrel tops, caprails, fittings edges) — puddles only stand on flat deck floor. Computed
     // OUTSIDE the branch (WGSL derivative rules).
-    let flatness = 1.0 - smoothstep(0.01, 0.05, fwidth(in.worldPos.y));
+    let flatness = 1.0 - smoothstep(0.02, 0.09, fwidth(in.worldPos.y));
     if (u.wet2.z > 0.5) {   // player ship: real wave-following waterline + deck puddles
         localSea = textureSampleLevel(seaMap, deckSamp, hullUV, 0.0).r;   // raw sea height (m)
         // Splash reach (m) above the local sea surface, raised on the forward hull (bow spray).
@@ -293,7 +293,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let wet = max(max(wetWL, u.wet0.w * rainUp * clamp(nUp, 0.0, 1.0)), puddle);
     // A wet film darkens the diffuse and drops roughness (sharper highlights); a puddle goes near-mirror.
     // The environment reflection is left to SSR (the real scene) — no flat analytic sky tint.
-    albedo = albedo * mix(mix(1.0, 0.68, damp), 0.38, puddle);
+    albedo = albedo * mix(mix(1.0, 0.68, damp), 0.5, puddle);   // puddle bottom: dark wet wood, grain still visible
     let roughW = mix(mix(roughness, 0.12, damp), 0.04, puddle);
 
     let Ngeom = normalize(in.normal);
@@ -347,7 +347,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     //    droplet rings (screen-UV distortion), and the wet wood shows THROUGH the water (refraction) at
     //    steep angles while the sky mirror takes over toward grazing — a real shallow-water look. Gated to
     //    deep puddles so only standing water does this. wet0.y/eye.w = render size ; wet2.w = time. ──
-    let puddleDeep = smoothstep(0.35, 0.85, puddle);
+    let puddleDeep = smoothstep(0.25, 0.72, puddle);
     if (puddleDeep > 0.001 && u.wet0.y > 1.0) {
         let pm = (hullUV - 0.5) * vec2<f32>(u.wet2.y, u.wet2.x) * 2.0;   // hull-local metres (across, along)
         let ripC = puddleRipple(pm, u.wet2.w, u.wet0.w);
@@ -356,10 +356,15 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         let base = in.position.xy / vec2<f32>(u.wet0.y, u.eye.w);
         let screenUV = clamp(base + rip * 0.016, vec2<f32>(0.002), vec2<f32>(0.998));
         let reflC = textureSampleLevel(reflTex, deckSamp, screenUV, 0.0).rgb;
-        // Keep the strong sky mirror (the shininess), brightening toward grazing.
-        let fresV = pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 4.0);
-        let mixA = clamp(puddleDeep * (0.62 + 0.33 * fresV), 0.0, 0.94);
-        color = mix(color, reflC, mixA);
+        // TRANSLUCENT water: the base is the wet wood seen THROUGH the puddle (this fragment's own
+        // shading, ripple-shimmered), and the sky mirror comes in only by water's real Fresnel — ~3%
+        // looking straight down, full mirror toward grazing. From above you see wood through water with
+        // moving reflections on top, not a blue-coated deck.
+        let cosNV = clamp(dot(N, V), 0.0, 1.0);
+        let fresW = 0.03 + 0.97 * pow(1.0 - cosNV, 5.0);
+        let bottom = color * (0.88 + 0.12 * ripC.x);                      // refraction shimmer on the wood
+        let water = mix(bottom, reflC, clamp(fresW * 1.7, 0.0, 0.9));     // Fresnel-only mirror (mild boost)
+        color = mix(color, water, puddleDeep);
         // Raindrop rings: the expanding wavefront crest catches the light — visible droplets in the water.
         color = color + vec3<f32>(1.0, 1.0, 1.0) * ripC.z * puddleDeep * 0.6;
     }

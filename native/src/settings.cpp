@@ -45,6 +45,7 @@ Values load() {
       x.dof = g.value("dof", x.dof);
       x.bloom = g.value("bloom", x.bloom);
       x.reflections = g.value("reflections", x.reflections);
+      x.ssr = g.value("ssr", x.ssr);
       x.waterTransparency = g.value("waterTransparency", x.waterTransparency);
       x.scatter = std::max(0, std::min(4, g.value("scatter", x.scatter)));
     }
@@ -65,7 +66,7 @@ void save(const Values& v) {
       { "adaptiveRes", g.adaptiveRes }, { "adaptiveTargetMs", g.adaptiveTargetMs },
       { "aa", g.aa }, { "taa", g.taa }, { "taaUpscale", g.taaUpscale },
       { "ssaa", g.ssaa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
-      { "bloom", g.bloom }, { "reflections", g.reflections },
+      { "bloom", g.bloom }, { "reflections", g.reflections }, { "ssr", g.ssr },
       { "waterTransparency", g.waterTransparency }, { "scatter", g.scatter },
     } },
   };

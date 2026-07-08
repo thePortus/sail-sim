@@ -3983,6 +3983,7 @@ int main(int argc, char** argv) {
   // waterline + bow-spray boost are recomputed each frame and read by the ship-uniform fill.
   float wetTopY = -1.0e6f, wetWaterlineY = -1.0e6f, wetBowBoost = 0.0f;
   float frameBeau = 3.0f;   // this frame's Beaufort (captured from the weather block for sea-state scaling)
+  float rainWet = 0.0f;     // rain/drizzle deck+hull wetness (rises fast, drains slow after the rain passes)
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
@@ -7863,6 +7864,12 @@ int main(int argc, char** argv) {
                    : cloudiness > 0.68f ? 0.12f : 0.0f;
       float rate = precipIntensity < target ? 0.9f : 0.55f;
       precipIntensity += (target - precipIntensity) * std::min(1.0f, dt * rate);
+      // Rain wetness: even a drizzle dampens the decks; heavier rain soaks them. Rises quickly, drains
+      // slowly so the ship stays wet a while after the rain passes (fed into the hull-wetness uniform).
+      const float rainTarget = glm::clamp(precipIntensity * 1.8f, 0.0f, 1.0f);
+      const float rwRate = rainWet < rainTarget ? 4.0f : 0.09f;   // fast wet, slow dry (~11 s)
+      rainWet += (rainTarget - rainWet) * std::min(1.0f, dt * rwRate);
+      if (const char* w = std::getenv("SAILSIM_WET")) rainWet = std::max(rainWet, (float)std::atof(w));   // debug force
     }
     // Lightning (cloud.service tickLightning port). Storm energy gates strikes;
     // the multi-peak flash envelope drives the scene flash AND the bolt so they
@@ -8588,10 +8595,12 @@ int main(int argc, char** argv) {
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
-        // Hull wetness on the player's own ship only (firstShip); every other mesh keeps the dry
-        // sentinel. Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
+        // Rain wets every ship's deck/hull from above (wet0.w). The waterline/bow-spray band is the
+        // player's own ship only (firstShip); every other mesh keeps the dry -1e6 sentinel for it.
+        // Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
+        mu.wet0.w = rainWet;
         if (firstShip) {
-          mu.wet0 = glm::vec4(wetWaterlineY, wetTopY, wetBowBoost, 0.0f);
+          mu.wet0 = glm::vec4(wetWaterlineY, wetTopY, wetBowBoost, rainWet);
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
         }
         // TAA motion vectors for MOVING ships (own + remote players; forts/towns are static → the

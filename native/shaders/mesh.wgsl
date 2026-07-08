@@ -224,7 +224,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let toFrag = normalize(vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y) + vec2<f32>(1e-5, 1e-5));
     let fwdness = dot(toFrag, u.wet1.zw);                       // +1 at the bow, -1 at the stern
     wetTopY = wetTopY + u.wet0.z * clamp(fwdness, 0.0, 1.0);    // bow spray raises the reach forward
-    let wet = clamp(1.0 - smoothstep(u.wet0.x - 0.15, wetTopY, in.worldPos.y), 0.0, 1.0);
+    let wetWL = clamp(1.0 - smoothstep(u.wet0.x - 0.15, wetTopY, in.worldPos.y), 0.0, 1.0);
+    // Rain wets from ABOVE: strongest on up-facing surfaces (decks, rails), less on the sides, dry
+    // underneath. wet0.w = rain wetness [0,1]. Combined with the waterline band by the wetter of the two.
+    let nUp = normalize(in.normal).y;
+    let rainUp = clamp(nUp * 0.5 + 0.55, 0.0, 1.0);             // deck ~1, sides ~0.55, underside ~0.05
+    let wet = max(wetWL, u.wet0.w * rainUp);
     // A wet film darkens the diffuse and drops the roughness toward a mirror; keep metals as-is.
     albedo = albedo * mix(1.0, 0.62, wet);
     let roughW = mix(roughness, 0.06, wet);

@@ -1940,6 +1940,10 @@ export class OceanService {
     mat.setTexture('u_sceneDepth', this.sceneService.oceanDepthMap ?? this.shoreMapBlackTexture ?? this.reflectionRTT);
     mat.setTexture('u_refraction', this.refractionRTT);
 
+    // Keep the sea OUT of the prePass G-buffer: the planar mirror owns water reflections, and SSR
+    // marching the ocean's flat G-buffer normals painted a hard-edged perfect-mirror oval under ships.
+    this.sceneService.excludeFromPrePass(mat);
+
     return mat;
   }
 

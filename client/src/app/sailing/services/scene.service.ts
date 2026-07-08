@@ -131,11 +131,25 @@ export class SceneService {
    * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't
    * generate a G-buffer variant for them, which would break SSAO2 and DoF.
    */
+  private _prePassExclusions: Material[] = [];
+
   excludeFromPrePass(material: Material): void {
+    // Remember every exclusion: the prePass renderer is created LAZILY (first SSAO2/SSR build), so a
+    // material registered before it exists must be re-applied then (flushPrePassExclusions) — the old
+    // early-return silently dropped those, which let the FFT ocean into the SSR G-buffer.
+    if (!this._prePassExclusions.includes(material)) this._prePassExclusions.push(material);
+    const prePass = this.scene?.prePassRenderer;
+    if (prePass && !prePass.excludedMaterials.includes(material)) {
+      prePass.excludedMaterials.push(material);
+    }
+  }
+
+  /** Re-apply exclusions registered before the prePass renderer existed. */
+  private flushPrePassExclusions(): void {
     const prePass = this.scene?.prePassRenderer;
     if (!prePass) return;
-    if (!prePass.excludedMaterials.includes(material)) {
-      prePass.excludedMaterials.push(material);
+    for (const m of this._prePassExclusions) {
+      if (!prePass.excludedMaterials.includes(m)) prePass.excludedMaterials.push(m);
     }
   }
 
@@ -1027,6 +1041,9 @@ export class SceneService {
     this.applyAaQuality();
     setTimeout(() => this.applyAaQuality(), 0);
 
+    // SSAO2 just created the prePass renderer — apply any exclusions registered before it existed.
+    this.flushPrePassExclusions();
+
     // Screen-space reflections, if the player had them on last session.
     if (this._ssrEnabled) this.buildSsr();
 
@@ -1187,6 +1204,7 @@ export class SceneService {
       ssr.attenuateIntersectionDistance = true;
       ssr.selfCollisionNumSkip = 2;
       this.ssr = ssr;
+      this.flushPrePassExclusions();   // SSR may have just created the prePass renderer
     } catch (e) {
       console.warn('[scene] SSR unavailable:', e);
       this._ssrEnabled = false;

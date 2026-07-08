@@ -57,6 +57,7 @@ export class OceanFFTRenderer {
       scene,
       camera,
       fft: this.fft,
+      excludeFromPrePass: (m) => this.sceneService.excludeFromPrePass(m),
       // Scene depth (camera-space Z of opaque geom, ocean excluded) — the same live DepthRenderer
       // the procedural ocean uses. Used here to depth-cut the near-boat hull reveal so it shows the
       // submerged hull but not the deeper seabed behind it. (Contact foam stays off — _ContactFoam=0.)

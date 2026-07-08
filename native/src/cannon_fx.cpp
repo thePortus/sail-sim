@@ -399,7 +399,7 @@ struct System::Impl {
 
 bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   p_ = new Impl();
-  p_->particles.resize(2600);
+  p_->particles.resize(4600);   // headroom for near-continuous bow spray on top of combat effects
   p_->puffs.resize(40);
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
@@ -522,7 +522,8 @@ void System::spray(const glm::vec3& p, const glm::vec3& velIn, float strength, f
   // energy [0,1] scales the launch power: low = a lazy plume that barely clears the rail, high = spray
   // thrown high and far. Count scales with both the impact strength and the energy.
   const float e = glm::clamp(energy, 0.0f, 1.0f);
-  const int n = (int)((110.0f + 190.0f * glm::clamp(strength, 0.0f, 1.0f)) * (0.6f + 0.5f * e));
+  // Bursts overlap into a near-continuous stream at speed, so each one is a touch leaner.
+  const int n = (int)((85.0f + 145.0f * glm::clamp(strength, 0.0f, 1.0f)) * (0.6f + 0.5f * e));
   // Slow-motion factor: velocity x k with gravity x k^2 keeps the SAME arc (height/reach) while the
   // flight takes 1/k longer — sea spray hangs in the air instead of snapping like a cannonball splash.
   const float k = 0.6f;

@@ -7347,7 +7347,8 @@ int main(int argc, char** argv) {
           cannonFx.spray(greenHit, glm::vec3(fwd.x, 0.0f, fwd.y) * -1.5f, glm::min(1.0f, greenBest * 1.5f));
         }
         if (sprayBowCd <= 0.0f && shipSpeed > 1.2f) {
-          const float bowX = shipX + fwd.x * halfLen, bowZ = shipZ + fwd.y * halfLen;
+          // The stem, not the bbox tip: halfLen comes from the GLB bounds, which include the bowsprit.
+          const float bowX = shipX + fwd.x * halfLen * 0.62f, bowZ = shipZ + fwd.y * halfLen * 0.62f;
           const float bowSea = fftHeight(bowX, bowZ);
           if (bowSea > wetWaterlineY + 0.45f) {   // the sea stands high against the stem
             sprayBowCd = 0.8f;

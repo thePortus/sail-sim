@@ -213,8 +213,9 @@ struct MeshUniforms {
   glm::mat4 mvpCur{1.0f};   // UNJITTERED current clip (TAA velocity; only the player ship fills it)
   glm::mat4 mvpPrev{1.0f};  // UNJITTERED previous clip (prev model) for TAA velocity
   // Hull wetness (only the player ship fills these; the -1e6 sentinel means "dry" for every other mesh).
-  glm::vec4 wet0{-1.0e6f, -1.0e6f, 0.0f, 0.0f};   // x = waterline Y ; y = wet-reach Y ; z = bow-spray boost
+  glm::vec4 wet0{-1.0e6f, -1.0e6f, 0.0f, 0.0f};   // x = waterline Y ; y = wet-reach Y ; z = bow-spray boost ; w = rain
   glm::vec4 wet1{0.0f};                            // xy = ship centre XZ ; zw = ship forward XZ
+  glm::vec4 wet2{0.0f};                            // x = hull half-len ; y = hull half-beam ; z = deck-map enabled
 };
 
 // A depth-tested, PBR-shaded mesh (glTF-loaded or the fallback cube). Holds the
@@ -427,7 +428,12 @@ struct SunShadow {
   WGPUBindGroupLayout castBGL = nullptr, recvBGL = nullptr;
   WGPUBindGroup castBG0 = nullptr, castBG1 = nullptr, castBG2 = nullptr, recvBG = nullptr;
   WGPUSampler cmp = nullptr;
+  // Deck wetness paint-map (Phase 3): a hull-local top-down puddle map for the player ship, bound in the
+  // shared receiver group so every mesh draw can sample it (only the player ship applies it). Uploaded
+  // from a CPU grid each frame; the recv bind group carries its view + a linear sampler.
+  WGPUTexture deckMap = nullptr;   WGPUTextureView deckMapView = nullptr;   WGPUSampler deckSampler = nullptr;
 };
+static constexpr uint32_t kDeckMapN = 64;   // deck puddle-map resolution
 static const uint32_t kShadowRes = 2048;
 // Live shadow-map resolution (settings-driven; the cascade textures size from
 // this at first creation, so the Shadows quality dial applies on the next
@@ -470,8 +476,23 @@ static SunShadow& sunShadow(WGPUDevice device) {
     WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 1; d.entries = &e;
     s.castBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
   }
+  // Deck puddle-map texture (R8, uploaded from the CPU grid each frame) + a linear clamp sampler.
   {
-    WGPUBindGroupLayoutEntry e[3] = {};
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    td.dimension = WGPUTextureDimension_2D; td.size = { kDeckMapN, kDeckMapN, 1 };
+    td.format = WGPUTextureFormat_R8Unorm; td.mipLevelCount = 1; td.sampleCount = 1;
+    s.deckMap = wgpuDeviceCreateTexture(device, &td);
+    s.deckMapView = wgpuTextureCreateView(s.deckMap, nullptr);
+    WGPUSamplerDescriptor sd = {};
+    sd.addressModeU = WGPUAddressMode_ClampToEdge; sd.addressModeV = WGPUAddressMode_ClampToEdge;
+    sd.addressModeW = WGPUAddressMode_ClampToEdge;
+    sd.magFilter = WGPUFilterMode_Linear; sd.minFilter = WGPUFilterMode_Linear;
+    sd.mipmapFilter = WGPUMipmapFilterMode_Nearest; sd.maxAnisotropy = 1;
+    s.deckSampler = wgpuDeviceCreateSampler(device, &sd);
+  }
+  {
+    WGPUBindGroupLayoutEntry e[5] = {};
     e[0].binding = 0; e[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     e[0].buffer.type = WGPUBufferBindingType_Uniform; e[0].buffer.minBindingSize = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].visibility = WGPUShaderStage_Fragment;
@@ -479,7 +500,12 @@ static SunShadow& sunShadow(WGPUDevice device) {
     e[1].texture.viewDimension = WGPUTextureViewDimension_2D;
     e[2].binding = 2; e[2].visibility = WGPUShaderStage_Fragment;
     e[2].sampler.type = WGPUSamplerBindingType_Comparison;
-    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 3; d.entries = e;
+    e[3].binding = 3; e[3].visibility = WGPUShaderStage_Fragment;   // deck puddle map
+    e[3].texture.sampleType = WGPUTextureSampleType_Float;
+    e[3].texture.viewDimension = WGPUTextureViewDimension_2D;
+    e[4].binding = 4; e[4].visibility = WGPUShaderStage_Fragment;
+    e[4].sampler.type = WGPUSamplerBindingType_Filtering;
+    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 5; d.entries = e;
     s.recvBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
   }
   auto mkCastBG = [&](WGPUBuffer buf) {
@@ -492,11 +518,13 @@ static SunShadow& sunShadow(WGPUDevice device) {
   s.castBG1 = mkCastBG(s.castU1);
   s.castBG2 = mkCastBG(s.castU2);
   {
-    WGPUBindGroupEntry e[3] = {};
+    WGPUBindGroupEntry e[5] = {};
     e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].textureView = s.view0;
     e[2].binding = 2; e[2].sampler = s.cmp;
-    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 3; d.entries = e;
+    e[3].binding = 3; e[3].textureView = s.deckMapView;
+    e[4].binding = 4; e[4].sampler = s.deckSampler;
+    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 5; d.entries = e;
     s.recvBG = wgpuDeviceCreateBindGroup(device, &d);
   }
   return s;
@@ -3992,6 +4020,10 @@ int main(int argc, char** argv) {
   float wetTopY = -1.0e6f, wetWaterlineY = -1.0e6f, wetBowBoost = 0.0f;
   float frameBeau = 3.0f;   // this frame's Beaufort (captured from the weather block for sea-state scaling)
   float rainWet = 0.0f;     // rain/drizzle deck+hull wetness (rises fast, drains slow after the rain passes)
+  // Deck puddle map (Phase 3): a hull-local top-down grid of standing water on the player's deck. Green
+  // water stamps it, it evaporates + drains toward the rail (scuppers), and it uploads to SunShadow.deckMap.
+  std::vector<float>   deckWet((size_t)kDeckMapN * kDeckMapN, 0.0f);
+  std::vector<uint8_t> deckWetU8((size_t)kDeckMapN * kDeckMapN, 0);
   // Combat phase 3: mast crack triggers, own hit shudder, camera shake, decals.
   std::map<std::string, float> prevMastHp;         // playerId -> last masts hp (crack one-shot)
   float ownMastHealth = 1.0f;
@@ -7198,6 +7230,48 @@ int main(int argc, char** argv) {
       const float kWetDrain = 0.5f;                                    // m/s the high-water mark recedes
       if (wetTopY < -1.0e5f) wetTopY = instTop;                        // first frame: no memory yet
       wetTopY = std::max(instTop, wetTopY - kWetDrain * dt);
+
+      // ── Deck puddle map. (1) Green water: on a coarse grid, if the wave crest at a deck cell tops the
+      //    deck (waterline + freeboard), paint a soft disc. (2) Decay every cell: evaporation + faster
+      //    drain within ~15% of the rail (scuppers). Then pack to R8 and upload to the deck texture. ──
+      {
+        const int N = (int)kDeckMapN;
+        const float halfLen = std::max(vrig.hullHalfLen, 2.0f), halfBeam = std::max(vrig.hullHalfBeam, 1.0f);
+        const float sinH = std::sin(shipHeading), cosH = std::cos(shipHeading);
+        const glm::vec2 fwd(sinH, cosH), rgt(cosH, -sinH);
+        const float deckThresh = wetWaterlineY + 1.2f;   // freeboard: crest above this washes the deck
+        const int DS = 2;                                // detection stride (cost control)
+        for (int j = 0; j < N; j += DS) {
+          for (int i = 0; i < N; i += DS) {
+            const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
+            const float across = (uu - 0.5f) * 2.0f * halfBeam, along = (ww - 0.5f) * 2.0f * halfLen;
+            const float cx = shipX + fwd.x * along + rgt.x * across;
+            const float cz = shipZ + fwd.y * along + rgt.y * across;
+            if (fftHeight(cx, cz) > deckThresh) {
+              for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
+                const int ii = i + di, jj = j + dj;
+                if (ii < 0 || ii >= N || jj < 0 || jj >= N) continue;
+                deckWet[(size_t)jj * N + ii] = std::min(1.0f, deckWet[(size_t)jj * N + ii] + 5.0f * dt);
+              }
+            }
+          }
+        }
+        const float evap = std::exp(-0.25f * dt);
+        for (int j = 0; j < N; ++j) for (int i = 0; i < N; ++i) {
+          const size_t k = (size_t)j * N + i;
+          float v = deckWet[k] * evap;
+          const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
+          const float edge = 1.0f - std::min(std::min(uu, 1.0f - uu), std::min(ww, 1.0f - ww)) / 0.15f;
+          if (edge > 0.0f) v -= 0.9f * dt * edge;   // scuppers
+          deckWet[k] = std::max(0.0f, v);
+          deckWetU8[k] = (uint8_t)(std::min(1.0f, deckWet[k]) * 255.0f + 0.5f);
+        }
+        if (std::getenv("SAILSIM_DECKTEST")) std::fill(deckWetU8.begin(), deckWetU8.end(), (uint8_t)255);
+        WGPUImageCopyTexture dst = {}; dst.texture = sunShadow(device).deckMap; dst.mipLevel = 0;
+        WGPUTextureDataLayout dl = {}; dl.bytesPerRow = (uint32_t)N; dl.rowsPerImage = (uint32_t)N;
+        WGPUExtent3D ext = { (uint32_t)N, (uint32_t)N, 1 };
+        wgpuQueueWriteTexture(queue, &dst, deckWetU8.data(), deckWetU8.size(), &dl, &ext);
+      }
     } else {
       wetTopY = -1.0e6f; wetWaterlineY = -1.0e6f; wetBowBoost = 0.0f;
     }
@@ -8610,6 +8684,8 @@ int main(int argc, char** argv) {
         if (firstShip) {
           mu.wet0 = glm::vec4(wetWaterlineY, wetTopY, wetBowBoost, rainWet);
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
+          mu.wet2 = glm::vec4(std::max(vrig.hullHalfLen, 2.0f), std::max(vrig.hullHalfBeam, 1.0f), 1.0f,
+                              std::getenv("SAILSIM_DECKVIZ") ? 1.0f : 0.0f);   // deck-map debug tint
         }
         // TAA motion vectors for MOVING ships (own + remote players; forts/towns are static → the
         // resolve's camera reprojection covers them). Previous model tracked per-ship by id.

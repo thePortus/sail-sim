@@ -10,8 +10,9 @@ struct Uniforms {
     misc   : vec4<f32>,     // x = hull-local mask floor Y (used by the stencil stamp, not here)
     mvpCur : mat4x4<f32>,   // UNJITTERED current-frame clip (this ship) — TAA velocity only
     mvpPrev: mat4x4<f32>,   // UNJITTERED previous-frame clip (this ship's prev model) — TAA velocity only
-    wet0   : vec4<f32>,     // hull wetness: x = waterline world Y ; y = wet-reach world Y (high-water mark) ; z = bow-spray boost ; w unused
+    wet0   : vec4<f32>,     // hull wetness: x = waterline world Y ; y = wet-reach world Y (high-water mark) ; z = bow-spray boost ; w = rain wetness [0,1]
     wet1   : vec4<f32>,     // xy = ship centre world XZ ; zw = ship forward dir world XZ (for bow-spray localisation)
+    wet2   : vec4<f32>,     // deck puddle map: x = hull half-length ; y = hull half-beam ; z = deck-map enabled (player ship) ; w unused
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var baseColorTex  : texture_2d<f32>;
@@ -45,6 +46,8 @@ struct ShadowU {
 @group(1) @binding(0) var<uniform> shadowU : ShadowU;
 @group(1) @binding(1) var shadowT : texture_depth_2d;
 @group(1) @binding(2) var shadowS : sampler_comparison;
+@group(1) @binding(3) var deckMap : texture_2d<f32>;   // hull-local top-down puddle map (player ship)
+@group(1) @binding(4) var deckSamp : sampler;
 
 // Morph + skin a vertex to model-local space (shared by both vertex entries).
 fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec4<f32>) -> vec4<f32> {
@@ -229,7 +232,22 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // underneath. wet0.w = rain wetness [0,1]. Combined with the waterline band by the wetter of the two.
     let nUp = normalize(in.normal).y;
     let rainUp = clamp(nUp * 0.4 + 0.68, 0.0, 1.0);            // deck ~1, walls/sides ~0.68, underside ~0.28
-    let wet = max(wetWL, u.wet0.w * rainUp);
+    // Deck puddles (player ship only, wet2.z): sample the hull-local top-down paint-map on up-facing
+    // surfaces above the waterline. wet2 = (half-length, half-beam, enabled). along = bow→stern (v),
+    // across = port→stbd (u); right = perpendicular to forward in XZ.
+    var wetDeck = 0.0;
+    // Deck level only: up-facing, above the waterline, and within ~4 m of it — excludes the high yards
+    // and rigging that share the hull's XZ column but aren't deck.
+    if (u.wet2.z > 0.5 && nUp > 0.25 && in.worldPos.y > u.wet0.x && in.worldPos.y < u.wet0.x + 4.0) {
+        let right = vec2<f32>(u.wet1.w, -u.wet1.z);
+        let d = vec2<f32>(in.worldPos.x - u.wet1.x, in.worldPos.z - u.wet1.y);
+        let along  = dot(d, u.wet1.zw) / (2.0 * u.wet2.x) + 0.5;
+        let across = dot(d, right)     / (2.0 * u.wet2.y) + 0.5;
+        if (along > 0.0 && along < 1.0 && across > 0.0 && across < 1.0) {
+            wetDeck = textureSampleLevel(deckMap, deckSamp, vec2<f32>(across, along), 0.0).r * clamp(nUp, 0.0, 1.0);
+        }
+    }
+    let wet = max(max(wetWL, u.wet0.w * rainUp), wetDeck);
     // A wet film darkens the diffuse and drops the roughness toward a mirror; keep metals as-is.
     albedo = albedo * mix(1.0, 0.62, wet);
     let roughW = mix(roughness, 0.06, wet);
@@ -285,5 +303,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-
     // tonemapped (flat) and never reached the bloom bright-pass; leaving them linear fixes both.
     // Alpha carries the wetness = the SSR reflectivity mask (Phase 0 channel).
+    if (u.wet2.w > 0.5) { return vec4<f32>(color + vec3<f32>(0.0, 0.6, 0.9) * wetDeck, wet); }   // deck-map debug tint (SAILSIM_DECKVIZ)
     return vec4<f32>(color, wet);
 }

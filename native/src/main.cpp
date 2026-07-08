@@ -3385,7 +3385,8 @@ int main(int argc, char** argv) {
   // TAA reprojection state: previous frame's UNJITTERED view-proj, history ping-pong index, and a
   // frame counter driving the Halton(2,3) sub-pixel jitter. taaHistValid gates the first frame.
   glm::mat4 taaPrevVP(1.0f);
-  glm::mat4 taaPrevPlayerModel(1.0f);   // player ship's previous-frame model matrix (motion vectors)
+  std::map<std::string, glm::mat4> taaShipPrevModel;   // per-ship (id) previous-frame model — TAA motion vectors
+  std::vector<std::pair<Mesh*, uint32_t>> taaMovers;   // (mesh, slot) of moving ships to draw into the velocity buffer
   bool taaHistValid = false;
   int  taaCur = 0;
   uint32_t taaJitterIdx = 0;
@@ -8278,6 +8279,7 @@ int main(int argc, char** argv) {
     }
     // Every ship's uniforms into its vessel's dynamic-offset slots (same per-mesh
     // ordering as the draw loop below, so slot indices line up).
+    taaMovers.clear();
     {
       std::map<Mesh*, uint32_t> slot;
       bool firstShip = true;
@@ -8286,10 +8288,16 @@ int main(int argc, char** argv) {
         if (idx >= kMaxShipInstances) continue;
         MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
-        if (firstShip && userCfg.gfx.taa) {   // player ship (slot 0): TAA motion-vector matrices (unjittered)
+        // TAA motion vectors for MOVING ships (own + remote players; forts/towns are static → the
+        // resolve's camera reprojection covers them). Previous model tracked per-ship by id.
+        const bool moving = firstShip || s.remote;
+        if (moving && userCfg.gfx.taa) {
+          const std::string key = firstShip ? std::string("@own") : s.rp.id;
+          auto pit = taaShipPrevModel.find(key);
           mu.mvpCur  = taaCurVP * s.model;
-          mu.mvpPrev = taaPrevVP * taaPrevPlayerModel;
-          taaPrevPlayerModel = s.model;   // for next frame
+          mu.mvpPrev = taaPrevVP * (pit != taaShipPrevModel.end() ? pit->second : s.model);
+          taaShipPrevModel[key] = s.model;   // for next frame
+          taaMovers.push_back({ s.mesh, idx });
         }
         wgpuQueueWriteBuffer(queue, s.mesh->uniformBuf,
                              (uint64_t)idx * s.mesh->uniformStride, &mu, sizeof(mu));
@@ -9039,10 +9047,11 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderEnd(fp);
       wgpuRenderPassEncoderRelease(fp);
     }
-    // ── TAA velocity pass: re-draw the player ship into the velocity buffer (cleared to a sentinel
-    //    ~99), depth-tested read-only so only its visible surface writes screen-UV motion vectors.
-    //    The resolve reads these to reproject the MOVING ship (camera-only depth reproj can't). ──
-    if (userCfg.gfx.taa && sailing && ownMesh && ownMesh->velocityPipeline) {
+    // ── TAA velocity pass: re-draw every MOVING ship (own + remotes) into the velocity buffer
+    //    (cleared to a sentinel ~99), depth-tested read-only so only visible surfaces write screen-UV
+    //    motion vectors. The resolve reads these to reproject the moving ships (camera-only depth
+    //    reproj can't); static geometry stays at the sentinel and uses the depth reprojection. ──
+    if (userCfg.gfx.taa && sailing && !taaMovers.empty()) {
       WGPURenderPassColorAttachment vca = {};
       vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
       vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
@@ -9050,13 +9059,17 @@ int main(int argc, char** argv) {
       vda.view = depthView; vda.depthReadOnly = true; vda.stencilReadOnly = true;
       WGPURenderPassDescriptor vpd = {}; vpd.colorAttachmentCount = 1; vpd.colorAttachments = &vca; vpd.depthStencilAttachment = &vda;
       WGPURenderPassEncoder vp = wgpuCommandEncoderBeginRenderPass(encoder, &vpd);
-      uint32_t zeroOffs[2] = { 0, 0 };
-      wgpuRenderPassEncoderSetPipeline(vp, ownMesh->velocityPipeline);
-      wgpuRenderPassEncoderSetVertexBuffer(vp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetIndexBuffer(vp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-      for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
-        wgpuRenderPassEncoderSetBindGroup(vp, 0, ownMesh->bindGroups[i], 2, zeroOffs);
-        wgpuRenderPassEncoderDrawIndexed(vp, ownMesh->submeshes[i].indexCount, 1, ownMesh->submeshes[i].indexOffset, 0, 0);
+      for (auto& mv : taaMovers) {
+        Mesh* m = mv.first; uint32_t sl = mv.second;
+        if (!m->velocityPipeline || m->bindGroups.empty()) continue;
+        uint32_t offs[2] = { sl * m->uniformStride, (uint32_t)(sl * kPaletteStride) };
+        wgpuRenderPassEncoderSetPipeline(vp, m->velocityPipeline);
+        wgpuRenderPassEncoderSetVertexBuffer(vp, 0, m->vbuf, 0, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderSetIndexBuffer(vp, m->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+        for (size_t i = 0; i < m->submeshes.size(); ++i) {
+          wgpuRenderPassEncoderSetBindGroup(vp, 0, m->bindGroups[i], 2, offs);
+          wgpuRenderPassEncoderDrawIndexed(vp, m->submeshes[i].indexCount, 1, m->submeshes[i].indexOffset, 0, 0);
+        }
       }
       wgpuRenderPassEncoderEnd(vp);
       wgpuRenderPassEncoderRelease(vp);

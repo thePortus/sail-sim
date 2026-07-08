@@ -49,6 +49,7 @@ struct ShadowU {
 @group(1) @binding(3) var deckMap : texture_2d<f32>;   // hull-local top-down puddle map (player ship)
 @group(1) @binding(4) var deckSamp : sampler;
 @group(1) @binding(5) var seaMap : texture_2d<f32>;    // hull-local FFT sea-height map (real waterline)
+@group(1) @binding(6) var reflTex : texture_2d<f32>;   // planar sky/cloud reflection (deck puddles mirror it)
 
 // Morph + skin a vertex to model-local space (shared by both vertex entries).
 fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec4<f32>) -> vec4<f32> {
@@ -303,14 +304,20 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     var color = ambient + Lo;
-    // ── Puddle sky sheen: ONLY actual standing water on the deck (puddle) catches a faint, Fresnel-
-    //    weighted sky reflection, so a real puddle glints without tinting the whole hull. The damp hull
-    //    and waterline rely on darkening + the SSR scene reflection instead of any flat sky tint. ──
-    if (puddle > 0.01) {
-        let Rv = reflect(-V, N);
-        let skyRefl = mix(skyHoriz, skyZenith, clamp(Rv.y * 0.5 + 0.5, 0.0, 1.0));
-        let fresW = 0.03 + 0.6 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 4.0);
-        color = color + skyRefl * fresW * puddle * 0.8;
+    // ── Deck puddles mirror the sky. A puddle samples the SAME planar reflection the ocean uses (the
+    //    scene mirrored across the water plane → correct for the far sky/clouds, which is what reads as
+    //    water) at its own screen position, rippled slightly by the surface normal. Blended by the
+    //    puddle strength and a Fresnel term so it brightens toward grazing angles. wet0.y = render width,
+    //    eye.w = render height (for the screen UV). ──
+    if (puddle > 0.01 && u.wet0.y > 1.0) {
+        let ripple = N.xz * 0.03;
+        let screenUV = clamp(in.position.xy / vec2<f32>(u.wet0.y, u.eye.w) + ripple, vec2<f32>(0.002), vec2<f32>(0.998));
+        let reflC = textureSampleLevel(reflTex, deckSamp, screenUV, 0.0).rgb;
+        let fresV = pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 4.0);
+        // Only a real (deep) puddle mirrors the sky; shallow damp just darkens. Strong reflection so it
+        // reads as standing water, brightening toward grazing angles.
+        let mixA = clamp(smoothstep(0.35, 0.85, puddle) * (0.6 + 0.35 * fresV), 0.0, 0.92);
+        color = mix(color, reflC, mixA);
     }
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing

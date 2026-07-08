@@ -435,6 +435,10 @@ struct SunShadow {
   // Hull-local sea-height map: the FFT wave height sampled over the hull footprint (CPU), so the mesh
   // shader can read the ACTUAL local sea surface per hull fragment and follow it — a real, wavy waterline.
   WGPUTexture seaMap = nullptr;   WGPUTextureView seaMapView = nullptr;
+  // Planar sky/cloud reflection (the same RTT the ocean mirrors). Bound so deck puddles reflect the sky
+  // like the sea does. Set after the reflection target exists + on resize; starts as a placeholder.
+  WGPUTextureView reflView = nullptr;
+  WGPUBindGroup recvBGNoRefl = nullptr;   // receiver group with binding 6 = placeholder — for the reflection pass (reflView is the target there)
 };
 static constexpr uint32_t kDeckMapN = 64;   // deck puddle-map resolution
 static constexpr uint32_t kSeaMapN  = 32;   // hull-local sea-height map resolution
@@ -502,7 +506,7 @@ static SunShadow& sunShadow(WGPUDevice device) {
     s.seaMapView = wgpuTextureCreateView(s.seaMap, nullptr);
   }
   {
-    WGPUBindGroupLayoutEntry e[6] = {};
+    WGPUBindGroupLayoutEntry e[7] = {};
     e[0].binding = 0; e[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     e[0].buffer.type = WGPUBufferBindingType_Uniform; e[0].buffer.minBindingSize = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].visibility = WGPUShaderStage_Fragment;
@@ -518,7 +522,10 @@ static SunShadow& sunShadow(WGPUDevice device) {
     e[5].binding = 5; e[5].visibility = WGPUShaderStage_Fragment;   // hull-local sea-height map
     e[5].texture.sampleType = WGPUTextureSampleType_Float;
     e[5].texture.viewDimension = WGPUTextureViewDimension_2D;
-    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 6; d.entries = e;
+    e[6].binding = 6; e[6].visibility = WGPUShaderStage_Fragment;   // planar sky/cloud reflection
+    e[6].texture.sampleType = WGPUTextureSampleType_Float;
+    e[6].texture.viewDimension = WGPUTextureViewDimension_2D;
+    WGPUBindGroupLayoutDescriptor d = {}; d.entryCount = 7; d.entries = e;
     s.recvBGL = wgpuDeviceCreateBindGroupLayout(device, &d);
   }
   auto mkCastBG = [&](WGPUBuffer buf) {
@@ -531,17 +538,39 @@ static SunShadow& sunShadow(WGPUDevice device) {
   s.castBG1 = mkCastBG(s.castU1);
   s.castBG2 = mkCastBG(s.castU2);
   {
-    WGPUBindGroupEntry e[6] = {};
+    s.reflView = s.deckMapView;   // placeholder until the real planar reflection is bound (see below)
+    WGPUBindGroupEntry e[7] = {};
     e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
     e[1].binding = 1; e[1].textureView = s.view0;
     e[2].binding = 2; e[2].sampler = s.cmp;
     e[3].binding = 3; e[3].textureView = s.deckMapView;
     e[4].binding = 4; e[4].sampler = s.deckSampler;
     e[5].binding = 5; e[5].textureView = s.seaMapView;
-    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 6; d.entries = e;
+    e[6].binding = 6; e[6].textureView = s.reflView;
+    WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 7; d.entries = e;
     s.recvBG = wgpuDeviceCreateBindGroup(device, &d);
+    e[6].textureView = s.deckMapView;   // placeholder (never a render target) for the reflection pass
+    s.recvBGNoRefl = wgpuDeviceCreateBindGroup(device, &d);
   }
   return s;
+}
+
+// Rebind the shadow-receiver group with the current planar reflection view (created after the shadow
+// singleton, and recreated on resize), so deck puddles can mirror the sky. Recreates recvBG in place.
+static void bindReflectionToShadow(WGPUDevice device, WGPUTextureView reflView) {
+  SunShadow& s = sunShadow(device);
+  s.reflView = reflView;
+  if (s.recvBG) wgpuBindGroupRelease(s.recvBG);
+  WGPUBindGroupEntry e[7] = {};
+  e[0].binding = 0; e[0].buffer = s.recvU; e[0].size = sizeof(ShadowUniform);
+  e[1].binding = 1; e[1].textureView = s.view0;
+  e[2].binding = 2; e[2].sampler = s.cmp;
+  e[3].binding = 3; e[3].textureView = s.deckMapView;
+  e[4].binding = 4; e[4].sampler = s.deckSampler;
+  e[5].binding = 5; e[5].textureView = s.seaMapView;
+  e[6].binding = 6; e[6].textureView = s.reflView;
+  WGPUBindGroupDescriptor d = {}; d.layout = s.recvBGL; d.entryCount = 7; d.entries = e;
+  s.recvBG = wgpuDeviceCreateBindGroup(device, &d);
 }
 
 static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat, RiggedData data) {
@@ -3689,6 +3718,7 @@ int main(int argc, char** argv) {
   uint32_t reflW = std::max(1u, rW / 2), reflH = std::max(1u, rH / 2);
   WGPUTexture reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
   WGPUTextureView reflView = wgpuTextureCreateView(reflTex, nullptr);
+  bindReflectionToShadow(device, reflView);   // deck puddles mirror the sky via the shadow-receiver group
   // Ocean bind groups are CACHED across frames (their views change only on resize /
   // terrain-load) instead of rebuilt every frame. Invalidated by a dirty flag set
   // on resize (pointer comparison is unsafe — a freed view handle can be reused).
@@ -4275,6 +4305,7 @@ int main(int argc, char** argv) {
       wgpuTextureViewRelease(reflDepthView); wgpuTextureRelease(reflDepth);
       reflTex = makeColorRTT(device, reflW, reflH, kSceneFormat);
       reflView = wgpuTextureCreateView(reflTex, nullptr);
+      bindReflectionToShadow(device, reflView);   // re-point the deck-puddle reflection
       oceanBGDirty = true;   // ocean bind group references reflView / oceanDepthReadView
       reflDepth = makeDepthTexture(device, reflW, reflH);
       reflDepthView = wgpuTextureCreateView(reflDepth, nullptr);
@@ -7299,13 +7330,24 @@ int main(int argc, char** argv) {
             }
           }
         }
-        const float rainFill = rainWet * 0.6f;    // rain collects across the whole deck
+        // Rain doesn't wet the deck evenly — it POOLS in the low spots. A smooth hull-local pattern
+        // marks where water collects (fills to a reflective puddle) vs the higher planking between
+        // (stays merely damp), so you get discrete puddles rather than one mirror sheet.
+        auto poolMask = [](float u, float v) {
+          float n = std::sin(u * 7.0f) * std::cos(v * 5.0f) * 0.5f
+                  + std::sin(u * 11.0f + 1.7f) * std::sin(v * 9.0f + 0.5f) * 0.35f
+                  + std::cos((u + v) * 6.0f) * 0.15f;
+          float m = glm::clamp(0.5f + 0.5f * n, 0.0f, 1.0f);
+          return glm::smoothstep(0.5f, 0.72f, m);   // ~1 in a pool, 0 on the high planking
+        };
+        const float rainFill = rainWet * 1.1f;    // rain feeds the pools
         const float evap = std::exp(-0.30f * dt);
         for (int j = 0; j < N; ++j) for (int i = 0; i < N; ++i) {
           const size_t k = (size_t)j * N + i;
           const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
-          float v = deckWet[k] + rainFill * dt;   // rain
-          if (ww > 0.55f) v += bowSprayRate * dt * (ww - 0.55f) / 0.45f;   // bow spray on the forward deck
+          const float pool = poolMask(uu, ww);
+          float v = deckWet[k] + rainFill * pool * dt;   // rain collects in the pool low spots
+          if (ww > 0.55f) v += bowSprayRate * pool * dt * (ww - 0.55f) / 0.45f;   // bow spray -> foredeck pools
           v *= evap;
           const float edge = 1.0f - std::min(std::min(uu, 1.0f - uu), std::min(ww, 1.0f - ww)) / 0.15f;
           if (edge > 0.0f) v -= 0.9f * dt * edge;   // scuppers drain the rail
@@ -8531,7 +8573,7 @@ int main(int argc, char** argv) {
         if (reflFull && ownMesh) {
           uint32_t zeroOffs[2] = { 0, 0 };   // instance slot 0: uniforms + palette
           wgpuRenderPassEncoderSetPipeline(rp, ownMesh->pipeline);
-          wgpuRenderPassEncoderSetBindGroup(rp, 1, sunShadow(device).recvBG, 0, nullptr);
+          wgpuRenderPassEncoderSetBindGroup(rp, 1, sunShadow(device).recvBGNoRefl, 0, nullptr);   // reflView is the target here
           wgpuRenderPassEncoderSetVertexBuffer(rp, 0, ownMesh->vbuf, 0, WGPU_WHOLE_SIZE);
           wgpuRenderPassEncoderSetIndexBuffer(rp, ownMesh->ibuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
           for (size_t i = 0; i < ownMesh->submeshes.size(); ++i) {
@@ -8721,14 +8763,14 @@ int main(int argc, char** argv) {
       for (const ShipInst& s : ships) {
         uint32_t idx = slot[s.mesh];
         if (idx >= kMaxShipInstances) continue;
-        MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, 1.0f),
+        MeshUniforms mu{ viewProj * s.model, s.model, glm::vec4(eye, (float)rH),   // eye.w = render height (reflection UV)
                          glm::vec4(lightDir, dayK), glm::vec4(s.mesh->maskFloorY, s.tint.r, s.tint.g, s.tint.b) };
         // Rain wets every ship's deck/hull from above (wet0.w). The waterline/bow-spray band is the
         // player's own ship only (firstShip); every other mesh keeps the dry -1e6 sentinel for it.
         // Forward = (sin H, cos H) per the seaward-heading convention, for bow-spray placement.
         mu.wet0.w = rainWet;
         if (firstShip) {
-          mu.wet0 = glm::vec4(wetTopY, 0.0f, wetBowBoost, rainWet);   // x = splash reach above local sea
+          mu.wet0 = glm::vec4(wetTopY, (float)rW, wetBowBoost, rainWet);   // x = splash reach ; y = render width (reflection UV)
           mu.wet1 = glm::vec4(shipX, shipZ, std::sin(shipHeading), std::cos(shipHeading));
           mu.wet2 = glm::vec4(std::max(vrig.hullHalfLen, 2.0f), std::max(vrig.hullHalfBeam, 1.0f), 1.0f,
                               std::getenv("SAILSIM_DECKVIZ") ? 1.0f : 0.0f);   // deck-map debug tint

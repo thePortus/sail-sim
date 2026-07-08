@@ -205,31 +205,46 @@ fn fresnelSchlick(cosT : f32, F0 : vec3<f32>) -> vec3<f32> {
     return F0 + (vec3<f32>(1.0) - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
-fn hash21(p : vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+// Raindrop impact field — VERBATIM port of the ocean's rainField (ocean_surface.wgsl), so puddle
+// droplets are the exact same size, density, and timing as the raindrops on the water: ~0.59 m cells,
+// rings expanding to ~0.15-0.40 m radius, 1-3 drops/s per cell.
+fn rvHashM(pIn : vec2<f32>) -> f32 {
+    let p = pIn - floor(pIn / 512.0) * 512.0;
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+fn deckRainField(p : vec2<f32>, t : f32) -> f32 {
+    let cell = floor(p);
+    let f = fract(p);
+    let h1 = rvHashM(cell); let h2 = rvHashM(cell + 5.7);
+    let h3 = rvHashM(cell + 11.3); let h4 = rvHashM(cell + 19.1);
+    let center = vec2<f32>(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+    let rate = mix(1.0, 3.2, h3);
+    let life = fract(t * rate + h1 * 7.0);
+    let r = length(f - center);
+    let sz = mix(0.16, 0.42, h4);
+    let impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+    let ringR = life * sz * 1.6;
+    var ring = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+    ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+    return impact + ring * 0.6;
 }
 
 // Water-surface ripple at a hull-local metre position, animated by time. xy = UV distortion (capillary
-// shimmer + droplet wavefronts), z = the droplet ring CREST [0,1] so the caller can light it up.
-// Droplets are cell-based (one per ~2.4 m tile, random position + phase per cycle) so the whole puddle
-// area gets a uniform, visible density of expanding rain rings, scaled by the rain amount.
+// shimmer + droplet wavefronts), z = the droplet CREST [0,1] so the caller can light it up. Droplets
+// come from deckRainField above — the ocean's rain rings at the ocean's scale.
 fn puddleRipple(pm : vec2<f32>, t : f32, rain : f32) -> vec3<f32> {
     var r = vec2<f32>(0.0);
     r += vec2<f32>(sin(pm.x * 3.1 + t * 2.0), cos(pm.y * 2.7 - t * 1.7)) * 0.5;
     r += vec2<f32>(cos(pm.y * 5.3 - t * 2.4), sin(pm.x * 4.6 + t * 3.1)) * 0.28;
     var crest = 0.0;
     if (rain > 0.02) {
-        let cell = floor(pm / 2.4);
-        let lp = pm - cell * 2.4;
-        let tt = t * 1.1 + hash21(cell) * 8.0;          // per-cell phase so rings don't sync
-        let slot = floor(tt);
-        let age = fract(tt);                             // 0 -> 1 over ~0.9 s: ring expands then fades
-        let c = vec2<f32>(hash21(cell + vec2<f32>(slot, 1.3)), hash21(cell + vec2<f32>(slot, 7.7))) * 2.4;
-        let dd = distance(lp, c);
-        let ringR = age * 1.1;
-        let ring = exp(-pow((dd - ringR) * 9.0, 2.0)) * (1.0 - age);
-        crest = ring * rain;
-        r += normalize(lp - c + vec2<f32>(1e-4, 1e-4)) * ring * 2.2 * rain;
+        let rp = pm * 1.7;   // same cell density as the ocean (rp = worldUV * 1.7)
+        let e = 0.18;
+        let n0 = deckRainField(rp, t);
+        let grad = vec2<f32>(deckRainField(rp + vec2<f32>(e, 0.0), t) - n0,
+                             deckRainField(rp + vec2<f32>(0.0, e), t) - n0) / e;
+        r += grad * 0.55 * rain;
+        crest = clamp(n0 * 0.8, 0.0, 1.0) * rain;
     }
     return vec3<f32>(r, crest);
 }

@@ -21,6 +21,7 @@ struct Graphics {
   bool  bloom = true;
   bool  reflections = true;      // planar water reflections (mirror pass) vs analytic sky only
   bool  ssr = false;             // screen-space reflections (wet-deck/hull sheen; opt-in)
+  bool  fog = true;              // aerial / distance fog (atmospheric haze)
   bool  waterTransparency = true;// shallow-water see-through
   int   scatter = 3;             // 0 Off, 1 Low .. 4 Ultra (foliage density + draw distance)
 };

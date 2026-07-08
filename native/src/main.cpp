@@ -1721,7 +1721,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   fx.fxaaUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   ubd.size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);   // TAA: invVP + prevVP + texel + params
   fx.taaUbuf = wgpuDeviceCreateBuffer(device, &ubd);
-  ubd.size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);   // SSR: invVP + vp + eye + params
+  ubd.size = 2 * sizeof(glm::mat4) + 4 * sizeof(glm::vec4);   // SSR: invVP + vp + eye + params
   fx.ssrUbuf = wgpuDeviceCreateBuffer(device, &ubd);
 
   // ── SMAA setup ──────────────────────────────────────────────────────────────
@@ -3307,6 +3307,7 @@ int main(int argc, char** argv) {
   if (std::getenv("SAILSIM_TAA")) userCfg.gfx.taa = true;
   if (const char* uenv = std::getenv("SAILSIM_TAA_UPSCALE")) userCfg.gfx.taaUpscale = std::clamp((float)atof(uenv), 0.5f, 1.0f);
   if (std::getenv("SAILSIM_SSR")) userCfg.gfx.ssr = true;   // startup override for screen-space reflections
+  if (std::getenv("SAILSIM_NOFOG")) userCfg.gfx.fog = false;   // disable aerial fog
   const float taaFeedback = std::getenv("SAILSIM_TAA_FEEDBACK") ? (float)atof(std::getenv("SAILSIM_TAA_FEEDBACK")) : 0.8f;
   const float taaSharpen  = std::getenv("SAILSIM_TAA_SHARPEN")  ? (float)atof(std::getenv("SAILSIM_TAA_SHARPEN"))  : 0.35f;
   const float taaClamp    = std::getenv("SAILSIM_TAA_CLAMP")    ? (float)atof(std::getenv("SAILSIM_TAA_CLAMP"))    : 0.4f;   // variance-clip gamma (tight — busy ocean)
@@ -3614,7 +3615,7 @@ int main(int argc, char** argv) {
   auto rebuildSsrBind = [&]() {
     if (ssrBind) wgpuBindGroupRelease(ssrBind);
     WGPUBindGroupEntry e[4] = {};
-    e[0].binding = 0; e[0].buffer = postFx.ssrUbuf; e[0].size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);
+    e[0].binding = 0; e[0].buffer = postFx.ssrUbuf; e[0].size = 2 * sizeof(glm::mat4) + 4 * sizeof(glm::vec4);
     e[1].binding = 1; e[1].textureView = sceneView;
     e[2].binding = 2; e[2].sampler = postFx.samp;
     e[3].binding = 3; e[3].textureView = depthReadView;
@@ -3622,7 +3623,7 @@ int main(int argc, char** argv) {
     ssrBind = wgpuDeviceCreateBindGroup(device, &d);
   };
   rebuildSsrBind();
-  rebuildPostBinds(device, postFx, userCfg.gfx.ssr ? ssrView : sceneView, bloomAView, bloomBView,
+  rebuildPostBinds(device, postFx, (userCfg.gfx.ssr || userCfg.gfx.fog) ? ssrView : sceneView, bloomAView, bloomBView,
                    aoAView, aoBView, dofAView, dofBView, depthReadView);
   auto rebuildFxaaBind = [&]() {
     if (postFx.fxaaBind) wgpuBindGroupRelease(postFx.fxaaBind);
@@ -4064,7 +4065,7 @@ int main(int argc, char** argv) {
       wgpuTextureViewRelease(dofBView); wgpuTextureRelease(dofBTex);
       dofBTex = makeColorRTT(device, rW / 2, rH / 2, kSceneFormat);
       dofBView = wgpuTextureCreateView(dofBTex, nullptr);
-      rebuildPostBinds(device, postFx, userCfg.gfx.ssr ? ssrView : sceneView, bloomAView, bloomBView,
+      rebuildPostBinds(device, postFx, (userCfg.gfx.ssr || userCfg.gfx.fog) ? ssrView : sceneView, bloomAView, bloomBView,
                        aoAView, aoBView, dofAView, dofBView, depthReadView);
     }
 
@@ -4539,13 +4540,21 @@ int main(int argc, char** argv) {
           ImGui::SetTooltip("Mirror the islands, ship and clouds in the water. Off = sky-only\nreflection (cheaper — skips a full scene + cloud re-render each frame).");
         // SSR toggles the post pass's scene input between sceneView and the SSR output, so rebuild
         // the post binds when it changes.
+        // SSR + aerial fog share the same scene-input pass, so rebuild post binds when either toggles.
         if (ImGui::Checkbox("Screen-space reflections (SSR)", &g.ssr)) {
-          rebuildPostBinds(device, postFx, g.ssr ? ssrView : sceneView, bloomAView, bloomBView,
+          rebuildPostBinds(device, postFx, (g.ssr || g.fog) ? ssrView : sceneView, bloomAView, bloomBView,
                            aoAView, aoBView, dofAView, dofBView, depthReadView);
           custom(); gsave();
         }
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Reflect the on-screen scene onto wet decks / hulls / metal (Fresnel-weighted).\nExperimental; adds a screen-space ray-march pass.");
+        if (ImGui::Checkbox("Aerial fog", &g.fog)) {
+          rebuildPostBinds(device, postFx, (g.ssr || g.fog) ? ssrView : sceneView, bloomAView, bloomBView,
+                           aoAView, aoBView, dofAView, dofBView, depthReadView);
+          custom(); gsave();
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Distance + height haze so far islands and sea recede into atmosphere.");
         ImGui::End();
       }
 
@@ -9080,12 +9089,19 @@ int main(int argc, char** argv) {
     // ── SSR pass (opt-in): reflect the composited HDR scene onto reflective surfaces (depth-based
     //    normals + screen-space ray-march), writing scene+reflection into ssrView, which the post
     //    pass then reads instead of sceneView. ──
-    if (userCfg.gfx.ssr && sailing) {
-      struct SsrUC { glm::mat4 invVP; glm::mat4 vp; glm::vec4 eye; glm::vec4 params; } su;
+    if ((userCfg.gfx.ssr || userCfg.gfx.fog) && sailing) {
+      struct SsrUC { glm::mat4 invVP; glm::mat4 vp; glm::vec4 eye; glm::vec4 params; glm::vec4 fog; glm::vec4 fogCol; } su;
       su.invVP  = glm::inverse(viewProj);
       su.vp     = viewProj;
       su.eye    = glm::vec4(eye, 1.0f);
-      su.params = glm::vec4(1.1f, 900.0f, 40.0f, 1.4f);   // strength, max world dist, step count, water-cut height
+      // SSR strength 0 disables the reflection march (fog-only pass); water-cut 1.4 m.
+      su.params = glm::vec4(userCfg.gfx.ssr ? 1.1f : 0.0f, 900.0f, 40.0f, 1.4f);
+      // Aerial fog: distance density, height falloff, sea-level Y, amount (0 = off). Fog colour tracks
+      // day/night toward a pale horizon haze.
+      const float fogAmt = userCfg.gfx.fog ? 1.0f : 0.0f;
+      su.fog = glm::vec4(0.00008f, 0.010f, 0.0f, fogAmt);
+      glm::vec3 fc = glm::mix(glm::vec3(0.02f, 0.03f, 0.05f), glm::vec3(0.58f, 0.66f, 0.76f), dayK);
+      su.fogCol = glm::vec4(fc, 1.0f);
       wgpuQueueWriteBuffer(queue, postFx.ssrUbuf, 0, &su, sizeof(su));
       WGPURenderPassColorAttachment ca = {};
       ca.view = ssrView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;

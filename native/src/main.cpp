@@ -4066,6 +4066,7 @@ int main(int argc, char** argv) {
   float frameBeau = 3.0f;   // this frame's Beaufort (captured from the weather block for sea-state scaling)
   float rainWet = 0.0f;     // rain/drizzle deck+hull wetness (rises fast, drains slow after the rain passes)
   float sprayBowCd = 0.0f, sprayGreenCd = 0.0f;   // spray-burst cooldowns (bow slam / green water)
+  float bowRelPrev = 0.0f;                        // last frame's sea height against the bow (impact detection)
   // Deck puddle map (Phase 3): a hull-local top-down grid of standing water on the player's deck. Green
   // water stamps it, it evaporates + drains toward the rail (scuppers), and it uploads to SunShadow.deckMap.
   std::vector<float>   deckWet((size_t)kDeckMapN * kDeckMapN, 0.0f);
@@ -7346,15 +7347,20 @@ int main(int argc, char** argv) {
           sprayGreenCd = 0.6f;
           cannonFx.spray(greenHit, glm::vec3(fwd.x, 0.0f, fwd.y) * -1.5f, glm::min(1.0f, greenBest * 1.5f));
         }
-        if (sprayBowCd <= 0.0f && shipSpeed > 1.2f) {
-          // The stem, not the bbox tip: halfLen comes from the GLB bounds, which include the bowsprit.
-          const float bowX = shipX + fwd.x * halfLen * 0.62f, bowZ = shipZ + fwd.y * halfLen * 0.62f;
-          const float bowSea = fftHeight(bowX, bowZ);
-          if (bowSea > wetWaterlineY + 0.45f) {   // the sea stands high against the stem
-            sprayBowCd = 0.8f;
-            cannonFx.spray(glm::vec3(bowX, bowSea + 0.3f, bowZ),
+        {
+          // Bow spray fires on IMPACT: the sea height against the bow (sampled just ahead of the stem)
+          // must be both high AND rising fast this frame — a wave front slamming into the bow — not
+          // merely standing high. Spawn at the stem (~0.75x halfLen; the bbox tip is the bowsprit).
+          const float sampX = shipX + fwd.x * halfLen * 0.85f, sampZ = shipZ + fwd.y * halfLen * 0.85f;
+          const float bowRel = fftHeight(sampX, sampZ) - wetWaterlineY;
+          const float bowRise = (bowRel - bowRelPrev) / std::max(dt, 1e-4f);   // m/s the wave climbs the bow
+          bowRelPrev = bowRel;
+          if (sprayBowCd <= 0.0f && shipSpeed > 1.0f && bowRel > 0.30f && bowRise > 0.7f) {
+            sprayBowCd = 0.5f;
+            const float bowX = shipX + fwd.x * halfLen * 0.75f, bowZ = shipZ + fwd.y * halfLen * 0.75f;
+            cannonFx.spray(glm::vec3(bowX, wetWaterlineY + bowRel * 0.7f + 0.3f, bowZ),
                            glm::vec3(fwd.x, 0.0f, fwd.y) * (0.8f + 0.5f * shipSpeed),
-                           glm::clamp(shipSpeed / 4.0f, 0.3f, 1.0f));
+                           glm::clamp(0.35f + bowRise * 0.35f + shipSpeed * 0.08f, 0.3f, 1.0f));
           }
         }
         // Rain doesn't wet the deck evenly — it POOLS in the low spots. Small, localized puddles: one

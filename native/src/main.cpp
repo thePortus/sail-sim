@@ -8030,13 +8030,14 @@ int main(int argc, char** argv) {
       if (!sailing) audioSys.musicSetGain(0.0f);
     }
     const glm::vec4 oceanSun(lightDir, dayK);
-    // Coastal shallows: hand the ocean the terrain heightfield bounds (see-depth
-    // 10 m, the client's _SeeDepth) once the field is resident.
-    glm::vec4 oceanTB(0.0f), oceanTM(1.0f, 1.0f, 0.0f, 10.0f);
+    // Coastal shallows: hand the ocean the terrain heightfield bounds + the see-depth
+    // (metres). 8 m — a touch murkier than the client's 10 m _SeeDepth, so the seabed
+    // reads as clear only in genuinely shallow water rather than everywhere over sand.
+    glm::vec4 oceanTB(0.0f), oceanTM(1.0f, 1.0f, 0.0f, 8.0f);
     if (terrainR.ready && terr.loaded()) {
       const terrain::Manifest& otm = terr.manifest();
       oceanTB = glm::vec4((float)otm.minX, (float)otm.maxX, (float)otm.minZ, (float)otm.maxZ);
-      oceanTM = glm::vec4((float)otm.width, (float)otm.height, 1.0f, 10.0f);
+      oceanTM = glm::vec4((float)otm.width, (float)otm.height, 1.0f, 8.0f);
     }
     // ── Sun-shadow cascades: cascade 0 = a tight ortho box around the player
     //    vessel (mast/rigging shadows on the deck + hull shadow on the water),

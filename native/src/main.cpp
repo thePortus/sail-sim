@@ -4259,8 +4259,16 @@ int main(int argc, char** argv) {
   // serviced by the Cocoa run loop that glfwPollEvents pumps below.
   updater::start();
 
+  // Which bower the game drops when we anchor — chosen randomly at the moment of
+  // anchoring (matches the browser VesselService.anchorSide), then held so the same
+  // anchor stays down until we weigh. Broadcast to remotes and drives the animation.
+  char ownAnchorSide = 'S';
+  bool prevAnchoredEdge = false;
+
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   while (!glfwWindowShouldClose(window)) {
+    if (vessel.anchored && !prevAnchoredEdge) ownAnchorSide = (std::rand() & 1) ? 'P' : 'S';
+    prevAnchoredEdge = vessel.anchored;
     glfwPollEvents();
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
@@ -6748,7 +6756,7 @@ int main(int argc, char** argv) {
           pu.isPortTack = pd <= 180.0f;
         }
         pu.anchored = vessel.anchored;
-        pu.anchorSide = "S";
+        pu.anchorSide = ownAnchorSide == 'P' ? "P" : "S";
         mpClient.sendUpdate(pu, netSeq++);
       }
     }
@@ -6813,10 +6821,11 @@ int main(int argc, char** argv) {
       combat::ShipPose gpose{ vessel.x, vessel.z, vessel.heading };
       // Headless test hook: SAILSIM_GUNS=1 runs out the starboard battery at
       // frame 120 and fires it at frame 420 (screenshot the arcs + balls).
-      if (std::getenv("SAILSIM_GUNS")) {
-        if (frame == 120) guns.armOrFire(1);
-        if (frame >= 420 && frame % 780 == 0) guns.armOrFire(1);   // re-fire as reloads complete
-        if (frame == 420) guns.armOrFire(1);
+      if (const char* gv = std::getenv("SAILSIM_GUNS")) {
+        const int gs = std::atoi(gv);   // 0=port, 1=stbd (DEBUG: which side to arm)
+        if (frame == 120) guns.armOrFire(gs);
+        if (frame >= 420 && frame % 780 == 0) guns.armOrFire(gs);   // re-fire as reloads complete
+        if (frame == 420) guns.armOrFire(gs);
       }
       // Audio test hook: SAILSIM_BELLTEST=1 rings the ship's bell at frame 240
       // and follows with a small gull chorus (hear both synths on demand).
@@ -7642,6 +7651,8 @@ int main(int argc, char** argv) {
       camFramed = true;
     }
     if (const char* cd = std::getenv("SAILSIM_CAMDIST")) camDist = (float)std::atof(cd);   // debug zoom
+    if (const char* cp = std::getenv("SAILSIM_CAMPITCH")) camPitch = (float)std::atof(cp);   // debug: overhead view
+    if (const char* cy = std::getenv("SAILSIM_CAMYAW")) camYawOffset = (float)std::atof(cy);   // debug: orbit
 
     // Place a ship on the wave field: heave to the surface, tilt to its normal
     // (central differences of the FFT height, ~2 m step), yaw to heading, then
@@ -8720,7 +8731,9 @@ int main(int argc, char** argv) {
       ownAnim->setRudder((float)helmInput);
       ownAnim->setSailTrim(vessel.sheetAngleDeg, isPortTack);
       ownAnim->applySailState(vessel.sailState);
-      ownAnim->dropAnchor('S', vessel.anchored ? 1.0f : 0.0f);
+      // Lower the randomly-chosen bower; the other stays catted (browser parity).
+      ownAnim->dropAnchor('S', (vessel.anchored && ownAnchorSide == 'S') ? 1.0f : 0.0f);
+      ownAnim->dropAnchor('P', (vessel.anchored && ownAnchorSide == 'P') ? 1.0f : 0.0f);
       ownAnim->setGunDeploy('P', guns.deploy(0), guns.recoil(0));
       ownAnim->setGunDeploy('S', guns.deploy(1), guns.recoil(1));
       ownAnim->setMastDamage(ownMastHealth);

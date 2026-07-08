@@ -7330,22 +7330,29 @@ int main(int argc, char** argv) {
             }
           }
         }
-        // Rain doesn't wet the deck evenly — it POOLS in the low spots. A smooth hull-local pattern
-        // marks where water collects (fills to a reflective puddle) vs the higher planking between
-        // (stays merely damp), so you get discrete puddles rather than one mirror sheet.
-        auto poolMask = [](float u, float v) {
-          float n = std::sin(u * 7.0f) * std::cos(v * 5.0f) * 0.5f
-                  + std::sin(u * 11.0f + 1.7f) * std::sin(v * 9.0f + 0.5f) * 0.35f
-                  + std::cos((u + v) * 6.0f) * 0.15f;
-          float m = glm::clamp(0.5f + 0.5f * n, 0.0f, 1.0f);
-          return glm::smoothstep(0.42f, 0.62f, m);   // ~1 in a pool, 0 on the high planking (generous coverage)
+        // Rain doesn't wet the deck evenly — it POOLS in the low spots. Small, localized puddles: one
+        // candidate per ~1.15 m cell of hull-local METRES (ship-size independent), random centre and
+        // radius (~0.3-0.6 m across), ~65% of cells host one — discrete scattered puddles, never sheets.
+        auto pmHash = [](float a, float b, float s) {
+          float v = std::sin(a * 12.9898f + b * 78.233f + s) * 43758.5453f;
+          return v - std::floor(v);
+        };
+        auto poolMask = [&](float mx, float mz) {
+          const float kCell = 1.15f;
+          const float cx = std::floor(mx / kCell), cz = std::floor(mz / kCell);
+          if (pmHash(cx, cz, 0.0f) < 0.35f) return 0.0f;                       // this cell holds no puddle
+          const float px = (cx + 0.3f + 0.4f * pmHash(cx, cz, 1.7f)) * kCell;  // centre, clear of the cell edge
+          const float pz = (cz + 0.3f + 0.4f * pmHash(cx, cz, 3.9f)) * kCell;
+          const float r  = 0.16f + 0.14f * pmHash(cx, cz, 7.3f);               // radius 0.16-0.30 m
+          const float d  = std::hypot(mx - px, mz - pz);
+          return glm::clamp(1.0f - glm::smoothstep(r * 0.5f, r, d), 0.0f, 1.0f);
         };
         const float rainFill = rainWet * 1.5f;    // rain feeds the pools
         const float evap = std::exp(-0.10f * dt);  // slow evaporation: puddles linger well after the rain
         for (int j = 0; j < N; ++j) for (int i = 0; i < N; ++i) {
           const size_t k = (size_t)j * N + i;
           const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
-          const float pool = poolMask(uu, ww);
+          const float pool = poolMask((uu - 0.5f) * 2.0f * halfBeam, (ww - 0.5f) * 2.0f * halfLen);
           float v = deckWet[k] + rainFill * pool * dt;   // rain collects in the pool low spots
           if (ww > 0.55f) v += bowSprayRate * pool * dt * (ww - 0.55f) / 0.45f;   // bow spray -> foredeck pools
           v *= evap;

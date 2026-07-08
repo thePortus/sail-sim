@@ -48,6 +48,8 @@ Values load() {
       x.ssr = g.value("ssr", x.ssr);
       x.fog = g.value("fog", x.fog);
       x.volumetric = g.value("volumetric", x.volumetric);
+      x.autoExposure = g.value("autoExposure", x.autoExposure);
+      x.grade = g.value("grade", x.grade);
       x.waterTransparency = g.value("waterTransparency", x.waterTransparency);
       x.scatter = std::max(0, std::min(4, g.value("scatter", x.scatter)));
     }
@@ -69,7 +71,7 @@ void save(const Values& v) {
       { "aa", g.aa }, { "taa", g.taa }, { "taaUpscale", g.taaUpscale },
       { "ssaa", g.ssaa }, { "shadows", g.shadows }, { "ssao", g.ssao }, { "dof", g.dof },
       { "bloom", g.bloom }, { "reflections", g.reflections }, { "ssr", g.ssr }, { "fog", g.fog },
-      { "volumetric", g.volumetric },
+      { "volumetric", g.volumetric }, { "autoExposure", g.autoExposure }, { "grade", g.grade },
       { "waterTransparency", g.waterTransparency }, { "scatter", g.scatter },
     } },
   };

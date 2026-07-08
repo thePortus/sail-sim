@@ -13,6 +13,7 @@ struct PostU {
     dof   : vec4<f32>,   // x = focus distance (m); y = CoC scale; z unused; w = DOF enabled
     zp    : vec4<f32>,   // x = proj[2][2]; y = proj[3][2]; z = SSAO enabled; w unused
     tele  : vec4<f32>,   // telescope lens: xy = centre (uv); z = radius, Y-normalized (0 = off); w = zoom
+    ae    : vec4<f32>,   // auto-exposure/grade: x = AE enabled; y = key (mid-grey target); z = min mul; w = max mul
 };
 @group(0) @binding(0) var<uniform> u : PostU;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -21,6 +22,7 @@ struct PostU {
 @group(0) @binding(4) var aoTex    : texture_2d<f32>;   // half-res blurred SSAO
 @group(0) @binding(5) var dofTex   : texture_2d<f32>;   // half-res CoC-blurred scene
 @group(0) @binding(6) var depthT   : texture_depth_2d;  // scene depth (read-only bound)
+@group(0) @binding(7) var lumTex   : texture_2d<f32>;   // 1x1 adapted luminance (auto-exposure)
 
 struct VSOut {
     @builtin(position) position : vec4<f32>,
@@ -270,7 +272,14 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
         //    vignette (linear, multiply mode) -> KHR PBR Neutral tonemap ->
         //    toGammaSpace + saturate -> contrast (GAMMA space, smoothstep
         //    curve — Babylon does NOT use a linear pivot) -> grain. ──
-        col *= u.grade.x;
+        // Exposure: the time-of-day base, optionally scaled by auto-exposure so the image self-levels
+        // toward a mid-grey key (metered + eye-adapted in lumadapt.wgsl into the 1x1 lumTex).
+        var expo = u.grade.x;
+        if (u.ae.x > 0.5) {
+            let L = max(textureLoad(lumTex, vec2<i32>(0, 0), 0).r, 1e-3);
+            expo *= clamp(u.ae.y / L, u.ae.z, u.ae.w);
+        }
+        col *= expo;
         // Vignette: viewportXY in NDC, scaleY = tan(vignetteCameraFov/2) with the
         // default fov 0.5, scaleX = scaleY * aspect; term^( -2 * weight ). Black
         // vignette colour in multiply mode => straight multiplier.
@@ -291,6 +300,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
             rgbG = mix(rgbG, highContrast, u.grade.y - 1.0);
         }
         rgbG = max(rgbG, vec3<f32>(0.0));
+        // ── Optional cinematic grade: gentle saturation push (zp.w = extra saturation, 0 = neutral),
+        //    around the perceptual luma so hues deepen without shifting exposure. ──
+        if (u.zp.w > 0.001) {
+            let luma = dot(rgbG, vec3<f32>(0.2126, 0.7152, 0.0722));
+            rgbG = max(mix(vec3<f32>(luma), rgbG, 1.0 + u.zp.w), vec3<f32>(0.0));
+        }
         // ── Film grain (gamma space, like Babylon's grain pass): animated when
         //    fx.y > 0.5, static otherwise. ──
         let gseed = select(vec2<f32>(0.0), vec2<f32>(fract(u.misc.z * 13.7), fract(u.misc.z * 7.3)), u.fx.y > 0.5);

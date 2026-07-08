@@ -247,10 +247,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
             wetDeck = textureSampleLevel(deckMap, deckSamp, vec2<f32>(across, along), 0.0).r * clamp(nUp, 0.0, 1.0);
         }
     }
-    let wet = max(max(wetWL, u.wet0.w * rainUp), wetDeck);
-    // A wet film darkens the diffuse and drops the roughness toward a mirror; keep metals as-is.
-    albedo = albedo * mix(1.0, 0.62, wet);
-    let roughW = mix(roughness, 0.06, wet);
+    let damp = max(wetWL, u.wet0.w * rainUp);   // general damp: waterline band + rain film
+    let puddle = wetDeck;                        // standing water pooled on the deck
+    let wet = max(damp, puddle);                 // feeds the SSR reflectivity mask (scene alpha)
+    // Damp reads as a slightly glossy film; a puddle reads as near-mirror standing water — darker and
+    // much smoother — so it stands out against the merely-damp deck and mirrors the rigging via SSR.
+    albedo = albedo * mix(mix(1.0, 0.62, damp), 0.28, puddle);
+    let roughW = mix(mix(roughness, 0.09, damp), 0.02, puddle);
 
     let Ngeom = normalize(in.normal);
     let texN = normalize(textureSample(normalTex, texSamp, in.uv).xyz * 2.0 - vec3<f32>(1.0));
@@ -297,7 +300,17 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambientFloor = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
-    let color = ambient + Lo;
+    var color = ambient + Lo;
+    // ── Wet-surface sky glint: wet surfaces catch a Fresnel-weighted analytic-sky reflection, so they
+    //    SHINE (a puddle catches the sky) instead of only darkening. Gated on `wet`, so dry metalwork is
+    //    untouched (why A1's specular env was removed globally). Puddles (smoother) get a stronger,
+    //    sharper glint on top of the SSR scene reflection. ──
+    if (wet > 0.01) {
+        let Rv = reflect(-V, N);
+        let skyRefl = mix(skyHoriz, skyZenith, clamp(Rv.y * 0.5 + 0.5, 0.0, 1.0));
+        let fresW = 0.04 + 0.96 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 5.0);
+        color = color + skyRefl * fresW * wet * (0.6 + 2.2 * puddle);
+    }
     // Output LINEAR HDR — no per-mesh tonemap. The scene target is RGBA16F and the single post
     // pass (exposure → KHR-Neutral tonemap → gamma) grades the whole frame at once. Reinhard-ing
     // here crushed bright specular/sunlit faces to ≤1 before the HDR buffer, so they double-

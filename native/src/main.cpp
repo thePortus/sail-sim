@@ -7231,15 +7231,18 @@ int main(int argc, char** argv) {
       if (wetTopY < -1.0e5f) wetTopY = instTop;                        // first frame: no memory yet
       wetTopY = std::max(instTop, wetTopY - kWetDrain * dt);
 
-      // ── Deck puddle map. (1) Green water: on a coarse grid, if the wave crest at a deck cell tops the
-      //    deck (waterline + freeboard), paint a soft disc. (2) Decay every cell: evaporation + faster
-      //    drain within ~15% of the rail (scuppers). Then pack to R8 and upload to the deck texture. ──
+      // ── Deck puddle map — where standing water collects on the deck. Sources: RAIN pools across the
+      //    deck (the common case), GREEN WATER stamps where a crest tops the deck, and BOW SPRAY dampens
+      //    the foredeck at speed. Every cell then evaporates and drains faster near the rail (scuppers),
+      //    so water pools mid-deck and pours off the edges. Packed to R8 and uploaded to the deck map. ──
       {
         const int N = (int)kDeckMapN;
         const float halfLen = std::max(vrig.hullHalfLen, 2.0f), halfBeam = std::max(vrig.hullHalfBeam, 1.0f);
         const float sinH = std::sin(shipHeading), cosH = std::cos(shipHeading);
         const glm::vec2 fwd(sinH, cosH), rgt(cosH, -sinH);
-        const float deckThresh = wetWaterlineY + 1.2f;   // freeboard: crest above this washes the deck
+        const float deckThresh = wetWaterlineY + 0.8f;   // freeboard: crest above this washes the deck
+        const float speedN = glm::clamp(shipSpeed / 4.0f, 0.0f, 1.0f);
+        const float bowSprayRate = speedN * (0.25f + 0.10f * frameBeau);   // spray onto the foredeck
         const int DS = 2;                                // detection stride (cost control)
         for (int j = 0; j < N; j += DS) {
           for (int i = 0; i < N; i += DS) {
@@ -7247,7 +7250,7 @@ int main(int argc, char** argv) {
             const float across = (uu - 0.5f) * 2.0f * halfBeam, along = (ww - 0.5f) * 2.0f * halfLen;
             const float cx = shipX + fwd.x * along + rgt.x * across;
             const float cz = shipZ + fwd.y * along + rgt.y * across;
-            if (fftHeight(cx, cz) > deckThresh) {
+            if (fftHeight(cx, cz) > deckThresh) {   // green water: paint a soft disc
               for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
                 const int ii = i + di, jj = j + dj;
                 if (ii < 0 || ii >= N || jj < 0 || jj >= N) continue;
@@ -7256,15 +7259,18 @@ int main(int argc, char** argv) {
             }
           }
         }
-        const float evap = std::exp(-0.25f * dt);
+        const float rainFill = rainWet * 0.6f;    // rain collects across the whole deck
+        const float evap = std::exp(-0.30f * dt);
         for (int j = 0; j < N; ++j) for (int i = 0; i < N; ++i) {
           const size_t k = (size_t)j * N + i;
-          float v = deckWet[k] * evap;
           const float uu = (i + 0.5f) / N, ww = (j + 0.5f) / N;
+          float v = deckWet[k] + rainFill * dt;   // rain
+          if (ww > 0.55f) v += bowSprayRate * dt * (ww - 0.55f) / 0.45f;   // bow spray on the forward deck
+          v *= evap;
           const float edge = 1.0f - std::min(std::min(uu, 1.0f - uu), std::min(ww, 1.0f - ww)) / 0.15f;
-          if (edge > 0.0f) v -= 0.9f * dt * edge;   // scuppers
-          deckWet[k] = std::max(0.0f, v);
-          deckWetU8[k] = (uint8_t)(std::min(1.0f, deckWet[k]) * 255.0f + 0.5f);
+          if (edge > 0.0f) v -= 0.9f * dt * edge;   // scuppers drain the rail
+          deckWet[k] = std::max(0.0f, std::min(1.0f, v));
+          deckWetU8[k] = (uint8_t)(deckWet[k] * 255.0f + 0.5f);
         }
         if (std::getenv("SAILSIM_DECKTEST")) std::fill(deckWetU8.begin(), deckWetU8.end(), (uint8_t)255);
         WGPUImageCopyTexture dst = {}; dst.texture = sunShadow(device).deckMap; dst.mipLevel = 0;

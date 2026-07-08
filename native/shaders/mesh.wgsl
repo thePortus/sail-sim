@@ -31,7 +31,8 @@ struct Palette {
 // .w (kit) is 0 for ships; for crew garments it packs a per-instance tint slot in
 // bits 0-3 (0 = none, else slot+1 -> pal.w[31+slot]) and a depth-bias LEVEL in bits
 // 4-7 (layers an outer garment in front of the shirt without z-fighting).
-@group(0) @binding(6) var<uniform> subInfo : vec4<u32>;
+struct SubInfoU { info : vec4<u32>, emissive : vec4<f32> };   // emissive = factor x KHR strength (lanterns)
+@group(0) @binding(6) var<uniform> subInfo : SubInfoU;
 @group(0) @binding(7) var<storage, read> morphDeltas : array<f32>;
 @group(0) @binding(8) var<storage, read> morphTable : array<vec2<u32>>;
 
@@ -54,11 +55,11 @@ struct ShadowU {
 // Morph + skin a vertex to model-local space (shared by both vertex entries).
 fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec4<f32>) -> vec4<f32> {
     var p = inPos;
-    for (var mi = 0u; mi < subInfo.x; mi = mi + 1u) {
-        let e = morphTable[subInfo.y + mi];
+    for (var mi = 0u; mi < subInfo.info.x; mi = mi + 1u) {
+        let e = morphTable[subInfo.info.y + mi];
         let wgt = pal.w[e.y >> 2u][e.y & 3u];
         if (wgt > 0.0001) {
-            let di = (e.x + (vid - subInfo.z)) * 3u;
+            let di = (e.x + (vid - subInfo.info.z)) * 3u;
             p += vec3<f32>(morphDeltas[di], morphDeltas[di + 1u], morphDeltas[di + 2u]) * wgt;
         }
     }
@@ -126,7 +127,7 @@ fn vs_main(@builtin(vertex_index) vid : u32,
     // Crew garment layering: pull an outer layer slightly toward the camera (in
     // perspective-correct NDC) so it wins the depth test over the shirt beneath
     // instead of z-fighting it. Ships have subInfo.w = 0 -> no change.
-    let cbias = f32((subInfo.w >> 4u) & 0xFu);
+    let cbias = f32((subInfo.info.w >> 4u) & 0xFu);
     out.position.z -= cbias * 0.00006 * out.position.w;
     out.worldPos = (u.model * lp).xyz;
     out.normal   = normalize((u.model * ln).xyz);
@@ -252,11 +253,11 @@ fn puddleRipple(pm : vec2<f32>, t : f32, rain : f32) -> vec3<f32> {
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let baseTex = textureSample(baseColorTex, texSamp, in.uv).rgb;
-    // Crew per-member garment tint: bits 0-3 of subInfo.w select a tint colour
+    // Crew per-member garment tint: bits 0-3 of subInfo.info.w select a tint colour
     // stored in this instance's palette weight region (pal.w[32..40]). It REPLACES
     // the garment base colour (like the client's albedoColor swap), the texture
     // still modulating it. 0 = no tint (ships + the crew's skin/eyes) -> no-op.
-    let tslot = subInfo.w & 0xFu;
+    let tslot = subInfo.info.w & 0xFu;
     var albedo = in.albedo * baseTex;
     if (tslot != 0u) { albedo = pal.w[31u + tslot].rgb * baseTex; }
     // Per-instance faction stone tint (misc.yzw): a subtle limestone lean toward the owning
@@ -357,6 +358,9 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
 
     var color = ambient + Lo;
+    // Material emissive (lantern glass, cabin windows): unlit HDR add — the bloom bright-pass turns
+    // it into the night glow the client's emissive+glow-layer gives these materials.
+    color = color + subInfo.emissive.rgb;
     // ── Deck puddles: an actual (shallow) water surface, not just a shiny patch. A pool samples the same
     //    planar sky/cloud reflection the ocean uses, its surface RIPPLING from a capillary shimmer + rain
     //    droplet rings (screen-UV distortion), and the wet wood shows THROUGH the water (refraction) at

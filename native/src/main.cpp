@@ -628,10 +628,14 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   {
     std::vector<float> deltas;
     std::vector<uint32_t> tableData;                        // pairs (deltaBase, weightSlot)
-    struct SubInfo { uint32_t cnt, base, vbase, pad; };
-    std::vector<SubInfo> infos(data.submeshes.size(), { 0, 0, 0, 0 });
+    struct SubInfo { uint32_t cnt, base, vbase, pad; glm::vec4 emissive; };
+    std::vector<SubInfo> infos(data.submeshes.size(), { 0, 0, 0, 0, glm::vec4(0.0f) });
     for (size_t si = 0; si < data.submeshes.size(); ++si) {
       infos[si].base = (uint32_t)(tableData.size() / 2);
+      // Material emissive (lantern glass, cabin windows): factor x KHR emissive strength, added
+      // unlit in the fragment shader — the HDR value blooms at night exactly like the client's glow.
+      infos[si].emissive = glm::vec4(data.submeshes[si].emissive[0], data.submeshes[si].emissive[1],
+                                     data.submeshes[si].emissive[2], 0.0f);
       for (size_t mi = 0; mi < data.morphs.size(); ++mi) {
         const RigMorph& m = data.morphs[mi];
         if (m.submesh != (int)si || mi >= kMaxMorphWeights) continue;
@@ -706,7 +710,7 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
   ble[5].buffer.minBindingSize = kPaletteStride;
   ble[6].binding = 6; ble[6].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
   ble[6].buffer.type = WGPUBufferBindingType_Uniform;
-  ble[6].buffer.minBindingSize = 16;       // per-submesh {count,tableBase,vertexBase,kit}
+  ble[6].buffer.minBindingSize = 32;       // per-submesh {count,tableBase,vertexBase,kit} + emissive vec4
   ble[7].binding = 7; ble[7].visibility = WGPUShaderStage_Vertex;
   ble[7].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
   ble[8].binding = 8; ble[8].visibility = WGPUShaderStage_Vertex;
@@ -877,7 +881,7 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
     bge[4].binding = 4; bge[4].sampler = mesh.sampler;
     bge[5].binding = 5; bge[5].buffer = mesh.paletteBuf; bge[5].size = kPaletteStride;
     bge[6].binding = 6; bge[6].buffer = mesh.submeshInfoBuf;
-    bge[6].offset = (uint64_t)256 * (&sm - mesh.submeshes.data()); bge[6].size = 16;
+    bge[6].offset = (uint64_t)256 * (&sm - mesh.submeshes.data()); bge[6].size = 32;
     bge[7].binding = 7; bge[7].buffer = mesh.morphDeltaBuf; bge[7].size = WGPU_WHOLE_SIZE;
     bge[8].binding = 8; bge[8].buffer = mesh.morphTableBuf; bge[8].size = WGPU_WHOLE_SIZE;
     WGPUBindGroupDescriptor bgd = {};
@@ -8191,7 +8195,12 @@ int main(int argc, char** argv) {
       const settings::Graphics& G = userCfg.gfx;
       float bloomThreshold = 0.62f + nightBlend * 0.51f;
       float dayBloomW = std::max(0.20f, 0.40f + horizon * 0.66f - cloudiness * 0.30f);
-      float bloomWeight = (isNight || !G.bloom) ? 0.0f : std::max(0.0f, dayBloomW * (1.0f - nightBlend));
+      // Night keeps a modest bloom: the threshold is ~1.13 there, so only true HDR emitters glow —
+      // lantern glass / cabin windows (emissive 3-11x) get the halo the client's GlowLayer gives them,
+      // while the rest of the night scene stays bloom-free (the original night look).
+      float bloomWeight = !G.bloom ? 0.0f
+                        : isNight ? 0.55f
+                                  : std::max(0.0f, dayBloomW * (1.0f - nightBlend));
       // DOF (DepthOfFieldEffect port): focus tracks the camera->ship distance
       // (the client hardcoded its 8 m rig); the client optics (f/2.8, 85 mm,
       // lens 50 mm) collapse to a far-field CoC of ~0.19. OFF on deck: the

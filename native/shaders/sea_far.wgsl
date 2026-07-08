@@ -47,5 +47,5 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   let H = normalize(V + L);
   col += vec3<f32>(1.0, 0.96, 0.86) * pow(max(dot(N, H), 0.0), 300.0) * 1.0;   // sun glint (matches ocean)
-  return vec4<f32>(col, 1.0);   // sRGB target does gamma
+  return vec4<f32>(col, 0.0);   // alpha = SSR reflectivity mask (open sea is not SSR-reflective)
 }

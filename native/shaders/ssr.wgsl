@@ -51,9 +51,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
 
   let P = worldFromUV(uv, d);
 
-  // ── SSR: only non-water surfaces above the water cut (params.x = strength; 0 = SSR off). The ocean
-  //    (Y below the cut) is skipped — its planar mirror covers it and depth-normals on waves smear. ──
-  if (u.params.x > 0.001 && P.y >= u.params.w) {
+  // ── SSR: non-water surfaces above the water cut, PLUS wet surfaces below it (refl > 0). The open
+  //    ocean writes 0 into the reflectivity mask, so the water-cut still excludes it, but a wet hull
+  //    dipping below the cut (the waterline band) now reflects. (params.x = strength; 0 = SSR off.) ──
+  if (u.params.x > 0.001 && (P.y >= u.params.w || refl > 0.02)) {
     let Pr = worldFromUV(uv + vec2<f32>(texel.x, 0.0), textureLoad(depthTex, ip + vec2<i32>(1, 0), 0));
     let Pu = worldFromUV(uv + vec2<f32>(0.0, texel.y), textureLoad(depthTex, ip + vec2<i32>(0, 1), 0));
     var N = normalize(cross(Pu - P, Pr - P));

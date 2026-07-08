@@ -1218,13 +1218,17 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
   ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0;   // test only, never write
 
   // Alpha-blended: the shallows output alpha < 1 so the real seabed (terrain
-  // rendered beneath, underwater-shaded) shows through the surface.
+  // rendered beneath, underwater-shaded) shows through the surface. The COLOUR
+  // blend uses the fragment's alpha for that see-through; the ALPHA channel is
+  // forced to 0 (Zero/Zero) so the ocean writes 0 into the SSR reflectivity
+  // mask — water is never "reflective" there, which lets SSR admit the wet hull
+  // below the water-cut (refl > 0) while still excluding the open sea.
   WGPUBlendState oblend = {};
   oblend.color.srcFactor = WGPUBlendFactor_SrcAlpha;
   oblend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
   oblend.color.operation = WGPUBlendOperation_Add;
-  oblend.alpha.srcFactor = WGPUBlendFactor_One;
-  oblend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+  oblend.alpha.srcFactor = WGPUBlendFactor_Zero;
+  oblend.alpha.dstFactor = WGPUBlendFactor_Zero;
   oblend.alpha.operation = WGPUBlendOperation_Add;
   WGPUColorTargetState target = {};
   target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All;
@@ -1751,7 +1755,9 @@ static PostFx createPostFx(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
     WGPUBlendState blend = {};
     blend.color.operation = WGPUBlendOperation_Add; blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_One;
     blend.alpha.operation = WGPUBlendOperation_Add; blend.alpha.srcFactor = WGPUBlendFactor_One; blend.alpha.dstFactor = WGPUBlendFactor_One;
-    WGPUColorTargetState target = {}; target.format = kSceneFormat; target.blend = &blend; target.writeMask = WGPUColorWriteMask_All;
+    // RGB only: this additive fullscreen pass must not touch scene alpha (the SSR reflectivity mask).
+    WGPUColorTargetState target = {}; target.format = kSceneFormat; target.blend = &blend;
+    target.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue;
     WGPUFragmentState frag = {}; frag.module = fx.volModule; frag.entryPoint = "fs_main"; frag.targetCount = 1; frag.targets = &target;
     WGPURenderPipelineDescriptor rpd = {};
     rpd.layout = pl;
@@ -2122,7 +2128,9 @@ static LightningRender createLightning(WGPUDevice device, WGPUTextureFormat colo
   blend.color.operation = WGPUBlendOperation_Add;
   blend.color.srcFactor = WGPUBlendFactor_One; blend.color.dstFactor = WGPUBlendFactor_One;
   blend.alpha = blend.color;
-  WGPUColorTargetState target = {}; target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All;
+  // RGB only: this additive bolt composites into the scene and must not touch the SSR reflectivity mask.
+  WGPUColorTargetState target = {}; target.format = colorFormat;
+  target.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue;
   target.blend = &blend;
   WGPUFragmentState frag = {}; frag.module = r.module; frag.entryPoint = "fs_main"; frag.targetCount = 1; frag.targets = &target;
   WGPURenderPipelineDescriptor rpd = {};
@@ -8840,8 +8848,9 @@ int main(int argc, char** argv) {
     colorAttachment.loadOp = WGPULoadOp_Clear;
     colorAttachment.storeOp = WGPUStoreOp_Store;
     // Sky-blue behind the sailing scene; plain brown behind the login/landing screen.
-    colorAttachment.clearValue = sailing ? WGPUColor{0.75, 0.85, 0.92, 1.0}
-                                         : WGPUColor{0.24, 0.16, 0.10, 1.0};
+    // Alpha 0 = the SSR reflectivity mask starts dry (only wet meshes paint it non-zero).
+    colorAttachment.clearValue = sailing ? WGPUColor{0.75, 0.85, 0.92, 0.0}
+                                         : WGPUColor{0.24, 0.16, 0.10, 0.0};
     // (Newer webgpu.h adds colorAttachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED here;
     //  wgpu-native v0.19 has no such field — zero-init leaves it correctly unset.)
 

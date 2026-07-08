@@ -228,7 +228,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     // Rain wets from ABOVE: strongest on up-facing surfaces (decks, rails), less on the sides, dry
     // underneath. wet0.w = rain wetness [0,1]. Combined with the waterline band by the wetter of the two.
     let nUp = normalize(in.normal).y;
-    let rainUp = clamp(nUp * 0.5 + 0.55, 0.0, 1.0);             // deck ~1, sides ~0.55, underside ~0.05
+    let rainUp = clamp(nUp * 0.4 + 0.68, 0.0, 1.0);            // deck ~1, walls/sides ~0.68, underside ~0.28
     let wet = max(wetWL, u.wet0.w * rainUp);
     // A wet film darkens the diffuse and drops the roughness toward a mirror; keep metals as-is.
     albedo = albedo * mix(1.0, 0.62, wet);

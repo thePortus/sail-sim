@@ -7363,7 +7363,7 @@ int main(int argc, char** argv) {
           const float spdN = glm::clamp(shipSpeed / 5.0f, 0.0f, 1.0f);
           if (sprayBowCd <= 0.0f && shipSpeed > 0.8f &&
               bowRel > 0.38f - 0.14f * spdN && bowRise > 0.95f - 0.45f * spdN) {
-            sprayBowCd = 0.9f - 0.6f * spdN;
+            sprayBowCd = 0.5f - 0.32f * spdN;   // frequent: ~2/s ghosting, ~5/s at full speed
             const float bowX = shipX + fwd.x * halfLen * 0.75f, bowZ = shipZ + fwd.y * halfLen * 0.75f;
             cannonFx.spray(glm::vec3(bowX, wetWaterlineY + bowRel * 0.7f + 0.3f, bowZ),
                            glm::vec3(fwd.x, 0.0f, fwd.y) * (0.8f + 0.5f * shipSpeed),

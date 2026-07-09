@@ -22,6 +22,10 @@ export interface OceanMaterialDeps {
   scene: Scene;
   camera: Camera;
   fft: OceanFFTEngine;
+  /** Exclude the ocean material from the prePass G-buffer (SceneService.excludeFromPrePass): the
+   *  planar mirror owns water reflections — SSR marching the sea's flat G-buffer normals paints a
+   *  hard-edged perfect-mirror patch under ships. */
+  excludeFromPrePass?: (m: PBRCustomMaterial) => void;
   /** Linear scene depth (ocean excluded) for contact foam; null disables contact foam. */
   depthTexture: BaseTexture | null;
   /** Current sun/light direction (world). */
@@ -81,6 +85,7 @@ export class OceanFFTMaterial {
   getMaterial(useMid: boolean, useClose: boolean): PBRCustomMaterial {
     const { scene, camera, fft } = this._deps;
     const mat = new PBRCustomMaterial(`oceanFFT${useMid ? '1' : '0'}${useClose ? '1' : '0'}`, scene);
+    this._deps.excludeFromPrePass?.(mat);   // the sea never enters the SSR/SSAO G-buffer
 
     mat.metallic = 0;
     mat.roughness = 0.311;

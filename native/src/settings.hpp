@@ -12,12 +12,22 @@ struct Graphics {
   bool  adaptiveRes = false;     // fps-driven render-scale nudge (never above renderScale)
   float adaptiveTargetMs = 33.3f;// target frame time (16.7=60fps .. 66=15fps)
   int   aa = 1;                  // 0 Off, 1 FXAA (post edge-blur), 2 SMAA (morphological)
+  bool  taa = false;             // temporal AA (jitter + reprojected history + motion vectors); overrides aa when on
+  float taaUpscale = 1.0f;       // temporal upscaling: render at this fraction of output res (0.5..1.0), TAA reconstructs
   int   ssaa = 0;                // supersampling: 0 Off(1x), 1 1.5x, 2 2x — multiplies render res; stacks with FXAA
   int   shadows = 2;             // 0 Off, 1 Low(1024), 2 Medium(2048), 3 High(4096), 4 Ultra(8192)
   bool  ssao = true;
   bool  dof = true;
   bool  bloom = true;
   bool  reflections = true;      // planar water reflections (mirror pass) vs analytic sky only
+  bool  ssr = false;             // screen-space reflections (wet-deck/hull sheen; opt-in)
+  bool  fog = true;              // aerial / distance fog (atmospheric haze)
+  bool  volumetric = false;      // volumetric sun shafts (shadow-marched god-rays; opt-in)
+  bool  autoExposure = false;    // metered + eye-adapted auto-exposure (self-levelling; opt-in)
+  bool  grade = false;           // cinematic colour grade (gentle saturation push; opt-in)
+  bool  contactShadows = false;  // screen-space contact shadows (short-range sun occlusion; opt-in)
+  bool  lut = false;             // 3D-LUT colour grade (filmic split-tone; opt-in)
+  bool  hullWetness = true;      // hull/deck wetness: waterline film, rain damp, deck puddles + raindrops
   bool  waterTransparency = true;// shallow-water see-through
   int   scatter = 3;             // 0 Off, 1 Low .. 4 Ultra (foliage density + draw distance)
 };

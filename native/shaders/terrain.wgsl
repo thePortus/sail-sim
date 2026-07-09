@@ -381,5 +381,5 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let hazeAmt = 1.0 - exp(-pow(hazeD * 0.00009, 2.0));
   let hazeCol = mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK);
   col = mix(col, hazeCol, hazeAmt);
-  return vec4<f32>(col, 1.0);   // sRGB target does gamma
+  return vec4<f32>(col, 0.0);   // alpha = SSR reflectivity mask (land is dry)
 }

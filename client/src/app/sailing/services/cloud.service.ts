@@ -27,6 +27,7 @@ import { SfxService } from './sfx.service';
 import { VolumetricCloudsPlugin } from './volumetric-clouds-plugin';
 import { LightningBolt } from './lightning-bolt';
 import { Weather } from '../models';
+import { Settings } from '../../app.settings';
 
 type CloudSpriteEntry = {
   sprite: Sprite;
@@ -390,6 +391,10 @@ export class CloudService {
         cloudCoverage:    this.cloudiness,
         windDirection:    new Vector3(this.windX, 0, this.windZ),
         windSpeed:        this.windSpeed,
+        // 3-D noise volume served from our own server (vendored via `npm run download:cloud-noise`),
+        // so there's no third-party runtime URL. If the fetch fails, the plugin falls back to a
+        // locally-generated noise volume (buildNoiseVolume3D).
+        volumeNoiseUrl: `${Settings.apiUrl}clouds/greyNoise3D.bin`,
         // Quality defaults — can be tweaked at runtime.
         marchSteps:  48,
         lightSteps:  6,

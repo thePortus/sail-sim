@@ -14,6 +14,7 @@ struct CloudU {
   groundCol   : vec4<f32>,
   slab        : vec4<f32>,   // cloudBase, cloudTop, cloudCoverage, cloudType
   anim        : vec4<f32>,   // time, driftX, driftZ, farZ
+  dbg         : vec4<f32>,   // sunGain, tonemapExposure, _, _  (env-tunable, debug)
 };
 @group(0) @binding(0) var<uniform> u : CloudU;
 @group(0) @binding(1) var noiseTex   : texture_2d<f32>;
@@ -137,12 +138,13 @@ fn vc_lightMarch(p : vec3<f32>, phase : f32, dC : f32, mu : f32, jOff : f32) -> 
     den = den + vc_getDensity(q + u.sunDir.xyz * f32(j) * stepL, 2.0);
   }
   let scatterAmount = mix(0.008, 1.0, smoothstep(0.96, 0.0, mu));
-  // Lower multi-scatter coefficients than the reference: they kept the deep/underside
-  // of the cloud lit (a flat, over-bright base), washing out the self-shadow. Smaller
-  // values let dense regions go properly dark so the base reads as grey shadow.
+  // Multi-scatter lobes: these are the through-glow that lights side/back-lit cloud
+  // (the "backlit" look). The reference uses 0.5/0.4; we sit partway (0.44/0.32) — enough
+  // glow to read as backlit, but still below the reference so dense cores keep their
+  // self-shadow (primary extinction dominates there) rather than flooding to a flat blob.
   let beersLaw = exp(-stepL * den)
-               + 0.34 * scatterAmount * exp(-0.1 * stepL * den)
-               + 0.22 * scatterAmount * exp(-0.02 * stepL * den);
+               + 0.44 * scatterAmount * exp(-0.1 * stepL * den)
+               + 0.32 * scatterAmount * exp(-0.02 * stepL * den);
   return beersLaw * phase
        * mix(0.05 + 1.5 * pow(min(1.0, dC * 8.5), 0.3 + 5.5 * ch), 1.0, clamp(den * 0.4, 0.0, 1.0));
 }
@@ -207,9 +209,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
       let ambLift = mix(2.5, 1.25, smoothstep(0.10, 0.78, u.slab.z));
       // Steep top→base gradient: sunlit tops get the full sky fill, undersides much
       // less, so the base sits in shadow (grey) instead of matching the bright top.
+      // A small base-fill (max(0,1-2ch)) keeps the deepest undersides a faint glowing
+      // grey rather than pure black — the reference uses 0.10; we use 0.06 to stay dim.
       let ambient = (u.skyCol.xyz * (0.32 + 0.9 * ch) * 0.24
+                   + u.skyCol.xyz * max(0.0, 1.0 - 2.0 * ch) * 0.06
                    + u.groundCol.xyz * (1.0 - ch) * 0.20) * ambLift;
-      let radiance = ambient + u.sunCol.xyz * 15.0 * lt;
+      let radiance = ambient + u.sunCol.xyz * u.dbg.x * lt;
       let sT = exp(-rho * stepSz);
       scatter = scatter + transmit * radiance * (1.0 - sT);
       transmit = transmit * sT;
@@ -221,11 +226,11 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   scatter = mix(scatter, pow(max(scatter, vec3<f32>(0.0)), vec3<f32>(0.62)), stormDetail);
   scatter = scatter * mix(1.45, 1.0, smoothstep(0.12, 0.55, u.slab.z));
 
-  // Highlight rolloff. The bright sunlit faces (sun term ~2..12) saturate to white
-  // while the dark ambient-only shadows (~0.4..0.6) stay a medium grey — so the full
-  // dark-shadow → white-top range is preserved, which is what reads as billowed form.
-  // (A soft-knee that capped everything at grey killed exactly this contrast.)
-  scatter = vec3<f32>(1.0) - exp(-scatter * 1.1);
+  // Highlight rolloff (exposure in u.dbg.y, default 0.5 — env-tunable). A harder exposure
+  // (was 1.1) slammed the whole bright sun term flat to white and erased the internal
+  // density/self-shadow gradient; 0.5 keeps the sunlit faces below saturation so that
+  // gradient — the billowed form — survives, while shadowed regions stay a medium grey.
+  scatter = vec3<f32>(1.0) - exp(-scatter * u.dbg.y);
 
   // Premultiplied-alpha output: framebuffer = scene*transmit + scatter.
   return vec4<f32>(scatter, 1.0 - transmit);

@@ -288,6 +288,7 @@ struct Particle {
   float life = 0, lifetime = 1;
   glm::vec3 p{ 0 }, v{ 0 };
   float size0 = 1, size1 = 2;
+  float gscale = 1;   // per-particle gravity scale (slow-motion spray: v*k + g*k^2 = same arc, longer flight)
 };
 struct ExplSlot {
   bool active = false, low = false;
@@ -333,21 +334,23 @@ struct System::Impl {
 
   // Burst n particles in a direction box (client direction1..direction2 cones).
   void burst(int sys, int n, const glm::vec3& at, const glm::vec3& box,
-             const glm::vec3& dir1, const glm::vec3& dir2) {
+             const glm::vec3& dir1, const glm::vec3& dir2, float sizeScale = 1.0f, float powScale = 1.0f,
+             float gravScale = 1.0f, float lifeScale = 1.0f) {
     const SysDef& d = kSys[sys];
     for (int i = 0; i < n; ++i) {
       Particle& q = *freeParticle();
       q.active = true;
       q.sys = sys;
       q.life = 0;
-      q.lifetime = frand(d.lifeMin, d.lifeMax);
+      q.lifetime = frand(d.lifeMin, d.lifeMax) * lifeScale;
+      q.gscale = gravScale;
       q.p = at + glm::vec3(frand(-box.x, box.x), frand(0.0f, box.y), frand(-box.z, box.z));
       glm::vec3 dir(frand(dir1.x, dir2.x), frand(dir1.y, dir2.y), frand(dir1.z, dir2.z));
       float len = glm::length(dir);
       if (len > 1e-4f) dir /= len;
-      q.v = dir * frand(d.powMin, d.powMax);
-      q.size0 = frand(d.size0Min, d.size0Max);
-      q.size1 = frand(d.size1Min, d.size1Max);
+      q.v = dir * frand(d.powMin, d.powMax) * powScale;
+      q.size0 = frand(d.size0Min, d.size0Max) * sizeScale;
+      q.size1 = frand(d.size1Min, d.size1Max) * sizeScale;
     }
   }
   glm::vec4 colorAt(const SysDef& d, float t) {
@@ -396,7 +399,7 @@ struct System::Impl {
 
 bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   p_ = new Impl();
-  p_->particles.resize(2600);
+  p_->particles.resize(4600);   // headroom for near-continuous bow spray on top of combat effects
   p_->puffs.resize(40);
 
   WGPUShaderModuleWGSLDescriptor wgsl = {};
@@ -514,6 +517,21 @@ void System::waterSplash(const glm::vec3& p, const glm::vec3& velIn) {
             r * 2.0f + glm::vec3(-2, 5, -2), r * 2.0f + glm::vec3(2, 10, 2));
 }
 
+void System::spray(const glm::vec3& p, const glm::vec3& velIn, float strength, float energy) {
+  // Many SMALL droplets (0.4x the cannonball-splash particle size) — fine mist, not a few blobs.
+  // energy [0,1] scales the launch power: low = a lazy plume that barely clears the rail, high = spray
+  // thrown high and far. Count scales with both the impact strength and the energy.
+  const float e = glm::clamp(energy, 0.0f, 1.0f);
+  // Bursts overlap into a near-continuous stream at speed, so each one is a touch leaner.
+  const int n = (int)((85.0f + 145.0f * glm::clamp(strength, 0.0f, 1.0f)) * (0.6f + 0.5f * e));
+  // Slow-motion factor: velocity x k with gravity x k^2 keeps the SAME arc (height/reach) while the
+  // flight takes 1/k longer — sea spray hangs in the air instead of snapping like a cannonball splash.
+  const float k = 0.6f;
+  p_->burst(SPLASH, n, p, glm::vec3(0.5f, 0.2f, 0.5f),
+            velIn + glm::vec3(-1.5f, 2.0f, -1.5f), velIn + glm::vec3(1.5f, 4.5f, 1.5f),
+            0.4f, (0.4f + 0.85f * e) * k, k * k, 1.0f / k);
+}
+
 void System::landHit(const glm::vec3& p, const glm::vec3& velIn) {
   glm::vec3 r = -velIn;
   float len = glm::length(r);
@@ -562,7 +580,7 @@ void System::update(float dt, float windX, float windZ) {
       q.p += q.v * (vk * dt);
       q.p += d.gravity * dt;   // gentle drift, not accumulated velocity
     } else {
-      q.v += d.gravity * dt;
+      q.v += d.gravity * (q.gscale * dt);
       q.p += q.v * dt;
     }
   }

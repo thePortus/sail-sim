@@ -39,6 +39,10 @@ server/assets/maps/sources/
 # downloaded sky textures (re-fetchable via npm run download:sky-textures)
 server/assets/sky/
 
+# downloaded 3D cloud noise volume (re-fetchable via npm run download:cloud-noise;
+# license unconfirmed — never commit it, both clients fall back to generated noise)
+server/assets/clouds/
+
 # downloaded CC0 scatter textures (re-fetchable via npm run download:scatter-textures)
 # runtime (served) set + raw authoring sources for Blender re-bakes — neither is committed.
 server/assets/geometry/scatter/cc0/

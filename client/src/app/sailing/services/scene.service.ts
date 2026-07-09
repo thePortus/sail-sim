@@ -5,6 +5,7 @@ import {
   FreeCamera, MeshBuilder, StandardMaterial, Mesh, AbstractMesh, Material, GlowLayer,
   DefaultRenderingPipeline, ShadowGenerator, CascadedShadowGenerator,
   SSAO2RenderingPipeline, DepthOfFieldEffectBlurLevel,
+  SSRRenderingPipeline, TAARenderingPipeline,
   DepthRenderer, RenderTargetTexture, Texture, Constants, DynamicTexture,
   SceneInstrumentation, EngineInstrumentation,
   VolumetricLightScatteringPostProcess, ColorCurves,
@@ -46,6 +47,11 @@ export class SceneService {
   private moonMesh!:  Mesh;
   private godRays: VolumetricLightScatteringPostProcess | null = null;
   private ssao: SSAO2RenderingPipeline | null = null;
+  private ssr: SSRRenderingPipeline | null = null;
+  private taa: TAARenderingPipeline | null = null;
+  /** Screen-space reflections (opt-in; persisted). Rigged vessels sit outside the prePass, so SSR
+   *  shows on terrain/towns/props — not hulls (same modest-verdict as the native SSR). */
+  private _ssrEnabled = (localStorage.getItem('ignis_ssr') ?? '0') === '1';
   private rainLens: RainLens | null = null;
   private starDome: Mesh | null = null;
   private starMat:  CustomMaterial | null = null;
@@ -125,11 +131,25 @@ export class SceneService {
    * Use for custom WGSL ShaderMaterials — Babylon's prePass compiler can't
    * generate a G-buffer variant for them, which would break SSAO2 and DoF.
    */
+  private _prePassExclusions: Material[] = [];
+
   excludeFromPrePass(material: Material): void {
+    // Remember every exclusion: the prePass renderer is created LAZILY (first SSAO2/SSR build), so a
+    // material registered before it exists must be re-applied then (flushPrePassExclusions) — the old
+    // early-return silently dropped those, which let the FFT ocean into the SSR G-buffer.
+    if (!this._prePassExclusions.includes(material)) this._prePassExclusions.push(material);
+    const prePass = this.scene?.prePassRenderer;
+    if (prePass && !prePass.excludedMaterials.includes(material)) {
+      prePass.excludedMaterials.push(material);
+    }
+  }
+
+  /** Re-apply exclusions registered before the prePass renderer existed. */
+  private flushPrePassExclusions(): void {
     const prePass = this.scene?.prePassRenderer;
     if (!prePass) return;
-    if (!prePass.excludedMaterials.includes(material)) {
-      prePass.excludedMaterials.push(material);
+    for (const m of this._prePassExclusions) {
+      if (!prePass.excludedMaterials.includes(m)) prePass.excludedMaterials.push(m);
     }
   }
 
@@ -1021,6 +1041,12 @@ export class SceneService {
     this.applyAaQuality();
     setTimeout(() => this.applyAaQuality(), 0);
 
+    // SSAO2 just created the prePass renderer — apply any exclusions registered before it existed.
+    this.flushPrePassExclusions();
+
+    // Screen-space reflections, if the player had them on last session.
+    if (this._ssrEnabled) this.buildSsr();
+
     // Perf probes for the post chain (SceneService owns these directly). SSAO2 is a separate
     // pipeline (attach/detach its camera); DoF + glow have cheap enable flags. god-rays registers
     // itself in buildGodRays (it may fail to construct). Clouds + ocean RTTs register from their
@@ -1124,15 +1150,74 @@ export class SceneService {
 
   private applyAaQuality(): void {
     if (!this.pipeline) return;
+    if (this._aaQuality !== 4 && this.taa) { this.taa.dispose(); this.taa = null; }
     switch (this._aaQuality) {
       case 0: this.pipeline.fxaaEnabled = false; this.pipeline.samples = 1; break;
       case 1: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 1; break;
       case 2: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 2; break;
       case 3: this.pipeline.fxaaEnabled = true;  this.pipeline.samples = 4; break;
+      case 4:   // TAA (beta): temporal accumulation replaces FXAA/MSAA entirely
+        this.pipeline.fxaaEnabled = false; this.pipeline.samples = 1;
+        this.buildTaa();
+        break;
     }
     // Render resolution is part of the same quality dial (it's the single biggest
     // quality/perf lever), so re-apply it whenever the AA level changes.
     this.applyResolutionScale();
+  }
+
+  /** TAA (Babylon TAARenderingPipeline, beta): camera-jitter + temporal accumulation. Unlike the
+   *  native client's TAA there are NO motion vectors, so a short history keeps the ever-moving sea
+   *  and rigging from ghosting; accumulation must stay on while the camera moves (it always does
+   *  at sea). Falls back to FXAA if construction fails. */
+  private buildTaa(): void {
+    if (this.taa || !this.scene || !this.camera) return;
+    try {
+      const taa = new TAARenderingPipeline('taa', this.scene, [this.camera]);
+      taa.samples = 16;
+      taa.factor = 0.12;                // shorter history than default (0.05) — less wave/rig ghosting
+      taa.disableOnCameraMove = false;  // the camera never sits still on a boat
+      this.taa = taa;
+    } catch (e) {
+      console.warn('[scene] TAA unavailable, falling back to FXAA:', e);
+      this._aaQuality = 1;
+      if (this.pipeline) this.pipeline.fxaaEnabled = true;
+    }
+  }
+
+  // ── Screen-space reflections (SSR v2, opt-in) ──────────────────────────────
+  // Rides the same prePass G-buffer as SSAO2 (custom WGSL materials — ocean — are excluded, so the
+  // sea keeps its planar mirror and SSR never marches it). Conservative march + strong attenuation.
+
+  private buildSsr(): void {
+    if (this.ssr || !this.scene || !this.camera) return;
+    try {
+      const ssr = new SSRRenderingPipeline('ssr', this.scene, [this.camera], false,
+                                           Constants.TEXTURETYPE_UNSIGNED_BYTE);
+      ssr.strength = 0.9;
+      ssr.maxDistance = 120;
+      ssr.thickness = 0.6;
+      ssr.roughnessFactor = 0.1;          // only genuinely glossy PBR surfaces reflect
+      ssr.blurDispersionStrength = 0.03;
+      ssr.attenuateScreenBorders = true;
+      ssr.attenuateFacingCamera = true;
+      ssr.attenuateIntersectionDistance = true;
+      ssr.selfCollisionNumSkip = 2;
+      this.ssr = ssr;
+      this.flushPrePassExclusions();   // SSR may have just created the prePass renderer
+    } catch (e) {
+      console.warn('[scene] SSR unavailable:', e);
+      this._ssrEnabled = false;
+    }
+  }
+
+  isSsrEnabled(): boolean { return this._ssrEnabled; }
+
+  setSsrEnabled(on: boolean): void {
+    this._ssrEnabled = on;
+    localStorage.setItem('ignis_ssr', on ? '1' : '0');
+    if (on) this.buildSsr();
+    else if (this.ssr) { this.ssr.dispose(); this.ssr = null; }
   }
 
   getAaQuality(): number { return this._aaQuality; }
@@ -1789,6 +1874,11 @@ export class SceneService {
     // recovers FPS under load without ever exceeding the quality the player picked.
     const eff = Math.max(0.25, native * this._renderScale * this._adaptiveFactor);
     this.engine.setHardwareScalingLevel(1 / eff);
+    // FSR1-style upscale sharpening: as the render fraction drops below native, raise the pipeline's
+    // sharpen (the RCAS half of FSR) so the upscaled frame recovers crispness. At full scale this is
+    // exactly the hand-tuned 0.08 baseline (see buildPostProcessing).
+    const frac = Math.min(1, this._renderScale * this._adaptiveFactor);
+    if (this.pipeline) this.pipeline.sharpen.edgeAmount = 0.08 + (1 - frac) * 0.30;
   }
 
   // ── Adaptive resolution (dynamic render-scale) ─────────────────────────────

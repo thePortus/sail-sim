@@ -234,7 +234,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   let hd = distance(u.eye.xyz, in.worldPos);
   let haze = 1.0 - exp(-pow(hd * 0.00009, 2.0));
   col = mix(col, mix(vec3<f32>(0.13, 0.155, 0.21), vec3<f32>(0.66, 0.72, 0.80), dayK), haze);
-  return vec4<f32>(col, 1.0);
+  return vec4<f32>(col, 0.0);   // alpha = SSR reflectivity mask (foliage is dry)
 }
 
 // Depth-only shadow caster WITH alpha test: sample the frond/leaf texture and
@@ -843,9 +843,9 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
 
   // ── Shoreline reeds + underwater seaweed (LOD-only meshes, alpha atlas) ──
   ok &= initAnimalFwd(p, p->reedsL, 0, 0.4f,
-                      { "reed_a_lod.glb", "reed_b_lod.glb", "reed_c_lod.glb" }, T + "reeds_atlas.png", 384, dir);
+                      { "reed_a_lod.glb", "reed_b_lod.glb", "reed_c_lod.glb" }, T + "reeds_atlas.png", 640, dir);
   ok &= initAnimalFwd(p, p->weedsL, 0, 0.0f,
-                      { "seaweed_a_lod.glb", "seaweed_b_lod.glb", "seaweed_c_lod.glb" }, T + "seaweed_albedo.png", 384, dir);
+                      { "seaweed_a_lod.glb", "seaweed_b_lod.glb", "seaweed_c_lod.glb" }, T + "seaweed_albedo.png", 640, dir);
 
   // ── Wildlife draw sets ──
   ok &= initAnimalFwd(p, p->birdsL, 3, 0.5f,
@@ -1876,8 +1876,8 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
           if (std::hypot(st.cx - x, st.cz - z) < 6) { near = true; break; }
         if (near) continue;
         Impl::Stand st{ x, z, {} };
-        int n = 6 + (int)(p->frand() * 9);
-        float radius = 1.2f + p->frand() * 1.6f;
+        int n = 18 + (int)(p->frand() * 27);       // 3x reed density (was 6 + rand*9)
+        float radius = 1.8f + p->frand() * 2.4f;   // widen the bed so the extra reeds spread naturally
         const glm::vec3 tints[5] = { {0.85f, 1.0f, 0.72f}, {0.90f, 0.95f, 0.66f}, {0.95f, 0.92f, 0.55f},
                                      {1.0f, 0.92f, 0.60f}, {0.92f, 0.90f, 0.60f} };
         for (int k = 0; k < n; ++k) {
@@ -1916,8 +1916,8 @@ void System::update(WGPUDevice, WGPUQueue, float dtIn, double timeSec,
             if (std::hypot(c.cx - x, c.cz - z) < 6) { near = true; break; }
           if (near) continue;
           Impl::Stand cl{ x, z, {} };
-          int n = 8 + (int)(p->frand() * 11);
-          float radius = 1.1f + p->frand() * 1.3f;
+          int n = 24 + (int)(p->frand() * 33);       // 3x seaweed density (was 8 + rand*11)
+          float radius = 1.7f + p->frand() * 2.0f;   // widen the clump so the extra weed spreads naturally
           const glm::vec3 tints[4] = { {0.62f, 0.74f, 0.42f}, {0.50f, 0.62f, 0.34f},
                                        {0.70f, 0.58f, 0.34f}, {0.44f, 0.58f, 0.44f} };
           for (int k = 0; k < n; ++k) {

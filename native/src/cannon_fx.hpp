@@ -26,6 +26,10 @@ class System {
   void shipHit(const glm::vec3& p, const glm::vec3& dirIn);   // splinters + fire + soot
   void waterSplash(const glm::vec3& p, const glm::vec3& velIn);
   void landHit(const glm::vec3& p, const glm::vec3& velIn);   // dirt burst + dust pall
+  // Sea spray at an arbitrary height (bow slam / green water over the deck): a smaller, gentler
+  // SPLASH burst at p (NOT snapped to sea level), thrown along velIn. strength [0,1] scales the count;
+  // energy [0,1] scales the launch power (low = lazy plume, high = thrown high and far).
+  void spray(const glm::vec3& p, const glm::vec3& velIn, float strength, float energy = 1.0f);
 
   void update(float dt, float windX, float windZ);
 

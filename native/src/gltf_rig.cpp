@@ -232,6 +232,11 @@ RiggedData loadGltfRigged(const char* path) {
       sm.indexOffset = indexOffset;
       sm.indexCount = (uint32_t)out.indices.size() - indexOffset;
       sm.baseColor = baseColorTex; sm.normal = normalTex; sm.metalRough = metalRoughTex;
+      if (prim.material) {   // emissive = factor x KHR strength (lantern glass, cabin windows)
+        const float es = prim.material->has_emissive_strength
+                       ? prim.material->emissive_strength.emissive_strength : 1.0f;
+        for (int c = 0; c < 3; ++c) sm.emissive[c] = prim.material->emissive_factor[c] * es;
+      }
       sm.name = nd.name ? nd.name : (nd.mesh->name ? nd.mesh->name : "");
       sm.material = (prim.material && prim.material->name) ? prim.material->name : "";
       sm.node = (int)ni;
@@ -321,7 +326,8 @@ RiggedData makeRiggedCube() {
   }
   m.indices = cube.indices;
   for (const Submesh& sm : cube.submeshes)
-    m.submeshes.push_back({ sm.indexOffset, sm.indexCount, sm.baseColor, sm.normal, sm.metalRough, sm.name, std::string(), 0, false });
+    m.submeshes.push_back({ sm.indexOffset, sm.indexCount, sm.baseColor, sm.normal, sm.metalRough,
+                            { 0, 0, 0 }, sm.name, std::string(), 0, false });
   m.nodes.push_back({ "root", -1 });
   m.restPalette.assign(1, glm::mat4(1.0f));
   for (int c = 0; c < 3; ++c) { m.bbMin[c] = cube.bbMin[c]; m.bbMax[c] = cube.bbMax[c]; }

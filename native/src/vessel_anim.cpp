@@ -441,8 +441,16 @@ void Controller::tickRig(float dt) {
   // Guns: lids open over the first half of the deploy, the gun runs out over the
   // second half minus the recoil kick (the client controllers' applyGunPose).
   // Rigs without lid clips (pinnace open mounts) run out over the whole deploy.
+  // HANDEDNESS: native reads glTF node TRS RAW (right-handed) and renders through
+  // an X-mirrored projection (proj[0][0] negated), so the model's authored port/
+  // starboard gun bones land on the OPPOSITE visual side from Babylon's RH->LH glTF
+  // import. The clips are named for the GAME side (Gun_S = game starboard, like the
+  // TS controllers), so drive the OPPOSITE-named clip to run the guns out on the
+  // correct (firing) side — the cannonsFor muzzles already render on the right side,
+  // and without this swap the run-out animation is mirrored relative to the shots
+  // (verified across all four hulls: arm-starboard was animating the port battery).
   for (int i = 0; i < 2; ++i) {
-    const std::string sd = i == 0 ? "P" : "S";
+    const std::string sd = i == 0 ? "S" : "P";   // gunDeploy_[0]=game PORT -> S clip, [1]=game STBD -> P clip
     const float dep = gunDeploy_[i], rec = gunRecoil_[i];
     if (clips_.count("Lid_" + sd)) {
       scrubNorm("Lid_" + sd, std::clamp(dep * 2.0f, 0.0f, 1.0f));

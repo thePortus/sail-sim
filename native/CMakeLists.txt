@@ -287,6 +287,11 @@ embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/sea_far.wgsl"          SEA_FAR_W
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/clouds.wgsl"           CLOUDS_WGSL           "${WGSL_GEN_DIR}/clouds_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/godrays.wgsl"          GODRAYS_WGSL          "${WGSL_GEN_DIR}/godrays_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/post.wgsl"             POST_WGSL             "${WGSL_GEN_DIR}/post_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/taa.wgsl"              TAA_WGSL              "${WGSL_GEN_DIR}/taa_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssr.wgsl"              SSR_WGSL              "${WGSL_GEN_DIR}/ssr_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/volumetric.wgsl"       VOLUMETRIC_WGSL       "${WGSL_GEN_DIR}/volumetric_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/lumadapt.wgsl"         LUMADAPT_WGSL         "${WGSL_GEN_DIR}/lumadapt_wgsl.h")
+embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/contact.wgsl"          CONTACT_WGSL          "${WGSL_GEN_DIR}/contact_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/bloom.wgsl"            BLOOM_WGSL            "${WGSL_GEN_DIR}/bloom_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssao.wgsl"             SSAO_WGSL             "${WGSL_GEN_DIR}/ssao_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/dof.wgsl"              DOF_WGSL              "${WGSL_GEN_DIR}/dof_wgsl.h")
@@ -457,6 +462,11 @@ if (APPLE AND SAILSIM_MACOS_BUNDLE)
     INSTALL_RPATH "@executable_path/../Frameworks"
     BUILD_WITH_INSTALL_RPATH ON)
 
+  # App icon → Contents/Resources/sail-sim.icns (CFBundleIconFile in Info.plist points at it).
+  set(_mac_icon "${CMAKE_CURRENT_SOURCE_DIR}/icons/sail-sim.icns")
+  target_sources(sailsim_native PRIVATE "${_mac_icon}")
+  set_source_files_properties("${_mac_icon}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+
   # Sparkle: the Obj-C++ shim (ARC + framework header search path), link the framework, and embed it in the
   # bundle's Contents/Frameworks (ditto preserves the framework's version symlinks) so @rpath resolves at run.
   target_sources(sailsim_native PRIVATE src/updater_mac.mm)
@@ -496,7 +506,11 @@ elseif (WIN32)
   # Arch subdir in the release zip: x64/Release (default), ARM64/Release, or Release (32-bit x86).
   set(SAILSIM_WINSPARKLE_ARCHDIR "x64/Release" CACHE STRING "WinSparkle prebuilt arch subdir")
 
-  target_sources(sailsim_native PRIVATE src/updater_win.cpp)
+  # App icon: the .rc (references icons/sail-sim.ico) is compiled by the RC compiler and linked
+  # into the .exe, so Explorer/taskbar/Alt-Tab show it. project() only enables C/CXX, so enable RC
+  # explicitly (portable across the VS and Ninja generators) before adding the resource script.
+  enable_language(RC)
+  target_sources(sailsim_native PRIVATE src/updater_win.cpp icons/app.rc)
   target_compile_definitions(sailsim_native PRIVATE SAILSIM_WINSPARKLE=1
     SAILSIM_SPARKLE_FEED_URL_WIN="${SAILSIM_SPARKLE_FEED_URL_WIN}"
     SAILSIM_SPARKLE_PUBKEY="${SAILSIM_SPARKLE_PUBKEY}")

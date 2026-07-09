@@ -4946,6 +4946,15 @@ int main(int argc, char** argv) {
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Waves wet the hull at the waterline, rain soaks the decks, and small puddles\ncollect and drain — with raindrop ripples and sky reflections in the standing water.");
 
+#if defined(SAILSIM_SPARKLE) || defined(SAILSIM_WINSPARKLE)
+        // ── UPDATES: show the build version + a manual check (real updater builds only). ──
+        ImGui::Spacing(); ImGui::Separator();
+        ImGui::TextDisabled("UPDATES");
+        ImGui::Text("Version %s", SAILSIM_VERSION);
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_ROTATE "  Check for updates")) updater::checkNow();
+#endif
+
         // ── UNINSTALL (danger zone): remove the game + its data from this computer. ──
         ImGui::Spacing(); ImGui::Separator();
         ImGui::TextDisabled("UNINSTALL");

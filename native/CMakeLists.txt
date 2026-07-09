@@ -443,19 +443,32 @@ if (SAILSIM_TLS)
               $<TARGET_RUNTIME_DLLS:sailsim_native> $<TARGET_FILE_DIR:sailsim_native>
       COMMAND_EXPAND_LISTS
       COMMENT "Copying imported runtime DLLs (OpenSSL, …) next to the executable")
-    # (b) Fallback — glob libssl/libcrypto from the OpenSSL install's bin/lib dir
-    #     (covers installer/choco builds whose FindOpenSSL target carries only the
-    #     import lib, so TARGET_RUNTIME_DLLS can't see the DLL). Captured at configure.
+    # (b) Robust find — locate the actual libssl/libcrypto DLLs by NAME (OpenSSL 3 =
+    #     *-3-x64, OpenSSL 4 = *-4-x64; some builds ship plain libssl.dll). Search the
+    #     OpenSSL install dirs AND the PATH (where the running exe resolves them), so
+    #     this works no matter how OpenSSL was installed (vcpkg/installer/choco/system).
     get_filename_component(_ssl_libdir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
-    file(GLOB _ssl_dlls
-      "${_ssl_libdir}/libssl*.dll"        "${_ssl_libdir}/libcrypto*.dll"
-      "${_ssl_libdir}/../bin/libssl*.dll" "${_ssl_libdir}/../bin/libcrypto*.dll"
-      "${OPENSSL_ROOT_DIR}/bin/libssl*.dll" "${OPENSSL_ROOT_DIR}/bin/libcrypto*.dll")
-    if (_ssl_dlls)
+    get_filename_component(_ssl_root   "${OPENSSL_INCLUDE_DIR}" DIRECTORY)   # <root>/include -> <root>
+    set(_ssl_hints
+      "${OPENSSL_ROOT_DIR}/bin" "${_ssl_root}/bin" "${_ssl_libdir}"
+      "${_ssl_libdir}/../bin" "${_ssl_libdir}/../../bin" "${_ssl_libdir}/../../../bin")
+    find_file(SAILSIM_LIBSSL_DLL
+      NAMES libssl-4-x64.dll libssl-3-x64.dll libssl-1_1-x64.dll libssl.dll
+      HINTS ${_ssl_hints} PATHS ENV PATH)
+    find_file(SAILSIM_LIBCRYPTO_DLL
+      NAMES libcrypto-4-x64.dll libcrypto-3-x64.dll libcrypto-1_1-x64.dll libcrypto.dll
+      HINTS ${_ssl_hints} PATHS ENV PATH)
+    message(STATUS "OpenSSL runtime DLLs to bundle: ssl=[${SAILSIM_LIBSSL_DLL}]  crypto=[${SAILSIM_LIBCRYPTO_DLL}]")
+    if (SAILSIM_LIBSSL_DLL AND SAILSIM_LIBCRYPTO_DLL)
       add_custom_command(TARGET sailsim_native POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ssl_dlls} "$<TARGET_FILE_DIR:sailsim_native>"
-        COMMAND_EXPAND_LISTS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SAILSIM_LIBSSL_DLL}" "${SAILSIM_LIBCRYPTO_DLL}" "$<TARGET_FILE_DIR:sailsim_native>"
         COMMENT "Copying OpenSSL DLLs next to the executable")
+    else()
+      message(WARNING
+        "Could NOT locate the OpenSSL runtime DLLs (libssl/libcrypto) to bundle — the release will fail on "
+        "machines without OpenSSL. Fix: pass -DOPENSSL_ROOT_DIR=<your OpenSSL dir> (whose bin/ holds the DLLs), "
+        "or copy libssl-*-x64.dll + libcrypto-*-x64.dll into the zip beside the exe by hand.")
     endif()
   endif()
 else()

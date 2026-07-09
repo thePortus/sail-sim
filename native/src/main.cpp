@@ -3052,7 +3052,15 @@ static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
 
 int main(int argc, char** argv) {
   // Flush per line so `[spike] …` progress shows even when piped or killed.
+#ifdef _WIN32
+  // Windows MSVCRT treats _IOLBF as FULL buffering, so a hard crash (access
+  // violation) discards a redirected log entirely. Go unbuffered so the last
+  // line before a crash actually reaches the file — essential for diagnosing.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
+#else
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
 
   // Management CLI flags — handled before the game starts. --uninstall wipes the settings + cache (the "clean
   // uninstall" path); --version prints the compiled-in build (what the auto-updater will compare to the appcast).

@@ -448,7 +448,10 @@ endif()
 
 # Compiler warnings — keep the spike honest.
 if (MSVC)
-  target_compile_options(sailsim_native PRIVATE /W4)
+  # /FIctype.h force-includes <ctype.h> into every TU: libc++ pulls isdigit/isalpha
+  # in transitively but MSVC doesn't, and third-party headers (basisu transcoder,
+  # stb) call them unqualified (C3861). Harmless (guarded, idempotent) elsewhere.
+  target_compile_options(sailsim_native PRIVATE /W4 /FIctype.h)
   # Windows/MSVC hygiene: NOMINMAX drops the min()/max() macros that mangle
   # std::min/std::max and std::numeric_limits<>::max(); WIN32_LEAN_AND_MEAN trims
   # <windows.h>; _USE_MATH_DEFINES exposes M_PI (audio.cpp); _CRT_SECURE_NO_WARNINGS

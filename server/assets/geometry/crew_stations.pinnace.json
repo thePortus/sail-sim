@@ -188,31 +188,6 @@
       "heading_deg": 0,
       "clip": "Lookout",
       "wp": "wp_foredeck"
-    },
-    {
-      "id": "seat_P_aft",
-      "kind": "seat",
-      "pos": [
-        0.32,
-        -0.05,
-        -1.5
-      ],
-      "heading_deg": 180,
-      "clip": "Sit",
-      "wp": "wp_zoneB",
-      "note": "sit on z-1.5 thwart facing stern. Y raised -0.12 -> -0.05 so the Sit-clip feet clear the hull bottom (min y-0.107 here) instead of poking through into the water; the low thwart (0.436) cannot seat the clip (seat 0.46) AND keep feet on the sole, so feet clearance wins with a small butt lift."
-    },
-    {
-      "id": "seat_S_aft",
-      "kind": "seat",
-      "pos": [
-        -0.32,
-        -0.05,
-        -1.5
-      ],
-      "heading_deg": 180,
-      "clip": "Sit",
-      "wp": "wp_zoneB"
     }
   ],
   "climb_paths": [],
@@ -220,6 +195,7 @@
     "No climb paths: the pinnace mast has bare shrouds (no ratlines) and is short - crew work the rig from deck.",
     "Thwart crossings are step_over edges: arc instance Y by +0.45 mid-edge or accept shin clipping at distance.",
     "Death footprint fits the sole between thwarts (1.8m) only along the centerline fore-aft; wounded near guns are fine.",
-    "max_crew_suggested: 6 (helm, 2 guns, 1 ropes, lookout, 1 seated)."
+    "Removed the two aft 'seat' stations: the crew Sit clip has legs extended ~0.5m forward, which on this tiny hull punch out through the port side / bottom at any seat height that keeps the butt near the low thwart. Crew stand/work instead. Restore only with a tucked-leg sit clip.",
+    "max_crew_suggested: 5 (helm, 2 guns, 1 ropes, lookout)."
   ]
 }

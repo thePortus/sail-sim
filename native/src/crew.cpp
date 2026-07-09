@@ -398,6 +398,11 @@ Deck::Deck(std::shared_ptr<const RiggedData> rig, const std::string& layoutPath,
   for (const Station& s : stations_) maxBeam_ = std::max(maxBeam_, std::fabs(beamAxisZ_ ? s.pos.z : s.pos.x));
   if (maxBeam_ < 1e-3f) maxBeam_ = 1.0f;
 
+  if (std::getenv("SAILSIM_CREW_POS"))
+    for (const Station& s : stations_)
+      std::fprintf(stderr, "[crewpos] %-10s kind=%-8s root-local pos=(%.3f, %.3f, %.3f)\n",
+                   s.id.c_str(), s.kind.c_str(), s.pos.x, s.pos.y, s.pos.z);
+
   const int n = std::min(count, (int)stations_.size());
   members_.reserve(n);
   const std::string firstWp = waypoints_.empty() ? std::string() : waypoints_.begin()->first;
@@ -465,6 +470,13 @@ void Deck::deckSnap(glm::vec3& p) const {
     const float a = o[0] * inb, b = o[1];          // a = inboard along beam, b = fore/aft along keel
     const float cx = beamAxisZ_ ? p.x + b : p.x + a;
     const float cz = beamAxisZ_ ? p.z + a : p.z + b;
+    // Never overshoot ACROSS the keel onto the far hull side: on a cramped hull
+    // (the pinnace) the fixed inboard offsets can jump a centreline station clear
+    // to the opposite sheer, where the hull curves away and the crew's feet hang
+    // over the side. Inboard/fore-aft moves stay; a big sign-flip is rejected so a
+    // blocked station keeps its authored on-sole spot instead.
+    const float candBeam = beamAxisZ_ ? cz : cx;
+    if (candBeam * beam < 0.0f && std::fabs(candBeam) > 0.15f) continue;
     const float hy = castHighest(cx, cz, topY);
     if (!std::isnan(hy) && hy >= lo && hy <= hi) { p.x = cx; p.z = cz; p.y = hy + deckLift_; return; }
   }

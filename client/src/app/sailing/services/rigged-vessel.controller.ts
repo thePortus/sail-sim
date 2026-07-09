@@ -6,6 +6,7 @@ import { RiggedManifest, SailState } from '../models';
 import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
+import { WetnessPlugin } from './wetness.plugin';
 import { mastDownAmount, mastBreakAmount } from './combat.constants';
 
 /**
@@ -152,6 +153,10 @@ export class SloopController implements VesselController {
         // occlusion map's coarse (darker) mips can't drive the ship toward black at range — see
         // BakedAOPlugin.bindForSubMesh.
         new BakedAOPlugin(mesh.material);
+        // Hull & deck wetness — not sails/flags/rigging/mast (matches the native wetness masking).
+        if (!name.startsWith('Sail_') && !name.startsWith('Flag_') && !/rigging|mast/i.test(name)) {
+          new WetnessPlugin(mesh.material);
+        }
         // Allow the sun + several cannon muzzle-flash point lights at once, so a nearby
         // broadside lights this hull without displacing the sun (which would darken the ship).
         // (The WebGPU 12-UBO/stage limit is governed by the scene's TOTAL light count, not this cap —

@@ -9,6 +9,7 @@ import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoade
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
+import { WetnessPlugin } from './wetness.plugin';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -2054,6 +2055,16 @@ export class VesselService {
 
     // ── Inform ocean service so wake plane shader knows boat position ──────
     this.oceanService.setBoatTransform(this.x, this.z, hdgR, this.speed);
+
+    // ── Hull/deck wetness: push the sea-surface height at the ship (the waterline height),
+    //    rain, time + enable to the shared WetnessPlugin state (one static across all vessel
+    //    materials). getHeightAt is NaN until the first FFT readback → fall back to sea level. ──
+    const wetT = this.oceanService.getOceanTime();
+    const wh = this.oceanService.getWaveHeightAt(this.x, this.z, wetT);
+    WetnessPlugin.shared.seaY = Number.isFinite(wh) ? wh : 0;
+    WetnessPlugin.shared.rain = this.oceanService.getRainIntensity();
+    WetnessPlugin.shared.time = wetT;
+    WetnessPlugin.shared.enabled = this.sceneService.isWetnessEnabled() ? 1 : 0;
   }
 
   // ── PBR material & texture helpers ────────────────────────────────────────

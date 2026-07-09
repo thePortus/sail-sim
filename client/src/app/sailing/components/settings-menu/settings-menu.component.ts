@@ -148,6 +148,13 @@ import { MultiplayerService } from '../../services/multiplayer.service';
           <div class="q-hint">Glossy surfaces reflect the scene (beta). Terrain, towns and props only — adds a screen-space march.</div>
 
           <div class="q-row" style="margin-top:0.7rem">
+            <span class="q-label">Hull &amp; deck wetness</span>
+            <button class="toggle-btn" [class.toggle-btn--on]="wetnessOn"
+                    (click)="toggleWetness()">{{ wetnessOn ? 'On' : 'Off' }}</button>
+          </div>
+          <div class="q-hint">The hull darkens at the waterline and the decks look rain-soaked.</div>
+
+          <div class="q-row" style="margin-top:0.7rem">
             <span class="q-label">Water Transparency</span>
             <button class="toggle-btn" [class.toggle-btn--on]="transparencyOn"
                     (click)="toggleTransparency()">{{ transparencyOn ? 'On' : 'Off' }}</button>
@@ -306,6 +313,7 @@ export class SettingsMenuComponent {
   adaptiveRes   = this.sceneSvc.isAdaptiveResolution();
   reflectionsOn  = this.ocean.isReflectionsEnabled();
   ssrOn          = this.sceneSvc.isSsrEnabled();
+  wetnessOn      = this.sceneSvc.isWetnessEnabled();
   transparencyOn = this.ocean.isWaterTransparencyEnabled();
   terrainPbrOn   = this.terrain.isTerrainPBREnabled();
   oceanQuality   = this.ocean.getOceanQuality();
@@ -382,6 +390,11 @@ export class SettingsMenuComponent {
   toggleSsr(): void {
     this.ssrOn = !this.ssrOn;
     this.sceneSvc.setSsrEnabled(this.ssrOn);
+    this.markCustom();
+  }
+  toggleWetness(): void {
+    this.wetnessOn = !this.wetnessOn;
+    this.sceneSvc.setWetnessEnabled(this.wetnessOn);
     this.markCustom();
   }
   toggleTransparency(): void {

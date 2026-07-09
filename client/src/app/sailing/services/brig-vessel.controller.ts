@@ -6,6 +6,7 @@ import { RiggedManifest, SailState } from '../models';
 import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
+import { WetnessPlugin } from './wetness.plugin';
 import { MAST_DAMAGE_ONSET } from './combat.constants';
 
 /** One sail's furl morph + the rope morphs that follow it (resolved by NAME — the rope meshes carry
@@ -185,6 +186,9 @@ export class BrigController implements VesselController {
       if (mesh.material instanceof PBRMaterial) {
         const mat = mesh.material;
         if (mat.ambientTexture && !mat.pluginManager?.getPlugin('BakedAO')) { new BakedAOPlugin(mat); }
+        // Hull & deck wetness — not sails/flags/rigging (matches the native wetness masking).
+        if (!name.startsWith('Sail_') && !name.startsWith('Flag_') && !/rigging/i.test(name) &&
+            !mat.pluginManager?.getPlugin('Wetness')) { new WetnessPlugin(mat); }
         mat.maxSimultaneousLights = 6;
       }
     }

@@ -21,6 +21,7 @@ import { Weather } from '../models';
 import { TelemetryService } from './telemetry.service';
 import { ProceduralSky } from './procedural-sky';
 import { RainLens } from './rain-lens';
+import { WetnessPlugin } from './wetness.plugin';
 
 @Injectable({ providedIn: 'root' })
 export class SceneService {
@@ -1218,6 +1219,16 @@ export class SceneService {
     localStorage.setItem('ignis_ssr', on ? '1' : '0');
     if (on) this.buildSsr();
     else if (this.ssr) { this.ssr.dispose(); this.ssr = null; }
+  }
+
+  // Hull & deck wetness (WetnessPlugin on the vessel materials). The plugin is always attached;
+  // this flag just gates the shader effect via its shared `enabled` uniform, so toggling is free.
+  private _wetnessEnabled = (localStorage.getItem('ignis_wetness') ?? '1') !== '0';
+  isWetnessEnabled(): boolean { return this._wetnessEnabled; }
+  setWetnessEnabled(on: boolean): void {
+    this._wetnessEnabled = on;
+    localStorage.setItem('ignis_wetness', on ? '1' : '0');
+    WetnessPlugin.shared.enabled = on ? 1 : 0;
   }
 
   getAaQuality(): number { return this._aaQuality; }

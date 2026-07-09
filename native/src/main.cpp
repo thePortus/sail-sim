@@ -3070,6 +3070,13 @@ int main(int argc, char** argv) {
       std::printf("sail-sim native %s\n", SAILSIM_VERSION);
       return EXIT_SUCCESS;
     }
+    if (a == "--print-paths") {   // diagnostic: what the in-game uninstall targets
+      std::printf("exe:      %s\n", paths::selfExecutable().c_str());
+      std::printf("game:     %s\n", paths::installArtifact().c_str());
+      std::printf("data:     %s\n", paths::dataDir().c_str());
+      std::printf("cache:    %s\n", paths::cacheDir().c_str());
+      return EXIT_SUCCESS;
+    }
     if (a == "--uninstall") {
       const bool ok = paths::wipeAll();
       std::printf("SailSim data + cache removed (%s).\n", ok ? "clean" : "some items remained");
@@ -4787,7 +4794,10 @@ int main(int argc, char** argv) {
       if (settingsOpen) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        // Fixed 380 wide; auto-fit height but capped to 90% of the screen so the tall
+        // GRAPHICS + UNINSTALL sections scroll instead of running off the bottom edge.
         ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(380, 0), ImVec2(380, io.DisplaySize.y * 0.9f));
         ImGui::Begin("Settings", &settingsOpen, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
         ImGui::TextDisabled("SOUND");
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -4935,6 +4945,42 @@ int main(int argc, char** argv) {
         if (ImGui::Checkbox("Hull & deck wetness", &g.hullWetness)) { custom(); gsave(); }
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Waves wet the hull at the waterline, rain soaks the decks, and small puddles\ncollect and drain — with raindrop ripples and sky reflections in the standing water.");
+
+        // ── UNINSTALL (danger zone): remove the game + its data from this computer. ──
+        ImGui::Spacing(); ImGui::Separator();
+        ImGui::TextDisabled("UNINSTALL");
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.52f, 0.15f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.42f, 0.11f, 0.11f, 1.0f));
+        if (ImGui::Button(ICON_FA_TRASH "  Uninstall SailSim", ImVec2(-FLT_MIN, 0)))
+          ImGui::OpenPopup("Uninstall SailSim?");
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Delete the game and all of its data (settings + cached assets) from this computer.");
+
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::BeginPopupModal("Uninstall SailSim?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+          ImGui::Text("This permanently removes SailSim from this computer:");
+          ImGui::BulletText("the game itself");
+          ImGui::BulletText("your settings");
+          ImGui::BulletText("the cached assets");
+          ImGui::Spacing();
+          ImGui::TextColored(ImVec4(0.95f, 0.62f, 0.40f, 1.0f),
+                             ICON_FA_TRIANGLE_EXCLAMATION "  This cannot be undone. The game will close now.");
+          ImGui::Spacing();
+          if (ImGui::Button("Cancel", ImVec2(150, 0))) ImGui::CloseCurrentPopup();
+          ImGui::SameLine();
+          ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.52f, 0.15f, 0.15f, 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+          if (ImGui::Button(ICON_FA_TRASH "  Delete everything", ImVec2(190, 0))) {
+            paths::wipeAll();             // settings + cached assets
+            paths::scheduleSelfDelete();  // detached helper removes the game after we exit
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+          }
+          ImGui::PopStyleColor(2);
+          ImGui::EndPopup();
+        }
         ImGui::End();
       }
 

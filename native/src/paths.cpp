@@ -5,6 +5,14 @@
 #include <filesystem>
 #include <system_error>
 
+#if defined(_WIN32)
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <mach-o/dyld.h>
+#else
+#  include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace paths {
@@ -111,6 +119,71 @@ bool wipeAll() {
   nuke(home / ".sailsim_session");
   nuke(home / ".sailsim_cache");
   return ok;
+}
+
+std::string selfExecutable() {
+#if defined(_WIN32)
+  wchar_t buf[MAX_PATH];
+  DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  std::error_code ec;
+  fs::path p = fs::weakly_canonical(fs::path(std::wstring(buf, n)), ec);
+  return ec ? fs::path(std::wstring(buf, n)).string() : p.string();
+#elif defined(__APPLE__)
+  char buf[4096]; uint32_t sz = sizeof(buf);
+  if (_NSGetExecutablePath(buf, &sz) != 0) return "";
+  std::error_code ec;
+  fs::path p = fs::canonical(buf, ec);
+  return ec ? std::string(buf) : p.string();
+#else
+  char buf[4096];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n <= 0) return "";
+  buf[n] = '\0';
+  return buf;
+#endif
+}
+
+std::string installArtifact() {
+  const std::string exe = selfExecutable();
+  if (exe.empty()) return "";
+  const fs::path p(exe);
+#if defined(__APPLE__)
+  // Inside a bundle (…/SailSim.app/Contents/MacOS/exe) → remove the whole .app.
+  for (fs::path a = p; a.has_parent_path() && a != a.parent_path(); a = a.parent_path())
+    if (a.extension() == ".app") return a.string();
+#endif
+  // Otherwise the folder the executable lives in (the install dir).
+  return p.parent_path().string();
+}
+
+bool scheduleSelfDelete() {
+  const std::string target = installArtifact();
+  if (target.empty()) return false;
+#if defined(_WIN32)
+  // A running exe can't delete itself, so hand the job to a detached cmd that
+  // waits for us to exit (ping = ~2 s delay), then removes the whole install
+  // folder. Its CWD is set OUTSIDE the target so rmdir can delete it.
+  // DETACHED_PROCESS | CREATE_NO_WINDOW keeps a console from flashing (release
+  // is a GUI-subsystem build with no console of its own).
+  std::string cmd = "cmd.exe /C \"ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"" + target + "\"\"";
+  const std::string cwd = fs::path(target).parent_path().string();
+  STARTUPINFOA si{}; si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                           DETACHED_PROCESS | CREATE_NO_WINDOW, nullptr,
+                           cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+  if (ok) { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+  return ok != 0;
+#else
+  // Background a subshell that outlives us: it sleeps, then rm -rf's the app /
+  // install folder. On macOS/Linux the running binary's inode survives deletion
+  // until the process exits, so removing it out from under ourselves is fine.
+  std::string esc;
+  for (char c : target) { if (c == '\'') esc += "'\\''"; else esc += c; }
+  const std::string cmd = "(sleep 1; rm -rf '" + esc + "') >/dev/null 2>&1 &";
+  return std::system(cmd.c_str()) == 0;
+#endif
 }
 
 }  // namespace paths

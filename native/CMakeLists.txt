@@ -463,6 +463,18 @@ else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ── Windows: hide the console window on release ──────────────────────────────
+# Dev/CI builds stay a console app so stdout/stderr (and crash logs) are visible.
+# Package a release with -DSAILSIM_WINDOWS_GUI=ON to build a GUI-subsystem exe:
+# double-clicking shows only the game window, no terminal. /ENTRY:mainCRTStartup
+# keeps plain int main() as the entry point under /SUBSYSTEM:WINDOWS. (The macOS
+# .app bundle already launches without a terminal.)
+option(SAILSIM_WINDOWS_GUI "Windows: build as a GUI app (no console window) for release" OFF)
+if (WIN32 AND SAILSIM_WINDOWS_GUI)
+  set_target_properties(sailsim_native PROPERTIES WIN32_EXECUTABLE ON)
+  target_link_options(sailsim_native PRIVATE "/ENTRY:mainCRTStartup")
+endif()
+
 # ── macOS: package as a .app bundle + Sparkle auto-updater ───────────────────
 # Off by default so the dev/CI loop keeps running ./build/bin/sailsim_native (a bare executable with a no-op
 # updater). Turn on with -DSAILSIM_MACOS_BUNDLE=ON to get build/bin/sailsim_native.app — a proper Cocoa app

@@ -16,7 +16,7 @@ project(sailsim_native LANGUAGES C CXX)
 
 # Single source of truth for the client version — feeds the compiled-in SAILSIM_VERSION string (shown by
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
-set(SAILSIM_VERSION "0.1.2")
+set(SAILSIM_VERSION "0.1.3")
 
 # Auto-update config: the per-platform appcast feed URLs (override for your deployment — Sparkle/WinSparkle
 # require https in production) and the shared Ed25519 public key (printed by `client-release.js keygen`; the one

@@ -100,6 +100,13 @@ per-platform, and defines the `webgpu` target from the header + lib in that same
   - Windows: Visual Studio 2022 (MSVC)
 - **Git** and a network connection for the first configure (deps are fetched via `FetchContent`:
   `glfw`, the WebGPU distribution + prebuilt wgpu-native lib, `glfw3webgpu`).
+- **OpenSSL** — only for the default TLS build (`SAILSIM_TLS=ON`, so one binary speaks both `ws://`
+  and `wss://`). macOS/Linux usually ship it; **Windows does not**. Either install it (below) or build
+  without TLS: `-DSAILSIM_TLS=OFF` (drops the OpenSSL dependency, `ws://` only).
+  - Windows via **vcpkg** (cleanest for CMake): `vcpkg install openssl:x64-windows`, then configure with
+    `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.
+  - Or Chocolatey `choco install openssl`, or the "Win64 OpenSSL" **full** (not "Light") dev installer.
+    If CMake still can't find it, point at the install: `-DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL-Win64"`.
 
 The default (wgpu) build is fast — no large source build. (The Dawn build is the slow one.)
 
@@ -159,6 +166,9 @@ distributable build would copy them into `Contents/Resources`.)
 
 - **CMake 4.x: "Compatibility with CMake < 3.5 has been removed".** Add
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (see above).
+- **"Could NOT find OpenSSL" (common on Windows).** The default `SAILSIM_TLS=ON` build needs OpenSSL.
+  Install it (vcpkg/Chocolatey/installer — see Prerequisites) or configure with `-DSAILSIM_TLS=OFF`
+  for an OpenSSL-free `ws://`-only build.
 - **Switching backends doesn't take effect.** The backend selects the fetched distribution tag, so
   after changing `SAILSIM_WEBGPU_BACKEND` do a clean reconfigure: `rm -rf build && cmake -B build …`.
 - **No output when piped/killed.** Fixed in-tree by line-buffering stdout; if you still see nothing,

@@ -16,7 +16,7 @@ project(sailsim_native LANGUAGES C CXX)
 
 # Single source of truth for the client version — feeds the compiled-in SAILSIM_VERSION string (shown by
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
-set(SAILSIM_VERSION "0.1.1")
+set(SAILSIM_VERSION "0.1.2")
 
 # Auto-update config: the per-platform appcast feed URLs (override for your deployment — Sparkle/WinSparkle
 # require https in production) and the shared Ed25519 public key (printed by `client-release.js keygen`; the one
@@ -137,7 +137,9 @@ else()
   # src/main.cpp) with the modern surface API.
   set(WGPU_VER "v0.19.4.1")
   if (WIN32)
-    set(WGPU_ZIP "wgpu-windows-x86_64-msvc-release.zip")
+    # NB: the v0.19.4.1 Windows asset has no toolchain suffix — it's
+    # "wgpu-windows-x86_64-release.zip" (an earlier "-msvc" name 404s).
+    set(WGPU_ZIP "wgpu-windows-x86_64-release.zip")
   elseif (APPLE)
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
       set(WGPU_ZIP "wgpu-macos-aarch64-release.zip")
@@ -276,7 +278,25 @@ function(embed_wgsl SRC VARNAME OUT)
   # without this dependency, shader edits silently never reach the binary.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SRC}")
   file(READ "${SRC}" _wgsl_src)
-  file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
+  # MSVC caps a single string literal at 16380 bytes (error C2026). Split the
+  # shader into <16 KB raw-string chunks and let adjacent-literal concatenation
+  # rejoin them — no shader contains the )WGSL delimiter, so byte-splitting is
+  # safe (and UTF-8 comment bytes survive raw-string concatenation intact).
+  string(LENGTH "${_wgsl_src}" _wgsl_len)
+  set(_wgsl_body "")
+  set(_wgsl_pos 0)
+  while(_wgsl_pos LESS _wgsl_len)
+    math(EXPR _wgsl_remain "${_wgsl_len} - ${_wgsl_pos}")
+    if(_wgsl_remain LESS 8000)
+      set(_wgsl_take ${_wgsl_remain})
+    else()
+      set(_wgsl_take 8000)
+    endif()
+    string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_piece)
+    string(APPEND _wgsl_body "R\"WGSL(${_wgsl_piece})WGSL\"\n")
+    math(EXPR _wgsl_pos "${_wgsl_pos} + ${_wgsl_take}")
+  endwhile()
+  file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} =\n${_wgsl_body};\n")
 endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
@@ -428,9 +448,31 @@ endif()
 
 # Compiler warnings — keep the spike honest.
 if (MSVC)
-  target_compile_options(sailsim_native PRIVATE /W4)
+  # /FIctype.h force-includes <ctype.h> into every TU: libc++ pulls isdigit/isalpha
+  # in transitively but MSVC doesn't, and third-party headers (basisu transcoder,
+  # stb) call them unqualified (C3861). Harmless (guarded, idempotent) elsewhere.
+  target_compile_options(sailsim_native PRIVATE /W4 /FIctype.h)
+  # Windows/MSVC hygiene: NOMINMAX drops the min()/max() macros that mangle
+  # std::min/std::max and std::numeric_limits<>::max(); WIN32_LEAN_AND_MEAN trims
+  # <windows.h>; _USE_MATH_DEFINES exposes M_PI (audio.cpp); _CRT_SECURE_NO_WARNINGS
+  # silences the getenv/sscanf C4996 spam. (The far/near/small macros from the RPC
+  # headers are dodged by not naming identifiers after them — see the sources.)
+  target_compile_definitions(sailsim_native PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ── Windows: hide the console window on release ──────────────────────────────
+# Dev/CI builds stay a console app so stdout/stderr (and crash logs) are visible.
+# Package a release with -DSAILSIM_WINDOWS_GUI=ON to build a GUI-subsystem exe:
+# double-clicking shows only the game window, no terminal. /ENTRY:mainCRTStartup
+# keeps plain int main() as the entry point under /SUBSYSTEM:WINDOWS. (The macOS
+# .app bundle already launches without a terminal.)
+option(SAILSIM_WINDOWS_GUI "Windows: build as a GUI app (no console window) for release" OFF)
+if (WIN32 AND SAILSIM_WINDOWS_GUI)
+  set_target_properties(sailsim_native PROPERTIES WIN32_EXECUTABLE ON)
+  target_link_options(sailsim_native PRIVATE "/ENTRY:mainCRTStartup")
 endif()
 
 # ── macOS: package as a .app bundle + Sparkle auto-updater ───────────────────

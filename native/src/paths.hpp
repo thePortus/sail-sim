@@ -26,4 +26,15 @@ void migrateLegacy();
 // everything that existed was removed cleanly.
 bool wipeAll();
 
+// Absolute path to the running executable (resolves symlinks). Empty on failure.
+std::string selfExecutable();
+
+// What "delete the game" removes: the .app bundle on macOS, otherwise the folder the executable lives in.
+std::string installArtifact();
+
+// Spawn a DETACHED helper that waits for this process to exit, then deletes installArtifact() (the game
+// itself). Pair with wipeAll() (data + cache), then quit, for a full in-game uninstall. Returns true if the
+// helper launched. No console window is shown.
+bool scheduleSelfDelete();
+
 }  // namespace paths

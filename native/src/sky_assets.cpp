@@ -35,10 +35,10 @@ Image fetch(const std::string& host, int port, const std::string& name, int maxW
     // Downsample huge maps (the 8192-wide star map) to bound VRAM. Preserve aspect.
     int dw = maxW;
     int dh = (int)((long long)h * dw / w);
-    std::vector<uint8_t> small((size_t)dw * dh * 4);
-    stbir_resize_uint8_srgb(pix, w, h, 0, small.data(), dw, dh, 0, STBIR_RGBA);
+    std::vector<uint8_t> resized((size_t)dw * dh * 4);
+    stbir_resize_uint8_srgb(pix, w, h, 0, resized.data(), dw, dh, 0, STBIR_RGBA);
     stbi_image_free(pix);
-    out.w = dw; out.h = dh; out.rgba = std::move(small); out.ok = true;
+    out.w = dw; out.h = dh; out.rgba = std::move(resized); out.ok = true;
   } else {
     out.w = w; out.h = h;
     out.rgba.assign(pix, pix + (size_t)w * h * 4);

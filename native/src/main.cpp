@@ -5267,11 +5267,16 @@ int main(int argc, char** argv) {
 
       // ── Gunnery panel (bottom-centre; the browser cannon HUD): per-side state,
       //    loaded pips + reload progress, ammo + elevation readouts. ──
+      // Its top edge is captured so the dock/mooring prompt stacks ABOVE it rather
+      // than overlapping (an overlap let a gunhud click bring it in front and bury
+      // the Dock button). NoBringToFrontOnFocus keeps HUD click order stable too.
+      float gunHudTopY = io.DisplaySize.y - 12.0f;   // fallback: bottom edge when the gunhud isn't shown
       if (!tiedUp) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 12.0f),
                                 ImGuiCond_Always, ImVec2(0.5f, 1.0f));
         ImGui::Begin("gunhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
         auto sideUi = [&](int gside, const char* name, const char* key) {
           combat::HudGunState st = guns.hudState(gside);
           const char* label = st == combat::HudGunState::Arming ? "ARMING"
@@ -5318,6 +5323,7 @@ int main(int argc, char** argv) {
         ImGui::EndGroup();
         ImGui::SameLine(0.0f, 26.0f);
         sideUi(1, "STBD", "C");
+        gunHudTopY = ImGui::GetWindowPos().y;   // top edge, so prompts can stack above
         ImGui::End();
       }
 
@@ -6178,7 +6184,7 @@ int main(int argc, char** argv) {
         // Dock prompt (bottom-centre) — shown when alongside a pier and not moored/mooring.
         if (!tiedUp && !docking && dockIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)dockIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 46.0f),
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
                                   ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("dockprompt", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
@@ -6197,7 +6203,7 @@ int main(int argc, char** argv) {
         // Mooring indicator (bottom-centre) while the hull glides into the berth (client "⚓ Mooring at …").
         if (docking && tiedIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 46.0f),
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
                                   ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("mooring", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);

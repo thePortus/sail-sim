@@ -432,8 +432,48 @@ if (SAILSIM_TLS)
     SAILSIM_HAVE_TLS=1 CPPHTTPLIB_OPENSSL_SUPPORT=1
     SAILSIM_SERVER_TLS_DEFAULT=$<BOOL:${SAILSIM_SERVER_TLS}>)
   target_link_libraries(sailsim_native PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+  # DISTRIBUTION: the TLS build dynamically links OpenSSL, so a machine WITHOUT
+  # OpenSSL installed fails at launch with "libssl-4-x64.dll not found". Ship the
+  # OpenSSL runtime DLLs next to the exe so the zipped release is self-contained.
+  if (WIN32)
+    # (a) Modern path — runtime DLLs of imported shared targets (vcpkg OpenSSL, etc.).
+    add_custom_command(TARGET sailsim_native POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:sailsim_native>>,copy_if_different,true>
+              $<TARGET_RUNTIME_DLLS:sailsim_native> $<TARGET_FILE_DIR:sailsim_native>
+      COMMAND_EXPAND_LISTS
+      COMMENT "Copying imported runtime DLLs (OpenSSL, …) next to the executable")
+    # (b) Fallback — glob libssl/libcrypto from the OpenSSL install's bin/lib dir
+    #     (covers installer/choco builds whose FindOpenSSL target carries only the
+    #     import lib, so TARGET_RUNTIME_DLLS can't see the DLL). Captured at configure.
+    get_filename_component(_ssl_libdir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+    file(GLOB _ssl_dlls
+      "${_ssl_libdir}/libssl*.dll"        "${_ssl_libdir}/libcrypto*.dll"
+      "${_ssl_libdir}/../bin/libssl*.dll" "${_ssl_libdir}/../bin/libcrypto*.dll"
+      "${OPENSSL_ROOT_DIR}/bin/libssl*.dll" "${OPENSSL_ROOT_DIR}/bin/libcrypto*.dll")
+    if (_ssl_dlls)
+      add_custom_command(TARGET sailsim_native POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ssl_dlls} "$<TARGET_FILE_DIR:sailsim_native>"
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying OpenSSL DLLs next to the executable")
+    endif()
+  endif()
 else()
   target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_TLS=0 SAILSIM_SERVER_TLS_DEFAULT=0)
+endif()
+
+# DISTRIBUTION: bundle the MSVC runtime (vcruntime140.dll, msvcp140.dll, …) so a
+# machine without the "Visual C++ Redistributable" installed doesn't fail with the
+# next missing-DLL error after OpenSSL is handled. Copied next to the exe for the zip.
+if (WIN32 AND MSVC)
+  set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)   # collect the paths only; we copy, not install()
+  include(InstallRequiredSystemLibraries)
+  if (CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+    add_custom_command(TARGET sailsim_native POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} "$<TARGET_FILE_DIR:sailsim_native>"
+      COMMAND_EXPAND_LISTS
+      COMMENT "Copying MSVC runtime DLLs next to the executable")
+  endif()
 endif()
 target_link_libraries(sailsim_native PRIVATE glfw webgpu glfw3webgpu glm::glm imgui nlohmann_json::nlohmann_json ixwebsocket)
 

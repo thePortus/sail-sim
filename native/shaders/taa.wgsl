@@ -47,6 +47,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   // rest of the screen is the sentinel ~99), which tracks the MOVING ship correctly. Where there's no
   // motion vector, fall back to camera-motion reprojection reconstructed from depth.
   let mv = textureLoad(velTex, pix, 0).xy;
+  // Translucent FX (cannon smoke) stamp a large-negative sentinel here: use the
+  // current frame with NO history so the ship's reprojected history can't ghost
+  // through the smoke. (Normal motion vectors are small; the static sentinel is +99.)
+  if (mv.x < -50.0) { return vec4<f32>(cur, 1.0); }
   var puv : vec2<f32>;
   if (abs(mv.x) < 10.0 && abs(mv.y) < 10.0) {
     puv = uv - mv;

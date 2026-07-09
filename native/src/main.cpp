@@ -9844,7 +9844,7 @@ int main(int argc, char** argv) {
     //    (cleared to a sentinel ~99), depth-tested read-only so only visible surfaces write screen-UV
     //    motion vectors. The resolve reads these to reproject the moving ships (camera-only depth
     //    reproj can't); static geometry stays at the sentinel and uses the depth reprojection. ──
-    if (userCfg.gfx.taa && sailing && !taaMovers.empty()) {
+    if (userCfg.gfx.taa && sailing && (!taaMovers.empty() || cannonFx.anyActive())) {
       WGPURenderPassColorAttachment vca = {};
       vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
       vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
@@ -9864,6 +9864,9 @@ int main(int argc, char** argv) {
           wgpuRenderPassEncoderDrawIndexed(vp, m->submeshes[i].indexCount, 1, m->submeshes[i].indexOffset, 0, 0);
         }
       }
+      // Stamp the smoke's no-history sentinel over the ships (depth-tested, so only
+      // smoke in FRONT of geometry marks) — keeps the ship from ghosting through it.
+      cannonFx.drawVelocity(vp);
       wgpuRenderPassEncoderEnd(vp);
       wgpuRenderPassEncoderRelease(vp);
     }

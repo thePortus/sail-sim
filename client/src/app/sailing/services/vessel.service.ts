@@ -2060,8 +2060,25 @@ export class VesselService {
     //    rain, time + enable to the shared WetnessPlugin state (one static across all vessel
     //    materials). getHeightAt is NaN until the first FFT readback → fall back to sea level. ──
     const wetT = this.oceanService.getOceanTime();
-    const wh = this.oceanService.getWaveHeightAt(this.x, this.z, wetT);
-    WetnessPlugin.shared.seaY = Number.isFinite(wh) ? wh : 0;
+    const fin = (v: number, d = 0): number => (Number.isFinite(v) ? v : d);
+    // Sample the real sea-height field (the one the hull floats on) at the ship and ±ε in x/z to get
+    // the local surface height + its world gradient — a tangent plane the shader follows so the wetline
+    // rides the swell (Phase 3). ε ≈ a fraction of the wavelength; ±10 m reads the slope at the hull.
+    const eps = 10;
+    const hc = fin(this.oceanService.getWaveHeightAt(this.x, this.z, wetT));
+    const hxp = fin(this.oceanService.getWaveHeightAt(this.x + eps, this.z, wetT));
+    const hxm = fin(this.oceanService.getWaveHeightAt(this.x - eps, this.z, wetT));
+    const hzp = fin(this.oceanService.getWaveHeightAt(this.x, this.z + eps, wetT));
+    const hzm = fin(this.oceanService.getWaveHeightAt(this.x, this.z - eps, wetT));
+    WetnessPlugin.shared.seaY = hc;
+    WetnessPlugin.shared.shipX = this.x;
+    WetnessPlugin.shared.shipZ = this.z;
+    WetnessPlugin.shared.gradX = (hxp - hxm) / (2 * eps);
+    WetnessPlugin.shared.gradZ = (hzp - hzm) / (2 * eps);
+    // Clamp the tangent-plane offset to the local wave amplitude so distant ships (sharing this one
+    // global static) don't get a plane extrapolated into absurd heights.
+    const amp = Math.max(Math.abs(hxp - hc), Math.abs(hxm - hc), Math.abs(hzp - hc), Math.abs(hzm - hc), 0.15);
+    WetnessPlugin.shared.amp = Math.min(amp * 1.5 + 0.1, 3.0);
     WetnessPlugin.shared.rain = this.oceanService.getRainIntensity();
     WetnessPlugin.shared.time = wetT;
     WetnessPlugin.shared.enabled = this.sceneService.isWetnessEnabled() ? 1 : 0;

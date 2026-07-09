@@ -158,7 +158,7 @@ the zip before uploading. A notarized build double-clicks cleanly with no `xattr
 
 ``` powershell
 cd native
-cmake -S . -B build-win -DSAILSIM_SERVER_HOST=your.server -DSAILSIM_SERVER_PORT=443 -DSAILSIM_SERVER_TLS=ON -DSAILSIM_SERVER_PATH=/api -DSAILSIM_SPARKLE_FEED_URL_WIN=https://your.server/api/client/appcast-win.xml -DSAILSIM_SPARKLE_PUBKEY=<your-public-key>
+cmake -S . -B build-win -DSAILSIM_SERVER_HOST="your.server" -DSAILSIM_SERVER_PORT="443" -DSAILSIM_SERVER_TLS="ON" -DSAILSIM_SERVER_PATH="/api" -DSAILSIM_SPARKLE_FEED_URL_WIN="https://your.server/api/client/appcast-win.xml" -DSAILSIM_WINDOWS_GUI="ON" -DCMAKE_POLICY_VERSION_MINIMUM="3.5" -DSAILSIM_SPARKLE_PUBKEY="<your-public-key>"
 cmake --build build-win --config Release
 # Zip the whole output folder (.exe + WinSparkle.dll):
 Compress-Archive -Path build-win\bin\Release\* -DestinationPath SailSim-<ver>-win.zip
@@ -213,6 +213,13 @@ keeps them — the releases via the existing `./server/assets` mount, the key vi
 they're host paths, you can also skip the `docker cp` and run the publish script on the host (with Node
 installed), pointing `--file` straight at `server/assets/client` on disk. **Back up `server/.sparkle/` off the
 host regardless** — a bind mount protects it from rebuilds, not from the box dying.
+
+## Enabling OSX
+
+```
+xattr -dr com.apple.quarantine /path/to/sailsim_native.app
+open /path/to/sailsim_native.app
+```
 
 # Credits
 

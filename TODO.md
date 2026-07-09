@@ -1,28 +1,24 @@
 # todo
 
-* Two related upgrades I want to make. 1. It seems that the auto-aim functionality on native doesn't hit as often as it does with the angular client. Are there any differences that might account for this? I seem to get many more misses 2. How accurate and fine-grained is the hit detection from the server? It does differ for each ship right? I ask because when I actually did manage to hit the enemy ship, it often seems like the hit displayed in empty space above the ship. Like, in the general area of the rigging and masts, but often was not actually hitting a mast. It was often hitting empty space and then showing an explosive hit.
-* thoughts on way to make the graphics and lighting "pop"?
+* hide console output on release, so no terminal screens for users
+* uninstall option
+* extreme scatter improvement for LOD distance.... distant islands forest biomes should look covered, not scattered
+* wet deck ssr and splashes in angular
 * Can we change how towns and their roads are laid out? Instead of starting by placing the buildings, and then connecting them with roads. Can we start by laying out a road network (with parameters to allow places for the buildings), and then only after placing the buildings on those roads? And look up online how to generate these road networks so each town is realistic, and has the number of roads it needs.
 * VR?
-* asset storage/streaming
-* all new player tutorial stuff from client INCLUDING not spawning as a new player near a pirate
-* camera clipping w terain
-* auto updater?
-* polars for sailing serverside, sailing penalties for mast damage should be serverside. Want server to enforce fair play
-* crew on pinnace sit with feet through floor
+* in native, if I shoot the cannons, in the smoke afterwards I can see a weird ghost image/shadow of the ship in the smoke if I rotate the camera at certain angles
+
 
 # General or Current TODO Items
 
-
-* frigate, galleon, barque, junkå
-* forts and taking towns
-* more tree varieties, flora.... regional/island differences
+* frigate, galleon, barque, junks
 * swordfighting, surrender & capture
 * fleets with prize crews to take them over
+* forts and taking towns
+* more tree varieties, flora.... regional/island differences
 * dancing
 * career of lands gained, etc. adapted to this game
 * server only accepts local requests, restricted to client
-* capture ships
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind
 * make salvage crate asset
 * pirate fame: as a mechanism to allow you access to best ships... and larger fleet to have more ships following and aiding you

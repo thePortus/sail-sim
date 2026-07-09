@@ -194,20 +194,20 @@
       "kind": "seat",
       "pos": [
         0.32,
-        -0.12,
+        -0.05,
         -1.5
       ],
       "heading_deg": 180,
       "clip": "Sit",
       "wp": "wp_zoneB",
-      "note": "sit on z-1.5 thwart facing stern; bench top 0.436 vs clip seat 0.46"
+      "note": "sit on z-1.5 thwart facing stern. Y raised -0.12 -> -0.05 so the Sit-clip feet clear the hull bottom (min y-0.107 here) instead of poking through into the water; the low thwart (0.436) cannot seat the clip (seat 0.46) AND keep feet on the sole, so feet clearance wins with a small butt lift."
     },
     {
       "id": "seat_S_aft",
       "kind": "seat",
       "pos": [
         -0.32,
-        -0.12,
+        -0.05,
         -1.5
       ],
       "heading_deg": 180,

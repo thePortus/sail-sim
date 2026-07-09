@@ -8949,9 +8949,9 @@ int main(int argc, char** argv) {
         };
         auto countFor = [](const std::string& s) { return s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
         // Candidates: own deck (dist 0) + each nearby remote ship with a layout.
-        struct Cand { crew::Deck* deck; glm::mat4 outer; float dist; bool frozen; };
+        struct Cand { crew::Deck* deck; glm::mat4 outer; float dist; bool frozen; float shipScale; };
         std::vector<Cand> cands;
-        if (crewDeck) cands.push_back({ crewDeck.get(), ownShipModel(*ownMesh) * glm::inverse(crewInner), 0.0f, false });
+        if (crewDeck) cands.push_back({ crewDeck.get(), ownShipModel(*ownMesh) * glm::inverse(crewInner), 0.0f, false, ownMesh->shipScale });
         const auto crewCounts = mpClient.crews();   // playerId -> {crew, maxCrew}
         std::set<std::string> seenCrew;
         for (const ShipInst& si : ships) {
@@ -8973,7 +8973,7 @@ int main(int argc, char** argv) {
           if (d) {
             auto cr = crewCounts.find(si.rp.id);   // server crew count for this ship
             if (cr != crewCounts.end() && cr->second.second > 0) d->setAliveCount(cr->second.first);
-            cands.push_back({ d.get(), si.model * glm::inverse(rin), dist, dist > CREW_FREEZE });
+            cands.push_back({ d.get(), si.model * glm::inverse(rin), dist, dist > CREW_FREEZE, si.mesh->shipScale });
           }
         }
         for (auto it = remoteCrewDecks.begin(); it != remoteCrewDecks.end();) {   // prune out-of-range / gone
@@ -9018,7 +9018,13 @@ int main(int argc, char** argv) {
             cmModel = glm::rotate(cmModel, m.leanRoll, glm::vec3(0, 0, 1));
             cmModel = glm::rotate(cmModel, m.leanPitch, glm::vec3(1, 0, 0));
             cmModel = glm::rotate(cmModel, m.yaw, glm::vec3(0, 1, 0));
-            cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature));
+            // Scale the crew body by the ship's shipScale so real-size crew fit the
+            // scaled-down hull (the browser parents crew under the ship root, so they
+            // inherit its scale; native placed them at scaled deck positions but drew
+            // the mesh at 1:1, leaving crew ~30% oversized — seated legs then punched
+            // through the hull bottom). Scale is about the feet origin (m.pos), so the
+            // deck-snapped soles stay planted.
+            cmModel = glm::scale(cmModel, glm::vec3(m.kit.stature * c.shipScale));
             MeshUniforms mu{ viewProj * cmModel, cmModel, glm::vec4(eye, 1.0f),
                              glm::vec4(lightDir, dayK), glm::vec4(-1.0e9f, 1.0f, 1.0f, 1.0f) };
             wgpuQueueWriteBuffer(queue, crewMesh->uniformBuf, (uint64_t)slot * crewMesh->uniformStride, &mu, sizeof(mu));

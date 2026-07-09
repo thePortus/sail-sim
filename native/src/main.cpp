@@ -7790,7 +7790,7 @@ int main(int argc, char** argv) {
     Mesh* ownMesh = nullptr;
     // Crew render list this frame: which decks got shared palette slots (own +
     // budgeted nearby remotes), filled by the crew drive block, drawn in the pass.
-    struct CrewRender { crew::Deck* deck; uint32_t slotBase; bool far; };
+    struct CrewRender { crew::Deck* deck; uint32_t slotBase; bool farLod; };   // 'far' is a <windows.h> macro — don't name a member that
     std::vector<CrewRender> crewRenders;
     // Wake sources this frame: local boat first (id "local", always packed
     // first), remotes appended below with their SMOOTHED display poses — the
@@ -9220,7 +9220,7 @@ int main(int argc, char** argv) {
             for (size_t s = 0; s < crewMesh->submeshes.size(); ++s) {
               const RigSubmesh& sm = crewMesh->submeshes[s];
               if (!crew::kitShowsSubmesh(kit, sm.name)) continue;
-              if (crd.far && (sm.name.find("Eye") != std::string::npos || sm.name.find("Neckerchief") != std::string::npos)) continue;
+              if (crd.farLod && (sm.name.find("Eye") != std::string::npos || sm.name.find("Neckerchief") != std::string::npos)) continue;
               wgpuRenderPassEncoderSetBindGroup(pass, 0, crewMesh->bindGroups[s], 2, off);
               wgpuRenderPassEncoderDrawIndexed(pass, sm.indexCount, 1, sm.indexOffset, 0, 0);
             }

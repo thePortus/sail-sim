@@ -1,6 +1,7 @@
 #include "scatter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>

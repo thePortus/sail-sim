@@ -278,7 +278,25 @@ function(embed_wgsl SRC VARNAME OUT)
   # without this dependency, shader edits silently never reach the binary.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SRC}")
   file(READ "${SRC}" _wgsl_src)
-  file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} = R\"WGSL(\n${_wgsl_src})WGSL\";\n")
+  # MSVC caps a single string literal at 16380 bytes (error C2026). Split the
+  # shader into <16 KB raw-string chunks and let adjacent-literal concatenation
+  # rejoin them — no shader contains the )WGSL delimiter, so byte-splitting is
+  # safe (and UTF-8 comment bytes survive raw-string concatenation intact).
+  string(LENGTH "${_wgsl_src}" _wgsl_len)
+  set(_wgsl_body "")
+  set(_wgsl_pos 0)
+  while(_wgsl_pos LESS _wgsl_len)
+    math(EXPR _wgsl_remain "${_wgsl_len} - ${_wgsl_pos}")
+    if(_wgsl_remain LESS 8000)
+      set(_wgsl_take ${_wgsl_remain})
+    else()
+      set(_wgsl_take 8000)
+    endif()
+    string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_piece)
+    string(APPEND _wgsl_body "R\"WGSL(${_wgsl_piece})WGSL\"\n")
+    math(EXPR _wgsl_pos "${_wgsl_pos} + ${_wgsl_take}")
+  endwhile()
+  file(WRITE "${OUT}" "#pragma once\ninline const char* ${VARNAME} =\n${_wgsl_body};\n")
 endfunction()
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/initial_spectrum.wgsl" INITIAL_SPECTRUM_WGSL "${WGSL_GEN_DIR}/initial_spectrum_wgsl.h")
 embed_wgsl("${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.wgsl"             MESH_WGSL             "${WGSL_GEN_DIR}/mesh_wgsl.h")
@@ -431,6 +449,13 @@ endif()
 # Compiler warnings — keep the spike honest.
 if (MSVC)
   target_compile_options(sailsim_native PRIVATE /W4)
+  # Windows/MSVC hygiene: NOMINMAX drops the min()/max() macros that mangle
+  # std::min/std::max and std::numeric_limits<>::max(); WIN32_LEAN_AND_MEAN trims
+  # <windows.h>; _USE_MATH_DEFINES exposes M_PI (audio.cpp); _CRT_SECURE_NO_WARNINGS
+  # silences the getenv/sscanf C4996 spam. (The far/near/small macros from the RPC
+  # headers are dodged by not naming identifiers after them — see the sources.)
+  target_compile_definitions(sailsim_native PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()

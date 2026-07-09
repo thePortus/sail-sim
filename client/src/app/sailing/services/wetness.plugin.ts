@@ -61,6 +61,7 @@ export class WetnessPlugin extends MaterialPluginBase {
       { name: 'wetReach',   size: 1, type: 'float' },
       { name: 'wetRain',    size: 1, type: 'float' },
       { name: 'wetEnabled', size: 1, type: 'float' },
+      { name: 'wetTime',    size: 1, type: 'float' },
       { name: 'wetSunDir',  size: 3, type: 'vec3'  },
       { name: 'wetWave',    size: 4, type: 'vec4'  },
       { name: 'wetAmp',     size: 1, type: 'float' },
@@ -73,6 +74,7 @@ export class WetnessPlugin extends MaterialPluginBase {
     uniformBuffer.updateFloat('wetReach', s.reach);
     uniformBuffer.updateFloat('wetRain', s.rain);
     uniformBuffer.updateFloat('wetEnabled', s.enabled);
+    uniformBuffer.updateFloat('wetTime', s.time);
     uniformBuffer.updateFloat3('wetSunDir', s.sunX, s.sunY, s.sunZ);
     uniformBuffer.updateFloat4('wetWave', s.shipX, s.shipZ, s.gradX, s.gradZ);
     uniformBuffer.updateFloat('wetAmp', s.amp);
@@ -92,7 +94,9 @@ export class WetnessPlugin extends MaterialPluginBase {
     };
   }
 
-  // ── Value noise (2D) for patchy puddle placement — cheap 4-corner bilinear hash. ──
+  // ── Helpers: value noise for puddle placement, the raindrop ripple field (VERBATIM port of the
+  //    ocean's rainField so puddle droplets match the raindrops on the water), and an analytic sky
+  //    reflection for the puddle surface (Phase 4). ──
   private static readonly GLSL_DEFS = `
     float wetHash21(vec2 p) {
       vec2 q = p - floor(p / 512.0) * 512.0;
@@ -106,6 +110,45 @@ export class WetnessPlugin extends MaterialPluginBase {
       float c = wetHash21(i + vec2(0.0, 1.0));
       float d = wetHash21(i + vec2(1.0, 1.0));
       return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+    float deckRainField(vec2 p, float t) {
+      vec2 cell = floor(p); vec2 f = fract(p);
+      float h1 = wetHash21(cell); float h2 = wetHash21(cell + 5.7);
+      float h3 = wetHash21(cell + 11.3); float h4 = wetHash21(cell + 19.1);
+      vec2 center = vec2(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+      float rate = mix(1.0, 3.2, h3);
+      float life = fract(t * rate + h1 * 7.0);
+      float r = length(f - center);
+      float sz = mix(0.16, 0.42, h4);
+      float impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+      float ringR = life * sz * 1.6;
+      float ring = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+      ring *= smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+      return impact + ring * 0.6;
+    }
+    vec3 puddleRipple(vec2 pm, float t, float rain) {
+      vec2 r = vec2(sin(pm.x * 3.1 + t * 2.0), cos(pm.y * 2.7 - t * 1.7)) * 0.5;
+      r += vec2(cos(pm.y * 5.3 - t * 2.4), sin(pm.x * 4.6 + t * 3.1)) * 0.28;
+      float crest = 0.0;
+      if (rain > 0.02) {
+        vec2 rp = pm * 1.7; float e = 0.18;
+        float n0 = deckRainField(rp, t);
+        vec2 grad = vec2(deckRainField(rp + vec2(e, 0.0), t) - n0,
+                         deckRainField(rp + vec2(0.0, e), t) - n0) / e;
+        r += grad * 0.55 * rain;
+        crest = clamp(n0 * 0.8, 0.0, 1.0) * rain;
+      }
+      return vec3(r, crest);
+    }
+    vec3 wetSkyColor(vec3 dir) {
+      float up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+      float day = clamp(wetSunDir.y * 3.0 + 0.15, 0.0, 1.0);
+      vec3 zenith  = mix(vec3(0.02, 0.03, 0.06), vec3(0.20, 0.40, 0.72), day);
+      vec3 horizon = mix(vec3(0.04, 0.05, 0.08), vec3(0.62, 0.70, 0.82), day);
+      vec3 sky = mix(horizon, zenith, up);
+      float sun = pow(max(dot(dir, wetSunDir), 0.0), 200.0);
+      sky += vec3(1.0, 0.9, 0.7) * sun * day * 2.0;
+      return sky;
     }
   `;
 
@@ -122,6 +165,45 @@ export class WetnessPlugin extends MaterialPluginBase {
       let c = wetHash21(i + vec2f(0.0, 1.0));
       let d = wetHash21(i + vec2f(1.0, 1.0));
       return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+    fn deckRainField(p : vec2f, t : f32) -> f32 {
+      let cell = floor(p); let f = fract(p);
+      let h1 = wetHash21(cell); let h2 = wetHash21(cell + 5.7);
+      let h3 = wetHash21(cell + 11.3); let h4 = wetHash21(cell + 19.1);
+      let center = vec2f(0.2 + h1 * 0.6, 0.2 + h2 * 0.6);
+      let rate = mix(1.0, 3.2, h3);
+      let life = fract(t * rate + h1 * 7.0);
+      let r = length(f - center);
+      let sz = mix(0.16, 0.42, h4);
+      let impact = (1.0 - smoothstep(0.0, sz * 0.55, r)) * (1.0 - smoothstep(0.0, 0.22, life));
+      let ringR = life * sz * 1.6;
+      var ring = 1.0 - smoothstep(0.0, sz * 0.34, abs(r - ringR));
+      ring = ring * smoothstep(0.0, 0.12, life) * (1.0 - smoothstep(0.5, 1.0, life));
+      return impact + ring * 0.6;
+    }
+    fn puddleRipple(pm : vec2f, t : f32, rain : f32) -> vec3f {
+      var r = vec2f(sin(pm.x * 3.1 + t * 2.0), cos(pm.y * 2.7 - t * 1.7)) * 0.5;
+      r = r + vec2f(cos(pm.y * 5.3 - t * 2.4), sin(pm.x * 4.6 + t * 3.1)) * 0.28;
+      var crest = 0.0;
+      if (rain > 0.02) {
+        let rp = pm * 1.7; let e = 0.18;
+        let n0 = deckRainField(rp, t);
+        let grad = vec2f(deckRainField(rp + vec2f(e, 0.0), t) - n0,
+                         deckRainField(rp + vec2f(0.0, e), t) - n0) / e;
+        r = r + grad * 0.55 * rain;
+        crest = clamp(n0 * 0.8, 0.0, 1.0) * rain;
+      }
+      return vec3f(r, crest);
+    }
+    fn wetSkyColor(dir : vec3f) -> vec3f {
+      let up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+      let day = clamp(uniforms.wetSunDir.y * 3.0 + 0.15, 0.0, 1.0);
+      let zenith  = mix(vec3f(0.02, 0.03, 0.06), vec3f(0.20, 0.40, 0.72), day);
+      let horizon = mix(vec3f(0.04, 0.05, 0.08), vec3f(0.62, 0.70, 0.82), day);
+      var sky = mix(horizon, zenith, up);
+      let sun = pow(max(dot(dir, uniforms.wetSunDir), 0.0), 200.0);
+      sky = sky + vec3f(1.0, 0.9, 0.7) * sun * day * 2.0;
+      return sky;
     }
   `;
 
@@ -153,6 +235,22 @@ export class WetnessPlugin extends MaterialPluginBase {
       float wShin = mix(60.0, 400.0, wPuddle);
       float wSpec = pow(max(dot(normalize(normalW), wH), 0.0), wShin) * wWet * wDay;
       finalColor.rgb += vec3(wSpec * 0.7);
+      // ── Standing water as an actual surface: raindrop ripples ripple the puddle normal, an analytic
+      //    sky reflection comes in by water's real Fresnel (weak looking down, mirror toward grazing),
+      //    and rain-ring crests catch the light. Gated to the deeper puddles only. ──
+      float wDeep = smoothstep(0.2, 0.7, wPuddle);
+      if (wDeep > 0.001) {
+        vec3 wRip = puddleRipple(vPositionW.xz, wetTime, wetRain);
+        vec3 wN2 = normalize(normalize(normalW) + vec3(wRip.x, 0.0, wRip.y) * 0.1);
+        vec3 wVv = normalize(viewDirectionW);
+        vec3 wRefDir = reflect(-wVv, wN2);
+        vec3 wSky = wetSkyColor(wRefDir);
+        float wCosNV = clamp(dot(wN2, wVv), 0.0, 1.0);
+        float wFres = 0.03 + 0.97 * pow(1.0 - wCosNV, 5.0);
+        vec3 wWater = mix(finalColor.rgb, wSky, clamp(wFres * 1.7, 0.0, 0.9));
+        finalColor.rgb = mix(finalColor.rgb, wWater, wDeep);
+        finalColor.rgb += vec3(wRip.z * wDeep * 0.5);
+      }
     }
   `;
 
@@ -180,6 +278,22 @@ export class WetnessPlugin extends MaterialPluginBase {
       let wShin = mix(60.0, 400.0, wPuddle);
       let wSpec = pow(max(dot(normalize(normalW), wH), 0.0), wShin) * wWet * wDay;
       finalColor = vec4f(finalColor.rgb + vec3f(wSpec * 0.7), finalColor.a);
+      // ── Standing water as an actual surface: raindrop ripples ripple the puddle normal, an analytic
+      //    sky reflection comes in by water's real Fresnel (weak looking down, mirror toward grazing),
+      //    and rain-ring crests catch the light. Gated to the deeper puddles only. ──
+      let wDeep = smoothstep(0.2, 0.7, wPuddle);
+      if (wDeep > 0.001) {
+        let wRip = puddleRipple(fragmentInputs.vPositionW.xz, uniforms.wetTime, uniforms.wetRain);
+        let wN2 = normalize(normalize(normalW) + vec3f(wRip.x, 0.0, wRip.y) * 0.1);
+        let wVv = normalize(viewDirectionW);
+        let wRefDir = reflect(-wVv, wN2);
+        let wSky = wetSkyColor(wRefDir);
+        let wCosNV = clamp(dot(wN2, wVv), 0.0, 1.0);
+        let wFres = 0.03 + 0.97 * pow(1.0 - wCosNV, 5.0);
+        let wWater = mix(finalColor.rgb, wSky, clamp(wFres * 1.7, 0.0, 0.9));
+        finalColor = vec4f(mix(finalColor.rgb, wWater, wDeep), finalColor.a);
+        finalColor = vec4f(finalColor.rgb + vec3f(wRip.z * wDeep * 0.5), finalColor.a);
+      }
     }
   `;
 }

@@ -2065,6 +2065,11 @@ export class VesselService {
     WetnessPlugin.shared.rain = this.oceanService.getRainIntensity();
     WetnessPlugin.shared.time = wetT;
     WetnessPlugin.shared.enabled = this.sceneService.isWetnessEnabled() ? 1 : 0;
+    // Sun direction (toward-sun, world) drives the wet-sheen sun highlight; it fades below the horizon.
+    const sd = this.sceneService.getSunDirection();
+    WetnessPlugin.shared.sunX = sd.x;
+    WetnessPlugin.shared.sunY = sd.y;
+    WetnessPlugin.shared.sunZ = sd.z;
   }
 
   // ── PBR material & texture helpers ────────────────────────────────────────

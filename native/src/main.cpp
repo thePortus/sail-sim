@@ -3560,6 +3560,7 @@ int main(int argc, char** argv) {
   float dockStartX = 0, dockStartZ = 0, dockStartHdg = 0;   // dockStartHdg in DEGREES (berth math is degrees)
   float dockBerthX = 0, dockBerthZ = 0, dockBerthHdg = 0;   // dockBerthHdg in DEGREES
   bool menuTavern = false, menuTrader = false, menuShipwright = false, menuGovernor = false;
+  bool showInventory = false;   // cargo-hold panel (I / toolbar box icon) — readable anywhere from the wallet state
   std::future<std::vector<props::VesselRow>> swFuture;   // shipwright catalogue (REST /vessels)
   std::vector<props::VesselRow> swShips; bool swRequested = false;
   float swFlagPick[3] = { 0.698f, 0.133f, 0.133f };     // shipwright flag-colour picker (RGB)
@@ -4705,7 +4706,51 @@ int main(int argc, char** argv) {
         if (iconBtn(ICON_FA_MAP, mapExpanded ? "Close chart" : "Open chart", mapExpanded))
           mapExpanded = !mapExpanded;
         ImGui::SameLine();
+        if (iconBtn(ICON_FA_BOXES_STACKED, "Cargo hold (I)", showInventory)) showInventory = !showInventory;
+        ImGui::SameLine();
         if (iconBtn(ICON_FA_GEAR, "Settings", settingsOpen)) { settingsOpen = !settingsOpen; escMenu = false; }
+        ImGui::End();
+      }
+
+      // ── Cargo hold (I / toolbar): the player's goods + gold, readable anywhere.
+      //    Reads the wallet snapshot (server-authoritative), same source the town
+      //    trader panel uses — so what you sell in town matches what shows here. ──
+      if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_I, false)) showInventory = !showInventory;
+      if (showInventory) {
+        mp::TownState inv = mpClient.town();
+        int used = 0, kinds = 0;
+        for (const auto& kv : inv.cargo) if (kv.second > 0) { used += kv.second; ++kinds; }
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(340.0f, 0.0f), ImGuiCond_Always);
+        if (ImGui::Begin(ICON_FA_BOXES_STACKED "  Cargo Hold", &showInventory,
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+          ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.41f, 1.0f), ICON_FA_COINS "  %d gold", inv.gold);
+          ImGui::SameLine(0, 18);
+          ImGui::Text("Hold %d / %d", used, inv.capacity);
+          ImGui::Separator();
+          if (kinds == 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("Your hold is empty. Buy goods from a town trader to fill it.");
+            ImGui::PopStyleColor();
+          } else if (ImGui::BeginTable("invgoods", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Good", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+            ImGui::TableSetupColumn("Qty");
+            ImGui::TableHeadersRow();
+            for (const auto& [id, qty] : inv.cargo) {
+              if (qty <= 0) continue;
+              ImGui::TableNextRow();
+              ImGui::TableNextColumn();
+              auto cit = inv.catalog.find(id);
+              ImGui::Text("%s", cit != inv.catalog.end() ? cit->second.c_str() : id.c_str());
+              ImGui::TableNextColumn();
+              ImGui::Text("%d", qty);
+            }
+            ImGui::EndTable();
+          }
+          ImGui::Spacing();
+          if (ImGui::Button("Close", ImVec2(-1, 0))) showInventory = false;
+        }
         ImGui::End();
       }
 

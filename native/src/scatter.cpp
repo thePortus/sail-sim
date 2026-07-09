@@ -942,11 +942,14 @@ buildFarLayers(const terrain::Terrain* terr) {
 
   // ── PASS A: FAR FOREST (beech) — dense hillside fill up to the treeline. ──
   // Cap the whole-map walk at ~8M cells (stride up on huge maps), matching the
-  // client. elevation() bilerps, so a sub-cell grid is fine. The client's band
-  // runs to 0.74*peak because it has a shader canopy up high; native's near ring
-  // stops at 80 m, so cap there too — else the high fill has no near mesh to hand
-  // off to and would fade to a bare hilltop within 280 m (a new pop-out).
-  float yLo = std::max(0.6f, 0.04f * peak), yHi = std::min(0.74f * peak, 80.0f);
+  // client. elevation() bilerps, so a sub-cell grid is fine. FOREST_FULL_Y = full
+  // canopy up to here; TREELINE_Y = trees keep climbing but THIN OUT (patchy spots
+  // on the upper hillsides / rocky uplands, not a hard forest edge).
+  // NB: the near ring still stops at 80 m, so trees above FOREST_FULL_Y have no near
+  // mesh and will pop out ~280 m off on approach until the near recipes are raised too.
+  const float FOREST_FULL_Y = 80.0f;
+  const float TREELINE_Y = 170.0f;
+  float yLo = std::max(0.6f, 0.04f * peak), yHi = std::min(0.74f * peak, TREELINE_Y);
   int nxF = std::max(2, (int)std::lround(spanX / cellM) + 1);
   int nzF = std::max(2, (int)std::lround(spanZ / cellM) + 1);
   int strideF = std::max(1, (int)std::ceil(std::sqrt((double)nxF * nzF / 8.0e6)));
@@ -965,12 +968,15 @@ buildFarLayers(const terrain::Terrain* terr) {
       float y = ground(px, pz);
       if (y < yLo || y > yHi) continue;
       float sl = slopeAt(px, pz, 3.0f);
-      if (sl > 0.6f) continue;
+      if (sl > 1.0f) continue;   // allow up to ~45° so the hill FLANKS forest, not just flat crests
       float stand = fbm2(px / 45.0f, pz / 45.0f), clearing = fbm2(px / 13.0f + 9.0f, pz / 13.0f - 4.0f);
       // Dense canopy: high BASE acceptance in forested stands (continuous forest,
-      // not dots), the clearing fbm only THINNING toward natural gaps. A softer
-      // slope penalty keeps the hills full. Denser than near beech = a superset.
-      float dens = (0.45f + 0.55f * sstep(0.28f, 0.62f, stand)) * sstep(0.18f, 0.52f, clearing) * (1.0f - sl * 0.35f);
+      // not dots), the clearing fbm only THINNING toward natural gaps. A gentle
+      // slope penalty keeps the hillsides full; elevThin fades the canopy toward
+      // the treeline so upper slopes / rocky uplands read as PATCHY tree spots.
+      float elevThin = 1.0f - sstep(FOREST_FULL_Y, yHi, y) * 0.78f;
+      float dens = (0.45f + 0.55f * sstep(0.28f, 0.62f, stand)) * sstep(0.18f, 0.52f, clearing)
+                 * (1.0f - sl * 0.18f) * elevThin;
       if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) continue;
       if (nearShoreline(px, pz, 6.0f)) continue;
       int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));

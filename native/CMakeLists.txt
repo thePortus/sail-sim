@@ -16,7 +16,7 @@ project(sailsim_native LANGUAGES C CXX)
 
 # Single source of truth for the client version — feeds the compiled-in SAILSIM_VERSION string (shown by
 # --version, and the value Sparkle/WinSparkle will compare against the appcast) and the macOS bundle version.
-set(SAILSIM_VERSION "0.1.1")
+set(SAILSIM_VERSION "0.1.2")
 
 # Auto-update config: the per-platform appcast feed URLs (override for your deployment — Sparkle/WinSparkle
 # require https in production) and the shared Ed25519 public key (printed by `client-release.js keygen`; the one
@@ -137,7 +137,9 @@ else()
   # src/main.cpp) with the modern surface API.
   set(WGPU_VER "v0.19.4.1")
   if (WIN32)
-    set(WGPU_ZIP "wgpu-windows-x86_64-msvc-release.zip")
+    # NB: the v0.19.4.1 Windows asset has no toolchain suffix — it's
+    # "wgpu-windows-x86_64-release.zip" (an earlier "-msvc" name 404s).
+    set(WGPU_ZIP "wgpu-windows-x86_64-release.zip")
   elseif (APPLE)
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
       set(WGPU_ZIP "wgpu-macos-aarch64-release.zip")

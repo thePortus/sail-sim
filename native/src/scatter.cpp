@@ -920,7 +920,12 @@ buildFarLayers(const terrain::Terrain* terr) {
     }
     return false;
   };
-  const int BUDGET_PER = 200000;   // per variant bin (600k total, the client's cap)
+  // ── Far-forest density knobs — pushed WELL above the Angular client so distant
+  //    islands read as full, lush canopy instead of scattered dots. Tune for the
+  //    look/perf tradeoff: trees scale with SUB² (build cost too) and are capped by
+  //    BUDGET_PER (≈64 B/instance in RAM + an equal GPU buffer, per of 6 bins). ──
+  const int FAR_FOREST_SUB = 3;    // PASS A sub-samples per heightfield-cell edge (density ∝ SUB²); 1 = client
+  const int BUDGET_PER = 600000;   // per-variant reservoir cap (was 200k)
   std::minstd_rand rng{ 777 };
   // Reservoir add: keep a uniform BUDGET_PER sample of an unbounded stream so the
   // cap doesn't bias toward whichever rows we walk first.
@@ -945,11 +950,18 @@ buildFarLayers(const terrain::Terrain* terr) {
   int nxF = std::max(2, (int)std::lround(spanX / cellM) + 1);
   int nzF = std::max(2, (int)std::lround(spanZ / cellM) + 1);
   int strideF = std::max(1, (int)std::ceil(std::sqrt((double)nxF * nzF / 8.0e6)));
+  // SUB-sample each cell FAR_FOREST_SUB× per axis so the far canopy packs tighter
+  // than the ~24 m heightfield grid (the old 1-per-cell walk read as scattered).
   for (int iz = 0; iz < nzF; iz += strideF)
-    for (int ix = 0; ix < nxF; ix += strideF) {
-      float jx = hash2(ix * 12.9f + iz, iz * 78.2f + ix), jz = hash2(ix * 39.3f + 7.1f, iz * 11.7f - 3.3f);
-      float px = (float)m.minX + ((float)ix + jx) / (float)(nxF - 1) * spanX;
-      float pz = (float)m.minZ + ((float)iz + jz) / (float)(nzF - 1) * spanZ;
+    for (int ix = 0; ix < nxF; ix += strideF)
+      for (int sz = 0; sz < FAR_FOREST_SUB; ++sz)
+        for (int sx = 0; sx < FAR_FOREST_SUB; ++sx) {
+      float jx = hash2(ix * 12.9f + iz + sx * 2.3f, iz * 78.2f + ix + sz * 5.1f);
+      float jz = hash2(ix * 39.3f + 7.1f + sz * 1.9f, iz * 11.7f - 3.3f + sx * 4.7f);
+      float fx = (float)ix + ((float)sx + jx) / (float)FAR_FOREST_SUB * (float)strideF;
+      float fz = (float)iz + ((float)sz + jz) / (float)FAR_FOREST_SUB * (float)strideF;
+      float px = (float)m.minX + fx / (float)(nxF - 1) * spanX;
+      float pz = (float)m.minZ + fz / (float)(nzF - 1) * spanZ;
       float y = ground(px, pz);
       if (y < yLo || y > yHi) continue;
       float sl = slopeAt(px, pz, 3.0f);
@@ -965,7 +977,7 @@ buildFarLayers(const terrain::Terrain* terr) {
       float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
       reservoir(out.first[(size_t)v], seenB[(size_t)v],
                 compose(0, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
-    }
+        }
 
   // ── PASS B: FAR COAST (palm + low beech) — fine sub-grid, EXACT near recipes. ──
   // Prune deep-ocean / clear-upland whole cells cheaply, then sub-sample each

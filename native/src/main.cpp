@@ -9324,17 +9324,20 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Dawn's DXGI (D3D12) swapchain advances on the INSTANCE event loop, not just the device
+    // tick — pump it before acquiring or GetCurrentTexture keeps handing back "success + null".
+#if defined(WEBGPU_BACKEND_DAWN)
+    wgpuInstanceProcessEvents(instance);
+#endif
     WGPUSurfaceTexture surfaceTex;
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
     if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
                                  frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
     if (!surfaceTex.texture) {
-      // The acquire right after wgpuSurfaceConfigure yields a valid texture, but here — at the
-      // END of the frame, after all the offscreen render work — Dawn's DXGI (D3D11/D3D12)
-      // swapchain hands back null. A full pass of queue submits between configure and this
-      // acquire leaves the flip-model swapchain stale; reconfiguring rebuilds it. Retry once.
+      // Fallback: reconfigure + pump both the instance events and the device, then retry once.
       wgpuSurfaceConfigure(surface, &surfaceConfig);
 #if defined(WEBGPU_BACKEND_DAWN)
+      wgpuInstanceProcessEvents(instance);
       wgpuDeviceTick(device);
 #elif defined(WEBGPU_BACKEND_WGPU)
       wgpuDevicePoll(device, false, nullptr);

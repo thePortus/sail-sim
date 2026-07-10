@@ -268,9 +268,21 @@ bool beginFrame(Bridge* b) {
     b->eyes[e].xrView = views[e];
     WGPUSharedTextureMemoryBeginAccessDescriptor ba{};
     ba.concurrentRead = false; ba.initialized = false; ba.fenceCount = 0;
-    if (!wgpuSharedTextureMemoryBeginAccess(b->eyes[e].mem, b->eyes[e].tex, &ba)) {
-      std::fprintf(stderr, "[vr] BeginAccess failed (eye %zu), deviceLost=%d\n",
-                   e, (int)wgpuSharedTextureMemoryIsDeviceLost(b->eyes[e].mem));
+    // Capture WHY BeginAccess fails (it works in the spike but not the game): wrap it in a
+    // validation error scope. A message = a validation reason; empty = a soft false.
+    wgpuDevicePushErrorScope(b->wdevice, WGPUErrorFilter_Validation);
+    bool ok = wgpuSharedTextureMemoryBeginAccess(b->eyes[e].mem, b->eyes[e].tex, &ba);
+    struct ES { std::string msg; bool done; } es{"", false};
+    wgpuDevicePopErrorScope(b->wdevice,
+      [](WGPUErrorType t, char const* m, void* ud) {
+        auto* s = static_cast<ES*>(ud);
+        if (t != WGPUErrorType_NoError && m) s->msg = m;
+        s->done = true;
+      }, &es);
+    for (int k = 0; k < 100000 && !es.done; ++k) { wgpuInstanceProcessEvents(b->winst); wgpuDeviceTick(b->wdevice); }
+    if (!ok) {
+      std::fprintf(stderr, "[vr] BeginAccess failed (eye %zu): deviceLost=%d scopeErr=\"%s\"\n",
+                   e, (int)wgpuSharedTextureMemoryIsDeviceLost(b->eyes[e].mem), es.msg.c_str());
       b->shouldRender = false; return false;
     }
   }

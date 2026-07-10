@@ -91,10 +91,13 @@ struct EyeSwapchain {
   UINT rtvStride = 0;
   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
 #if defined(WEBGPU_BACKEND_DAWN)
-  // Dawn path (increment 3): each XR image imported as a Dawn shared texture, rendered via wgpu.
-  std::vector<WGPUSharedTextureMemory> mem;   // one per swapchain image
-  std::vector<WGPUTexture> tex;
-  std::vector<WGPUTextureView> view;
+  // Dawn path (increment 3): the XR images can't be imported (no keyed mutex / no simultaneous
+  // access), so Dawn renders into OUR OWN shared render target (created with the right flags) and
+  // we CopyResource it into the acquired XR image. One owned RT + its Dawn import, per eye.
+  ComPtr<ID3D12Resource> ownRT;
+  WGPUSharedTextureMemory mem = nullptr;
+  WGPUTexture tex = nullptr;
+  WGPUTextureView view = nullptr;
 #endif
 };
 
@@ -347,33 +350,42 @@ XrResult run() {
     }
 
 #if defined(WEBGPU_BACKEND_DAWN)
-    // Import each XR image (shareable — probe confirmed) into Dawn as a shared texture so we can
-    // render into it directly with wgpu. CreateSharedHandle → wgpuDeviceImportSharedTextureMemory.
-    eye.mem.resize(imgCount, nullptr);
-    eye.tex.resize(imgCount, nullptr);
-    eye.view.resize(imgCount, nullptr);
-    for (uint32_t i = 0; i < imgCount; ++i) {
+    // The XR images can't be imported into Dawn (no keyed mutex / no ALLOW_SIMULTANEOUS_ACCESS), so
+    // create OUR OWN render target WITH those flags, import THAT into Dawn, render into it, and
+    // CopyResource it into the XR image each frame. One owned RT per eye.
+    {
+      D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC rd = {};
+      rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      rd.Width = eye.width; rd.Height = eye.height;
+      rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+      rd.Format = colorFormat; rd.SampleDesc.Count = 1;
+      rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+      HRESULT hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd,
+                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&eye.ownRT));
+      if (FAILED(hr)) { std::fprintf(stderr, "[vr-spike] eye %u own RT create failed 0x%08lx\n", e, (unsigned long)hr);
+                        return XR_ERROR_RUNTIME_FAILURE; }
       HANDLE sh = nullptr;
-      HRESULT hr = device->CreateSharedHandle(eye.images[i].texture, nullptr, GENERIC_ALL, nullptr, &sh);
-      if (FAILED(hr) || !sh) { std::fprintf(stderr, "[vr-spike] eye %u img %u CreateSharedHandle failed 0x%08lx\n",
-                                            e, i, (unsigned long)hr); return XR_ERROR_RUNTIME_FAILURE; }
+      hr = device->CreateSharedHandle(eye.ownRT.Get(), nullptr, GENERIC_ALL, nullptr, &sh);
+      if (FAILED(hr) || !sh) { std::fprintf(stderr, "[vr-spike] eye %u own RT shared handle 0x%08lx\n", e, (unsigned long)hr);
+                               return XR_ERROR_RUNTIME_FAILURE; }
       WGPUSharedTextureMemoryDXGISharedHandleDescriptor dxgi = {};
       dxgi.chain.sType = WGPUSType_SharedTextureMemoryDXGISharedHandleDescriptor;
       dxgi.handle = sh;
-      dxgi.useKeyedMutex = false;  // VD's XR images are plain shared NT-handle resources (no keyed mutex)
+      dxgi.useKeyedMutex = false;
       WGPUSharedTextureMemoryDescriptor smd = {};
       smd.nextInChain = &dxgi.chain;
-      smd.label = "xr-eye-image";
-      eye.mem[i] = wgpuDeviceImportSharedTextureMemory(wdevice, &smd);
-      CloseHandle(sh);   // Dawn duplicates the handle on import
-      if (!eye.mem[i]) { std::fprintf(stderr, "[vr-spike] eye %u img %u ImportSharedTextureMemory returned null\n", e, i);
-                         return XR_ERROR_RUNTIME_FAILURE; }
-      eye.tex[i]  = wgpuSharedTextureMemoryCreateTexture(eye.mem[i], nullptr);   // null => infer from shared memory
-      if (!eye.tex[i]) { std::fprintf(stderr, "[vr-spike] eye %u img %u CreateTexture returned null\n", e, i);
-                         return XR_ERROR_RUNTIME_FAILURE; }
-      eye.view[i] = wgpuTextureCreateView(eye.tex[i], nullptr);
+      smd.label = "vr-eye-own-rt";
+      eye.mem = wgpuDeviceImportSharedTextureMemory(wdevice, &smd);
+      CloseHandle(sh);
+      if (!eye.mem) { std::fprintf(stderr, "[vr-spike] eye %u ImportSharedTextureMemory null\n", e); return XR_ERROR_RUNTIME_FAILURE; }
+      eye.tex = wgpuSharedTextureMemoryCreateTexture(eye.mem, nullptr);
+      if (!eye.tex) { std::fprintf(stderr, "[vr-spike] eye %u CreateTexture null\n", e); return XR_ERROR_RUNTIME_FAILURE; }
+      eye.view = wgpuTextureCreateView(eye.tex, nullptr);
     }
-    std::printf("[vr-spike] eye %u swapchain: %ux%u, %u images (imported into Dawn)\n", e, eye.width, eye.height, imgCount);
+    std::printf("[vr-spike] eye %u swapchain: %ux%u, %u images (Dawn renders own RT -> CopyResource)\n",
+                e, eye.width, eye.height, imgCount);
 #else
     std::printf("[vr-spike] eye %u swapchain: %ux%u, %u images\n", e, eye.width, eye.height, imgCount);
 #endif
@@ -473,17 +485,17 @@ XrResult run() {
         const float* col = (e == 0) ? left : right;
 
 #if defined(WEBGPU_BACKEND_DAWN)
-        // Increment 3: render into the XR image THROUGH Dawn (proves the wgpu↔XR bridge).
+        // Increment 3: Dawn renders into our own shared RT, then we CopyResource it into the XR image.
         WGPUSharedTextureMemoryBeginAccessDescriptor ba = {};
         ba.concurrentRead = false;
-        ba.initialized = false;   // clearing fresh; xrWaitSwapchainImage already freed the image
+        ba.initialized = false;   // clearing fresh
         ba.fenceCount = 0;
-        if (!wgpuSharedTextureMemoryBeginAccess(eye.mem[idx], eye.tex[idx], &ba)) {
-          std::fprintf(stderr, "[vr-spike] BeginAccess failed (eye %u img %u)\n", e, idx);
+        if (!wgpuSharedTextureMemoryBeginAccess(eye.mem, eye.tex, &ba)) {
+          std::fprintf(stderr, "[vr-spike] BeginAccess failed (eye %u)\n", e);
           return XR_ERROR_RUNTIME_FAILURE;
         }
         WGPURenderPassColorAttachment ca = {};
-        ca.view = eye.view[idx];
+        ca.view = eye.view;
         ca.loadOp = WGPULoadOp_Clear;
         ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ col[0], col[1], col[2], col[3] };
@@ -503,9 +515,8 @@ XrResult run() {
         wgpuCommandEncoderRelease(enc);
 
         WGPUSharedTextureMemoryEndAccessState es = {};
-        wgpuSharedTextureMemoryEndAccess(eye.mem[idx], eye.tex[idx], &es);
-        // OpenXR waits on OUR binding queue, not Dawn's — so CPU-sync: block until Dawn's GPU work
-        // is done before releasing the image back to the runtime. Simple + correct for a spike.
+        wgpuSharedTextureMemoryEndAccess(eye.mem, eye.tex, &es);
+        // CPU-sync: block until Dawn's render finishes before we copy on our queue.
         {
           struct W { bool done; } w{false};
           wgpuQueueOnSubmittedWorkDone(dawnQueue,
@@ -513,6 +524,33 @@ XrResult run() {
           for (int k = 0; k < 200000 && !w.done; ++k) { wgpuInstanceProcessEvents(winst); wgpuDeviceTick(wdevice); }
         }
         wgpuSharedTextureMemoryEndAccessStateFreeMembers(es);
+
+        // Copy our RT into the acquired XR image on OUR queue (the OpenXR binding queue). The XR
+        // image arrives in RENDER_TARGET state → transition to COPY_DEST, copy, transition back.
+        // Our RT is ALLOW_SIMULTANEOUS_ACCESS, so it's a valid copy source with no barrier.
+        HR_TRY(cmdAlloc->Reset());
+        HR_TRY(cmdList->Reset(cmdAlloc.Get(), nullptr));
+        D3D12_RESOURCE_BARRIER toCopy = {};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = eye.images[idx].texture;
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toCopy.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &toCopy);
+        cmdList->CopyResource(eye.images[idx].texture, eye.ownRT.Get());
+        D3D12_RESOURCE_BARRIER toRT = toCopy;
+        toRT.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        toRT.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        cmdList->ResourceBarrier(1, &toRT);
+        HR_TRY(cmdList->Close());
+        ID3D12CommandList* copyLists[] = { cmdList.Get() };
+        queue->ExecuteCommandLists(1, copyLists);
+        const UINT64 sig = ++fenceVal;
+        HR_TRY(queue->Signal(fence.Get(), sig));
+        if (fence->GetCompletedValue() < sig) {
+          HR_TRY(fence->SetEventOnCompletion(sig, fenceEvent));
+          WaitForSingleObject(fenceEvent, INFINITE);
+        }
 #else
         // Increment 1/2: raw-D3D12 clear on our own queue (image arrives in RENDER_TARGET state).
         HR_TRY(cmdAlloc->Reset());
@@ -568,9 +606,9 @@ XrResult run() {
   // 12. Teardown.
 #if defined(WEBGPU_BACKEND_DAWN)
   for (auto& eye : eyes) {
-    for (auto v : eye.view) if (v) wgpuTextureViewRelease(v);
-    for (auto t : eye.tex)  if (t) wgpuTextureRelease(t);
-    for (auto m : eye.mem)  if (m) wgpuSharedTextureMemoryRelease(m);
+    if (eye.view) wgpuTextureViewRelease(eye.view);
+    if (eye.tex)  wgpuTextureRelease(eye.tex);
+    if (eye.mem)  wgpuSharedTextureMemoryRelease(eye.mem);
   }
 #endif
   for (auto& eye : eyes) if (eye.handle) xrDestroySwapchain(eye.handle);

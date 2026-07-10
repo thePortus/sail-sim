@@ -24,6 +24,17 @@
 
 const PI_2 = 1.5708; // Math.PI / 2
 
+// Build a broadside of `n` guns a side, evenly spread fore-aft in [+zMax..-zMax], at beam ±x and world muzzle
+// height y (game frame: +Z bow, +X starboard). The array LENGTH is the broadside size the combat gate uses.
+function gunLine(n, x, y, zMax) {
+  const port = [], stbd = [];
+  for (let i = 0; i < n; i++) {
+    const z = +(zMax - (n > 1 ? i * (2 * zMax / (n - 1)) : 0)).toFixed(1);
+    port.push({ x: -x, y, z }); stbd.push({ x, y, z });
+  }
+  return { port, stbd };
+}
+
 // Per-vessel config consumed by the client:
 //   glb/manifest  — rigged asset + animation manifest under /geometry/
 //   importFlipY   — rotate the model 180° about Y on import so its bow faces game-forward (+Z)
@@ -194,6 +205,39 @@ const VESSELS = [
     price: 200000,                // Ships-as-economy: the top-tier shipwright purchase
     parts: [],
   },
+  // ── Frigate (USS Constitution type) — apex warship, three armament loadouts (shared hull/rig/asset) ──────────
+  // FAST under a huge sail plan but the heaviest hull afloat: slow to gather way (weight→massK) + slow to turn
+  // (physics.turnFactor). Bow=+Z. The `armament` field drives the client Frigate_Guns_<v> mesh toggle.
+  {
+    id: 5, name: 'Frigate (Heavy)', slug: 'frigate_heavy', armament: 'heavy',
+    description: 'A 44-gun heavy frigate — a purpose-built man-of-war with a full battery of 24-pounders and spar-deck carronades. The toughest hull and deadliest broadside afloat, fast under her huge press of canvas, but the heaviest ship in the fleet: ponderous to turn and slow to gather way. The apex predator of the sea.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50 },
+    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    cannons: gunLine(12, 5.5, 3.3, 16),
+    zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
+    crew: 16, cargo: 40, price: 750000, parts: [],
+  },
+  {
+    id: 6, name: 'Frigate (Medium)', slug: 'frigate_medium', armament: 'medium',
+    description: 'A frigate on a medium battery — fewer, lighter guns than the heavy, trading some of that crushing broadside for a slightly livelier, cheaper ship. Still the toughest hull and among the fastest afloat, and still ponderous to handle.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55 },
+    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    cannons: gunLine(9, 5.5, 3.3, 15),
+    zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
+    crew: 14, cargo: 50, price: 500000, parts: [],
+  },
+  {
+    id: 7, name: 'Frigate (Light)', slug: 'frigate_light', armament: 'light',
+    description: 'A frigate on a light battery — the least-armed loadout, the fastest and handiest of the three, and the cheapest way onto a frigate\'s deck. A stout, fast hull for a captain who values speed over a full broadside.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60 },
+    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    cannons: gunLine(7, 5.5, 3.3, 14),
+    zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
+    crew: 12, cargo: 60, price: 350000, parts: [],
+  },
 ];
 
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
@@ -208,6 +252,9 @@ const UPGRADE_COST = {
   sloop:       { cannon: 25000, armor: 25000 },
   brig:        { cannon: 60000, armor: 60000 },
   merchantman: { cannon: 30000, armor: 30000 },   // both together < the brig (200k); a hauler's modest refit
+  frigate_heavy:  { cannon: 120000, armor: 120000 },   // apex tier — flat, expensive refit scaled by loadout
+  frigate_medium: { cannon: 90000,  armor: 90000  },
+  frigate_light:  { cannon: 70000,  armor: 70000  },
 };
 /** Cost of a 'cannon' | 'armor' upgrade for a vessel slug (0 if unknown). */
 exports.upgradeCost = (slug, kind) => (UPGRADE_COST[slug] && UPGRADE_COST[slug][kind]) || 0;

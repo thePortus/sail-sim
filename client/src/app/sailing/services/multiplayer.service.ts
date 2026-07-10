@@ -1575,8 +1575,10 @@ export class MultiplayerService {
     sloop:       { halfLen: 5.0, radius: 2.2 },
     pinnace:     { halfLen: 3.8, radius: 1.4 },
     merchantman: { halfLen: 13.0, radius: 3.6 },   // mirrors server movement-constants.js
+    frigate:     { halfLen: 15.0, radius: 4.5 },   // longest hull; all 3 armament variants share it
   };
   private collDims(slug: string | undefined): { halfLen: number; radius: number } {
+    if (slug && slug.startsWith('frigate')) return this.COLL_DIMS_BY_SLUG['frigate'];
     return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
   }
   // (Separation/bounce is resolved server-side now — movement.resolvePair. The client only detects

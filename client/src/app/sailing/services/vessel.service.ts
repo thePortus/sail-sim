@@ -1130,7 +1130,7 @@ export class VesselService {
     // f(sf) = K · sf / (1 + (sf/p)²) — peaks at sf=p, then falls as 1/sf
     const p    = 0.28;                  // peak agility at 28 % of hull speed
     const rate = 155 * sf / (1 + (sf / p) * (sf / p));
-    return Math.max(4, Math.min(30, rate));
+    return Math.max(4, Math.min(30, rate)) * (this.physics.turnFactor ?? 1);
   }
 
   // ── Sheet adjustment rate ─────────────────────────────────────────────────

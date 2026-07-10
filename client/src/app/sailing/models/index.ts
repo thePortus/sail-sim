@@ -243,6 +243,8 @@ export interface VesselPhysics {
   minTackAngle:    number;
   sailAreaFactor:  number;
   weight:          number;
+  /** Turn-rate multiplier on the global helm curve (1 = default; <1 = turns slower — a long frigate hull). */
+  turnFactor?:     number;
   /** Seconds a fired broadside takes to reload before that side can fire again.
    *  Later modified by crew/morale; a flat per-ship constant for now. */
   reloadWindow?:   number;

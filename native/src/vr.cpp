@@ -272,6 +272,17 @@ int             eyeCount(Bridge* b) { return b ? (int)b->eyes.size() : 0; }
 WGPUTextureView eyeTarget(Bridge* b, int e) { return b ? b->eyes[e].view : nullptr; }
 uint32_t        eyeWidth(Bridge* b, int e)  { return b ? b->eyes[e].width : 0; }
 uint32_t        eyeHeight(Bridge* b, int e) { return b ? b->eyes[e].height : 0; }
+WGPUTextureFormat eyeFormat(Bridge* b) {
+  // Match the DXGI swapchain/own-RT format to a wgpu format (the eye views' format).
+  if (!b) return WGPUTextureFormat_RGBA8UnormSrgb;
+  switch (b->colorFormat) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return WGPUTextureFormat_RGBA8UnormSrgb;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:      return WGPUTextureFormat_RGBA8Unorm;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return WGPUTextureFormat_BGRA8UnormSrgb;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:      return WGPUTextureFormat_BGRA8Unorm;
+    default:                              return WGPUTextureFormat_RGBA8UnormSrgb;
+  }
+}
 
 void eyeCamera(Bridge* b, int e, float pose7[7], float fov4[4]) {
   const XrView& v = b->eyes[e].xrView;

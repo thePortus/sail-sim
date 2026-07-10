@@ -3453,45 +3453,11 @@ int main(int argc, char** argv) {
   WGPUQueue queue = wgpuDeviceGetQueue(device);
 
 #ifdef SAILSIM_HAVE_VR
-  // P1 step 2a — prove the VR bridge runs from inside the game binary (device + link + feature),
-  // by clearing each eye to a pulsing colour, bypassing the (D3D12-broken) window swapchain. The
-  // real per-eye SCENE render replaces this clear next. Runs its own loop, then exits.
-  if (vrMode) {
-    std::printf("[vr] SAILSIM_VR set — entering VR mode (clear-only bring-up).\n");
-    vr::Bridge* vb = vr::create(instance, device);
-    if (!vb) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return EXIT_FAILURE; }
-    bool running = false, exitReq = false; long vf = 0;
-    while (!exitReq) {
-      vr::poll(vb, running, exitReq);
-      if (!running) { glfwPollEvents(); continue; }
-      if (vr::beginFrame(vb)) {
-        float pulse = 0.5f + 0.5f * (float)std::sin(vf * 0.03);
-        for (int e = 0; e < vr::eyeCount(vb); ++e) {
-          const float col[4] = { e == 0 ? 0.85f * pulse : 0.10f, e == 0 ? 0.20f : 0.35f,
-                                 e == 0 ? 0.15f : 0.85f * pulse, 1.0f };
-          WGPURenderPassColorAttachment ca = {};
-          ca.view = vr::eyeTarget(vb, e);
-          ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
-          ca.clearValue = WGPUColor{ col[0], col[1], col[2], col[3] };
-#ifdef WGPU_DEPTH_SLICE_UNDEFINED
-          ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-#endif
-          WGPURenderPassDescriptor rp = {}; rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
-          WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
-          WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(enc, &rp);
-          wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
-          WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-          wgpuQueueSubmit(queue, 1, &cmd);
-          wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-        }
-        if ((vf % 90) == 0) std::printf("[vr] frame %ld\n", vf);
-      }
-      vr::endFrame(vb);
-      ++vf;
-    }
-    vr::destroy(vb);
-    return EXIT_SUCCESS;
-  }
+  // P1 step 2b: the VR bridge is created just before the render loop (it needs the game's render
+  // targets set up first) and driven INSIDE the loop — the game renders its frame into an
+  // intermediate, which is blitted into both eyes. Created here as null; see the loop below.
+  vr::Bridge* vrB = nullptr;
+  if (vrMode) std::printf("[vr] SAILSIM_VR set — VR mode (per-eye scene, mono bring-up).\n");
 #endif
 
   // Phase 0 criteria 3-5: prove the ocean-FFT WGSL runs natively and reads back.
@@ -4480,9 +4446,92 @@ int main(int argc, char** argv) {
   char ownAnchorSide = 'S';
   bool prevAnchoredEdge = false;
 
+#ifdef SAILSIM_HAVE_VR
+  // ── VR setup (P1 2b) ──────────────────────────────────────────────────────────────────
+  // In VR the game renders its whole frame into `vrFrameTex` (window-res, swapchain format) exactly
+  // as it would the window, then a fullscreen blit copies it into each eye's (sRGB) target. Mono for
+  // now (both eyes get the same image); per-eye stereo cameras come next.
+  WGPUTexture vrFrameTex = nullptr; WGPUTextureView vrFrameView = nullptr;
+  WGPURenderPipeline vrBlitPipe = nullptr; WGPUBindGroup vrBlitBind = nullptr;
+  if (vrMode) {
+    vrB = vr::create(instance, device);
+    if (!vrB) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return EXIT_FAILURE; }
+
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    td.dimension = WGPUTextureDimension_2D;
+    td.size = { curW, curH, 1 };
+    td.format = surfaceFormat;   // matches the game's final resolve pipeline; blit converts to eye sRGB
+    td.mipLevelCount = 1; td.sampleCount = 1;
+    vrFrameTex = wgpuDeviceCreateTexture(device, &td);
+    vrFrameView = wgpuTextureCreateView(vrFrameTex, nullptr);
+
+    static const char* VR_BLIT_WGSL = R"(
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSamp: sampler;
+struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VO {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  var o: VO; let xy = p[vi];
+  o.pos = vec4<f32>(xy, 0.0, 1.0);
+  o.uv = vec2<f32>((xy.x + 1.0) * 0.5, (1.0 - xy.y) * 0.5);
+  return o;
+}
+@fragment fn fs(i: VO) -> @location(0) vec4<f32> {
+  let c = textureSample(srcTex, srcSamp, i.uv).rgb;
+  // vrFrameTex holds display-encoded values; the eye is an sRGB target that re-encodes on write,
+  // so decode to linear first to avoid double gamma.
+  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2)), 1.0);
+}
+)";
+    WGPUShaderModule blitMod = makeWGSL(device, VR_BLIT_WGSL);
+    WGPUBindGroupLayoutEntry bgle[2] = {};
+    bgle[0].binding = 0; bgle[0].visibility = WGPUShaderStage_Fragment;
+    bgle[0].texture.sampleType = WGPUTextureSampleType_Float; bgle[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    bgle[1].binding = 1; bgle[1].visibility = WGPUShaderStage_Fragment;
+    bgle[1].sampler.type = WGPUSamplerBindingType_Filtering;
+    WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 2; bgld.entries = bgle;
+    WGPUBindGroupLayout blitBGL = wgpuDeviceCreateBindGroupLayout(device, &bgld);
+    WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &blitBGL;
+    WGPUPipelineLayout blitPL = wgpuDeviceCreatePipelineLayout(device, &pld);
+    WGPUColorTargetState cts = {}; cts.format = vr::eyeFormat(vrB); cts.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState fs = {}; fs.module = blitMod; fs.entryPoint = "fs"; fs.targetCount = 1; fs.targets = &cts;
+    WGPURenderPipelineDescriptor rpd = {};
+    rpd.layout = blitPL;
+    rpd.vertex.module = blitMod; rpd.vertex.entryPoint = "vs";
+    rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
+    rpd.fragment = &fs;
+    vrBlitPipe = wgpuDeviceCreateRenderPipeline(device, &rpd);
+
+    WGPUSamplerDescriptor smp = {};
+    smp.magFilter = WGPUFilterMode_Linear; smp.minFilter = WGPUFilterMode_Linear;
+    smp.addressModeU = WGPUAddressMode_ClampToEdge; smp.addressModeV = WGPUAddressMode_ClampToEdge;
+    smp.addressModeW = WGPUAddressMode_ClampToEdge; smp.maxAnisotropy = 1;
+    WGPUSampler blitSamp = wgpuDeviceCreateSampler(device, &smp);
+    WGPUBindGroupEntry bge[2] = {};
+    bge[0].binding = 0; bge[0].textureView = vrFrameView;
+    bge[1].binding = 1; bge[1].sampler = blitSamp;
+    WGPUBindGroupDescriptor bgd = {}; bgd.layout = blitBGL; bgd.entryCount = 2; bgd.entries = bge;
+    vrBlitBind = wgpuDeviceCreateBindGroup(device, &bgd);
+    std::printf("[vr] frame intermediate %ux%u + blit pipeline ready (eye fmt %d)\n",
+                curW, curH, (int)vr::eyeFormat(vrB));
+  }
+  bool vrRunning = false, vrExit = false;   // session state
+#endif
+
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   std::fprintf(stderr, "[boot] render resources built; entering render loop\n");
   while (!glfwWindowShouldClose(window)) {
+#ifdef SAILSIM_HAVE_VR
+    // VR: pace to the compositor + open per-eye access. vrActive = we have a frame to render+submit.
+    bool vrActive = false;
+    if (vrMode) {
+      vr::poll(vrB, vrRunning, vrExit);
+      if (vrExit) break;
+      if (vrRunning) vrActive = vr::beginFrame(vrB);
+    }
+#endif
     if (vessel.anchored && !prevAnchoredEdge) ownAnchorSide = (std::rand() & 1) ? 'P' : 'S';
     prevAnchoredEdge = vessel.anchored;
     glfwPollEvents();
@@ -9396,34 +9445,40 @@ int main(int argc, char** argv) {
 #if defined(WEBGPU_BACKEND_DAWN)
     wgpuInstanceProcessEvents(instance);
 #endif
-    WGPUSurfaceTexture surfaceTex;
-    wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
-    if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
-                                 frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
-    if (!surfaceTex.texture) {
-      // Fallback: reconfigure + pump both the instance events and the device, then retry once.
-      wgpuSurfaceConfigure(surface, &surfaceConfig);
-#if defined(WEBGPU_BACKEND_DAWN)
-      wgpuInstanceProcessEvents(instance);
-      wgpuDeviceTick(device);
-#elif defined(WEBGPU_BACKEND_WGPU)
-      wgpuDevicePoll(device, false, nullptr);
+    WGPUSurfaceTexture surfaceTex = {};
+    WGPUTextureView view = nullptr;
+#ifdef SAILSIM_HAVE_VR
+    // VR: render the whole frame into the VR intermediate (not the D3D12-broken window surface).
+    if (vrMode) view = vrFrameView;
 #endif
+    if (!view) {
       wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
-      if (frame <= 8) std::fprintf(stderr, "[boot] frame %ld: after reconfigure retry, texture=%p status=%d\n",
+      if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
                                    frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
       if (!surfaceTex.texture) {
-        // Still nothing (genuinely minimised / occluded). Pump the backend and skip the frame.
+        // Fallback: reconfigure + pump both the instance events and the device, then retry once.
+        wgpuSurfaceConfigure(surface, &surfaceConfig);
 #if defined(WEBGPU_BACKEND_DAWN)
+        wgpuInstanceProcessEvents(instance);
         wgpuDeviceTick(device);
 #elif defined(WEBGPU_BACKEND_WGPU)
         wgpuDevicePoll(device, false, nullptr);
 #endif
-        continue;
+        wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
+        if (frame <= 8) std::fprintf(stderr, "[boot] frame %ld: after reconfigure retry, texture=%p status=%d\n",
+                                     frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
+        if (!surfaceTex.texture) {
+          // Still nothing (genuinely minimised / occluded). Pump the backend and skip the frame.
+#if defined(WEBGPU_BACKEND_DAWN)
+          wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+          wgpuDevicePoll(device, false, nullptr);
+#endif
+          continue;
+        }
       }
+      view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
     }
-
-    WGPUTextureView view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
 
     WGPUCommandEncoderDescriptor encDesc = {};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
@@ -10179,6 +10234,29 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderRelease(fp);
     }
 
+#ifdef SAILSIM_HAVE_VR
+    // Blit the finished frame (vrFrameTex) into each eye — same encoder, right after the resolve
+    // pass wrote it (Dawn inserts the write→read barrier). Mono: both eyes get the same image.
+    if (vrActive) {
+      for (int e = 0; e < vr::eyeCount(vrB); ++e) {
+        WGPURenderPassColorAttachment eca = {};
+        eca.view = vr::eyeTarget(vrB, e);
+        eca.loadOp = WGPULoadOp_Clear; eca.storeOp = WGPUStoreOp_Store;
+        eca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
+#ifdef WGPU_DEPTH_SLICE_UNDEFINED
+        eca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+#endif
+        WGPURenderPassDescriptor erp = {}; erp.colorAttachmentCount = 1; erp.colorAttachments = &eca;
+        WGPURenderPassEncoder ep = wgpuCommandEncoderBeginRenderPass(encoder, &erp);
+        wgpuRenderPassEncoderSetPipeline(ep, vrBlitPipe);
+        wgpuRenderPassEncoderSetBindGroup(ep, 0, vrBlitBind, 0, nullptr);
+        wgpuRenderPassEncoderDraw(ep, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(ep);
+        wgpuRenderPassEncoderRelease(ep);
+      }
+    }
+#endif
+
     WGPUCommandBufferDescriptor cmdDesc = {};
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &cmdDesc);
     wgpuQueueSubmit(queue, 1, &cmd);
@@ -10191,12 +10269,18 @@ int main(int argc, char** argv) {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);
     // (ocean bind groups are cached now — released only on rebuild, not per frame)
-    wgpuTextureViewRelease(view);
-
-    if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: presenting\n", frame);
-#ifndef __EMSCRIPTEN__
-    wgpuSurfacePresent(surface);
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode) {
+      vr::endFrame(vrB);   // EndAccess + copy each eye's RT into the XR image + submit the XR frame
+    } else
 #endif
+    {
+      wgpuTextureViewRelease(view);
+      if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: presenting\n", frame);
+#ifndef __EMSCRIPTEN__
+      wgpuSurfacePresent(surface);
+#endif
+    }
 
     // Let Dawn/wgpu service their internal work queues each frame.
 #if defined(WEBGPU_BACKEND_DAWN)

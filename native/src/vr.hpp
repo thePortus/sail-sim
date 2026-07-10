@@ -45,6 +45,7 @@ int             eyeCount(Bridge* b);
 WGPUTextureView eyeTarget(Bridge* b, int eye);      // render the eye here (valid between begin/endFrame)
 uint32_t        eyeWidth(Bridge* b, int eye);
 uint32_t        eyeHeight(Bridge* b, int eye);
+WGPUTextureFormat eyeFormat(Bridge* b);             // the eye texture's wgpu format (for matching pipelines)
 
 // HMD pose + asymmetric FOV for `eye` this frame. pose7 = {px,py,pz, qx,qy,qz,qw}; fov4 =
 // {angleLeft, angleRight, angleUp, angleDown} in radians (left/down are negative).

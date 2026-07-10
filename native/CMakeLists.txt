@@ -211,6 +211,17 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
       else()
         message(WARNING "[vr] DXC headers not found at ${_dxcinc}/dxc/dxcapi.h — D3D build may fail")
       endif()
+      # Dawn's d3d12 code does `#include <d3d12.h>` expecting the modern DirectX-Headers version (newer
+      # enums like D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE that the Win10 19041 SDK lacks), but the dep
+      # isn't wired to dawn_native. Prepend DirectX-Headers so its d3d12.h shadows the SDK's (superset,
+      # designed as a drop-in). include/directx holds d3d12.h; include holds directx/*.
+      set(_dxh "${CMAKE_BINARY_DIR}/_deps/dawn-src/third_party/dxheaders/include")
+      if (EXISTS "${_dxh}/directx/d3d12.h")
+        target_include_directories(dawn_native BEFORE PRIVATE "${_dxh}/directx" "${_dxh}")
+        message(STATUS "[vr] prepended DirectX-Headers to dawn_native: ${_dxh}")
+      else()
+        message(WARNING "[vr] DirectX-Headers not found at ${_dxh}/directx/d3d12.h — d3d12 enums may be missing")
+      endif()
     endif()
   else()
     FetchContent_MakeAvailable(webgpu)

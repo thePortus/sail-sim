@@ -748,43 +748,53 @@ if (SAILSIM_VR)
   target_include_directories(sailsim_vr_probe PRIVATE "${openxr_SOURCE_DIR}/include")
   message(STATUS "SAILSIM_VR ON — building sailsim_vr_probe (OpenXR ${openxr_SOURCE_DIR})")
 
-  # Dawn's D3D12 backend loads dxcompiler.dll (+ dxil.dll, for shader signing) at RUNTIME via
-  # LoadLibrary from the exe dir. They build to ${CMAKE_BINARY_DIR}/$<CONFIG>/, not next to the exe,
-  # so D3D12 init fails ("DXC dlls were built, but are not available") and Dawn falls back to D3D11 —
-  # whose swapchain never produces a surface texture (white screen, GetCurrentTexture null forever).
+  # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile
+  # WGSL→HLSL→DXIL and to SIGN the DXIL (D3D12 rejects unsigned shaders). It needs a SIGNED release
+  # dxil.dll (>= 1.6); the Windows SDK's (10.0.19041.x) is too old → Dawn prints "DXC dlls were built,
+  # but are not available" and silently falls back to D3D11 (whose DXGI swapchain then no-ops → white
+  # screen). Dawn's own from-source DXC build does NOT produce a usable signed dxil.dll either.
   #
-  # BUT: Dawn's own DXC build produces an open-source dxil.dll that Dawn rejects as too old (< 1.6),
-  # so even copying its built DLLs still fails the "DXC available" check and drops to D3D11. The fix
-  # is to ship the dxcompiler.dll + dxil.dll from a DirectXShaderCompiler GitHub *release* (signed,
-  # >= 1.6). Point -DSAILSIM_DXC_DLL_DIR at the folder holding those two DLLs and they win; otherwise
-  # we fall back to Dawn's built ones (which will drop to D3D11 — a loud warning says so).
-  # SAILSIM_DXC_DLL_DIR: explicit override (empty by default). When empty we fall back to the
-  # DLLs vendored in the repo (native/third_party/dxc/bin/x64) so the VR build works out of the
-  # box. A LOCAL var derives the effective dir so a stale empty cache entry can't defeat the
-  # vendored default (a CACHE default wouldn't override an already-cached "").
-  set(SAILSIM_DXC_DLL_DIR "" CACHE PATH
-      "Override folder with a release dxcompiler.dll + dxil.dll (~1.8/1.9.x) for Dawn D3D12 (blank = vendored)")
-  set(_dxc_dll_dir "${SAILSIM_DXC_DLL_DIR}")
-  if (NOT _dxc_dll_dir)
-    set(_dxc_dll_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/x64")   # vendored default
-  endif()
-  if (EXISTS "${_dxc_dll_dir}/dxil.dll")
-    add_custom_command(TARGET sailsim_native POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${_dxc_dll_dir}/dxcompiler.dll" "$<TARGET_FILE_DIR:sailsim_native>"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${_dxc_dll_dir}/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
-      COMMENT "Copying RELEASE DXC DLLs from ${_dxc_dll_dir} next to the exe (Dawn D3D12)")
-    message(STATUS "[vr] DXC runtime DLLs sourced from ${_dxc_dll_dir}")
-  elseif (TARGET dxcompiler AND TARGET sailsim_native)
-    add_custom_command(TARGET sailsim_native POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE:dxcompiler>" "$<TARGET_FILE_DIR:sailsim_native>"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE_DIR:dxcompiler>/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
-      COMMENT "Copying Dawn's BUILT DXC DLLs next to the exe (WILL likely drop to D3D11 — vendor release DLLs)")
-    message(WARNING "[vr] No release DXC DLLs found at ${_dxc_dll_dir} — copying Dawn's built dxil.dll, which Dawn "
-                    "rejects as too old → D3D12 init fails and falls back to D3D11 (white screen). Drop a release "
-                    "dxcompiler.dll + dxil.dll (~1.8/1.9.x) into native/third_party/dxc/bin/x64 (see its README).")
+  # HISTORY OF PAIN (do not reintroduce): a previous POST_BUILD copied Dawn's BUILT dxil.dll (= the
+  # SDK's 10.0.x) next to the exe on EVERY build, which CLOBBERED any good dxil.dll placed there by
+  # hand — making it impossible to win by copying files. That fallback is deleted. We now:
+  #   1. Find a real release pair (dxil+dxcompiler) automatically, checking, in order:
+  #        a) -DSAILSIM_DXC_DLL_DIR=<dir> override
+  #        b) vendored in-repo:  native/third_party/dxc/bin/x64
+  #        c) the temp extract left by the download helper:  %TEMP%\dxc\bin\x64
+  #   2. Cache whatever we find INTO the repo (third_party/dxc/bin/x64) so it survives TEMP cleanup
+  #      and fresh build dirs (commit it once and every checkout works).
+  #   3. copy_if_different it next to the exe.
+  #   4. If nothing is found we copy NOTHING (never the SDK dll) — a hand-placed dxil.dll next to the
+  #      exe then STICKS across builds.
+  if (WIN32)
+    set(SAILSIM_DXC_DLL_DIR "" CACHE PATH
+        "Override folder with a release dxcompiler.dll + dxil.dll (~1.8/1.9.x) for Dawn D3D12")
+    set(_dxc_vendored "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/x64")
+    set(_dxc_dll_dir "")
+    foreach(_cand "${SAILSIM_DXC_DLL_DIR}" "${_dxc_vendored}" "$ENV{TEMP}/dxc/bin/x64" "$ENV{TMP}/dxc/bin/x64")
+      if (_cand AND EXISTS "${_cand}/dxil.dll" AND EXISTS "${_cand}/dxcompiler.dll")
+        set(_dxc_dll_dir "${_cand}")
+        break()
+      endif()
+    endforeach()
+    if (_dxc_dll_dir)
+      if (NOT _dxc_dll_dir STREQUAL _dxc_vendored)
+        file(COPY "${_dxc_dll_dir}/dxil.dll" "${_dxc_dll_dir}/dxcompiler.dll" DESTINATION "${_dxc_vendored}")
+        message(STATUS "[vr] cached release DXC DLLs from ${_dxc_dll_dir} into ${_dxc_vendored} (commit them to keep)")
+        set(_dxc_dll_dir "${_dxc_vendored}")
+      endif()
+      add_custom_command(TARGET sailsim_native POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_dxc_dll_dir}/dxcompiler.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_dxc_dll_dir}/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+        COMMENT "Copying release DXC DLLs (${_dxc_dll_dir}) next to the exe for Dawn D3D12")
+      message(STATUS "[vr] DXC runtime DLLs: ${_dxc_dll_dir}")
+    else()
+      message(WARNING "[vr] No release DXC DLLs found (checked SAILSIM_DXC_DLL_DIR, third_party/dxc/bin/x64, "
+                      "%TEMP%/dxc/bin/x64). Dawn-D3D12 needs a signed dxil.dll >= 1.6 or it drops to D3D11 "
+                      "(white screen). Get one via third_party/dxc/bin/x64/README.md. The build will NOT "
+                      "overwrite a dxil.dll you place next to the exe, so a manual copy there now sticks.")
+    endif()
   endif()
 endif()

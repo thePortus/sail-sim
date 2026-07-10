@@ -324,6 +324,20 @@ XrResult run() {
     std::printf("[vr-spike] eye %u swapchain: %ux%u, %u images\n", e, eye.width, eye.height, imgCount);
   }
 
+  // Interop probe (increment 3 design decision): can we make a DXGI shared handle from an XR
+  // swapchain image? If yes, Dawn can import it directly (SharedTextureMemoryDXGISharedHandle) and
+  // render straight in — zero copy. If not, we must render into our own shared texture and
+  // CopyResource into the XR image. 6512 Dawn has no direct ID3D12Resource import, so this decides it.
+  if (!eyes.empty() && !eyes[0].images.empty()) {
+    HANDLE sh = nullptr;
+    HRESULT hr = device->CreateSharedHandle(eyes[0].images[0].texture, nullptr, GENERIC_ALL, nullptr, &sh);
+    std::printf("[vr-spike] XR image CreateSharedHandle: %s (hr=0x%08lx)\n",
+                SUCCEEDED(hr) ? "SHAREABLE -> Dawn can import the XR image directly (zero-copy)"
+                              : "NOT shareable -> render to own shared texture + CopyResource",
+                (unsigned long)hr);
+    if (sh) CloseHandle(sh);
+  }
+
   // 11. Frame loop, driven by the OpenXR session state machine.
   bool running = false;      // between xrBeginSession and xrEndSession
   bool exitLoop = false;

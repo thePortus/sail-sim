@@ -753,7 +753,7 @@ if (SAILSIM_VR)
   # the Dawn rebuild. Windows-only (D3D12). Retires the "does OpenXR D3D12 reach the headset" risk
   # before we wire Dawn's device (increment 2) + SharedTextureMemory (increment 3).
   if (WIN32)
-    add_executable(sailsim_vr_spike src/vr_spike.cpp)
+    add_executable(sailsim_vr_spike src/vr_spike.cpp src/vr.cpp)   # vr.cpp: the shared VR bridge module
     target_include_directories(sailsim_vr_spike PRIVATE "${openxr_SOURCE_DIR}/include")
     if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
       # Increment 2: link Dawn so the spike can drive OpenXR with Dawn's ID3D12Device.

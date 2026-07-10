@@ -216,6 +216,10 @@ XrResult run() {
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   HR_TRY(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
   WGPUQueue dawnQueue = wgpuDeviceGetQueue(wdevice);   // Dawn's render queue (increment 3)
+  wgpuDeviceSetUncapturedErrorCallback(wdevice,
+    [](WGPUErrorType t, char const* m, void*) {
+      std::fprintf(stderr, "[vr-spike] Dawn uncaptured error (%d): %s\n", (int)t, m ? m : "(no message)");
+    }, nullptr);
 #else
   // Increment 1: our own plain D3D12 device on the OpenXR-required adapter (LUID match).
   ComPtr<IDXGIFactory4> factory;
@@ -344,7 +348,7 @@ XrResult run() {
       WGPUSharedTextureMemoryDXGISharedHandleDescriptor dxgi = {};
       dxgi.chain.sType = WGPUSType_SharedTextureMemoryDXGISharedHandleDescriptor;
       dxgi.handle = sh;
-      dxgi.useKeyedMutex = false;
+      dxgi.useKeyedMutex = true;   // VD's cross-process XR images carry a keyed mutex (acquire key 0)
       WGPUSharedTextureMemoryDescriptor smd = {};
       smd.nextInChain = &dxgi.chain;
       smd.label = "xr-eye-image";

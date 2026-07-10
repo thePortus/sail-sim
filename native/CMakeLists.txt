@@ -769,6 +769,20 @@ if (SAILSIM_VR)
       target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader d3d12 dxgi)
       message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, own device)")
     endif()
+
+    # P1: fold the VR bridge into the GAME. Compile vr.cpp into sailsim_native and link the VR deps
+    # (only meaningful on the Dawn backend — VR needs the D3D12 OpenXR binding + Dawn's device).
+    # SAILSIM_HAVE_VR gates the VR code paths in main.cpp.
+    if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN" AND TARGET sailsim_native)
+      target_sources(sailsim_native PRIVATE src/vr.cpp)
+      target_link_libraries(sailsim_native PRIVATE openxr_loader dawn_native d3d12 dxgi)
+      target_include_directories(sailsim_native PRIVATE "${openxr_SOURCE_DIR}/include")
+      if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+        target_include_directories(sailsim_native PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+      endif()
+      target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_VR)
+      message(STATUS "SAILSIM_VR ON — VR bridge folded into sailsim_native (SAILSIM_HAVE_VR)")
+    endif()
   endif()
 
   # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile

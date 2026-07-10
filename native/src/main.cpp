@@ -26,6 +26,9 @@
 #if defined(WEBGPU_BACKEND_WGPU)
 #include <webgpu/wgpu.h>   // wgpu-native extensions (e.g. wgpuDevicePoll)
 #endif
+#ifdef SAILSIM_HAVE_VR
+#include "vr.hpp"          // OpenXR ⇄ Dawn-D3D12 bridge (Windows+Dawn; head-tracked stereo)
+#endif
 #include <glfw3webgpu.h>
 #include <GLFW/glfw3.h>
 
@@ -3200,6 +3203,14 @@ int main(int argc, char** argv) {
   const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
   long frame = 0;
 
+  // VR: SAILSIM_VR set → head-tracked stereo via OpenXR (Windows + Dawn only). Opt-in; absent =
+  // the normal desktop game. (SAILSIM_HAVE_VR is the compile-time gate; the env var is the runtime one.)
+#ifdef SAILSIM_HAVE_VR
+  const bool vrMode = std::getenv("SAILSIM_VR") != nullptr;
+#else
+  const bool vrMode = false;
+#endif
+
   // Headless screenshot: SAILSIM_SHOT=out.png renders to a chosen frame (default
   // 240, so the FFT/foam has settled), writes a PNG, and exits.
   const char* shotPath = std::getenv("SAILSIM_SHOT");
@@ -3420,12 +3431,68 @@ int main(int argc, char** argv) {
   // 4. Device + queue
   WGPUDeviceDescriptor deviceDesc = {};
   deviceDesc.label = "sailsim-device";
+#ifdef SAILSIM_HAVE_VR
+  // VR needs the DXGI shared-handle features on the device (SharedTextureMemory interop). Request
+  // whatever the adapter supports; `vrFeats` must outlive requestDeviceSync.
+  std::vector<WGPUFeatureName> vrFeats;
+  if (vrMode) {
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedTextureMemoryDXGISharedHandle))
+      vrFeats.push_back(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedFenceDXGISharedHandle))
+      vrFeats.push_back(WGPUFeatureName_SharedFenceDXGISharedHandle);
+    deviceDesc.requiredFeatureCount = vrFeats.size();
+    deviceDesc.requiredFeatures = vrFeats.empty() ? nullptr : vrFeats.data();
+    std::printf("[vr] requesting %zu shared-handle device feature(s)\n", vrFeats.size());
+  }
+#endif
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);
   if (!device) return EXIT_FAILURE;
 
   wgpuDeviceSetUncapturedErrorCallback(device, onDeviceError, nullptr);
 
   WGPUQueue queue = wgpuDeviceGetQueue(device);
+
+#ifdef SAILSIM_HAVE_VR
+  // P1 step 2a — prove the VR bridge runs from inside the game binary (device + link + feature),
+  // by clearing each eye to a pulsing colour, bypassing the (D3D12-broken) window swapchain. The
+  // real per-eye SCENE render replaces this clear next. Runs its own loop, then exits.
+  if (vrMode) {
+    std::printf("[vr] SAILSIM_VR set — entering VR mode (clear-only bring-up).\n");
+    vr::Bridge* vb = vr::create(instance, device);
+    if (!vb) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return EXIT_FAILURE; }
+    bool running = false, exitReq = false; long vf = 0;
+    while (!exitReq) {
+      vr::poll(vb, running, exitReq);
+      if (!running) { glfwPollEvents(); continue; }
+      if (vr::beginFrame(vb)) {
+        float pulse = 0.5f + 0.5f * (float)std::sin(vf * 0.03);
+        for (int e = 0; e < vr::eyeCount(vb); ++e) {
+          const float col[4] = { e == 0 ? 0.85f * pulse : 0.10f, e == 0 ? 0.20f : 0.35f,
+                                 e == 0 ? 0.15f : 0.85f * pulse, 1.0f };
+          WGPURenderPassColorAttachment ca = {};
+          ca.view = vr::eyeTarget(vb, e);
+          ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
+          ca.clearValue = WGPUColor{ col[0], col[1], col[2], col[3] };
+#ifdef WGPU_DEPTH_SLICE_UNDEFINED
+          ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+#endif
+          WGPURenderPassDescriptor rp = {}; rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
+          WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
+          WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(enc, &rp);
+          wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+          WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+          wgpuQueueSubmit(queue, 1, &cmd);
+          wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
+        }
+        if ((vf % 90) == 0) std::printf("[vr] frame %ld\n", vf);
+      }
+      vr::endFrame(vb);
+      ++vf;
+    }
+    vr::destroy(vb);
+    return EXIT_SUCCESS;
+  }
+#endif
 
   // Phase 0 criteria 3-5: prove the ocean-FFT WGSL runs natively and reads back.
   runInitialSpectrumTest(device, queue);

@@ -137,6 +137,11 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
     GIT_TAG        dawn-6512
     GIT_SHALLOW    ON)
   if (SAILSIM_VR)
+    # ⚠ Build the VR/Dawn variant with CMake 3.x (3.28–3.31), NOT CMake 4.x: enabling D3D12 pulls in
+    # DirectX Shader Compiler (an old LLVM fork, chromium/6512) whose CMake uses `cmake_policy(SET
+    # CMP0051 OLD)` and `cmake_minimum_required(VERSION 2.8.8)` — both removed in CMake 4.0.
+    # `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` only covers the min-version part, not CMP0051. Use cmake 3.31.
+    #
     # The distribution builds Vulkan-only Dawn on Windows (D3D12/D3D11 OFF). VR wants the D3D12
     # OpenXR binding (it just takes an existing ID3D12Device — no Vulkan extension-injection). So
     # populate the distribution, flip its FetchDawn.cmake backend flags to D3D12, then add it.

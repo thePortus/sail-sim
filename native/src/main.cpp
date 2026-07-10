@@ -3506,7 +3506,11 @@ int main(int argc, char** argv) {
   surfaceConfig.presentMode = WGPUPresentMode_Fifo;   // vsync
   surfaceConfig.alphaMode = alphaMode;
   if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
-  wgpuSurfaceConfigure(surface, &surfaceConfig);
+  // In VR we never present to the window, and having an active D3D12 window swapchain alongside the
+  // OpenXR runtime's swapchains on the same device removes the device ("GPU device disconnected").
+  // Skip configuring the window swapchain entirely in VR (the format was already read from caps above).
+  if (!vrMode)
+    wgpuSurfaceConfigure(surface, &surfaceConfig);
 
   // Everything below goes to stderr (unbuffered) because the Windows console silently drops
   // stdout under the asset-load flood. On Dawn, tick once so any surface-configure validation
@@ -4572,7 +4576,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (w > 0 && h > 0 && (winChanged || scaleChanged)) {
       curW = (uint32_t)w; curH = (uint32_t)h;
       rW = wantRW; rH = wantRH;
-      if (winChanged) {
+      if (winChanged && !vrMode) {   // VR never configures the window swapchain (device-loss guard)
         surfaceConfig.width = curW; surfaceConfig.height = curH;
         wgpuSurfaceConfigure(surface, &surfaceConfig);
       }

@@ -149,17 +149,41 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
     set(_fd "${webgpu_SOURCE_DIR}/cmake/FetchDawn.cmake")
     file(READ "${_fd}" _fdsrc)
     string(REPLACE "set(DAWN_ENABLE_D3D11 OFF)" "set(DAWN_ENABLE_D3D11 ON)  # VR" _fdsrc "${_fdsrc}")
-    string(REPLACE "set(DAWN_ENABLE_D3D12 OFF)" "set(DAWN_ENABLE_D3D12 ON)  # VR" _fdsrc "${_fdsrc}")
+    # Enable D3D12 AND build DXC: with DAWN_USE_BUILT_DXC OFF (Dawn's default) the dxc headers
+    # (dxcapi.h/IDxcCompiler3) are never put on the include path and the Windows 10 SDK doesn't ship
+    # them, so the D3D backend fails to compile; ON adds the headers, builds DXC, and links it (our
+    # compute shaders need DXC→DXIL at runtime too).
+    string(REPLACE "set(DAWN_ENABLE_D3D12 OFF)"
+                   "set(DAWN_ENABLE_D3D12 ON)  # VR\n\tset(DAWN_USE_BUILT_DXC ON)  # VR"
+                   _fdsrc "${_fdsrc}")
     string(REPLACE "set(USE_VULKAN ON)"         "set(USE_VULKAN OFF) # VR"       _fdsrc "${_fdsrc}")
     file(WRITE "${_fd}" "${_fdsrc}")
     file(READ "${_fd}" _fdcheck)
-    if (_fdcheck MATCHES "DAWN_ENABLE_D3D12 ON")
-      message(STATUS "============================================================")
-      message(STATUS "  [vr] Dawn D3D12 backend patch ACTIVE (D3D12 ON, Vulkan OFF)")
-      message(STATUS "============================================================")
-    else()
-      message(FATAL_ERROR "[vr] FAILED to patch Dawn to D3D12 in ${_fd} — distribution strings changed?")
+    if (NOT _fdcheck MATCHES "DAWN_ENABLE_D3D12 ON" OR NOT _fdcheck MATCHES "DAWN_USE_BUILT_DXC ON")
+      message(FATAL_ERROR "[vr] FAILED to patch Dawn to D3D12+DXC in ${_fd} — distribution strings changed?")
     endif()
+    # The distribution's curated dep-fetch list (patch/tools/fetch_dawn_dependencies.py) is Vulkan-only
+    # and omits the DirectX Shader Compiler, so Dawn's D3D backend can't find dxcapi.h (IDxcCompiler3).
+    # Add the D3D deps so the D3D12 backend builds. (Idempotent — guarded on 'third_party/dxc'.)
+    set(_fdeps "${webgpu_SOURCE_DIR}/patch/tools/fetch_dawn_dependencies.py")
+    if (EXISTS "${_fdeps}")
+      file(READ "${_fdeps}" _dsrc)
+      if (NOT _dsrc MATCHES "third_party/dxc")
+        string(REPLACE "'third_party/abseil-cpp',"
+                       "'third_party/abseil-cpp',\n        'third_party/dxc',\n        'third_party/dxheaders',"
+                       _dsrc "${_dsrc}")
+        file(WRITE "${_fdeps}" "${_dsrc}")
+      endif()
+      file(READ "${_fdeps}" _dcheck)
+      if (NOT _dcheck MATCHES "third_party/dxc")
+        message(FATAL_ERROR "[vr] FAILED to add DXC to Dawn's fetch list in ${_fdeps}")
+      endif()
+    else()
+      message(WARNING "[vr] ${_fdeps} not found — DXC dep may be missing; D3D build could fail")
+    endif()
+    message(STATUS "============================================================")
+    message(STATUS "  [vr] Dawn D3D12 patch ACTIVE (D3D12 ON, Vulkan OFF, +DXC dep)")
+    message(STATUS "============================================================")
     add_subdirectory("${webgpu_SOURCE_DIR}" "${webgpu_BINARY_DIR}")
   else()
     FetchContent_MakeAvailable(webgpu)

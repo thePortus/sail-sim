@@ -1066,17 +1066,21 @@ export class CannonService {
       const ready = this.gun[side].state === 'engaged';   // show the aim tubes whenever the battery is run out
       if (!ready) { for (const t of tubes) t.setEnabled(false); continue; }
 
-      // Solve the lock ONCE (round/bar) — reused for every gun's arc shape, its colour, and the reticle.
-      let sol: ReturnType<CannonService['solveLock']> = null;
+      // Solve the lock (round/bar) once per BATTERY: long guns at full velocity, carronades at their reduced
+      // velocity — so the carronade arcs trace a SHORT throw that splashes at ~100 m, converging on a target
+      // only when it's actually within their reach (else solveLock returns null → a free short arc).
+      let solLong: ReturnType<CannonService['solveLock']> = null;
+      let solCarr: ReturnType<CannonService['solveLock']> = null;
       if (this.shotType() !== 'grape') {
         const vs = this.vesselService.state();
         const hRad = vs.heading * Math.PI / 180, sinH = Math.sin(hRad), cosH = Math.cos(hRad);
         const beamX = side === 'port' ? -cosH : cosH, beamZ = side === 'port' ? sinH : -sinH;
-        sol = this.solveLock(side, vs, beamX, beamZ, this.muzzleV(), this.muzzles[side][0].y);
-        if (sol && !lock) lock = { id: sol.lockId, x: sol.cx, z: sol.cz };   // park the reticle ON the locked ship
+        const muzY = this.muzzles[side][0].y;
+        solLong = this.solveLock(side, vs, beamX, beamZ, this.muzzleV(), muzY);
+        solCarr = this.solveLock(side, vs, beamX, beamZ, this.muzzleV() * CARRONADE_V_FACTOR, muzY);
+        if (solLong && !lock) lock = { id: solLong.lockId, x: solLong.cx, z: solLong.cz };   // reticle on the locked ship
       }
 
-      const mat     = this.aimMaterial(!!sol);   // locked → green solution arc; free → red
       const muzzles = this.muzzles[side];
       // One arc per cannon: each gun launches from its own muzzle, sharing the side's launch solution, so the
       // arcs run parallel on free aim and converge onto the lock — a sheaf that reads as the whole broadside.
@@ -1084,6 +1088,8 @@ export class CannonService {
         // Per-cannon: only show this gun's arc if THAT gun is actually loaded (reloading guns have no arc).
         const loaded = i < this.gunsPerSide && this.elapsed >= this.gun[side].loadAt[i];
         if (!loaded) { if (tubes[i]) tubes[i].setEnabled(false); continue; }
+        const sol = muzzles[i].carronade ? solCarr : solLong;   // carronades trace their own short arc
+        const mat = this.aimMaterial(!!sol);                    // locked → green; free / out-of-reach → red
         const path = this.buildArcPath(side, sol, muzzles[i]);
         const prev = tubes[i];
         if (prev) {
@@ -1190,7 +1196,7 @@ export class CannonService {
     const beamX   = side === 'port' ? -cosH :  cosH;
     const beamZ   = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
-    const mv      = this.muzzleV();
+    const mv      = this.muzzleV() * (muz.carronade ? CARRONADE_V_FACTOR : 1);   // carronade arc falls short
 
     const ox  = vs.x + muz.x * cosH + muz.z * sinH;
     const oy  = muz.y;

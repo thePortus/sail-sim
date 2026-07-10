@@ -216,6 +216,8 @@ Bridge* create(WGPUInstance instance, WGPUDevice wdevice) {
   if (XR_FAILED(xrCreateReferenceSpace(b->session, &rsci, &b->appSpace))) { destroy(b); return nullptr; }
 
   if (!setupSwapchains(b)) { std::fprintf(stderr, "[vr] swapchain setup failed\n"); destroy(b); return nullptr; }
+  std::fprintf(stderr, "[vr] post-setup deviceLost=%d (0 = alive after create; loss is later, in the frame loop)\n",
+               b->eyes.empty() ? -1 : (int)wgpuSharedTextureMemoryIsDeviceLost(b->eyes[0].mem));
   std::printf("[vr] session ready (Dawn D3D12 binding).\n");
   return b;
 }

@@ -123,6 +123,11 @@ FetchContent_MakeAvailable(stb)
 # texture formats. Fetching upstream guarantees header/lib agreement.
 set(SAILSIM_WEBGPU_BACKEND "WGPU" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
 
+# VR (OpenXR) — opt-in, OFF by default. Declared HERE (before the backend fetch) because the VR
+# render bridge needs Dawn built on D3D12 (see native/VR_PLAN.md), which patches the Dawn fetch below.
+# The probe + OpenXR loader are wired at the end of this file.
+option(SAILSIM_VR "Build the OpenXR VR probe + support" OFF)
+
 if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
   # Dawn, from source, via Élie Michel's distribution. NOTE: on Apple Silicon this
   # still needs its vendored fuzzers (libprotobuf-mutator) disabled and an abseil
@@ -131,7 +136,26 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
     GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
     GIT_TAG        dawn-6512
     GIT_SHALLOW    ON)
-  FetchContent_MakeAvailable(webgpu)
+  if (SAILSIM_VR)
+    # The distribution builds Vulkan-only Dawn on Windows (D3D12/D3D11 OFF). VR wants the D3D12
+    # OpenXR binding (it just takes an existing ID3D12Device — no Vulkan extension-injection). So
+    # populate first, flip the backend flags in the fetched FetchDawn.cmake, THEN add_subdirectory.
+    # (Verified string-replaces → D3D11 ON / D3D12 ON / Vulkan OFF; absolute paths, no CWD ambiguity.)
+    FetchContent_GetProperties(webgpu)
+    if (NOT webgpu_POPULATED)
+      FetchContent_Populate(webgpu)
+      set(_fd "${webgpu_SOURCE_DIR}/cmake/FetchDawn.cmake")
+      file(READ "${_fd}" _fdsrc)
+      string(REPLACE "set(DAWN_ENABLE_D3D11 OFF)" "set(DAWN_ENABLE_D3D11 ON)  # VR" _fdsrc "${_fdsrc}")
+      string(REPLACE "set(DAWN_ENABLE_D3D12 OFF)" "set(DAWN_ENABLE_D3D12 ON)  # VR" _fdsrc "${_fdsrc}")
+      string(REPLACE "set(USE_VULKAN ON)"         "set(USE_VULKAN OFF) # VR"       _fdsrc "${_fdsrc}")
+      file(WRITE "${_fd}" "${_fdsrc}")
+      message(STATUS "[vr] patched Dawn backend → D3D11 ON / D3D12 ON / Vulkan OFF (${_fd})")
+      add_subdirectory("${webgpu_SOURCE_DIR}" "${webgpu_BINARY_DIR}")
+    endif()
+  else()
+    FetchContent_MakeAvailable(webgpu)
+  endif()
 else()
   # wgpu-native official prebuilt release. Classic-callback webgpu.h (matches
   # src/main.cpp) with the modern surface API.
@@ -624,15 +648,12 @@ endif()
 # See native/VR_PLAN.md. Head-tracked stereo via OpenXR; targeting OpenXR once makes
 # Meta Link, Virtual Desktop (VDXR), and SteamVR all work with no runtime-specific code.
 #
-# P0.0 (this): a standalone probe (src/vr_probe.cpp) that brings up an OpenXR instance
-# and reports the runtime, HMD, per-eye resolution, and available graphics-binding
-# extensions. It creates NO session and needs NO graphics API or Dawn, so it builds on
-# any WebGPU backend / OS and links only the OpenXR loader. The real per-eye render
-# bridge (Dawn ↔ D3D12 XR swapchain via SharedTextureMemory) forces the Dawn backend and
-# lands in a later phase.
-#
-# Enable with:  cmake -S native -B native/build -DSAILSIM_VR=ON
-option(SAILSIM_VR "Build the OpenXR VR probe + support" OFF)
+# P0.0: a standalone probe (src/vr_probe.cpp) that brings up an OpenXR instance and reports the
+# runtime, HMD, per-eye resolution, and available graphics-binding extensions. It creates NO session
+# and needs NO graphics API or Dawn, so it builds on any WebGPU backend / OS and links only the OpenXR
+# loader. The real per-eye render bridge (Dawn ↔ D3D12 XR swapchain) needs the Dawn backend built on
+# D3D12 — enable both:  cmake -S native -B build-win-vr -DSAILSIM_WEBGPU_BACKEND=DAWN -DSAILSIM_VR=ON
+# (SAILSIM_VR is declared up by the WebGPU-backend section, which applies the Dawn→D3D12 patch.)
 if (SAILSIM_VR)
   # Upstream loader + headers (like wgpu-native, we fetch the source of truth, not a
   # redistribution). Builds the openxr_loader target; disable its tests/api-layers.

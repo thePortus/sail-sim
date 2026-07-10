@@ -54,8 +54,8 @@ each eye into an OpenXR D3D12 swapchain image imported into Dawn as a shared tex
 - **Decision: build Dawn with D3D12 enabled for VR.** The distribution *does* build the `dawn_native`
   target and exposes Dawn's full headers (incl. `dawn/native/D3D12Backend.h`) via `_deps/dawn-src/include`,
   so `dawn::native::d3d12::GetD3D12Device(WGPUDevice)` (binding A's device extraction) is reachable once
-  D3D12 is on. We flip the flags with a portable patch (`native/cmake/vr_dawn_d3d12.cmake`, verified:
-  → D3D11 ON / D3D12 ON / Vulkan OFF) applied as the distribution's `PATCH_COMMAND`.
+  D3D12 is on. We flip the flags with an inline patch in `CMakeLists.txt` (the VR+DAWN path populates the
+  distribution, string-replaces `FetchDawn.cmake` → D3D11 ON / D3D12 ON / Vulkan OFF, then add_subdirectory).
 - **Sequencing before wiring D3D12:** first confirm the **existing** Dawn backend even builds + runs on the
   Windows box (`cmake -S native -B build-win-dawn -DSAILSIM_WEBGPU_BACKEND=DAWN`, run `sailsim_native`) — a
   heavy one-time source build, but it de-risks the whole Dawn dependency with zero new code. If Dawn runs,

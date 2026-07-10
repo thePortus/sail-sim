@@ -116,9 +116,21 @@ WGPUAdapter requestAdapterSync(WGPUInstance instance) {
   return s.adapter;
 }
 WGPUDevice requestDeviceSync(WGPUInstance instance, WGPUAdapter adapter) {
+  // The XR-image interop needs the DXGI shared-handle features enabled on the DEVICE (WebGPU gates
+  // SharedTextureMemory/SharedFence behind opt-in features). Request whatever the adapter supports.
+  std::vector<WGPUFeatureName> feats;
+  auto want = [&](WGPUFeatureName f, const char* name) {
+    if (wgpuAdapterHasFeature(adapter, f)) { feats.push_back(f); std::printf("[vr-spike] enable feature: %s\n", name); }
+    else std::fprintf(stderr, "[vr-spike] adapter LACKS feature: %s\n", name);
+  };
+  want(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle, "SharedTextureMemoryDXGISharedHandle");
+  want(WGPUFeatureName_SharedFenceDXGISharedHandle,         "SharedFenceDXGISharedHandle");
+
   struct S { WGPUDevice device; bool done; } s{nullptr, false};
   WGPUDeviceDescriptor dd{};
   dd.label = "sailsim-vr-spike-device";
+  dd.requiredFeatureCount = feats.size();
+  dd.requiredFeatures = feats.empty() ? nullptr : feats.data();
   wgpuAdapterRequestDevice(adapter, &dd,
     [](WGPURequestDeviceStatus status, WGPUDevice d, char const* msg, void* ud) {
       auto* s = static_cast<S*>(ud);

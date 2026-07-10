@@ -619,3 +619,35 @@ elseif (WIN32)
 else()
   target_sources(sailsim_native PRIVATE src/updater_stub.cpp)
 endif()
+
+# ── VR (OpenXR) — opt-in, OFF by default ─────────────────────────────────────
+# See native/VR_PLAN.md. Head-tracked stereo via OpenXR; targeting OpenXR once makes
+# Meta Link, Virtual Desktop (VDXR), and SteamVR all work with no runtime-specific code.
+#
+# P0.0 (this): a standalone probe (src/vr_probe.cpp) that brings up an OpenXR instance
+# and reports the runtime, HMD, per-eye resolution, and available graphics-binding
+# extensions. It creates NO session and needs NO graphics API or Dawn, so it builds on
+# any WebGPU backend / OS and links only the OpenXR loader. The real per-eye render
+# bridge (Dawn ↔ D3D12 XR swapchain via SharedTextureMemory) forces the Dawn backend and
+# lands in a later phase.
+#
+# Enable with:  cmake -S native -B native/build -DSAILSIM_VR=ON
+option(SAILSIM_VR "Build the OpenXR VR probe + support" OFF)
+if (SAILSIM_VR)
+  # Upstream loader + headers (like wgpu-native, we fetch the source of truth, not a
+  # redistribution). Builds the openxr_loader target; disable its tests/api-layers.
+  set(BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+  set(BUILD_API_LAYERS  OFF CACHE BOOL "" FORCE)
+  set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(openxr
+    GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK
+    GIT_TAG        release-1.1.61
+    GIT_SHALLOW    ON)
+  FetchContent_MakeAvailable(openxr)
+
+  add_executable(sailsim_vr_probe src/vr_probe.cpp)
+  target_link_libraries(sailsim_vr_probe PRIVATE openxr_loader)
+  # openxr_loader usually propagates its include dir; add it explicitly in case it doesn't.
+  target_include_directories(sailsim_vr_probe PRIVATE "${openxr_SOURCE_DIR}/include")
+  message(STATUS "SAILSIM_VR ON — building sailsim_vr_probe (OpenXR ${openxr_SOURCE_DIR})")
+endif()

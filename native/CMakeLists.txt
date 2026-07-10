@@ -751,13 +751,32 @@ if (SAILSIM_VR)
   # Dawn's D3D12 backend loads dxcompiler.dll (+ dxil.dll, for shader signing) at RUNTIME via
   # LoadLibrary from the exe dir. They build to ${CMAKE_BINARY_DIR}/$<CONFIG>/, not next to the exe,
   # so D3D12 init fails ("DXC dlls were built, but are not available") and Dawn falls back to D3D11 —
-  # which then dies when the render loop hits features D3D11 lacks. Copy both next to the exe.
-  if (TARGET dxcompiler AND TARGET sailsim_native)
+  # whose swapchain never produces a surface texture (white screen, GetCurrentTexture null forever).
+  #
+  # BUT: Dawn's own DXC build produces an open-source dxil.dll that Dawn rejects as too old (< 1.6),
+  # so even copying its built DLLs still fails the "DXC available" check and drops to D3D11. The fix
+  # is to ship the dxcompiler.dll + dxil.dll from a DirectXShaderCompiler GitHub *release* (signed,
+  # >= 1.6). Point -DSAILSIM_DXC_DLL_DIR at the folder holding those two DLLs and they win; otherwise
+  # we fall back to Dawn's built ones (which will drop to D3D11 — a loud warning says so).
+  set(SAILSIM_DXC_DLL_DIR "" CACHE PATH
+      "Folder with a release dxcompiler.dll + dxil.dll (>= 1.6) to copy next to the exe for Dawn D3D12")
+  if (SAILSIM_DXC_DLL_DIR AND EXISTS "${SAILSIM_DXC_DLL_DIR}/dxil.dll")
+    add_custom_command(TARGET sailsim_native POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${SAILSIM_DXC_DLL_DIR}/dxcompiler.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${SAILSIM_DXC_DLL_DIR}/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+      COMMENT "Copying RELEASE DXC DLLs from ${SAILSIM_DXC_DLL_DIR} next to the exe (Dawn D3D12)")
+    message(STATUS "[vr] DXC runtime DLLs sourced from SAILSIM_DXC_DLL_DIR=${SAILSIM_DXC_DLL_DIR}")
+  elseif (TARGET dxcompiler AND TARGET sailsim_native)
     add_custom_command(TARGET sailsim_native POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               "$<TARGET_FILE:dxcompiler>" "$<TARGET_FILE_DIR:sailsim_native>"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               "$<TARGET_FILE_DIR:dxcompiler>/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
-      COMMENT "Copying DXC runtime DLLs (dxcompiler.dll, dxil.dll) next to the exe (D3D12 backend)")
+      COMMENT "Copying Dawn's BUILT DXC DLLs next to the exe (WILL likely drop to D3D11 — set SAILSIM_DXC_DLL_DIR)")
+    message(WARNING "[vr] SAILSIM_DXC_DLL_DIR not set — copying Dawn's built dxil.dll, which Dawn rejects as < 1.6 "
+                    "→ D3D12 init fails and falls back to D3D11 (white screen). Set -DSAILSIM_DXC_DLL_DIR to a "
+                    "folder with a release dxcompiler.dll + dxil.dll to get D3D12.")
   endif()
 endif()

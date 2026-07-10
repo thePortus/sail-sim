@@ -114,6 +114,14 @@ function caliberFor(slug, cannonUpgrade) {
   if (cannonUpgrade) return CALIBER_UPGRADED_BY_SLUG[slug] || ((CALIBER_BY_SLUG[slug] || 1.0) * 1.2);
   return CALIBER_BY_SLUG[slug] || 1.0;
 }
+// Carronades: fire at CARRONADE_V_FACTOR × ammo velocity (~31% range) but hit CARRONADE_DMG_MULT × harder.
+// Must match the client cannon.service constants.
+const CARRONADE_V_FACTOR = 0.56;
+const CARRONADE_DMG_MULT = 1.7;
+function carronadeBand(shotType) {
+  const v = shotDef(shotType).v * CARRONADE_V_FACTOR;
+  return { vMin: v * 0.70, vMax: v * 1.30 };
+}
 
 // Waterline bonus: a shot striking at/near the waterline holes the ship below the
 // floodline and hurts far more. Hull y runs 0 (waterline) .. DECK_Y (deck). A hit at or
@@ -202,6 +210,7 @@ module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
   HULL_DIMS_BY_SLUG, hullDimsFor, HULL_MAX_HALF_LEN,
+  CARRONADE_V_FACTOR, CARRONADE_DMG_MULT, carronadeBand,
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL, ARMOR_UPGRADE_MULT, ARMOR_ZONES,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, CALIBER_UPGRADED_BY_SLUG, caliberFor,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,

@@ -34,6 +34,16 @@ function gunLine(n, x, y, zMax) {
   }
   return { port, stbd };
 }
+// Two-battery layout from the actual model gun positions: `guns` = gun-deck long guns (full range),
+// `carr` = spar-deck CARRONADES (tagged carronade:true → short range + heavy; the client auto-holds them
+// beyond reach). Each is a stbd-side [x,y,z] list; port mirrors x. Muzzle flashes line up with the ports.
+function battery(guns, carr) {
+  const mk = (arr, c) => arr.map(([x, y, z]) => (c ? { x, y, z, carronade: true } : { x, y, z }));
+  const stbd = [...mk(guns, false), ...mk(carr, true)];
+  return { stbd, port: stbd.map(m => ({ ...m, x: -m.x })) };
+}
+const FRIG_LONG = [[5.6,4.0,16.6],[6.1,3.8,14.1],[6.5,3.6,11.5],[6.8,3.5,9.0],[7.1,3.3,6.5],[7.2,3.2,4.0],[7.3,3.1,1.5],[7.3,3.1,-1.0],[7.3,3.2,-3.5],[7.2,3.3,-6.0],[7.1,3.4,-8.5],[7.0,3.5,-11.0],[6.8,3.6,-13.5],[6.5,3.6,-16.0],[6.2,3.7,-18.6]];
+const FRIG_CARR = [[4.9,5.9,14.0],[5.3,5.6,10.6],[5.6,5.5,7.2],[5.8,5.3,3.8],[5.8,5.2,0.4],[5.8,5.3,-3.0],[5.8,5.4,-6.4],[5.7,5.5,-9.8],[5.6,5.6,-13.2],[5.4,5.7,-16.6],[5.1,5.9,-20.0]];
 
 // Per-vessel config consumed by the client:
 //   glb/manifest  — rigged asset + animation manifest under /geometry/
@@ -214,7 +224,7 @@ const VESSELS = [
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50 },
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
-    cannons: gunLine(12, 5.5, 3.3, 16),
+    cannons: battery(FRIG_LONG, FRIG_CARR),   // 15 long guns + 11 carronades
     zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
     crew: 16, cargo: 40, price: 750000, parts: [],
   },
@@ -224,7 +234,7 @@ const VESSELS = [
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55 },
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
-    cannons: gunLine(9, 5.5, 3.3, 15),
+    cannons: battery(FRIG_LONG, FRIG_CARR.slice(1, 9)),   // 15 long guns + 8 carronades
     zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
     crew: 14, cargo: 50, price: 500000, parts: [],
   },
@@ -234,7 +244,7 @@ const VESSELS = [
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60 },
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
-    cannons: gunLine(7, 5.5, 3.3, 14),
+    cannons: battery(FRIG_LONG.slice(0, 13), FRIG_CARR.slice(2, 8)),   // 13 long guns + 6 carronades
     zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
     crew: 12, cargo: 60, price: 350000, parts: [],
   },

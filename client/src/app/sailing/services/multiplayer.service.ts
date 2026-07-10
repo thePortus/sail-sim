@@ -304,7 +304,7 @@ export class MultiplayerService {
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
                   vx: number, vy: number, vz: number,
-                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape') => void) | null = null;
+                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape', carronade?: boolean) => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
   /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
@@ -312,9 +312,9 @@ export class MultiplayerService {
 
   broadcastShot(ox: number, oy: number, oz: number,
                 vx: number, vy: number, vz: number, seq: number,
-                shotType: 'round' | 'bar' | 'grape' = 'round'): void {
+                shotType: 'round' | 'bar' | 'grape' = 'round', carronade = false): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType, carronade: carronade ? 1 : 0 }));
   }
 
   /** Ask the server to restore our hull to full IN PLACE (dock "Repair Vessel"; no teleport). */
@@ -669,7 +669,8 @@ export class MultiplayerService {
       if (msg.id === this.myId) return;
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
                           String(msg.id), +msg.seq || 0,
-                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
+                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round',
+                          !!msg.carronade);
       this.players.get(String(msg.id))?.crew?.reactToFire('port');   // (P4) that ship's crew flinch at their own blast (side unused)
 
     } else if (msg.type === 'combat_hit') {

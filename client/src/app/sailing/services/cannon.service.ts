@@ -26,7 +26,9 @@ const BALL_POOL  = 24;           // max simultaneous cannonballs (broadsides = 3
 const ELEV_RAD   = 8 * Math.PI / 180;   // fixed launch elevation
 const MUZZLE_V_ROUND = 55;               // solid round shot muzzle velocity (m/s)
 const MUZZLE_V_BAR   = 37;               // bar shot: ~45% range (range ∝ v²) — must match server SHOT_TYPES.bar.v
-const MUZZLE_V_GRAPE = 26;               // grapeshot: ~22% range (shortest) — must match server SHOT_TYPES.grape.v
+const MUZZLE_V_GRAPE = 26;
+const CARRONADE_V_FACTOR = 0.56;   // carronades fire at 56% velocity → ~31% range (~100 m)
+const CARRONADE_RANGE    = 110;    // m — auto-hold cutoff (track CARRONADE_V_FACTOR² × long-gun reach)               // grapeshot: ~22% range (shortest) — must match server SHOT_TYPES.grape.v
 // Grapeshot fans a SPREAD of pellets out of each gun (a true canister burst). Each pellet is its own
 // server-adjudicated shot; the server attrites crew per pellet that connects.
 const GRAPE_PELLETS    = 5;               // pellets thrown per gun
@@ -58,7 +60,7 @@ const DECAL_MAX_PER_SHIP = 16;           // oldest scorch fades out once this ma
 // the 3 gunports. x = lateral (port = −x, starboard = +x); y = barrel height; z = fore/aft (bow = +Z).
 // Used when the vessel def carries no `cannons` layout. Per-vessel batteries (e.g. the pinnace's
 // single gun a side, opposite handedness) override this via syncGuns() reading VesselService.
-type Muz = { x: number; y: number; z: number };
+type Muz = { x: number; y: number; z: number; carronade?: boolean };
 const DEFAULT_MUZZLES: Record<'port' | 'stbd', Muz[]> = {
   port: [
     { x: -1.98, y: 1.50, z: 1.36 },
@@ -944,13 +946,31 @@ export class CannonService {
    *  battery still rolls down the side). Guns mid-reload simply don't fire → a partial broadside. */
   private fireLoaded(side: 'port' | 'stbd'): void {
     const g = this.gun[side];
+    const carrOk = this.hasTargetInCarronadeRange(side);   // carronades auto-hold beyond their short reach
     let order = 0;
     for (let i = 0; i < this.gunsPerSide; i++) {
+      if (this.muzzles[side][i]?.carronade && !carrOk) continue;      // out-of-range carronade → hold, stay loaded
       if (this.elapsed >= g.loadAt[i] && g.fireAt[i] === Infinity) {   // loaded + no shot already queued
         g.fireAt[i] = this.elapsed + order * (STAGGER_MIN + Math.random() * (STAGGER_MAX - STAGGER_MIN));
         order++;
       }
     }
+  }
+
+  /** True if an enemy sits on `side` within carronade reach — the auto-hold gate for the short-range battery. */
+  private hasTargetInCarronadeRange(side: 'port' | 'stbd'): boolean {
+    const enemies = this.multiplayerService.otherPlayers();
+    if (!enemies.length) return false;
+    const vs = this.vesselService.state();
+    const hRad = vs.heading * Math.PI / 180, sinH = Math.sin(hRad), cosH = Math.cos(hRad);
+    const beamX = side === 'port' ? -cosH : cosH, beamZ = side === 'port' ? sinH : -sinH;
+    const r2 = CARRONADE_RANGE * CARRONADE_RANGE;
+    for (const e of enemies) {
+      const dx = e.x - vs.x, dz = e.z - vs.z;
+      if (dx * dx + dz * dz > r2) continue;
+      if (dx * beamX + dz * beamZ > 0) return true;   // within reach AND on the firing side
+    }
+    return false;
   }
 
   /** Esc / stand-down: stow an arming/engaged side back to closed ports (no fire). */
@@ -1417,10 +1437,10 @@ export class CannonService {
     const dirX = side === 'port' ? -cosH :  cosH;   // raw beam (muzzle FX + grape spread fire out the rail)
     const dirZ = side === 'port' ?  sinH : -sinH;
     const elevRad = this.gunElevDeg() * Math.PI / 180;
-    const mv   = this.muzzleV();
-
     // Muzzle world position from this cannon's local offset, rotated by heading.
     const muz = this.muzzles[side][idx] ?? this.muzzles[side][0];
+    const isCarr = !!muz.carronade;                          // spar-deck carronade → short range + heavy ball
+    const mv   = this.muzzleV() * (isCarr ? CARRONADE_V_FACTOR : 1);
     const mwx = vs.x + muz.x * cosH + muz.z * sinH;
     const mwy = muz.y;
     const mwz = vs.z - muz.x * sinH + muz.z * cosH;
@@ -1451,7 +1471,7 @@ export class CannonService {
       }
       const seq = ++this.shotSeq;
       this.launchBall(mwx, mwy, mwz, bvx, vyk, bvz, myId, seq, kind);
-      this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vyk, bvz, seq, kind);
+      this.multiplayerService.broadcastShot(mwx, mwy, mwz, bvx, vyk, bvz, seq, kind, isCarr);
     }
     this.birds.startleAt(mwx, mwz);   // the bang flushes nearby resting gulls
     this.dolphins.scatterFrom(mwx, mwz);   // …and sends nearby dolphins bolting

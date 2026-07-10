@@ -287,7 +287,7 @@ export interface VesselPart {
 }
 
 /** One cannon muzzle in vessel-local space (+Z bow, +Y up). */
-export interface VesselCannon { x: number; y: number; z: number; }
+export interface VesselCannon { x: number; y: number; z: number; carronade?: boolean; }
 
 export interface Vessel {
   id:          number;

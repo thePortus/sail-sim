@@ -19,6 +19,7 @@
 #endif
 #include <windows.h>   // crash handler (SetUnhandledExceptionFilter) — see sailsimCrashHandler()
 #include <dbghelp.h>   // symbolize the crash backtrace (function names + file:line, if a PDB is present)
+#include <winver.h>    // GetFileVersionInfo — DXC DLL probe (which dxil.dll/dxcompiler.dll loads + its version)
 #endif
 
 #include <webgpu/webgpu.h>
@@ -3111,6 +3112,39 @@ static LONG WINAPI sailsimCrashHandler(EXCEPTION_POINTERS* ep) {
   std::fflush(stderr);
   return EXCEPTION_EXECUTE_HANDLER;   // log, then let the process terminate
 }
+
+// Probe a DXC runtime DLL the way Dawn's D3D12 backend will: LoadLibrary by bare name
+// (so we see the ACTUAL file the loader resolves — a stale C:\Windows\System32 copy would
+// hijack the one next to our exe), then report its on-disk version. Dawn requires
+// dxcompiler.dll + dxil.dll to load AND meet a minimum version; if either fails it prints
+// "DXC dlls were built, but are not available" and silently drops to D3D11 (no swapchain →
+// white screen). This tells us WHICH failure it is: wrong file, or too-old version.
+static void probeDxcDll(const char* name) {
+  HMODULE h = LoadLibraryA(name);
+  if (!h) {
+    std::fprintf(stderr, "[dxc-probe] LoadLibrary(\"%s\") FAILED (GetLastError=%lu)\n",
+                 name, (unsigned long)GetLastError());
+    return;
+  }
+  char path[MAX_PATH] = {0};
+  GetModuleFileNameA(h, path, MAX_PATH);
+  char ver[64] = "unknown";
+  DWORD ignored = 0;
+  DWORD vsz = GetFileVersionInfoSizeA(path, &ignored);
+  if (vsz) {
+    std::vector<char> buf(vsz);
+    if (GetFileVersionInfoA(path, 0, vsz, buf.data())) {
+      VS_FIXEDFILEINFO* ffi = nullptr; UINT ffiLen = 0;
+      if (VerQueryValueA(buf.data(), "\\", (void**)&ffi, &ffiLen) && ffi) {
+        std::snprintf(ver, sizeof(ver), "%u.%u.%u.%u",
+                      (unsigned)HIWORD(ffi->dwFileVersionMS), (unsigned)LOWORD(ffi->dwFileVersionMS),
+                      (unsigned)HIWORD(ffi->dwFileVersionLS), (unsigned)LOWORD(ffi->dwFileVersionLS));
+      }
+    }
+  }
+  std::fprintf(stderr, "[dxc-probe] \"%s\" -> %s  (version %s)\n", name, path, ver);
+  FreeLibrary(h);
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -3122,6 +3156,12 @@ int main(int argc, char** argv) {
   // line before a crash actually reaches the file — essential for diagnosing.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::setvbuf(stderr, nullptr, _IONBF, 0);
+#if defined(WEBGPU_BACKEND_DAWN)
+  // Dawn D3D12 loads these two at runtime; show exactly which files resolve + their versions
+  // so a search-order hijack or version-too-old (→ D3D11 fallback → white screen) is obvious.
+  probeDxcDll("dxcompiler.dll");
+  probeDxcDll("dxil.dll");
+#endif
 #else
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 #endif

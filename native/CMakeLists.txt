@@ -611,7 +611,7 @@ if (MSVC)
   # undo /DEBUG's default of keeping unreferenced code. dbghelp provides SymFromAddr/SymGetLine.
   target_compile_options(sailsim_native PRIVATE /Zi)
   target_link_options(sailsim_native PRIVATE /DEBUG /OPT:REF /OPT:ICF)
-  target_link_libraries(sailsim_native PRIVATE dbghelp)
+  target_link_libraries(sailsim_native PRIVATE dbghelp version)   # version: DXC DLL probe (GetFileVersionInfo)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()

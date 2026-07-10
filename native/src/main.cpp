@@ -10,6 +10,16 @@
 // header differs, the two request helpers below and the surface-status check are the
 // only spots likely to need a one-line reconcile — see native/README.md.
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // crash handler (SetUnhandledExceptionFilter) — see installCrashHandler()
+#endif
+
 #include <webgpu/webgpu.h>
 #if defined(WEBGPU_BACKEND_WGPU)
 #include <webgpu/wgpu.h>   // wgpu-native extensions (e.g. wgpuDevicePoll)
@@ -3050,9 +3060,39 @@ static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   return c;
 }
 
+#ifdef _WIN32
+// Basename of the module owning a code address (which DLL/exe a frame is in). No DbgHelp/PDB needed —
+// enough to tell whether a crash is inside dxcompiler.dll (a shader DXC choked on) vs the exe
+// (our code or the static-linked dawn_native/tint).
+static const char* sailsimModuleForAddr(void* addr) {
+  static char name[MAX_PATH];
+  HMODULE mod = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         (LPCSTR)addr, &mod) && GetModuleFileNameA(mod, name, MAX_PATH)) {
+    const char* b = name;
+    for (const char* p = name; *p; ++p) { if (*p == '\\' || *p == '/') { b = p + 1; } }
+    return b;
+  }
+  return "?";
+}
+static LONG WINAPI sailsimCrashHandler(EXCEPTION_POINTERS* ep) {
+  void* fault = ep->ExceptionRecord->ExceptionAddress;
+  std::fprintf(stderr, "\n[crash] exception 0x%08lx at %p in %s\n",
+               (unsigned long)ep->ExceptionRecord->ExceptionCode, fault, sailsimModuleForAddr(fault));
+  void* frames[24];
+  USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+  for (USHORT i = 0; i < n; ++i) {
+    std::fprintf(stderr, "[crash]  #%02u %p  %s\n", i, frames[i], sailsimModuleForAddr(frames[i]));
+  }
+  std::fflush(stderr);
+  return EXCEPTION_EXECUTE_HANDLER;   // log, then let the process terminate
+}
+#endif
+
 int main(int argc, char** argv) {
   // Flush per line so `[spike] …` progress shows even when piped or killed.
 #ifdef _WIN32
+  SetUnhandledExceptionFilter(sailsimCrashHandler);   // dump the faulting module + backtrace on a hard crash
   // Windows MSVCRT treats _IOLBF as FULL buffering, so a hard crash (access
   // violation) discards a redirected log entirely. Go unbuffered so the last
   // line before a crash actually reaches the file — essential for diagnosing.

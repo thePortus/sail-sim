@@ -3395,6 +3395,28 @@ int main(int argc, char** argv) {
   wgpuSurfaceGetCapabilities(surface, adapter, &caps);
   WGPUTextureFormat surfaceFormat = caps.formatCount > 0 ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
 
+  // Dump what the surface actually advertises for this adapter/backend. On Dawn-D3D12
+  // the flip-model swapchain only offers a subset of alpha/present modes, and picking
+  // one it doesn't support makes wgpuSurfaceGetCurrentTexture hand back a null texture
+  // (with a Success status) every frame — a silent white screen. Log it so a bad pick
+  // is obvious instead of invisible.
+  std::fprintf(stderr, "[boot] surface caps: formats=%zu presentModes=%zu alphaModes=%zu\n",
+               (size_t)caps.formatCount, (size_t)caps.presentModeCount, (size_t)caps.alphaModeCount);
+  for (size_t i = 0; i < caps.formatCount; ++i)
+    std::fprintf(stderr, "[boot]   format[%zu]=%d\n", i, (int)caps.formats[i]);
+  for (size_t i = 0; i < caps.alphaModeCount; ++i)
+    std::fprintf(stderr, "[boot]   alphaMode[%zu]=%d\n", i, (int)caps.alphaModes[i]);
+  for (size_t i = 0; i < caps.presentModeCount; ++i)
+    std::fprintf(stderr, "[boot]   presentMode[%zu]=%d\n", i, (int)caps.presentModes[i]);
+
+  // Alpha mode: D3D12 flip-model swapchains reject Auto — prefer Opaque if the surface
+  // lists it, else fall back to whatever it lists first, else Auto (wgpu-native path).
+  WGPUCompositeAlphaMode alphaMode = WGPUCompositeAlphaMode_Auto;
+  for (size_t i = 0; i < caps.alphaModeCount; ++i) {
+    if (caps.alphaModes[i] == WGPUCompositeAlphaMode_Opaque) { alphaMode = WGPUCompositeAlphaMode_Opaque; break; }
+    if (i == 0) alphaMode = caps.alphaModes[i];
+  }
+
   int fbWidth = 0, fbHeight = 0;
   glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
 
@@ -3405,12 +3427,12 @@ int main(int argc, char** argv) {
   surfaceConfig.width = (uint32_t)fbWidth;
   surfaceConfig.height = (uint32_t)fbHeight;
   surfaceConfig.presentMode = WGPUPresentMode_Fifo;   // vsync
-  surfaceConfig.alphaMode = WGPUCompositeAlphaMode_Auto;
+  surfaceConfig.alphaMode = alphaMode;
   if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
   wgpuSurfaceConfigure(surface, &surfaceConfig);
 
-  std::printf("[spike] surface configured: %dx%d format=%d — entering render loop\n",
-              fbWidth, fbHeight, (int)surfaceFormat);
+  std::printf("[spike] surface configured: %dx%d format=%d alphaMode=%d — entering render loop\n",
+              fbWidth, fbHeight, (int)surfaceFormat, (int)alphaMode);
 
   // Vessels are loaded lazily by slug and cached — you and remote players share a
   // hull's geometry (one copy), each drawn as its own instance. The owned hull is
@@ -9260,7 +9282,18 @@ int main(int argc, char** argv) {
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
     if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
                                  frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
-    if (!surfaceTex.texture) continue;  // e.g. minimised / needs reconfigure
+    if (!surfaceTex.texture) {
+      // No swapchain image this frame (minimised / needs reconfigure). Don't just
+      // `continue` — on Dawn that skips the end-of-frame wgpuDeviceTick below, so the
+      // swapchain never advances and every subsequent GetCurrentTexture is null too
+      // (a silent white-screen spin). Pump the backend before looping.
+#if defined(WEBGPU_BACKEND_DAWN)
+      wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+      wgpuDevicePoll(device, false, nullptr);
+#endif
+      continue;
+    }
 
     WGPUTextureView view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
 

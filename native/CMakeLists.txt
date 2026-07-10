@@ -132,6 +132,15 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
   # Dawn, from source, via Élie Michel's distribution. NOTE: on Apple Silicon this
   # still needs its vendored fuzzers (libprotobuf-mutator) disabled and an abseil
   # `-msse4.1`-on-arm64 issue resolved — see PORTING.md. Kept wired for later.
+  #
+  # Dawn UNCONDITIONALLY builds libprotobuf-mutator (third_party/CMakeLists.txt:
+  # `if(NOT TARGET libprotobuf-mutator) include(BUILD.cmake)`), a fuzzer-only dep that
+  # needs protobuf we never fetch (→ "google/protobuf/any.pb.h: No such file"). Pre-define
+  # the target as a stub so Dawn's guard skips it (nothing in a non-fuzzer build links it).
+  if (NOT TARGET libprotobuf-mutator)
+    add_library(libprotobuf-mutator INTERFACE)
+  endif()
+
   FetchContent_Declare(webgpu
     GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
     GIT_TAG        dawn-6512

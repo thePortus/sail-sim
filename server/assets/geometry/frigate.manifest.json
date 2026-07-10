@@ -1,0 +1,106 @@
+{
+  "schema_version": 2,
+  "name": "frigate_constitution",
+  "description": "Heavy 44-gun frigate (USS Constitution type). Three masts, fore + main + mizzen fully square-rigged with a mizzen spanker + gaff, jibs + staysails, complete standing + running rigging, copper-sheathed hull. Two full gun decks (gun-deck long guns + spar-deck carronades) with working port lids, twin bower anchors, working steering. Fully rigged + skinned + animated.",
+  "armature": "Frigate_Rig",
+  "axes": {
+    "build": "bow -Y, starboard +X, up +Z (brig convention)",
+    "gltf": "exported Y-up: bow = +Z, up = +Y, starboard = +X",
+    "note": "Controller orients the root to the game forward. Native negates projection X (handedness swap), so side-named clips (Gun_S, AnchorDrop_S) drive the OPPOSITE game side there — already handled in vessel_anim.cpp; clips are named by GAME side."
+  },
+  "materials": {
+    "note": "Procedural wood/paint/metal/copper baked to FOUR per-mesh atlases (merge-by-animation-safety; brig pattern). Each atlas = fr_albedo_<tag>.png (sRGB, ETC1S in GLB) + fr_orm_<tag> (R=occlusion, G=roughness, B=metallic; UASTC) + fr_normal_<tag> (UASTC). Babylon: metallicTexture=orm, useRoughnessFromMetallicTextureGreen, useMetallnessFromMetallicTextureBlue.",
+    "atlases": [
+      {"material": "FR_MATTE_Plank", "res": 4096, "uv": "atlas (cube-project)", "covers": "HERO hull planking + weather decks + copper sheathing + gunport stripe"},
+      {"material": "FR_MATTE_Hull", "res": 4096, "uv": "atlas (smart)", "covers": "static fittings: bulwarks, head, stern gallery, deck furniture, boats, carvings, iron/brass"},
+      {"material": "FR_MATTE_Rigging", "res": 2048, "uv": "atlas (smart)", "covers": "skinned spars: masts, yards, gaff, bowsprit, running/standing rope, guns, carriages, rudder, wheel, anchors + cables"},
+      {"material": "FR_MATTE_Ports", "res": 1024, "uv": "atlas (smart)", "covers": "the gun-deck + spar-deck port lids (Lid_S / Lid_P morph mesh)"}
+    ],
+    "kept_separate": [
+      {"material": "FR_CANVAS", "covers": "the 17 Sail_* meshes ONLY. MUST stay separate — the client SailBillowPlugin binds it + vertex-displaces it; sharing would billow the ship.", "roughness": 0.85},
+      {"material": "FR_ROPE", "covers": "Rig_SailSheets (the running-sheet/clew rope morph mesh)"},
+      {"material": "FR_GLASS", "covers": "lantern + window + binnacle + skylight glass (8 panes)", "emissive": true, "note": "warm emissiveFactor + KHR_materials_emissive_strength 4; add a Babylon glow layer for lit lanterns/windows"},
+      {"material": "FR_FLAG", "covers": "Frigate_Flags (5 flags merged)", "vertex_color": "COLOR_0", "note": "game flag-colour picker tints per-vertex"}
+    ]
+  },
+  "meshes": {
+    "note": "MERGED by animation-safety: 241 objects -> 24 meshes / ~24 draws. Frigate_Plank + Frigate_Hull = static; Frigate_Rigging = skinned morph-free (vertex groups preserved -> mast-fall/trim/guns/wheel/rudder/anchors deform); Frigate_Ports = the lid morph mesh; the 17 sails + Rig_SailSheets + Frigate_Flags + Frigate_Glass kept separate. Loader appends .NNN datablock suffixes; strip them.",
+    "sails": ["Sail_Fore_Course","Sail_Fore_Topsail","Sail_Fore_Topgallant","Sail_Fore_Royal","Sail_Main_Course","Sail_Main_Topsail","Sail_Main_Topgallant","Sail_Main_Royal","Sail_Mizzen_Topsail","Sail_Mizzen_Topgallant","Sail_Mizzen_Royal","Sail_ForeTopmastStaysail","Sail_Jib","Sail_FlyingJib","Sail_MainTopmastStaysail","Sail_MizzenTopmastStaysail","Sail_Spanker"],
+    "flags": ["Frigate_Flags"],
+    "rope_morph_meshes": ["Rig_SailSheets"],
+    "port_lid_mesh": "Frigate_Ports"
+  },
+  "clips": [
+    {"name": "Rudder", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Rudder"], "axis": "local Y", "meaning": {"0": "hard port -30deg", "0.5": "centred (frame 15)", "1": "hard starboard +30deg"}},
+    {"name": "Trim", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Yard_Fore","B_Yard_Main","B_Yard_Mizzen","B_Gaff"], "axis": "yards + gaff local Y yaw (all trim together; the gaff carries the spanker + ensign)", "meaning": {"0": "one tack -30deg", "0.5": "square", "1": "other tack +30deg"}},
+    {"name": "Gun_S", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Gun_S"], "axis": "location local Y (outboard)", "meaning": {"0": "run in", "1": "run out 0.8 m"}},
+    {"name": "Gun_P", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Gun_P"], "axis": "location local Y (outboard)", "meaning": {"0": "run in", "1": "run out 0.8 m"}},
+    {"name": "AnchorDrop_S", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Anchor_S"], "axis": "location local Y (= world down); AnchorCable_S pays out via gradient skin (no morph)", "meaning": {"0": "catted", "1": "lowered 3.4 m"}},
+    {"name": "AnchorDrop_P", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Anchor_P"], "axis": "location local Y (= world down); AnchorCable_P pays out", "meaning": {"0": "catted", "1": "lowered 3.4 m"}},
+    {"name": "MastDown_Fore", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Mast_Fore"], "axis": "local Z (topple sideways over the rail; +sign)", "meaning": {"0": "upright", "0.5": "cracked ~40deg", "1": "collapsed ~80deg"}, "note": "carries the fore yards+sails+flag; fore standing+running rig follows via foot->mast gradient; jibs drape on their stays"},
+    {"name": "MastDown_Main", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Mast_Main"], "axis": "local Z (opposite rail to fore; -sign)", "meaning": {"0": "upright", "0.5": "cracked", "1": "collapsed"}},
+    {"name": "MastDown_Mizzen", "kind": "scrub", "frame_range": [0,30], "targets": ["B_Mast_Mizzen"], "axis": "local Z (+sign; carries the spanker/gaff + ensign)", "meaning": {"0": "upright", "0.5": "cracked", "1": "collapsed"}}
+  ],
+  "morph_targets": {
+    "note": "DIRECT morph drive (no clip; the loader/controller prunes morph-weight channels). Each sail has a Furl key (0=set, 0.5=partial/reefed, 1=furled). The gun-port LIDS are morphs too (NOT bone clips like the merchantman): Frigate_Ports has Lid_S + Lid_P (0=closed, 1=open ~82deg), one per broadside (drives both gun-deck + spar-deck lids of that side).",
+    "sail_furl": {"mesh_per_sail": true, "target": "Furl"},
+    "lids": [
+      {"mesh": "Frigate_Ports", "target": "Lid_S", "meaning": {"0": "closed", "1": "starboard ports open ~82deg"}},
+      {"mesh": "Frigate_Ports", "target": "Lid_P", "meaning": {"0": "closed", "1": "port ports open ~82deg"}}
+    ]
+  },
+  "sail_sheet_pairs": {
+    "note": "When furling sail S to value v, set each listed rope morph to v too (sheets/clews gather with the sail).",
+    "Sail_Fore_Course": [{"object":"Rig_SailSheets","shape_key":"Furl_Fore_Course"}],
+    "Sail_Fore_Topsail": [{"object":"Rig_SailSheets","shape_key":"Furl_Fore_Topsail"}],
+    "Sail_Fore_Topgallant": [{"object":"Rig_SailSheets","shape_key":"Furl_Fore_Topgallant"}],
+    "Sail_Fore_Royal": [{"object":"Rig_SailSheets","shape_key":"Furl_Fore_Royal"}],
+    "Sail_Main_Course": [{"object":"Rig_SailSheets","shape_key":"Furl_Main_Course"}],
+    "Sail_Main_Topsail": [{"object":"Rig_SailSheets","shape_key":"Furl_Main_Topsail"}],
+    "Sail_Main_Topgallant": [{"object":"Rig_SailSheets","shape_key":"Furl_Main_Topgallant"}],
+    "Sail_Main_Royal": [{"object":"Rig_SailSheets","shape_key":"Furl_Main_Royal"}],
+    "Sail_Mizzen_Topsail": [{"object":"Rig_SailSheets","shape_key":"Furl_Mizzen_Topsail"}],
+    "Sail_Mizzen_Topgallant": [{"object":"Rig_SailSheets","shape_key":"Furl_Mizzen_Topgallant"}],
+    "Sail_Mizzen_Royal": [{"object":"Rig_SailSheets","shape_key":"Furl_Mizzen_Royal"}],
+    "Sail_ForeTopmastStaysail": [{"object":"Rig_SailSheets","shape_key":"Furl_ForeTopmastStaysail"}],
+    "Sail_Jib": [{"object":"Rig_SailSheets","shape_key":"Furl_Jib"}],
+    "Sail_FlyingJib": [{"object":"Rig_SailSheets","shape_key":"Furl_FlyingJib"}],
+    "Sail_MainTopmastStaysail": [{"object":"Rig_SailSheets","shape_key":"Furl_MainTopmastStaysail"}],
+    "Sail_MizzenTopmastStaysail": [{"object":"Rig_SailSheets","shape_key":"Furl_MizzenTopmastStaysail"}],
+    "Sail_Spanker": [{"object":"Rig_SailSheets","shape_key":"Furl_Spanker"}]
+  },
+  "free_rotation": {
+    "note": "No clip — drive in code. B_Wheel spins about its LOCAL Y (bone points along the fore-aft axle). Flags stream downwind + flutter; the ensign rides B_Gaff so it follows spanker trim then cancels the deviation to stay wind-aligned.",
+    "bones": ["B_Wheel","B_Flag_Ensign","B_Flag_Jack","B_Flag_Pennant","B_Flag_ForeSignal","B_Flag_MizzenSignal"],
+    "wheel_spin_axis": "B_Wheel local Y"
+  },
+  "gunnery": {
+    "note": "Per side: open the lid (Lid_{S|P} morph) then run the gun out (Gun_{S|P} clip); recoil reuses the run-out travel. Lids are MORPHS driven directly, guns are a bone clip scrubbed. ALL 3 armament variants are rigged to B_Gun_S/P, so whichever is shown animates.",
+    "sides": ["S","P"]
+  },
+  "variants": {
+    "note": "Armament loadout. All 3 gun sets ship IN the GLB as separate skinned meshes (each rigged to B_Gun_S/P); the client shows the active one + hides the other two. Driven by the vessel's `armament` field (server-authoritative; NPCs vary on spawn). Live test override: localStorage.ignis_fr_armament = heavy|medium|light.",
+    "field": "armament",
+    "default": "heavy",
+    "options": {
+      "heavy":  {"mesh": "Frigate_Guns_Heavy",  "label": "Heavy — full long guns + carronades (Constitution)"},
+      "medium": {"mesh": "Frigate_Guns_Medium", "label": "Medium battery"},
+      "light":  {"mesh": "Frigate_Guns_Light",  "label": "Light battery"}
+    }
+  },
+  "mast_damage": {
+    "schema": "three independent zones (fore, main, mizzen), driven from a single collective masts HP.",
+    "driver_formula": "frac = 1 - hp/maxHp; map onto each zone's window then scrub its MastDown clip. Ease over ~1.5-2.5 s.",
+    "hinge_note": "Mast topples about local Z (sideways over the rail, alternating sides); pole+tops+yards+sails follow (children); standing+running rigging follows via a foot->mast gradient skin so the rope FEET stay on the hull and stretch.",
+    "zones": [
+      {"id":"fore","fall_clip":"MastDown_Fore","hinge_bone":"B_Mast_Fore","break_morph":null},
+      {"id":"main","fall_clip":"MastDown_Main","hinge_bone":"B_Mast_Main","break_morph":null},
+      {"id":"mizzen","fall_clip":"MastDown_Mizzen","hinge_bone":"B_Mast_Mizzen","break_morph":null}
+    ],
+    "note": "Deck splinter morphs not yet authored (masts hinge clean at the deck) — later combat polish."
+  },
+  "constants": {
+    "rudder_max_deg": 30, "trim_max_deg": 30, "gun_run_m": 0.8,
+    "anchor_drop_m": 3.4, "lid_open_deg": 82, "clip_frame_end": 30
+  }
+}

@@ -841,6 +841,10 @@ export class VesselService {
     this.waterShadowMat.disableLighting = true;
     this.waterShadowMat.backFaceCulling = false;
     this.waterShadowMat.alpha = 0.90;
+    // Keep the water-shadow disc OUT of the SSR/SSAO prePass. It's a big (radius 16) flat StandardMaterial
+    // at the waterline with roughness 0 → SSR marched it as a perfect mirror, painting a hard-edged flat
+    // oval of sky/ship reflection under the ship that only read at low sun (dawn/dusk, bright horizon).
+    this.sceneService.excludeFromPrePass(this.waterShadowMat);
 
     this.waterShadow = MeshBuilder.CreateDisc('hullShadow', { radius: 16, tessellation: 32 }, scene);
     this.waterShadow.material = this.waterShadowMat;

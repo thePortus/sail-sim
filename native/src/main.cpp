@@ -3433,16 +3433,20 @@ int main(int argc, char** argv) {
   deviceDesc.label = "sailsim-device";
 #ifdef SAILSIM_HAVE_VR
   // VR needs the DXGI shared-handle features on the device (SharedTextureMemory interop). Request
-  // whatever the adapter supports; `vrFeats` must outlive requestDeviceSync.
+  // them UNCONDITIONALLY on Dawn-D3D12 (don't gate on wgpuAdapterHasFeature — it reported false for
+  // the game's surface-compatible adapter, so the feature was silently skipped and every
+  // shared-texture call failed). If truly unsupported, requestDevice returns null and we fail loudly.
+  // `vrFeats` must outlive requestDeviceSync.
   std::vector<WGPUFeatureName> vrFeats;
   if (vrMode) {
-    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedTextureMemoryDXGISharedHandle))
-      vrFeats.push_back(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
-    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedFenceDXGISharedHandle))
-      vrFeats.push_back(WGPUFeatureName_SharedFenceDXGISharedHandle);
+    bool hasTex = wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
+    bool hasFence = wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedFenceDXGISharedHandle);
+    vrFeats.push_back(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
+    vrFeats.push_back(WGPUFeatureName_SharedFenceDXGISharedHandle);
     deviceDesc.requiredFeatureCount = vrFeats.size();
-    deviceDesc.requiredFeatures = vrFeats.empty() ? nullptr : vrFeats.data();
-    std::printf("[vr] requesting %zu shared-handle device feature(s)\n", vrFeats.size());
+    deviceDesc.requiredFeatures = vrFeats.data();
+    std::printf("[vr] requesting shared-handle device features (adapter reports tex=%d fence=%d)\n",
+                (int)hasTex, (int)hasFence);
   }
 #endif
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);

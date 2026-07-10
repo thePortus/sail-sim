@@ -133,6 +133,14 @@ bool setupSwapchains(Bridge* b) {
     eye.mem = wgpuDeviceImportSharedTextureMemory(b->wdevice, &smd);
     CloseHandle(sh);
     if (!eye.mem) return false;
+    // A failed import (e.g. the device feature wasn't enabled) returns an INVALID-but-non-null
+    // object; GetProperties reports that so we fail here instead of at BeginAccess with a black screen.
+    WGPUSharedTextureMemoryProperties props = {};
+    if (wgpuSharedTextureMemoryGetProperties(eye.mem, &props) != WGPUStatus_Success) {
+      std::fprintf(stderr, "[vr] eye %u: imported shared texture is invalid — is the device's "
+                           "SharedTextureMemoryDXGISharedHandle feature enabled?\n", e);
+      return false;
+    }
     eye.tex = wgpuSharedTextureMemoryCreateTexture(eye.mem, nullptr);
     if (!eye.tex) return false;
     eye.view = wgpuTextureCreateView(eye.tex, nullptr);

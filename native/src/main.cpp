@@ -3471,8 +3471,22 @@ int main(int argc, char** argv) {
   if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
   wgpuSurfaceConfigure(surface, &surfaceConfig);
 
-  std::printf("[spike] surface configured: %dx%d format=%d alphaMode=%d — entering render loop\n",
-              fbWidth, fbHeight, (int)surfaceFormat, (int)alphaMode);
+  // Everything below goes to stderr (unbuffered) because the Windows console silently drops
+  // stdout under the asset-load flood. On Dawn, tick once so any surface-configure validation
+  // error lands in onDeviceError NOW (before the flood) instead of being deferred + lost.
+  std::fprintf(stderr, "[boot] surface configured: %dx%d format=%d alphaMode=%d presentMode=%d surface=%p\n",
+               fbWidth, fbHeight, (int)surfaceFormat, (int)alphaMode, (int)surfaceConfig.presentMode, (void*)surface);
+#if defined(WEBGPU_BACKEND_DAWN)
+  wgpuDeviceTick(device);
+  // Probe one acquire right here, before the render loop, so we know whether the swapchain
+  // yields a texture at all (isolates a config failure from something later in the frame).
+  {
+    WGPUSurfaceTexture stx = {};
+    wgpuSurfaceGetCurrentTexture(surface, &stx);
+    std::fprintf(stderr, "[boot] pre-loop acquire: texture=%p status=%u\n", (void*)stx.texture, (unsigned)stx.status);
+  }
+  wgpuDeviceTick(device);
+#endif
 
   // Vessels are loaded lazily by slug and cached — you and remote players share a
   // hull's geometry (one copy), each drawn as its own instance. The owned hull is

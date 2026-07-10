@@ -754,9 +754,21 @@ if (SAILSIM_VR)
   # before we wire Dawn's device (increment 2) + SharedTextureMemory (increment 3).
   if (WIN32)
     add_executable(sailsim_vr_spike src/vr_spike.cpp)
-    target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader d3d12 dxgi)
     target_include_directories(sailsim_vr_spike PRIVATE "${openxr_SOURCE_DIR}/include")
-    message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike)")
+    if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
+      # Increment 2: link Dawn so the spike can drive OpenXR with Dawn's ID3D12Device.
+      # `webgpu` brings <webgpu/webgpu.h> + WEBGPU_BACKEND_DAWN; `dawn_native` brings
+      # dawn::native::d3d12::GetD3D12Device + <dawn/native/D3D12Backend.h>. Add dawn-src/include
+      # explicitly in case dawn_native doesn't propagate it as an INTERFACE include dir.
+      target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader webgpu dawn_native d3d12 dxgi)
+      if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+        target_include_directories(sailsim_vr_spike PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+      endif()
+      message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, DAWN device)")
+    else()
+      target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader d3d12 dxgi)
+      message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, own device)")
+    endif()
   endif()
 
   # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile

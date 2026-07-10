@@ -28,6 +28,14 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+// Increment 2: when built with the Dawn backend, drive the OpenXR session with DAWN's own
+// ID3D12Device (so increment 3 can render the real scene via wgpu into the XR swapchain).
+// Without the Dawn backend the spike falls back to its own D3D12 device (increment 1).
+#if defined(WEBGPU_BACKEND_DAWN)
+#include <webgpu/webgpu.h>
+#include <dawn/native/D3D12Backend.h>
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -82,6 +90,39 @@ struct EyeSwapchain {
   UINT rtvStride = 0;
   DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
 };
+
+#if defined(WEBGPU_BACKEND_DAWN)
+// Minimal synchronous Dawn adapter/device requests. Dawn resolves the callbacks while its
+// instance event loop is pumped, so spin wgpuInstanceProcessEvents until they fire.
+WGPUAdapter requestAdapterSync(WGPUInstance instance) {
+  struct S { WGPUAdapter adapter; bool done; } s{nullptr, false};
+  WGPURequestAdapterOptions opt{};
+  opt.powerPreference = WGPUPowerPreference_HighPerformance;
+  wgpuInstanceRequestAdapter(instance, &opt,
+    [](WGPURequestAdapterStatus status, WGPUAdapter a, char const* msg, void* ud) {
+      auto* s = static_cast<S*>(ud);
+      if (status == WGPURequestAdapterStatus_Success) s->adapter = a;
+      else std::fprintf(stderr, "[vr-spike] requestAdapter failed: %s\n", msg ? msg : "(no message)");
+      s->done = true;
+    }, &s);
+  for (int i = 0; i < 10000 && !s.done; ++i) wgpuInstanceProcessEvents(instance);
+  return s.adapter;
+}
+WGPUDevice requestDeviceSync(WGPUInstance instance, WGPUAdapter adapter) {
+  struct S { WGPUDevice device; bool done; } s{nullptr, false};
+  WGPUDeviceDescriptor dd{};
+  dd.label = "sailsim-vr-spike-device";
+  wgpuAdapterRequestDevice(adapter, &dd,
+    [](WGPURequestDeviceStatus status, WGPUDevice d, char const* msg, void* ud) {
+      auto* s = static_cast<S*>(ud);
+      if (status == WGPURequestDeviceStatus_Success) s->device = d;
+      else std::fprintf(stderr, "[vr-spike] requestDevice failed: %s\n", msg ? msg : "(no message)");
+      s->done = true;
+    }, &s);
+  for (int i = 0; i < 10000 && !s.done; ++i) wgpuInstanceProcessEvents(instance);
+  return s.device;
+}
+#endif
 
 XrResult run() {
   // 1. Runtime up? Enumerate instance extensions (first runtime call).
@@ -140,7 +181,35 @@ XrResult run() {
               (unsigned long)reqs.adapterLuid.HighPart, (unsigned long)reqs.adapterLuid.LowPart,
               (unsigned)reqs.minFeatureLevel);
 
-  // 5. Create a plain D3D12 device on THAT adapter (LUID must match or the runtime rejects the session).
+  // 5. Obtain the D3D12 device the OpenXR session will render with, on the required adapter.
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12CommandQueue> queue;
+
+#if defined(WEBGPU_BACKEND_DAWN)
+  // Increment 2: use DAWN's D3D12 device. Create a minimal Dawn device (Dawn selects the
+  // adapter), extract its ID3D12Device via the native interop, and make our OWN command queue
+  // on it (6512's D3D12Backend.h has no queue accessor; a second queue on the device is fine).
+  WGPUInstance winst = wgpuCreateInstance(nullptr);
+  if (!winst) { std::fprintf(stderr, "[vr-spike] wgpuCreateInstance failed\n"); return XR_ERROR_RUNTIME_FAILURE; }
+  WGPUAdapter wadapter = requestAdapterSync(winst);
+  if (!wadapter) { std::fprintf(stderr, "[vr-spike] no WebGPU adapter\n"); return XR_ERROR_RUNTIME_FAILURE; }
+  WGPUDevice wdevice = requestDeviceSync(winst, wadapter);
+  if (!wdevice) { std::fprintf(stderr, "[vr-spike] no WebGPU device\n"); return XR_ERROR_RUNTIME_FAILURE; }
+  device = dawn::native::d3d12::GetD3D12Device(wdevice);
+  if (!device) { std::fprintf(stderr, "[vr-spike] GetD3D12Device returned null (Dawn not on D3D12?)\n");
+                 return XR_ERROR_RUNTIME_FAILURE; }
+  LUID dawnLuid = device->GetAdapterLuid();
+  std::printf("[vr-spike] using DAWN's ID3D12Device (adapter LUID %08lx:%08lx)\n",
+              (unsigned long)dawnLuid.HighPart, (unsigned long)dawnLuid.LowPart);
+  if (dawnLuid.LowPart != reqs.adapterLuid.LowPart || dawnLuid.HighPart != reqs.adapterLuid.HighPart) {
+    std::fprintf(stderr, "[vr-spike] WARNING: Dawn's adapter LUID != OpenXR-required LUID — the runtime "
+                         "may reject the session (multi-GPU: force Dawn onto the XR adapter).\n");
+  }
+  D3D12_COMMAND_QUEUE_DESC qd{};
+  qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  HR_TRY(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
+#else
+  // Increment 1: our own plain D3D12 device on the OpenXR-required adapter (LUID match).
   ComPtr<IDXGIFactory4> factory;
   HR_TRY(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   ComPtr<IDXGIAdapter1> adapter;
@@ -159,14 +228,11 @@ XrResult run() {
   }
   if (!found) { std::fprintf(stderr, "[vr-spike] no DXGI adapter matches the OpenXR-required LUID\n");
                 return XR_ERROR_RUNTIME_FAILURE; }
-
-  ComPtr<ID3D12Device> device;
   HR_TRY(D3D12CreateDevice(adapter.Get(), reqs.minFeatureLevel, IID_PPV_ARGS(&device)));
-
-  ComPtr<ID3D12CommandQueue> queue;
   D3D12_COMMAND_QUEUE_DESC qd{};
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   HR_TRY(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
+#endif
 
   ComPtr<ID3D12CommandAllocator> cmdAlloc;
   HR_TRY(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAlloc)));

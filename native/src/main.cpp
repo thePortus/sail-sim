@@ -2490,6 +2490,8 @@ static void captureSurface(WGPUDevice device, WGPUQueue queue, WGPUTexture tex,
   while (!st.done) {
 #if defined(WEBGPU_BACKEND_WGPU)
     wgpuDevicePoll(device, true, nullptr);
+#else
+    wgpuDeviceTick(device);   // Dawn: pump the event loop so the map callback resolves
 #endif
   }
   const uint8_t* mapped = (const uint8_t*)wgpuBufferGetConstMappedRange(rb, 0, bufSize);
@@ -4344,12 +4346,14 @@ int main(int argc, char** argv) {
   bool prevAnchoredEdge = false;
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
+  std::fprintf(stderr, "[boot] render resources built; entering render loop\n");
   while (!glfwWindowShouldClose(window)) {
     if (vessel.anchored && !prevAnchoredEdge) ownAnchorSide = (std::rand() & 1) ? 'P' : 'S';
     prevAnchoredEdge = vessel.anchored;
     glfwPollEvents();
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
+    if (frame == 1) std::fprintf(stderr, "[boot] frame 1: top of loop\n");
 
     // Adaptive resolution (client scene.service): measure real frame time over a
     // ~0.5 s window and nudge adaptiveFactor to hold the target budget — shed 5%
@@ -9254,6 +9258,8 @@ int main(int argc, char** argv) {
 
     WGPUSurfaceTexture surfaceTex;
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
+    if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
+                                 frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
     if (!surfaceTex.texture) continue;  // e.g. minimised / needs reconfigure
 
     WGPUTextureView view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
@@ -10026,6 +10032,7 @@ int main(int argc, char** argv) {
     // (ocean bind groups are cached now — released only on rebuild, not per frame)
     wgpuTextureViewRelease(view);
 
+    if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: presenting\n", frame);
 #ifndef __EMSCRIPTEN__
     wgpuSurfacePresent(surface);
 #endif

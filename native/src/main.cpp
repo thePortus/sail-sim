@@ -3477,15 +3477,7 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[boot] surface configured: %dx%d format=%d alphaMode=%d presentMode=%d surface=%p\n",
                fbWidth, fbHeight, (int)surfaceFormat, (int)alphaMode, (int)surfaceConfig.presentMode, (void*)surface);
 #if defined(WEBGPU_BACKEND_DAWN)
-  wgpuDeviceTick(device);
-  // Probe one acquire right here, before the render loop, so we know whether the swapchain
-  // yields a texture at all (isolates a config failure from something later in the frame).
-  {
-    WGPUSurfaceTexture stx = {};
-    wgpuSurfaceGetCurrentTexture(surface, &stx);
-    std::fprintf(stderr, "[boot] pre-loop acquire: texture=%p status=%u\n", (void*)stx.texture, (unsigned)stx.status);
-  }
-  wgpuDeviceTick(device);
+  wgpuDeviceTick(device);   // flush any surface-configure validation error to onDeviceError now
 #endif
 
   // Vessels are loaded lazily by slug and cached — you and remote players share a
@@ -9337,16 +9329,28 @@ int main(int argc, char** argv) {
     if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
                                  frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
     if (!surfaceTex.texture) {
-      // No swapchain image this frame (minimised / needs reconfigure). Don't just
-      // `continue` — on Dawn that skips the end-of-frame wgpuDeviceTick below, so the
-      // swapchain never advances and every subsequent GetCurrentTexture is null too
-      // (a silent white-screen spin). Pump the backend before looping.
+      // The acquire right after wgpuSurfaceConfigure yields a valid texture, but here — at the
+      // END of the frame, after all the offscreen render work — Dawn's DXGI (D3D11/D3D12)
+      // swapchain hands back null. A full pass of queue submits between configure and this
+      // acquire leaves the flip-model swapchain stale; reconfiguring rebuilds it. Retry once.
+      wgpuSurfaceConfigure(surface, &surfaceConfig);
 #if defined(WEBGPU_BACKEND_DAWN)
       wgpuDeviceTick(device);
 #elif defined(WEBGPU_BACKEND_WGPU)
       wgpuDevicePoll(device, false, nullptr);
 #endif
-      continue;
+      wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
+      if (frame <= 8) std::fprintf(stderr, "[boot] frame %ld: after reconfigure retry, texture=%p status=%d\n",
+                                   frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
+      if (!surfaceTex.texture) {
+        // Still nothing (genuinely minimised / occluded). Pump the backend and skip the frame.
+#if defined(WEBGPU_BACKEND_DAWN)
+        wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+        wgpuDevicePoll(device, false, nullptr);
+#endif
+        continue;
+      }
     }
 
     WGPUTextureView view = wgpuTextureCreateView(surfaceTex.texture, nullptr);

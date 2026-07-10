@@ -741,4 +741,17 @@ if (SAILSIM_VR)
   # openxr_loader usually propagates its include dir; add it explicitly in case it doesn't.
   target_include_directories(sailsim_vr_probe PRIVATE "${openxr_SOURCE_DIR}/include")
   message(STATUS "SAILSIM_VR ON — building sailsim_vr_probe (OpenXR ${openxr_SOURCE_DIR})")
+
+  # Dawn's D3D12 backend loads dxcompiler.dll (+ dxil.dll, for shader signing) at RUNTIME via
+  # LoadLibrary from the exe dir. They build to ${CMAKE_BINARY_DIR}/$<CONFIG>/, not next to the exe,
+  # so D3D12 init fails ("DXC dlls were built, but are not available") and Dawn falls back to D3D11 —
+  # which then dies when the render loop hits features D3D11 lacks. Copy both next to the exe.
+  if (TARGET dxcompiler AND TARGET sailsim_native)
+    add_custom_command(TARGET sailsim_native POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:dxcompiler>" "$<TARGET_FILE_DIR:sailsim_native>"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE_DIR:dxcompiler>/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+      COMMENT "Copying DXC runtime DLLs (dxcompiler.dll, dxil.dll) next to the exe (D3D12 backend)")
+  endif()
 endif()

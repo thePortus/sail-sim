@@ -1005,6 +1005,22 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
   VesselSpec spec = vesselSpecFor(slug);
   float horiz = std::max(extent.x, extent.z);   // hull length runs along the longer axis
   Mesh mesh = createMesh(device, queue, fmt, std::move(data));
+  // Armament variants: the frigate GLB carries all three gun batteries (Frigate_Guns_Heavy/Medium/Light) as
+  // separate submeshes; the vessel cache is keyed by slug (frigate_heavy/medium/light), so for THIS slug hide
+  // the other two by zeroing their draw range — every render pass draws by submesh.indexCount, so 0 = skipped.
+  if (slug.rfind("frigate", 0) == 0) {
+    std::string want = "heavy";                        // default when the slug has no variant suffix
+    auto us = slug.find('_'); if (us != std::string::npos) want = slug.substr(us + 1);
+    int hidden = 0;
+    for (RigSubmesh& sm : mesh.submeshes) {
+      auto p = sm.name.find("Frigate_Guns_");
+      if (p == std::string::npos) continue;
+      std::string v = sm.name.substr(p + 13);          // "Heavy" / "Medium" / "Light" (+ any datablock suffix)
+      for (char& c : v) c = (char)std::tolower((unsigned char)c);
+      if (v.rfind(want, 0) != 0) { sm.indexCount = 0; ++hidden; }   // not the active loadout → draw nothing
+    }
+    printf("[frigate] %s: showing '%s' battery, hid %d other-variant gun submesh(es)\n", slug.c_str(), want.c_str(), hidden);
+  }
   mesh.manifestPath = manifestPath;
   mesh.shipScale  = (horiz > 1e-6f) ? (2.0f * spec.hullHalfLen / horiz) : 1.0f;
   mesh.keelCenter = glm::vec3(center.x, bbMin.y, center.z);
@@ -3368,6 +3384,7 @@ int main(int argc, char** argv) {
     // (orientation/scale), else fall back to a neutral "__cli" default.
     std::string mp = modelArg, cliSlug = "__cli";
     if (mp.find("merchantman") != std::string::npos)      cliSlug = "merchantman";
+    else if (mp.find("frigate") != std::string::npos)     cliSlug = "frigate";   // model-viewer: heavy battery default
     else if (mp.find("brig") != std::string::npos)        cliSlug = "brig";
     else if (mp.find("pinnace") != std::string::npos)     cliSlug = "pinnace";
     else if (mp.find("sloop") != std::string::npos)       cliSlug = "sloop";

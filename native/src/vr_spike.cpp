@@ -1,0 +1,412 @@
+// ── OpenXR D3D12 render spike (VR P0.1, increment 1) ─────────────────────────
+//
+// Retires the biggest VR risk — "does OpenXR D3D12 rendering actually reach the
+// headset through Meta Link / Virtual Desktop" — with the SMALLEST possible code
+// and NO Dawn dependency. It creates its OWN plain D3D12 device (on the adapter
+// OpenXR requires), opens an OpenXR session with the D3D12 graphics binding, makes
+// a stereo swapchain per eye, and every frame clears each eye to a slowly pulsing
+// solid colour (left warm, right cool) submitted as a projection composition layer.
+//
+// Because it uses raw D3D12 (no webgpu / no Dawn / no DXC), it builds in seconds and
+// iterates without the Dawn rebuild. Exit criteria: two solid, head-STABLE colour
+// fields in the headset over Link AND Virtual Desktop, head pose logged live. Once
+// green, increment 2 swaps this throwaway D3D12 device for Dawn's ID3D12Device
+// (dawn::native::d3d12::GetD3D12Device), then increment 3 renders via Dawn into the
+// XR swapchain through SharedTextureMemory. See native/VR_PLAN.md.
+//
+// Build:  cmake -S native -B build-win-vr -DSAILSIM_VR=ON  (Dawn backend not required
+//         for THIS target) && cmake --build build-win-vr --target sailsim_vr_spike --config Release
+// Run:    build-win-vr\bin\Release\sailsim_vr_spike.exe   (Link / Virtual Desktop active, headset on)
+
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+
+#define XR_USE_GRAPHICS_API_D3D12
+#define XR_USE_PLATFORM_WIN32
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+// ── error plumbing ───────────────────────────────────────────────────────────
+std::string xrStr(XrInstance instance, XrResult r) {
+  if (instance != XR_NULL_HANDLE) {
+    char buf[XR_MAX_RESULT_STRING_SIZE] = {0};
+    if (XR_SUCCEEDED(xrResultToString(instance, r, buf)) && buf[0]) return buf;
+  }
+  return std::to_string(static_cast<int>(r));
+}
+
+XrInstance gInstance = XR_NULL_HANDLE;   // for the macros' message lookup
+
+#define XR_TRY(call)                                                                     \
+  do {                                                                                   \
+    XrResult _r = (call);                                                                \
+    if (XR_FAILED(_r)) {                                                                 \
+      std::fprintf(stderr, "[vr-spike] %s FAILED: %s\n", #call, xrStr(gInstance, _r).c_str()); \
+      return _r;                                                                         \
+    }                                                                                    \
+  } while (0)
+
+#define HR_TRY(call)                                                                     \
+  do {                                                                                   \
+    HRESULT _hr = (call);                                                                \
+    if (FAILED(_hr)) {                                                                    \
+      std::fprintf(stderr, "[vr-spike] %s FAILED: HRESULT 0x%08lx\n", #call, (unsigned long)_hr); \
+      return XR_ERROR_RUNTIME_FAILURE;                                                    \
+    }                                                                                    \
+  } while (0)
+
+bool hasExt(const std::vector<XrExtensionProperties>& exts, const char* name) {
+  for (const auto& e : exts) if (std::strcmp(e.extensionName, name) == 0) return true;
+  return false;
+}
+
+// One eye's swapchain + its D3D12 back-buffer images and render-target views.
+struct EyeSwapchain {
+  XrSwapchain handle = XR_NULL_HANDLE;
+  uint32_t width = 0, height = 0;
+  std::vector<XrSwapchainImageD3D12KHR> images;   // .texture is ID3D12Resource*
+  ComPtr<ID3D12DescriptorHeap> rtvHeap;
+  UINT rtvStride = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+};
+
+XrResult run() {
+  // 1. Runtime up? Enumerate instance extensions (first runtime call).
+  uint32_t extCount = 0;
+  {
+    XrResult r = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+    if (XR_FAILED(r)) {
+      std::fprintf(stderr, "[vr-spike] no active OpenXR runtime (%s). Start Link / Virtual Desktop, headset on.\n",
+                   xrStr(XR_NULL_HANDLE, r).c_str());
+      return r;
+    }
+  }
+  std::vector<XrExtensionProperties> exts(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
+  XR_TRY(xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data()));
+  if (!hasExt(exts, XR_KHR_D3D12_ENABLE_EXTENSION_NAME)) {
+    std::fprintf(stderr, "[vr-spike] runtime does NOT advertise %s — cannot use the D3D12 binding.\n",
+                 XR_KHR_D3D12_ENABLE_EXTENSION_NAME);
+    return XR_ERROR_EXTENSION_NOT_PRESENT;
+  }
+
+  // 2. Instance with the D3D12 graphics binding extension enabled.
+  const char* enabledExts[] = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME };
+  XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
+  std::snprintf(ci.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "sailsim-vr-spike");
+  ci.applicationInfo.applicationVersion = 1;
+  std::snprintf(ci.applicationInfo.engineName, XR_MAX_ENGINE_NAME_SIZE, "%s", "sailsim");
+  ci.applicationInfo.engineVersion = 1;
+  ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);   // maximally compatible (see vr_probe)
+  ci.enabledExtensionCount = 1;
+  ci.enabledExtensionNames = enabledExts;
+  XR_TRY(xrCreateInstance(&ci, &gInstance));
+  XrInstance instance = gInstance;
+
+  XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
+  XR_TRY(xrGetInstanceProperties(instance, &ip));
+  std::printf("[vr-spike] runtime: \"%s\" %u.%u.%u\n", ip.runtimeName,
+              XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
+              XR_VERSION_PATCH(ip.runtimeVersion));
+
+  // 3. HMD system.
+  XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
+  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+  XrSystemId systemId = XR_NULL_SYSTEM_ID;
+  XR_TRY(xrGetSystem(instance, &sgi, &systemId));
+
+  // 4. D3D12 graphics requirements → which adapter (LUID) + min feature level OpenXR needs.
+  //    xrGetD3D12GraphicsRequirementsKHR is an extension entry point — load it dynamically.
+  PFN_xrGetD3D12GraphicsRequirementsKHR pfnGetReqs = nullptr;
+  XR_TRY(xrGetInstanceProcAddr(instance, "xrGetD3D12GraphicsRequirementsKHR",
+                               reinterpret_cast<PFN_xrVoidFunction*>(&pfnGetReqs)));
+  if (!pfnGetReqs) { std::fprintf(stderr, "[vr-spike] xrGetD3D12GraphicsRequirementsKHR not found\n");
+                     return XR_ERROR_FUNCTION_UNSUPPORTED; }
+  XrGraphicsRequirementsD3D12KHR reqs{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+  XR_TRY(pfnGetReqs(instance, systemId, &reqs));
+  std::printf("[vr-spike] D3D12 requirements: adapterLUID=%08lx:%08lx minFeatureLevel=0x%x\n",
+              (unsigned long)reqs.adapterLuid.HighPart, (unsigned long)reqs.adapterLuid.LowPart,
+              (unsigned)reqs.minFeatureLevel);
+
+  // 5. Create a plain D3D12 device on THAT adapter (LUID must match or the runtime rejects the session).
+  ComPtr<IDXGIFactory4> factory;
+  HR_TRY(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+  ComPtr<IDXGIAdapter1> adapter;
+  bool found = false;
+  for (UINT i = 0; factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+    DXGI_ADAPTER_DESC1 desc{};
+    adapter->GetDesc1(&desc);
+    if (desc.AdapterLuid.LowPart == reqs.adapterLuid.LowPart &&
+        desc.AdapterLuid.HighPart == reqs.adapterLuid.HighPart) {
+      char name[128] = {0};
+      std::snprintf(name, sizeof(name), "%ls", desc.Description);
+      std::printf("[vr-spike] using adapter: %s\n", name);
+      found = true;
+      break;
+    }
+  }
+  if (!found) { std::fprintf(stderr, "[vr-spike] no DXGI adapter matches the OpenXR-required LUID\n");
+                return XR_ERROR_RUNTIME_FAILURE; }
+
+  ComPtr<ID3D12Device> device;
+  HR_TRY(D3D12CreateDevice(adapter.Get(), reqs.minFeatureLevel, IID_PPV_ARGS(&device)));
+
+  ComPtr<ID3D12CommandQueue> queue;
+  D3D12_COMMAND_QUEUE_DESC qd{};
+  qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  HR_TRY(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
+
+  ComPtr<ID3D12CommandAllocator> cmdAlloc;
+  HR_TRY(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAlloc)));
+  ComPtr<ID3D12GraphicsCommandList> cmdList;
+  HR_TRY(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAlloc.Get(), nullptr,
+                                   IID_PPV_ARGS(&cmdList)));
+  cmdList->Close();
+  ComPtr<ID3D12Fence> fence;
+  HR_TRY(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+  UINT64 fenceVal = 0;
+  HANDLE fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
+  // 6. Session with the D3D12 binding (our device + queue).
+  XrGraphicsBindingD3D12KHR gb{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
+  gb.device = device.Get();
+  gb.queue  = queue.Get();
+  XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
+  sci.next = &gb;
+  sci.systemId = systemId;
+  XrSession session = XR_NULL_HANDLE;
+  XR_TRY(xrCreateSession(instance, &sci, &session));
+  std::printf("[vr-spike] session created (D3D12 binding accepted).\n");
+
+  // 7. Reference space (seated LOCAL) for the composition layer poses.
+  XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+  rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+  rsci.poseInReferenceSpace.orientation.w = 1.0f;   // identity
+  XrSpace appSpace = XR_NULL_HANDLE;
+  XR_TRY(xrCreateReferenceSpace(session, &rsci, &appSpace));
+
+  // 8. View config (stereo, 2 eyes) + per-eye size.
+  uint32_t viewCount = 0;
+  XR_TRY(xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                           0, &viewCount, nullptr));
+  std::vector<XrViewConfigurationView> viewConfigs(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+  XR_TRY(xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                           viewCount, &viewCount, viewConfigs.data()));
+
+  // 9. Pick a colour swapchain format the runtime supports (prefer 8-bit sRGB).
+  uint32_t fmtCount = 0;
+  XR_TRY(xrEnumerateSwapchainFormats(session, 0, &fmtCount, nullptr));
+  std::vector<int64_t> fmts(fmtCount);
+  XR_TRY(xrEnumerateSwapchainFormats(session, fmtCount, &fmtCount, fmts.data()));
+  auto supports = [&](int64_t f) { for (auto x : fmts) if (x == f) return true; return false; };
+  DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+  if      (supports(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+  else if (supports(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+  else if (fmtCount > 0)                               colorFormat = (DXGI_FORMAT)fmts[0];
+  std::printf("[vr-spike] swapchain colour format: %d\n", (int)colorFormat);
+
+  // 10. One swapchain per eye + RTVs for each of its images.
+  std::vector<EyeSwapchain> eyes(viewCount);
+  for (uint32_t e = 0; e < viewCount; ++e) {
+    EyeSwapchain& eye = eyes[e];
+    eye.width  = viewConfigs[e].recommendedImageRectWidth;
+    eye.height = viewConfigs[e].recommendedImageRectHeight;
+    eye.format = colorFormat;
+
+    XrSwapchainCreateInfo scci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    scci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    scci.format = colorFormat;
+    scci.width = eye.width;
+    scci.height = eye.height;
+    scci.sampleCount = 1;
+    scci.faceCount = 1;
+    scci.arraySize = 1;
+    scci.mipCount = 1;
+    XR_TRY(xrCreateSwapchain(session, &scci, &eye.handle));
+
+    uint32_t imgCount = 0;
+    XR_TRY(xrEnumerateSwapchainImages(eye.handle, 0, &imgCount, nullptr));
+    eye.images.assign(imgCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    XR_TRY(xrEnumerateSwapchainImages(eye.handle, imgCount, &imgCount,
+                                      reinterpret_cast<XrSwapchainImageBaseHeader*>(eye.images.data())));
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = imgCount;
+    HR_TRY(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&eye.rtvHeap)));
+    eye.rtvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = eye.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_RENDER_TARGET_VIEW_DESC rtvd{};
+    rtvd.Format = colorFormat;
+    rtvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    for (uint32_t i = 0; i < imgCount; ++i) {
+      device->CreateRenderTargetView(eye.images[i].texture, &rtvd, rtv);
+      rtv.ptr += eye.rtvStride;
+    }
+    std::printf("[vr-spike] eye %u swapchain: %ux%u, %u images\n", e, eye.width, eye.height, imgCount);
+  }
+
+  // 11. Frame loop, driven by the OpenXR session state machine.
+  bool running = false;      // between xrBeginSession and xrEndSession
+  bool exitLoop = false;
+  XrSessionState state = XR_SESSION_STATE_UNKNOWN;
+  long frame = 0;
+
+  while (!exitLoop) {
+    // Drain events (session-state transitions).
+    XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(instance, &ev) == XR_SUCCESS) {
+      if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+        auto* ssc = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
+        state = ssc->state;
+        if (state == XR_SESSION_STATE_READY) {
+          XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
+          bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+          XR_TRY(xrBeginSession(session, &bi));
+          running = true;
+          std::printf("[vr-spike] session READY → begun.\n");
+        } else if (state == XR_SESSION_STATE_STOPPING) {
+          XR_TRY(xrEndSession(session));
+          running = false;
+          std::printf("[vr-spike] session STOPPING → ended.\n");
+        } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
+          exitLoop = true;
+          std::printf("[vr-spike] session exiting.\n");
+        }
+      } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+        exitLoop = true;
+      }
+      ev = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+
+    if (!running) {
+      // Not rendering yet (idle/synchronized handshake) — yield briefly.
+      Sleep(10);
+      continue;
+    }
+
+    // Pace to the compositor.
+    XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    XR_TRY(xrWaitFrame(session, &fwi, &fs));
+
+    XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
+    XR_TRY(xrBeginFrame(session, &fbi));
+
+    std::vector<XrCompositionLayerProjectionView> projViews;
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+
+    if (fs.shouldRender) {
+      // Locate the eyes for this predicted display time.
+      XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+      vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+      vli.displayTime = fs.predictedDisplayTime;
+      vli.space = appSpace;
+      XrViewState vs{XR_TYPE_VIEW_STATE};
+      std::vector<XrView> xrViews(viewCount, {XR_TYPE_VIEW});
+      uint32_t got = 0;
+      XR_TRY(xrLocateViews(session, &vli, &vs, viewCount, &got, xrViews.data()));
+
+      // Slowly pulse so it's obviously LIVE, and distinct per eye.
+      double t = (double)fs.predictedDisplayTime * 1e-9;
+      float pulse = 0.5f + 0.5f * (float)std::sin(t * 1.5);
+
+      projViews.resize(viewCount);
+      for (uint32_t e = 0; e < viewCount; ++e) {
+        EyeSwapchain& eye = eyes[e];
+        uint32_t idx = 0;
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XR_TRY(xrAcquireSwapchainImage(eye.handle, &ai, &idx));
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = XR_INFINITE_DURATION;
+        XR_TRY(xrWaitSwapchainImage(eye.handle, &wi));
+
+        // Per XR_KHR_D3D12_enable the runtime hands the image ALREADY in RENDER_TARGET state
+        // and expects it back in the same state — so no resource barriers, just clear it.
+        HR_TRY(cmdAlloc->Reset());
+        HR_TRY(cmdList->Reset(cmdAlloc.Get(), nullptr));
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = eye.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += (SIZE_T)idx * eye.rtvStride;
+        const float left[4]  = { 0.85f * pulse, 0.20f, 0.15f, 1.0f };   // warm (left eye)
+        const float right[4] = { 0.10f, 0.35f, 0.85f * pulse, 1.0f };   // cool (right eye)
+        cmdList->ClearRenderTargetView(rtv, e == 0 ? left : right, 0, nullptr);
+
+        HR_TRY(cmdList->Close());
+        ID3D12CommandList* lists[] = { cmdList.Get() };
+        queue->ExecuteCommandLists(1, lists);
+        // Simple sync: wait for the GPU before releasing (fine for a spike).
+        const UINT64 signal = ++fenceVal;
+        HR_TRY(queue->Signal(fence.Get(), signal));
+        if (fence->GetCompletedValue() < signal) {
+          HR_TRY(fence->SetEventOnCompletion(signal, fenceEvent));
+          WaitForSingleObject(fenceEvent, INFINITE);
+        }
+
+        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        XR_TRY(xrReleaseSwapchainImage(eye.handle, &ri));
+
+        XrCompositionLayerProjectionView& pv = projViews[e];
+        pv = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        pv.pose = xrViews[e].pose;
+        pv.fov  = xrViews[e].fov;
+        pv.subImage.swapchain = eye.handle;
+        pv.subImage.imageRect.offset = {0, 0};
+        pv.subImage.imageRect.extent = {(int32_t)eye.width, (int32_t)eye.height};
+      }
+
+      layer.space = appSpace;
+      layer.viewCount = (uint32_t)projViews.size();
+      layer.views = projViews.data();
+
+      if ((frame % 90) == 0) {
+        const XrPosef& p = xrViews[0].pose;
+        std::printf("[vr-spike] frame %ld  head pos (% .2f,% .2f,% .2f)  quat(% .2f,% .2f,% .2f,% .2f)\n",
+                    frame, p.position.x, p.position.y, p.position.z,
+                    p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
+      }
+    }
+
+    XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
+    fei.displayTime = fs.predictedDisplayTime;
+    fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer) };
+    fei.layerCount = (fs.shouldRender && !projViews.empty()) ? 1u : 0u;
+    fei.layers = (fei.layerCount > 0) ? layers : nullptr;
+    XR_TRY(xrEndFrame(session, &fei));
+    ++frame;
+  }
+
+  // 12. Teardown.
+  for (auto& eye : eyes) if (eye.handle) xrDestroySwapchain(eye.handle);
+  if (appSpace) xrDestroySpace(appSpace);
+  if (session)  xrDestroySession(session);
+  if (fenceEvent) CloseHandle(fenceEvent);
+  xrDestroyInstance(instance);
+  std::printf("[vr-spike] clean exit after %ld frames.\n", frame);
+  return XR_SUCCESS;
+}
+
+}  // namespace
+
+int main() {
+  std::printf("[vr-spike] OpenXR D3D12 render spike (VR P0.1) — solid-colour stereo eyes, own D3D12 device.\n");
+  XrResult r = run();
+  if (XR_FAILED(r)) {
+    std::fprintf(stderr, "[vr-spike] FAILED (%d). See messages above.\n", (int)r);
+    return 1;
+  }
+  return 0;
+}

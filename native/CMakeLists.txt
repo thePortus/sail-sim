@@ -748,6 +748,17 @@ if (SAILSIM_VR)
   target_include_directories(sailsim_vr_probe PRIVATE "${openxr_SOURCE_DIR}/include")
   message(STATUS "SAILSIM_VR ON — building sailsim_vr_probe (OpenXR ${openxr_SOURCE_DIR})")
 
+  # VR P0.1 increment 1: OpenXR D3D12 render spike (src/vr_spike.cpp). Solid-colour stereo eyes
+  # via a plain D3D12 device — NO Dawn / webgpu / DXC, so it builds in seconds and iterates without
+  # the Dawn rebuild. Windows-only (D3D12). Retires the "does OpenXR D3D12 reach the headset" risk
+  # before we wire Dawn's device (increment 2) + SharedTextureMemory (increment 3).
+  if (WIN32)
+    add_executable(sailsim_vr_spike src/vr_spike.cpp)
+    target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader d3d12 dxgi)
+    target_include_directories(sailsim_vr_spike PRIVATE "${openxr_SOURCE_DIR}/include")
+    message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike)")
+  endif()
+
   # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile
   # WGSL→HLSL→DXIL and to SIGN the DXIL (D3D12 rejects unsigned shaders). It needs a SIGNED release
   # dxil.dll (>= 1.6); the Windows SDK's (10.0.19041.x) is too old → Dawn prints "DXC dlls were built,

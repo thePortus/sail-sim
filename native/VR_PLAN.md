@@ -40,6 +40,27 @@ WebGPU-rendered frame into OpenXR's native swapchain.
 **Decision:** the VR build is `SAILSIM_WEBGPU_BACKEND=DAWN` on Windows (D3D12). We render
 each eye into an OpenXR D3D12 swapchain image imported into Dawn as a shared texture.
 
+### P0.1 findings (2026-07-09) — probe result + Dawn distribution audit
+
+- **Probe ran clean on Windows** through **VirtualDesktopXR (VDXR) 1.0.10** on a **Meta Quest 3**
+  (full 6DoF). The "works via a Desktop Streamer" goal is proven on real hardware, through the
+  one OpenXR path. Runtime advertises **D3D12, D3D11, Vulkan, and OpenGL** bindings (no `XR_FB_*`).
+  Per-eye **recommended 3072×3264** (VD supersampling; we'll render well below this as a ceiling).
+- **The eliemichel WebGPU distribution builds Vulkan-only Dawn on Windows** (`FetchDawn.cmake`:
+  `DAWN_ENABLE_D3D12 OFF`, `DAWN_ENABLE_D3D11 OFF`, `USE_VULKAN ON`). That would force us onto the
+  **Vulkan** OpenXR binding — the painful one (must create `VkInstance`/`VkDevice` with runtime-
+  mandated extensions, or make Dawn adopt an OpenXR-created device). **D3D12's binding just takes an
+  existing `ID3D12Device`** — no extension injection, no device adoption.
+- **Decision: build Dawn with D3D12 enabled for VR.** The distribution *does* build the `dawn_native`
+  target and exposes Dawn's full headers (incl. `dawn/native/D3D12Backend.h`) via `_deps/dawn-src/include`,
+  so `dawn::native::d3d12::GetD3D12Device(WGPUDevice)` (binding A's device extraction) is reachable once
+  D3D12 is on. We flip the flags with a portable patch (`native/cmake/vr_dawn_d3d12.cmake`, verified:
+  → D3D11 ON / D3D12 ON / Vulkan OFF) applied as the distribution's `PATCH_COMMAND`.
+- **Sequencing before wiring D3D12:** first confirm the **existing** Dawn backend even builds + runs on the
+  Windows box (`cmake -S native -B build-win-dawn -DSAILSIM_WEBGPU_BACKEND=DAWN`, run `sailsim_native`) — a
+  heavy one-time source build, but it de-risks the whole Dawn dependency with zero new code. If Dawn runs,
+  flipping to D3D12 (the patch) + linking `dawn_native` is a small, confident step; then the interop spike.
+
 **Two viable bindings, pick during the P0 spike:**
 - **(A) D3D12 binding, shared device** — create the XR session with
   `XR_KHR_D3D12_enable` using Dawn's own `ID3D12Device` + queue (via `dawn::native::d3d12`).

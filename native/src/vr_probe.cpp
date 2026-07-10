@@ -26,13 +26,24 @@
 
 namespace {
 
-// xrResultToString needs an instance; before we have one, fall back to the raw int.
+// xrResultToString needs an instance; before we have one (e.g. xrCreateInstance itself
+// failing), map the common codes by hand so the message is legible, else the raw int.
 std::string resStr(XrInstance instance, XrResult r) {
   if (instance != XR_NULL_HANDLE) {
     char buf[XR_MAX_RESULT_STRING_SIZE] = {0};
     if (XR_SUCCEEDED(xrResultToString(instance, r, buf)) && buf[0]) { return buf; }
   }
-  return std::to_string(static_cast<int>(r));
+  switch (r) {
+    case XR_ERROR_VALIDATION_FAILURE:       return "XR_ERROR_VALIDATION_FAILURE";
+    case XR_ERROR_RUNTIME_FAILURE:          return "XR_ERROR_RUNTIME_FAILURE";
+    case XR_ERROR_OUT_OF_MEMORY:            return "XR_ERROR_OUT_OF_MEMORY";
+    case XR_ERROR_API_VERSION_UNSUPPORTED:  return "XR_ERROR_API_VERSION_UNSUPPORTED";
+    case XR_ERROR_INITIALIZATION_FAILED:    return "XR_ERROR_INITIALIZATION_FAILED";
+    case XR_ERROR_EXTENSION_NOT_PRESENT:    return "XR_ERROR_EXTENSION_NOT_PRESENT";
+    case XR_ERROR_FORM_FACTOR_UNAVAILABLE:  return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_ERROR_RUNTIME_UNAVAILABLE:      return "XR_ERROR_RUNTIME_UNAVAILABLE";
+    default:                                return std::to_string(static_cast<int>(r));
+  }
 }
 
 #define XR_TRY(instance, call)                                                        \
@@ -92,14 +103,21 @@ XrResult run() {
   ci.applicationInfo.applicationVersion = 1;
   std::snprintf(ci.applicationInfo.engineName, XR_MAX_ENGINE_NAME_SIZE, "%s", "sailsim");
   ci.applicationInfo.engineVersion = 1;
-  ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+  // Request OpenXR 1.0 (not XR_CURRENT_API_VERSION from the SDK headers): many runtimes still
+  // cap at 1.0.x and reject a 1.1 request with XR_ERROR_API_VERSION_UNSUPPORTED. We use no
+  // 1.1-only features, and every runtime supports 1.0 — so 1.0 is the maximally compatible ask.
+  ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
 
   XrInstance instance = XR_NULL_HANDLE;
   {
     XrResult r = xrCreateInstance(&ci, &instance);
     if (XR_FAILED(r)) {
       std::fprintf(stderr, "[vr-probe] xrCreateInstance FAILED: %s\n", resStr(XR_NULL_HANDLE, r).c_str());
-      std::fprintf(stderr, "[vr-probe] → No active OpenXR runtime? Start Meta Link / Virtual Desktop / SteamVR and retry.\n");
+      if (r == XR_ERROR_API_VERSION_UNSUPPORTED) {
+        std::fprintf(stderr, "[vr-probe] → runtime rejected the requested OpenXR API version.\n");
+      } else {
+        std::fprintf(stderr, "[vr-probe] → runtime present but instance creation failed (see loader errors above).\n");
+      }
       return r;
     }
   }

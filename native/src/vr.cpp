@@ -269,7 +269,8 @@ bool beginFrame(Bridge* b) {
     WGPUSharedTextureMemoryBeginAccessDescriptor ba{};
     ba.concurrentRead = false; ba.initialized = false; ba.fenceCount = 0;
     if (!wgpuSharedTextureMemoryBeginAccess(b->eyes[e].mem, b->eyes[e].tex, &ba)) {
-      std::fprintf(stderr, "[vr] BeginAccess failed (eye %zu)\n", e);
+      std::fprintf(stderr, "[vr] BeginAccess failed (eye %zu), deviceLost=%d\n",
+                   e, (int)wgpuSharedTextureMemoryIsDeviceLost(b->eyes[e].mem));
       b->shouldRender = false; return false;
     }
   }

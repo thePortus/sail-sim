@@ -199,6 +199,19 @@ if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
     message(STATUS "  [vr] Dawn D3D12 patch ACTIVE (D3D12 ON, Vulkan OFF, +DXC dep)")
     message(STATUS "============================================================")
     add_subdirectory("${webgpu_SOURCE_DIR}" "${webgpu_BINARY_DIR}")
+    # Dawn links the `dxcompiler` target for DXC, but this old DXC doesn't export its include dir as
+    # INTERFACE, so dawn_native's d3d sources can't find dxcapi.h (→ IDxcCompiler3 undeclared, cascading
+    # DAWN_TRY errors). Add the DXC headers to dawn_native explicitly. Layout: .../dxc/include/dxc/dxcapi.h,
+    # so add both the root (for `<dxc/dxcapi.h>`) and the dxc/ subdir (for `<dxcapi.h>`).
+    if (TARGET dawn_native)
+      set(_dxcinc "${CMAKE_BINARY_DIR}/_deps/dawn-src/third_party/dxc/include")
+      if (EXISTS "${_dxcinc}/dxc/dxcapi.h")
+        target_include_directories(dawn_native PRIVATE "${_dxcinc}" "${_dxcinc}/dxc")
+        message(STATUS "[vr] added DXC headers to dawn_native: ${_dxcinc}")
+      else()
+        message(WARNING "[vr] DXC headers not found at ${_dxcinc}/dxc/dxcapi.h — D3D build may fail")
+      endif()
+    endif()
   else()
     FetchContent_MakeAvailable(webgpu)
   endif()

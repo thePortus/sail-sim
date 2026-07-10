@@ -360,7 +360,7 @@ XrResult run() {
       WGPUSharedTextureMemoryDXGISharedHandleDescriptor dxgi = {};
       dxgi.chain.sType = WGPUSType_SharedTextureMemoryDXGISharedHandleDescriptor;
       dxgi.handle = sh;
-      dxgi.useKeyedMutex = true;   // VD's cross-process XR images carry a keyed mutex (acquire key 0)
+      dxgi.useKeyedMutex = false;  // VD's XR images are plain shared NT-handle resources (no keyed mutex)
       WGPUSharedTextureMemoryDescriptor smd = {};
       smd.nextInChain = &dxgi.chain;
       smd.label = "xr-eye-image";

@@ -17,7 +17,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>   // crash handler (SetUnhandledExceptionFilter) — see installCrashHandler()
+#include <windows.h>   // crash handler (SetUnhandledExceptionFilter) — see sailsimCrashHandler()
+#include <dbghelp.h>   // symbolize the crash backtrace (function names + file:line, if a PDB is present)
 #endif
 
 #include <webgpu/webgpu.h>
@@ -3076,13 +3077,34 @@ static const char* sailsimModuleForAddr(void* addr) {
   return "?";
 }
 static LONG WINAPI sailsimCrashHandler(EXCEPTION_POINTERS* ep) {
+  HANDLE proc = GetCurrentProcess();
+  SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+  SymInitialize(proc, nullptr, TRUE);   // resolves names from sailsim_native.pdb if it's beside the exe
   void* fault = ep->ExceptionRecord->ExceptionAddress;
   std::fprintf(stderr, "\n[crash] exception 0x%08lx at %p in %s\n",
                (unsigned long)ep->ExceptionRecord->ExceptionCode, fault, sailsimModuleForAddr(fault));
-  void* frames[24];
-  USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+  void* frames[32];
+  USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
+  char symBuf[sizeof(SYMBOL_INFO) + 512];
+  SYMBOL_INFO* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+  sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+  sym->MaxNameLen = 511;
   for (USHORT i = 0; i < n; ++i) {
-    std::fprintf(stderr, "[crash]  #%02u %p  %s\n", i, frames[i], sailsimModuleForAddr(frames[i]));
+    const char* mod = sailsimModuleForAddr(frames[i]);
+    DWORD64 disp = 0;
+    if (SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[i]), &disp, sym)) {
+      IMAGEHLP_LINE64 line{};
+      line.SizeOfStruct = sizeof(line);
+      DWORD lineDisp = 0;
+      if (SymGetLineFromAddr64(proc, reinterpret_cast<DWORD64>(frames[i]), &lineDisp, &line)) {
+        std::fprintf(stderr, "[crash]  #%02u %s!%s +0x%llx  (%s:%lu)\n",
+                     i, mod, sym->Name, (unsigned long long)disp, line.FileName, (unsigned long)line.LineNumber);
+      } else {
+        std::fprintf(stderr, "[crash]  #%02u %s!%s +0x%llx\n", i, mod, sym->Name, (unsigned long long)disp);
+      }
+    } else {
+      std::fprintf(stderr, "[crash]  #%02u %p  %s\n", i, frames[i], mod);
+    }
   }
   std::fflush(stderr);
   return EXCEPTION_EXECUTE_HANDLER;   // log, then let the process terminate

@@ -606,6 +606,12 @@ if (MSVC)
   # headers are dodged by not naming identifiers after them — see the sources.)
   target_compile_definitions(sailsim_native PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+  # Emit a PDB even in Release (/Zi + /DEBUG, but keep optimization) so the crash handler
+  # (sailsimCrashHandler) can print function names + file:line for frames in the exe. /OPT:REF,ICF
+  # undo /DEBUG's default of keeping unreferenced code. dbghelp provides SymFromAddr/SymGetLine.
+  target_compile_options(sailsim_native PRIVATE /Zi)
+  target_link_options(sailsim_native PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+  target_link_libraries(sailsim_native PRIVATE dbghelp)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()

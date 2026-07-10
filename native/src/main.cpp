@@ -4049,7 +4049,7 @@ int main(int argc, char** argv) {
   auto rigFromServer = [](const net::VesselPhysics& p, const std::string& slug) {
     sail::Rig r = sail::rigForSlug(slug);   // hardcoded fallback seeds anything the server omits
     r.maxSpeed = p.maxSpeed; r.accelRate = p.accelerationRate; r.minTackAngle = p.minTackAngle;
-    r.sailAreaFactor = p.sailAreaFactor; r.weight = p.weight;
+    r.sailAreaFactor = p.sailAreaFactor; r.weight = p.weight; r.turnFactor = p.turnFactor;
     if (p.hasRig) {   // only when the server sent the v2 rig block (else keep the hardcoded rig)
       r.forceK = p.forceK; r.trimForgive = p.trimForgive; r.leewayK = p.leewayK;
       r.hullHalfLen = p.hullHalfLen; r.hullHalfBeam = p.hullHalfBeam;

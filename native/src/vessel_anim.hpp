@@ -140,6 +140,7 @@ private:
   float wheelMaxRad_ = 6.2831853f;
   bool singleAnchor_ = false;
   MorphRef cableS_, cableP_;                   // anchor cable morphs (pinnace/brig)
+  MorphRef lidMorphS_, lidMorphP_;             // frigate gun-port lids — MORPHS (Frigate_Ports), not bone clips
   std::vector<FlagSpec> flags_;
   float flagYawOffset_ = 0.0f;
   bool flagChainRipple_ = false;               // pinnace Flag1>2>3 travelling wave

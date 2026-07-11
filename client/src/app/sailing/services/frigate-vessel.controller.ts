@@ -79,6 +79,10 @@ export class FrigateController implements VesselController {
   private readonly GUN_RECOIL_DECAY = 5.0;
   /** The gun-port lids are a MORPH mesh (Frigate_Ports) with Lid_S / Lid_P targets — not a bone clip. */
   private readonly PORTS_MESH = 'Frigate_Ports';
+  /** Safety valve for gunport side: if a build ever reads port/starboard reversed, flip with
+   *  localStorage.ignis_fr_gunside='swap' (default: no flip — B_Gun_S = starboard, matches the fleet). */
+  private readonly gunSideFlip = typeof localStorage !== 'undefined' && localStorage.getItem('ignis_fr_gunside') === 'swap';
+  private clipSide(side: GunSide): GunSide { return this.gunSideFlip ? (side === 'S' ? 'P' : 'S') : side; }
 
   private readonly anchorReq: Record<GunSide, number> = { S: 0, P: 0 };
   private readonly anchorCur: Record<GunSide, number> = { S: 0, P: 0 };
@@ -307,7 +311,7 @@ export class FrigateController implements VesselController {
   }
   /** Lids are a MORPH (Frigate_Ports.Lid_{S|P}), driven directly — NOT a clip. */
   setGunports(side: GunSide, open: number): void {
-    this.setMorphByName(this.PORTS_MESH, `Lid_${side}`, Math.max(0, Math.min(1, open)));
+    this.setMorphByName(this.PORTS_MESH, `Lid_${this.clipSide(side)}`, Math.max(0, Math.min(1, open)));
   }
 
   /** Choose the visible armament variant ('heavy' | 'medium' | 'light'). All three are rigged, so the shown
@@ -421,8 +425,9 @@ export class FrigateController implements VesselController {
     const dep = this.gunDeployCur[side];
     const lid = Math.max(0, Math.min(1, dep * 2));                              // lid opens over the first half
     const gun = Math.max(0, Math.min(1, dep * 2 - 1) - this.gunRecoil[side]);   // gun runs out over the second half
-    this.setMorphByName(this.PORTS_MESH, `Lid_${side}`, lid);                   // lids = morph, NOT a clip
-    this.poseNorm(`Gun_${side}`, gun);
+    const cs = this.clipSide(side);
+    this.setMorphByName(this.PORTS_MESH, `Lid_${cs}`, lid);                     // lids = morph, NOT a clip
+    this.poseNorm(`Gun_${cs}`, gun);
   }
 
   private applyFurl(sail: string, v: number): void {

@@ -81,7 +81,7 @@ export class FrigateController implements VesselController {
   private readonly PORTS_MESH = 'Frigate_Ports';
   /** Safety valve for gunport side: if a build ever reads port/starboard reversed, flip with
    *  localStorage.ignis_fr_gunside='swap' (default: no flip — B_Gun_S = starboard, matches the fleet). */
-  private readonly gunSideFlip = typeof localStorage !== 'undefined' && localStorage.getItem('ignis_fr_gunside') === 'swap';
+  private readonly gunSideFlip = !(typeof localStorage !== 'undefined' && localStorage.getItem('ignis_fr_gunside') === 'noswap');
   private clipSide(side: GunSide): GunSide { return this.gunSideFlip ? (side === 'S' ? 'P' : 'S') : side; }
 
   private readonly anchorReq: Record<GunSide, number> = { S: 0, P: 0 };

@@ -22,17 +22,18 @@ GunLayout cannonsFor(const std::string& slug) {
              { {  3.4f, 2.5f, 4.1f }, {  3.4f, 2.5f, -2.4f }, {  3.4f, 2.5f, -5.9f } } };
   if (slug.rfind("frigate", 0) == 0) {
     // Frigate: gun-deck LONG guns (FRIG_LONG) + spar-deck CARRONADES (FRIG_CARR), verbatim from server
-    // vessels.controller.js battery(). Positions are the actual model barrel-muzzle tips (glTF space:
-    // +X stbd, +Y up, +Z bow) so the flash/aim tube sits AT the gun. Carronades are tagged so they fire
-    // the slow short-range ball + auto-hold until an enemy closes (matches the client cannon.service).
+    // vessels.controller.js battery(). Positions are the barrel muzzle tips AT RUN-OUT (glTF +X stbd,
+    // +Y up, +Z bow) = the rest tip + the 0.8m run-out translation. The gun fires + aims only when run
+    // out (Engaged), so the muzzle flash / volumetric / aim tube sit at the projected barrel mouth just
+    // OUTSIDE the hull (rest tips were inside the hull -> the fireball spawned half-occluded).
     static const float L[15][3] = {
-      {4.29f,4.01f,16.55f},{4.85f,3.80f,14.13f},{5.23f,3.62f,11.60f},{5.56f,3.47f,9.10f},{5.80f,3.35f,6.60f},
-      {5.97f,3.26f,4.08f},{6.05f,3.18f,1.58f},{6.05f,3.17f,-0.92f},{6.04f,3.24f,-3.42f},{5.98f,3.32f,-5.93f},
-      {5.83f,3.42f,-8.43f},{5.70f,3.50f,-10.93f},{5.50f,3.56f,-13.44f},{5.23f,3.61f,-15.96f},{5.05f,3.70f,-18.60f} };
+      {5.09f,4.01f,16.55f},{5.65f,3.80f,14.13f},{6.03f,3.62f,11.60f},{6.36f,3.47f,9.10f},{6.60f,3.35f,6.60f},
+      {6.77f,3.26f,4.08f},{6.85f,3.18f,1.58f},{6.85f,3.17f,-0.92f},{6.84f,3.24f,-3.42f},{6.78f,3.32f,-5.93f},
+      {6.63f,3.42f,-8.43f},{6.50f,3.50f,-10.93f},{6.30f,3.56f,-13.44f},{6.03f,3.61f,-15.96f},{5.85f,3.70f,-18.60f} };
     static const float C[11][3] = {
-      {3.64f,5.90f,13.98f},{4.05f,5.64f,10.61f},{4.35f,5.45f,7.19f},{4.50f,5.31f,3.80f},{4.52f,5.21f,0.40f},
-      {4.53f,5.28f,-3.00f},{4.50f,5.41f,-6.40f},{4.41f,5.53f,-9.79f},{4.26f,5.64f,-13.19f},{4.06f,5.74f,-16.45f},
-      {3.82f,5.85f,-19.98f} };
+      {4.44f,5.90f,13.98f},{4.85f,5.64f,10.61f},{5.15f,5.45f,7.19f},{5.30f,5.31f,3.80f},{5.32f,5.21f,0.40f},
+      {5.33f,5.28f,-3.00f},{5.30f,5.41f,-6.40f},{5.21f,5.53f,-9.79f},{5.06f,5.64f,-13.19f},{4.86f,5.74f,-16.45f},
+      {4.62f,5.85f,-19.98f} };
     // Variant slices (match server battery(): heavy 15L+11C, medium 15L+C[1:9], light L[0:13]+C[2:8]).
     int nL = 15, cA = 0, cB = 11;
     if (slug == "frigate_medium")     { cA = 1; cB = 9; }

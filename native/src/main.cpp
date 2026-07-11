@@ -313,7 +313,7 @@ struct VesselSpec {
   bool  oceanMask; float maskFloorY;    // stencil on/off + hull-local deck clamp
 };
 static VesselSpec vesselSpecFor(const std::string& slug) {
-  if (slug.rfind("frigate", 0) == 0) return { 0.0f, 24.0f, 0.0f, true, 5.0f };   // frigate: bow +Z, origin at LWL
+  if (slug.rfind("frigate", 0) == 0) return { 0.0f, 24.0f, -1.0f, true, 5.0f };  // frigate: bow +Z, origin at LWL -> derive draft from model (keel ~7.2m below origin), else floatDraft 0 leaves the keel at the surface (rides way too high)
   if (slug == "merchantman") return { 90.0f, 15.0f, 3.8f, true, 6.5f };
   if (slug == "brig")        return { 0.0f, 12.0f, 2.0f, false, -1.0e9f };
   // Sloop: the client's importFlipY (its authored bow is -Z) = a 180 deg yaw here.

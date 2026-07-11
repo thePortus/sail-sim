@@ -23,10 +23,13 @@ GunLayout cannonsFor(const std::string& slug) {
   if (slug.rfind("frigate", 0) == 0) {
     // Frigate: the 15 gun-deck long guns (from server FRIG_LONG). Spar-deck carronades + the carronade
     // short-range system are a later native port; the long battery is the main visible fire for now.
+    // Positions are the actual model barrel-muzzle tips (glTF space: +X stbd, +Y up, +Z bow) so the
+    // muzzle flash / aim tube sits AT the gun. (The guns were moved 1.3m inboard for the rest pose; the
+    // old array still had the run-out X and floated the tubes ~1.3m off the hull.)
     static const float L[15][3] = {
-      {5.6f,4.0f,16.6f},{6.1f,3.8f,14.1f},{6.5f,3.6f,11.5f},{6.8f,3.5f,9.0f},{7.1f,3.3f,6.5f},
-      {7.2f,3.2f,4.0f},{7.3f,3.1f,1.5f},{7.3f,3.1f,-1.0f},{7.3f,3.2f,-3.5f},{7.2f,3.3f,-6.0f},
-      {7.1f,3.4f,-8.5f},{7.0f,3.5f,-11.0f},{6.8f,3.6f,-13.5f},{6.5f,3.6f,-16.0f},{6.2f,3.7f,-18.6f} };
+      {4.29f,4.01f,16.55f},{4.85f,3.80f,14.13f},{5.23f,3.62f,11.60f},{5.56f,3.47f,9.10f},{5.80f,3.35f,6.60f},
+      {5.97f,3.26f,4.08f},{6.05f,3.18f,1.58f},{6.05f,3.17f,-0.92f},{6.04f,3.24f,-3.42f},{5.98f,3.32f,-5.93f},
+      {5.83f,3.42f,-8.43f},{5.70f,3.50f,-10.93f},{5.50f,3.56f,-13.44f},{5.23f,3.61f,-15.96f},{5.05f,3.70f,-18.60f} };
     GunLayout g;
     for (auto& p : L) { g.port.push_back({ -p[0], p[1], p[2] }); g.stbd.push_back({ p[0], p[1], p[2] }); }
     return g;

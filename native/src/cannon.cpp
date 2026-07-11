@@ -20,6 +20,17 @@ GunLayout cannonsFor(const std::string& slug) {
   if (slug == "merchantman")
     return { { { -3.4f, 2.5f, 4.1f }, { -3.4f, 2.5f, -2.4f }, { -3.4f, 2.5f, -5.9f } },
              { {  3.4f, 2.5f, 4.1f }, {  3.4f, 2.5f, -2.4f }, {  3.4f, 2.5f, -5.9f } } };
+  if (slug.rfind("frigate", 0) == 0) {
+    // Frigate: the 15 gun-deck long guns (from server FRIG_LONG). Spar-deck carronades + the carronade
+    // short-range system are a later native port; the long battery is the main visible fire for now.
+    static const float L[15][3] = {
+      {5.6f,4.0f,16.6f},{6.1f,3.8f,14.1f},{6.5f,3.6f,11.5f},{6.8f,3.5f,9.0f},{7.1f,3.3f,6.5f},
+      {7.2f,3.2f,4.0f},{7.3f,3.1f,1.5f},{7.3f,3.1f,-1.0f},{7.3f,3.2f,-3.5f},{7.2f,3.3f,-6.0f},
+      {7.1f,3.4f,-8.5f},{7.0f,3.5f,-11.0f},{6.8f,3.6f,-13.5f},{6.5f,3.6f,-16.0f},{6.2f,3.7f,-18.6f} };
+    GunLayout g;
+    for (auto& p : L) { g.port.push_back({ -p[0], p[1], p[2] }); g.stbd.push_back({ p[0], p[1], p[2] }); }
+    return g;
+  }
   // Sloop battery = the client's DEFAULT_MUZZLES (3 per side).
   return { { { -1.98f, 1.50f, 1.36f }, { -1.87f, 1.65f, 2.40f }, { -1.72f, 1.90f, 3.44f } },
            { {  1.98f, 1.50f, 1.36f }, {  1.87f, 1.65f, 2.40f }, {  1.72f, 1.90f, 3.44f } } };

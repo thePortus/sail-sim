@@ -226,7 +226,7 @@ const VESSELS = [
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
     cannons: battery(FRIG_LONG, FRIG_CARR),   // 15 long guns + 11 carronades
     zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
-    crew: 16, cargo: 40, price: 750000, parts: [],
+    crew: 480, cargo: 40, price: 750000, parts: [],
   },
   {
     id: 6, name: 'Frigate (Medium)', slug: 'frigate_medium', armament: 'medium',
@@ -236,7 +236,7 @@ const VESSELS = [
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
     cannons: battery(FRIG_LONG, FRIG_CARR.slice(1, 9)),   // 15 long guns + 8 carronades
     zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
-    crew: 14, cargo: 50, price: 500000, parts: [],
+    crew: 420, cargo: 50, price: 500000, parts: [],
   },
   {
     id: 7, name: 'Frigate (Light)', slug: 'frigate_light', armament: 'light',
@@ -246,7 +246,7 @@ const VESSELS = [
     firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
     cannons: battery(FRIG_LONG.slice(0, 13), FRIG_CARR.slice(2, 8)),   // 13 long guns + 6 carronades
     zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
-    crew: 12, cargo: 60, price: 350000, parts: [],
+    crew: 360, cargo: 60, price: 350000, parts: [],
   },
 ];
 

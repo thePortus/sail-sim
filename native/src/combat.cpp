@@ -12,6 +12,9 @@ Zones zoneHpFor(const std::string& slug, bool armorUpgrade) {
   if (slug == "pinnace")          z = { 55, 55, 80, 80, 60 };
   else if (slug == "brig")        z = { 140, 140, 200, 200, 150 };
   else if (slug == "merchantman") z = { 150, 150, 220, 220, 160 };
+  else if (slug == "frigate_heavy")  z = { 250, 250, 360, 360, 250 };
+  else if (slug == "frigate_medium") z = { 230, 230, 320, 320, 230 };
+  else if (slug == "frigate_light")  z = { 210, 210, 280, 280, 210 };
   else                            z = { 90, 90, 130, 130, 100 };   // sloop default
   if (armorUpgrade) { z.bow *= 1.25f; z.stern *= 1.25f; z.port *= 1.25f; z.starboard *= 1.25f; }
   return z;

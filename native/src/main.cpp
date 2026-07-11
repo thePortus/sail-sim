@@ -313,6 +313,7 @@ struct VesselSpec {
   bool  oceanMask; float maskFloorY;    // stencil on/off + hull-local deck clamp
 };
 static VesselSpec vesselSpecFor(const std::string& slug) {
+  if (slug.rfind("frigate", 0) == 0) return { 0.0f, 24.0f, 0.0f, true, 5.0f };   // frigate: bow +Z, origin at LWL
   if (slug == "merchantman") return { 90.0f, 15.0f, 3.8f, true, 6.5f };
   if (slug == "brig")        return { 0.0f, 12.0f, 2.0f, false, -1.0e9f };
   // Sloop: the client's importFlipY (its authored bow is -Z) = a 180 deg yaw here.
@@ -950,6 +951,7 @@ static std::string glbFileForSlug(const std::string& slug) {
          slug == "brig"        ? "brig.glb" :
          slug == "merchantman" ? "merchantman.glb" :
          slug == "pinnace"     ? "pinnace.glb" :
+         slug.rfind("frigate", 0) == 0 ? "frigate.glb" :   // frigate_heavy/medium/light share the one GLB
                                  "pinnace.glb";   // starter hull is the safe fallback
 }
 static std::string glbForSlug(const std::string& slug) {
@@ -9049,16 +9051,19 @@ int main(int argc, char** argv) {
       if (crewMesh && !ownMesh->deckTris.empty() &&
           (!crewDeck || crewDeckSlug != ownVesselSlug)) {
         const bool hasLayout = ownVesselSlug == "sloop" || ownVesselSlug == "pinnace" ||
-                               ownVesselSlug == "brig" || ownVesselSlug == "merchantman";
+                               ownVesselSlug == "brig" || ownVesselSlug == "merchantman" ||
+                               ownVesselSlug.rfind("frigate", 0) == 0;
         crewDeck.reset();
         crewDeckSlug = ownVesselSlug;
         if (hasLayout) {
-          const int want = ownVesselSlug == "brig" ? 12 : ownVesselSlug == "merchantman" ? 9
+          const int want = ownVesselSlug.rfind("frigate", 0) == 0 ? 12
+                         : ownVesselSlug == "brig" ? 12 : ownVesselSlug == "merchantman" ? 9
                          : ownVesselSlug == "sloop" ? 7 : 4;
           crewInner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
           crewInner = glm::scale(crewInner, glm::vec3(ownMesh->shipScale));
           crewInner = glm::translate(crewInner, -ownMesh->keelCenter);
-          const std::string layoutPath = geomAsset("crew_stations." + ownVesselSlug + ".json");
+          const std::string crewSlug = ownVesselSlug.rfind("frigate", 0) == 0 ? std::string("frigate") : ownVesselSlug;
+          const std::string layoutPath = geomAsset("crew_stations." + crewSlug + ".json");
           const uint32_t seed = 0xC4E0u ^ (uint32_t)std::hash<std::string>{}(ownVesselSlug);
           auto d = std::make_unique<crew::Deck>(crewMesh->rig, layoutPath, seed, want,
                                                 crewInner, ownMesh->deckTris, ownMesh->bowYaw, 1.2f);
@@ -9080,7 +9085,7 @@ int main(int argc, char** argv) {
           in = glm::scale(in, glm::vec3(mm.shipScale));
           return glm::translate(in, -mm.keelCenter);
         };
-        auto countFor = [](const std::string& s) { return s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
+        auto countFor = [](const std::string& s) { return s.rfind("frigate", 0) == 0 ? 12 : s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
         // Candidates: own deck (dist 0) + each nearby remote ship with a layout.
         struct Cand { crew::Deck* deck; glm::mat4 outer; float dist; bool frozen; float shipScale; };
         std::vector<Cand> cands;
@@ -9097,7 +9102,7 @@ int main(int argc, char** argv) {
           const glm::mat4 rin = innerFor(*si.mesh);
           auto& d = remoteCrewDecks[si.rp.id];
           if (!d || remoteCrewSlugs[si.rp.id] != slug) {
-            const std::string lp = geomAsset("crew_stations." + slug + ".json");
+            const std::string lp = geomAsset("crew_stations." + (slug.rfind("frigate", 0) == 0 ? std::string("frigate") : slug) + ".json");
             d = std::make_unique<crew::Deck>(crewMesh->rig, lp, (uint32_t)std::hash<std::string>{}(si.rp.id),
                                              countFor(slug), rin, si.mesh->deckTris, si.mesh->bowYaw, 1.2f);
             remoteCrewSlugs[si.rp.id] = slug;

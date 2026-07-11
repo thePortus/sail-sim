@@ -476,8 +476,12 @@ void Controller::tickRig(float dt) {
       scrubNorm("Lid_" + sd, std::clamp(dep * 2.0f, 0.0f, 1.0f));
       scrubNorm("Gun_" + sd, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
     } else if (!lidMorphS_.node.empty()) {   // frigate: lids are MORPHS (Frigate_Ports), run-out is a clip
-      setMorph(sd == "S" ? lidMorphS_ : lidMorphP_, std::clamp(dep * 2.0f, 0.0f, 1.0f));
-      scrubNorm("Gun_" + sd, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
+      // The frigate is NOT fleet-swapped: its muzzles already fire on the commanded side, so the run-out +
+      // lids must follow the SAME side (the fleet swap above sent port-command → Gun_S = visual starboard,
+      // i.e. the battery opposite the one firing). Drive the same-named side as the command.
+      const std::string fs = i == 0 ? "P" : "S";   // gunDeploy_[0]=game PORT -> P clip, [1]=game STBD -> S clip
+      setMorph(fs == "S" ? lidMorphS_ : lidMorphP_, std::clamp(dep * 2.0f, 0.0f, 1.0f));
+      scrubNorm("Gun_" + fs, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
     } else if (clips_.count("Gun_" + sd)) {
       scrubNorm("Gun_" + sd, std::clamp(dep - rec, 0.0f, 1.0f));
     }

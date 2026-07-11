@@ -6978,7 +6978,7 @@ int main(int argc, char** argv) {
       bool firedThisFrame = false;
       for (const combat::FireEvent& fe : fires) {
         mpClient.sendCannonShot(fe.mwx, fe.mwy, fe.mwz, fe.vx, fe.vy, fe.vz,
-                                fe.seq, combat::shotName(fe.kind));
+                                fe.seq, combat::shotName(fe.kind), fe.carronade);
         // Muzzle FX once per gun (grape shares one blast across its pellets).
         if (fe.seq == fires.front().seq || fe.kind != combat::ShotKind::Grape || !firedThisFrame) {
           glm::vec3 mw(fe.mwx, fe.mwy, fe.mwz);

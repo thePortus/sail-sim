@@ -16,6 +16,14 @@ inline constexpr int   kGrapePellets   = 5;
 inline constexpr float kGrapeSpreadRad = 7.0f  * 3.14159265f / 180.0f;   // azimuth half-cone
 inline constexpr float kGrapeElevRad   = 4.0f  * 3.14159265f / 180.0f;   // elevation jitter
 
+// ── Carronades (spar-deck "smashers"): short range, heavy ball (cannon.service.ts) ──
+// A muzzle tagged carronade fires at a reduced velocity (range ∝ v²) so it splashes
+// short (~100 m); the battery AUTO-HOLDS these guns until an enemy is inside reach on
+// that side. The server validates the short shot against carronadeBand + applies the
+// close-range damage multiplier — the client just fires the flagged, slow ball.
+inline constexpr float kCarronadeVFactor = 0.56f;    // × ammo muzzle velocity
+inline constexpr float kCarronadeRange   = 110.0f;   // m — auto-hold cutoff (tracks VFactor² × long reach)
+
 // ── Elevation control (deg) ──
 inline constexpr float kElevMin   = 0.0f;
 inline constexpr float kElevMax   = 18.0f;

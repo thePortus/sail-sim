@@ -7966,7 +7966,9 @@ int main(int argc, char** argv) {
         wakeBoats.push_back({ rp.id, rp.x, rp.z, std::fabs(rp.speed) * 4.0f });
         // Distant-ship LOD (client LOD_NEAR=460/LOD_FAR=540 hysteresis): beyond the
         // far edge swap the full rigged GLB for the baked azimuth billboard.
-        auto ait = shipImp.slugs.find(slug);
+        // Frigate armament variants (frigate_heavy/medium/light) share ONE impostor atlas (keyed 'frigate').
+        const std::string impSlug = (slug.rfind("frigate", 0) == 0) ? std::string("frigate") : slug;
+        auto ait = shipImp.slugs.find(impSlug);
         float d = std::hypot(rp.x - eye.x, rp.z - eye.z);
         bool& act = shipImpActive[rp.id];
         act = (ait != shipImp.slugs.end()) && (act ? d > 460.0f : d > 540.0f);

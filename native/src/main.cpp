@@ -1214,7 +1214,8 @@ struct Ocean {
 
 static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFormat) {
   // Grid of XZ positions centred on the origin; the shader displaces + normals it.
-  const int   N = 600;
+  const int   N = 1000;         // near-ocean tessellation: 1000 cells over +/-1.5 km = 3 m cells (was 600 = 5 m,
+                                // which undersampled the 5 m FFT cascade -> faceted near waves). 1M verts, one draw.
   const float half = 1500.0f;   // detailed FFT ocean out to +/-1.5 km (was 300 m — its
                                 // square edge was visible up close); flat far-sea beyond
   std::vector<float> gv;    gv.reserve((size_t)(N + 1) * (N + 1) * 2);

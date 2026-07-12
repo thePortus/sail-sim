@@ -267,7 +267,11 @@ fn fs_smoke_vel(in : VSOut) -> @location(0) vec4<f32> {
   let sceneZ = -u.proj.w / (dRaw + u.proj.z);
   let soft = clamp((-sceneZ - in.misc.w) / max(u.camFwd.w, 0.1), 0.0, 1.0);
   alpha *= soft;
-  if (alpha < 0.04) { discard; }
+  // Only DENSE smoke disables TAA. The old 0.04 let wispy-thin smoke kill temporal AA on all the rigging
+  // behind it — the sails read aliased/"dithered" through the haze. Thin smoke keeps AA (you can see the ship
+  // clearly through it, so its slight ghosting is invisible); only thick smoke, where the ship IS obscured and
+  // a smear WOULD show, drops history. TUNE up if ghosting returns, down if sails still shimmer through smoke.
+  if (alpha < 0.28) { discard; }
   return vec4<f32>(-99.0, -99.0, 0.0, 0.0);
 }
 )WGSL";
@@ -518,9 +522,9 @@ void System::muzzleBlast(const glm::vec3& m, float dirX, float dirZ, float camDi
   for (ExplSlot& s : im.expl) if (!s.active) { slot = &s; break; }
   if (!slot) { slot = &im.expl[0]; for (ExplSlot& s : im.expl) if (s.life > slot->life) slot = &s; }
   slot->active = true;
-  slot->low = camDist < 6.5f * 9.0f;
+  slot->low = camDist < 9.0f * 9.0f;
   slot->life = 0;
-  slot->size = 6.5f;
+  slot->size = 9.0f;   // bigger blast than the client's 6.5 (reads better on the big frigate broadside)
   slot->seed = std::fabs(std::fmod(m.x * 0.37f + m.z * 0.91f, 50.0f));
   slot->pos = glm::vec3(m.x + dirX * 0.5f, m.y + 0.1f, m.z + dirZ * 0.5f);
   // Smoke belch + lingering pall.
@@ -580,7 +584,7 @@ void System::update(float dt, float windX, float windZ) {
   // Fireballs (0.9 s, ANIM_RATE 6.3, expand 0.8 -> 1.15).
   for (ExplSlot& s : im.expl) {
     if (!s.active) continue;
-    s.life += dt / 0.9f;
+    s.life += dt / 1.35f;   // longer-lived than the client's 0.9 s so the fireball lingers a beat
     if (s.life >= 1.0f) s.active = false;
   }
   // Belch emitters spit puffs every 0.06 s over 0.6 s.

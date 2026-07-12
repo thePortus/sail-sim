@@ -266,8 +266,14 @@ fn fs_smoke_vel(in : VSOut) -> @location(0) vec4<f32> {
   let dRaw = textureLoad(sceneDepth, px, 0);
   let sceneZ = -u.proj.w / (dRaw + u.proj.z);
   let soft = clamp((-sceneZ - in.misc.w) / max(u.camFwd.w, 0.1), 0.0, 1.0);
-  alpha *= soft;
-  if (alpha < 0.04) { discard; }
+  // The no-history sentinel exists to stop the SHIP ghosting through the smoke, so it must only mark where the
+  // smoke covers NEAR geometry (the hull/rig). `soft` is the soft-particle fade: ~1 over FAR scene (open water/
+  // sky), ~0 where the smoke sits just in front of near geometry. Multiplying by `soft` (the old code) stamped
+  // the sentinel over the water/sky in the smoke's TRIANGULAR billboard shape — disabling TAA there, so those
+  // patches rendered un-antialiased at current-frame vs the smoothed history = the chunky fluttering triangles.
+  // Use (1 - soft): mark only where the smoke is close in front of geometry (the ship); leave water/sky TAA'd.
+  alpha *= (1.0 - soft);
+  if (alpha < 0.20) { discard; }
   return vec4<f32>(-99.0, -99.0, 0.0, 0.0);
 }
 )WGSL";

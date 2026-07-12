@@ -267,12 +267,7 @@ fn fs_smoke_vel(in : VSOut) -> @location(0) vec4<f32> {
   let sceneZ = -u.proj.w / (dRaw + u.proj.z);
   let soft = clamp((-sceneZ - in.misc.w) / max(u.camFwd.w, 0.1), 0.0, 1.0);
   alpha *= soft;
-  // DISABLED (threshold > max possible alpha ~0.9): the no-history sentinel suppresses TAA where the smoke is,
-  // which reveals the sails' dithered-alpha rendering as a stippled "white triangles" artifact (worse than the
-  // mild ghosting it was meant to prevent). Keep TAA on through the smoke instead. If ghosting of the ship
-  // through moving smoke turns out worse than the stipple, lower this back toward ~0.4 to re-enable it in dense
-  // smoke only.
-  if (alpha < 1.0) { discard; }
+  if (alpha < 0.04) { discard; }
   return vec4<f32>(-99.0, -99.0, 0.0, 0.0);
 }
 )WGSL";

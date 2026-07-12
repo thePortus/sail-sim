@@ -41,6 +41,14 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   if (d >= 0.99999) { return vec4<f32>(1.0); }   // sky — never shadowed
 
   let P = worldFromUV(uv, d);
+  // Contact shadows are a SHORT-RANGE effect (rope/rail/hull-meets-water). Near the horizon a single texel
+  // spans a huge world distance and NDC depth precision collapses, so the depth-reconstructed normal below
+  // goes noisy and the grazing gate flips frame-to-frame -> the distant-ocean strobing. Nothing that far has
+  // a legitimate short-range occluder (and the march there is sub-pixel anyway), so fade the whole effect out
+  // with camera distance.
+  let dCam = distance(u.camPos.xyz, P);
+  let distFade = 1.0 - smoothstep(140.0, 320.0, dCam);
+  if (distFade <= 0.001) { return vec4<f32>(1.0); }
   let L = normalize(u.sunDir.xyz);
   let steps = i32(u.params.y);
   let stepLen = u.params.x / f32(steps);
@@ -85,6 +93,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     }
   }
 
-  let shadow = occ * u.params.z * u.sunDir.w;   // scale by strength and daylight
+  let shadow = occ * u.params.z * u.sunDir.w * distFade;   // scale by strength, daylight, distance falloff
   return vec4<f32>(vec3<f32>(1.0 - shadow), 1.0);
 }

@@ -4169,6 +4169,8 @@ int main(int argc, char** argv) {
   // keeps chasing as the ship turns while any drag offset is preserved.
   float camYawOffset = 0.0f, camPitch = 0.43f, camDist = 14.3f;
   if (const char* cd = std::getenv("SAILSIM_CAMDIST")) camDist = (float)std::atof(cd);   // screenshot framing
+  if (const char* cy = std::getenv("SAILSIM_CAMYAW"))  camYawOffset = (float)std::atof(cy);   // screenshot framing (rad, 0 = astern)
+  if (const char* cp = std::getenv("SAILSIM_CAMPITCH")) camPitch = (float)std::atof(cp);       // screenshot framing (rad)
   bool  camFramed = false;   // set the default chase distance from the vessel size once
   // ── View modes (client HUD buttons) ──
   bool  firstPerson = false;            // camera sits on the deck; drag = free-look, LMB+WASD = walk

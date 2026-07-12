@@ -78,7 +78,9 @@ fn spiralNoise(pin : vec3<f32>, tim : f32) -> f32 {
   let nudge = 4.0;
   let normalizer = 0.2425356250;
   var p = pin;
-  var n = -(tim * 0.2 - 2.0 * floor(tim * 0.2 / 2.0));   // -mod(t*0.2, -2) equivalent phase
+  var n = -(tim * 0.2 - (-2.0) * floor(tim * 0.2 / (-2.0)));   // -mod(t*0.2, -2.0): GLSL mod keeps the divisor's
+                                                              // sign — porting it as mod(.,+2) shifted the density
+                                                              // field ~3, over-accumulating into a flat solid disc.
   var iter = 2.0;
   for (var i = 0; i < 6; i = i + 1) {
     n += -abs(sin(p.y * iter) + cos(p.x * iter)) / iter;

@@ -151,9 +151,7 @@ fn explosion(uv : vec2<f32>, life : f32, tim : f32, steps : i32, sScale : f32) -
     let s3 = sum.xyz * sum.xyz * (3.0 - 2.0 * sum.xyz);
     sum = vec4<f32>(s3, sum.a);
   }
-  var col = sum.xyz * 6.0;   // brightness boost (native HDR tone-maps the additive fire far harder than Babylon's
-                             // default pipeline, so the byte-identical 1.7 read as faint wisps — lift it to survive).
-                             // TUNE: down toward ~3 if broadsides look like white blobs, up if still faint.
+  var col = sum.xyz * 1.7;   // brightness boost so it reads against the scene (matches the Angular reference)
   let rr = length(uv - 0.5) * 2.0;
   let front = 1.05 - life * 0.95;
   let radial = smoothstep(front, front - 0.5, rr);
@@ -465,15 +463,11 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   vbl.stepMode = WGPUVertexStepMode_Instance;
   vbl.attributeCount = 3; vbl.attributes = attrs;
 
-  auto makePipe = [&](const char* fs, bool additive, bool noBlend = false, bool onTop = false) {
+  auto makePipe = [&](const char* fs, bool additive, bool noBlend = false) {
     WGPUDepthStencilState ds = {};
     ds.format = WGPUTextureFormat_Depth24PlusStencil8;
     ds.depthWriteEnabled = false;            // test only: hull occludes, FX never punch holes
-    // onTop = draw over everything (Always): the muzzle FIREBALL is fire erupting from the gun muzzle, in
-    // FRONT of the barrel — depth-testing it against the hull clipped it wherever the ship sat behind it in
-    // screen space (a ship-shaped bite; on the frigate the muzzles sit deep inside the beam so almost all of
-    // it vanished, leaving only the water glow). Smoke/particles stay depth-tested (Less) so they occlude.
-    ds.depthCompare = onTop ? WGPUCompareFunction_Always : WGPUCompareFunction_Less;
+    ds.depthCompare = WGPUCompareFunction_Less;
     ds.stencilFront.compare = WGPUCompareFunction_Always;
     ds.stencilBack.compare = WGPUCompareFunction_Always;
     ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
@@ -509,8 +503,8 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   p_->pipeFire = makePipe("fs_particle", true);
   p_->pipeSmoke = makePipe("fs_smoke", false);
   p_->pipeSmokeVel = makePipe("fs_smoke_vel", false, true);   // writes the TAA no-history sentinel
-  p_->pipeExplHi = makePipe("fs_expl_hi", true, false, /*onTop=*/true);
-  p_->pipeExplLo = makePipe("fs_expl_lo", true, false, /*onTop=*/true);
+  p_->pipeExplHi = makePipe("fs_expl_hi", true);
+  p_->pipeExplLo = makePipe("fs_expl_lo", true);
   wgpuPipelineLayoutRelease(pl);
   return p_->pipeExplHi != nullptr;
 }

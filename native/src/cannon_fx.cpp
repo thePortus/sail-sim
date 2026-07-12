@@ -470,9 +470,17 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
     ds.format = WGPUTextureFormat_Depth24PlusStencil8;
     ds.depthWriteEnabled = false;            // test only: hull occludes, FX never punch holes
     ds.depthCompare = WGPUCompareFunction_Less;
+    // The FX billboards must NOT touch the stencil buffer. The ocean is stencil-masked (the hull water-mask
+    // stamps ref=1, the ocean tests it), and this pipeline left its stencil OPS unset (0) with a 0xFF write
+    // mask — so the smoke's triangular quads wrote into the stencil where they drew, corrupting the ocean's
+    // mask into chunky triangles that flutter under the moving smoke. Force Keep + a zero write mask so the
+    // stencil is truly read-only for the FX.
     ds.stencilFront.compare = WGPUCompareFunction_Always;
-    ds.stencilBack.compare = WGPUCompareFunction_Always;
-    ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
+    ds.stencilFront.failOp = WGPUStencilOperation_Keep;
+    ds.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
+    ds.stencilFront.passOp = WGPUStencilOperation_Keep;
+    ds.stencilBack = ds.stencilFront;
+    ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0u;
     WGPUBlendState blend = {};
     if (additive) {
       blend.color.srcFactor = WGPUBlendFactor_One;

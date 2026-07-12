@@ -6981,14 +6981,7 @@ int main(int argc, char** argv) {
                                 fe.seq, combat::shotName(fe.kind), fe.carronade);
         // Muzzle FX once per gun (grape shares one blast across its pellets).
         if (fe.seq == fires.front().seq || fe.kind != combat::ShotKind::Grape || !firedThisFrame) {
-          // The volumetric fireball is depth-tested against the hull. On big hulls the muzzles sit INSIDE the
-          // widest beam (tumblehome), so a blast spawned at the muzzle is mostly occluded — you see the flash
-          // but the expanding fire is clipped behind the hull. Push the FX spawn outboard along the beam,
-          // scaled by the muzzle's own beam offset (small hulls barely move), + a small lift, so the fire
-          // billows clear of the hull silhouette. Only the FX moves — the shot/arc still leave the real muzzle.
-          const float beamOff = (fe.mwx - vessel.x) * fe.dirX + (fe.mwz - vessel.z) * fe.dirZ;
-          const float push = std::max(0.0f, beamOff) * 0.22f;
-          glm::vec3 mw(fe.mwx + fe.dirX * push, fe.mwy + 0.25f, fe.mwz + fe.dirZ * push);
+          glm::vec3 mw(fe.mwx, fe.mwy, fe.mwz);
           cannonFx.muzzleBlast(mw, fe.dirX, fe.dirZ, glm::distance(lastEye, mw));
           if (oceanFlashes.size() >= 6) oceanFlashes.erase(oceanFlashes.begin());
           oceanFlashes.push_back({ fe.mwx, fe.mwz, 0.0f, std::atan2(fe.dirZ, fe.dirX) });

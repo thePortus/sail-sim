@@ -463,11 +463,15 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   vbl.stepMode = WGPUVertexStepMode_Instance;
   vbl.attributeCount = 3; vbl.attributes = attrs;
 
-  auto makePipe = [&](const char* fs, bool additive, bool noBlend = false) {
+  auto makePipe = [&](const char* fs, bool additive, bool noBlend = false, bool onTop = false) {
     WGPUDepthStencilState ds = {};
     ds.format = WGPUTextureFormat_Depth24PlusStencil8;
     ds.depthWriteEnabled = false;            // test only: hull occludes, FX never punch holes
-    ds.depthCompare = WGPUCompareFunction_Less;
+    // onTop = draw over everything (Always): the muzzle FIREBALL is fire erupting from the gun muzzle, in
+    // FRONT of the barrel — depth-testing it against the hull clipped it wherever the ship sat behind it in
+    // screen space (a ship-shaped bite; on the frigate the muzzles sit deep inside the beam so almost all of
+    // it vanished, leaving only the water glow). Smoke/particles stay depth-tested (Less) so they occlude.
+    ds.depthCompare = onTop ? WGPUCompareFunction_Always : WGPUCompareFunction_Less;
     ds.stencilFront.compare = WGPUCompareFunction_Always;
     ds.stencilBack.compare = WGPUCompareFunction_Always;
     ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
@@ -503,8 +507,8 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   p_->pipeFire = makePipe("fs_particle", true);
   p_->pipeSmoke = makePipe("fs_smoke", false);
   p_->pipeSmokeVel = makePipe("fs_smoke_vel", false, true);   // writes the TAA no-history sentinel
-  p_->pipeExplHi = makePipe("fs_expl_hi", true);
-  p_->pipeExplLo = makePipe("fs_expl_lo", true);
+  p_->pipeExplHi = makePipe("fs_expl_hi", true, false, /*onTop=*/true);
+  p_->pipeExplLo = makePipe("fs_expl_lo", true, false, /*onTop=*/true);
   wgpuPipelineLayoutRelease(pl);
   return p_->pipeExplHi != nullptr;
 }

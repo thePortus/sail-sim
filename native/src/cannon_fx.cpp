@@ -151,7 +151,9 @@ fn explosion(uv : vec2<f32>, life : f32, tim : f32, steps : i32, sScale : f32) -
     let s3 = sum.xyz * sum.xyz * (3.0 - 2.0 * sum.xyz);
     sum = vec4<f32>(s3, sum.a);
   }
-  var col = sum.xyz * 1.7;
+  var col = sum.xyz * 6.0;   // brightness boost (native HDR tone-maps the additive fire far harder than Babylon's
+                             // default pipeline, so the byte-identical 1.7 read as faint wisps — lift it to survive).
+                             // TUNE: down toward ~3 if broadsides look like white blobs, up if still faint.
   let rr = length(uv - 0.5) * 2.0;
   let front = 1.05 - life * 0.95;
   let radial = smoothstep(front, front - 0.5, rr);

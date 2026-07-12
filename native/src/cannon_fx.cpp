@@ -217,9 +217,12 @@ fn snoise(v : vec3<f32>) -> f32 {
   return 42.0 * dot(m * m, vec4<f32>(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
 fn fbmCloud(uv : vec2<f32>, tim : f32, seed : f32) -> f32 {
-  let n = snoise(vec3<f32>(uv * 3.0 + seed, tim * 0.4)) * 0.55
-        + snoise(vec3<f32>(uv * 6.0 + seed * 1.7, tim * 0.5)) * 0.28
-        + snoise(vec3<f32>(uv * 12.0 - seed * 0.9, tim * 0.3)) * 0.14;
+  // Higher base frequency + a 4th octave: the old uv*3 base showed the SIMPLEX GRID (large triangular cells),
+  // which the density smoothstep hardened into triangular transparent holes revealing the bright sky/water.
+  let n = snoise(vec3<f32>(uv * 5.0 + seed, tim * 0.4)) * 0.44
+        + snoise(vec3<f32>(uv * 9.0 + seed * 1.7, tim * 0.5)) * 0.28
+        + snoise(vec3<f32>(uv * 16.0 - seed * 0.9, tim * 0.3)) * 0.18
+        + snoise(vec3<f32>(uv * 28.0 + seed * 2.3, tim * 0.35)) * 0.10;
   return 0.5 * (n + 1.0);
 }
 @fragment
@@ -231,7 +234,10 @@ fn fs_smoke(in : VSOut) -> @location(0) vec4<f32> {
   let a = in.misc.y * 0.2 + in.misc.z;
   let ruv = vec2<f32>(q.x * cos(a) - q.y * sin(a), q.x * sin(a) + q.y * cos(a)) + 0.5;
   let n = fbmCloud(ruv, in.misc.y, in.misc.z);
-  let dens = smoothstep(0.28, 0.78, n) * disc;
+  // Softer transition + a density FLOOR inside the disc: the old smoothstep(0.28,0.78) drove the smoke core
+  // to FULLY transparent wherever the noise dipped, letting the bright background punch through in the noise's
+  // (triangular) shape. Keep the core at least partly opaque so it never reveals hard background holes.
+  let dens = (0.34 + 0.66 * smoothstep(0.18, 0.86, n)) * disc;
   let col = mix(vec3<f32>(0.13, 0.13, 0.14), vec3<f32>(0.5, 0.49, 0.46), n * n);
   let env = smoothstep(0.0, 0.10, life) * (1.0 - smoothstep(0.6, 1.0, life));
   var alpha = dens * env * 0.9;
@@ -258,7 +264,10 @@ fn fs_smoke_vel(in : VSOut) -> @location(0) vec4<f32> {
   let a = in.misc.y * 0.2 + in.misc.z;
   let ruv = vec2<f32>(q.x * cos(a) - q.y * sin(a), q.x * sin(a) + q.y * cos(a)) + 0.5;
   let n = fbmCloud(ruv, in.misc.y, in.misc.z);
-  let dens = smoothstep(0.28, 0.78, n) * disc;
+  // Softer transition + a density FLOOR inside the disc: the old smoothstep(0.28,0.78) drove the smoke core
+  // to FULLY transparent wherever the noise dipped, letting the bright background punch through in the noise's
+  // (triangular) shape. Keep the core at least partly opaque so it never reveals hard background holes.
+  let dens = (0.34 + 0.66 * smoothstep(0.18, 0.86, n)) * disc;
   let env = smoothstep(0.0, 0.10, life) * (1.0 - smoothstep(0.6, 1.0, life));
   var alpha = dens * env * 0.9;
   let dims = vec2<f32>(textureDimensions(sceneDepth));

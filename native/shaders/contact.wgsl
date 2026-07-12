@@ -47,9 +47,23 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
   // Interleaved-gradient dither on the start offset hides the low step count.
   let jitter = fract(52.9829189 * fract(dot(in.position.xy, vec2<f32>(0.06711056, 0.00583715))));
 
+  // Geometric normal from depth (oriented toward the camera). On a GRAZING or back-facing surface the sun ray
+  // slides along the facet and hits the surface itself — that self-occlusion is the dark-triangle pattern on the
+  // faceted ocean and the flashing on the flat sails. Skip those: a facet that grazes/faces away from the sun
+  // has no legitimate short-range occluder anyway (its shading comes from normal lighting). Nothing to do with
+  // the depth threshold, which is why bias/thickness tweaks and TAA changed nothing.
+  let texel = 1.0 / dims;
+  let dimI  = vec2<i32>(dims) - vec2<i32>(1);
+  let Pr = worldFromUV(uv + vec2<f32>(texel.x, 0.0), textureLoad(depthTex, min(ip + vec2<i32>(1, 0), dimI), 0));
+  let Pu = worldFromUV(uv + vec2<f32>(0.0, texel.y), textureLoad(depthTex, min(ip + vec2<i32>(0, 1), dimI), 0));
+  var N = normalize(cross(Pu - P, Pr - P));
+  if (dot(N, u.camPos.xyz - P) < 0.0) { N = -N; }
+  if (dot(N, L) < 0.20) { return vec4<f32>(1.0); }        // grazing / back-facing → no contact shadow
+  let Pm = P + N * 0.06;                                  // lift the march off the surface (no self re-entry)
+
   var occ = 0.0;
   for (var i = 0; i < steps; i = i + 1) {
-    let Q = P + L * ((f32(i) + jitter) * stepLen);
+    let Q = Pm + L * ((f32(i) + jitter) * stepLen);
     let c = u.vp * vec4<f32>(Q, 1.0);
     if (c.w <= 0.0) { break; }
     let sndc = c.xyz / c.w;

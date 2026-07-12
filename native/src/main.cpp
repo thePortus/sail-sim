@@ -1928,7 +1928,7 @@ static PostFx createPostFx(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   fx.volUbuf = wgpuDeviceCreateBuffer(device, &ubd);
   ubd.size = sizeof(glm::vec4);   // Auto-exposure: rate + min-luminance
   fx.lumUbuf = wgpuDeviceCreateBuffer(device, &ubd);
-  ubd.size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);   // Contact shadows: invVP + vp + sunDir + params
+  ubd.size = 2 * sizeof(glm::mat4) + 3 * sizeof(glm::vec4);   // Contact shadows: invVP + vp + sunDir + params + camPos
   fx.csUbuf = wgpuDeviceCreateBuffer(device, &ubd);
 
   // ── SMAA setup ──────────────────────────────────────────────────────────────
@@ -9736,14 +9736,15 @@ int main(int argc, char** argv) {
     //    the HDR scene where a nearer surface occludes the light at short range (grounding the rigging /
     //    the ship's contact shadow on the water). Runs after composite, before the additive shafts. ──
     if (userCfg.gfx.contactShadows && sailing && lightDir.y > 0.05f) {
-      struct CsUC { glm::mat4 invVP; glm::mat4 vp; glm::vec4 sunDir; glm::vec4 params; } cu;
+      struct CsUC { glm::mat4 invVP; glm::mat4 vp; glm::vec4 sunDir; glm::vec4 params; glm::vec4 camPos; } cu;
       cu.invVP  = glm::inverse(viewProj);
       cu.vp     = viewProj;
       cu.sunDir = glm::vec4(glm::normalize(lightDir), dayK);
-      cu.params = glm::vec4(0.55f, 16.0f, 0.55f, 0.5f);   // max dist (m), steps, strength, depth thickness
+      cu.params = glm::vec4(0.55f, 16.0f, 0.55f, 0.5f);   // max dist (m), steps, strength, thickness slab (m, world)
+      cu.camPos = glm::vec4(eye, 1.0f);                    // world-space depth comparison (see contact.wgsl)
       wgpuQueueWriteBuffer(queue, postFx.csUbuf, 0, &cu, sizeof(cu));
       WGPUBindGroupEntry ce[2] = {};
-      ce[0].binding = 0; ce[0].buffer = postFx.csUbuf; ce[0].size = 2 * sizeof(glm::mat4) + 2 * sizeof(glm::vec4);
+      ce[0].binding = 0; ce[0].buffer = postFx.csUbuf; ce[0].size = 2 * sizeof(glm::mat4) + 3 * sizeof(glm::vec4);
       ce[1].binding = 1; ce[1].textureView = depthReadView;
       WGPUBindGroupDescriptor cbd = {}; cbd.layout = postFx.csBGL; cbd.entryCount = 2; cbd.entries = ce;
       WGPUBindGroup cbind = wgpuDeviceCreateBindGroup(device, &cbd);

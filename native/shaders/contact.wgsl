@@ -9,7 +9,8 @@ struct CsU {
   invVP  : mat4x4<f32>,   // NDC -> world
   vp     : mat4x4<f32>,   // world -> NDC (for projecting march samples)
   sunDir : vec4<f32>,     // xyz = unit toward the sun ; w = day factor
-  params : vec4<f32>,     // x = max march distance (m) ; y = step count ; z = strength [0..1] ; w = depth thickness
+  params : vec4<f32>,     // x = max march distance (m) ; y = step count ; z = strength [0..1] ; w = thickness slab (m)
+  camPos : vec4<f32>,     // xyz = camera world position (for metric depth comparison)
 };
 @group(0) @binding(0) var<uniform> u : CsU;
 @group(0) @binding(1) var depthTex : texture_depth_2d;
@@ -56,11 +57,17 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { break; }
     let sp = vec2<i32>(clamp(suv * dims, vec2<f32>(0.0), dims - 1.0));
     let sd = textureLoad(depthTex, sp, 0);
-    // Occluded when a stored surface sits IN FRONT of the marched sample (nearer to the camera) by
-    // more than a small bias, but within a thickness slab (so we don't shadow through the whole world).
-    if (sd < sndc.z - 0.00003 && sd > sndc.z - u.params.w) {
-      // Fade with march distance so the contact darkening stays local.
-      occ = max(occ, 1.0 - f32(i) / f32(steps));
+    if (sd >= 0.99999) { continue; }                       // sky at the sample — no occluder there
+    // Compare in WORLD space (metres), NOT raw NDC depth: NDC is wildly non-linear, so the old
+    // `sd - u.params.w` slab was effectively half the world (over-occlusion) and the 0.00003 NDC bias let
+    // wave crests + sail surfaces self-shadow -> dark triangles on the water + flashing on the sails.
+    let occWorld = worldFromUV(suv, sd);                   // frontmost surface at this sample
+    let dQ   = distance(u.camPos.xyz, Q);                  // marched point's distance from camera
+    let dOcc = distance(u.camPos.xyz, occWorld);           // occluder's distance from camera
+    // Occluded when a real surface sits IN FRONT of the march point by [bias, thickness] METRES — a thin
+    // slab that skips self/grazing hits (bias) and never shadows through the background (thickness).
+    if (dOcc < dQ - 0.08 && dOcc > dQ - u.params.w) {
+      occ = max(occ, 1.0 - f32(i) / f32(steps));           // fade with march distance — darkening stays local
     }
   }
 

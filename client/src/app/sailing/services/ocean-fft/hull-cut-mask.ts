@@ -288,8 +288,12 @@ export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, s
   // freshly-built proxy loses no skinning. Excludes any prior 'hull_stencil_proxy' so re-runs don't double up.
   const parent = hull.parent as (TransformNode | null);
   const siblings = (parent ? parent.getChildMeshes(true) : [hull]) as Mesh[];
+  // Match the hull AND the wood planking/wales/fenders/sheer moldings (the frigate splits these into a
+  // separate 'Frigate_Plank' primitive). Without the plank, the fenders + sheer moldings sit outside the
+  // stencil, so the ocean doesn't cut around them like it does the hull — they stay visible where the hull
+  // is correctly masked. Other vessels keep their planking inside the hull mesh, so this is a no-op there.
   const parts = siblings.filter(m =>
-    /hull/i.test(m.name) && !/stencil/i.test(m.name) &&
+    /hull|plank/i.test(m.name) && !/stencil/i.test(m.name) &&
     m.getTotalVertices() > 0 && typeof (m as Mesh).getVerticesData === 'function');
   const meshes = parts.length ? parts : [(hull as unknown as { sourceMesh?: Mesh }).sourceMesh ?? (hull as Mesh)];
   const allPos: number[] = []; const allIdx: number[] = []; const allNrm: number[] = [];

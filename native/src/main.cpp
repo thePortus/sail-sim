@@ -4174,6 +4174,7 @@ int main(int argc, char** argv) {
   if (const char* cy = std::getenv("SAILSIM_CAMYAW"))  camYawOffset = (float)std::atof(cy);   // screenshot framing (rad, 0 = astern)
   if (const char* cp = std::getenv("SAILSIM_CAMPITCH")) camPitch = (float)std::atof(cp);       // screenshot framing (rad)
   bool  camFramed = false;   // set the default chase distance from the vessel size once
+  float aimTubeFade[2] = { 0.0f, 0.0f };   // per-side: spikes to 1 on each shot, decays — dims the aim tubes during a broadside so the muzzle flashes/explosions read clean
   // ── View modes (client HUD buttons) ──
   bool  firstPerson = false;            // camera sits on the deck; drag = free-look, LMB+WASD = walk
   glm::vec3 fpEye(0.0f, 2.0f, -2.0f);   // root-local eye (deck-walk position)
@@ -6980,8 +6981,10 @@ int main(int argc, char** argv) {
       }
       std::vector<combat::FireEvent> fires;
       guns.update(dt, gpose, enemies, crewFactor, meId, fires);
+      for (int s = 0; s < 2; ++s) aimTubeFade[s] = std::max(0.0f, aimTubeFade[s] - dt * 1.7f);   // ~0.6s decay back to full-strength tubes
       bool firedThisFrame = false;
       for (const combat::FireEvent& fe : fires) {
+        aimTubeFade[fe.side] = 1.0f;   // this side just fired → dim its aim tubes so the muzzle flash/explosion reads
         mpClient.sendCannonShot(fe.mwx, fe.mwy, fe.mwz, fe.vx, fe.vy, fe.vz,
                                 fe.seq, combat::shotName(fe.kind), fe.carronade);
         // Muzzle FX once per gun (grape shares one blast across its pellets).
@@ -9496,9 +9499,11 @@ int main(int argc, char** argv) {
         if (guns.sideState(s2) != combat::SideState::Engaged || guns.loadedCount(s2) == 0)
           continue;
         const combat::LockSolution& lk = guns.lock(s2);
-        // GREEN converging on the lock, RED splashing free (client tube colours).
-        const glm::vec4 col = lk.valid ? glm::vec4(0.25f, 0.95f, 0.40f, 0.32f)
-                                       : glm::vec4(0.95f, 0.30f, 0.25f, 0.28f);
+        // GREEN converging on the lock, RED splashing free (client tube colours). Alpha dips toward
+        // ~12% while this side is firing (aimTubeFade) so the tubes don't fight the muzzle flashes.
+        const float tubeA = 1.0f - 0.88f * aimTubeFade[s2];
+        const glm::vec4 col = lk.valid ? glm::vec4(0.25f, 0.95f, 0.40f, 0.32f * tubeA)
+                                       : glm::vec4(0.95f, 0.30f, 0.25f, 0.28f * tubeA);
         for (int gi = 0; gi < guns.gunsPerSide(); ++gi)
           if (guns.gunLoaded(s2, gi))   // only a re-armed gun shows its aim tube
             primsSys.tube(guns.arcPath(s2, gi, apose), 0.16f, col, 6);

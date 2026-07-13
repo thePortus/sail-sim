@@ -229,6 +229,9 @@ export class CannonService {
   private aimMat: StandardMaterial | null = null;       // free-aim arc (red)
   private aimMatLock: StandardMaterial | null = null;   // locked solution arc (green)
   private readonly aimTubes: Record<'port' | 'stbd', Mesh[]> = { port: [], stbd: [] };
+  // Time (this.elapsed) each side last fired a gun. The aim tubes dim toward ~12% for ~0.6s after each
+  // shot so a rolling broadside's still-loaded arcs don't fight the muzzle flashes/explosions.
+  private readonly aimFireAt: Record<'port' | 'stbd', number> = { port: -1, stbd: -1 };
   // Lock reticle: a camera-facing corner-bracket billboard parked on the soft-locked enemy (built lazily).
   private reticle: Mesh | null = null;
   private readonly RETICLE_Y = 3.5;   // sit it on the hull/low rig of the locked ship
@@ -1065,6 +1068,9 @@ export class CannonService {
       const tubes = this.aimTubes[side];
       const ready = this.gun[side].state === 'engaged';   // show the aim tubes whenever the battery is run out
       if (!ready) { for (const t of tubes) t.setEnabled(false); continue; }
+      // Dim toward ~12% for ~0.6s after this side last fired (per-mesh visibility scales the alpha) so a
+      // rolling broadside's still-loaded arcs recede behind the flashes/explosions, then fade back in.
+      const tubeVis = 1 - 0.88 * Math.max(0, 1 - (this.elapsed - this.aimFireAt[side]) / 0.6);
 
       // Solve the lock (round/bar) once per BATTERY: long guns at full velocity, carronades at their reduced
       // velocity — so the carronade arcs trace a SHORT throw that splashes at ~100 m, converging on a target
@@ -1096,6 +1102,7 @@ export class CannonService {
           // Reuse the geometry — same sample count, so update in place (cheap).
           const tube = MeshBuilder.CreateTube('aim_' + side + i, { path, instance: prev }, this.scene);
           tube.material = mat;                  // recolour by lock state each frame
+          tube.visibility = tubeVis;            // dip during the broadside
           tube.setEnabled(true);
           tubes[i] = tube;
         } else {
@@ -1103,6 +1110,7 @@ export class CannonService {
             path, radius: AIM_RADIUS, tessellation: 6, cap: Mesh.NO_CAP, updatable: true,
           }, this.scene);
           tube.material         = mat;
+          tube.visibility       = tubeVis;  // dip during the broadside
           tube.isPickable       = false;
           tube.renderingGroupId = 3;        // draw over the water like the cannon FX
           tube.alphaIndex       = 0;        // behind the smoke/flame within the group
@@ -1433,6 +1441,7 @@ export class CannonService {
   // ── Fire one cannon of a broadside (fixed beam direction, no aiming) ────────
 
   private fireOneCannon(side: 'port' | 'stbd', idx: number): void {
+    this.aimFireAt[side] = this.elapsed;   // dim this side's aim tubes for the muzzle flash
     const vs   = this.vesselService.state();
     const hRad = vs.heading * Math.PI / 180;
     const sinH = Math.sin(hRad);

@@ -223,7 +223,7 @@ const VESSELS = [
     description: 'A 44-gun heavy frigate — a purpose-built man-of-war with a full battery of 24-pounders and spar-deck carronades. The toughest hull and deadliest broadside afloat, fast under her huge press of canvas, but the heaviest ship in the fleet: ponderous to turn and slow to gather way. The apex predator of the sea.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50 },
-    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG, FRIG_CARR),   // 15 long guns + 11 carronades
     zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
     crew: 480, cargo: 40, price: 750000, parts: [],
@@ -233,7 +233,7 @@ const VESSELS = [
     description: 'A frigate on a medium battery — fewer, lighter guns than the heavy, trading some of that crushing broadside for a slightly livelier, cheaper ship. Still the toughest hull and among the fastest afloat, and still ponderous to handle.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55 },
-    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG, FRIG_CARR.slice(1, 9)),   // 15 long guns + 8 carronades
     zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
     crew: 420, cargo: 50, price: 500000, parts: [],
@@ -243,7 +243,7 @@ const VESSELS = [
     description: 'A frigate on a light battery — the least-armed loadout, the fastest and handiest of the three, and the cheapest way onto a frigate\'s deck. A stout, fast hull for a captain who values speed over a full broadside.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
     physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60 },
-    firstPersonCam: { x: 1.6, y: 5.6, z: -20.6 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG.slice(0, 13), FRIG_CARR.slice(2, 8)),   // 13 long guns + 6 carronades
     zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
     crew: 360, cargo: 60, price: 350000, parts: [],

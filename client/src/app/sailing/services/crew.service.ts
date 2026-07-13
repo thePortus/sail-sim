@@ -169,7 +169,7 @@ export class CrewService {
     merchantman: 'crew_stations.merchantman.json',
     frigate:     'crew_stations.frigate.json',
   };
-  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12, merchantman: 9, frigate: 10 };
+  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12, merchantman: 9, frigate: 32 };
 
   /**
    * Spawn a crew on one vessel.

@@ -962,6 +962,12 @@ export class SceneService {
     ssao.samples          = 16;    // 16 gives clean results on modern GPUs
     ssao.maxZ             = 100;   // AO zeroed beyond 100 u — excludes islands / far terrain
     ssao.bilateralSamples = 8;     // denoising pass sample count (smooth edges)
+    // DIAGNOSTIC: localStorage ignis_ssao='off' neutralises SSAO (base 1 / strength 0). The rigged vessel is
+    // excluded from the prePass, so SSAO paints the OCEAN's wave/coast AO onto the hull — a faint wash by day,
+    // but amplified into dark speckle at night by auto-exposure. Flip this to confirm it's the source.
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('ignis_ssao') === 'off') {
+      ssao.totalStrength = 0; ssao.base = 1;
+    }
 
     // Sharpening — restores a little crispness to rigging and deck detail after
     // FXAA / SSAO's bilateral blur. Kept low: a high edgeAmount amplifies contrast
@@ -975,7 +981,9 @@ export class SceneService {
     // Film grain — breaks up the uniform "CG plastic" look on flat surfaces
     // (deck planks, sails, hull paint).  Animated so it reads as surface
     // texture/life rather than static noise.
-    this.pipeline.grainEnabled       = true;
+    // DIAGNOSTIC: localStorage ignis_grain='off' disables the animated film grain (a second speckle source at
+    // night, when high exposure amplifies the noise). Flip it to see how much of the speckle is grain vs SSAO.
+    this.pipeline.grainEnabled       = !(typeof localStorage !== 'undefined' && localStorage.getItem('ignis_grain') === 'off');
     this.pipeline.grain.intensity    = 12;
     this.pipeline.grain.animated     = true;
 

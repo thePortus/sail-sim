@@ -35,7 +35,9 @@ interface MastZone {
  *     pruned from the baked clips, so lids are driven DIRECTLY via setMorphByName (one Lid morph per broadside
  *     opens both the gun-deck long-gun ports AND the spar-deck carronade ports of that side).
  *   • The masts topple about local Z (baked into the MastDown clips — the controller just scrubs them).
- * HEAVY battery only (Constitution ships Heavy); Medium/Light variants are not in the shipped GLB.
+ * All 3 variants ship in ONE GLB. Lids are NESTED per-variant morph groups (Lid_{S|P} = light set,
+ * +LidM_{S|P} = medium's extra ports, +LidH_{S|P} = heavy's); the active variant opens up to its tier and
+ * leaves the rest bolted shut (an un-opened lid hides its gun). Counts H/M/L: long guns 15/15/13, carronades 11/8/6.
  *
  * AnimationGroups may carry an 'NLA_' prefix + a loader .NNN suffix; strip() removes both.
  */
@@ -229,7 +231,7 @@ export class FrigateController implements VesselController {
         if (!this.hasMorph(p.sailMorph.node, p.sailMorph.target)) missing.push(p.sailMorph.node + '|' + p.sailMorph.target);
         for (const r of p.rigging) if (!this.hasMorph(r.node, r.target)) missing.push(r.node + '|' + r.target);
       }
-      for (const side of ['S', 'P'] as const) if (!this.hasMorph(this.PORTS_MESH, `Lid_${side}`)) missing.push(`${this.PORTS_MESH}|Lid_${side}`);
+      for (const side of ['S', 'P'] as const) for (const grp of ['Lid', 'LidM', 'LidH']) if (!this.hasMorph(this.PORTS_MESH, `${grp}_${side}`)) missing.push(`${this.PORTS_MESH}|${grp}_${side}`);
       console.log(`[Frigate] clips (${this.clips.size}), pruned ${this.prunedChannels} constant channels:`, [...this.clips.keys()].join(', '));
       if (missing.length) console.warn('[Frigate] UNRESOLVED morphs →', missing.join(', '));
       else console.log('[Frigate] all sail/rope/lid morphs resolved by name ✓');
@@ -311,7 +313,18 @@ export class FrigateController implements VesselController {
   }
   /** Lids are a MORPH (Frigate_Ports.Lid_{S|P}), driven directly — NOT a clip. */
   setGunports(side: GunSide, open: number): void {
-    this.setMorphByName(this.PORTS_MESH, `Lid_${this.clipSide(side)}`, Math.max(0, Math.min(1, open)));
+    this.setLidsOpen(this.clipSide(side), open);
+  }
+
+  /** Open the nested per-variant lid groups. One GLB carries all ports; the variant tier decides how many
+   *  open (light = Lid_* only, medium adds LidM_*, heavy adds LidH_*). Groups above the tier are forced shut
+   *  (bolted) — self-correcting so a variant downgrade after deploy can't leave a group stuck open. */
+  private setLidsOpen(cs: string, open: number): void {
+    const v = Math.max(0, Math.min(1, open));
+    const tier = this.armament === 'heavy' ? 2 : this.armament === 'medium' ? 1 : 0;
+    this.setMorphByName(this.PORTS_MESH, `Lid_${cs}`, v);
+    this.setMorphByName(this.PORTS_MESH, `LidM_${cs}`, tier >= 1 ? v : 0);
+    this.setMorphByName(this.PORTS_MESH, `LidH_${cs}`, tier >= 2 ? v : 0);
   }
 
   /** Choose the visible armament variant ('heavy' | 'medium' | 'light'). All three are rigged, so the shown
@@ -426,7 +439,7 @@ export class FrigateController implements VesselController {
     const lid = Math.max(0, Math.min(1, dep * 2));                              // lid opens over the first half
     const gun = Math.max(0, Math.min(1, dep * 2 - 1) - this.gunRecoil[side]);   // gun runs out over the second half
     const cs = this.clipSide(side);
-    this.setMorphByName(this.PORTS_MESH, `Lid_${cs}`, lid);                     // lids = morph, NOT a clip
+    this.setLidsOpen(cs, lid);                                                  // lids = nested per-variant morphs
     this.poseNorm(`Gun_${cs}`, gun);
   }
 

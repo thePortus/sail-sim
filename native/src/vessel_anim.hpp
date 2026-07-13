@@ -141,6 +141,9 @@ private:
   bool singleAnchor_ = false;
   MorphRef cableS_, cableP_;                   // anchor cable morphs (pinnace/brig)
   MorphRef lidMorphS_, lidMorphP_;             // frigate gun-port lids — MORPHS (Frigate_Ports), not bone clips
+  MorphRef lidMorphMS_, lidMorphMP_;           // + medium-variant ports (opened on medium & heavy)
+  MorphRef lidMorphHS_, lidMorphHP_;           // + heavy-only ports (opened on heavy)
+  int frigateTier_ = 0;                        // 0=light, 1=medium, 2=heavy — how many nested lid groups deploy
   std::vector<FlagSpec> flags_;
   float flagYawOffset_ = 0.0f;
   bool flagChainRipple_ = false;               // pinnace Flag1>2>3 travelling wave

@@ -3393,6 +3393,7 @@ int main(int argc, char** argv) {
     else if (mp.find("pinnace") != std::string::npos)     cliSlug = "pinnace";
     else if (mp.find("sloop") != std::string::npos)       cliSlug = "sloop";
     else if (mp.find("sloop") != std::string::npos || mp.find("bermuda") != std::string::npos) cliSlug = "sloop";
+    if (const char* sv = std::getenv("SAILSIM_SLUG")) cliSlug = sv;   // test hook: force variant (e.g. frigate_heavy/_medium/_light)
     vessels.emplace(cliSlug, loadVessel(device, queue, kSceneFormat, modelArg, cliSlug));
     ownVesselSlug = cliSlug;
   }

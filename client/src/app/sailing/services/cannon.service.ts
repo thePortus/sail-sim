@@ -229,9 +229,9 @@ export class CannonService {
   private aimMat: StandardMaterial | null = null;       // free-aim arc (red)
   private aimMatLock: StandardMaterial | null = null;   // locked solution arc (green)
   private readonly aimTubes: Record<'port' | 'stbd', Mesh[]> = { port: [], stbd: [] };
-  // Time (this.elapsed) each side last fired a gun. The aim tubes dim toward ~12% for ~0.6s after each
-  // shot so a rolling broadside's still-loaded arcs don't fight the muzzle flashes/explosions.
-  private readonly aimFireAt: Record<'port' | 'stbd', number> = { port: -1, stbd: -1 };
+  // this.elapsed of the last shot on ANY side. ALL aim tubes dim toward ~12% while a broadside fires (held
+  // through the rolling volley, ~0.9s fade after the last gun) so they don't fight the flashes/explosions.
+  private aimFireAt = -1;
   // Lock reticle: a camera-facing corner-bracket billboard parked on the soft-locked enemy (built lazily).
   private reticle: Mesh | null = null;
   private readonly RETICLE_Y = 3.5;   // sit it on the hull/low rig of the locked ship
@@ -1068,9 +1068,9 @@ export class CannonService {
       const tubes = this.aimTubes[side];
       const ready = this.gun[side].state === 'engaged';   // show the aim tubes whenever the battery is run out
       if (!ready) { for (const t of tubes) t.setEnabled(false); continue; }
-      // Dim toward ~12% for ~0.6s after this side last fired (per-mesh visibility scales the alpha) so a
-      // rolling broadside's still-loaded arcs recede behind the flashes/explosions, then fade back in.
-      const tubeVis = 1 - 0.88 * Math.max(0, 1 - (this.elapsed - this.aimFireAt[side]) / 0.6);
+      // Dim ALL tubes toward ~12% while any broadside fires (per-mesh visibility scales the alpha), held
+      // through the rolling volley and fading back ~0.9s after the last gun.
+      const tubeVis = 1 - 0.88 * Math.max(0, 1 - (this.elapsed - this.aimFireAt) / 0.9);
 
       // Solve the lock (round/bar) once per BATTERY: long guns at full velocity, carronades at their reduced
       // velocity — so the carronade arcs trace a SHORT throw that splashes at ~100 m, converging on a target
@@ -1441,7 +1441,7 @@ export class CannonService {
   // ── Fire one cannon of a broadside (fixed beam direction, no aiming) ────────
 
   private fireOneCannon(side: 'port' | 'stbd', idx: number): void {
-    this.aimFireAt[side] = this.elapsed;   // dim this side's aim tubes for the muzzle flash
+    this.aimFireAt = this.elapsed;   // a broadside is firing → dim ALL aim tubes for the flashes
     const vs   = this.vesselService.state();
     const hRad = vs.heading * Math.PI / 180;
     const sinH = Math.sin(hRad);

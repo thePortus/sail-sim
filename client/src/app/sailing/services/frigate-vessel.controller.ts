@@ -59,9 +59,10 @@ export class FrigateController implements VesselController {
   private readonly restQ  = new Map<string, Quaternion>();
   private readonly parentRestQ = new Map<string, Quaternion>();
   private readonly frameEnd: number;
-  // Rig_SailSheets Furl_* morphs now GATHER the clewlines up to their yards with the furled sail (the deck
-  // sheets were zeroed so they no longer stretch clew→deck-block into flat triangles — that was the brig's
-  // old failure). Safe to drive; disable with localStorage ignis_fr_ropefurl='off' if needed.
+  // Rig_SailSheets Furl_* morphs raise each sheet's clew end to follow the furled sail while its bulwark end
+  // stays tied — the sheet rises as a taut rope (like the brig). The old morph collapsed the clew RING to a
+  // point, so the stretched sheet became a degenerate flat triangle; now the ring moves rigidly (cross-section
+  // preserved) so it stays a round rope. Safe to drive; disable with localStorage ignis_fr_ropefurl='off'.
   private driveRopeFurl = true;
 
   private rudderCur = 0; private rudderTarget = 0;

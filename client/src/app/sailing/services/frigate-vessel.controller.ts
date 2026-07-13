@@ -59,12 +59,10 @@ export class FrigateController implements VesselController {
   private readonly restQ  = new Map<string, Quaternion>();
   private readonly parentRestQ = new Map<string, Quaternion>();
   private readonly frameEnd: number;
-  // The Rig_SailSheets Furl_* morphs fling the sheets — a clew correctly rises ~12m to its yard, but the
-  // sheet rope stretches from the risen clew down to its fixed deck block into a big flat triangle (the exact
-  // failure the brigantine hit before its rope morphs were re-baked). Native tolerates it; Babylon renders the
-  // stretched ribbons as dark triangles off the masts. Until the morphs are re-authored, leave the running
-  // rigging at its set position when sails furl (opt back in with localStorage ignis_fr_ropefurl='on').
-  private driveRopeFurl = false;
+  // Rig_SailSheets Furl_* morphs now GATHER the clewlines up to their yards with the furled sail (the deck
+  // sheets were zeroed so they no longer stretch clew→deck-block into flat triangles — that was the brig's
+  // old failure). Safe to drive; disable with localStorage ignis_fr_ropefurl='off' if needed.
+  private driveRopeFurl = true;
 
   private rudderCur = 0; private rudderTarget = 0;
   private trimCur   = 0.5; private trimTarget = 0.5;
@@ -127,7 +125,7 @@ export class FrigateController implements VesselController {
     if (typeof localStorage !== 'undefined') {
       const fdeg = localStorage.getItem('ignis_fr_flag_deg');
       if (fdeg !== null && !isNaN(parseFloat(fdeg))) this.FLAG_YAW_OFFSET = parseFloat(fdeg) * Math.PI / 180;
-      if (localStorage.getItem('ignis_fr_ropefurl') === 'on') this.driveRopeFurl = true;   // opt in to the (flinging) rope morphs
+      if (localStorage.getItem('ignis_fr_ropefurl') === 'off') this.driveRopeFurl = false;
       const wa = localStorage.getItem('ignis_fr_wheelaxis');
       if (wa === 'x') this.WHEEL_AXIS = Vector3.Right();
       else if (wa === 'y') this.WHEEL_AXIS = Vector3.Up();

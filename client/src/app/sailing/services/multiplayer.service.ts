@@ -1878,7 +1878,7 @@ export class MultiplayerService {
       const omo = (typeof localStorage !== 'undefined') ? localStorage.getItem('ignis_oceanmask_' + slug) : null;
       const oceanMask = omo === 'on' ? true : omo === 'off' ? false : (rig.oceanMask !== false);
       const hull = oceanMask ? vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0) : null;
-      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig))) {
+      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig), rig.oceanMaskBeamX)) {
         this.oceanService.setHullStencilMask(true);
       }
     }

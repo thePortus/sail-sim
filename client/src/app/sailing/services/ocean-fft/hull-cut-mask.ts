@@ -277,7 +277,7 @@ export function buildHullStencilCap(
  * Render wiring (caller): renderingGroupId 0 + the group-0 opaque sort that draws stencilProxy meshes
  * first, so the stamp lands before the water reads it. Returns null if the hull can't be cloned.
  */
-export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene, waterlineLocalY?: number): Mesh | null {
+export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, scene: Scene, waterlineLocalY?: number, beamClampX?: number): Mesh | null {
   // An InstancedMesh shares its sourceMesh's geometry; clone the SOURCE (a real Mesh with a material slot).
   // Gather ALL of the hull's primitives, not just the one mesh handed in. A wood-reskinned hull is split into
   // many material primitives (the open pinnace went 4→9); Babylon loads each primitive as a separate sibling
@@ -309,6 +309,11 @@ export function buildHullStencilProxy(hull: AbstractMesh, root: TransformNode, s
   // Clamp below the hull-local waterline (when given) so the stencil masks only the above-water hull, never the
   // submerged hull/keel (which showed through the sea). Undefined → keep the whole hull (shallow open boats).
   if (waterlineLocalY != null) { for (let i = 1; i < p.length; i += 3) { if (p[i] < waterlineLocalY) { p[i] = waterlineLocalY; } } }
+  // Clamp the proxy's beam (|localX|) so a tumblehome hull's wide WATERLINE outline doesn't cut the ocean past the
+  // rail (which reveals the seabed in the gap). The rail-width footprint still covers the whole deck; the hull sides
+  // outboard of it are opaque and cover themselves. Only pulls in verts wider than the clamp — the narrower bow/stern
+  // and the deck are untouched.
+  if (beamClampX != null) { for (let i = 0; i < p.length; i += 3) { if (p[i] > beamClampX) { p[i] = beamClampX; } else if (p[i] < -beamClampX) { p[i] = -beamClampX; } } }
   const vd = new VertexData();
   vd.positions = p; vd.indices = allIdx;
   if (haveNrm && allNrm.length === allPos.length) { vd.normals = new Float32Array(allNrm); }

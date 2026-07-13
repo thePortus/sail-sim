@@ -597,7 +597,7 @@ export class VesselService {
       // waterline still revealed the keel, because the proxy's flat bottom sat right where the line of sight to
       // the underwater hull crosses the sea). Undefined → mask the whole hull (shallow open boats).
       this.hullStencilCap = buildHullStencilProxy(
-        hull, this.root, this.sceneService.scene, maskFloorFor(this.vesselSlug, this.rig));
+        hull, this.root, this.sceneService.scene, maskFloorFor(this.vesselSlug, this.rig), this.rig.oceanMaskBeamX);
       if (this.hullStencilCap) {
         this.oceanService.setHullStencilMask(true);
         this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard

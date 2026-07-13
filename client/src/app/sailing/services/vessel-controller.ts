@@ -99,6 +99,11 @@ export interface VesselRig {
    *  above this — never the waterline/underwater hull (which otherwise shows the keel through the sea). Set
    *  to ~the weather-deck height (keel at local 0). Omit → mask the whole hull (fine for shallow open boats). */
   oceanMaskFloorY?: number;
+  /** Hull-LOCAL |X| the stencil proxy is clamped to (removes the tumblehome bulge that pokes past the rail).
+   *  A hull is widest at the WATERLINE; on a tumblehome hull (e.g. the frigate: waterline beam ~7 vs rail ~5.6)
+   *  the proxy silhouette is that wide waterline beam, so the ocean gets cut ~1.4m outboard of the rail and the
+   *  seabed shows in the gap. Clamp |X| to ~the rail half-beam so the cut hugs the deck. Omit → no beam clamp. */
+  oceanMaskBeamX?: number;
   /** v2 sailing polar (omit → falls back to the legacy step curve). */
   sail?: SailRig;
 }
@@ -157,7 +162,11 @@ export const VESSEL_RIGS: Record<string, VesselRig> = {
   // bow=+Z, so NO baseYaw. Model origin is at the LWL (waterline Z0; keel at -6.4m), so floatDraft ~0 floats it
   // right. floatDraft / hullCut.waterlineY / buoyancy are STARTING values — tune live (ignis_draft_frigate etc).
   // A very heavy man-of-war rides the swell ponderously (low pitchScale, long time constants).
-  frigate: { glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1, controller: 'frigate', floatDraft: 0, hullHalfLen: 24.0, hullHalfBeam: 5.5, oceanMaskFloorY: 6.5, hullCut: { floorY: 0.2, alongSign: 1, waterlineY: 0 }, buoyancy: { pitchScale: 0.05, heaveTau: 1.2, tiltTau: 0.7 }, sail: FRIGATE_SAIL },
+  // oceanMaskFloorY drops to the waterline (frigate has no modeled underwater body, just a keel fin) so the stencil
+  // proxy's flattened disk sits at sea level instead of floating up at the rail; oceanMaskBeamX clamps the proxy beam
+  // in to the rail so the wide tumblehome waterline outline (beam ~7) stops cutting the ocean ~1.4m past the rail
+  // (~5.6) and revealing the seabed. See buildHullStencilProxy. Tune live: localStorage ignis_maskfloor_frigate.
+  frigate: { glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1, controller: 'frigate', floatDraft: 0, hullHalfLen: 24.0, hullHalfBeam: 5.5, oceanMaskFloorY: 0.5, oceanMaskBeamX: 5.7, hullCut: { floorY: 0.2, alongSign: 1, waterlineY: 0 }, buoyancy: { pitchScale: 0.05, heaveTau: 1.2, tiltTau: 0.7 }, sail: FRIGATE_SAIL },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {

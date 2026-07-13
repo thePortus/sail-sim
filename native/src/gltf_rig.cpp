@@ -257,8 +257,14 @@ RiggedData loadGltfRigged(const char* path) {
           m.vertexBase = base;
           m.vertexCount = (uint32_t)vcount;
           m.dpos.resize(vcount);
-          for (cgltf_size v = 0; v < vcount; ++v)
-            cgltf_accessor_read_float(mt.attributes[ai].data, v, &m.dpos[v].x, 3);
+          // unpack_floats (NOT read_float per-vertex): it applies SPARSE substitution.
+          // cgltf_accessor_read_float returns 0 and writes nothing for a sparse accessor,
+          // and the Blender glTF exporter stores a morph target sparsely once it moves
+          // fewer than ~half the mesh's verts — so a subset-morph (e.g. the frigate's
+          // per-variant gun-port lid groups) would otherwise read all-zero deltas and
+          // never deform. glm::vec3 is 3 contiguous floats, so dpos packs tightly.
+          if (vcount)
+            cgltf_accessor_unpack_floats(mt.attributes[ai].data, &m.dpos[0].x, vcount * 3);
           out.morphs.push_back(std::move(m));
         }
       }

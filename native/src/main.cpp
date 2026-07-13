@@ -1061,6 +1061,7 @@ static Mesh loadVessel(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat fmt
 // Used as the deck-walk START; the deck raycast snaps the eye height each frame,
 // so a small model-scale difference just re-seats the eye on the real deck.
 static glm::vec3 fpCamFor(const std::string& slug) {
+  if (slug.rfind("frigate", 0) == 0) return { 0.0f, 9.0f, -16.7f };   // helmsman abaft the wheel, quarterdeck (Y re-snapped to deck)
   if (slug == "merchantman") return { 1.4f, 8.8f, -9.0f };
   if (slug == "brig")        return { 1.2f, 6.6f, -9.5f };
   if (slug == "pinnace")     return { -0.45f, 1.45f, -2.4f };
@@ -9059,7 +9060,7 @@ int main(int argc, char** argv) {
         crewDeck.reset();
         crewDeckSlug = ownVesselSlug;
         if (hasLayout) {
-          const int want = ownVesselSlug.rfind("frigate", 0) == 0 ? 12
+          const int want = ownVesselSlug.rfind("frigate", 0) == 0 ? 32
                          : ownVesselSlug == "brig" ? 12 : ownVesselSlug == "merchantman" ? 9
                          : ownVesselSlug == "sloop" ? 7 : 4;
           crewInner = glm::rotate(glm::mat4(1.0f), ownMesh->bowYaw, glm::vec3(0, 1, 0));
@@ -9088,7 +9089,7 @@ int main(int argc, char** argv) {
           in = glm::scale(in, glm::vec3(mm.shipScale));
           return glm::translate(in, -mm.keelCenter);
         };
-        auto countFor = [](const std::string& s) { return s.rfind("frigate", 0) == 0 ? 12 : s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
+        auto countFor = [](const std::string& s) { return s.rfind("frigate", 0) == 0 ? 32 : s == "brig" ? 12 : s == "merchantman" ? 9 : s == "sloop" ? 7 : 4; };
         // Candidates: own deck (dist 0) + each nearby remote ship with a layout.
         struct Cand { crew::Deck* deck; glm::mat4 outer; float dist; bool frozen; float shipScale; };
         std::vector<Cand> cands;

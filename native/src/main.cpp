@@ -3677,6 +3677,42 @@ int main(int argc, char** argv) {
   // Procedural audio beds (ocean wash + rain patter) + the music synth.
   // Skipped for headless screenshot runs so CI/tests stay silent.
   settings::Values userCfg = settings::load();
+
+  // ── Fault-hunt (Dawn-D3D12 device removal) ─────────────────────────────────────────────────
+  // The scene render has never executed on D3D12 (the null-surface `continue` short-circuited it),
+  // and running it under VR removes the device. SAILSIM_GFX_MIN forces EVERY optional graphics
+  // feature off so the faulting pass can be bisected WITHOUT rebuilding: start from MIN (device
+  // should survive), then re-enable one feature at a time with the SAILSIM_GFX_<FEATURE>=1 vars
+  // below until the device dies again — that feature owns the fault.
+  if (std::getenv("SAILSIM_GFX_MIN")) {
+    userCfg.gfx.preset = -1;                       // Custom (don't let a preset re-apply anything)
+    userCfg.gfx.aa = 0;              userCfg.gfx.taa = false;         userCfg.gfx.ssaa = 0;
+    userCfg.gfx.shadows = 0;         userCfg.gfx.ssao = false;        userCfg.gfx.dof = false;
+    userCfg.gfx.bloom = false;       userCfg.gfx.reflections = false; userCfg.gfx.ssr = false;
+    userCfg.gfx.fog = false;         userCfg.gfx.volumetric = false;  userCfg.gfx.autoExposure = false;
+    userCfg.gfx.grade = false;       userCfg.gfx.contactShadows = false;
+    userCfg.gfx.lut = false;         userCfg.gfx.hullWetness = false;
+    userCfg.gfx.waterTransparency = false;
+    userCfg.gfx.scatter = 0;
+    std::printf("[gfx] SAILSIM_GFX_MIN — all optional graphics features OFF (D3D12 fault bisect)\n");
+  }
+  // Per-feature re-enables for the bisect (set to 1 to turn a single feature back on).
+  {
+    auto on = [](const char* n) { const char* v = std::getenv(n); return v && *v && *v != '0'; };
+    if (on("SAILSIM_GFX_SSAO"))        userCfg.gfx.ssao = true;
+    if (on("SAILSIM_GFX_DOF"))         userCfg.gfx.dof = true;
+    if (on("SAILSIM_GFX_BLOOM"))       userCfg.gfx.bloom = true;
+    if (on("SAILSIM_GFX_REFL"))        userCfg.gfx.reflections = true;
+    if (on("SAILSIM_GFX_FOG"))         userCfg.gfx.fog = true;
+    if (on("SAILSIM_GFX_GRADE"))       userCfg.gfx.grade = true;
+    if (on("SAILSIM_GFX_LUT"))         userCfg.gfx.lut = true;
+    if (on("SAILSIM_GFX_WETNESS"))     userCfg.gfx.hullWetness = true;
+    if (on("SAILSIM_GFX_WATERTRANS"))  userCfg.gfx.waterTransparency = true;
+    if (on("SAILSIM_GFX_CONTACT"))     userCfg.gfx.contactShadows = true;
+    if (const char* v = std::getenv("SAILSIM_GFX_SHADOWS")) userCfg.gfx.shadows = std::max(0, std::min(4, atoi(v)));
+    if (const char* v = std::getenv("SAILSIM_GFX_SCATTER")) userCfg.gfx.scatter = std::max(0, std::min(4, atoi(v)));
+  }
+
   // AA override for screenshot tests: SAILSIM_AA=<0..2> (0 off, 1 FXAA, 2 SMAA),
   // optional SAILSIM_SSAA=<0..2>.
   if (const char* aaEnv = std::getenv("SAILSIM_AA")) userCfg.gfx.aa = std::max(0, std::min(2, atoi(aaEnv)));

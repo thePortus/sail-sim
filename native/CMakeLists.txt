@@ -374,8 +374,15 @@ function(embed_wgsl SRC VARNAME OUT)
   file(READ "${SRC}" _wgsl_src)
   # MSVC caps a single string literal at 16380 bytes (error C2026). Split the
   # shader into <16 KB raw-string chunks and let adjacent-literal concatenation
-  # rejoin them — no shader contains the )WGSL delimiter, so byte-splitting is
-  # safe (and UTF-8 comment bytes survive raw-string concatenation intact).
+  # rejoin them — no shader contains the )WGSL delimiter.
+  #
+  # ⚠ Split at the last NEWLINE before the limit, never at a raw byte offset: a byte
+  # cut can land MID-UTF-8-SEQUENCE (e.g. an — or … in a comment), making the generated
+  # header invalid UTF-8. MSVC then mis-decodes the source and the runtime WGSL string
+  # carries invalid bytes — Dawn's ShaderModule diagnostics fail to decode them and it
+  # DECLARES THE DEVICE LOST with the GPU healthy ("Device removed reason: S_OK"): the
+  # cause of the D3D12 white-screen / instant-device-loss saga. Newlines are ASCII, so a
+  # newline cut is always a valid UTF-8 boundary.
   string(LENGTH "${_wgsl_src}" _wgsl_len)
   set(_wgsl_body "")
   set(_wgsl_pos 0)
@@ -385,6 +392,11 @@ function(embed_wgsl SRC VARNAME OUT)
       set(_wgsl_take ${_wgsl_remain})
     else()
       set(_wgsl_take 8000)
+      string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_probe)
+      string(FIND "${_wgsl_probe}" "\n" _wgsl_nl REVERSE)
+      if(_wgsl_nl GREATER 0)
+        math(EXPR _wgsl_take "${_wgsl_nl} + 1")   # cut just after the last newline
+      endif()
     endif()
     string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_piece)
     string(APPEND _wgsl_body "R\"WGSL(${_wgsl_piece})WGSL\"\n")

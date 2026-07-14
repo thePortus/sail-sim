@@ -155,6 +155,18 @@ static void onDeviceError(WGPUErrorType type, char const* message, void*) {
                (int)type, message ? message : "(no message)");
 }
 
+// Zero-init color attachment with depthSlice handled correctly for BOTH backends. Dawn's
+// webgpu.h has a depthSlice field where 0 means "slice 0 of a 3D attachment" — INVALID for 2D
+// targets (every pass here); it must be WGPU_DEPTH_SLICE_UNDEFINED. wgpu-native v0.19 has no
+// such field (nor the macro), where plain zero-init is correct. Use this for every attachment.
+static inline WGPURenderPassColorAttachment colorAttach0() {
+  WGPURenderPassColorAttachment ca{};
+#ifdef WGPU_DEPTH_SLICE_UNDEFINED
+  ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+#endif
+  return ca;
+}
+
 // Mouse-wheel accumulator (GLFW only delivers scroll via callback, not polling).
 static double g_scrollAccum = 0.0;
 static void onScroll(GLFWwindow*, double, double yoff) { g_scrollAccum += yoff; }
@@ -4076,7 +4088,7 @@ int main(int argc, char** argv) {
   postFx.lumHistView = lumHistView;
   {  // Seed the history to ~0.2 (mid daylight key) via a one-shot clear.
     WGPUCommandEncoder ce = wgpuDeviceCreateCommandEncoder(device, nullptr);
-    WGPURenderPassColorAttachment ca = {};
+    WGPURenderPassColorAttachment ca = colorAttach0();
     ca.view = lumHistView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
     ca.clearValue = WGPUColor{ 0.2, 0.0, 0.0, 1.0 };
     WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -9050,7 +9062,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
       {
         // Mirror scene: sky, then the landscape (far ring + near grid), then the ship.
-        WGPURenderPassColorAttachment rc = {};
+        WGPURenderPassColorAttachment rc = colorAttach0();
         rc.view = reflView; rc.loadOp = WGPULoadOp_Clear; rc.storeOp = WGPUStoreOp_Store;
         rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
         WGPURenderPassDepthStencilAttachment rd = {};
@@ -9092,7 +9104,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (reflFull) {
         // Mirror clouds: ray-march through the mirrored camera into the refl cloud
         // buffer, depth-tested against the mirror scene (load, no write)...
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = reflCloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
         WGPURenderPassDepthStencilAttachment da = {};
@@ -9109,7 +9121,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
       if (reflFull) {
         // ...then denoise-composite them onto the mirror (premultiplied blend).
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = reflView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
         WGPURenderPassDepthStencilAttachment da = {};
         da.view = reflDepthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
@@ -9554,7 +9566,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     WGPUCommandEncoderDescriptor encDesc = {};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
 
-    WGPURenderPassColorAttachment colorAttachment = {};
+    WGPURenderPassColorAttachment colorAttachment = colorAttach0();
     colorAttachment.view = sceneView;   // linear HDR scene target; post grades to the swapchain
     colorAttachment.loadOp = WGPULoadOp_Clear;
     colorAttachment.storeOp = WGPUStoreOp_Store;
@@ -9970,7 +9982,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // ── God-ray occlusion: the sun's brightness where the sky shows, depth-tested
     //    against the scene so terrain/ocean/ships silhouette it into shafts. ──
     if (sailing) {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = grView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -9991,7 +10003,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (sailing) {
       float dsz[4] = { (float)curW, (float)curH, cloudDenoiseBypass, 0.0f };
       wgpuQueueWriteBuffer(queue, clouds.denoiseUniform, 0, dsz, sizeof(dsz));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = cloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -10009,7 +10021,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     // ── Composite pass (into the HDR scene): cloud denoise + god-ray shafts. ──
     if (sailing) {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDepthStencilAttachment da = {};
       da.view = depthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
@@ -10040,7 +10052,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     //    CoC-scaled gather blur), then bloom (brightpass, blur H, blur V). ──
     if (sailing) {
       auto fullscreen = [&](WGPUTextureView target, WGPURenderPipeline pipe, WGPUBindGroup bind) {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = target; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
         WGPURenderPassDescriptor pd = {};
@@ -10077,7 +10089,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       ce[1].binding = 1; ce[1].textureView = depthReadView;
       WGPUBindGroupDescriptor cbd = {}; cbd.layout = postFx.csBGL; cbd.entryCount = 2; cbd.entries = ce;
       WGPUBindGroup cbind = wgpuDeviceCreateBindGroup(device, &cbd);
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
       WGPURenderPassEncoder cp = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
@@ -10111,7 +10123,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       ve[3].binding = 3; ve[3].sampler = vsh.cmp;
       WGPUBindGroupDescriptor vbd = {}; vbd.layout = postFx.volBGL; vbd.entryCount = 4; vbd.entries = ve;
       WGPUBindGroup vbind = wgpuDeviceCreateBindGroup(device, &vbd);
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
       WGPURenderPassEncoder vp2 = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
@@ -10140,7 +10152,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       glm::vec3 fc = glm::mix(glm::vec3(0.02f, 0.03f, 0.05f), glm::vec3(0.58f, 0.66f, 0.76f), dayK);
       su.fogCol = glm::vec4(fc, 1.0f);
       wgpuQueueWriteBuffer(queue, postFx.ssrUbuf, 0, &su, sizeof(su));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = ssrView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -10158,7 +10170,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (userCfg.gfx.autoExposure && sailing) {
       glm::vec4 lp(0.045f, 0.0015f, 0.0f, 0.0f);   // adaptation rate/frame, min luminance clamp
       wgpuQueueWriteBuffer(queue, postFx.lumUbuf, 0, &lp, sizeof(lp));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = lumDstView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -10180,7 +10192,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     //    is attached READ-ONLY so the post shader can also sample the depth aspect
     //    (full-res CoC) in this same pass. ──
     {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = ldrView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -10200,7 +10212,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     //    motion vectors. The resolve reads these to reproject the moving ships (camera-only depth
     //    reproj can't); static geometry stays at the sentinel and uses the depth reprojection. ──
     if (userCfg.gfx.taa && sailing && (!taaMovers.empty() || cannonFx.anyActive())) {
-      WGPURenderPassColorAttachment vca = {};
+      WGPURenderPassColorAttachment vca = colorAttach0();
       vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
       vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
       WGPURenderPassDepthStencilAttachment vda = {};
@@ -10239,7 +10251,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       tu.params = glm::vec4(taaSharpen, taaClamp, 0.0f, 0.0f);
       wgpuQueueWriteBuffer(queue, postFx.taaUbuf, 0, &tu, sizeof(tu));
       {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = taaHistView[taaCur]; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
         WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -10252,7 +10264,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
       glm::vec4 fu(0.0f, 1.0f / (float)curW, 1.0f / (float)curH, 0.0f);   // fxaa passthrough (x=0)
       wgpuQueueWriteBuffer(queue, postFx.fxaaUbuf, 0, &fu, sizeof(fu));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = view; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor fpd = {}; fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca;
@@ -10271,7 +10283,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       glm::vec4 rtm(1.0f / (float)rW, 1.0f / (float)rH, (float)rW, (float)rH);
       wgpuQueueWriteBuffer(queue, postFx.smaaUbuf, 0, &rtm, sizeof(rtm));
       auto smaaPass = [&](WGPUTextureView tgt, WGPURenderPipeline pipe, WGPUBindGroup bind, bool isSwap) {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = tgt; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, isSwap ? 1.0 : 0.0 };
         WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -10289,7 +10301,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     } else {
       glm::vec4 fu(userCfg.gfx.aa >= 1 ? 1.0f : 0.0f, 1.0f / (float)curW, 1.0f / (float)curH, 0.0f);
       wgpuQueueWriteBuffer(queue, postFx.fxaaUbuf, 0, &fu, sizeof(fu));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = view; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       // No depth: this pass renders at swapchain res, while the scene depth is at
@@ -10310,7 +10322,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // pass wrote it (Dawn inserts the write→read barrier). Mono: both eyes get the same image.
     if (vrActive) {
       for (int e = 0; e < vr::eyeCount(vrB); ++e) {
-        WGPURenderPassColorAttachment eca = {};
+        WGPURenderPassColorAttachment eca = colorAttach0();
         eca.view = vr::eyeTarget(vrB, e);
         eca.loadOp = WGPULoadOp_Clear; eca.storeOp = WGPUStoreOp_Store;
         eca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };

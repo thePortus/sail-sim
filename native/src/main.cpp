@@ -3420,6 +3420,18 @@ int main(int argc, char** argv) {
     std::printf("[spike] window %dx%d (work area seed %dx%d)\n", gw, gh, winW, winH); }
   glfwSetScrollCallback(window, onScroll);   // mouse-wheel zoom
 
+#ifdef SAILSIM_HAVE_VR
+  // VR: the player has a headset on and can't see the desktop — never require clicking the
+  // (white) window to make input work. Grab keyboard focus outright, and CONFINE the visible
+  // cursor to the window (GLFW 3.4 captured mode) so every click/keystroke reaches the game.
+  if (vrMode) {
+    glfwFocusWindow(window);
+#ifdef GLFW_CURSOR_CAPTURED
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_CAPTURED);
+#endif
+  }
+#endif
+
   // 1. Instance
   WGPUInstanceDescriptor instanceDesc = {};
   WGPUInstance instance = wgpuCreateInstance(&instanceDesc);

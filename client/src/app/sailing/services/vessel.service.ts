@@ -667,6 +667,14 @@ export class VesselService {
       if (mat && !seenMats.has(mat)) {
         seenMats.add(mat);
         mat.fogEnabled = false;
+        // FRIGATE EXCEPTION to the kept-in-prePass rule above: its emissive glass (roughness≈0), copper
+        // (0.35) and the noisy baked-roughness wood all clear the SSR pipeline's reflectivity threshold,
+        // so SSR ray-marches the whole ship and paints per-frame moving dark speckle onto the hull and
+        // stern windows as she rocks (reads as Z-fighting / "the surface underneath leaking through").
+        // Verified live (A/B/A, night + dawn): detaching SSR kills it; excluding FR_* from the prePass
+        // kills it with SSR+SSAO fully on. Other vessels' mats are matte enough that SSR skips them, so
+        // they keep their true depth/normals in the G-buffer for SSAO.
+        if (mat.name.startsWith('FR_')) this.sceneService.excludeFromPrePass(mat);
       }
       // Spawn a shadow-CATCHER twin for the STATIC deck/hull surfaces (no skin weights). Skinned parts (rigging) and
       // cloth are skipped — crew/furniture shadows land on the deck, which is static. The catcher RECEIVES; the
@@ -1653,6 +1661,7 @@ export class VesselService {
       const eye = Vector3.TransformCoordinates(this.fpEye, this.root.getWorldMatrix());
       eye.addInPlace(this.camShakeOffset);
       cam.position.copyFrom(eye);
+      cam.minZ = 0.5;   // wheel/binnacle sit <1 m from the eye — needs the close near plane
       const yaw   = (this.heading + this.fpYaw) * Math.PI / 180;
       const pitch = this.fpPitch * Math.PI / 180;
       const cp    = Math.cos(pitch);
@@ -1704,6 +1713,14 @@ export class VesselService {
       tjy = Math.sin(rt * this.CAM_SHAKE_FREQ * 2.1 + 1.7) * ra * 0.7;    // vertical, detuned
     }
     cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
+
+    // Z-FIGHT FIX — scale the near plane with zoom. At minZ 0.5 (vs native's 2.0, main.cpp glm::perspective)
+    // the 24-bit depth buffer runs out of precision for the ship's close-offset detail (copper/glass 8 mm
+    // proud, the coincident shadow-catcher twins) and the rocking hull SPARKLES with per-frame depth-tie
+    // flips — the "Z-fighting speckle" seen on Angular only (native's tighter planes never fight). Nothing
+    // sits nearer than ~camDist·0.08 in orbit, so the near plane can ride the zoom: 0.64 at the closest
+    // zoom (8 m), ≈1.9 at the default 24 m (matches native), capped at 3. First-person resets to 0.5 above.
+    cam.minZ = Math.min(3.0, Math.max(0.5, this.camDist * 0.08));
   }
 
   /** Ship structural meshes (hull/deck/furniture) to raycast the deck-walk eye onto. Merged ship meshes get

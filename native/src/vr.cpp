@@ -376,7 +376,12 @@ void endFrame(Bridge* b) {
 
       XrCompositionLayerProjectionView& pv = projViews[e];
       pv = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-      pv.pose = eye.xrView.pose; pv.fov = eye.xrView.fov;
+      // MONO bring-up: the app renders ONE flat image into both eyes. Submitting each eye's copy
+      // with its own (offset, asymmetric) view puts identical pixels at different world directions
+      // per eye — unfusable double vision. Until true per-eye rendering lands, submit BOTH eyes
+      // with eye 0's pose+FOV: identical images through identical frusta fuse into one flat screen
+      // at infinity. Remove when the scene renders per eye (stereo).
+      pv.pose = b->eyes[0].xrView.pose; pv.fov = b->eyes[0].xrView.fov;
       pv.subImage.swapchain = eye.handle;
       pv.subImage.imageRect.offset = {0, 0};
       pv.subImage.imageRect.extent = {(int32_t)eye.width, (int32_t)eye.height};

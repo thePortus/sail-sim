@@ -4594,6 +4594,13 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       vr::poll(vrB, vrRunning, vrExit);
       if (vrExit) break;
       if (vrRunning) vrActive = vr::beginFrame(vrB);
+      if (vr::lost(vrB)) {
+        // Unrecoverable D3D12 device removal. Exit the loop instead of spinning on a dead
+        // session forever — the clean vr::destroy below releases the XR session so Virtual
+        // Desktop recovers without a reboot, and the process actually exits.
+        std::fprintf(stderr, "[vr] device lost — exiting cleanly (see [device-LOST]/error lines above)\n");
+        break;
+      }
     }
 #endif
     if (vessel.anchored && !prevAnchoredEdge) ownAnchorSide = (std::rand() & 1) ? 'P' : 'S';
@@ -10355,6 +10362,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   }
 
   std::printf("[spike] render loop exited after %ld frames — tearing down cleanly\n", frame);
+
+#ifdef SAILSIM_HAVE_VR
+  // ALWAYS destroy the bridge (xrEndSession/xrDestroySession/xrDestroyInstance): leaving the XR
+  // session open on exit wedges Virtual Desktop's compositor (black headset until a PC reboot).
+  if (vrB) { vr::destroy(vrB); vrB = nullptr; std::fprintf(stderr, "[vr] session destroyed cleanly\n"); }
+#endif
 
   // 7. Teardown
   wgpuTextureViewRelease(depthView);

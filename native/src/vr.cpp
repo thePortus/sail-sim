@@ -73,6 +73,7 @@ struct Bridge {
   XrFrameState frameState{XR_TYPE_FRAME_STATE};
   bool inFrame = false;
   bool shouldRender = false;
+  bool deviceLost = false;   // unrecoverable — see vr::lost()
 };
 
 namespace {
@@ -283,13 +284,17 @@ bool beginFrame(Bridge* b) {
       }, &es);
     for (int k = 0; k < 100000 && !es.done; ++k) { wgpuInstanceProcessEvents(b->winst); wgpuDeviceTick(b->wdevice); }
     if (!ok) {
+      const bool isLost = wgpuSharedTextureMemoryIsDeviceLost(b->eyes[e].mem);
       std::fprintf(stderr, "[vr] BeginAccess failed (eye %zu): deviceLost=%d scopeErr=\"%s\"\n",
-                   e, (int)wgpuSharedTextureMemoryIsDeviceLost(b->eyes[e].mem), es.msg.c_str());
+                   e, (int)isLost, es.msg.c_str());
+      if (isLost) b->deviceLost = true;   // unrecoverable — caller should tear down + exit
       b->shouldRender = false; return false;
     }
   }
   return true;
 }
+
+bool lost(Bridge* b) { return b && b->deviceLost; }
 
 int             eyeCount(Bridge* b) { return b ? (int)b->eyes.size() : 0; }
 WGPUTextureView eyeTarget(Bridge* b, int e) { return b ? b->eyes[e].view : nullptr; }
@@ -330,7 +335,10 @@ void endFrame(Bridge* b) {
       struct W { bool done; } w{false};
       wgpuQueueOnSubmittedWorkDone(b->dawnQueue,
         [](WGPUQueueWorkDoneStatus, void* ud){ static_cast<W*>(ud)->done = true; }, &w);
-      for (int k = 0; k < 200000 && !w.done; ++k) { wgpuInstanceProcessEvents(b->winst); wgpuDeviceTick(b->wdevice); }
+      // Bounded spin; bail immediately on a dead device (the callback may never fire, and a
+      // 200k-iteration spin per eye per frame is what made the fail loop feel like a hang).
+      for (int k = 0; k < 200000 && !w.done && !b->deviceLost; ++k)
+        { wgpuInstanceProcessEvents(b->winst); wgpuDeviceTick(b->wdevice); }
       wgpuSharedTextureMemoryEndAccessStateFreeMembers(es);
 
       // Acquire the XR image and copy our RT into it on the binding queue.

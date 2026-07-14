@@ -37,6 +37,11 @@ void    destroy(Bridge* b);
 // `exitRequested` = the runtime asked us to quit.
 void poll(Bridge* b, bool& running, bool& exitRequested);
 
+// True once the Dawn/D3D12 device is lost (BeginAccess failed with a dead device). Unrecoverable:
+// the app should log, destroy the bridge (clean xrDestroySession so the runtime releases), and exit
+// instead of spinning on a dead session (which wedges Virtual Desktop until a reboot).
+bool lost(Bridge* b);
+
 // Pace to the compositor and locate the eyes. Returns true if this frame should be rendered
 // (false → still call endFrame, which submits an empty frame). Opens shared-texture access per eye.
 bool beginFrame(Bridge* b);

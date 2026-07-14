@@ -3151,6 +3151,13 @@ static void probeDxcDll(const char* name) {
 #endif
 
 int main(int argc, char** argv) {
+  // SAILSIM_DIAG=<path>: redirect BOTH streams into a file from inside the app. The Windows
+  // console demonstrably drops whole stretches of output under load (diagnostics vanished from
+  // several captures), so shell-level piping can't be trusted for debugging. This can.
+  if (const char* diagPath = std::getenv("SAILSIM_DIAG")) {
+    if (std::freopen(diagPath, "w", stdout)) {}
+    if (std::freopen(diagPath, "a", stderr)) {}
+  }
   // Flush per line so `[spike] …` progress shows even when piped or killed.
 #ifdef _WIN32
   SetUnhandledExceptionFilter(sailsimCrashHandler);   // dump the faulting module + backtrace on a hard crash
@@ -3449,10 +3456,23 @@ int main(int argc, char** argv) {
                 (int)hasTex, (int)hasFence);
   }
 #endif
+  // Device LOSS does not go through the uncaptured-error callback — without this handler a D3D12
+  // device removal during init is completely silent (the symptom is just null surface textures /
+  // failed shared-texture access later). Dawn's message names the removal reason + failing call.
+  // wgpu-native takes the callback in the device descriptor; Dawn has the setter.
+  auto onDeviceLost = [](WGPUDeviceLostReason reason, char const* message, void*) {
+    std::fprintf(stderr, "[device-LOST] reason=%d: %s\n", (int)reason, message ? message : "(no message)");
+  };
+#if defined(WEBGPU_BACKEND_WGPU)
+  deviceDesc.deviceLostCallback = onDeviceLost;
+#endif
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);
   if (!device) return EXIT_FAILURE;
 
   wgpuDeviceSetUncapturedErrorCallback(device, onDeviceError, nullptr);
+#if defined(WEBGPU_BACKEND_DAWN)
+  wgpuDeviceSetDeviceLostCallback(device, onDeviceLost, nullptr);
+#endif
 
   WGPUQueue queue = wgpuDeviceGetQueue(device);
 

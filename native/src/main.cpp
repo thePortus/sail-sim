@@ -4885,12 +4885,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (tanHW > 0.01f && tanHH > 0.01f) {
         static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 1.2f) : 0.88f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 1.5f) : 1.06f;
         }();
         // 16:9 in ANGULAR terms (matches the virtual screen ⇒ undistorted).
         float angH = uiFrac * (tanU - tanD);                       // fraction of the VISIBLE height
         float angW = angH * (16.0f / 9.0f);
-        const float maxW = 2.0f * std::min(-tanL, tanR) * 0.95f;   // binocular overlap (both eyes)
+        const float maxW = 2.0f * std::min(-tanL, tanR) * 1.14f;   // ~binocular overlap +14% (edges single-eye)
         if (angW > maxW) { angW = maxW; angH = angW * (9.0f / 16.0f); }
         const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
         vrUiW = angW / (2.0f * tanHW) * (float)curW;
@@ -5053,6 +5053,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       //    fullscreen + hide all HUD/labels for a clean shot), first-person
       //    on-deck (V). Buttons drawn in the toolbar below; keys here. ──
       auto setFullscreen = [&](bool on) {
+        if (vrMode) return;   // VR: glfwSetWindowMonitor stalls the (unused, unpresented) window — disabled
         if (on == isFullscreen) return;
         if (on) {
           glfwGetWindowPos(window, &savedWinX, &savedWinY);
@@ -5066,6 +5067,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         isFullscreen = on;   // the per-frame resize block reconfigures the surface + targets
       };
       auto setPhotoMode = [&](bool on) {
+        if (vrMode) return;   // VR: rides setFullscreen (disabled) and hides the HUD you rely on
         if (on == photoMode) return;
         photoMode = on;
         setFullscreen(on);   // entering also goes fullscreen; leaving drops back (client parity)
@@ -5134,12 +5136,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
         if (iconBtn(ICON_FA_PERSON, firstPerson ? "Chase camera (V)" : "First-person on deck (V)", firstPerson))
           enterFirstPerson(!firstPerson);
-        ImGui::SameLine();
-        if (iconBtn(ICON_FA_CAMERA, "Photo mode — hide HUD + fullscreen (F2)", false)) setPhotoMode(true);
-        ImGui::SameLine();
-        if (iconBtn(isFullscreen ? ICON_FA_COMPRESS : ICON_FA_EXPAND,
-                    isFullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)", isFullscreen))
-          setFullscreen(!isFullscreen);
+        if (!vrMode) {   // photo mode + fullscreen are desktop-window features — hidden in VR
+          ImGui::SameLine();
+          if (iconBtn(ICON_FA_CAMERA, "Photo mode — hide HUD + fullscreen (F2)", false)) setPhotoMode(true);
+          ImGui::SameLine();
+          if (iconBtn(isFullscreen ? ICON_FA_COMPRESS : ICON_FA_EXPAND,
+                      isFullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)", isFullscreen))
+            setFullscreen(!isFullscreen);
+        }
         ImGui::SameLine();
         if (iconBtn(ICON_FA_MAP, mapExpanded ? "Close chart" : "Open chart", mapExpanded))
           mapExpanded = !mapExpanded;
@@ -6086,6 +6090,17 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         auto project = [&](const glm::vec3& w, ImVec2& out) -> bool {
           glm::vec4 c = lastViewProj * glm::vec4(w, 1.0f);
           if (c.w <= 0.1f) return false;
+#ifdef SAILSIM_HAVE_VR
+          if (vrMode && vrUiW > 0.0f) {
+            // VR: lastViewProj is the CENTER-eye camera → project into FRAME pixels, then
+            // inverse-map through the UI box transform so the draw-data transform puts the label
+            // back at that exact frame position — world-anchored instead of riding the HUD.
+            const float fx = (c.x / c.w * 0.5f + 0.5f) * (float)curW;
+            const float fy = (0.5f - c.y / c.w * 0.5f) * (float)curH;
+            out = ImVec2((fx - vrUiOffX) * (1920.0f / vrUiW), (fy - vrUiOffY) * (1080.0f / vrUiH));
+            return true;
+          }
+#endif
           out = ImVec2((c.x / c.w * 0.5f + 0.5f) * io.DisplaySize.x,
                        (0.5f - c.y / c.w * 0.5f) * io.DisplaySize.y);
           return true;
@@ -8251,7 +8266,28 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       proj[2][1] += (2.0f * jy) / (float)rH;
     }
     glm::mat4 viewProj = proj * viewM;   // JITTERED — used for all scene rendering this frame
-    lastViewProj = viewProj; lastEye = eye;   // for next frame's screen-space labels
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrActive) {
+      if (vrEye == 0) {
+        // Save a CENTER (between-the-eyes) camera for next frame's world labels: eye positions
+        // averaged, eye 0's orientation, the same symmetric projection. Labels project through
+        // this into frame pixels and stay anchored over their towns/ships as the head moves.
+        float pa[7], fa[4], pb[7], fb[4];
+        vr::eyeCamera(vrB, 0, pa, fa);
+        vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
+        static const bool vrNoMirror2 = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+        glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
+        const glm::quat qc = vrNoMirror2 ? glm::quat(pa[6], pa[3], pa[4], pa[5])
+                                         : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
+        if (!vrNoMirror2) pc.x = -pc.x;
+        const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
+        const glm::mat4 camC = glm::inverse(kmViewBase) * poseC;
+        lastViewProj = proj * glm::inverse(camC);   // proj: this eye's symmetric VR projection
+        lastEye = glm::vec3(camC[3]);
+      }
+    } else
+#endif
+    { lastViewProj = viewProj; lastEye = eye; }   // for next frame's screen-space labels
 
     // Our hull is server-authoritative — adopt the slug from the "wallet" message
     // (unless a CLI/env model override forced one).

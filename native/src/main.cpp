@@ -7300,15 +7300,20 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     ImGui::Render();
 #ifdef SAILSIM_HAVE_VR
     if (vrMode && vrUiW > 0.0f) {
-      // The resolve pass draws the UI through a viewport that maps the 1920×1080 virtual screen
-      // into the centered on-frame box — but ImGui's SCISSOR rects are emitted in virtual-screen
-      // pixels and scissors ignore the viewport, so untransformed they clip the whole UI to the
-      // frame's top-left 1920×1080 quadrant (the "bottom-right of the map at dead centre" bug).
-      // Map every clip rect into the box once per frame (the draw data is reused for both eyes).
+      // Map the finished UI draw data from the 1920×1080 virtual screen into the centered
+      // on-frame box. A render-pass viewport can NOT do this: imgui_impl_wgpu sets its own
+      // viewport (0,0,DisplaySize) inside RenderDrawData, so transform the VERTICES and SCISSOR
+      // rects directly, then retarget the draw data's DisplaySize to the full frame — the
+      // backend's own viewport/ortho then maps our frame-pixel coordinates 1:1. Done once per
+      // frame (the draw data is reused for both eyes' resolve passes).
       ImDrawData* dd = ImGui::GetDrawData();
       const float sx = vrUiW / 1920.0f, sy = vrUiH / 1080.0f;
       for (int li = 0; li < dd->CmdListsCount; ++li) {
         ImDrawList* dl = dd->CmdLists[li];
+        for (int vi = 0; vi < dl->VtxBuffer.Size; ++vi) {
+          dl->VtxBuffer[vi].pos.x = dl->VtxBuffer[vi].pos.x * sx + vrUiOffX;
+          dl->VtxBuffer[vi].pos.y = dl->VtxBuffer[vi].pos.y * sy + vrUiOffY;
+        }
         for (int ci = 0; ci < dl->CmdBuffer.Size; ++ci) {
           ImDrawCmd& c = dl->CmdBuffer[ci];
           c.ClipRect.x = c.ClipRect.x * sx + vrUiOffX;
@@ -7317,6 +7322,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           c.ClipRect.w = c.ClipRect.w * sy + vrUiOffY;
         }
       }
+      dd->DisplaySize = ImVec2((float)curW, (float)curH);   // backend viewport/ortho = full frame
     }
 #endif
 
@@ -10436,10 +10442,6 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       wgpuRenderPassEncoderSetPipeline(fp, postFx.fxaaPipe);
       wgpuRenderPassEncoderSetBindGroup(fp, 0, taaBlitBind[taaCur], 0, nullptr);
       wgpuRenderPassEncoderDraw(fp, 3, 1, 0, 0);
-#ifdef SAILSIM_HAVE_VR
-      if (vrMode && vrUiW > 0.0f)   // draw the virtual UI screen centered + aspect-correct
-        wgpuRenderPassEncoderSetViewport(fp, vrUiOffX, vrUiOffY, vrUiW, vrUiH, 0.0f, 1.0f);
-#endif
       ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), fp);
       wgpuRenderPassEncoderEnd(fp);
       wgpuRenderPassEncoderRelease(fp);
@@ -10459,10 +10461,6 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         wgpuRenderPassEncoderSetPipeline(p, pipe);
         wgpuRenderPassEncoderSetBindGroup(p, 0, bind, 0, nullptr);
         wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
-#ifdef SAILSIM_HAVE_VR
-        if (isSwap && vrMode && vrUiW > 0.0f)
-          wgpuRenderPassEncoderSetViewport(p, vrUiOffX, vrUiOffY, vrUiW, vrUiH, 0.0f, 1.0f);
-#endif
         if (isSwap) ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), p);
         wgpuRenderPassEncoderEnd(p);
         wgpuRenderPassEncoderRelease(p);
@@ -10484,10 +10482,6 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       wgpuRenderPassEncoderSetPipeline(fp, postFx.fxaaPipe);
       wgpuRenderPassEncoderSetBindGroup(fp, 0, postFx.fxaaBind, 0, nullptr);
       wgpuRenderPassEncoderDraw(fp, 3, 1, 0, 0);
-#ifdef SAILSIM_HAVE_VR
-      if (vrMode && vrUiW > 0.0f)   // draw the virtual UI screen centered + aspect-correct
-        wgpuRenderPassEncoderSetViewport(fp, vrUiOffX, vrUiOffY, vrUiW, vrUiH, 0.0f, 1.0f);
-#endif
       ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), fp);
       wgpuRenderPassEncoderEnd(fp);
       wgpuRenderPassEncoderRelease(fp);

@@ -4870,7 +4870,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // centered, aspect-correct viewport at the resolve pass. The mouse is transformed at the
     // EVENT level (our GLFW cursor callback, see gVrUi*), so ImGui's event queue carries virtual
     // coordinates natively — no per-frame fighting, cursor and clicks stay consistent.
-    float vrUiOffX = 0.0f, vrUiOffY = 0.0f, vrUiW = 0.0f, vrUiH = 0.0f;
+    float vrUiOffX = 0.0f, vrUiOffY = 0.0f, vrUiW = 0.0f, vrUiH = 0.0f, vrUiVh = 1080.0f;
     if (vrMode && vrRunning) {
       float p7[7], f4[4];
       vr::eyeCamera(vrB, 0, p7, f4);
@@ -4885,23 +4885,26 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (tanHW > 0.01f && tanHH > 0.01f) {
         static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 1.5f) : 1.06f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.95f;
         }();
-        // 16:9 in ANGULAR terms (matches the virtual screen ⇒ undistorted).
-        float angH = uiFrac * (tanU - tanD);                       // fraction of the VISIBLE height
-        float angW = angH * (16.0f / 9.0f);
-        const float maxW = 2.0f * std::min(-tanL, tanR) * 1.14f;   // ~binocular overlap +14% (edges single-eye)
-        if (angW > maxW) { angW = maxW; angH = angW * (9.0f / 16.0f); }
+        // The comfortable view is nearly SQUARE, so a fixed 16:9 screen either overflows the
+        // sides (both extremes hard to see) or wastes the vertical. Decouple the two axes:
+        // width fills the binocular overlap (both eyes see all of it), height uses uiFrac of the
+        // visible vertical, and the VIRTUAL screen the UI lays out on takes the matching aspect
+        // (1920 × variable) — undistorted, and bottom rows get real room instead of crushing.
+        const float angW = 2.0f * std::min(-tanL, tanR) * 0.95f;   // inside the binocular overlap
+        const float angH = uiFrac * (tanU - tanD);                 // use the vertical we actually have
         const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
+        vrUiVh = 1920.0f * (angH / angW);                          // virtual screen height = box aspect
         vrUiW = angW / (2.0f * tanHW) * (float)curW;
         vrUiH = angH / (2.0f * tanHH) * (float)curH;
         vrUiOffX = ((float)curW - vrUiW) * 0.5f;                          // horizontally on-axis (fuses flat)
         vrUiOffY = (1.0f - cy / tanHH) * 0.5f * (float)curH - vrUiH * 0.5f;   // centred on the visible middle
         gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
-        gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = 1080.0f / vrUiH;
+        gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = vrUiVh / vrUiH;
         gVrUiActive = true;
         ImGuiIO& vio = ImGui::GetIO();
-        vio.DisplaySize = ImVec2(1920.0f, 1080.0f);
+        vio.DisplaySize = ImVec2(1920.0f, vrUiVh);
         vio.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
       }
     }
@@ -6097,7 +6100,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             // back at that exact frame position — world-anchored instead of riding the HUD.
             const float fx = (c.x / c.w * 0.5f + 0.5f) * (float)curW;
             const float fy = (0.5f - c.y / c.w * 0.5f) * (float)curH;
-            out = ImVec2((fx - vrUiOffX) * (1920.0f / vrUiW), (fy - vrUiOffY) * (1080.0f / vrUiH));
+            out = ImVec2((fx - vrUiOffX) * (1920.0f / vrUiW), (fy - vrUiOffY) * (vrUiVh / vrUiH));
             return true;
           }
 #endif
@@ -7322,7 +7325,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // backend's own viewport/ortho then maps our frame-pixel coordinates 1:1. Done once per
       // frame (the draw data is reused for both eyes' resolve passes).
       ImDrawData* dd = ImGui::GetDrawData();
-      const float sx = vrUiW / 1920.0f, sy = vrUiH / 1080.0f;
+      const float sx = vrUiW / 1920.0f, sy = vrUiH / vrUiVh;
       for (int li = 0; li < dd->CmdListsCount; ++li) {
         ImDrawList* dl = dd->CmdLists[li];
         for (int vi = 0; vi < dl->VtxBuffer.Size; ++vi) {

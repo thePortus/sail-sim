@@ -155,6 +155,15 @@ static void onDeviceError(WGPUErrorType type, char const* message, void*) {
                (int)type, message ? message : "(no message)");
 }
 
+#ifdef SAILSIM_HAVE_VR
+// VR virtual-UI mouse transform (window px → virtual-screen px). Applied at the EVENT level via
+// our own GLFW cursor callback: the ImGui GLFW backend queues raw positions from its callback, so
+// transforming anywhere later (e.g. before NewFrame) is clobbered by the event queue — that was
+// the flickering cursor + dead clicks. Updated per frame from the UI box; identity until VR runs.
+static float gVrUiOffX = 0.0f, gVrUiOffY = 0.0f, gVrUiSclX = 1.0f, gVrUiSclY = 1.0f;
+static bool  gVrUiActive = false;
+#endif
+
 // Zero-init color attachment with depthSlice handled correctly for BOTH backends. Dawn's
 // webgpu.h has a depthSlice field where 0 means "slice 0 of a 3D attachment" — INVALID for 2D
 // targets (every pass here); it must be WGPU_DEPTH_SLICE_UNDEFINED. wgpu-native v0.19 has no
@@ -4458,6 +4467,19 @@ int main(int argc, char** argv) {
   imio.FontGlobalScale = 1.0f / uiScaleX;
   styleSailSim();
   ImGui_ImplGlfw_InitForOther(window, true);
+#ifdef SAILSIM_HAVE_VR
+  // VR: replace the backend's cursor callback with one that feeds ImGui PRE-TRANSFORMED positions
+  // (window px → virtual UI screen px). See gVrUi* above. The game's own input reads the cursor
+  // via glfwGetCursorPos directly, so camera/orbit aiming is unaffected.
+  if (vrMode) {
+    glfwSetCursorPosCallback(window, [](GLFWwindow*, double x, double y) {
+      ImGuiIO& gio = ImGui::GetIO();
+      if (gVrUiActive) gio.AddMousePosEvent(((float)x - gVrUiOffX) * gVrUiSclX,
+                                            ((float)y - gVrUiOffY) * gVrUiSclY);
+      else gio.AddMousePosEvent((float)x, (float)y);
+    });
+  }
+#endif
   ImGui_ImplWGPU_InitInfo imguiInit;
   imguiInit.Device = device;
   imguiInit.NumFramesInFlight = 3;
@@ -4842,12 +4864,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     ImGui_ImplGlfw_NewFrame();
 #ifdef SAILSIM_HAVE_VR
     // VR: the frame's pixel space (window-wide) is displayed across the eye's nearly-square FOV,
-    // so UI drawn full-frame appears squished ~2× horizontally. Keep the UI laid out in normal
-    // WINDOW coordinates (the ImGui GLFW backend feeds raw cursor events every frame — fighting
-    // it with a remap made the cursor flicker and killed clicks), and fix the distortion purely
-    // at DRAW time: render the finished UI into a centered viewport whose ANGULAR aspect equals
-    // the window's pixel aspect. One transform applies to widgets, cursor, and hit-boxes alike,
-    // so aim/click stay consistent by construction.
+    // so UI drawn full-frame appears squished ~2× horizontally — and window-coordinate layout
+    // makes desktop-sized widgets tiny on the virtual screen. Lay the UI out on a 16:9 VIRTUAL
+    // 1920×1080 screen (all HUD anchors use io.DisplaySize; widgets get 2× bigger) drawn into a
+    // centered, aspect-correct viewport at the resolve pass. The mouse is transformed at the
+    // EVENT level (our GLFW cursor callback, see gVrUi*), so ImGui's event queue carries virtual
+    // coordinates natively — no per-frame fighting, cursor and clicks stay consistent.
     float vrUiOffX = 0.0f, vrUiOffY = 0.0f, vrUiW = 0.0f, vrUiH = 0.0f;
     if (vrMode && vrRunning) {
       float p7[7], f4[4];
@@ -4859,17 +4881,23 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
           return v ? std::clamp((float)std::atof(v), 0.2f, 1.5f) : 0.88f;
         }();
-        // Undistorted = the box's angular aspect matches the window's pixel aspect. Height from
-        // uiFrac; width follows; allow up to 120% of the horizontal FOV before clamping (a huge
-        // UI may prefer slightly clipped corners over being small — user-tunable).
+        // 16:9 in ANGULAR terms (matches the virtual screen ⇒ undistorted). Width is capped at
+        // 98% of the horizontal FOV so every HUD element stays visible; explicit uiFrac > 1
+        // opts into up to 125% width (bigger UI, slightly clipped side edges).
         float angH = uiFrac * 2.0f * tanH;
-        float angW = angH * ((float)curW / (float)curH);   // undistorted ⇔ angular aspect = pixel aspect
-        const float maxW = 1.2f * 2.0f * tanW;
-        if (angW > maxW) { angW = maxW; angH = angW * ((float)curH / (float)curW); }
+        float angW = angH * (16.0f / 9.0f);
+        const float maxW = 2.0f * tanW * (uiFrac > 1.0f ? 1.25f : 0.98f);
+        if (angW > maxW) { angW = maxW; angH = angW * (9.0f / 16.0f); }
         vrUiW = angW / (2.0f * tanW) * (float)curW;
         vrUiH = angH / (2.0f * tanH) * (float)curH;
         vrUiOffX = ((float)curW - vrUiW) * 0.5f;
         vrUiOffY = ((float)curH - vrUiH) * 0.5f;
+        gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
+        gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = 1080.0f / vrUiH;
+        gVrUiActive = true;
+        ImGuiIO& vio = ImGui::GetIO();
+        vio.DisplaySize = ImVec2(1920.0f, 1080.0f);
+        vio.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
       }
     }
 #endif

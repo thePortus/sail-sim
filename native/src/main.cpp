@@ -4842,10 +4842,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     ImGui_ImplGlfw_NewFrame();
 #ifdef SAILSIM_HAVE_VR
     // VR: the frame's pixel space (window-wide) is displayed across the eye's nearly-square FOV,
-    // so full-frame UI squishes horizontally and edge-anchored HUD lands in barely-visible
-    // periphery. Instead lay the UI out on a 16:9 VIRTUAL screen (all HUD anchors use
-    // io.DisplaySize) and draw it into a centered, aspect-corrected viewport at the resolve pass;
-    // remap the mouse into virtual-screen coordinates so aim/click matches what's drawn.
+    // so UI drawn full-frame appears squished ~2× horizontally. Keep the UI laid out in normal
+    // WINDOW coordinates (the ImGui GLFW backend feeds raw cursor events every frame — fighting
+    // it with a remap made the cursor flicker and killed clicks), and fix the distortion purely
+    // at DRAW time: render the finished UI into a centered viewport whose ANGULAR aspect equals
+    // the window's pixel aspect. One transform applies to widgets, cursor, and hit-boxes alike,
+    // so aim/click stay consistent by construction.
     float vrUiOffX = 0.0f, vrUiOffY = 0.0f, vrUiW = 0.0f, vrUiH = 0.0f;
     if (vrMode && vrRunning) {
       float p7[7], f4[4];
@@ -4855,21 +4857,19 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (tanW > 0.01f && tanH > 0.01f) {
         static const float uiFrac = [] {   // UI height as a fraction of the eye's vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 0.95f) : 0.55f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 1.5f) : 0.88f;
         }();
-        // 16:9 in ANGULAR terms, sized to uiFrac of the vertical FOV, then to frame pixels.
+        // Undistorted = the box's angular aspect matches the window's pixel aspect. Height from
+        // uiFrac; width follows; allow up to 120% of the horizontal FOV before clamping (a huge
+        // UI may prefer slightly clipped corners over being small — user-tunable).
         float angH = uiFrac * 2.0f * tanH;
-        float angW = angH * (16.0f / 9.0f);
-        if (angW > 2.0f * tanW * 0.95f) { angW = 2.0f * tanW * 0.95f; angH = angW * (9.0f / 16.0f); }
+        float angW = angH * ((float)curW / (float)curH);   // undistorted ⇔ angular aspect = pixel aspect
+        const float maxW = 1.2f * 2.0f * tanW;
+        if (angW > maxW) { angW = maxW; angH = angW * ((float)curH / (float)curW); }
         vrUiW = angW / (2.0f * tanW) * (float)curW;
         vrUiH = angH / (2.0f * tanH) * (float)curH;
         vrUiOffX = ((float)curW - vrUiW) * 0.5f;
         vrUiOffY = ((float)curH - vrUiH) * 0.5f;
-        ImGuiIO& vio = ImGui::GetIO();
-        vio.MousePos = ImVec2((vio.MousePos.x - vrUiOffX) * (1920.0f / vrUiW),
-                              (vio.MousePos.y - vrUiOffY) * (1080.0f / vrUiH));
-        vio.DisplaySize = ImVec2(1920.0f, 1080.0f);
-        vio.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
       }
     }
 #endif

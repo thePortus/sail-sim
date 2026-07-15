@@ -4874,24 +4874,29 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (vrMode && vrRunning) {
       float p7[7], f4[4];
       vr::eyeCamera(vrB, 0, p7, f4);
-      const float tanW = std::min(-std::tan(f4[0]), std::tan(f4[1]));
-      const float tanH = std::min(std::tan(f4[2]), -std::tan(f4[3]));
-      if (tanW > 0.01f && tanH > 0.01f) {
-        static const float uiFrac = [] {   // UI height as a fraction of the eye's vertical FOV
+      // The eye's ASYMMETRIC fov, in signed tan units: the physical view extends further down
+      // than up and further outward than inward. The frame is rendered across the symmetric
+      // SUPERSET (see the camera block), so place the UI inside the VISIBLE sub-region: sized
+      // against the visible extents, vertically centered on the true view centre (below the lens
+      // axis), width capped to the binocular overlap so BOTH eyes see all of it.
+      const float tanL = std::tan(f4[0]), tanR = std::tan(f4[1]);          // tanL < 0
+      const float tanU = std::tan(f4[2]), tanD = std::tan(f4[3]);          // tanD < 0
+      const float tanHW = std::max(-tanL, tanR), tanHH = std::max(tanU, -tanD);   // frame mapping (superset)
+      if (tanHW > 0.01f && tanHH > 0.01f) {
+        static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 1.5f) : 0.88f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 1.2f) : 0.88f;
         }();
-        // 16:9 in ANGULAR terms (matches the virtual screen ⇒ undistorted). Width is capped at
-        // 98% of the horizontal FOV so every HUD element stays visible; explicit uiFrac > 1
-        // opts into up to 125% width (bigger UI, slightly clipped side edges).
-        float angH = uiFrac * 2.0f * tanH;
+        // 16:9 in ANGULAR terms (matches the virtual screen ⇒ undistorted).
+        float angH = uiFrac * (tanU - tanD);                       // fraction of the VISIBLE height
         float angW = angH * (16.0f / 9.0f);
-        const float maxW = 2.0f * tanW * (uiFrac > 1.0f ? 1.25f : 0.98f);
+        const float maxW = 2.0f * std::min(-tanL, tanR) * 0.95f;   // binocular overlap (both eyes)
         if (angW > maxW) { angW = maxW; angH = angW * (9.0f / 16.0f); }
-        vrUiW = angW / (2.0f * tanW) * (float)curW;
-        vrUiH = angH / (2.0f * tanH) * (float)curH;
-        vrUiOffX = ((float)curW - vrUiW) * 0.5f;
-        vrUiOffY = ((float)curH - vrUiH) * 0.5f;
+        const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
+        vrUiW = angW / (2.0f * tanHW) * (float)curW;
+        vrUiH = angH / (2.0f * tanHH) * (float)curH;
+        vrUiOffX = ((float)curW - vrUiW) * 0.5f;                          // horizontally on-axis (fuses flat)
+        vrUiOffY = (1.0f - cy / tanHH) * 0.5f * (float)curH - vrUiH * 0.5f;   // centred on the visible middle
         gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
         gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = 1080.0f / vrUiH;
         gVrUiActive = true;
@@ -8187,13 +8192,13 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       const glm::mat4 camWorld = glm::inverse(kmViewBase) * poseM;
       viewM = glm::inverse(camWorld);
       eye = glm::vec3(camWorld[3]);
-      // Per-eye SYMMETRIC projection: downstream passes (AO, ocean, DOF unproject) assume a
-      // centered projection, so keep it centered and tell the compositor we rendered exactly this
-      // FOV. Use the INTERSECTION of the eye's asymmetric FOV (min, not max): everything we render
-      // is then inside the physically visible area — a superset FOV pushed frame edges (and the
-      // edge-anchored HUD) beyond what the headset can show. Costs a sliver of one-eye periphery.
-      const float tanHalfW = std::min(-std::tan(f4[0]), std::tan(f4[1]));
-      const float tanHalfH = std::min(std::tan(f4[2]), -std::tan(f4[3]));
+      // Per-eye SYMMETRIC projection covering (superset, max) the eye's asymmetric FOV: downstream
+      // passes (AO, ocean, DOF unproject) assume a centered projection, so keep it centered and
+      // tell the compositor exactly what we rendered. Superset fills the entire physical view
+      // (no black borders); the UI is placed inside the VISIBLE sub-region separately (see the
+      // virtual-UI block), so nothing readable lands in the invisible margins.
+      const float tanHalfW = std::max(-std::tan(f4[0]), std::tan(f4[1]));
+      const float tanHalfH = std::max(std::tan(f4[2]), -std::tan(f4[3]));
       proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, 2.0f, 40000.0f);
       proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
       vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));

@@ -7989,7 +7989,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
     }
     if (g_scrollAccum != 0.0) {
-      if (camActive && !io.WantCaptureMouse) {
+      // VR: the captured cursor usually rests over the (large) HUD, so WantCaptureMouse would
+      // silently eat every wheel tick — let the wheel always zoom the camera while sailing.
+#ifdef SAILSIM_HAVE_VR
+      const bool wheelZooms = camActive && (vrMode || !io.WantCaptureMouse);
+#else
+      const bool wheelZooms = camActive && !io.WantCaptureMouse;
+#endif
+      if (wheelZooms) {
         camDist *= std::pow(0.9f, (float)g_scrollAccum);   // wheel up -> zoom in
         camDist = glm::clamp(camDist, 4.0f, 80.0f);
       }

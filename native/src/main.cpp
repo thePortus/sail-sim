@@ -3768,6 +3768,11 @@ int main(int argc, char** argv) {
   // startup override. Feedback/sharpen/clamp stay env-only (advanced tuning; baked defaults otherwise).
   if (std::getenv("SAILSIM_TAA")) userCfg.gfx.taa = true;
   if (const char* uenv = std::getenv("SAILSIM_TAA_UPSCALE")) userCfg.gfx.taaUpscale = std::clamp((float)atof(uenv), 0.5f, 1.0f);
+#ifdef SAILSIM_HAVE_VR
+  // VR renders per-eye with its own reprojection in the compositor; TAA's single shared history
+  // (and jitter) fights both. Hard-off in VR regardless of settings/env.
+  if (vrMode) userCfg.gfx.taa = false;
+#endif
   if (std::getenv("SAILSIM_SSR")) userCfg.gfx.ssr = true;   // startup override for screen-space reflections
   if (std::getenv("SAILSIM_NOFOG")) userCfg.gfx.fog = false;   // disable aerial fog
   if (std::getenv("SAILSIM_VOLUMETRIC")) userCfg.gfx.volumetric = true;   // startup override for sun shafts
@@ -8082,13 +8087,55 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       float groundY = terr.elevation(eye.x, eye.z);
       if (eye.y < groundY + 3.0f) eye.y = groundY + 3.0f;
     }
-    glm::mat4 viewM = glm::lookAt(eye, lookTarget, lookUp);
+    // ── (VR) per-eye render: everything from the camera to the frame submit runs once per eye
+    //    with that eye's view+projection; flat mode is a single iteration. Sim above runs once. ──
+#ifdef SAILSIM_HAVE_VR
+    const int vrEyePasses = (vrMode && vrActive) ? vr::eyeCount(vrB) : 1;
+#else
+    const int vrEyePasses = 1;
+#endif
+    const glm::mat4 kmViewBase = glm::lookAt(eye, lookTarget, lookUp);   // the k/m camera (per-frame base)
+    const glm::vec3 kmEyeBase = eye;
+    WGPUSurfaceTexture surfaceTex = {};
+    WGPUTextureView view = nullptr;   // frame target: window swapchain (flat) / VR intermediate (VR)
+    bool skipFrame = false;           // minimised window: nothing to render this frame
+    for (int vrEye = 0; vrEye < vrEyePasses; ++vrEye) {
+    eye = kmEyeBase;
+    glm::mat4 viewM = kmViewBase;
     glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 2.0f, 40000.0f);
     // Mirror clip-space X: the world uses compass conventions (+X east, +Z north,
     // heading clockwise) like the browser's left-handed Babylon scene, but a
     // right-handed camera puts east on the LEFT — mirroring the coastlines and
     // reversing apparent A/D turn direction. Safe: every pipeline culls None.
     proj[0][0] = -proj[0][0];
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrActive) {
+      // Head-tracked per-eye camera: worldEye = k/m camera ∘ XR eye pose (seated LOCAL space,
+      // meters, y-up — same units/up as the world). The pose passes through the engine's X-mirror
+      // (M·R·M with M = diag(-1,1,1): negate px, and qy/qz of the quaternion) so head yaw/roll and
+      // the IPD eye offset read correctly in the mirrored world. SAILSIM_VR_NOMIRROR=1 composes
+      // the raw pose instead — a no-rebuild A/B for the handedness landmine.
+      float p7[7], f4[4];
+      vr::eyeCamera(vrB, vrEye, p7, f4);
+      static const bool vrNoMirror = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+      const glm::quat q = vrNoMirror ? glm::quat(p7[6], p7[3], p7[4], p7[5])
+                                     : glm::quat(p7[6], p7[3], -p7[4], -p7[5]);
+      const glm::vec3 p = vrNoMirror ? glm::vec3(p7[0], p7[1], p7[2])
+                                     : glm::vec3(-p7[0], p7[1], p7[2]);
+      const glm::mat4 poseM = glm::translate(glm::mat4(1.0f), p) * glm::mat4_cast(q);
+      const glm::mat4 camWorld = glm::inverse(kmViewBase) * poseM;
+      viewM = glm::inverse(camWorld);
+      eye = glm::vec3(camWorld[3]);
+      // Per-eye SYMMETRIC projection covering the eye's asymmetric FOV: downstream passes (AO,
+      // ocean, DOF unproject) assume a centered projection, so keep it centered and tell the
+      // compositor we rendered exactly this FOV (slight pixel waste, zero geometry error).
+      const float tanHalfW = std::max(-std::tan(f4[0]), std::tan(f4[1]));
+      const float tanHalfH = std::max(std::tan(f4[2]), -std::tan(f4[3]));
+      proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, 2.0f, 40000.0f);
+      proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
+      vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));
+    }
+#endif
     glm::mat4 taaCurVP = proj * viewM;   // UNJITTERED view-proj (TAA camera-motion reprojection)
     glm::mat4 volShadowVP(1.0f);   // frame-scope copy of the cascade-0 shadow VP for the volumetric pass
     if (userCfg.gfx.taa) {
@@ -8541,8 +8588,9 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       float gale = std::max(0.0f, ((swv0.valid ? swv0.windSpeed : 8.0f) - 20.0f) / 8.0f);
       scatter::System::ShipInfo si{ vessel.x, vessel.z, vessel.heading,
                                     vessel.speed * 0.514f, vessel.anchored };
-      scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
-                        [&](float x, float z) { return fftHeight(x, z); });
+      if (vrEye == 0)   // sim advance once per FRAME (not per eye) — both eyes must see identical state
+        scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
+                          [&](float x, float z) { return fftHeight(x, z); });
       // Gull cries queued by the flock behaviours -> attenuate by camera
       // distance ((1 - d/320)^2, inaudible skipped), pan by view-space
       // position (client playCry), and hand to the synth.
@@ -8768,7 +8816,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       audioSys.setWeather(std::max(2.0f, aw.valid ? aw.windSpeed : 8.0f));
       audioSys.setRain(sailing ? precipIntensity : 0.0f);
       audioSys.setEnabled(sailing);
-      musicMgr.update();
+      if (vrEye == 0) musicMgr.update();   // advance once per frame, not per eye
       if (!sailing) audioSys.musicSetGain(0.0f);
     }
     const glm::vec4 oceanSun(lightDir, dayK);
@@ -9547,8 +9595,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 #if defined(WEBGPU_BACKEND_DAWN)
     wgpuInstanceProcessEvents(instance);
 #endif
-    WGPUSurfaceTexture surfaceTex = {};
-    WGPUTextureView view = nullptr;
+    // (surfaceTex / view / skipFrame are declared just above the per-eye loop.)
 #ifdef SAILSIM_HAVE_VR
     // VR: render the whole frame into the VR intermediate (not the D3D12-broken window surface).
     if (vrMode) view = vrFrameView;
@@ -9570,17 +9617,19 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         if (frame <= 8) std::fprintf(stderr, "[boot] frame %ld: after reconfigure retry, texture=%p status=%d\n",
                                      frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
         if (!surfaceTex.texture) {
-          // Still nothing (genuinely minimised / occluded). Pump the backend and skip the frame.
+          // Still nothing (genuinely minimised / occluded). Pump the backend, leave the per-eye
+          // loop, and skip the whole frame (a bare `continue` would fall into the present block).
 #if defined(WEBGPU_BACKEND_DAWN)
           wgpuDeviceTick(device);
 #elif defined(WEBGPU_BACKEND_WGPU)
           wgpuDevicePoll(device, false, nullptr);
 #endif
-          continue;
+          skipFrame = true;
         }
       }
-      view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
+      if (!skipFrame) view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
     }
+    if (skipFrame) break;   // out of the per-eye loop; the post-loop guard skips the frame
 
     WGPUCommandEncoderDescriptor encDesc = {};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
@@ -10337,25 +10386,21 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     }
 
 #ifdef SAILSIM_HAVE_VR
-    // Blit the finished frame (vrFrameTex) into each eye — same encoder, right after the resolve
-    // pass wrote it (Dawn inserts the write→read barrier). Mono: both eyes get the same image.
+    // Blit THIS eye's finished frame (vrFrameTex) into its eye target — same encoder, right after
+    // the resolve pass wrote it (Dawn inserts the write→read barrier). Stereo: each per-eye
+    // iteration renders its own view of the frame and blits only its own eye.
     if (vrActive) {
-      for (int e = 0; e < vr::eyeCount(vrB); ++e) {
-        WGPURenderPassColorAttachment eca = colorAttach0();
-        eca.view = vr::eyeTarget(vrB, e);
-        eca.loadOp = WGPULoadOp_Clear; eca.storeOp = WGPUStoreOp_Store;
-        eca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
-#ifdef WGPU_DEPTH_SLICE_UNDEFINED
-        eca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-#endif
-        WGPURenderPassDescriptor erp = {}; erp.colorAttachmentCount = 1; erp.colorAttachments = &eca;
-        WGPURenderPassEncoder ep = wgpuCommandEncoderBeginRenderPass(encoder, &erp);
-        wgpuRenderPassEncoderSetPipeline(ep, vrBlitPipe);
-        wgpuRenderPassEncoderSetBindGroup(ep, 0, vrBlitBind, 0, nullptr);
-        wgpuRenderPassEncoderDraw(ep, 3, 1, 0, 0);
-        wgpuRenderPassEncoderEnd(ep);
-        wgpuRenderPassEncoderRelease(ep);
-      }
+      WGPURenderPassColorAttachment eca = colorAttach0();
+      eca.view = vr::eyeTarget(vrB, vrEye);
+      eca.loadOp = WGPULoadOp_Clear; eca.storeOp = WGPUStoreOp_Store;
+      eca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
+      WGPURenderPassDescriptor erp = {}; erp.colorAttachmentCount = 1; erp.colorAttachments = &eca;
+      WGPURenderPassEncoder ep = wgpuCommandEncoderBeginRenderPass(encoder, &erp);
+      wgpuRenderPassEncoderSetPipeline(ep, vrBlitPipe);
+      wgpuRenderPassEncoderSetBindGroup(ep, 0, vrBlitBind, 0, nullptr);
+      wgpuRenderPassEncoderDraw(ep, 3, 1, 0, 0);
+      wgpuRenderPassEncoderEnd(ep);
+      wgpuRenderPassEncoderRelease(ep);
     }
 #endif
 
@@ -10363,7 +10408,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &cmdDesc);
     wgpuQueueSubmit(queue, 1, &cmd);
 
-    if (shotPath && frame == shotFrame) {
+    if (shotPath && frame == shotFrame && surfaceTex.texture) {
       captureSurface(device, queue, surfaceTex.texture, curW, curH, shotPath);
       glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
@@ -10371,6 +10416,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);
     // (ocean bind groups are cached now — released only on rebuild, not per frame)
+    }   // ── end of the per-eye render loop ──
+
+    if (skipFrame) continue;   // minimised: nothing rendered/submitted this frame
+
 #ifdef SAILSIM_HAVE_VR
     if (vrMode) {
       vr::endFrame(vrB);   // EndAccess + copy each eye's RT into the XR image + submit the XR frame

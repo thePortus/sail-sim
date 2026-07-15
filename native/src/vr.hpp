@@ -61,6 +61,11 @@ void eyeCamera(Bridge* b, int eye, float pose7[7], float fov4[4]);
 // the eye texture's different shape. Remove with the mono path once true stereo rendering lands.
 void setMonoLayerAspect(Bridge* b, float aspect);
 
+// STEREO: the app rendered this eye with a symmetric frustum of these half-angles (radians).
+// The composition layer must submit exactly the rendered FOV; when set (per frame), it overrides
+// both the eye's native asymmetric FOV and the mono-aspect hack, and the eye's REAL pose is used.
+void setEyeSubmitFov(Bridge* b, int eye, float halfW, float halfH);
+
 // Close each eye's access, copy the rendered RT into the acquired XR image, and submit the frame.
 void endFrame(Bridge* b);
 

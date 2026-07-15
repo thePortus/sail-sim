@@ -21,8 +21,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -76,6 +78,7 @@ struct Bridge {
   bool shouldRender = false;
   bool deviceLost = false;   // unrecoverable — see vr::lost()
   float monoAspect = 0.0f;   // >0 = mono bring-up: flat-frame aspect for the layer FOV
+  float submitHalfW[2] = {0, 0}, submitHalfH[2] = {0, 0};   // stereo: rendered symmetric FOV per eye
 };
 
 namespace {
@@ -268,6 +271,11 @@ bool beginFrame(Bridge* b) {
   if (XR_FAILED(xrLocateViews(b->session, &vli, &vs, (uint32_t)views.size(), &got, views.data())))
     { b->shouldRender = false; return false; }
 
+  // SAILSIM_VR_SWAP=1: swap the located views between the eyes — a no-rebuild diagnostic for the
+  // stereo eye-assignment landmine (wrong assignment = inverted depth, "inside-out" 3D).
+  static const bool swapEyes = std::getenv("SAILSIM_VR_SWAP") != nullptr;
+  if (swapEyes && views.size() >= 2) std::swap(views[0], views[1]);
+
   // Open Dawn access to each eye's RT so the app can render into it this frame.
   for (size_t e = 0; e < b->eyes.size(); ++e) {
     b->eyes[e].xrView = views[e];
@@ -299,6 +307,11 @@ bool beginFrame(Bridge* b) {
 bool lost(Bridge* b) { return b && b->deviceLost; }
 
 void setMonoLayerAspect(Bridge* b, float aspect) { if (b) b->monoAspect = aspect; }
+
+void setEyeSubmitFov(Bridge* b, int eye, float halfW, float halfH) {
+  if (!b || eye < 0 || eye > 1) return;
+  b->submitHalfW[eye] = halfW; b->submitHalfH[eye] = halfH;
+}
 
 int             eyeCount(Bridge* b) { return b ? (int)b->eyes.size() : 0; }
 WGPUTextureView eyeTarget(Bridge* b, int e) { return b ? b->eyes[e].view : nullptr; }
@@ -380,20 +393,26 @@ void endFrame(Bridge* b) {
 
       XrCompositionLayerProjectionView& pv = projViews[e];
       pv = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-      // MONO bring-up: the app renders ONE flat image into both eyes. Submitting each eye's copy
-      // with its own (offset, asymmetric) view puts identical pixels at different world directions
-      // per eye — unfusable double vision. Until true per-eye rendering lands, submit BOTH eyes
-      // with eye 0's pose and ONE shared symmetric FOV whose width/height ratio matches the flat
-      // frame's aspect — identical frusta fuse into one flat screen, and the aspect match undoes
-      // the squish from stretching the wide frame into the taller eye texture.
-      pv.pose = b->eyes[0].xrView.pose; pv.fov = b->eyes[0].xrView.fov;
-      if (b->monoAspect > 0.0f) {
+      if (e < 2 && b->submitHalfW[e] > 0.0f) {
+        // STEREO: the app rendered this eye from its REAL pose with a symmetric frustum of these
+        // half-angles — submit exactly that (pose + rendered FOV).
+        pv.pose = eye.xrView.pose;
+        pv.fov.angleLeft  = -b->submitHalfW[e];
+        pv.fov.angleRight =  b->submitHalfW[e];
+        pv.fov.angleUp    =  b->submitHalfH[e];
+        pv.fov.angleDown  = -b->submitHalfH[e];
+      } else if (b->monoAspect > 0.0f) {
+        // MONO bring-up: one flat image in both eyes → both views share eye 0's pose and an
+        // aspect-matched symmetric FOV so identical frusta fuse into one undistorted flat screen.
+        pv.pose = b->eyes[0].xrView.pose;
         const float tanHalfW = 0.839f;                       // ~80° total horizontal — big screen
         const float tanHalfH = tanHalfW / b->monoAspect;
         pv.fov.angleLeft  = -std::atan(tanHalfW);
         pv.fov.angleRight =  std::atan(tanHalfW);
         pv.fov.angleUp    =  std::atan(tanHalfH);
         pv.fov.angleDown  = -std::atan(tanHalfH);
+      } else {
+        pv.pose = eye.xrView.pose; pv.fov = eye.xrView.fov;
       }
       pv.subImage.swapchain = eye.handle;
       pv.subImage.imageRect.offset = {0, 0};

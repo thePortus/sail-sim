@@ -56,6 +56,11 @@ WGPUTextureFormat eyeFormat(Bridge* b);             // the eye texture's wgpu fo
 // {angleLeft, angleRight, angleUp, angleDown} in radians (left/down are negative).
 void eyeCamera(Bridge* b, int eye, float pose7[7], float fov4[4]);
 
+// MONO bring-up only: the aspect (w/h) of the flat frame the app blits into both eyes. When set
+// (>0), the composition layer uses an aspect-matched symmetric FOV so the image isn't squashed by
+// the eye texture's different shape. Remove with the mono path once true stereo rendering lands.
+void setMonoLayerAspect(Bridge* b, float aspect);
+
 // Close each eye's access, copy the rendered RT into the acquired XR image, and submit the frame.
 void endFrame(Bridge* b);
 

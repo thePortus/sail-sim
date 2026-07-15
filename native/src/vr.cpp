@@ -19,6 +19,7 @@
 
 #include <dawn/native/D3D12Backend.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -74,6 +75,7 @@ struct Bridge {
   bool inFrame = false;
   bool shouldRender = false;
   bool deviceLost = false;   // unrecoverable — see vr::lost()
+  float monoAspect = 0.0f;   // >0 = mono bring-up: flat-frame aspect for the layer FOV
 };
 
 namespace {
@@ -296,6 +298,8 @@ bool beginFrame(Bridge* b) {
 
 bool lost(Bridge* b) { return b && b->deviceLost; }
 
+void setMonoLayerAspect(Bridge* b, float aspect) { if (b) b->monoAspect = aspect; }
+
 int             eyeCount(Bridge* b) { return b ? (int)b->eyes.size() : 0; }
 WGPUTextureView eyeTarget(Bridge* b, int e) { return b ? b->eyes[e].view : nullptr; }
 uint32_t        eyeWidth(Bridge* b, int e)  { return b ? b->eyes[e].width : 0; }
@@ -379,9 +383,18 @@ void endFrame(Bridge* b) {
       // MONO bring-up: the app renders ONE flat image into both eyes. Submitting each eye's copy
       // with its own (offset, asymmetric) view puts identical pixels at different world directions
       // per eye — unfusable double vision. Until true per-eye rendering lands, submit BOTH eyes
-      // with eye 0's pose+FOV: identical images through identical frusta fuse into one flat screen
-      // at infinity. Remove when the scene renders per eye (stereo).
+      // with eye 0's pose and ONE shared symmetric FOV whose width/height ratio matches the flat
+      // frame's aspect — identical frusta fuse into one flat screen, and the aspect match undoes
+      // the squish from stretching the wide frame into the taller eye texture.
       pv.pose = b->eyes[0].xrView.pose; pv.fov = b->eyes[0].xrView.fov;
+      if (b->monoAspect > 0.0f) {
+        const float tanHalfW = 0.839f;                       // ~80° total horizontal — big screen
+        const float tanHalfH = tanHalfW / b->monoAspect;
+        pv.fov.angleLeft  = -std::atan(tanHalfW);
+        pv.fov.angleRight =  std::atan(tanHalfW);
+        pv.fov.angleUp    =  std::atan(tanHalfH);
+        pv.fov.angleDown  = -std::atan(tanHalfH);
+      }
       pv.subImage.swapchain = eye.handle;
       pv.subImage.imageRect.offset = {0, 0};
       pv.subImage.imageRect.extent = {(int32_t)eye.width, (int32_t)eye.height};

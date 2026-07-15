@@ -4420,6 +4420,12 @@ int main(int argc, char** argv) {
   ImGui::CreateContext();
   ImGuiIO& imio = ImGui::GetIO();
   imio.IniFilename = nullptr;   // don't write imgui.ini next to the exe
+#ifdef SAILSIM_HAVE_VR
+  // VR: the OS cursor is drawn by Windows on the DESKTOP — it is never part of our rendered
+  // frame, so it's invisible in the headset and the player can't aim clicks. ImGui's software
+  // cursor draws INTO the frame (thus into the eyes) at the exact position clicks land.
+  if (vrMode) imio.MouseDrawCursor = true;
+#endif
   // Embedded fonts, rasterised at the display's content scale for crisp text on
   // HiDPI; FontGlobalScale then brings them back to logical size. Inter is the
   // default (body) font; Cinzel is kept for titles (pushed where needed).
@@ -4602,6 +4608,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     bge[1].binding = 1; bge[1].sampler = blitSamp;
     WGPUBindGroupDescriptor bgd = {}; bgd.layout = blitBGL; bgd.entryCount = 2; bgd.entries = bge;
     vrBlitBind = wgpuDeviceCreateBindGroup(device, &bgd);
+    vr::setMonoLayerAspect(vrB, (float)curW / (float)curH);   // undo the blit's aspect squish
     std::printf("[vr] frame intermediate %ux%u + blit pipeline ready (eye fmt %d)\n",
                 curW, curH, (int)vr::eyeFormat(vrB));
   }

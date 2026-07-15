@@ -7298,6 +7298,27 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
     }
     ImGui::Render();
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrUiW > 0.0f) {
+      // The resolve pass draws the UI through a viewport that maps the 1920×1080 virtual screen
+      // into the centered on-frame box — but ImGui's SCISSOR rects are emitted in virtual-screen
+      // pixels and scissors ignore the viewport, so untransformed they clip the whole UI to the
+      // frame's top-left 1920×1080 quadrant (the "bottom-right of the map at dead centre" bug).
+      // Map every clip rect into the box once per frame (the draw data is reused for both eyes).
+      ImDrawData* dd = ImGui::GetDrawData();
+      const float sx = vrUiW / 1920.0f, sy = vrUiH / 1080.0f;
+      for (int li = 0; li < dd->CmdListsCount; ++li) {
+        ImDrawList* dl = dd->CmdLists[li];
+        for (int ci = 0; ci < dl->CmdBuffer.Size; ++ci) {
+          ImDrawCmd& c = dl->CmdBuffer[ci];
+          c.ClipRect.x = c.ClipRect.x * sx + vrUiOffX;
+          c.ClipRect.y = c.ClipRect.y * sy + vrUiOffY;
+          c.ClipRect.z = c.ClipRect.z * sx + vrUiOffX;
+          c.ClipRect.w = c.ClipRect.w * sy + vrUiOffY;
+        }
+      }
+    }
+#endif
 
     // Server pose corrections (browser applyServerCorrection): the sim snaps to
     // the authoritative pose — clamps, collisions, or an admin moving us. The

@@ -4608,7 +4608,30 @@ int main(int argc, char** argv) {
     vrFrameTex = wgpuDeviceCreateTexture(device, &td);
     vrFrameView = wgpuTextureCreateView(vrFrameTex, nullptr);
 
-    static const char* VR_BLIT_WGSL = R"(
+    // Eye-blit transfer: vrFrameTex holds display-encoded values and the eye is an sRGB target
+    // that re-encodes on write — so decode to linear first. VR compositors disagree about sRGB
+    // handling ("everything looks darker"), so the decode is selectable WITHOUT a rebuild:
+    //   SAILSIM_VR_GAMMA=off   pass the encoded bytes through (compositor already expects encoded)
+    //   SAILSIM_VR_GAMMA=2.2   decode with a plain power curve
+    //   (default)              exact inverse-sRGB decode
+    std::string blitFs;
+    {
+      const char* gv = std::getenv("SAILSIM_VR_GAMMA");
+      if (gv && std::strcmp(gv, "off") == 0) {
+        blitFs = "  return vec4<f32>(c, 1.0);";
+      } else if (gv && std::atof(gv) > 0.0) {
+        char gb[160];
+        std::snprintf(gb, sizeof(gb),
+                      "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(%.4f)), 1.0);", std::atof(gv));
+        blitFs = gb;
+      } else {
+        blitFs = "  let cc = max(c, vec3<f32>(0.0));\n"
+                 "  let lin = select(pow((cc + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),\n"
+                 "                   cc / 12.92, cc <= vec3<f32>(0.04045));\n"
+                 "  return vec4<f32>(lin, 1.0);";
+      }
+    }
+    const std::string VR_BLIT_WGSL = std::string(R"(
 @group(0) @binding(0) var srcTex: texture_2d<f32>;
 @group(0) @binding(1) var srcSamp: sampler;
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -4621,12 +4644,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
   let c = textureSample(srcTex, srcSamp, i.uv).rgb;
-  // vrFrameTex holds display-encoded values; the eye is an sRGB target that re-encodes on write,
-  // so decode to linear first to avoid double gamma.
-  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2)), 1.0);
-}
-)";
-    WGPUShaderModule blitMod = makeWGSL(device, VR_BLIT_WGSL);
+)") + blitFs + "\n}\n";
+    WGPUShaderModule blitMod = makeWGSL(device, VR_BLIT_WGSL.c_str());
     WGPUBindGroupLayoutEntry bgle[2] = {};
     bgle[0].binding = 0; bgle[0].visibility = WGPUShaderStage_Fragment;
     bgle[0].texture.sampleType = WGPUTextureSampleType_Float; bgle[0].texture.viewDimension = WGPUTextureViewDimension_2D;
@@ -6171,12 +6190,16 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
         // Draw the chart + markers into the current window at S px; handles zoom /
         // pan / right-click teleport when expanded. One body for both map sizes.
-        auto drawMap = [&](float S, bool expanded) {
+        auto drawMap = [&](float S, bool expanded, bool circular = false) {
           clampMapView();
           float zoom = expanded ? mapZoom : 1.0f;
           float visW = worldW / zoom, visH = worldH / zoom;
           float vcx = expanded ? mapVCX : (float)(tm.minX + tm.maxX) * 0.5f;
           float vcz = expanded ? mapVCZ : (float)(tm.minZ + tm.maxZ) * 0.5f;
+          if (circular) {   // VR local radar: centred on the ship, fixed span; M opens the full chart
+            visW = visH = 5200.0f;
+            vcx = vessel.x; vcz = vessel.z;
+          }
           float viewMinX = vcx - visW * 0.5f, viewMaxZ = vcz + visH * 0.5f;
 
           ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -6193,9 +6216,15 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           // Terrain raster: blit the visible sub-rectangle of the baked chart.
           ImVec2 uv0((viewMinX - (float)tm.minX) / worldW, ((float)tm.maxZ - viewMaxZ) / worldH);
           ImVec2 uv1(uv0.x + visW / worldW, uv0.y + visH / worldH);
+          if (circular) {
+            mdl->AddImageRounded((ImTextureID)mapView, p0, ImVec2(p0.x + S, p0.y + S), uv0, uv1,
+                                 IM_COL32(255, 255, 255, 235), S * 0.5f);
+            mdl->AddCircle(ImVec2(p0.x + S * 0.5f, p0.y + S * 0.5f), S * 0.5f,
+                           IM_COL32(140, 170, 195, 175), 64, 2.0f);   // instrument rim
+          } else
           mdl->AddImage((ImTextureID)mapView, p0, ImVec2(p0.x + S, p0.y + S), uv0, uv1);
           // Subtle grid.
-          for (int i = 1; i < 8; ++i) {
+          if (!circular) for (int i = 1; i < 8; ++i) {
             float g = S * (float)i / 8.0f;
             mdl->AddLine(ImVec2(p0.x + g, p0.y), ImVec2(p0.x + g, p0.y + S), IM_COL32(255, 255, 255, 10));
             mdl->AddLine(ImVec2(p0.x, p0.y + g), ImVec2(p0.x + S, p0.y + g), IM_COL32(255, 255, 255, 10));
@@ -6231,6 +6260,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           for (const terrain::Harbor& hb : tm.harbors) {
             ImVec2 hp(wx(hb.x), wz(hb.z));
             if (hp.x < p0.x || hp.x > p0.x + S || hp.y < p0.y || hp.y > p0.y + S) continue;
+            if (circular && std::hypot(hp.x - (p0.x + S * 0.5f), hp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
             mdl->AddCircleFilled(hp, R + 2.0f, IM_COL32(0, 0, 0, 140));
             mdl->AddCircleFilled(hp, R, factionCol(hb.faction));
             mdl->AddCircle(hp, R, IM_COL32(0, 0, 0, 190), 0, 1.3f);
@@ -6254,6 +6284,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             float lanePulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 1.45f);
             for (const mp::LaneHotspot& ln : mpClient.lanes()) {
               ImVec2 lp(wx(ln.x), wz(ln.z));
+              if (circular && std::hypot(lp.x - (p0.x + S * 0.5f), lp.y - (p0.y + S * 0.5f)) > S * 0.5f) continue;
               float worldR = 1600.0f + 1500.0f * ln.w;
               float rPx = std::max(6.0f, worldR / visW * S);
               // Radial glow approximated with concentric fills.
@@ -6281,10 +6312,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           };
           {
             float ds2 = expanded ? 6.0f : 5.0f;
-            for (const mp::MapShip& m : mpClient.merchantsAll())
-              diamond(ImVec2(wx(m.x), wz(m.z)), ds2, IM_COL32(34, 227, 208, 255), IM_COL32(255, 255, 255, 230));
+            for (const mp::MapShip& m : mpClient.merchantsAll()) {
+              ImVec2 mp2(wx(m.x), wz(m.z));
+              if (circular && std::hypot(mp2.x - (p0.x + S * 0.5f), mp2.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
+              diamond(mp2, ds2, IM_COL32(34, 227, 208, 255), IM_COL32(255, 255, 255, 230));
+            }
             for (const mp::MapPirate& pr : mpClient.piratesAll()) {
               ImVec2 pp(wx(pr.x), wz(pr.z));
+              if (circular && std::hypot(pp.x - (p0.x + S * 0.5f), pp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
               if (pr.hunter) diamond(pp, ds2, IM_COL32(207, 217, 230, 255), IM_COL32(51, 80, 110, 255));
               else {
                 diamond(pp, ds2, IM_COL32(200, 30, 42, 255), IM_COL32(0, 0, 0, 217));
@@ -6317,6 +6352,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             if (rp.npc) continue;
             ImVec2 pp(wx(rp.x), wz(rp.z));
             if (pp.x < p0.x || pp.x > p0.x + S || pp.y < p0.y || pp.y > p0.y + S) continue;
+            if (circular && std::hypot(pp.x - (p0.x + S * 0.5f), pp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
             if (isSquadMate(rp.id)) {
               const float s = expanded ? 6.0f : 5.0f;
               const ImVec2 d0(pp.x, pp.y - s), d1(pp.x + s, pp.y), d2(pp.x, pp.y + s), d3(pp.x - s, pp.y);
@@ -6448,16 +6484,17 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           if (!mapExpanded) { mapZoom = 1.0f; mapViewInit = false; }   // closed via title-bar X
         } else {
           const float S = 200.0f;
-          if (vrHudActive)
+          if (vrHudActive) {
             ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.74f * std::cos(glm::radians(352.0f)),
                                            io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.74f * std::sin(glm::radians(352.0f))),
                                     ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-          else
+            ImGui::SetNextWindowBgAlpha(0.0f);   // circular radar draws its own glass — no plate
+          } else
           ImGui::SetNextWindowPos(hudPos(1.0f, 1.0f, -12.0f, -12.0f),
                                   ImGuiCond_Always, ImVec2(1.0f, 1.0f));
           ImGui::Begin("minimap", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-          drawMap(S, false);
+          drawMap(S, false, vrHudActive);   // VR: circular local radar (M = full chart)
           if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) mapExpanded = true;   // click the chart to expand
           ImGui::End();
         }

@@ -8720,6 +8720,11 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     glm::vec3 sunDir  = computeSunDir(gameHours);
     if (std::getenv("SAILSIM_NOON")) sunDir = glm::normalize(glm::vec3(0.25f, 0.72f, 0.18f));   // test: force daylight
     if (std::getenv("SAILSIM_SUNLOW")) sunDir = glm::normalize(glm::vec3(0.82f, 0.20f, 0.14f));  // test: low sun, long shadows
+    if (const char* sdv = std::getenv("SAILSIM_SUNDIR")) {   // test: arbitrary sun direction "x,y,z" (screenshot the sky toward any azimuth)
+      float sx = 0, sy = 0, sz = 0;
+      if (std::sscanf(sdv, "%f,%f,%f", &sx, &sy, &sz) == 3 && (sx*sx + sy*sy + sz*sz) > 1e-6f)
+        sunDir = glm::normalize(glm::vec3(sx, sy, sz));
+    }
     const glm::vec3 moonDir = -sunDir;
     const float sunEl = sunDir.y;                                  // -1 midnight .. +1 noon
     const float dayK  = glm::clamp((sunEl + 0.10f) / 0.20f, 0.0f, 1.0f);   // 1 day, 0 night

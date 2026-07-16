@@ -4625,10 +4625,8 @@ int main(int argc, char** argv) {
                       "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(%.4f)), 1.0);", std::atof(gv));
         blitFs = gb;
       } else {
-        blitFs = "  let cc = max(c, vec3<f32>(0.0));\n"
-                 "  let lin = select(pow((cc + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),\n"
-                 "                   cc / 12.92, cc <= vec3<f32>(0.04045));\n"
-                 "  return vec4<f32>(lin, 1.0);";
+        // User-tuned in-headset (VDXR + Quest 3): 1.6 matches the flat game's brightness.
+        blitFs = "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.6)), 1.0);";
       }
     }
     const std::string VR_BLIT_WGSL = std::string(R"(
@@ -4714,6 +4712,25 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       vr::poll(vrB, vrRunning, vrExit);
       if (vrExit) break;
       if (vrRunning) vrActive = vr::beginFrame(vrB);
+      // World labels: project with THIS frame's freshly-located head pose (the k/m camera base is
+      // one frame old but slow-moving) so town/ship nameplates stay pinned during head motion —
+      // the old one-frame pose lag made them jostle and snap back.
+      static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
+      static bool vrLabelBaseValid = false;
+      if (vrActive && vrLabelBaseValid) {
+        float pa[7], fa[4], pb[7], fb[4];
+        vr::eyeCamera(vrB, 0, pa, fa);
+        vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
+        static const bool nmL = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+        glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
+        const glm::quat qc = nmL ? glm::quat(pa[6], pa[3], pa[4], pa[5])
+                                 : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
+        if (!nmL) pc.x = -pc.x;
+        const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
+        const glm::mat4 camC = glm::inverse(vrLabelBase) * poseC;
+        lastViewProj = vrLabelProj * glm::inverse(camC);
+        lastEye = glm::vec3(camC[3]);
+      }
       if (vr::lost(vrB)) {
         // Unrecoverable D3D12 device removal. Exit the loop instead of spinning on a dead
         // session forever — the clean vr::destroy below releases the XR session so Virtual
@@ -8663,7 +8680,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     for (int vrEye = 0; vrEye < vrEyePasses; ++vrEye) {
     eye = kmEyeBase;
     glm::mat4 viewM = kmViewBase;
-    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 2.0f, 40000.0f);
+    // Near plane: 2 m suits the chase camera (depth-precision tuning), but it slices open any
+    // geometry inside ~2 m in first-person — and in VR you can lean into things. 0.5 m there.
+    const float nearZ = (firstPerson || vrMode) ? 0.5f : 2.0f;
+    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, nearZ, 40000.0f);
     // Mirror clip-space X: the world uses compass conventions (+X east, +Z north,
     // heading clockwise) like the browser's left-handed Babylon scene, but a
     // right-handed camera puts east on the LEFT — mirroring the coastlines and
@@ -8694,7 +8714,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // virtual-UI block), so nothing readable lands in the invisible margins.
       const float tanHalfW = std::max(-std::tan(f4[0]), std::tan(f4[1]));
       const float tanHalfH = std::max(std::tan(f4[2]), -std::tan(f4[3]));
-      proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, 2.0f, 40000.0f);
+      proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, nearZ, 40000.0f);
       proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
       vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));
     }
@@ -8728,8 +8748,9 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         if (!vrNoMirror2) pc.x = -pc.x;
         const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
         const glm::mat4 camC = glm::inverse(kmViewBase) * poseC;
-        lastViewProj = proj * glm::inverse(camC);   // proj: this eye's symmetric VR projection
+        lastViewProj = proj * glm::inverse(camC);   // fallback (first frame); labels re-project fresh
         lastEye = glm::vec3(camC[3]);
+        vrLabelBase = kmViewBase; vrLabelProj = proj; vrLabelBaseValid = true;
       }
     } else
 #endif

@@ -2310,7 +2310,11 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
                         u.center.z + u.right.y * c.x * size);
   var o : VSOut;
   o.position = u.viewProj * vec4<f32>(world, 1.0);
-  o.uv = vec2<f32>(c.x + 0.5, 0.5 - c.y);
+  // u runs 1->0 along camera-right: the engine's X-MIRRORED projection (proj[0][0] flip) shows
+  // the +right quad edge on the screen LEFT, so the baked atlas cell (authored unmirrored, like
+  // the browser shows it) must be flipped to match — else every ship reads bow-for-stern from
+  // the side (the real hulls pass through the mirror; the baked texture content does not).
+  o.uv = vec2<f32>(0.5 - c.x, 0.5 - c.y);
   return o;
 }
 @fragment
@@ -2413,7 +2417,9 @@ fn vs_main(@builtin(vertex_index) vi : u32, @location(0) inst : vec4<f32>) -> VS
   let world = vec3<f32>(inst.x + u.cam.z * c.x * size, inst.y + ly, inst.z + u.cam.w * c.x * size);
   var o : VSOut;
   o.position = u.viewProj * vec4<f32>(world, 1.0);
-  o.uv = vec2<f32>(c.x + 0.5, 1.0 - c.y);
+  // u flipped for the X-mirrored projection (see the ship impostor) so the baked sprite matches
+  // the near real-geometry buildings it cross-fades with at the LOD band.
+  o.uv = vec2<f32>(0.5 - c.x, 1.0 - c.y);
   o.haze = 1.0 - exp(-pow(d * 0.00009, 2.0));
   return o;
 }

@@ -4885,17 +4885,22 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (tanHW > 0.01f && tanHH > 0.01f) {
         static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.95f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.62f;
+        }();
+        static const float uiWFrac = [] {  // UI width as a fraction of the binocular overlap
+          const char* v = std::getenv("SAILSIM_VR_UI_WIDTH");
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.81f;
         }();
         // The comfortable view is nearly SQUARE, so a fixed 16:9 screen either overflows the
         // sides (both extremes hard to see) or wastes the vertical. Decouple the two axes:
         // width fills the binocular overlap (both eyes see all of it), height uses uiFrac of the
         // visible vertical, and the VIRTUAL screen the UI lays out on takes the matching aspect
         // (1920 × variable) — undistorted, and bottom rows get real room instead of crushing.
-        // Uniform 0.85 shrink (user-tuned): the full-fit box pushed content into the periphery —
-        // pull everything in a bit while keeping the same shape and centering.
-        const float angW = 2.0f * std::min(-tanL, tanR) * 0.95f * 0.85f;   // inside the binocular overlap
-        const float angH = uiFrac * (tanU - tanD) * 0.85f;                 // the visible vertical, pulled in
+        // User-tuned fractions (defaults from in-headset iteration: width 0.81 of the overlap felt
+        // right; the vertical needed pulling in much harder, to 0.62 of the visible height).
+        // Live-tunable via SAILSIM_VR_UI_WIDTH / SAILSIM_VR_UI_SIZE — no rebuild.
+        const float angW = 2.0f * std::min(-tanL, tanR) * uiWFrac;
+        const float angH = uiFrac * (tanU - tanD);
         const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
         vrUiVh = 1920.0f * (angH / angW);                          // virtual screen height = box aspect
         vrUiW = angW / (2.0f * tanHW) * (float)curW;

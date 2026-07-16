@@ -5477,6 +5477,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // Screen rects of HUD controls the tutorial guidance can ring (populated as
       // each is drawn this frame; consumed by the quest-guidance pass at frame end).
       std::map<std::string, ImVec4> guideRects;
+      if (!vrMode) {
       // ── Top-left: wind gauge + readouts ──
       ImGui::SetNextWindowPos(hudPos(0.0f, 0.0f, 12.0f, 12.0f), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -5603,6 +5604,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // Log out lives in the Esc menu (gear icon / Esc) — kept out of this panel
       // to reclaim vertical space in the restructured HUD.
       ImGui::End();
+      }   // end flat top-left hud
 
       // ── Top-right: sail status ──
       const char* sailLabel = vessel.anchored ? "ANCHORED"
@@ -5610,6 +5612,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       const ImVec4 sailCol = vessel.anchored ? ImVec4(0.90f, 0.65f, 0.35f, 1.0f)
                            : vessel.sailState == 2 ? ImVec4(0.50f, 0.85f, 0.55f, 1.0f)
                            : vessel.sailState == 1 ? ImVec4(0.90f, 0.82f, 0.45f, 1.0f) : ImVec4(0.65f, 0.68f, 0.72f, 1.0f);
+      if (!vrMode) {
       ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
       ImGui::Begin("sailhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
@@ -5625,6 +5628,145 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         guideRects["sails"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }   // tutorial: "set your canvas" ring
       ImGui::End();
+      }   // end flat sailhud
+#ifdef SAILSIM_HAVE_VR
+      // ═══ VR-NATIVE DASHBOARD ═══ Replaces the flat hud + sailhud in VR. The visible field is
+      // an OVAL, so the instruments sit on its lower arc (glance-down zone) instead of rectangle
+      // corners: a round wind/compass dial low-left of centre, a helm dial (big glance numbers)
+      // low-right, and a one-line status strip at the bottom apex. Desktop hint text dropped.
+      if (vrMode) {
+        // Position a window on the ellipse of the visible view (virtual-screen coords). The
+        // virtual screen is already centred on the visible middle; 270° = bottom apex.
+        auto vrArcWin = [&](const char* name, float angleDeg, ImVec2 pivot) {
+          const float cx = io.DisplaySize.x * 0.5f, cyv = io.DisplaySize.y * 0.5f;
+          const float a = cx * 0.86f, b = cyv * 0.86f;
+          const float r = glm::radians(angleDeg);
+          ImGui::SetNextWindowPos(ImVec2(cx + a * std::cos(r), cyv - b * std::sin(r)),
+                                  ImGuiCond_Always, pivot);
+          ImGui::SetNextWindowBgAlpha(0.42f);
+          ImGui::Begin(name, nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
+                       ImGuiWindowFlags_NoScrollbar);
+        };
+
+        // ── Wind & compass dial (lower-left arc) — the rose is inherently round: no-go shading
+        //    from the real polar, rotating compass card, wind arrow, bow-up ship. ──
+        vrArcWin("##vrwind", 214.0f, ImVec2(0.0f, 1.0f));
+        {
+          const float G = 168.0f;
+          ImVec2 p0 = ImGui::GetCursorScreenPos();
+          ImGui::Dummy(ImVec2(G, G));
+          guideRects["wind"] = ImVec4(p0.x, p0.y, G, G);
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          ImVec2 c(p0.x + G * 0.5f, p0.y + G * 0.5f);
+          float R = G * 0.5f - 6.0f;
+          auto dirAt = [&](float deg) {
+            float rr = glm::radians(deg);
+            return ImVec2(c.x + R * std::sin(rr), c.y - R * std::cos(rr));
+          };
+          {
+            float peak = 0.5f;
+            for (const glm::vec2& pt : vrig.polar) peak = std::max(peak, pt.y);
+            float good = std::max(0.01f, 0.7f * peak);
+            const float STEP = 4.0f;
+            for (float ang = rel - 90.0f; ang < rel + 90.0f; ang += STEP) {
+              float offMid = std::fabs((ang + STEP * 0.5f) - rel);
+              float drive  = sail::detail::polarDrive(offMid, vrig);
+              float redF   = glm::clamp((good - drive) / good, 0.0f, 1.0f);
+              if (redF <= 0.02f) continue;
+              dl->AddTriangleFilled(c, dirAt(ang), dirAt(ang + STEP), IM_COL32(210, 70, 60, (int)(redF * 100.0f)));
+            }
+          }
+          dl->AddCircleFilled(c, R, IM_COL32(20, 34, 48, 170));
+          dl->AddCircle(c, R, IM_COL32(150, 180, 205, 210), 48, 2.0f);
+          {
+            const float s = R / 36.0f;
+            auto cardPt = [&](float bearingDeg, float radius) {
+              float ar = glm::radians(bearingDeg - headingDeg);
+              return ImVec2(c.x + radius * s * std::sin(ar), c.y - radius * s * std::cos(ar));
+            };
+            dl->AddLine(cardPt(0, 35), cardPt(0, 26), IM_COL32(249, 115, 22, 255), 2.5f * s);
+            dl->AddLine(cardPt(90, 35), cardPt(90, 29), IM_COL32(255, 255, 255, 77), 1.0f * s);
+            dl->AddLine(cardPt(180, 35), cardPt(180, 27), IM_COL32(255, 255, 255, 77), 1.5f * s);
+            dl->AddLine(cardPt(270, 35), cardPt(270, 29), IM_COL32(255, 255, 255, 77), 1.0f * s);
+            for (int ic = 45; ic < 360; ic += 90)
+              dl->AddLine(cardPt((float)ic, 36), cardPt((float)ic, 32), IM_COL32(255, 255, 255, 46), 0.8f * s);
+            auto cardLabel = [&](float bearingDeg, float radius, const char* txt, ImU32 col) {
+              ImVec2 lp = cardPt(bearingDeg, radius);
+              ImVec2 ts = ImGui::CalcTextSize(txt);
+              dl->AddText(ImVec2(lp.x - ts.x * 0.5f, lp.y - ts.y * 0.5f), col, txt);
+            };
+            cardLabel(0, 19, "N", IM_COL32(251, 146, 60, 255));
+            cardLabel(90, 20, "E", IM_COL32(255, 255, 255, 102));
+            cardLabel(180, 22, "S", IM_COL32(255, 255, 255, 102));
+            cardLabel(270, 20, "W", IM_COL32(255, 255, 255, 102));
+          }
+          ImVec2 wt = dirAt(rel), wh(c.x + (wt.x - c.x) * 0.30f, c.y + (wt.y - c.y) * 0.30f);
+          dl->AddLine(wt, wh, IM_COL32(90, 180, 240, 255), 3.5f);
+          { ImVec2 d(wh.x - wt.x, wh.y - wt.y); float l = std::hypot(d.x, d.y); if (l > 1e-3f) { d.x /= l; d.y /= l; }
+            ImVec2 n(-d.y, d.x);
+            dl->AddTriangleFilled(wh, ImVec2(wh.x - d.x*11 + n.x*7, wh.y - d.y*11 + n.y*7),
+                                  ImVec2(wh.x - d.x*11 - n.x*7, wh.y - d.y*11 - n.y*7), IM_COL32(90, 180, 240, 255)); }
+          dl->AddTriangleFilled(ImVec2(c.x, c.y - 16), ImVec2(c.x - 10, c.y + 12), ImVec2(c.x + 10, c.y + 12), IM_COL32(235, 235, 240, 255));
+          if (wv.valid) {
+            char wtxt[48]; std::snprintf(wtxt, sizeof(wtxt), ICON_FA_WIND "  %.0f kn  B%d", wv.windSpeed, wv.beaufort);
+            ImVec2 ts = ImGui::CalcTextSize(wtxt);
+            ImGui::SetCursorPosX((ImGui::GetWindowSize().x - ts.x) * 0.5f);
+            ImGui::Text("%s", wtxt);
+          }
+        }
+        ImGui::End();
+
+        // ── Helm dial (lower-right arc): BIG speed, sail state, trim quality bar. ──
+        vrArcWin("##vrhelm", 326.0f, ImVec2(1.0f, 1.0f));
+        {
+          ImGui::PushFont(fontTitle);
+          ImGui::Text("%.1f kn", shipSpeed);
+          ImGui::PopFont();
+          ImGui::TextColored(sailCol, "%s  %s", vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, sailLabel);
+          if (vessel.sailState != 0 && !vessel.anchored) {
+            const float q = vessel.trimQ;
+            const ImVec4 qcol = q > 0.75f ? ImVec4(0.35f, 0.85f, 0.50f, 1.0f)
+                              : q > 0.40f ? ImVec4(0.95f, 0.83f, 0.35f, 1.0f)
+                                          : ImVec4(0.94f, 0.38f, 0.38f, 1.0f);
+            ImGui::TextColored(qcol, "trim %d%%", (int)std::lround(q * 100.0f));
+            ImVec2 gp = ImGui::GetCursorScreenPos();
+            const float gw = 170.0f, gh = 9.0f;
+            ImGui::Dummy(ImVec2(gw, gh + 4.0f));
+            const float fill = (vessel.sheetAngleDeg - 5.0f) / 83.0f;
+            const float opt = (sail::optimalSheetAngle(vessel.driveAngle) - 5.0f) / 83.0f;
+            ImDrawList* gdl = ImGui::GetWindowDrawList();
+            gdl->AddRectFilled(gp, ImVec2(gp.x + gw, gp.y + gh), IM_COL32(255, 255, 255, 26), 4.0f);
+            gdl->AddRectFilled(gp, ImVec2(gp.x + gw * fill, gp.y + gh), ImGui::GetColorU32(qcol), 4.0f);
+            gdl->AddRectFilled(ImVec2(gp.x + gw * opt - 1.5f, gp.y - 2.0f),
+                               ImVec2(gp.x + gw * opt + 1.5f, gp.y + gh + 2.0f), IM_COL32(255, 255, 255, 180));
+          }
+          { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            guideRects["sails"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }
+        }
+        ImGui::End();
+
+        // ── Status strip (bottom apex): callsign · point of sail · crew · link. One glance line. ──
+        vrArcWin("##vrstatus", 270.0f, ImVec2(0.5f, 1.0f));
+        {
+          ImGui::TextDisabled("%s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
+          ImGui::SameLine(0.0f, 18.0f);
+          if (vessel.anchored) ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.45f, 1.0f), ICON_FA_ANCHOR "  Anchored");
+          else                 ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.95f, 1.0f), ICON_FA_SAILBOAT "  %s", pos);
+          { mp::TownState ct = mpClient.town();
+            if (ct.maxCrew > 0) {
+              ImGui::SameLine(0.0f, 18.0f);
+              const bool full = ct.crew >= ct.maxCrew;
+              ImGui::TextColored(full ? ImVec4(0.80f, 0.82f, 0.86f, 1.0f) : ImVec4(0.95f, 0.72f, 0.42f, 1.0f),
+                                 ICON_FA_USERS "  %d/%d", ct.crew, ct.maxCrew);
+            } }
+          ImGui::SameLine(0.0f, 18.0f);
+          const ImVec4 vconnCol = cs == mp::ConnState::Open ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f) : ImVec4(0.90f, 0.70f, 0.40f, 1.0f);
+          ImGui::TextColored(vconnCol, ICON_FA_TOWER_BROADCAST "  %d", (int)others.size());
+        }
+        ImGui::End();
+      }
+#endif
 
       // ── Damage panel (top-right, under the sail status): its own window so the
       //    main HUD never collides with the chat panel. ──

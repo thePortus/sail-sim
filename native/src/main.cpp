@@ -4892,8 +4892,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         // width fills the binocular overlap (both eyes see all of it), height uses uiFrac of the
         // visible vertical, and the VIRTUAL screen the UI lays out on takes the matching aspect
         // (1920 × variable) — undistorted, and bottom rows get real room instead of crushing.
-        const float angW = 2.0f * std::min(-tanL, tanR) * 0.95f;   // inside the binocular overlap
-        const float angH = uiFrac * (tanU - tanD);                 // use the vertical we actually have
+        // Uniform 0.85 shrink (user-tuned): the full-fit box pushed content into the periphery —
+        // pull everything in a bit while keeping the same shape and centering.
+        const float angW = 2.0f * std::min(-tanL, tanR) * 0.95f * 0.85f;   // inside the binocular overlap
+        const float angH = uiFrac * (tanU - tanD) * 0.85f;                 // the visible vertical, pulled in
         const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
         vrUiVh = 1920.0f * (angH / angW);                          // virtual screen height = box aspect
         vrUiW = angW / (2.0f * tanHW) * (float)curW;

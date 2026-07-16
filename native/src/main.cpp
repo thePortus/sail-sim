@@ -6569,8 +6569,15 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         // wooden banner (distinct silhouettes, mirroring nameplate.ts).
         auto plaque = [&](ImVec2 cpx, float ph, const char* title, const char* sub,
                           ImU32 bg, ImU32 border, bool town) {
+          // VR: the frame spans a much wider angular field, so distance-scaled plates read too
+          // small — scale the whole plaque (plate + border + text together, fit logic intact).
+          static const float vrLabelScale = [] {
+            const char* v = std::getenv("SAILSIM_VR_LABEL_SCALE");
+            return v ? std::clamp((float)std::atof(v), 1.0f, 2.5f) : 1.45f;
+          }();
+          if (vrHudActive) ph *= vrLabelScale;
           if (ph < 9.0f) return;
-          ph = std::min(ph, 170.0f);
+          ph = std::min(ph, vrHudActive ? 235.0f : 170.0f);
           float pw = ph * 3.6f;
           ImVec2 p0(cpx.x - pw * 0.5f, cpx.y - ph * 0.5f), p1(cpx.x + pw * 0.5f, cpx.y + ph * 0.5f);
           float bw = std::max(1.5f, ph * 0.045f);
@@ -6687,7 +6694,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             char lbl[96];
             if (fs.neutralized) std::snprintf(lbl, sizeof(lbl), "%s  -  SILENCED", hb.name.c_str());
             else std::snprintf(lbl, sizeof(lbl), "%s  -  %d/%d guns", hb.name.c_str(), fs.gunsUp, fs.gunsTotal);
-            float ts = std::clamp(bh * 1.35f, 10.0f, 20.0f);
+            float ts = std::clamp(bh * (vrHudActive ? 1.9f : 1.35f), 10.0f, vrHudActive ? 28.0f : 20.0f);
             ImVec2 tsz = ImGui::GetFont()->CalcTextSizeA(ts, 1e9f, 0.0f, lbl);
             ImVec2 tp(cpx.x - tsz.x * 0.5f, a.y - ts - 3.0f);
             wdl->AddText(ImGui::GetFont(), ts, ImVec2(tp.x + 1, tp.y + 1), IM_COL32(6, 10, 16, 230), lbl);

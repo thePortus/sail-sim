@@ -31,6 +31,10 @@
 #endif
 #include <glfw3webgpu.h>
 #include <GLFW/glfw3.h>
+#if defined(_WIN32) && defined(SAILSIM_HAVE_VR)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // glfwGetWin32Window — VR confines the OS cursor to the window
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -4662,6 +4666,19 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // VR: pace to the compositor + open per-eye access. vrActive = we have a frame to render+submit.
     bool vrActive = false;
     if (vrMode) {
+      // The player has a headset on and can't see the desktop: never let input escape. Retake
+      // keyboard focus if anything stole it, and confine the OS cursor to the window's client
+      // rect every frame — a click can then never land outside and silently drop focus.
+      if (!glfwGetWindowAttrib(window, GLFW_FOCUSED)) glfwFocusWindow(window);
+#ifdef _WIN32
+      if (HWND hw = glfwGetWin32Window(window)) {
+        RECT rc; GetClientRect(hw, &rc);
+        POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
+        ClientToScreen(hw, &tl); ClientToScreen(hw, &br);
+        RECT clip{tl.x, tl.y, br.x, br.y};
+        ClipCursor(&clip);
+      }
+#endif
       vr::poll(vrB, vrRunning, vrExit);
       if (vrExit) break;
       if (vrRunning) vrActive = vr::beginFrame(vrB);
@@ -4923,6 +4940,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
         gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = vrUiVh / vrUiH;
         gVrUiActive = true;
+        static bool vrCursorSeeded = false;
+        if (!vrCursorSeeded) {   // ImGui knows no mouse pos until the first MOVE — seed it so the
+          vrCursorSeeded = true; // software cursor is visible immediately at startup.
+          double mx = 0.0, my = 0.0;
+          glfwGetCursorPos(window, &mx, &my);
+          ImGui::GetIO().AddMousePosEvent(((float)mx - gVrUiOffX) * gVrUiSclX,
+                                          ((float)my - gVrUiOffY) * gVrUiSclY);
+        }
         ImGuiIO& vio = ImGui::GetIO();
         vio.DisplaySize = ImVec2(1920.0f, vrUiVh);
         vio.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
@@ -10769,6 +10794,9 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   // ALWAYS destroy the bridge (xrEndSession/xrDestroySession/xrDestroyInstance): leaving the XR
   // session open on exit wedges Virtual Desktop's compositor (black headset until a PC reboot).
   if (vrB) { vr::destroy(vrB); vrB = nullptr; std::fprintf(stderr, "[vr] session destroyed cleanly\n"); }
+#ifdef _WIN32
+  if (vrMode) ClipCursor(nullptr);   // release the cursor confinement
+#endif
 #endif
 
   // 7. Teardown

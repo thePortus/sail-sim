@@ -4446,6 +4446,14 @@ int main(int argc, char** argv) {
   float uiScaleX = 1.0f, uiScaleY = 1.0f;
   glfwGetWindowContentScale(window, &uiScaleX, &uiScaleY);
   if (uiScaleX <= 0.0f) uiScaleX = 1.0f;
+#ifdef SAILSIM_HAVE_VR
+  // VR: angular text size is what fails in-headset — rasterize the fonts larger (crisp glyphs,
+  // not a blurry FontGlobalScale upscale). Auto-resize HUD windows grow with the text.
+  if (vrMode) {
+    const char* v = std::getenv("SAILSIM_VR_FONT");
+    uiScaleX *= v ? std::clamp((float)std::atof(v), 1.0f, 2.0f) : 1.35f;
+  }
+#endif
   ImFontConfig fontCfg;
   fontCfg.FontDataOwnedByAtlas = false;   // static arrays — don't let ImGui free them
   imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_BODY, (int)UI_FONT_BODY_SIZE,
@@ -4464,7 +4472,12 @@ int main(int argc, char** argv) {
   }
   ImFont* fontTitle = imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_TITLE, (int)UI_FONT_TITLE_SIZE,
                                                        30.0f * uiScaleX, &fontCfg);
-  imio.FontGlobalScale = 1.0f / uiScaleX;
+  {
+    float contentScale = 1.0f, cs2 = 1.0f;
+    glfwGetWindowContentScale(window, &contentScale, &cs2);
+    if (contentScale <= 0.0f) contentScale = 1.0f;
+    imio.FontGlobalScale = 1.0f / contentScale;   // undo HiDPI only — the VR factor stays in effect
+  }
   styleSailSim();
   ImGui_ImplGlfw_InitForOther(window, true);
 #ifdef SAILSIM_HAVE_VR
@@ -4885,11 +4898,11 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (tanHW > 0.01f && tanHH > 0.01f) {
         static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
           const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.62f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.92f;
         }();
         static const float uiWFrac = [] {  // UI width as a fraction of the binocular overlap
           const char* v = std::getenv("SAILSIM_VR_UI_WIDTH");
-          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.81f;
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.92f;
         }();
         // The comfortable view is nearly SQUARE, so a fixed 16:9 screen either overflows the
         // sides (both extremes hard to see) or wastes the vertical. Decouple the two axes:
@@ -4918,6 +4931,25 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 #endif
     ImGui::NewFrame();
     ImGuiIO& io = ImGui::GetIO();
+    // Edge-anchored HUD placement. Flat: identical to raw io.DisplaySize math. VR: anchors
+    // reference an inset "comfort ring" instead of the true screen edges, pulling corner HUD
+    // (chat, minimap, wind gauge...) toward the readable zone while centered content keeps the
+    // full screen. Ring insets are live-tunable: SAILSIM_VR_HUD_INSET (sides), _TOP, _BOT.
+    auto hudPos = [&](float ax, float ay, float dx, float dy) -> ImVec2 {
+      float x0 = 0.0f, y0 = 0.0f, x1 = io.DisplaySize.x, y1 = io.DisplaySize.y;
+#ifdef SAILSIM_HAVE_VR
+      if (vrMode) {
+        auto envf = [](const char* n, float d) {
+          const char* v = std::getenv(n); return v ? (float)std::atof(v) : d; };
+        static const float inS = std::clamp(envf("SAILSIM_VR_HUD_INSET",     0.10f), 0.0f, 0.35f);
+        static const float inT = std::clamp(envf("SAILSIM_VR_HUD_INSET_TOP", 0.18f), 0.0f, 0.40f);
+        static const float inB = std::clamp(envf("SAILSIM_VR_HUD_INSET_BOT", 0.06f), 0.0f, 0.40f);
+        x0 = io.DisplaySize.x * inS; x1 = io.DisplaySize.x * (1.0f - inS);
+        y0 = io.DisplaySize.y * inT; y1 = io.DisplaySize.y * (1.0f - inB);
+      }
+#endif
+      return ImVec2(x0 + (x1 - x0) * ax + dx, y0 + (y1 - y0) * ay + dy);
+    };
 
     // Resolve an in-flight auth request (posted off-thread so the sea keeps moving).
     if (appState == AppState::Connecting && authFuture.valid() &&
@@ -5140,7 +5172,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // ── View-mode toolbar (top-centre): camera views + settings/map, as a
       //    compact icon strip. Hidden in photo mode (clean shot; Esc/F2 exits). ──
       if (!photoMode) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 12.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowPos(hudPos(0.5f, 0.0f, 0.0f, 12.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
         ImGui::Begin("##viewtools", nullptr,
                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
@@ -5446,7 +5478,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // each is drawn this frame; consumed by the quest-guidance pass at frame end).
       std::map<std::string, ImVec4> guideRects;
       // ── Top-left: wind gauge + readouts ──
-      ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
+      ImGui::SetNextWindowPos(hudPos(0.0f, 0.0f, 12.0f, 12.0f), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       ImGui::Text("%s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
@@ -5578,7 +5610,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       const ImVec4 sailCol = vessel.anchored ? ImVec4(0.90f, 0.65f, 0.35f, 1.0f)
                            : vessel.sailState == 2 ? ImVec4(0.50f, 0.85f, 0.55f, 1.0f)
                            : vessel.sailState == 1 ? ImVec4(0.90f, 0.82f, 0.45f, 1.0f) : ImVec4(0.65f, 0.68f, 0.72f, 1.0f);
-      ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 12), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+      ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
       ImGui::Begin("sailhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       // Icon in the body font (Font Awesome isn't merged into the title face),
@@ -5612,7 +5644,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
                          (mastRepairStartT >= 0 && mastRepairArmedMs > 0);
           } }
         if (haveCombat) {
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+          ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -12.0f, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
           ImGui::Begin("damagehud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       // ── Damage diagram (browser damage HUD): 5 hull zones coloured by the
@@ -5709,7 +5741,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // the Dock button). NoBringToFrontOnFocus keeps HUD click order stable too.
       float gunHudTopY = io.DisplaySize.y - 12.0f;   // fallback: bottom edge when the gunhud isn't shown
       if (!tiedUp) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 12.0f),
+        ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -12.0f),
                                 ImGuiCond_Always, ImVec2(0.5f, 1.0f));
         ImGui::Begin("gunhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
@@ -5766,7 +5798,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
       // ── Salvage toast (bottom-centre, ~6 s). ──
       if (!salvageToast.empty() && t - salvageToastAtT < 6.0) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 90.0f),
+        ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -90.0f),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::Begin("salvagetoast", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
@@ -6081,7 +6113,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           if (!mapExpanded) { mapZoom = 1.0f; mapViewInit = false; }   // closed via title-bar X
         } else {
           const float S = 200.0f;
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, io.DisplaySize.y - 12.0f),
+          ImGui::SetNextWindowPos(hudPos(1.0f, 1.0f, -12.0f, -12.0f),
                                   ImGuiCond_Always, ImVec2(1.0f, 1.0f));
           ImGui::Begin("minimap", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
@@ -6410,7 +6442,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
         // ── Quest tracker: the objective checklist (draggable), skip for intro. ──
         if (q.active) {
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 302.0f, 92.0f), ImGuiCond_FirstUseEver);
+          ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -302.0f, 92.0f), ImGuiCond_FirstUseEver);
           ImGui::SetNextWindowSizeConstraints(ImVec2(288, 0), ImVec2(288, FLT_MAX));
           ImGui::Begin("Quest##tracker", nullptr,
                        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
@@ -6664,7 +6696,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         // Moored: the town menu (name, faction, description, the four doors, cast off).
         if (tiedUp && tiedIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 40.0f),
+          ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -40.0f),
                                   ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_Always);
           ImGui::Begin("dockmenu", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -7144,7 +7176,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
       // Collapsed: a chat-bubble button (bottom-left) with an unread badge.
       if (!chatOpen) {
-        ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        ImGui::SetNextWindowPos(hudPos(0.0f, 1.0f, 12.0f, -12.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
         ImGui::Begin("##chatbubble", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
         const ImVec2 bp = ImGui::GetCursorScreenPos();
@@ -7160,7 +7192,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         ImGui::End();
       }
 
-      ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
+      ImGui::SetNextWindowPos(hudPos(0.0f, 1.0f, 12.0f, -12.0f), ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
       ImGui::SetNextWindowSize(ImVec2(380.0f, 262.0f), ImGuiCond_FirstUseEver);
       ImGui::SetNextWindowSizeConstraints(ImVec2(280.0f, 170.0f), ImVec2(820.0f, 640.0f));
       const bool chatShown = chatOpen;   // Begin() called iff open — End() must match

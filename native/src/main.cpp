@@ -6013,8 +6013,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
                           ghh >= 6.5f && ghh < 19.5f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
           ImDrawList* fdl = ImGui::GetForegroundDrawList();
           ImVec2 ts = ImGui::CalcTextSize(line);
-          ImVec2 sp = arcPt(270.0f, 0.86f);
-          ImVec2 tp(sp.x - ts.x * 0.5f, sp.y - ts.y * 0.5f);
+          // Sits just ABOVE the round tool cluster (arcPt 270°/0.60, 64 px tall, centre pivot) —
+          // the deep-arc spot (270°/0.86) was too low to read comfortably in-headset.
+          ImVec2 sp = arcPt(270.0f, 0.60f);
+          ImVec2 tp(sp.x - ts.x * 0.5f, sp.y - 32.0f - 12.0f - ts.y);
           fdl->AddText(ImVec2(tp.x + 1.5f, tp.y + 1.5f), IM_COL32(0, 0, 0, 170), line);
           fdl->AddText(tp, IM_COL32(222, 230, 238, 235), line);
           vrBarTop = tp.y - 8.0f;
@@ -7199,11 +7201,17 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           return hb.tier == "capital" ? "Governor's Mansion" : "Mayor's House";
         };
 
-        // Dock prompt (bottom-centre) — shown when alongside a pier and not moored/mooring.
+        // Dock prompt — shown when alongside a pier and not moored/mooring. Flat: bottom-centre,
+        // stacked above the gun HUD. VR: dead centre of the view — bottom-stacked prompts sink
+        // below the comfortable gaze and get missed in-headset.
         if (!tiedUp && !docking && dockIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)dockIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
-                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          if (vrHudActive)
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          else
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("dockprompt", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
           char lbl[128];
@@ -7218,11 +7226,16 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           ImGui::PopFont();
           ImGui::End();
         }
-        // Mooring indicator (bottom-centre) while the hull glides into the berth (client "⚓ Mooring at …").
+        // Mooring indicator while the hull glides into the berth (client "⚓ Mooring at …").
+        // Same placement as the Dock prompt it replaces (VR: centre, flat: bottom-centre).
         if (docking && tiedIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
-                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          if (vrHudActive)
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          else
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("mooring", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
           ImGui::PushFont(fontTitle);

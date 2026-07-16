@@ -165,6 +165,7 @@ static void onDeviceError(WGPUErrorType type, char const* message, void*) {
 // transforming anywhere later (e.g. before NewFrame) is clobbered by the event queue — that was
 // the flickering cursor + dead clicks. Updated per frame from the UI box; identity until VR runs.
 static float gVrUiOffX = 0.0f, gVrUiOffY = 0.0f, gVrUiSclX = 1.0f, gVrUiSclY = 1.0f;
+static float gVrUiBoxW = 0.0f, gVrUiBoxH = 0.0f;   // UI box size in window px (cursor confinement)
 static bool  gVrUiActive = false;
 #endif
 
@@ -4678,7 +4679,16 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         RECT rc; GetClientRect(hw, &rc);
         POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
         ClientToScreen(hw, &tl); ClientToScreen(hw, &br);
+        // Confine to the VIRTUAL UI SCREEN region (the visible HUD area), not the whole window:
+        // a cursor parked in the window's overscan margins maps outside the headset's view and
+        // "disappears". Fall back to the client rect until the UI box exists.
         RECT clip{tl.x, tl.y, br.x, br.y};
+        if (gVrUiActive && gVrUiBoxW > 0.0f) {
+          clip.left   = tl.x + (LONG)gVrUiOffX;
+          clip.top    = tl.y + (LONG)gVrUiOffY;
+          clip.right  = tl.x + (LONG)(gVrUiOffX + gVrUiBoxW);
+          clip.bottom = tl.y + (LONG)(gVrUiOffY + gVrUiBoxH);
+        }
         ClipCursor(&clip);
       }
 #endif
@@ -4945,14 +4955,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         vrUiOffY = (1.0f - cy / tanHH) * 0.5f * (float)curH - vrUiH * 0.5f;   // centred on the visible middle
         gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
         gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = vrUiVh / vrUiH;
+        gVrUiBoxW = vrUiW; gVrUiBoxH = vrUiH;
         gVrUiActive = true;
         static bool vrCursorSeeded = false;
-        if (!vrCursorSeeded) {   // ImGui knows no mouse pos until the first MOVE — seed it so the
-          vrCursorSeeded = true; // software cursor is visible immediately at startup.
-          double mx = 0.0, my = 0.0;
-          glfwGetCursorPos(window, &mx, &my);
-          ImGui::GetIO().AddMousePosEvent(((float)mx - gVrUiOffX) * gVrUiSclX,
-                                          ((float)my - gVrUiOffY) * gVrUiSclY);
+        if (!vrCursorSeeded) {   // The OS cursor starts wherever it was on the desktop — often
+          vrCursorSeeded = true; // outside the visible UI. WARP it to the HUD centre and tell
+                                  // ImGui, so the in-headset cursor is visible from frame one.
+          glfwSetCursorPos(window, vrUiOffX + vrUiW * 0.5f, vrUiOffY + vrUiH * 0.5f);
+          ImGui::GetIO().AddMousePosEvent(960.0f, vrUiVh * 0.5f);
         }
         ImGuiIO& vio = ImGui::GetIO();
         vio.DisplaySize = ImVec2(1920.0f, vrUiVh);
@@ -6439,8 +6449,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         } else {
           const float S = 200.0f;
           if (vrHudActive)
-            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.60f * std::cos(glm::radians(344.0f)),
-                                           io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.60f * std::sin(glm::radians(344.0f))),
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.74f * std::cos(glm::radians(352.0f)),
+                                           io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.74f * std::sin(glm::radians(352.0f))),
                                     ImGuiCond_Always, ImVec2(0.5f, 0.5f));
           else
           ImGui::SetNextWindowPos(hudPos(1.0f, 1.0f, -12.0f, -12.0f),

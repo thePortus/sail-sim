@@ -6,6 +6,7 @@ import { RiggedManifest, SailState } from '../models';
 import type { VesselController, GunSide } from './vessel-controller';
 import { SailBillowPlugin } from './sail-billow.plugin';
 import { BakedAOPlugin } from './baked-ao.plugin';
+import { WetnessPlugin } from './wetness.plugin';
 import { mastDownAmount, mastBreakAmount } from './combat.constants';
 
 /**
@@ -107,6 +108,9 @@ export class PinnaceController implements VesselController {
       if (mesh.material instanceof PBRMaterial) {
         const mat = mesh.material;
         if (mat.ambientTexture && !mat.pluginManager?.getPlugin('BakedAO')) { new BakedAOPlugin(mat); }
+        // Hull & deck wetness — not sails (MainSail/Jib) / rigging / mast / flags.
+        if (name !== 'MainSail' && name !== 'Jib' && !/rigging|mast|flag/i.test(name) &&
+            !mat.pluginManager?.getPlugin('Wetness')) { new WetnessPlugin(mat); }
         mat.maxSimultaneousLights = 6;   // sun + cannon flashes (forward pass); UBO budget is set by scene light count
       }
     }

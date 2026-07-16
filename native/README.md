@@ -162,17 +162,64 @@ so it renders at native Retina resolution. An app icon (`.icns`) can be added la
 `MACOSX_BUNDLE_ICON_FILE`. (Assets are still referenced by baked absolute paths for now; a
 distributable build would copy them into `Contents/Resources`.)
 
+## Cutting a Windows release (auto-update)
+
+The client self-updates via **WinSparkle** (Windows) / **Sparkle** (macOS): each launch polls a signed
+*appcast* XML and installs anything newer. Checklist to ship a new Windows build:
+
+1. **Bump the version.** Edit `SAILSIM_VERSION` in `CMakeLists.txt` (e.g. `0.1.4` → `0.1.5`). **This is
+   mandatory every release** — the updater only offers a build whose appcast version is *strictly greater*
+   than the installed one. Same version = no update, ever (the single most common mistake).
+2. **Build as a release** — GUI subsystem (no console window) + the real appcast feed URL baked in:
+   ```bat
+   cmake -S native -B native/build-win -DSAILSIM_WINDOWS_GUI=ON ^
+     -DSAILSIM_SPARKLE_FEED_URL_WIN=https://sail-sim.theport.us/api/client/appcast-win.xml
+   cmake --build native/build-win --config Release
+   ```
+3. **Verify the runtime DLLs shipped** next to the exe (the TLS build needs OpenSSL, and a clean machine
+   has neither it nor the VC++ redist — the build copies both automatically):
+   ```bat
+   dir native\build-win\bin\Release\*.dll
+   ```
+   Expect `libssl-*.dll`, `libcrypto-*.dll`, `WinSparkle.dll`, `vcruntime140.dll`, `msvcp140.dll`. If the
+   OpenSSL pair is missing, your install has an odd layout — copy them from your OpenSSL `bin` into the zip
+   by hand. (`wgpu-native` is statically linked on Windows, so there is no WebGPU DLL.)
+4. **Zip** the whole `Release` folder as `SailSim-<version>-win.zip` (exe + all the DLLs above).
+5. **Publish** — signs the artifact (Ed25519, `server/.sparkle/` key) and writes `appcast-win.xml` into
+   `server/assets/client/`, which the server serves at `/client`:
+   ```sh
+   node server/scripts/client-release.js publish --platform win --version 0.1.5 \
+     --file SailSim-0.1.5-win.zip --base-url https://sail-sim.theport.us/api/client
+   ```
+6. **Deploy the server** so the new appcast + zip are live, then confirm the feed:
+   `curl https://sail-sim.theport.us/api/client/appcast-win.xml` shows the new `<sparkle:version>`.
+7. **Test:** on an already-installed client, **Settings → Check for updates** forces a check past
+   WinSparkle's once-a-day throttle; watch that it not only *detects* but *applies* the zip.
+
+Gotchas worth remembering:
+- A client can only auto-update if **it already had the correct feed URL baked in.** Any build made before
+  you started passing `-DSAILSIM_SPARKLE_FEED_URL_WIN=…` (or that shipped the `CHANGEME.example` default) is
+  a dead end — distribute one correctly-configured build manually; updates flow from there.
+- The signing **public** key in `CMakeLists.txt` (`SAILSIM_SPARKLE_PUBKEY`) must match the **private** key
+  in `server/.sparkle/` (generated once via `client-release.js keygen`). Back that private key up — losing
+  it breaks updates for every installed client.
+- macOS releases use the same tooling with `--platform mac` against the `.app` bundle (see below).
+
 ## Troubleshooting
 
 - **CMake 4.x: "Compatibility with CMake < 3.5 has been removed".** Add
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (see above).
+- **Windows: `libssl-4-x64.dll` (or `vcruntime140.dll`) not found on another machine.** The release build
+  copies OpenSSL + the MSVC runtime next to the exe — make sure you zipped the *whole* `Release` folder,
+  not just the `.exe`. See "Cutting a Windows release" above.
 - **"Could NOT find OpenSSL" (common on Windows).** The default `SAILSIM_TLS=ON` build needs OpenSSL.
   Install it (vcpkg/Chocolatey/installer — see Prerequisites) or configure with `-DSAILSIM_TLS=OFF`
   for an OpenSSL-free `ws://`-only build.
 - **Switching backends doesn't take effect.** The backend selects the fetched distribution tag, so
   after changing `SAILSIM_WEBGPU_BACKEND` do a clean reconfigure: `rm -rf build && cmake -B build …`.
-- **No output when piped/killed.** Fixed in-tree by line-buffering stdout; if you still see nothing,
-  the window failed to open — run without a frame cap to see the GLFW/adapter error.
+- **No output when piped/killed.** stdout is line-buffered on Unix and **unbuffered on Windows** (MSVCRT
+  treats `_IOLBF` as full buffering, so a crash would otherwise discard a redirected log). If a redirected
+  log is still empty, the process died before the first print — run without the redirect to see it live.
 - **Windows: exe starts then exits / DLL not found.** With the default static wgpu build there's no
   runtime DLL. If you switch to a dynamic distribution, ensure `target_copy_webgpu_binaries` runs.
 

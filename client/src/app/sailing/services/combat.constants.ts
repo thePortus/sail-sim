@@ -20,6 +20,9 @@ export const ZONE_HP_BY_SLUG: Record<string, Record<Zone, number>> = {
   // Merchantman / hagboat — the largest, most heavily-timbered hull (tankiest), but lightly gunned: a fat
   // trader that soaks punishment. Three masts collapse off the one masts zone.
   merchantman: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
+  frigate_heavy:  { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
+  frigate_medium: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
+  frigate_light:  { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
 };
 
 /** Per-zone max HP for a vessel slug (defaults to the sloop). */

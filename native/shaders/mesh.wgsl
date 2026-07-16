@@ -355,7 +355,13 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let up = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
     let skyIrr = mix(skyHoriz, skyZenith, up);
     let ambientFloor = mix(vec3<f32>(0.10, 0.13, 0.20), vec3<f32>(0.18), dayK) * albedo;
-    let ambient = ambientFloor + skyIrr * albedo * 0.32 * (1.0 - metallic);   // additive; metals keep only the floor
+    // Sea bounce: the sunlit ocean is a huge reflector throwing light back UP onto the hull's shaded
+    // side and underbelly. The sky hemisphere alone leaves exactly those away-from-sun / down-facing
+    // faces on weak blue fill, so dark wood collapses to near-black through the tonemap. `down` is 1
+    // straight-down, 0.5 horizontal, 0 up — so it lifts the shaded topsides + underbelly, not the deck.
+    let down = clamp(-N.y * 0.5 + 0.5, 0.0, 1.0);
+    let seaBounce = vec3<f32>(0.20, 0.29, 0.35) * dayK * down;
+    let ambient = ambientFloor + (skyIrr * 0.42 + seaBounce) * albedo * (1.0 - metallic);   // additive; metals keep only the floor
 
     var color = ambient + Lo;
     // Material emissive (lantern glass, cabin windows): unlit HDR add — the bloom bright-pass turns

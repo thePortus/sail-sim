@@ -86,14 +86,16 @@ function loadManifest(): Promise<Record<string, { size: number; centerY: number;
 
 /** Load (and cache) the shared atlas for a ship slug. null if there's no impostor for it. */
 export async function getShipImpostorAtlas(scene: Scene, slug: string): Promise<ShipImpostorAtlas | null> {
-  if (atlasCache.has(slug)) return atlasCache.get(slug) ?? null;
+  // Frigate armament variants share ONE impostor (gun differences vanish at impostor distance).
+  const impSlug = slug.startsWith('frigate') ? 'frigate' : slug;
+  if (atlasCache.has(impSlug)) return atlasCache.get(impSlug) ?? null;
   const ships = await loadManifest();
-  const m = ships[slug];
-  if (!m) { atlasCache.set(slug, null); return null; }
-  const tex = new Texture(`${BASE}${slug}_atlas.png`, scene, undefined, undefined, Texture.TRILINEAR_SAMPLINGMODE);
+  const m = ships[impSlug];
+  if (!m) { atlasCache.set(impSlug, null); return null; }
+  const tex = new Texture(`${BASE}${impSlug}_atlas.png`, scene, undefined, undefined, Texture.TRILINEAR_SAMPLINGMODE);
   tex.hasAlpha = true;
   const atlas: ShipImpostorAtlas = { tex, size: m.size, centerY: m.centerY ?? m.size * 0.4, n: m.n, cols: m.cols };
-  atlasCache.set(slug, atlas);
+  atlasCache.set(impSlug, atlas);
   return atlas;
 }
 

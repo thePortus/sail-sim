@@ -148,6 +148,22 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let upDark = smoothstep(0.03, 0.45, D.y) * dusk;
     color = color * (1.0 - upDark * 0.88);
 
+    // ── Golden-hour horizon glow + sea-mist band (port of the client's beauty pass 3 —
+    //    procedural-sky.ts; this is what makes its sunrises/sunsets dramatic). goldenLow is
+    //    strong at dawn/dusk (sun low but up), 0 at high noon AND at deep night. ──
+    let sunUp     = smoothstep(-0.10, 0.08, Ds.y);
+    let goldenLow = warmF * sunUp;
+    // (A) Near-sun scattering AUREOLE — a soft deep-orange halo flooding the sky around the
+    //     low sun. Additive linear HDR; the post grade tonemaps it downstream.
+    let sunMu   = max(dot(D, Ds), 0.0);
+    let aureole = pow(sunMu, 6.0);
+    color = color + vec3<f32>(1.0, 0.52, 0.22) * (aureole * goldenLow * 0.9);
+    // (B) SEA-MIST BAND — pale low haze hugging the horizon line, cool by day-edge and
+    //     warming to amber at full sunset; lifts the waterline behind distant islands.
+    let mistBand = smoothstep(0.14, 0.0, abs(D.y));
+    let mistCol  = mix(vec3<f32>(0.62, 0.66, 0.74), vec3<f32>(0.96, 0.74, 0.52), warmF);
+    color = mix(color, mistCol, mistBand * goldenLow * 0.38);
+
     // ── Stars: real all-sky map, faded in below the horizon-sun, above the sea. ──
     let starFade = u.params.x * u.params.y * smoothstep(-0.03, 0.06, viewDir.y);
     if (starFade > 0.001) {

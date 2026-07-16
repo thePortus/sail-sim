@@ -40,6 +40,10 @@ class System {
             const glm::vec3& camFwd, const glm::vec3& camPos,
             WGPUTextureView sceneDepth, const glm::vec4& proj);
 
+  // Stamp the smoke's TAA "no-history" sentinel into the velocity buffer. Call in
+  // the TAA velocity pass AFTER draw() (it replays this frame's smoke instances).
+  void drawVelocity(WGPURenderPassEncoder pass);
+
   bool anyActive() const;
 
  private:

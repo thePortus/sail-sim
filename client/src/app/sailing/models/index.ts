@@ -243,6 +243,8 @@ export interface VesselPhysics {
   minTackAngle:    number;
   sailAreaFactor:  number;
   weight:          number;
+  /** Turn-rate multiplier on the global helm curve (1 = default; <1 = turns slower — a long frigate hull). */
+  turnFactor?:     number;
   /** Seconds a fired broadside takes to reload before that side can fire again.
    *  Later modified by crew/morale; a flat per-ship constant for now. */
   reloadWindow?:   number;
@@ -285,7 +287,7 @@ export interface VesselPart {
 }
 
 /** One cannon muzzle in vessel-local space (+Z bow, +Y up). */
-export interface VesselCannon { x: number; y: number; z: number; }
+export interface VesselCannon { x: number; y: number; z: number; carronade?: boolean; }
 
 export interface Vessel {
   id:          number;

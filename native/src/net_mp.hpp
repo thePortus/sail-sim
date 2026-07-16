@@ -270,7 +270,7 @@ public:
   // ammo, and the per-side reload token bucket — invalid shots vanish silently.
   void sendCannonShot(float ox, float oy, float oz,
                       float vx, float vy, float vz,
-                      int seq, const std::string& shotType);
+                      int seq, const std::string& shotType, bool carronade = false);
   void sendRespawn();                                      // after combat_sunk: back to harbour
   void sendSalvageCollect(const std::string& crateId);
 

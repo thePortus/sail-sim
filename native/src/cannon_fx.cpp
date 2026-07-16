@@ -78,7 +78,9 @@ fn spiralNoise(pin : vec3<f32>, tim : f32) -> f32 {
   let nudge = 4.0;
   let normalizer = 0.2425356250;
   var p = pin;
-  var n = -(tim * 0.2 - 2.0 * floor(tim * 0.2 / 2.0));   // -mod(t*0.2, -2) equivalent phase
+  var n = -(tim * 0.2 - (-2.0) * floor(tim * 0.2 / (-2.0)));   // -mod(t*0.2, -2.0): GLSL mod keeps the divisor's
+                                                              // sign — porting it as mod(.,+2) shifted the density
+                                                              // field ~3, over-accumulating into a flat solid disc.
   var iter = 2.0;
   for (var i = 0; i < 6; i = i + 1) {
     n += -abs(sin(p.y * iter) + cos(p.x * iter)) / iter;
@@ -151,7 +153,7 @@ fn explosion(uv : vec2<f32>, life : f32, tim : f32, steps : i32, sScale : f32) -
     let s3 = sum.xyz * sum.xyz * (3.0 - 2.0 * sum.xyz);
     sum = vec4<f32>(s3, sum.a);
   }
-  var col = sum.xyz * 1.7;
+  var col = sum.xyz * 1.7;   // brightness boost so it reads against the scene (matches the Angular reference)
   let rr = length(uv - 0.5) * 2.0;
   let front = 1.05 - life * 0.95;
   let radial = smoothstep(front, front - 0.5, rr);
@@ -242,6 +244,32 @@ fn fs_smoke(in : VSOut) -> @location(0) vec4<f32> {
   alpha *= soft;
   return vec4<f32>(col, alpha);
 }
+// TAA "no-history" mask: where the smoke is visibly dense (same alpha as fs_smoke),
+// write a distinct sentinel into the motion-vector buffer so the TAA resolve uses
+// the CURRENT frame there instead of reprojected history — otherwise the ship's
+// history smears THROUGH the translucent smoke and ghosts. Thin/empty/occluded
+// texels discard so the rest of the frame keeps normal temporal AA.
+@fragment
+fn fs_smoke_vel(in : VSOut) -> @location(0) vec4<f32> {
+  let life = clamp(in.misc.x, 0.0, 1.0);
+  let q = in.uv - 0.5;
+  let rr = length(q) * 2.0;
+  let disc = smoothstep(1.0, 0.1, rr);
+  let a = in.misc.y * 0.2 + in.misc.z;
+  let ruv = vec2<f32>(q.x * cos(a) - q.y * sin(a), q.x * sin(a) + q.y * cos(a)) + 0.5;
+  let n = fbmCloud(ruv, in.misc.y, in.misc.z);
+  let dens = smoothstep(0.28, 0.78, n) * disc;
+  let env = smoothstep(0.0, 0.10, life) * (1.0 - smoothstep(0.6, 1.0, life));
+  var alpha = dens * env * 0.9;
+  let dims = vec2<f32>(textureDimensions(sceneDepth));
+  let px = vec2<i32>(clamp(in.position.xy, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
+  let dRaw = textureLoad(sceneDepth, px, 0);
+  let sceneZ = -u.proj.w / (dRaw + u.proj.z);
+  let soft = clamp((-sceneZ - in.misc.w) / max(u.camFwd.w, 0.1), 0.0, 1.0);
+  alpha *= soft;
+  if (alpha < 0.04) { discard; }
+  return vec4<f32>(-99.0, -99.0, 0.0, 0.0);
+}
 )WGSL";
 
 // ── Particle-system definitions (client cannon.service constants) ─────────────
@@ -306,7 +334,11 @@ struct Inst { glm::vec4 posSize, misc, color; };
 
 struct System::Impl {
   WGPURenderPipeline pipeParticle = nullptr, pipeFire = nullptr, pipeSmoke = nullptr;
+  WGPURenderPipeline pipeSmokeVel = nullptr;   // smoke -> TAA no-history sentinel
   WGPURenderPipeline pipeExplHi = nullptr, pipeExplLo = nullptr;
+  // This frame's smoke instance run in vbuf (set by draw(), replayed by drawVelocity()).
+  uint32_t smokeVelStart = 0, smokeVelCount = 0;
+  uint64_t vbufBytes = 0;
   WGPUBindGroupLayout bgl = nullptr;
   WGPUBuffer ubuf = nullptr, vbuf = nullptr;
   uint64_t vbufCap = 0;
@@ -433,14 +465,22 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   vbl.stepMode = WGPUVertexStepMode_Instance;
   vbl.attributeCount = 3; vbl.attributes = attrs;
 
-  auto makePipe = [&](const char* fs, bool additive) {
+  auto makePipe = [&](const char* fs, bool additive, bool noBlend = false) {
     WGPUDepthStencilState ds = {};
     ds.format = WGPUTextureFormat_Depth24PlusStencil8;
     ds.depthWriteEnabled = false;            // test only: hull occludes, FX never punch holes
     ds.depthCompare = WGPUCompareFunction_Less;
+    // The FX billboards must NOT touch the stencil buffer. The ocean is stencil-masked (the hull water-mask
+    // stamps ref=1, the ocean tests it), and this pipeline left its stencil OPS unset (0) with a 0xFF write
+    // mask — so the smoke's triangular quads wrote into the stencil where they drew, corrupting the ocean's
+    // mask into chunky triangles that flutter under the moving smoke. Force Keep + a zero write mask so the
+    // stencil is truly read-only for the FX.
     ds.stencilFront.compare = WGPUCompareFunction_Always;
-    ds.stencilBack.compare = WGPUCompareFunction_Always;
-    ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0xFFFFFFFFu;
+    ds.stencilFront.failOp = WGPUStencilOperation_Keep;
+    ds.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
+    ds.stencilFront.passOp = WGPUStencilOperation_Keep;
+    ds.stencilBack = ds.stencilFront;
+    ds.stencilReadMask = 0xFFFFFFFFu; ds.stencilWriteMask = 0u;
     WGPUBlendState blend = {};
     if (additive) {
       blend.color.srcFactor = WGPUBlendFactor_One;
@@ -454,8 +494,15 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
     blend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
     blend.alpha.operation = WGPUBlendOperation_Add;
     WGPUColorTargetState target = {};
-    target.format = colorFormat; target.writeMask = WGPUColorWriteMask_All;
-    target.blend = &blend;
+    target.format = colorFormat;
+    // Scene FX (blended: smoke/fire/particles/explosion) must write RGB ONLY — the scene ALPHA channel is the
+    // SSR reflectivity mask (ssr.wgsl: refl = scene.a). Writing alpha here flagged every smoke pixel as
+    // "reflective", so SSR fired reflection rays through the smoke and its chunky screen-space march painted the
+    // triangular, fluttering artifacts over the water (only with SSR on). The velocity pass (noBlend) targets the
+    // motion buffer, not the scene, so it keeps full write.
+    target.writeMask = noBlend ? WGPUColorWriteMask_All
+                               : (WGPUColorWriteMask_Red | WGPUColorWriteMask_Green | WGPUColorWriteMask_Blue);
+    target.blend = noBlend ? nullptr : &blend;   // velocity mask: replace, don't blend the sentinel
     WGPUFragmentState frag = {};
     frag.module = mod; frag.entryPoint = fs; frag.targetCount = 1; frag.targets = &target;
     WGPURenderPipelineDescriptor rpd = {};
@@ -472,6 +519,7 @@ bool System::init(WGPUDevice device, WGPUTextureFormat colorFormat) {
   p_->pipeParticle = makePipe("fs_particle", false);
   p_->pipeFire = makePipe("fs_particle", true);
   p_->pipeSmoke = makePipe("fs_smoke", false);
+  p_->pipeSmokeVel = makePipe("fs_smoke_vel", false, true);   // writes the TAA no-history sentinel
   p_->pipeExplHi = makePipe("fs_expl_hi", true);
   p_->pipeExplLo = makePipe("fs_expl_lo", true);
   wgpuPipelineLayoutRelease(pl);
@@ -485,9 +533,9 @@ void System::muzzleBlast(const glm::vec3& m, float dirX, float dirZ, float camDi
   for (ExplSlot& s : im.expl) if (!s.active) { slot = &s; break; }
   if (!slot) { slot = &im.expl[0]; for (ExplSlot& s : im.expl) if (s.life > slot->life) slot = &s; }
   slot->active = true;
-  slot->low = camDist < 6.5f * 9.0f;
+  slot->low = camDist < 9.0f * 9.0f;
   slot->life = 0;
-  slot->size = 6.5f;
+  slot->size = 9.0f;   // bigger blast than the client's 6.5 (reads better on the big frigate broadside)
   slot->seed = std::fabs(std::fmod(m.x * 0.37f + m.z * 0.91f, 50.0f));
   slot->pos = glm::vec3(m.x + dirX * 0.5f, m.y + 0.1f, m.z + dirZ * 0.5f);
   // Smoke belch + lingering pall.
@@ -547,7 +595,7 @@ void System::update(float dt, float windX, float windZ) {
   // Fireballs (0.9 s, ANIM_RATE 6.3, expand 0.8 -> 1.15).
   for (ExplSlot& s : im.expl) {
     if (!s.active) continue;
-    s.life += dt / 0.9f;
+    s.life += dt / 1.35f;   // longer-lived than the client's 0.9 s so the fireball lingers a beat
     if (s.life >= 1.0f) s.active = false;
   }
   // Belch emitters spit puffs every 0.06 s over 0.6 s.
@@ -638,7 +686,7 @@ void System::draw(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass
                      glm::vec4(s.life, s.seed + s.life * 0.9f * 6.3f, s.seed, 0), glm::vec4(1) });
   }
   uint32_t loEnd = (uint32_t)inst.size();
-  if (inst.empty()) return;
+  if (inst.empty()) { p_->smokeVelCount = 0; return; }
 
   struct { glm::mat4 vp; glm::vec4 r, u, f, c, proj; } uni{
     viewProj, glm::vec4(camRight, 0), glm::vec4(camUp, 0),
@@ -665,6 +713,10 @@ void System::draw(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass
     im.bind = wgpuDeviceCreateBindGroup(device, &d);
     im.boundDepth = sceneDepth;
   }
+  // Remember the smoke run + buffer size so drawVelocity() (a later pass, same
+  // frame) can replay just the smoke into the TAA velocity buffer.
+  im.smokeVelStart = smokeStart; im.smokeVelCount = smokeEnd - smokeStart;
+  im.vbufBytes = bytes;
   wgpuRenderPassEncoderSetBindGroup(pass, 0, im.bind, 0, nullptr);
   wgpuRenderPassEncoderSetVertexBuffer(pass, 0, im.vbuf, 0, bytes);
   auto drawRun = [&](WGPURenderPipeline pipe, uint32_t a, uint32_t b) {
@@ -677,6 +729,19 @@ void System::draw(WGPUDevice device, WGPUQueue queue, WGPURenderPassEncoder pass
   drawRun(im.pipeFire, fireRun.first, fireRun.second);
   drawRun(im.pipeExplHi, hiStart, hiEnd);
   drawRun(im.pipeExplLo, hiEnd, loEnd);
+}
+
+// Replay just the smoke into the TAA velocity buffer (a later pass, same frame),
+// stamping the no-history sentinel so the resolve won't reproject stale scene
+// history through the translucent smoke. Reuses this frame's uniform bind +
+// instance buffer built by draw(), so draw() MUST run first.
+void System::drawVelocity(WGPURenderPassEncoder pass) {
+  Impl& im = *p_;
+  if (im.smokeVelCount == 0 || !im.bind || !im.vbuf) return;
+  wgpuRenderPassEncoderSetBindGroup(pass, 0, im.bind, 0, nullptr);
+  wgpuRenderPassEncoderSetVertexBuffer(pass, 0, im.vbuf, 0, im.vbufBytes);
+  wgpuRenderPassEncoderSetPipeline(pass, im.pipeSmokeVel);
+  wgpuRenderPassEncoderDraw(pass, 6, im.smokeVelCount, 0, im.smokeVelStart);
 }
 
 }  // namespace fx

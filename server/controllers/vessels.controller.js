@@ -24,6 +24,27 @@
 
 const PI_2 = 1.5708; // Math.PI / 2
 
+// Build a broadside of `n` guns a side, evenly spread fore-aft in [+zMax..-zMax], at beam ±x and world muzzle
+// height y (game frame: +Z bow, +X starboard). The array LENGTH is the broadside size the combat gate uses.
+function gunLine(n, x, y, zMax) {
+  const port = [], stbd = [];
+  for (let i = 0; i < n; i++) {
+    const z = +(zMax - (n > 1 ? i * (2 * zMax / (n - 1)) : 0)).toFixed(1);
+    port.push({ x: -x, y, z }); stbd.push({ x, y, z });
+  }
+  return { port, stbd };
+}
+// Two-battery layout from the actual model gun positions: `guns` = gun-deck long guns (full range),
+// `carr` = spar-deck CARRONADES (tagged carronade:true → short range + heavy; the client auto-holds them
+// beyond reach). Each is a stbd-side [x,y,z] list; port mirrors x. Muzzle flashes line up with the ports.
+function battery(guns, carr) {
+  const mk = (arr, c) => arr.map(([x, y, z]) => (c ? { x, y, z, carronade: true } : { x, y, z }));
+  const stbd = [...mk(guns, false), ...mk(carr, true)];
+  return { stbd, port: stbd.map(m => ({ ...m, x: -m.x })) };
+}
+const FRIG_LONG = [[5.09,4.01,16.55],[5.65,3.80,14.13],[6.03,3.62,11.60],[6.36,3.47,9.10],[6.60,3.35,6.60],[6.77,3.26,4.08],[6.85,3.18,1.58],[6.85,3.17,-0.92],[6.84,3.24,-3.42],[6.78,3.32,-5.93],[6.63,3.42,-8.43],[6.50,3.50,-10.93],[6.30,3.56,-13.44],[6.03,3.61,-15.96],[5.85,3.70,-18.60]];
+const FRIG_CARR = [[5.18,5.90,13.98],[5.59,5.64,10.61],[5.89,5.45,7.19],[6.04,5.31,3.80],[6.06,5.21,0.40],[6.07,5.28,-3.00],[6.04,5.41,-6.40],[5.95,5.53,-9.79],[5.80,5.64,-13.19],[5.60,5.74,-16.45],[5.36,5.85,-19.98]];
+
 // Per-vessel config consumed by the client:
 //   glb/manifest  — rigged asset + animation manifest under /geometry/
 //   importFlipY   — rotate the model 180° about Y on import so its bow faces game-forward (+Z)
@@ -194,6 +215,39 @@ const VESSELS = [
     price: 200000,                // Ships-as-economy: the top-tier shipwright purchase
     parts: [],
   },
+  // ── Frigate (USS Constitution type) — apex warship, three armament loadouts (shared hull/rig/asset) ──────────
+  // FAST under a huge sail plan but the heaviest hull afloat: slow to gather way (weight→massK) + slow to turn
+  // (physics.turnFactor). Bow=+Z. The `armament` field drives the client Frigate_Guns_<v> mesh toggle.
+  {
+    id: 5, name: 'Frigate (Heavy)', slug: 'frigate_heavy', armament: 'heavy',
+    description: 'A 44-gun heavy frigate — a purpose-built man-of-war with a full battery of 24-pounders and spar-deck carronades. The toughest hull and deadliest broadside afloat, fast under her huge press of canvas, but the heaviest ship in the fleet: ponderous to turn and slow to gather way. The apex predator of the sea.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
+    cannons: battery(FRIG_LONG, FRIG_CARR),   // 15 long guns + 11 carronades
+    zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
+    crew: 480, cargo: 40, price: 750000, parts: [],
+  },
+  {
+    id: 6, name: 'Frigate (Medium)', slug: 'frigate_medium', armament: 'medium',
+    description: 'A frigate on a medium battery — fewer, lighter guns than the heavy, trading some of that crushing broadside for a slightly livelier, cheaper ship. Still the toughest hull and among the fastest afloat, and still ponderous to handle.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
+    cannons: battery(FRIG_LONG, FRIG_CARR.slice(1, 9)),   // 15 long guns + 8 carronades
+    zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
+    crew: 420, cargo: 50, price: 500000, parts: [],
+  },
+  {
+    id: 7, name: 'Frigate (Light)', slug: 'frigate_light', armament: 'light',
+    description: 'A frigate on a light battery — the least-armed loadout, the fastest and handiest of the three, and the cheapest way onto a frigate\'s deck. A stout, fast hull for a captain who values speed over a full broadside.',
+    glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
+    physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60 },
+    firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
+    cannons: battery(FRIG_LONG.slice(0, 13), FRIG_CARR.slice(2, 8)),   // 13 long guns + 6 carronades
+    zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
+    crew: 360, cargo: 60, price: 350000, parts: [],
+  },
 ];
 
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
@@ -208,6 +262,9 @@ const UPGRADE_COST = {
   sloop:       { cannon: 25000, armor: 25000 },
   brig:        { cannon: 60000, armor: 60000 },
   merchantman: { cannon: 30000, armor: 30000 },   // both together < the brig (200k); a hauler's modest refit
+  frigate_heavy:  { cannon: 120000, armor: 120000 },   // apex tier — flat, expensive refit scaled by loadout
+  frigate_medium: { cannon: 90000,  armor: 90000  },
+  frigate_light:  { cannon: 70000,  armor: 70000  },
 };
 /** Cost of a 'cannon' | 'armor' upgrade for a vessel slug (0 if unknown). */
 exports.upgradeCost = (slug, kind) => (UPGRADE_COST[slug] && UPGRADE_COST[slug][kind]) || 0;

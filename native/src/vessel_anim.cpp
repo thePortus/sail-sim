@@ -165,6 +165,35 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
     // Foremast topples first (down by ~30% HP left); the main only at 0 HP.
     mastZones_ = { { "MastDown_Fore", { "Mast_Fore_Lower", "Break_Fore", 0 }, 0.40f, 0.70f, 0, 0 },
                    { "MastDown_Main", { "Mast_Main_Lower", "Break_Main", 0 }, 0.70f, 1.00f, 0, 0 } };
+  } else if (slug_.rfind("frigate", 0) == 0) {   // frigate_heavy / _medium / _light (shared rig)
+    trimMode_ = TrimMode::SymmetricSquare; rudderMode_ = RudderMode::SymmetricClip;   // rudder authored non-reversed
+    trimRate_ = 1.4f; furlRate_ = 0.5f;
+    wheelNode_ = "B_Wheel"; wheelAxis_ = glm::vec3(0, 1, 0);   // axle = local Y (like the merchantman)
+    // 4 streamed flags (flagPhi_ caps at 4); the mizzen signal stays static — a minor cosmetic omission.
+    flags_ = { { "B_Flag_Ensign", 2.0f, 0.0f, 0.18f }, { "B_Flag_Jack", 2.4f, 0.3f, 0.22f },
+               { "B_Flag_Pennant", 1.6f, -0.4f, 0.40f }, { "B_Flag_ForeSignal", 2.3f, 0.5f, 0.24f } };
+    flagYawOffset_ = 0.0f;
+    const char* ALL[] = { "Sail_Fore_Course","Sail_Fore_Topsail","Sail_Fore_Topgallant","Sail_Fore_Royal",
+                          "Sail_Main_Course","Sail_Main_Topsail","Sail_Main_Topgallant","Sail_Main_Royal",
+                          "Sail_Mizzen_Topsail","Sail_Mizzen_Topgallant","Sail_Mizzen_Royal","Sail_ForeTopmastStaysail",
+                          "Sail_Jib","Sail_FlyingJib","Sail_MainTopmastStaysail","Sail_MizzenTopmastStaysail","Sail_Spanker" };
+    const char* KITES[] = { "Sail_Fore_Royal","Sail_Main_Royal","Sail_Mizzen_Royal","Sail_FlyingJib" };
+    for (const char* s : ALL) { furlTables_[2][s] = 0; furlTables_[1][s] = 0; furlTables_[0][s] = 1; }
+    for (const char* k : KITES) furlTables_[1][k] = 1;   // topsails: strike the light kites (royals + flying jib)
+    mastZones_ = { { "MastDown_Fore",   { "", "", 0 }, 0.40f, 0.60f, 0, 0 },
+                   { "MastDown_Mizzen", { "", "", 0 }, 0.60f, 0.80f, 0, 0 },
+                   { "MastDown_Main",   { "", "", 0 }, 0.80f, 1.00f, 0, 0 } };
+    lidMorphS_ = { "Frigate_Ports", "Lid_S", 0 };   // gun-port lids are MORPHS (not the merchantman's bone clips)
+    lidMorphP_ = { "Frigate_Ports", "Lid_P", 0 };
+    // Nested per-variant lid groups (one GLB, code opens a different count per variant).
+    // Light opens Lid_* only; medium adds LidM_*; heavy adds LidH_*. Ports outside the
+    // variant's set stay closed (bolted shut) — their gun sits hidden behind the shut lid.
+    lidMorphMS_ = { "Frigate_Ports", "LidM_S", 0 };
+    lidMorphMP_ = { "Frigate_Ports", "LidM_P", 0 };
+    lidMorphHS_ = { "Frigate_Ports", "LidH_S", 0 };
+    lidMorphHP_ = { "Frigate_Ports", "LidH_P", 0 };
+    frigateTier_ = slug_.rfind("frigate_heavy", 0) == 0 ? 2
+                 : slug_.rfind("frigate_medium", 0) == 0 ? 1 : 0;   // _light + bare "frigate" = 0
   } else {   // merchantman (also the fallback)
     trimMode_ = TrimMode::SymmetricSquare; rudderMode_ = RudderMode::SymmetricClipReversed;
     trimRate_ = 1.4f; furlRate_ = 0.5f;
@@ -455,6 +484,17 @@ void Controller::tickRig(float dt) {
     if (clips_.count("Lid_" + sd)) {
       scrubNorm("Lid_" + sd, std::clamp(dep * 2.0f, 0.0f, 1.0f));
       scrubNorm("Gun_" + sd, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
+    } else if (!lidMorphS_.node.empty()) {   // frigate: lids are MORPHS (Frigate_Ports), run-out is a clip
+      // The frigate is NOT fleet-swapped: its muzzles already fire on the commanded side, so the run-out +
+      // lids must follow the SAME side (the fleet swap above sent port-command → Gun_S = visual starboard,
+      // i.e. the battery opposite the one firing). Drive the same-named side as the command.
+      const std::string fs = i == 0 ? "P" : "S";   // gunDeploy_[0]=game PORT -> P clip, [1]=game STBD -> S clip
+      const float lidOpen = std::clamp(dep * 2.0f, 0.0f, 1.0f);
+      const bool st = fs == "S";
+      setMorph(st ? lidMorphS_ : lidMorphP_, lidOpen);                                  // always: the light-variant set
+      setMorph(st ? lidMorphMS_ : lidMorphMP_, frigateTier_ >= 1 ? lidOpen : 0.0f);     // medium & heavy add these ports
+      setMorph(st ? lidMorphHS_ : lidMorphHP_, frigateTier_ >= 2 ? lidOpen : 0.0f);     // heavy adds the rest; else bolted shut
+      scrubNorm("Gun_" + fs, std::clamp(std::clamp(dep * 2.0f - 1.0f, 0.0f, 1.0f) - rec, 0.0f, 1.0f));
     } else if (clips_.count("Gun_" + sd)) {
       scrubNorm("Gun_" + sd, std::clamp(dep - rec, 0.0f, 1.0f));
     }

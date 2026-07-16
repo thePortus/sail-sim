@@ -4,4 +4,5 @@
 
 namespace updater {
 void start() {}
+void checkNow() {}
 }  // namespace updater

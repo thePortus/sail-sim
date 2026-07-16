@@ -304,7 +304,7 @@ export class MultiplayerService {
   // ── Cannon shot + combat callbacks (set by CannonService; avoids circular DI) ──
   onRemoteShot: ((ox: number, oy: number, oz: number,
                   vx: number, vy: number, vz: number,
-                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape') => void) | null = null;
+                  shooterId: string, seq: number, kind: 'round' | 'bar' | 'grape', carronade?: boolean) => void) | null = null;
   /** Server-adjudicated ship hit → play the authoritative cosmetic on the struck ship. */
   onCombatHit: ((msg: CombatHitMsg) => void) | null = null;
   /** A ship repaired to full (own or remote) → clear its persistent battle damage. */
@@ -312,9 +312,9 @@ export class MultiplayerService {
 
   broadcastShot(ox: number, oy: number, oz: number,
                 vx: number, vy: number, vz: number, seq: number,
-                shotType: 'round' | 'bar' | 'grape' = 'round'): void {
+                shotType: 'round' | 'bar' | 'grape' = 'round', carronade = false): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType }));
+    this.ws.send(JSON.stringify({ type: 'cannon_shot', ox, oy, oz, vx, vy, vz, seq, shotType, carronade: carronade ? 1 : 0 }));
   }
 
   /** Ask the server to restore our hull to full IN PLACE (dock "Repair Vessel"; no teleport). */
@@ -669,7 +669,8 @@ export class MultiplayerService {
       if (msg.id === this.myId) return;
       this.onRemoteShot?.(+msg.ox, +msg.oy, +msg.oz, +msg.vx, +msg.vy, +msg.vz,
                           String(msg.id), +msg.seq || 0,
-                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round');
+                          msg.shotType === 'bar' ? 'bar' : msg.shotType === 'grape' ? 'grape' : 'round',
+                          !!msg.carronade);
       this.players.get(String(msg.id))?.crew?.reactToFire('port');   // (P4) that ship's crew flinch at their own blast (side unused)
 
     } else if (msg.type === 'combat_hit') {
@@ -1575,8 +1576,10 @@ export class MultiplayerService {
     sloop:       { halfLen: 5.0, radius: 2.2 },
     pinnace:     { halfLen: 3.8, radius: 1.4 },
     merchantman: { halfLen: 13.0, radius: 3.6 },   // mirrors server movement-constants.js
+    frigate:     { halfLen: 15.0, radius: 4.5 },   // longest hull; all 3 armament variants share it
   };
   private collDims(slug: string | undefined): { halfLen: number; radius: number } {
+    if (slug && slug.startsWith('frigate')) return this.COLL_DIMS_BY_SLUG['frigate'];
     return this.COLL_DIMS_BY_SLUG[slug ?? ''] ?? this.COLL_DIMS_BY_SLUG['sloop'];
   }
   // (Separation/bounce is resolved server-side now — movement.resolvePair. The client only detects
@@ -1875,7 +1878,7 @@ export class MultiplayerService {
       const omo = (typeof localStorage !== 'undefined') ? localStorage.getItem('ignis_oceanmask_' + slug) : null;
       const oceanMask = omo === 'on' ? true : omo === 'off' ? false : (rig.oceanMask !== false);
       const hull = oceanMask ? vesselMeshes.find(m => /hull/i.test(m.name) && m.getTotalVertices() > 0) : null;
-      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig))) {
+      if (hull && buildHullStencilProxy(hull, entry.root, scene, maskFloorFor(slug, rig), rig.oceanMaskBeamX)) {
         this.oceanService.setHullStencilMask(true);
       }
     }

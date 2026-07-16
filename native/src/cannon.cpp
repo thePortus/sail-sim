@@ -20,6 +20,29 @@ GunLayout cannonsFor(const std::string& slug) {
   if (slug == "merchantman")
     return { { { -3.4f, 2.5f, 4.1f }, { -3.4f, 2.5f, -2.4f }, { -3.4f, 2.5f, -5.9f } },
              { {  3.4f, 2.5f, 4.1f }, {  3.4f, 2.5f, -2.4f }, {  3.4f, 2.5f, -5.9f } } };
+  if (slug.rfind("frigate", 0) == 0) {
+    // Frigate: gun-deck LONG guns (FRIG_LONG) + spar-deck CARRONADES (FRIG_CARR), verbatim from server
+    // vessels.controller.js battery(). Positions are the barrel muzzle tips AT RUN-OUT (glTF +X stbd,
+    // +Y up, +Z bow) = the rest tip + the 0.8m run-out translation. The gun fires + aims only when run
+    // out (Engaged), so the muzzle flash / volumetric / aim tube sit at the projected barrel mouth just
+    // OUTSIDE the hull (rest tips were inside the hull -> the fireball spawned half-occluded).
+    static const float L[15][3] = {
+      {5.09f,4.01f,16.55f},{5.65f,3.80f,14.13f},{6.03f,3.62f,11.60f},{6.36f,3.47f,9.10f},{6.60f,3.35f,6.60f},
+      {6.77f,3.26f,4.08f},{6.85f,3.18f,1.58f},{6.85f,3.17f,-0.92f},{6.84f,3.24f,-3.42f},{6.78f,3.32f,-5.93f},
+      {6.63f,3.42f,-8.43f},{6.50f,3.50f,-10.93f},{6.30f,3.56f,-13.44f},{6.03f,3.61f,-15.96f},{5.85f,3.70f,-18.60f} };
+    static const float C[11][3] = {
+      {5.18f,5.90f,13.98f},{5.59f,5.64f,10.61f},{5.89f,5.45f,7.19f},{6.04f,5.31f,3.80f},{6.06f,5.21f,0.40f},
+      {6.07f,5.28f,-3.00f},{6.04f,5.41f,-6.40f},{5.95f,5.53f,-9.79f},{5.80f,5.64f,-13.19f},{5.60f,5.74f,-16.45f},
+      {5.36f,5.85f,-19.98f} };
+    // Variant slices (match server battery(): heavy 15L+11C, medium 15L+C[1:9], light L[0:13]+C[2:8]).
+    int nL = 15, cA = 0, cB = 11;
+    if (slug == "frigate_medium")     { cA = 1; cB = 9; }
+    else if (slug == "frigate_light") { nL = 13; cA = 2; cB = 8; }
+    GunLayout g;
+    for (int i = 0; i < nL; ++i) { g.port.push_back({ -L[i][0], L[i][1], L[i][2], false }); g.stbd.push_back({ L[i][0], L[i][1], L[i][2], false }); }
+    for (int i = cA; i < cB; ++i) { g.port.push_back({ -C[i][0], C[i][1], C[i][2], true  }); g.stbd.push_back({ C[i][0], C[i][1], C[i][2], true  }); }
+    return g;
+  }
   // Sloop battery = the client's DEFAULT_MUZZLES (3 per side).
   return { { { -1.98f, 1.50f, 1.36f }, { -1.87f, 1.65f, 2.40f }, { -1.72f, 1.90f, 3.44f } },
            { {  1.98f, 1.50f, 1.36f }, {  1.87f, 1.65f, 2.40f }, {  1.72f, 1.90f, 3.44f } } };
@@ -65,15 +88,36 @@ void Guns::armOrFire(int side) {
     g.deployTarget = 1.0f;
     g.deployDirty = true;
   } else if (g.state == SideState::Engaged) {
-    // Queue every loaded gun, rippled down the side by a human stagger.
+    // Queue every loaded gun, rippled down the side by a human stagger. Carronades AUTO-HOLD: skip them
+    // unless an enemy is within their short reach on this side — they stay loaded (no wasted reload) until
+    // you close the range, then the next fire order looses the full battery (client cannon.service parity).
+    const bool carrOk = hasTargetInCarronadeRange(side);
+    const auto& muzzles = side == 0 ? layout_.port : layout_.stbd;
     int order = 0;
     for (size_t i = 0; i < g.loadAt.size(); ++i) {
+      if (i < muzzles.size() && muzzles[i].carronade && !carrOk) continue;   // out-of-range smasher → hold
       if (elapsed_ >= g.loadAt[i] && g.fireAt[i] > 1e17) {
         g.fireAt[i] = elapsed_ + order * (kStaggerMin + frand() * (kStaggerMax - kStaggerMin));
         order++;
       }
     }
   }
+}
+
+// True if an enemy sits on `side` within carronade reach — the auto-hold gate (uses the latest own pose
+// + enemy snapshot cached in update()). Mirrors cannon.service.ts hasTargetInCarronadeRange.
+bool Guns::hasTargetInCarronadeRange(int side) const {
+  if (enemies_.empty()) return false;
+  const float sinH = std::sin(pose_.headingRad), cosH = std::cos(pose_.headingRad);
+  const float beamX = side == 0 ? -cosH : cosH;   // outboard normal for this side
+  const float beamZ = side == 0 ?  sinH : -sinH;
+  const float r2 = kCarronadeRange * kCarronadeRange;
+  for (const Enemy& e : enemies_) {
+    const float dx = e.x - pose_.x, dz = e.z - pose_.z;
+    if (dx * dx + dz * dz > r2) continue;
+    if (dx * beamX + dz * beamZ > 0.0f) return true;   // in reach AND on the firing side
+  }
+  return false;
 }
 
 void Guns::cancel() {
@@ -197,10 +241,10 @@ void Guns::fireOneCannon(int side, int idx, const ShipPose& vs,
   const float dirX = side == 0 ? -cosH : cosH;
   const float dirZ = side == 0 ?  sinH : -sinH;
   const float elevRad = elevDeg_ * 3.14159265f / 180.0f;
-  const float mv = muzzleV();
-
   const auto& muzzles = side == 0 ? layout_.port : layout_.stbd;
   const Muz& muz = muzzles[(size_t)idx < muzzles.size() ? idx : 0];
+  const bool isCarr = muz.carronade;                            // spar-deck smasher → slow ball, short range
+  const float mv = muzzleV() * (isCarr ? kCarronadeVFactor : 1.0f);
   const float mwx = vs.x + muz.x * cosH + muz.z * sinH;
   const float mwy = muz.y;
   const float mwz = vs.z - muz.x * sinH + muz.z * cosH;
@@ -234,6 +278,7 @@ void Guns::fireOneCannon(int side, int idx, const ShipPose& vs,
     fe.vx = bvx; fe.vy = vyk; fe.vz = bvz;
     fe.dirX = dirX; fe.dirZ = dirZ;
     fe.seq = seq; fe.kind = shot_;
+    fe.carronade = isCarr;
     outFires.push_back(fe);
   }
   side_[side].recoil = 1.0f;   // gun slides back, then eases forward again
@@ -244,6 +289,7 @@ void Guns::update(float dt, const ShipPose& pose, const std::vector<Enemy>& enem
   elapsed_ += dt;
   crewFactor_ = std::clamp(crewFactor, 0.5f, 1.0f);
   enemies_ = enemies;
+  pose_ = pose;               // cache for the carronade auto-hold gate (armOrFire has no pose/enemies args)
 
   // Guard against running before configure(): until the vessel slug resolves the gun layout is empty, and the
   // per-side muzzle lookup below (`layout_.port[0]`) would dereference an empty vector — UB that reads a null
@@ -366,16 +412,17 @@ std::vector<glm::vec3> Guns::arcPath(int side, int gunIdx, const ShipPose& vs) c
   const float ox = vs.x + muz.x * cosH + muz.z * sinH;
   const float oy = muz.y;
   const float oz = vs.z - muz.x * sinH + muz.z * cosH;
+  const bool isCarr = muz.carronade;
   const LockSolution& sol = lock_[side];
 
   float vh, vy0, bvx, bvz, tEnd;
-  if (sol.valid) {
+  if (sol.valid && !isCarr) {   // long guns trace the shared lock; carronades draw their own short arc
     vh = sol.vh; vy0 = sol.vy0;
     bvx = sol.dirX * vh; bvz = sol.dirZ * vh;
     tEnd = std::hypot(sol.px - ox, sol.pz - oz) / std::max(1.0f, vh);
   } else {
     const float elevRad = elevDeg_ * 3.14159265f / 180.0f;
-    const float mv = muzzleV();
+    const float mv = muzzleV() * (isCarr ? kCarronadeVFactor : 1.0f);   // reduced-v → falls short (~100 m)
     vh = mv * std::cos(elevRad); vy0 = mv * std::sin(elevRad);
     const float dirX = side == 0 ? -cosH : cosH;
     const float dirZ = side == 0 ?  sinH : -sinH;

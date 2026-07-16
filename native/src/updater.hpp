@@ -5,4 +5,7 @@
 
 namespace updater {
 void start();
+// User-triggered "Check for updates now" (Settings button). Shows the updater's own UI: up-to-date, an error,
+// or the update prompt. Bypasses the once-a-day automatic throttle. No-op on the stub (dev/CI) build.
+void checkNow();
 }  // namespace updater

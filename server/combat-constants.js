@@ -36,11 +36,15 @@ const HULL_DIMS_BY_SLUG = {
   sloop:       { halfLen: 8.0,  halfBeam: 3.0, deckY: 2.8, bowLon: 4.0, mastLat: 1.1, mastLon: 4.0, mastYTop: 16.0 },
   brig:        { halfLen: 13.0, halfBeam: 3.8, deckY: 3.2, bowLon: 6.5, mastLat: 1.3, mastLon: 6.0, mastYTop: 21.0 },
   merchantman: { halfLen: 16.0, halfBeam: 4.2, deckY: 3.4, bowLon: 8.0, mastLat: 1.3, mastLon: 7.0, mastYTop: 23.0 },
+  // Frigate: ~58 m long, ~14 m beam. All 3 armament variants share the one hull.
+  frigate_heavy:  { halfLen: 27.0, halfBeam: 6.8, deckY: 5.0, bowLon: 16.0, mastLat: 1.4, mastLon: 20.0, mastYTop: 34.0 },
+  frigate_medium: { halfLen: 27.0, halfBeam: 6.8, deckY: 5.0, bowLon: 16.0, mastLat: 1.4, mastLon: 20.0, mastYTop: 34.0 },
+  frigate_light:  { halfLen: 27.0, halfBeam: 6.8, deckY: 5.0, bowLon: 16.0, mastLat: 1.4, mastLon: 20.0, mastYTop: 34.0 },
 };
 const HULL_DIMS_DEFAULT = { halfLen: HALF_LEN, halfBeam: HALF_BEAM, deckY: DECK_Y, bowLon: BOW_LON, mastLat: MAST_LAT, mastLon: MAST_LON, mastYTop: MAST_Y_TOP };
 function hullDimsFor(slug) { return HULL_DIMS_BY_SLUG[slug] || HULL_DIMS_DEFAULT; }
 // Widest hull half-length (merchantman) — the broad-phase reject pad is sized off this so no ship is missed.
-const HULL_MAX_HALF_LEN = 16.0;
+const HULL_MAX_HALF_LEN = 27.0;   // frigate — the longest hull (was 16 = merchantman)
 
 // Zone names. 'masts' is tracked but exempt from the sink rule and has no effect yet.
 const ZONES = ['bow', 'stern', 'port', 'starboard', 'masts'];
@@ -56,6 +60,10 @@ const ZONE_HP_BY_SLUG = {
   // Merchantman / hagboat — the largest, most heavily-timbered hull (tankiest), but lightly gunned: a fat
   // trader that soaks punishment. Three masts collapse off the one masts zone.
   merchantman: { bow: 150, stern: 150, port: 220, starboard: 220, masts: 160 },
+  // Frigate (Constitution type) — apex man-of-war: highest-HP hull afloat; heavier armament = tougher.
+  frigate_heavy:  { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
+  frigate_medium: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
+  frigate_light:  { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
 };
 // ── Shipwright ARMOR upgrade ──────────────────────────────────────────────────────────────────────────────
 // A once-per-hull armor upgrade adds +25% HP to the four HULL zones (masts excluded — they're rigging, not
@@ -95,14 +103,24 @@ const DMG_PERP_EXP = 1.3;
 // Net: a brig wrecks a pinnace fast, while a pinnace peppering a brig barely dents it. Keyed by the SHOOTER slug.
 // The merchantman is a TRADER: lightly gunned (modest caliber) despite its size — its tough hull, not its
 // guns, is what keeps it alive.
-const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7, merchantman: 1.1 };
+const CALIBER_BY_SLUG = { pinnace: 0.8, sloop: 1.0, brig: 1.7, merchantman: 1.1,
+  frigate_heavy: 2.0, frigate_medium: 1.8, frigate_light: 1.5 };   // heaviest guns afloat (24-pounders)
 // Shipwright CANNON upgrade (once per hull): heavier guns → more stopping power, but tuned to stay BELOW the
 // next ship up (armed pinnace 0.9 < sloop 1.0; armed sloop 1.3 < brig 1.7) so it never matches the next tier.
 // The brig (top tier) gets a flat ~+24% with no cap.
-const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1, merchantman: 1.4 };
+const CALIBER_UPGRADED_BY_SLUG = { pinnace: 0.9, sloop: 1.3, brig: 2.1, merchantman: 1.4,
+  frigate_heavy: 2.5, frigate_medium: 2.2, frigate_light: 1.9 };
 function caliberFor(slug, cannonUpgrade) {
   if (cannonUpgrade) return CALIBER_UPGRADED_BY_SLUG[slug] || ((CALIBER_BY_SLUG[slug] || 1.0) * 1.2);
   return CALIBER_BY_SLUG[slug] || 1.0;
+}
+// Carronades: fire at CARRONADE_V_FACTOR × ammo velocity (~31% range) but hit CARRONADE_DMG_MULT × harder.
+// Must match the client cannon.service constants.
+const CARRONADE_V_FACTOR = 0.56;
+const CARRONADE_DMG_MULT = 1.7;
+function carronadeBand(shotType) {
+  const v = shotDef(shotType).v * CARRONADE_V_FACTOR;
+  return { vMin: v * 0.70, vMax: v * 1.30 };
 }
 
 // Waterline bonus: a shot striking at/near the waterline holes the ship below the
@@ -192,6 +210,7 @@ module.exports = {
   G, TRAVEL_SCALE,
   HALF_LEN, HALF_BEAM, DECK_Y, BOW_LON, MAST_LAT, MAST_LON, MAST_Y_TOP,
   HULL_DIMS_BY_SLUG, hullDimsFor, HULL_MAX_HALF_LEN,
+  CARRONADE_V_FACTOR, CARRONADE_DMG_MULT, carronadeBand,
   ZONES, ZONE_HP, ZONE_HP_BY_SLUG, zoneHpFor, ZONE_NORMAL, ARMOR_UPGRADE_MULT, ARMOR_ZONES,
   DMG_K, DMG_PERP_EXP, WATERLINE_BONUS_MAX, WATERLINE_BAND, CALIBER_BY_SLUG, CALIBER_UPGRADED_BY_SLUG, caliberFor,
   SEV_GREEN_MIN, SEV_YELLOW_MIN,

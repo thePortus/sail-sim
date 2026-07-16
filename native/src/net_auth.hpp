@@ -58,6 +58,7 @@ struct VesselPhysics {
   bool ok = false;
   int  status = 0;
   float maxSpeed = 9.0f, accelerationRate = 0.22f, minTackAngle = 32.0f, sailAreaFactor = 0.40f, weight = 2800.0f;
+  float turnFactor = 1.0f;                       // helm turn-rate multiplier (<1 = slower; frigate ~0.5)
   bool  hasRig = false;                          // server sent the v2 rig block (forceK/trim/leeway/hull)
   float forceK = 0.26f, trimForgive = 1.0f, leewayK = 1.0f;
   std::vector<std::pair<float, float>> polar;   // [apparentAngleDeg, driveCoeff] breakpoints

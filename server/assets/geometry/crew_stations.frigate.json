@@ -1,0 +1,618 @@
+{
+  "ship": "frigate",
+  "glb": "frigate.glb",
+  "wheel_rim": 0.7,
+  "gun_grip_up": 1.0,
+  "rope_grip_up": 1.0,
+  "schema_version": 1,
+  "space": "ship-local GLB-NATIVE coordinates; crew are parented to the ship GLB root. The frigate exports bow=+Z (no baseYaw), so author in this frame directly.",
+  "axes": {
+    "up": "+Y",
+    "bow": "+Z",
+    "stern": "-Z",
+    "starboard": "+X",
+    "port": "-X",
+    "note": "Frigate exports bow=+Z (like the brig/sloop), UNLIKE the merchantman (bow=+X). beam_axis=x."
+  },
+  "beam_axis": "x",
+  "heading_convention": "yaw deg about +Y (Babylon local): 0 = facing +Z (BOW), 90 = facing +X (STARBOARD), 180 = facing -Z (stern), 270 = facing -X (PORT). Gun crews face outboard; the helm faces the bow.",
+  "deck_levels": {
+    "spar_deck": 4.8,
+    "gun_deck": 3.0,
+    "note": "Flush spar (weather) deck at Y~4.8 \u2014 forecastle, waist and quarterdeck are one continuous level (as the Constitution). The gun deck below (~Y3.0) is enclosed; crew work the weather deck."
+  },
+  "landmarks": {
+    "foremast": [
+      0,
+      4.8,
+      13
+    ],
+    "mainmast": [
+      0,
+      4.8,
+      -4
+    ],
+    "mizzenmast": [
+      0,
+      4.8,
+      -17
+    ],
+    "wheel": [
+      0,
+      6.29,
+      -20
+    ],
+    "bow": 24.0,
+    "stern": -27.0,
+    "note": "Three masts on the flush spar deck; the double wheel abaft the mizzen (hub root-local 0,6.29,-20). Spar-deck carronades a side at x~5.15 spanning z -20..14; rail at x~6.8."
+  },
+  "waypoints": {
+    "wp_bow": [
+      0,
+      4.8,
+      22
+    ],
+    "wp_foreC": [
+      0,
+      4.8,
+      13
+    ],
+    "wp_foreS": [
+      3.2,
+      4.8,
+      13
+    ],
+    "wp_foreP": [
+      -3.2,
+      4.8,
+      13
+    ],
+    "wp_waistS": [
+      3.4,
+      4.8,
+      4
+    ],
+    "wp_waistP": [
+      -3.4,
+      4.8,
+      4
+    ],
+    "wp_mainC": [
+      0,
+      4.8,
+      -4
+    ],
+    "wp_mainS": [
+      3.4,
+      4.8,
+      -4
+    ],
+    "wp_mainP": [
+      -3.4,
+      4.8,
+      -4
+    ],
+    "wp_mizS": [
+      3.2,
+      4.8,
+      -14
+    ],
+    "wp_mizP": [
+      -3.2,
+      4.8,
+      -14
+    ],
+    "wp_mizC": [
+      0,
+      4.8,
+      -17
+    ],
+    "wp_helm": [
+      0,
+      4.8,
+      -20
+    ],
+    "wp_stern": [
+      0,
+      4.8,
+      -25
+    ]
+  },
+  "edges": [
+    [
+      "wp_bow",
+      "wp_foreC",
+      null
+    ],
+    [
+      "wp_foreC",
+      "wp_foreS",
+      null
+    ],
+    [
+      "wp_foreC",
+      "wp_foreP",
+      null
+    ],
+    [
+      "wp_foreS",
+      "wp_waistS",
+      null
+    ],
+    [
+      "wp_foreP",
+      "wp_waistP",
+      null
+    ],
+    [
+      "wp_waistS",
+      "wp_mainS",
+      null
+    ],
+    [
+      "wp_waistP",
+      "wp_mainP",
+      null
+    ],
+    [
+      "wp_foreC",
+      "wp_mainC",
+      null
+    ],
+    [
+      "wp_mainC",
+      "wp_mainS",
+      null
+    ],
+    [
+      "wp_mainC",
+      "wp_mainP",
+      null
+    ],
+    [
+      "wp_mainS",
+      "wp_mizS",
+      null
+    ],
+    [
+      "wp_mainP",
+      "wp_mizP",
+      null
+    ],
+    [
+      "wp_mainC",
+      "wp_mizC",
+      null
+    ],
+    [
+      "wp_mizC",
+      "wp_mizS",
+      null
+    ],
+    [
+      "wp_mizC",
+      "wp_mizP",
+      null
+    ],
+    [
+      "wp_mizC",
+      "wp_helm",
+      null
+    ],
+    [
+      "wp_helm",
+      "wp_stern",
+      null
+    ]
+  ],
+  "stations": [
+    {
+      "id": "helm",
+      "kind": "helm",
+      "pos": [
+        0,
+        4.8,
+        -20.7
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_helm",
+      "note": "abaft the double wheel (hub 0,6.29,-20), facing the bow \u2014 hands IK onto the wheel rim"
+    },
+    {
+      "id": "gun_S_0",
+      "kind": "cannon",
+      "pos": [
+        4.2,
+        4.8,
+        10
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "wp_foreS",
+      "note": "inboard of the fwd starboard carronade, facing outboard (+X) \u2014 hands IK onto the barrel"
+    },
+    {
+      "id": "gun_S_1",
+      "kind": "cannon",
+      "pos": [
+        4.2,
+        4.8,
+        -2
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "wp_mainS",
+      "note": "inboard of the mid starboard carronade, facing outboard"
+    },
+    {
+      "id": "gun_S_2",
+      "kind": "cannon",
+      "pos": [
+        4.2,
+        4.8,
+        -14
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "wp_mizS",
+      "note": "inboard of the aft starboard carronade, facing outboard"
+    },
+    {
+      "id": "gun_P_0",
+      "kind": "cannon",
+      "pos": [
+        -4.2,
+        4.8,
+        10
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "wp_foreP",
+      "note": "inboard of the fwd port carronade, facing outboard (-X)"
+    },
+    {
+      "id": "gun_P_1",
+      "kind": "cannon",
+      "pos": [
+        -4.2,
+        4.8,
+        -2
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "wp_mainP",
+      "note": "inboard of the mid port carronade, facing outboard"
+    },
+    {
+      "id": "gun_P_2",
+      "kind": "cannon",
+      "pos": [
+        -4.2,
+        4.8,
+        -14
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "wp_mizP",
+      "note": "inboard of the aft port carronade, facing outboard"
+    },
+    {
+      "id": "ropes_fore",
+      "kind": "ropes",
+      "pos": [
+        1.6,
+        4.8,
+        11.6
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_foreC",
+      "note": "at the foremast fife rail, facing the pins (+Z toward the mast) \u2014 hands IK onto the belaying pins"
+    },
+    {
+      "id": "ropes_main",
+      "kind": "ropes",
+      "pos": [
+        1.6,
+        4.8,
+        -5.6
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_mainC",
+      "note": "at the mainmast fife rail, facing the pins"
+    },
+    {
+      "id": "ropes_mizzen",
+      "kind": "ropes",
+      "pos": [
+        -1.6,
+        4.8,
+        -15.6
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "wp_mizC",
+      "note": "at the mizzenmast fife rail, facing the pins"
+    },
+    {
+      "id": "idle_00",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        -18
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_01",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        -18
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_02",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        -10
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_03",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        -10
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_04",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        -6
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_05",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        -6
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_06",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        2
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_07",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        2
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_08",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        6
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_09",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        6
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_10",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        14
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_11",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        14
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_12",
+      "kind": "idle",
+      "pos": [
+        3.6,
+        4.8,
+        18
+      ],
+      "heading_deg": 270,
+      "clip": "Idle",
+      "wp": "",
+      "note": "stbd gangway idle"
+    },
+    {
+      "id": "idle_13",
+      "kind": "idle",
+      "pos": [
+        -3.6,
+        4.8,
+        18
+      ],
+      "heading_deg": 90,
+      "clip": "Idle",
+      "wp": "",
+      "note": "port gangway idle"
+    },
+    {
+      "id": "idle_14",
+      "kind": "idle",
+      "pos": [
+        0,
+        4.8,
+        20
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "",
+      "note": "forecastle centre"
+    },
+    {
+      "id": "idle_15",
+      "kind": "idle",
+      "pos": [
+        2.5,
+        4.8,
+        17
+      ],
+      "heading_deg": 200,
+      "clip": "Idle",
+      "wp": "",
+      "note": "forecastle stbd"
+    },
+    {
+      "id": "idle_16",
+      "kind": "idle",
+      "pos": [
+        -2.5,
+        4.8,
+        17
+      ],
+      "heading_deg": 160,
+      "clip": "Idle",
+      "wp": "",
+      "note": "forecastle port"
+    },
+    {
+      "id": "idle_17",
+      "kind": "idle",
+      "pos": [
+        2.5,
+        4.8,
+        -18
+      ],
+      "heading_deg": 340,
+      "clip": "Idle",
+      "wp": "",
+      "note": "quarterdeck stbd"
+    },
+    {
+      "id": "idle_18",
+      "kind": "idle",
+      "pos": [
+        -2.5,
+        4.8,
+        -18
+      ],
+      "heading_deg": 20,
+      "clip": "Idle",
+      "wp": "",
+      "note": "quarterdeck port"
+    },
+    {
+      "id": "idle_19",
+      "kind": "idle",
+      "pos": [
+        2.6,
+        4.8,
+        -9
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "",
+      "note": "waist stbd"
+    },
+    {
+      "id": "idle_20",
+      "kind": "idle",
+      "pos": [
+        -2.6,
+        4.8,
+        -9
+      ],
+      "heading_deg": 0,
+      "clip": "Idle",
+      "wp": "",
+      "note": "waist port"
+    }
+  ],
+  "climb_paths": [],
+  "notes": [
+    "Flush spar deck (Y~4.8): forecastle (z12..24), waist (z-4.5..12), quarterdeck (z-29..-4.5) are one level.",
+    "Crew work the weather deck: helm at the double wheel, 3 carronades a side (of ~15 ports), fife-rail hands at each mast. The enclosed gun-deck long guns are not manned by visible crew."
+  ]
+}

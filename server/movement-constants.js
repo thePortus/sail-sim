@@ -44,8 +44,12 @@ const COLL_DIMS_BY_SLUG = {
   sloop:       { halfLen: 5.0, radius: 2.2 },
   pinnace:     { halfLen: 3.8, radius: 1.4 },
   merchantman: { halfLen: 13.0, radius: 3.6 },   // the biggest hull (brig still falls back to sloop dims)
+  frigate:     { halfLen: 15.0, radius: 4.5 },   // longest hull afloat (all 3 armament variants share it)
 };
-function collDims(slug) { return COLL_DIMS_BY_SLUG[slug] || COLL_DIMS_BY_SLUG.sloop; }
+function collDims(slug) {
+  if (slug && slug.startsWith('frigate')) return COLL_DIMS_BY_SLUG.frigate;
+  return COLL_DIMS_BY_SLUG[slug] || COLL_DIMS_BY_SLUG.sloop;
+}
 
 // Collision response (mirrors the client): restitution 0 = dead stop (head-on / T-bone), 1 = fully
 // elastic. Below COLL_MIN_SPEED we don't re-aim the heading (avoids a spin at a near-standstill).

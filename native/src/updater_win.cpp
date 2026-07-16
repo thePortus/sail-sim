@@ -19,4 +19,9 @@ void start() {
   win_sparkle_init();
 }
 
+void checkNow() {
+  // Force a check WITH UI now, bypassing the automatic once-a-day throttle.
+  win_sparkle_check_update_with_ui();
+}
+
 }  // namespace updater

@@ -4,6 +4,7 @@ import { SloopController } from './rigged-vessel.controller';
 import { PinnaceController } from './pinnace-vessel.controller';
 import { BrigController } from './brig-vessel.controller';
 import { MerchantmanController } from './merchantman-vessel.controller';
+import { FrigateController } from './frigate-vessel.controller';
 
 export type GunSide = 'S' | 'P';
 
@@ -26,6 +27,9 @@ export interface VesselController {
   isGunReady(side: GunSide): boolean;
   gunSettled(side: GunSide): boolean;
   setGunports(side: GunSide, open: number): void;   // no-op on rigs without gunport lids
+  /** Choose a visible loadout variant (e.g. the frigate's armament: 'heavy'|'medium'|'light'). Optional —
+   *  only rigs that ship multiple toggleable variant meshes implement it. */
+  setArmament?(variant: string): void;
   /** Mast damage from the `masts` HP zone: 1 = intact .. 0 = destroyed (mast comes down). Eased in
    *  tickRig; no-op on GLBs without a `mast_damage` rig. */
   setMastDamage(health: number): void;
@@ -60,7 +64,10 @@ export interface VesselRig {
   manifest: string;
   importFlipY: boolean;
   rightSign: 1 | -1;
-  controller: 'sloop' | 'pinnace' | 'brig' | 'merchantman';
+  controller: 'sloop' | 'pinnace' | 'brig' | 'merchantman' | 'frigate';
+  /** Loadout variant for a multi-variant hull (the frigate's armament: 'heavy'|'medium'|'light'). Applied to
+   *  the controller via setArmament so it shows the right gun mesh. Omit → the controller's default. */
+  armament?: string;
   /** Base yaw (deg, about world up) applied at import for models whose authored bow isn't +Z (the
    *  merchantman exports bow=+X, so −90 turns it to +Z). Omit → 0. */
   baseYawDeg?: number;
@@ -92,6 +99,11 @@ export interface VesselRig {
    *  above this — never the waterline/underwater hull (which otherwise shows the keel through the sea). Set
    *  to ~the weather-deck height (keel at local 0). Omit → mask the whole hull (fine for shallow open boats). */
   oceanMaskFloorY?: number;
+  /** Hull-LOCAL |X| the stencil proxy is clamped to (removes the tumblehome bulge that pokes past the rail).
+   *  A hull is widest at the WATERLINE; on a tumblehome hull (e.g. the frigate: waterline beam ~7 vs rail ~5.6)
+   *  the proxy silhouette is that wide waterline beam, so the ocean gets cut ~1.4m outboard of the rail and the
+   *  seabed shows in the gap. Clamp |X| to ~the rail half-beam so the cut hugs the deck. Omit → no beam clamp. */
+  oceanMaskBeamX?: number;
   /** v2 sailing polar (omit → falls back to the legacy step curve). */
   sail?: SailRig;
 }
@@ -123,6 +135,13 @@ const MERCHANTMAN_SAIL: SailRig = {
   polar: [[52, 0.38], [72, 0.60], [92, 0.80], [120, 1.00], [150, 0.96], [180, 0.88]],
   forceK: 1.18, trimForgive: 1.15, leewayK: 0.85,
 };
+//  • Frigate — heavy three-masted square-rigger (Constitution type). A huge, efficient sail plan on a fine,
+//    fast man-of-war hull: points a touch better than the merchantman (no-go 48°), the biggest peak drive on a
+//    reach, and holds it downwind; deep keel → little leeway, and a well-drilled rig is fairly forgiving.
+const FRIGATE_SAIL: SailRig = {
+  polar: [[48, 0.42], [68, 0.64], [90, 0.84], [120, 1.00], [150, 0.95], [180, 0.86]],
+  forceK: 1.22, trimForgive: 1.1, leewayK: 0.8,
+};
 
 export const VESSEL_RIGS: Record<string, VesselRig> = {
   sloop:   { glb: 'bermuda_sloop_rigged.glb', manifest: 'bermuda_sloop_rigged.manifest.json', importFlipY: true,  rightSign: 1,  controller: 'sloop',   floatDraft: 0,    hullHalfLen: 7.0, hullHalfBeam: 2.2, sail: SLOOP_SAIL },
@@ -139,10 +158,25 @@ export const VESSEL_RIGS: Record<string, VesselRig> = {
   // Model origin is at the KEEL (bboxMin Y=0), so floatDraft sinks it ~2.7m to float the waterline. A very heavy
   // hull rides the swell ponderously. floatDraft / hullCut.waterlineY / buoyancy are STARTING values — tune live.
   merchantman: { glb: 'merchantman.glb', manifest: 'merchantman.manifest.json', importFlipY: false, rightSign: 1, controller: 'merchantman', baseYawDeg: 90, floatDraft: -3.8, hullHalfLen: 15.0, hullHalfBeam: 3.6, oceanMaskFloorY: 6.5, hullCut: { floorY: 0.2, alongSign: 1, waterlineY: 3.8 }, buoyancy: { pitchScale: 0.06, heaveTau: 1.1, tiltTau: 0.65 }, sail: MERCHANTMAN_SAIL },
+  // Frigate (USS Constitution type) — the largest, deepest hull. Authored bow=-Y (brig convention) → exports
+  // bow=+Z, so NO baseYaw. Model origin is at the LWL (waterline Z0; keel at -6.4m), so floatDraft ~0 floats it
+  // right. floatDraft / hullCut.waterlineY / buoyancy are STARTING values — tune live (ignis_draft_frigate etc).
+  // A very heavy man-of-war rides the swell ponderously (low pitchScale, long time constants).
+  // oceanMaskFloorY drops to the waterline (frigate has no modeled underwater body, just a keel fin) so the stencil
+  // proxy's flattened disk sits at sea level instead of floating up at the rail; oceanMaskBeamX clamps the proxy beam
+  // in to the rail so the wide tumblehome waterline outline (beam ~7) stops cutting the ocean ~1.4m past the rail
+  // (~5.6) and revealing the seabed. See buildHullStencilProxy. Tune live: localStorage ignis_maskfloor_frigate.
+  frigate: { glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1, controller: 'frigate', floatDraft: 0, hullHalfLen: 24.0, hullHalfBeam: 5.5, oceanMaskFloorY: 0.5, oceanMaskBeamX: 5.7, hullCut: { floorY: 0.2, alongSign: 1, waterlineY: 0 }, buoyancy: { pitchScale: 0.05, heaveTau: 1.2, tiltTau: 0.7 }, sail: FRIGATE_SAIL },
 };
 
 export function rigForSlug(slug: string | undefined): VesselRig {
-  return VESSEL_RIGS[slug ?? ''] ?? VESSEL_RIGS['sloop'];
+  if (slug && VESSEL_RIGS[slug]) return VESSEL_RIGS[slug];
+  // Frigate armament variants (frigate_heavy/medium/light) all share the one 'frigate' rig/asset; the suffix
+  // just selects the visible gun mesh (armament) — no separate rig entry needed.
+  if (slug && slug.startsWith('frigate')) {
+    return { ...VESSEL_RIGS['frigate'], armament: slug.split('_')[1] || 'heavy' };
+  }
+  return VESSEL_RIGS['sloop'];
 }
 
 /** Base import yaw (deg) for a slug, with a live `localStorage.ignis_yaw_<slug>` override so a mis-oriented
@@ -184,6 +218,12 @@ export function createVesselController(
   if (kind === 'pinnace')     return new PinnaceController(entries, root, manifest, scene);
   if (kind === 'brig')        return new BrigController(entries, root, manifest, scene);
   if (kind === 'merchantman') return new MerchantmanController(entries, root, manifest, scene);
+  if (kind === 'frigate') {
+    const c = new FrigateController(entries, root, manifest, scene);
+    const arm = rigForSlug(slug).armament;   // heavy/medium/light from the vessel slug
+    if (arm) c.setArmament(arm);
+    return c;
+  }
   return new SloopController(entries, root, manifest, scene);
 }
 

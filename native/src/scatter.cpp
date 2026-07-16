@@ -691,7 +691,7 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   StaticCfg cfgs[] = {
     { &p->palms, 1, 0.5f, 14, 4000, { "palm_a.glb", "palm_b.glb", "palm_c.glb" }, {}, {},
       { T + "impostor_a.png", T + "impostor_b.png", T + "impostor_c.png" } },
-    { &p->trees, 2, 0.5f, 16, 4000, { "beech_a.glb", "beech_b.glb", "beech_c.glb" }, {}, {},
+    { &p->trees, 2, 0.5f, 5, 4000, { "beech_a.glb", "beech_b.glb", "beech_c.glb" }, {}, {},
       { T + "beech_impostor_a.png", T + "beech_impostor_b.png", T + "beech_impostor_c.png" } },
     { &p->rocks, 0, 0.0f, 24, 6000,
       { "rock_a.glb", "rock_b.glb", "rock_c.glb", "rock_d.glb", "rock_e.glb" },
@@ -885,15 +885,29 @@ bool System::init(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat colorFor
   return ok;
 }
 
+// Shared BEECH-FOREST acceptance — the far PASS A impostor fill and the near
+// treeKernel use the IDENTICAL recipe so the LOD handoff never conjures or drops
+// trees on approach. Full canopy up to FOREST_FULL_Y, thinning to patchy spots by
+// FOREST_TREELINE_Y (upper hillsides / rocky uplands). stand/clearing are the two
+// fbm octaves, sl the ground slope, y the ground height.
+static constexpr float FOREST_FULL_Y = 80.0f;
+static constexpr float FOREST_TREELINE_Y = 170.0f;
+static float beechAccept(float stand, float clearing, float sl, float y) {
+  float elevThin = 1.0f - sstep(FOREST_FULL_Y, FOREST_TREELINE_Y, y) * 0.78f;
+  return (0.45f + 0.55f * sstep(0.28f, 0.62f, stand)) * sstep(0.18f, 0.52f, clearing)
+       * (1.0f - sl * 0.18f) * elevThin;
+}
+
 // Static far-impostor layers — a faithful port of the client's buildFarForest +
 // buildFarCoast (scatter.service.ts). The bug this fixes: the near ring places
 // trees on a ~2.9 m grid, but the old far walk sampled a single coarse grid with
 // the near PALM recipe verbatim — at 6 m that is ~4× sparser than the near palms,
 // so coastal palm groves had few/no impostors and "sprang into existence" on
 // approach. The cure (as in Angular) is TWO passes with matching spatial density:
-//   A. Far FOREST — the whole forested hillband, a DENSE fill (high base accept)
-//      so distant slopes read as continuous canopy and are a strict SUPERSET of
-//      the sparse near beech ring (approaching only thins, never conjures).
+//   A. Far FOREST — the whole forested hillband, a DENSE fill via beechAccept()
+//      (slopes + patchy uplands to the treeline). The near treeKernel shares the
+//      SAME beechAccept() at a matching ~8 m grid, so approach neither bares a
+//      slope nor conjures a canopy — the density just carries through.
 //   B. Far COAST — the low shore strip, SUB-SAMPLED to ~3.2 m (near spacing) and
 //      run through the EXACT near palm + near beech recipes, so far palm density
 //      equals near palm density and the groves line up 1:1.
@@ -920,7 +934,12 @@ buildFarLayers(const terrain::Terrain* terr) {
     }
     return false;
   };
-  const int BUDGET_PER = 200000;   // per variant bin (600k total, the client's cap)
+  // ── Far-forest density knobs — pushed WELL above the Angular client so distant
+  //    islands read as full, lush canopy instead of scattered dots. Tune for the
+  //    look/perf tradeoff: trees scale with SUB² (build cost too) and are capped by
+  //    BUDGET_PER (≈64 B/instance in RAM + an equal GPU buffer, per of 6 bins). ──
+  const int FAR_FOREST_SUB = 3;    // PASS A sub-samples per heightfield-cell edge (density ∝ SUB²); 1 = client
+  const int BUDGET_PER = 600000;   // per-variant reservoir cap (was 200k)
   std::minstd_rand rng{ 777 };
   // Reservoir add: keep a uniform BUDGET_PER sample of an unbounded stream so the
   // cap doesn't bias toward whichever rows we walk first.
@@ -937,35 +956,40 @@ buildFarLayers(const terrain::Terrain* terr) {
 
   // ── PASS A: FAR FOREST (beech) — dense hillside fill up to the treeline. ──
   // Cap the whole-map walk at ~8M cells (stride up on huge maps), matching the
-  // client. elevation() bilerps, so a sub-cell grid is fine. The client's band
-  // runs to 0.74*peak because it has a shader canopy up high; native's near ring
-  // stops at 80 m, so cap there too — else the high fill has no near mesh to hand
-  // off to and would fade to a bare hilltop within 280 m (a new pop-out).
-  float yLo = std::max(0.6f, 0.04f * peak), yHi = std::min(0.74f * peak, 80.0f);
+  // client. elevation() bilerps, so a sub-cell grid is fine. FOREST_FULL_Y = full
+  // canopy up to here; TREELINE_Y = trees keep climbing but THIN OUT (patchy spots
+  // on the upper hillsides / rocky uplands, not a hard forest edge).
+  // The near treeKernel shares beechAccept() + this band, so the handoff matches.
+  float yLo = std::max(0.6f, 0.04f * peak), yHi = std::min(0.74f * peak, FOREST_TREELINE_Y);
   int nxF = std::max(2, (int)std::lround(spanX / cellM) + 1);
   int nzF = std::max(2, (int)std::lround(spanZ / cellM) + 1);
   int strideF = std::max(1, (int)std::ceil(std::sqrt((double)nxF * nzF / 8.0e6)));
+  // SUB-sample each cell FAR_FOREST_SUB× per axis so the far canopy packs tighter
+  // than the ~24 m heightfield grid (the old 1-per-cell walk read as scattered).
   for (int iz = 0; iz < nzF; iz += strideF)
-    for (int ix = 0; ix < nxF; ix += strideF) {
-      float jx = hash2(ix * 12.9f + iz, iz * 78.2f + ix), jz = hash2(ix * 39.3f + 7.1f, iz * 11.7f - 3.3f);
-      float px = (float)m.minX + ((float)ix + jx) / (float)(nxF - 1) * spanX;
-      float pz = (float)m.minZ + ((float)iz + jz) / (float)(nzF - 1) * spanZ;
+    for (int ix = 0; ix < nxF; ix += strideF)
+      for (int sz = 0; sz < FAR_FOREST_SUB; ++sz)
+        for (int sx = 0; sx < FAR_FOREST_SUB; ++sx) {
+      float jx = hash2(ix * 12.9f + iz + sx * 2.3f, iz * 78.2f + ix + sz * 5.1f);
+      float jz = hash2(ix * 39.3f + 7.1f + sz * 1.9f, iz * 11.7f - 3.3f + sx * 4.7f);
+      float fx = (float)ix + ((float)sx + jx) / (float)FAR_FOREST_SUB * (float)strideF;
+      float fz = (float)iz + ((float)sz + jz) / (float)FAR_FOREST_SUB * (float)strideF;
+      float px = (float)m.minX + fx / (float)(nxF - 1) * spanX;
+      float pz = (float)m.minZ + fz / (float)(nzF - 1) * spanZ;
       float y = ground(px, pz);
       if (y < yLo || y > yHi) continue;
       float sl = slopeAt(px, pz, 3.0f);
-      if (sl > 0.6f) continue;
+      if (sl > 1.0f) continue;   // allow up to ~45° so the hill FLANKS forest, not just flat crests
       float stand = fbm2(px / 45.0f, pz / 45.0f), clearing = fbm2(px / 13.0f + 9.0f, pz / 13.0f - 4.0f);
-      // Dense canopy: high BASE acceptance in forested stands (continuous forest,
-      // not dots), the clearing fbm only THINNING toward natural gaps. A softer
-      // slope penalty keeps the hills full. Denser than near beech = a superset.
-      float dens = (0.45f + 0.55f * sstep(0.28f, 0.62f, stand)) * sstep(0.18f, 0.52f, clearing) * (1.0f - sl * 0.35f);
+      // Dense canopy fading to patchy toward the treeline — shared with treeKernel.
+      float dens = beechAccept(stand, clearing, sl, y);
       if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) continue;
       if (nearShoreline(px, pz, 6.0f)) continue;
       int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));
       float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
       reservoir(out.first[(size_t)v], seenB[(size_t)v],
                 compose(0, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
-    }
+        }
 
   // ── PASS B: FAR COAST (palm + low beech) — fine sub-grid, EXACT near recipes. ──
   // Prune deep-ocean / clear-upland whole cells cheaply, then sub-sample each
@@ -1068,14 +1092,16 @@ static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
 }
 static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::vector<Inst>>& out, std::vector<Inst>& blobs) {
   float y = p->ground(px, pz);
-  if (y < 0.6f || y > 80.0f) return;
+  if (y < 0.6f || y > FOREST_TREELINE_Y) return;   // match far PASS A band (seamless LOD handoff)
   float sl = p->slope(px, pz);
-  if (sl > 0.5f) return;
+  if (sl > 1.0f) return;
   float stand = fbm2(px / 45.0f, pz / 45.0f);
   float clearing = fbm2(px / 13.0f + 9.0f, pz / 13.0f - 4.0f);
-  float dens = sstep(0.46f, 0.72f, stand) * sstep(0.4f, 0.62f, clearing) * (1.0f - sl * 0.8f) * 0.18f;
+  // Same acceptance as the far impostor fill: the near ring's finer grid only packs
+  // it DENSER (approaching thickens the canopy, never bares a slope/upland).
+  float dens = beechAccept(stand, clearing, sl, y);
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) return;
-  if (p->nearShore(px, pz, 7.0f)) return;
+  if (p->nearShore(px, pz, 6.0f)) return;
   float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));

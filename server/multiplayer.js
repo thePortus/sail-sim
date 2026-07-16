@@ -1506,6 +1506,7 @@ function attachMultiplayer(server) {
         };
         const seq = +msg.seq || 0;
         const shotType = (msg.shotType === 'bar' || msg.shotType === 'grape') ? msg.shotType : 'round';   // ammo type (default round)
+        const carronade = !!msg.carronade;   // short-range spar-deck gun
         const now = Date.now();
 
         // ── Authority: reject implausible / spammed shots (no relay, no sim) ──────
@@ -1513,7 +1514,7 @@ function attachMultiplayer(server) {
         // it against THAT side's reload bucket, sized to this ship's guns-per-side and stretched by its crew. A
         // cancelled run-out can't reset it, and a bigger future broadside scales automatically.
         const fireSide = combat.shotSide(me?.state?.heading, shotData.vx, shotData.vz);
-        if (!combat.validateShot(shotData, me?.state, shotType)
+        if (!combat.validateShot(shotData, me?.state, shotType, carronade)
             || !combat.allowShot(me?.combat, now, shotType, fireSide, crewFactor(me))) {
           return;
         }
@@ -1528,7 +1529,7 @@ function attachMultiplayer(server) {
         // The step loop flies it over real time and tests it against each victim's ACTUAL
         // evolving pose, so manoeuvring during the flight genuinely dodges it. fireTime is
         // `now` (when the muzzle data is valid); lastT tracks how far it's been tested.
-        activeShots.push({ shooterId: id, seq, ...shotData, shotType, fireTime: now, lastT: 0 });
+        activeShots.push({ shooterId: id, seq, ...shotData, shotType, carronade, fireTime: now, lastT: 0 });
 
       } else if (msg.type === 'combat_reset') {
         // Dock "Repair Vessel" → restore the hull to full, for a gold fee (the first gold sink). The sunk→

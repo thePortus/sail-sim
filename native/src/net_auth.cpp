@@ -126,6 +126,7 @@ VesselPhysics vesselPhysics(const std::string& host, int port, const std::string
   r.minTackAngle     = p.value("minTackAngle", r.minTackAngle);
   r.sailAreaFactor   = p.value("sailAreaFactor", r.sailAreaFactor);
   r.weight           = p.value("weight", r.weight);
+  r.turnFactor       = p.value("turnFactor", r.turnFactor);
   // Rig/hull block: only authoritative when the server actually sent it (an older
   // server without these fields must NOT silently downgrade a brig to sloop defaults).
   if (p.contains("forceK")) {

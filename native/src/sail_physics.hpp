@@ -21,6 +21,7 @@ struct Rig {
   float trimForgive = 1.0f, leewayK = 1.0f;
   float weight = 2800, maxSpeed = 9, accelRate = 0.22f;
   float minTackAngle = 32, sailAreaFactor = 0.40f;
+  float turnFactor = 1.0f;        // multiplier on the helm turn-rate curve (<1 = turns slower; frigate ~0.5)
   float hullHalfLen = 7.0f, hullHalfBeam = 2.2f;
   float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // tiltTau<0 => use default smoothing
 };
@@ -49,6 +50,12 @@ inline Rig rigForSlug(const std::string& s) {
     r.forceK = 1.18f; r.trimForgive = 1.15f; r.leewayK = 0.85f;
     r.weight = 6500; r.maxSpeed = 8.6f; r.accelRate = 0.12f; r.minTackAngle = 52; r.sailAreaFactor = 0.50f;
     r.hullHalfLen = 15.0f; r.hullHalfBeam = 3.6f; r.pitchScale = 0.06f; r.heaveTau = 1.1f; r.tiltTau = 0.65f;
+  } else if (s.rfind("frigate", 0) == 0) {   // frigate_heavy/medium/light — the server sends exact per-variant physics
+    r.polar = {{48,0.42f},{68,0.64f},{90,0.84f},{120,1.00f},{150,0.95f},{180,0.86f}};
+    r.forceK = 1.22f; r.trimForgive = 1.1f; r.leewayK = 0.8f;
+    r.weight = 10000; r.maxSpeed = 10.5f; r.accelRate = 0.10f; r.minTackAngle = 50; r.sailAreaFactor = 0.55f;
+    r.turnFactor = 0.55f;   // fast under a huge sail plan but ponderous to turn (heaviest hull)
+    r.hullHalfLen = 24.0f; r.hullHalfBeam = 5.5f; r.pitchScale = 0.05f; r.heaveTau = 1.2f; r.tiltTau = 0.7f;
   }
   // else: sloop — the base rig set above (matches VESSEL_RIGS 'sloop').
   return r;
@@ -187,7 +194,7 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
   if (std::fabs(v.speed) < 0.001f) v.speed = 0.0f;
 
   // Steering: helm sets a target yaw the boat eases toward (angular inertia).
-  float maxYaw = detail::turnRate(v.speed, r.maxSpeed) * DEG;
+  float maxYaw = detail::turnRate(v.speed, r.maxSpeed) * r.turnFactor * DEG;   // turnFactor: heavy hull turns slower
   float targetYaw = (float)rudder * maxYaw;
   v.yawRate += (targetYaw - v.yawRate) * std::min(1.0f, YAW_RESPONSE * dt);
   v.heading = v.heading + v.yawRate * dt;

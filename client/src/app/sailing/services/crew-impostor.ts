@@ -53,6 +53,9 @@ export class CrewImpostorLayer {
     mat.emissiveTexture = this.tex;                        // show the texture colour at full (diffuse is unlit-black)
     mat.backFaceCulling = false;                           // a billboard is seen from either side as it yaws
     // fogEnabled stays true (default) so distant crew tint into the scene fog like every other impostor.
+    // Keep this unlit billboard out of the SSR/SSAO prePass: roughness 0 at the waterline would let SSR
+    // mirror it. Built lazily (distant crew only), so the prePass renderer already exists by now.
+    this.scene.prePassRenderer?.excludedMaterials.push(mat);
     this.mat = mat;
 
     const plane = MeshBuilder.CreatePlane('crewImpostors', { width: 1, height: 1 }, this.scene);

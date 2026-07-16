@@ -14,7 +14,7 @@ struct PostU {
     zp    : vec4<f32>,   // x = proj[2][2]; y = proj[3][2]; z = SSAO enabled; w unused
     tele  : vec4<f32>,   // telescope lens: xy = centre (uv); z = radius, Y-normalized (0 = off); w = zoom
     ae    : vec4<f32>,   // auto-exposure/grade: x = AE enabled; y = key (mid-grey target); z = min mul; w = max mul
-    lut   : vec4<f32>,   // 3D-LUT grade: x = LUT enabled; y = amount [0..1]; z,w unused
+    lut   : vec4<f32>,   // 3D-LUT grade: x = LUT enabled; y = amount [0..1]; z = displayed-aspect override for the lens (VR; 0 = use resolution); w unused
 };
 @group(0) @binding(0) var<uniform> u : PostU;
 @group(0) @binding(1) var sceneTex : texture_2d<f32>;
@@ -177,7 +177,10 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     var teleDist = 1.0e9;
     if (teleR > 0.001) {
         var td = in.uv - u.tele.xy;
-        td.x *= res.x / res.y;
+        // Roundness correction: on a monitor the frame's PIXEL aspect is what's displayed, but in
+        // VR the wide frame is shown across the eye's near-square FOV — the DISPLAYED aspect
+        // (tanHalfW/tanHalfH, u.lut.z) is what keeps the lens circular there.
+        td.x *= select(res.x / res.y, u.lut.z, u.lut.z > 0.0);
         teleDist = length(td);
         if (teleDist < teleR) {
             teleRR = clamp(teleDist / teleR, 0.0, 1.0);

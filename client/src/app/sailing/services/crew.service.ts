@@ -167,8 +167,9 @@ export class CrewService {
     sloop:       'crew_stations.sloop.json',
     brig:        'crew_stations.brig.json',
     merchantman: 'crew_stations.merchantman.json',
+    frigate:     'crew_stations.frigate.json',
   };
-  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12, merchantman: 9 };
+  private static readonly DEFAULT_COUNT: Record<string, number> = { pinnace: 4, sloop: 7, brig: 12, merchantman: 9, frigate: 32 };
 
   /**
    * Spawn a crew on one vessel.
@@ -183,7 +184,9 @@ export class CrewService {
   async attach(
     slug: string, shipGlbRoot: TransformNode, scene: Scene, seed: number, count?: number,
   ): Promise<CrewHandle | null> {
-    const layoutFile = CrewService.LAYOUTS[slug];
+    // Frigate armament variants (frigate_heavy/medium/light) share the one 'frigate' crew layout.
+    const layoutSlug = slug.startsWith('frigate') ? 'frigate' : slug;
+    const layoutFile = CrewService.LAYOUTS[layoutSlug];
     if (!layoutFile) return null;
     // The new Mixamo crew (crew_spike.glb — faces/skins/beards/hair/clothing variety + the full lifecycle) is now
     // the DEFAULT. It flows through the same lifecycle as the legacy pirate crew (placement, deck-snap, walking,
@@ -198,7 +201,7 @@ export class CrewService {
         ? ({ constants: { walk_speed_mps: 1.2 } } as unknown as PirateManifest)
         : await this.loadManifest();
       if (shipGlbRoot.isDisposed()) return null;
-      const n = Math.min(count ?? CrewService.DEFAULT_COUNT[slug] ?? 5, layout.stations.length);
+      const n = Math.min(count ?? CrewService.DEFAULT_COUNT[layoutSlug] ?? 5, layout.stations.length);
       const handle = new CrewHandle(scene, shipGlbRoot, layout, manifest, this.baseUrl, seed, useNew);
       for (let i = 0; i < n; i++) {
         const rigged = await this.assetCache.instantiateRigged(glb, scene, shipGlbRoot, false);

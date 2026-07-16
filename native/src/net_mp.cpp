@@ -728,13 +728,13 @@ std::map<std::string, std::pair<int, int>> Client::gunStates() const {
 
 void Client::sendCannonShot(float ox, float oy, float oz,
                             float vx, float vy, float vz,
-                            int seq, const std::string& shotType) {
+                            int seq, const std::string& shotType, bool carronade) {
   if (p_->conn.load() != ConnState::Open) return;
   json j = {
     { "type", "cannon_shot" },
     { "ox", ox }, { "oy", oy }, { "oz", oz },
     { "vx", vx }, { "vy", vy }, { "vz", vz },
-    { "seq", seq }, { "shotType", shotType },
+    { "seq", seq }, { "shotType", shotType }, { "carronade", carronade },
   };
   p_->ws.send(j.dump());
 }

@@ -157,7 +157,8 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
       const zone = zoneAtLocal(lat, lon, by, v.dims);
       if (!zone) continue;
       const side = lat < 0 ? 'port' : 'stbd';
-      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType) * caliber;
+      const carr = shot.carronade ? C.CARRONADE_DMG_MULT : 1;   // heavy smasher ball hits harder up close
+      const dmg  = computeDamage(vx, vy - C.G * t, vz, pose, zone, by, shot.shotType) * caliber * carr;
       return { victimId: v.pid, zone, hx: bx, hy: by, hz: bz, side, dmg, tof: t };
     }
   }
@@ -165,10 +166,10 @@ function stepShot(shot, tFrom, tTo, players, nowMs) {
 }
 
 /** Plausibility check on a claimed shot (origin near shooter, speed in band). */
-function validateShot(shot, shooterState, shotType) {
+function validateShot(shot, shooterState, shotType, carronade) {
   if (!shooterState) return false;
   const speed = Math.hypot(shot.vx, shot.vy, shot.vz);
-  const band = C.shotDef(shotType);   // bar shot has a lower plausible-velocity band than round
+  const band = carronade ? C.carronadeBand(shotType) : C.shotDef(shotType);   // bar shot has a lower plausible-velocity band than round
   if (speed < band.vMin || speed > band.vMax) return false;
   const dx = shot.ox - shooterState.x, dz = shot.oz - shooterState.z;
   return dx * dx + dz * dz <= C.VALID_ORIGIN_RADIUS * C.VALID_ORIGIN_RADIUS;

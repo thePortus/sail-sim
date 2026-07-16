@@ -17,7 +17,7 @@
 
 namespace combat {
 
-struct Muz { float x, y, z; };                       // vessel-local (+Z bow, +X starboard)
+struct Muz { float x, y, z; bool carronade = false; };  // vessel-local (+Z bow, +X starboard)
 struct GunLayout { std::vector<Muz> port, stbd; };
 GunLayout cannonsFor(const std::string& slug);       // server vessels.controller.js layouts
 
@@ -56,6 +56,7 @@ struct FireEvent {
   float dirX = 0, dirZ = 0;          // raw beam (muzzle FX direction)
   int seq = 0;
   ShotKind kind = ShotKind::Round;
+  bool carronade = false;            // spar-deck smasher → server validates the short shot + boosts damage
 };
 
 // A ball ended (water/land in phase 1; ship impacts via server combat_hit).
@@ -123,6 +124,8 @@ class Guns {
   void armGunArrays(int side);
   LockSolution solveLock(int side, const ShipPose& pose, float beamX, float beamZ,
                          float mv, float muzzleY, const std::vector<Enemy>& enemies) const;
+  // True if an enemy sits on `side` within carronade reach — the auto-hold gate for the smashers.
+  bool hasTargetInCarronadeRange(int side) const;
   float muzzleV() const;
   void fireOneCannon(int side, int idx, const ShipPose& pose,
                      const std::vector<Enemy>& enemies, const std::string& myId,
@@ -136,7 +139,8 @@ class Guns {
   int shotSeq_ = 0;
   float crewFactor_ = 1.0f;
   LockSolution lock_[2];
-  std::vector<Enemy> enemies_;     // latest (for arcPath re-solve-free rendering)
+  std::vector<Enemy> enemies_;     // latest (for arcPath re-solve-free rendering + carronade auto-hold)
+  ShipPose pose_;                  // latest own pose (for the carronade range gate in armOrFire)
   std::array<Ball, (size_t)kBallPool> balls_;
 };
 

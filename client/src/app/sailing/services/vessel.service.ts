@@ -9,6 +9,7 @@ import '@babylonjs/loaders/glTF';   // registers GLB/GLTF plugin with SceneLoade
 import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
+import { WetnessPlugin } from './wetness.plugin';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -596,7 +597,7 @@ export class VesselService {
       // waterline still revealed the keel, because the proxy's flat bottom sat right where the line of sight to
       // the underwater hull crosses the sea). Undefined → mask the whole hull (shallow open boats).
       this.hullStencilCap = buildHullStencilProxy(
-        hull, this.root, this.sceneService.scene, maskFloorFor(this.vesselSlug, this.rig));
+        hull, this.root, this.sceneService.scene, maskFloorFor(this.vesselSlug, this.rig), this.rig.oceanMaskBeamX);
       if (this.hullStencilCap) {
         this.oceanService.setHullStencilMask(true);
         this.oceanService.setHullCutEnabled(false);   // proxy does the masking — no shader carve/discard
@@ -666,6 +667,14 @@ export class VesselService {
       if (mat && !seenMats.has(mat)) {
         seenMats.add(mat);
         mat.fogEnabled = false;
+        // FRIGATE EXCEPTION to the kept-in-prePass rule above: its emissive glass (roughness≈0), copper
+        // (0.35) and the noisy baked-roughness wood all clear the SSR pipeline's reflectivity threshold,
+        // so SSR ray-marches the whole ship and paints per-frame moving dark speckle onto the hull and
+        // stern windows as she rocks (reads as Z-fighting / "the surface underneath leaking through").
+        // Verified live (A/B/A, night + dawn): detaching SSR kills it; excluding FR_* from the prePass
+        // kills it with SSR+SSAO fully on. Other vessels' mats are matte enough that SSR skips them, so
+        // they keep their true depth/normals in the G-buffer for SSAO.
+        if (mat.name.startsWith('FR_')) this.sceneService.excludeFromPrePass(mat);
       }
       // Spawn a shadow-CATCHER twin for the STATIC deck/hull surfaces (no skin weights). Skinned parts (rigging) and
       // cloth are skipped — crew/furniture shadows land on the deck, which is static. The catcher RECEIVES; the
@@ -840,6 +849,10 @@ export class VesselService {
     this.waterShadowMat.disableLighting = true;
     this.waterShadowMat.backFaceCulling = false;
     this.waterShadowMat.alpha = 0.90;
+    // Keep the water-shadow disc OUT of the SSR/SSAO prePass. It's a big (radius 16) flat StandardMaterial
+    // at the waterline with roughness 0 → SSR marched it as a perfect mirror, painting a hard-edged flat
+    // oval of sky/ship reflection under the ship that only read at low sun (dawn/dusk, bright horizon).
+    this.sceneService.excludeFromPrePass(this.waterShadowMat);
 
     this.waterShadow = MeshBuilder.CreateDisc('hullShadow', { radius: 16, tessellation: 32 }, scene);
     this.waterShadow.material = this.waterShadowMat;
@@ -1125,7 +1138,7 @@ export class VesselService {
     // f(sf) = K · sf / (1 + (sf/p)²) — peaks at sf=p, then falls as 1/sf
     const p    = 0.28;                  // peak agility at 28 % of hull speed
     const rate = 155 * sf / (1 + (sf / p) * (sf / p));
-    return Math.max(4, Math.min(30, rate));
+    return Math.max(4, Math.min(30, rate)) * (this.physics.turnFactor ?? 1);
   }
 
   // ── Sheet adjustment rate ─────────────────────────────────────────────────
@@ -1648,6 +1661,7 @@ export class VesselService {
       const eye = Vector3.TransformCoordinates(this.fpEye, this.root.getWorldMatrix());
       eye.addInPlace(this.camShakeOffset);
       cam.position.copyFrom(eye);
+      cam.minZ = 0.5;   // wheel/binnacle sit <1 m from the eye — needs the close near plane
       const yaw   = (this.heading + this.fpYaw) * Math.PI / 180;
       const pitch = this.fpPitch * Math.PI / 180;
       const cp    = Math.cos(pitch);
@@ -1699,6 +1713,14 @@ export class VesselService {
       tjy = Math.sin(rt * this.CAM_SHAKE_FREQ * 2.1 + 1.7) * ra * 0.7;    // vertical, detuned
     }
     cam.setTarget(new Vector3(targetX + tjx, targetY + tjy, targetZ));
+
+    // Z-FIGHT FIX — scale the near plane with zoom. At minZ 0.5 (vs native's 2.0, main.cpp glm::perspective)
+    // the 24-bit depth buffer runs out of precision for the ship's close-offset detail (copper/glass 8 mm
+    // proud, the coincident shadow-catcher twins) and the rocking hull SPARKLES with per-frame depth-tie
+    // flips — the "Z-fighting speckle" seen on Angular only (native's tighter planes never fight). Nothing
+    // sits nearer than ~camDist·0.08 in orbit, so the near plane can ride the zoom: 0.64 at the closest
+    // zoom (8 m), ≈1.9 at the default 24 m (matches native), capped at 3. First-person resets to 0.5 above.
+    cam.minZ = Math.min(3.0, Math.max(0.5, this.camDist * 0.08));
   }
 
   /** Ship structural meshes (hull/deck/furniture) to raycast the deck-walk eye onto. Merged ship meshes get
@@ -2054,6 +2076,38 @@ export class VesselService {
 
     // ── Inform ocean service so wake plane shader knows boat position ──────
     this.oceanService.setBoatTransform(this.x, this.z, hdgR, this.speed);
+
+    // ── Hull/deck wetness: push the sea-surface height at the ship (the waterline height),
+    //    rain, time + enable to the shared WetnessPlugin state (one static across all vessel
+    //    materials). getHeightAt is NaN until the first FFT readback → fall back to sea level. ──
+    const wetT = this.oceanService.getOceanTime();
+    const fin = (v: number, d = 0): number => (Number.isFinite(v) ? v : d);
+    // Sample the real sea-height field (the one the hull floats on) at the ship and ±ε in x/z to get
+    // the local surface height + its world gradient — a tangent plane the shader follows so the wetline
+    // rides the swell (Phase 3). ε ≈ a fraction of the wavelength; ±10 m reads the slope at the hull.
+    const eps = 10;
+    const hc = fin(this.oceanService.getWaveHeightAt(this.x, this.z, wetT));
+    const hxp = fin(this.oceanService.getWaveHeightAt(this.x + eps, this.z, wetT));
+    const hxm = fin(this.oceanService.getWaveHeightAt(this.x - eps, this.z, wetT));
+    const hzp = fin(this.oceanService.getWaveHeightAt(this.x, this.z + eps, wetT));
+    const hzm = fin(this.oceanService.getWaveHeightAt(this.x, this.z - eps, wetT));
+    WetnessPlugin.shared.seaY = hc;
+    WetnessPlugin.shared.shipX = this.x;
+    WetnessPlugin.shared.shipZ = this.z;
+    WetnessPlugin.shared.gradX = (hxp - hxm) / (2 * eps);
+    WetnessPlugin.shared.gradZ = (hzp - hzm) / (2 * eps);
+    // Clamp the tangent-plane offset to the local wave amplitude so distant ships (sharing this one
+    // global static) don't get a plane extrapolated into absurd heights.
+    const amp = Math.max(Math.abs(hxp - hc), Math.abs(hxm - hc), Math.abs(hzp - hc), Math.abs(hzm - hc), 0.15);
+    WetnessPlugin.shared.amp = Math.min(amp * 1.5 + 0.1, 3.0);
+    WetnessPlugin.shared.rain = this.oceanService.getRainIntensity();
+    WetnessPlugin.shared.time = wetT;
+    WetnessPlugin.shared.enabled = this.sceneService.isWetnessEnabled() ? 1 : 0;
+    // Sun direction (toward-sun, world) drives the wet-sheen sun highlight; it fades below the horizon.
+    const sd = this.sceneService.getSunDirection();
+    WetnessPlugin.shared.sunX = sd.x;
+    WetnessPlugin.shared.sunY = sd.y;
+    WetnessPlugin.shared.sunZ = sd.z;
   }
 
   // ── PBR material & texture helpers ────────────────────────────────────────

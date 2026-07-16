@@ -1,13 +1,12 @@
 # todo
 
-* hide console output on release, so no terminal screens for users
-* uninstall option
-* extreme scatter improvement for LOD distance.... distant islands forest biomes should look covered, not scattered
-* wet deck ssr and splashes in angular
+* limit trees in towns, increase physical size of capitals
+* ability to walk on land... make NPC townspeople
+* make player ship upgrades server authoritative
+* crew penality to movement and reload on both native and angular
+* loading screen on native until assets are in
 * Can we change how towns and their roads are laid out? Instead of starting by placing the buildings, and then connecting them with roads. Can we start by laying out a road network (with parameters to allow places for the buildings), and then only after placing the buildings on those roads? And look up online how to generate these road networks so each town is realistic, and has the number of roads it needs.
 * VR?
-* in native, if I shoot the cannons, in the smoke afterwards I can see a weird ghost image/shadow of the ship in the smoke if I rotate the camera at certain angles
-
 
 # General or Current TODO Items
 
@@ -16,7 +15,7 @@
 * fleets with prize crews to take them over
 * forts and taking towns
 * more tree varieties, flora.... regional/island differences
-* dancing
+* dancing 
 * career of lands gained, etc. adapted to this game
 * server only accepts local requests, restricted to client
 * brig flags seem off from wind direction... off because they also rotate with trim in addition to wind

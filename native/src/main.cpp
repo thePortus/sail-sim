@@ -1460,13 +1460,25 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
 
 // Procedural gradient sky drawn as a full-screen triangle (no vertex buffer).
 // Unit vector FROM origin TOWARD the sun for a game hour (0..24) — port of the
-// client's scene.service computeSunDir: a smooth sine arc (sunrise h=6, noon h=12,
-// sunset h=18). The X term is negated so the sun rises in the east (+X) / sets in
-// the west (-X), matching the world's cardinal convention. Drives the sky scatter,
-// sun disc, and (blended with the moon) all scene lighting so they stay consistent.
+// client's scene.service computeSunDir — long SUMMER day: the sun is up from DAY_START
+// to DAY_END (16 h daylight / 8 h night) on a broad, high arc, instead of a symmetric
+// 12/12. Elevation is a sine over the (asymmetric) day + night spans, so it's smooth and
+// CONTINUOUS at sunrise/sunset (both cross the horizon at 0), peaks +1 at midday (~13:00)
+// and dips -1 in the middle of the shorter night. The X term is negated so the sun rises
+// in the east (+X) / sets in the west (-X), matching the world's cardinal convention.
+// Drives the sky scatter, sun disc, and (blended with the moon) all scene lighting —
+// golden hour, fog, dayK etc. all key off the elevation, so they follow automatically.
 static glm::vec3 computeSunDir(float gameHours) {
   const float PI = glm::pi<float>();
-  float elev  = std::sin(((gameHours - 6.0f) / 12.0f) * PI);
+  const float DAY_START = 5.0f, DAY_END = 21.0f;   // sunrise / sunset hour (match the client!)
+  float elev;
+  if (gameHours >= DAY_START && gameHours <= DAY_END) {
+    elev = std::sin(PI * (gameHours - DAY_START) / (DAY_END - DAY_START));   // 0 → +1 → 0, long day
+  } else {
+    const float nightLen = 24.0f - (DAY_END - DAY_START);
+    const float nh = gameHours < DAY_START ? (gameHours + 24.0f - DAY_END) : (gameHours - DAY_END);
+    elev = -std::sin(PI * nh / nightLen);                                    // 0 → -1 → 0, short night
+  }
   float az    = (gameHours / 24.0f) * 2.0f * PI - PI;
   float horiz = std::sqrt(std::max(0.0f, 1.0f - elev * elev));
   return glm::normalize(glm::vec3(-horiz * std::sin(az), elev, horiz * std::cos(az)));
@@ -6004,13 +6016,13 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
                           authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str(),
                           vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, vessel.anchored ? "Anchored" : pos,
                           ct.crew, ct.maxCrew, (int)others.size(),
-                          ghh >= 6.5f && ghh < 19.5f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
+                          ghh >= 5.0f && ghh < 21.0f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
           else
             std::snprintf(line, sizeof(line), "%s      %s %s      " ICON_FA_TOWER_BROADCAST " %d      %s %d:%02d %s",
                           authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str(),
                           vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, vessel.anchored ? "Anchored" : pos,
                           (int)others.size(),
-                          ghh >= 6.5f && ghh < 19.5f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
+                          ghh >= 5.0f && ghh < 21.0f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
           ImDrawList* fdl = ImGui::GetForegroundDrawList();
           ImVec2 ts = ImGui::CalcTextSize(line);
           // Sits just ABOVE the round tool cluster (arcPt 270°/0.60, 64 px tall, centre pivot) —

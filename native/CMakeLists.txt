@@ -121,12 +121,24 @@ FetchContent_MakeAvailable(stb)
 # (eliemichel/WebGPU-distribution wgpu-static-v0.19.4.1) shipped a webgpu.h whose
 # enum values were out of sync with the lib it bundled, which silently corrupts
 # texture formats. Fetching upstream guarantees header/lib agreement.
-set(SAILSIM_WEBGPU_BACKEND "WGPU" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
+# Windows ships ONE unified binary: Dawn (D3D12) + OpenXR compiled in, flat desktop by default
+# with VR as a runtime toggle (a headset lights up a VR button in the toolbar). So on Windows the
+# defaults are DAWN + SAILSIM_VR=ON — a plain `cmake -S . -B build-win` IS the release config; the
+# old two-tree workflow (wgpu-native build-win + separate build-win-vr) is obsolete. Other
+# platforms keep wgpu-native and VR stays off (vr.cpp compiles inert stubs there regardless).
+if (WIN32)
+  set(_sailsim_backend_default "DAWN")
+  set(_sailsim_vr_default ON)
+else()
+  set(_sailsim_backend_default "WGPU")
+  set(_sailsim_vr_default OFF)
+endif()
+set(SAILSIM_WEBGPU_BACKEND "${_sailsim_backend_default}" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
 
-# VR (OpenXR) — opt-in, OFF by default. Declared HERE (before the backend fetch) because the VR
-# render bridge needs Dawn built on D3D12 (see native/VR_PLAN.md), which patches the Dawn fetch below.
-# The probe + OpenXR loader are wired at the end of this file.
-option(SAILSIM_VR "Build the OpenXR VR probe + support" OFF)
+# VR (OpenXR) — ON by default on Windows (see above), opt-in elsewhere. Declared HERE (before the
+# backend fetch) because the VR render bridge needs Dawn built on D3D12 (see native/VR_PLAN.md),
+# which patches the Dawn fetch below. The probe + OpenXR loader are wired at the end of this file.
+option(SAILSIM_VR "Build the OpenXR VR probe + support" ${_sailsim_vr_default})
 
 if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
   # Dawn, from source, via Élie Michel's distribution. NOTE: on Apple Silicon this
@@ -746,8 +758,8 @@ endif()
 # runtime, HMD, per-eye resolution, and available graphics-binding extensions. It creates NO session
 # and needs NO graphics API or Dawn, so it builds on any WebGPU backend / OS and links only the OpenXR
 # loader. The real per-eye render bridge (Dawn ↔ D3D12 XR swapchain) needs the Dawn backend built on
-# D3D12 — enable both:  cmake -S native -B build-win-vr -DSAILSIM_WEBGPU_BACKEND=DAWN -DSAILSIM_VR=ON
-# (SAILSIM_VR is declared up by the WebGPU-backend section, which applies the Dawn→D3D12 patch.)
+# D3D12 — both are the DEFAULT on Windows (see the WebGPU-backend section, which also applies the
+# Dawn→D3D12 patch), so a plain `cmake -S native -B build-win` builds the unified flat+VR binary.
 if (SAILSIM_VR)
   # Upstream loader + headers (like wgpu-native, we fetch the source of truth, not a
   # redistribution). Builds the openxr_loader target; disable its tests/api-layers.
@@ -802,6 +814,10 @@ if (SAILSIM_VR)
       message(STATUS "SAILSIM_VR ON — real VR bridge folded into sailsim_native (SAILSIM_VR_REAL)")
     endif()
   endif()
+endif()  # SAILSIM_VR
+
+# The DXC runtime DLLs are a DAWN-D3D12 need, not a VR one — key on the backend so a Windows Dawn
+# build can never silently drop to D3D11 (white screen) just because VR was switched off.
 
   # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile
   # WGSL→HLSL→DXIL and to SIGN the DXIL (D3D12 rejects unsigned shaders). It needs a SIGNED release
@@ -821,7 +837,7 @@ if (SAILSIM_VR)
   #   3. copy_if_different it next to the exe.
   #   4. If nothing is found we copy NOTHING (never the SDK dll) — a hand-placed dxil.dll next to the
   #      exe then STICKS across builds.
-  if (WIN32)
+  if (WIN32 AND SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN" AND TARGET sailsim_native)
     set(SAILSIM_DXC_DLL_DIR "" CACHE PATH
         "Override folder with a release dxcompiler.dll + dxil.dll (~1.8/1.9.x) for Dawn D3D12")
     set(_dxc_vendored "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/x64")
@@ -852,4 +868,3 @@ if (SAILSIM_VR)
                       "overwrite a dxil.dll you place next to the exe, so a manual copy there now sticks.")
     endif()
   endif()
-endif()

@@ -8833,6 +8833,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // right-handed camera puts east on the LEFT — mirroring the coastlines and
     // reversing apparent A/D turn direction. Safe: every pipeline culls None.
     proj[0][0] = -proj[0][0];
+    // Displayed aspect of THIS eye's frame (VR: tanHalfW/tanHalfH — the wide frame is shown
+    // across the near-square FOV, so pixel aspect lies about on-screen shape). 0 = flat mode,
+    // post.wgsl falls back to the resolution aspect. Keeps the telescope lens circular in VR.
+    float vrLensAspect = 0.0f;
 #ifdef SAILSIM_HAVE_VR
     if (vrMode && vrActive) {
       // Head-tracked per-eye camera: worldEye = k/m camera ∘ XR eye pose (seated LOCAL space,
@@ -8861,6 +8865,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, nearZ, 40000.0f);
       proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
       vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));
+      vrLensAspect = tanHalfW / tanHalfH;   // the frame's DISPLAYED aspect (telescope roundness)
     }
 #endif
     glm::mat4 taaCurVP = proj * viewM;   // UNJITTERED view-proj (TAA camera-motion reprojection)
@@ -9500,8 +9505,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         { teleCX, teleCY, (teleHeld && sailing) ? 0.255f : 0.0f, 5.0f },
         // Auto-exposure: enabled, key (mid-grey target), min & max exposure multipliers.
         { aeOn, 0.20f, 0.45f, 2.2f },
-        // 3D-LUT grade: enabled, blend amount.
-        { lutOn, 0.85f, 0.0f, 0.0f },
+        // 3D-LUT grade: enabled, blend amount; z = the eye's displayed aspect (VR lens roundness).
+        { lutOn, 0.85f, vrLensAspect, 0.0f },
       };
       wgpuQueueWriteBuffer(queue, postFx.postUbuf, 0, postU, sizeof(postU));
       glm::vec4 bp(bloomThreshold, 0.0f, 0.0f, 0.0f);

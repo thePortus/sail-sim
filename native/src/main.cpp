@@ -4715,8 +4715,6 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       // World labels: project with THIS frame's freshly-located head pose (the k/m camera base is
       // one frame old but slow-moving) so town/ship nameplates stay pinned during head motion —
       // the old one-frame pose lag made them jostle and snap back.
-      static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
-      static bool vrLabelBaseValid = false;
       if (vrActive && vrLabelBaseValid) {
         float pa[7], fa[4], pb[7], fb[4];
         vr::eyeCamera(vrB, 0, pa, fa);
@@ -4746,6 +4744,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
     if (frame == 1) std::fprintf(stderr, "[boot] frame 1: top of loop\n");
+    // VR world-label camera state: the k/m base + projection saved by the camera block (per
+    // frame), consumed at the next loop top with the freshly-located head pose. Loop-scope so
+    // both sites (different blocks) see it.
+    static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
+    static bool vrLabelBaseValid = false;
+    (void)vrLabelBase; (void)vrLabelProj; (void)vrLabelBaseValid;
     // Offline VR-HUD layout preview (SAILSIM_VR_PREVIEW=1): jump straight to the sailing HUD so
     // headless screenshots can iterate the cockpit layout without a login or a headset.
     if (frame == 30 && std::getenv("SAILSIM_VR_PREVIEW")) appState = AppState::Sailing;

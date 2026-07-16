@@ -3236,18 +3236,19 @@ int main(int argc, char** argv) {
   const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
   long frame = 0;
 
-  // VR: SAILSIM_VR set → head-tracked stereo via OpenXR (Windows + Dawn only). Opt-in; absent =
-  // the normal desktop game. (SAILSIM_HAVE_VR is the compile-time gate; the env var is the runtime one.)
-#ifdef SAILSIM_HAVE_VR
-  const bool vrMode = std::getenv("SAILSIM_VR") != nullptr;
-#else
-  const bool vrMode = false;
-#endif
+  // VR: flat desktop is ALWAYS the default. When a headset is detected (async OpenXR probe), a
+  // toolbar button appears; clicking it enters head-tracked stereo AT RUNTIME, and a VR-cluster
+  // button (or the runtime ending the session) drops back to flat — MSFS-style. SAILSIM_VR is the
+  // dev harness: enter VR straight from launch (and fail loudly if the bridge can't come up).
+  // The VR code compiles on every platform (vr.cpp stubs off Windows+Dawn); it can only ACTIVATE
+  // where the real bridge exists.
+  const bool vrEnvForced = std::getenv("SAILSIM_VR") != nullptr;
+  bool vrMode = false;   // runtime state — flipped by enterVr()/exitVr() (defined before the loop)
 
   // VR HUD layout on flat builds: SAILSIM_VR_PREVIEW=1 renders the VR dashboard layout in a
   // normal window (no headset, no bridge) so it can be iterated via headless screenshots.
-  const bool vrHudActive = vrMode || std::getenv("SAILSIM_VR_PREVIEW") != nullptr;
-  (void)vrHudActive;
+  const bool vrPreview = std::getenv("SAILSIM_VR_PREVIEW") != nullptr;
+  bool vrHudActive = vrPreview;   // == vrMode || vrPreview; kept in sync by enterVr()/exitVr()
 
   // Headless screenshot: SAILSIM_SHOT=out.png renders to a chosen frame (default
   // 240, so the FFT/foam has settled), writes a PNG, and exits.
@@ -3439,18 +3440,6 @@ int main(int argc, char** argv) {
     std::printf("[spike] window %dx%d (work area seed %dx%d)\n", gw, gh, winW, winH); }
   glfwSetScrollCallback(window, onScroll);   // mouse-wheel zoom
 
-#ifdef SAILSIM_HAVE_VR
-  // VR: the player has a headset on and can't see the desktop — never require clicking the
-  // (white) window to make input work. Grab keyboard focus outright, and CONFINE the visible
-  // cursor to the window (GLFW 3.4 captured mode) so every click/keystroke reaches the game.
-  if (vrMode) {
-    glfwFocusWindow(window);
-#ifdef GLFW_CURSOR_CAPTURED
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_CAPTURED);
-#endif
-  }
-#endif
-
   // 1. Instance
   WGPUInstanceDescriptor instanceDesc = {};
   WGPUInstance instance = wgpuCreateInstance(&instanceDesc);
@@ -3481,22 +3470,22 @@ int main(int argc, char** argv) {
   // 4. Device + queue
   WGPUDeviceDescriptor deviceDesc = {};
   deviceDesc.label = "sailsim-device";
-#ifdef SAILSIM_HAVE_VR
-  // VR needs the DXGI shared-handle features on the device (SharedTextureMemory interop). Request
-  // them UNCONDITIONALLY on Dawn-D3D12 (don't gate on wgpuAdapterHasFeature — it reported false for
-  // the game's surface-compatible adapter, so the feature was silently skipped and every
-  // shared-texture call failed). If truly unsupported, requestDevice returns null and we fail loudly.
-  // `vrFeats` must outlive requestDeviceSync.
+  // VR needs the DXGI shared-handle features on the device (SharedTextureMemory interop), and VR
+  // can now be entered at RUNTIME — so on Dawn-D3D12 request them up front, unconditionally (don't
+  // gate on wgpuAdapterHasFeature — it reported false for the game's surface-compatible adapter,
+  // so the feature was silently skipped and every shared-texture call failed). If the device
+  // request fails we retry WITHOUT them below and just disable VR. `vrFeats` must outlive
+  // requestDeviceSync. vrDeviceReady gates the headset probe + toolbar VR button.
+  bool vrDeviceReady = false;
+#if defined(WEBGPU_BACKEND_DAWN) && defined(_WIN32)
   std::vector<WGPUFeatureName> vrFeats;
-  if (vrMode) {
-    bool hasTex = wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
-    bool hasFence = wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedFenceDXGISharedHandle);
+  if (adapterProps.backendType == WGPUBackendType_D3D12) {
     vrFeats.push_back(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
     vrFeats.push_back(WGPUFeatureName_SharedFenceDXGISharedHandle);
     deviceDesc.requiredFeatureCount = vrFeats.size();
     deviceDesc.requiredFeatures = vrFeats.data();
-    std::printf("[vr] requesting shared-handle device features (adapter reports tex=%d fence=%d)\n",
-                (int)hasTex, (int)hasFence);
+    vrDeviceReady = true;
+    std::printf("[vr] requesting shared-handle device features (VR available at runtime)\n");
   }
 #endif
   // Device LOSS does not go through the uncaptured-error callback — without this handler a D3D12
@@ -3510,6 +3499,16 @@ int main(int argc, char** argv) {
   deviceDesc.deviceLostCallback = onDeviceLost;
 #endif
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);
+#if defined(WEBGPU_BACKEND_DAWN) && defined(_WIN32)
+  if (!device && vrDeviceReady) {
+    // The adapter refused the shared-handle features — run flat-only rather than not at all.
+    std::fprintf(stderr, "[vr] device rejected shared-handle features — VR disabled, retrying flat\n");
+    vrDeviceReady = false;
+    deviceDesc.requiredFeatureCount = 0;
+    deviceDesc.requiredFeatures = nullptr;
+    device = requestDeviceSync(adapter, &deviceDesc);
+  }
+#endif
   if (!device) return EXIT_FAILURE;
 
   wgpuDeviceSetUncapturedErrorCallback(device, onDeviceError, nullptr);
@@ -3520,11 +3519,10 @@ int main(int argc, char** argv) {
   WGPUQueue queue = wgpuDeviceGetQueue(device);
 
 #ifdef SAILSIM_HAVE_VR
-  // P1 step 2b: the VR bridge is created just before the render loop (it needs the game's render
-  // targets set up first) and driven INSIDE the loop — the game renders its frame into an
-  // intermediate, which is blitted into both eyes. Created here as null; see the loop below.
+  // The VR bridge is created by enterVr() (defined just before the render loop) whenever the
+  // player clicks the toolbar VR button — or immediately at startup when SAILSIM_VR forces it.
   vr::Bridge* vrB = nullptr;
-  if (vrMode) std::printf("[vr] SAILSIM_VR set — VR mode (per-eye scene, mono bring-up).\n");
+  if (vrEnvForced) std::printf("[vr] SAILSIM_VR set — entering VR at launch (dev harness).\n");
 #endif
 
   // Phase 0 criteria 3-5: prove the ocean-FFT WGSL runs natively and reads back.
@@ -3569,11 +3567,18 @@ int main(int argc, char** argv) {
   surfaceConfig.presentMode = WGPUPresentMode_Fifo;   // vsync
   surfaceConfig.alphaMode = alphaMode;
   if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
-  // In VR we never present to the window, and having an active D3D12 window swapchain alongside the
-  // OpenXR runtime's swapchains on the same device removes the device ("GPU device disconnected").
-  // Skip configuring the window swapchain entirely in VR (the format was already read from caps above).
-  if (!vrMode)
-    wgpuSurfaceConfigure(surface, &surfaceConfig);
+  // While IN VR the window is only a spectator mirror, and a FIFO (vsynced) present would block
+  // the render loop to the MONITOR's refresh — juddering the headset, which paces the loop itself
+  // via xrWaitFrame. Pick the best non-blocking mode now; enterVr()/exitVr() swap it in and out.
+  WGPUPresentMode vrMirrorPresent = WGPUPresentMode_Fifo;
+  for (size_t i = 0; i < caps.presentModeCount; ++i) {
+    if (caps.presentModes[i] == WGPUPresentMode_Immediate) { vrMirrorPresent = WGPUPresentMode_Immediate; break; }
+    if (caps.presentModes[i] == WGPUPresentMode_Mailbox) vrMirrorPresent = WGPUPresentMode_Mailbox;
+  }
+  // Always configure the window swapchain: flat desktop is the default, and while IN VR the
+  // window doubles as the desktop mirror. (The old "window swapchain + XR swapchains remove the
+  // device" belief was a misdiagnosis of the UTF-8 shader-embed device loss, since fixed.)
+  wgpuSurfaceConfigure(surface, &surfaceConfig);
 
   // Everything below goes to stderr (unbuffered) because the Windows console silently drops
   // stdout under the asset-load flood. On Dawn, tick once so any surface-configure validation
@@ -3787,11 +3792,8 @@ int main(int argc, char** argv) {
   // startup override. Feedback/sharpen/clamp stay env-only (advanced tuning; baked defaults otherwise).
   if (std::getenv("SAILSIM_TAA")) userCfg.gfx.taa = true;
   if (const char* uenv = std::getenv("SAILSIM_TAA_UPSCALE")) userCfg.gfx.taaUpscale = std::clamp((float)atof(uenv), 0.5f, 1.0f);
-#ifdef SAILSIM_HAVE_VR
-  // VR renders per-eye with its own reprojection in the compositor; TAA's single shared history
-  // (and jitter) fights both. Hard-off in VR regardless of settings/env.
-  if (vrMode) userCfg.gfx.taa = false;
-#endif
+  // (VR hard-disables TAA at runtime — see enterVr(): the compositor's per-eye reprojection
+  //  fights TAA's single shared history + jitter. Restored by exitVr().)
   if (std::getenv("SAILSIM_SSR")) userCfg.gfx.ssr = true;   // startup override for screen-space reflections
   if (std::getenv("SAILSIM_NOFOG")) userCfg.gfx.fog = false;   // disable aerial fog
   if (std::getenv("SAILSIM_VOLUMETRIC")) userCfg.gfx.volumetric = true;   // startup override for sun shafts
@@ -4444,69 +4446,66 @@ int main(int argc, char** argv) {
   ImGui::CreateContext();
   ImGuiIO& imio = ImGui::GetIO();
   imio.IniFilename = nullptr;   // don't write imgui.ini next to the exe
-#ifdef SAILSIM_HAVE_VR
-  // VR: the OS cursor is drawn by Windows on the DESKTOP — it is never part of our rendered
-  // frame, so it's invisible in the headset and the player can't aim clicks. ImGui's software
-  // cursor draws INTO the frame (thus into the eyes) at the exact position clicks land.
-  if (vrMode) imio.MouseDrawCursor = true;
-#endif
-  // Embedded fonts, rasterised at the display's content scale for crisp text on
-  // HiDPI; FontGlobalScale then brings them back to logical size. Inter is the
-  // default (body) font; Cinzel is kept for titles (pushed where needed).
-  float uiScaleX = 1.0f, uiScaleY = 1.0f;
-  glfwGetWindowContentScale(window, &uiScaleX, &uiScaleY);
-  if (uiScaleX <= 0.0f) uiScaleX = 1.0f;
-  // VR: angular text size is what fails in-headset — rasterize the fonts larger (crisp glyphs,
-  // not a blurry FontGlobalScale upscale). Auto-resize HUD windows grow with the text.
-  if (vrHudActive) {
-    const char* v = std::getenv("SAILSIM_VR_FONT");
-    uiScaleX *= v ? std::clamp((float)std::atof(v), 1.0f, 2.0f) : 1.35f;
-  }
-  ImFontConfig fontCfg;
-  fontCfg.FontDataOwnedByAtlas = false;   // static arrays — don't let ImGui free them
-  imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_BODY, (int)UI_FONT_BODY_SIZE,
-                                   18.0f * uiScaleX, &fontCfg);   // default = body
-  // Merge Font Awesome into the body atlas so ICON_FA_* glyphs render inline with
-  // text. Kept a touch smaller + baseline-nudged so icons sit centred on the line.
-  {
+  // Embedded fonts, rasterised at the display's content scale for crisp text on HiDPI;
+  // FontGlobalScale then brings them back to logical size. Inter is the default (body) font;
+  // Cinzel is kept for titles (pushed where needed). REBUILDABLE because entering/leaving VR at
+  // runtime re-rasterizes at the VR factor (crisp glyphs, not a blurry FontGlobalScale upscale —
+  // angular text size is what fails in-headset); auto-resize HUD windows grow with the text.
+  ImFont* fontTitle = nullptr;
+  bool imguiBackendReady = false;   // ImGui_ImplWGPU up → font rebuilds must invalidate its objects
+  auto rebuildFonts = [&](bool vrScale) {
+    float sx = 1.0f, sy = 1.0f;
+    glfwGetWindowContentScale(window, &sx, &sy);
+    if (sx <= 0.0f) sx = 1.0f;
+    float fscale = sx;
+    if (vrScale) {
+      const char* v = std::getenv("SAILSIM_VR_FONT");
+      fscale *= v ? std::clamp((float)std::atof(v), 1.0f, 2.0f) : 1.35f;
+    }
+    ImGuiIO& fio = ImGui::GetIO();
+    fio.Fonts->Clear();
+    ImFontConfig fontCfg;
+    fontCfg.FontDataOwnedByAtlas = false;   // static arrays — don't let ImGui free them
+    fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_BODY, (int)UI_FONT_BODY_SIZE,
+                                    18.0f * fscale, &fontCfg);   // default = body
+    // Merge Font Awesome into the body atlas so ICON_FA_* glyphs render inline with
+    // text. Kept a touch smaller + baseline-nudged so icons sit centred on the line.
     static const ImWchar kIconRange[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
     ImFontConfig icfg;
     icfg.FontDataOwnedByAtlas = false;
     icfg.MergeMode = true;
     icfg.PixelSnapH = true;
-    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * uiScaleX);   // small baseline nudge for inline text icons
-    imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_ICONS, (int)UI_FONT_ICONS_SIZE,
-                                     15.0f * uiScaleX, &icfg, kIconRange);
-  }
-  ImFont* fontTitle = imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_TITLE, (int)UI_FONT_TITLE_SIZE,
-                                                       30.0f * uiScaleX, &fontCfg);
-  {
-    float contentScale = 1.0f, cs2 = 1.0f;
-    glfwGetWindowContentScale(window, &contentScale, &cs2);
-    if (contentScale <= 0.0f) contentScale = 1.0f;
-    imio.FontGlobalScale = 1.0f / contentScale;   // undo HiDPI only — the VR factor stays in effect
-  }
+    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * fscale);   // small baseline nudge for inline text icons
+    fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_ICONS, (int)UI_FONT_ICONS_SIZE,
+                                    15.0f * fscale, &icfg, kIconRange);
+    fontTitle = fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_TITLE, (int)UI_FONT_TITLE_SIZE,
+                                                30.0f * fscale, &fontCfg);
+    fio.FontGlobalScale = 1.0f / sx;   // undo HiDPI only — the VR factor stays in effect
+    // Drop the backend's font texture + pipeline; the next NewFrame lazily rebuilds them from
+    // the new atlas. Only valid BETWEEN frames — VR toggles apply at the top of the loop.
+    if (imguiBackendReady) ImGui_ImplWGPU_InvalidateDeviceObjects();
+  };
+  rebuildFonts(vrHudActive);
   styleSailSim();
   ImGui_ImplGlfw_InitForOther(window, true);
-#ifdef SAILSIM_HAVE_VR
-  // VR: replace the backend's cursor callback with one that feeds ImGui PRE-TRANSFORMED positions
-  // (window px → virtual UI screen px). See gVrUi* above. The game's own input reads the cursor
-  // via glfwGetCursorPos directly, so camera/orbit aiming is unaffected.
-  if (vrMode) {
-    glfwSetCursorPosCallback(window, [](GLFWwindow*, double x, double y) {
-      ImGuiIO& gio = ImGui::GetIO();
-      if (gVrUiActive) gio.AddMousePosEvent(((float)x - gVrUiOffX) * gVrUiSclX,
-                                            ((float)y - gVrUiOffY) * gVrUiSclY);
-      else gio.AddMousePosEvent((float)x, (float)y);
-    });
-  }
-#endif
+  // Replace the backend's cursor callback with one that, while the VR virtual UI screen is live,
+  // feeds ImGui PRE-TRANSFORMED positions (window px → virtual UI screen px; see gVrUi*), and
+  // otherwise defers to the backend's own handler. Installed permanently (VR toggles at runtime);
+  // the game's own input reads the cursor via glfwGetCursorPos directly, so aiming is unaffected.
+  static GLFWcursorposfun prevCursorCb = nullptr;
+  prevCursorCb = glfwSetCursorPosCallback(window, [](GLFWwindow* wnd, double x, double y) {
+    if (gVrUiActive) ImGui::GetIO().AddMousePosEvent(((float)x - gVrUiOffX) * gVrUiSclX,
+                                                     ((float)y - gVrUiOffY) * gVrUiSclY);
+    else if (prevCursorCb) prevCursorCb(wnd, x, y);
+    else ImGui::GetIO().AddMousePosEvent((float)x, (float)y);
+  });
   ImGui_ImplWGPU_InitInfo imguiInit;
   imguiInit.Device = device;
   imguiInit.NumFramesInFlight = 3;
   imguiInit.RenderTargetFormat = surfaceFormat;
   imguiInit.DepthStencilFormat = WGPUTextureFormat_Undefined;   // UI draws in the resolve pass (no depth)
   ImGui_ImplWGPU_Init(&imguiInit);
+  imguiBackendReady = true;
 
   // App state: sign in first, then sail. The ocean scene renders behind the login.
   enum class AppState { Login, Connecting, Sailing };
@@ -4589,16 +4588,30 @@ int main(int argc, char** argv) {
   bool prevAnchoredEdge = false;
 
 #ifdef SAILSIM_HAVE_VR
-  // ── VR setup (P1 2b) ──────────────────────────────────────────────────────────────────
-  // In VR the game renders its whole frame into `vrFrameTex` (window-res, swapchain format) exactly
-  // as it would the window, then a fullscreen blit copies it into each eye's (sRGB) target. Mono for
-  // now (both eyes get the same image); per-eye stereo cameras come next.
+  // ── VR runtime toggle ─────────────────────────────────────────────────────────────────
+  // Flat desktop is the default. A background headset probe (vr::headsetPresent, re-tried while
+  // absent) lights up a toolbar VR button; clicking it calls enterVr() — OpenXR session + the
+  // frame intermediate `vrFrameTex` (window-res, swapchain format) that each eye pass renders
+  // into, blitted per eye into the (sRGB) XR targets and mirrored to the desktop window.
+  // exitVr() (VR-cluster button, or the runtime ending the session) tears it all down again.
   WGPUTexture vrFrameTex = nullptr; WGPUTextureView vrFrameView = nullptr;
-  WGPURenderPipeline vrBlitPipe = nullptr; WGPUBindGroup vrBlitBind = nullptr;
-  if (vrMode) {
-    vrB = vr::create(instance, device);
-    if (!vrB) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return EXIT_FAILURE; }
+  WGPURenderPipeline vrBlitPipe = nullptr; WGPUBindGroup vrBlitBind = nullptr;   // eye blit (gamma decode)
+  WGPURenderPipeline vrMirrorPipe = nullptr;                                     // desktop mirror (raw copy)
+  WGPUBindGroupLayout vrBlitBGL = nullptr; WGPUSampler vrBlitSamp = nullptr;
+  bool vrRunning = false, vrExit = false;      // session state
+  bool vrCursorSeeded = false;                 // warp the cursor into the visible HUD once per entry
+  bool vrTaaBefore = false;                    // the player's TAA setting, restored on exit
+  bool vrEnterRequested = false, vrExitRequested = false;   // applied at the top of the loop
+  bool vrHeadsetPresent = false;
+  std::future<bool> vrProbeFuture;
+  double vrNextProbe = 0.0;
 
+  // (Re)create the frame intermediate + its bind group at the CURRENT window size, and keep the
+  // mono-layer aspect in sync. Called on entry and again if the window resizes while in VR.
+  auto buildVrFrameTargets = [&]() {
+    if (vrBlitBind)  { wgpuBindGroupRelease(vrBlitBind);   vrBlitBind = nullptr; }
+    if (vrFrameView) { wgpuTextureViewRelease(vrFrameView); vrFrameView = nullptr; }
+    if (vrFrameTex)  { wgpuTextureRelease(vrFrameTex);      vrFrameTex = nullptr; }
     WGPUTextureDescriptor td = {};
     td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
     td.dimension = WGPUTextureDimension_2D;
@@ -4607,13 +4620,35 @@ int main(int argc, char** argv) {
     td.mipLevelCount = 1; td.sampleCount = 1;
     vrFrameTex = wgpuDeviceCreateTexture(device, &td);
     vrFrameView = wgpuTextureCreateView(vrFrameTex, nullptr);
+    WGPUBindGroupEntry bge[2] = {};
+    bge[0].binding = 0; bge[0].textureView = vrFrameView;
+    bge[1].binding = 1; bge[1].sampler = vrBlitSamp;
+    WGPUBindGroupDescriptor bgd = {}; bgd.layout = vrBlitBGL; bgd.entryCount = 2; bgd.entries = bge;
+    vrBlitBind = wgpuDeviceCreateBindGroup(device, &bgd);
+    if (vrB) vr::setMonoLayerAspect(vrB, (float)curW / (float)curH);   // undo the blit's aspect squish
+  };
+
+  auto releaseVrObjects = [&]() {
+    if (vrBlitBind)   { wgpuBindGroupRelease(vrBlitBind);        vrBlitBind = nullptr; }
+    if (vrFrameView)  { wgpuTextureViewRelease(vrFrameView);     vrFrameView = nullptr; }
+    if (vrFrameTex)   { wgpuTextureRelease(vrFrameTex);          vrFrameTex = nullptr; }
+    if (vrBlitPipe)   { wgpuRenderPipelineRelease(vrBlitPipe);   vrBlitPipe = nullptr; }
+    if (vrMirrorPipe) { wgpuRenderPipelineRelease(vrMirrorPipe); vrMirrorPipe = nullptr; }
+    if (vrBlitSamp)   { wgpuSamplerRelease(vrBlitSamp);          vrBlitSamp = nullptr; }
+    if (vrBlitBGL)    { wgpuBindGroupLayoutRelease(vrBlitBGL);   vrBlitBGL = nullptr; }
+  };
+
+  auto enterVr = [&]() -> bool {
+    if (vrMode) return true;
+    vrB = vr::create(instance, device);
+    if (!vrB) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return false; }
 
     // Eye-blit transfer: vrFrameTex holds display-encoded values and the eye is an sRGB target
     // that re-encodes on write — so decode to linear first. VR compositors disagree about sRGB
     // handling ("everything looks darker"), so the decode is selectable WITHOUT a rebuild:
     //   SAILSIM_VR_GAMMA=off   pass the encoded bytes through (compositor already expects encoded)
     //   SAILSIM_VR_GAMMA=2.2   decode with a plain power curve
-    //   (default)              exact inverse-sRGB decode
+    //   (default)              pow 1.6 — user-tuned in-headset (VDXR + Quest 3) to match flat
     std::string blitFs;
     {
       const char* gv = std::getenv("SAILSIM_VR_GAMMA");
@@ -4625,10 +4660,11 @@ int main(int argc, char** argv) {
                       "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(%.4f)), 1.0);", std::atof(gv));
         blitFs = gb;
       } else {
-        // User-tuned in-headset (VDXR + Quest 3): 1.6 matches the flat game's brightness.
         blitFs = "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.6)), 1.0);";
       }
     }
+    // fs = the gamma-decoding eye blit; fsRaw = untouched copy for the desktop mirror window
+    // (the window shows the same display-encoded bytes the flat game would).
     const std::string VR_BLIT_WGSL = std::string(R"(
 @group(0) @binding(0) var srcTex: texture_2d<f32>;
 @group(0) @binding(1) var srcSamp: sampler;
@@ -4640,6 +4676,9 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   o.uv = vec2<f32>((xy.x + 1.0) * 0.5, (1.0 - xy.y) * 0.5);
   return o;
 }
+@fragment fn fsRaw(i: VO) -> @location(0) vec4<f32> {
+  return vec4<f32>(textureSample(srcTex, srcSamp, i.uv).rgb, 1.0);
+}
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
   let c = textureSample(srcTex, srcSamp, i.uv).rgb;
 )") + blitFs + "\n}\n";
@@ -4650,8 +4689,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     bgle[1].binding = 1; bgle[1].visibility = WGPUShaderStage_Fragment;
     bgle[1].sampler.type = WGPUSamplerBindingType_Filtering;
     WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 2; bgld.entries = bgle;
-    WGPUBindGroupLayout blitBGL = wgpuDeviceCreateBindGroupLayout(device, &bgld);
-    WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &blitBGL;
+    vrBlitBGL = wgpuDeviceCreateBindGroupLayout(device, &bgld);
+    WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &vrBlitBGL;
     WGPUPipelineLayout blitPL = wgpuDeviceCreatePipelineLayout(device, &pld);
     WGPUColorTargetState cts = {}; cts.format = vr::eyeFormat(vrB); cts.writeMask = WGPUColorWriteMask_All;
     WGPUFragmentState fs = {}; fs.module = blitMod; fs.entryPoint = "fs"; fs.targetCount = 1; fs.targets = &cts;
@@ -4662,22 +4701,68 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
     rpd.fragment = &fs;
     vrBlitPipe = wgpuDeviceCreateRenderPipeline(device, &rpd);
+    // Same shader, raw fragment, window format → the desktop-mirror pipeline.
+    WGPUColorTargetState mcts = {}; mcts.format = surfaceFormat; mcts.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState mfs = {}; mfs.module = blitMod; mfs.entryPoint = "fsRaw"; mfs.targetCount = 1; mfs.targets = &mcts;
+    rpd.fragment = &mfs;
+    vrMirrorPipe = wgpuDeviceCreateRenderPipeline(device, &rpd);
 
     WGPUSamplerDescriptor smp = {};
     smp.magFilter = WGPUFilterMode_Linear; smp.minFilter = WGPUFilterMode_Linear;
     smp.addressModeU = WGPUAddressMode_ClampToEdge; smp.addressModeV = WGPUAddressMode_ClampToEdge;
     smp.addressModeW = WGPUAddressMode_ClampToEdge; smp.maxAnisotropy = 1;
-    WGPUSampler blitSamp = wgpuDeviceCreateSampler(device, &smp);
-    WGPUBindGroupEntry bge[2] = {};
-    bge[0].binding = 0; bge[0].textureView = vrFrameView;
-    bge[1].binding = 1; bge[1].sampler = blitSamp;
-    WGPUBindGroupDescriptor bgd = {}; bgd.layout = blitBGL; bgd.entryCount = 2; bgd.entries = bge;
-    vrBlitBind = wgpuDeviceCreateBindGroup(device, &bgd);
-    vr::setMonoLayerAspect(vrB, (float)curW / (float)curH);   // undo the blit's aspect squish
-    std::printf("[vr] frame intermediate %ux%u + blit pipeline ready (eye fmt %d)\n",
+    vrBlitSamp = wgpuDeviceCreateSampler(device, &smp);
+    buildVrFrameTargets();
+
+    // The player has a headset on and can't see the desktop — grab keyboard focus outright and
+    // confine the visible cursor to the window (GLFW 3.4 captured mode) so input can't escape.
+    glfwFocusWindow(window);
+#ifdef GLFW_CURSOR_CAPTURED
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_CAPTURED);
+#endif
+    // ImGui's software cursor draws INTO the frame (thus into the eyes) at the exact position
+    // clicks land — the OS cursor is on the desktop and invisible in-headset.
+    ImGui::GetIO().MouseDrawCursor = true;
+    // The compositor's per-eye reprojection fights TAA's single shared history + jitter.
+    vrTaaBefore = userCfg.gfx.taa;
+    userCfg.gfx.taa = false;
+    // Mirror presents must never block the loop on the monitor's vsync — the headset paces us.
+    if (vrMirrorPresent != surfaceConfig.presentMode) {
+      surfaceConfig.presentMode = vrMirrorPresent;
+      wgpuSurfaceConfigure(surface, &surfaceConfig);
+    }
+    vrRunning = false; vrExit = false; vrCursorSeeded = false;
+    vrMode = true; vrHudActive = true;
+    rebuildFonts(true);   // re-rasterize larger for in-headset angular size
+    std::printf("[vr] entered VR — frame intermediate %ux%u, eye fmt %d\n",
                 curW, curH, (int)vr::eyeFormat(vrB));
-  }
-  bool vrRunning = false, vrExit = false;   // session state
+    return true;
+  };
+
+  auto exitVr = [&]() {
+    if (!vrMode) return;
+#ifdef _WIN32
+    ClipCursor(nullptr);   // release the cursor confinement
+#endif
+    if (vrB) { vr::destroy(vrB); vrB = nullptr; }   // clean xrDestroySession — VD recovers
+    releaseVrObjects();
+    vrMode = false; vrHudActive = vrPreview;
+    vrRunning = false; vrExit = false;
+    gVrUiActive = false;   // cursor callback + confinement fall back to plain window coords
+    ImGui::GetIO().MouseDrawCursor = false;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    userCfg.gfx.taa = vrTaaBefore;
+    if (surfaceConfig.presentMode != WGPUPresentMode_Fifo) {   // restore vsync for flat play
+      surfaceConfig.presentMode = WGPUPresentMode_Fifo;
+      wgpuSurfaceConfigure(surface, &surfaceConfig);
+    }
+    rebuildFonts(vrPreview);
+    std::fprintf(stderr, "[vr] exited VR — back to the flat desktop\n");
+  };
+
+  // Dev harness: SAILSIM_VR enters VR straight from launch and fails LOUDLY (headless test runs
+  // must not silently continue flat).
+  if (vrEnvForced && !enterVr()) return EXIT_FAILURE;
 #endif
 
   // 6. Render loop: reflection pass, then sky + ocean + ship.
@@ -4690,6 +4775,29 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     static bool vrLabelBaseValid = false;
     (void)vrLabelBase; (void)vrLabelProj; (void)vrLabelBaseValid;
 #ifdef SAILSIM_HAVE_VR
+    // Headset presence: an async probe (throwaway XrInstance + xrGetSystem on a worker thread —
+    // never a frame hitch) at startup, re-tried every 10 s while absent. When it lands true the
+    // toolbar's VR button appears (MSFS-style: flat is the default, VR is opted into in-game).
+    if (vrDeviceReady && !vrHeadsetPresent && !vrMode) {
+      if (vrProbeFuture.valid()) {
+        if (vrProbeFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+          vrHeadsetPresent = vrProbeFuture.get();
+          vrProbeFuture = {};
+          if (vrHeadsetPresent) std::fprintf(stderr, "[vr] headset detected — VR button enabled\n");
+        }
+      } else if (glfwGetTime() >= vrNextProbe) {
+        vrNextProbe = glfwGetTime() + 10.0;
+        vrProbeFuture = std::async(std::launch::async, [] { return vr::headsetPresent(); });
+      }
+    }
+    // Apply queued VR toggles between frames only — enter/exit rebuilds the font atlas and the
+    // ImGui backend objects, which must never happen mid-ImGui-frame.
+    if (vrExitRequested)  { vrExitRequested = false; exitVr(); }
+    if (vrEnterRequested) {
+      vrEnterRequested = false;
+      if (!enterVr()) vrHeadsetPresent = false;   // probe again — the runtime/HMD went away
+    }
+
     // VR: pace to the compositor + open per-eye access. vrActive = we have a frame to render+submit.
     bool vrActive = false;
     if (vrMode) {
@@ -4716,31 +4824,37 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
 #endif
       vr::poll(vrB, vrRunning, vrExit);
-      if (vrExit) break;
-      if (vrRunning) vrActive = vr::beginFrame(vrB);
-      // World labels: project with THIS frame's freshly-located head pose (the k/m camera base is
-      // one frame old but slow-moving) so town/ship nameplates stay pinned during head motion —
-      // the old one-frame pose lag made them jostle and snap back.
-      if (vrActive && vrLabelBaseValid) {
-        float pa[7], fa[4], pb[7], fb[4];
-        vr::eyeCamera(vrB, 0, pa, fa);
-        vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
-        static const bool nmL = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
-        glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
-        const glm::quat qc = nmL ? glm::quat(pa[6], pa[3], pa[4], pa[5])
-                                 : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
-        if (!nmL) pc.x = -pc.x;
-        const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
-        const glm::mat4 camC = glm::inverse(vrLabelBase) * poseC;
-        lastViewProj = vrLabelProj * glm::inverse(camC);
-        lastEye = glm::vec3(camC[3]);
-      }
       if (vr::lost(vrB)) {
         // Unrecoverable D3D12 device removal. Exit the loop instead of spinning on a dead
         // session forever — the clean vr::destroy below releases the XR session so Virtual
         // Desktop recovers without a reboot, and the process actually exits.
         std::fprintf(stderr, "[vr] device lost — exiting cleanly (see [device-LOST]/error lines above)\n");
         break;
+      }
+      if (vrExit) {
+        // The runtime ended the session (headset off, Virtual Desktop closed...): drop back to
+        // the flat desktop game instead of quitting — VR is a mode now, not the process.
+        std::fprintf(stderr, "[vr] runtime ended the session — leaving VR\n");
+        exitVr();
+      } else {
+        if (vrRunning) vrActive = vr::beginFrame(vrB);
+        // World labels: project with THIS frame's freshly-located head pose (the k/m camera base
+        // is one frame old but slow-moving) so town/ship nameplates stay pinned during head
+        // motion — the old one-frame pose lag made them jostle and snap back.
+        if (vrActive && vrLabelBaseValid) {
+          float pa[7], fa[4], pb[7], fb[4];
+          vr::eyeCamera(vrB, 0, pa, fa);
+          vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
+          static const bool nmL = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+          glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
+          const glm::quat qc = nmL ? glm::quat(pa[6], pa[3], pa[4], pa[5])
+                                   : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
+          if (!nmL) pc.x = -pc.x;
+          const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
+          const glm::mat4 camC = glm::inverse(vrLabelBase) * poseC;
+          lastViewProj = vrLabelProj * glm::inverse(camC);
+          lastEye = glm::vec3(camC[3]);
+        }
       }
     }
 #endif
@@ -4783,10 +4897,13 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (w > 0 && h > 0 && (winChanged || scaleChanged)) {
       curW = (uint32_t)w; curH = (uint32_t)h;
       rW = wantRW; rH = wantRH;
-      if (winChanged && !vrMode) {   // VR never configures the window swapchain (device-loss guard)
+      if (winChanged) {
         surfaceConfig.width = curW; surfaceConfig.height = curH;
         wgpuSurfaceConfigure(surface, &surfaceConfig);
       }
+#ifdef SAILSIM_HAVE_VR
+      if (vrMode && vrFrameTex) buildVrFrameTargets();   // the VR intermediate + mirror track the window
+#endif
       wgpuTextureViewRelease(depthView);
       wgpuTextureViewRelease(depthReadView);
       wgpuTextureRelease(depthTex);
@@ -4997,10 +5114,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = vrUiVh / vrUiH;
         gVrUiBoxW = vrUiW; gVrUiBoxH = vrUiH;
         gVrUiActive = true;
-        static bool vrCursorSeeded = false;
         if (!vrCursorSeeded) {   // The OS cursor starts wherever it was on the desktop — often
           vrCursorSeeded = true; // outside the visible UI. WARP it to the HUD centre and tell
                                   // ImGui, so the in-headset cursor is visible from frame one.
+                                  // (Reset by enterVr — re-seeds on every VR entry.)
           glfwSetCursorPos(window, vrUiOffX + vrUiW * 0.5f, vrUiOffY + vrUiH * 0.5f);
           ImGui::GetIO().AddMousePosEvent(960.0f, vrUiVh * 0.5f);
         }
@@ -5273,6 +5390,14 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           mapExpanded = !mapExpanded;
         ImGui::SameLine();
         if (iconBtn(ICON_FA_BOXES_STACKED, "Cargo hold (I)", showInventory)) showInventory = !showInventory;
+#ifdef SAILSIM_HAVE_VR
+        // MSFS-style: the VR button only exists once a headset is detected; the game always
+        // launches flat and the player opts into VR from here.
+        if (vrHeadsetPresent && !vrMode) {
+          ImGui::SameLine();
+          if (iconBtn(ICON_FA_VR_CARDBOARD, "Enter VR (headset detected)", false)) vrEnterRequested = true;
+        }
+#endif
         ImGui::SameLine();
         if (iconBtn(ICON_FA_GEAR, "Settings", settingsOpen)) { settingsOpen = !settingsOpen; escMenu = false; }
         ImGui::End();
@@ -5895,10 +6020,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           vrBarTop = tp.y - 8.0f;
         }
 
-        // ── Three round tool buttons under the status line. ──
+        // ── Round tool buttons under the status line (camera, chart, settings — plus exit-VR
+        //    while a real VR session is live). ──
         {
+          const float nTools = vrMode ? 4.0f : 3.0f;
           ImGui::SetNextWindowPos(arcPt(270.0f, 0.60f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-          ImGui::SetNextWindowSize(ImVec2(3.0f * 58.0f + 12.0f, 64.0f));
+          ImGui::SetNextWindowSize(ImVec2(nTools * 58.0f + 12.0f, 64.0f));
           ImGui::Begin("##vrtools", nullptr, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize |
                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
           auto roundBtn = [&](const char* icon, const char* tip, bool active) -> bool {
@@ -5925,6 +6052,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             mapExpanded = !mapExpanded;
           ImGui::SameLine(0.0f, 10.0f);
           if (roundBtn(ICON_FA_GEAR, "Settings", settingsOpen)) { settingsOpen = !settingsOpen; escMenu = false; }
+#ifdef SAILSIM_HAVE_VR
+          if (vrMode) {
+            ImGui::SameLine(0.0f, 10.0f);
+            if (roundBtn(ICON_FA_VR_CARDBOARD, "Exit VR — back to the desktop", true)) vrExitRequested = true;
+          }
+#endif
           }
           ImGui::End();
         }
@@ -11039,6 +11172,41 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 #ifdef SAILSIM_HAVE_VR
     if (vrMode) {
       vr::endFrame(vrB);   // EndAccess + copy each eye's RT into the XR image + submit the XR frame
+      // Desktop mirror: blit the frame intermediate (the last-rendered eye) to the window, so the
+      // desktop shows what the player sees instead of a frozen frame. Best-effort — a minimised
+      // window just skips it. SAILSIM_VR_MIRROR=off disables (e.g. to A/B a swapchain conflict).
+      static const bool vrMirrorOff = [] {
+        const char* v = std::getenv("SAILSIM_VR_MIRROR");
+        return v && std::strcmp(v, "off") == 0;
+      }();
+      if (!vrMirrorOff && vrMirrorPipe && vrBlitBind) {
+        WGPUSurfaceTexture mst = {};
+        wgpuSurfaceGetCurrentTexture(surface, &mst);
+        if (mst.texture) {
+          WGPUTextureView mv = wgpuTextureCreateView(mst.texture, nullptr);
+          WGPUCommandEncoderDescriptor med = {};
+          WGPUCommandEncoder menc = wgpuDeviceCreateCommandEncoder(device, &med);
+          WGPURenderPassColorAttachment mca = colorAttach0();
+          mca.view = mv; mca.loadOp = WGPULoadOp_Clear; mca.storeOp = WGPUStoreOp_Store;
+          mca.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+          WGPURenderPassDescriptor mrp = {}; mrp.colorAttachmentCount = 1; mrp.colorAttachments = &mca;
+          WGPURenderPassEncoder mp = wgpuCommandEncoderBeginRenderPass(menc, &mrp);
+          wgpuRenderPassEncoderSetPipeline(mp, vrMirrorPipe);
+          wgpuRenderPassEncoderSetBindGroup(mp, 0, vrBlitBind, 0, nullptr);
+          wgpuRenderPassEncoderDraw(mp, 3, 1, 0, 0);
+          wgpuRenderPassEncoderEnd(mp);
+          wgpuRenderPassEncoderRelease(mp);
+          WGPUCommandBufferDescriptor mcd = {};
+          WGPUCommandBuffer mcb = wgpuCommandEncoderFinish(menc, &mcd);
+          wgpuQueueSubmit(queue, 1, &mcb);
+          wgpuCommandBufferRelease(mcb);
+          wgpuCommandEncoderRelease(menc);
+          wgpuTextureViewRelease(mv);
+#ifndef __EMSCRIPTEN__
+          wgpuSurfacePresent(surface);
+#endif
+        }
+      }
     } else
 #endif
     {

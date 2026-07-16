@@ -506,8 +506,14 @@ add_executable(sailsim_native
   src/cannon_fx.cpp
   src/prims.cpp
   src/stb_impl.cpp
+  src/vr.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
+
+# The VR code paths in main.cpp compile on EVERY platform (vr.cpp provides inert stubs when the
+# real OpenXR bridge isn't built) — this is what keeps the mac build honest about VR-touching
+# changes. The real bridge is selected by SAILSIM_VR_REAL in the SAILSIM_VR block below.
+target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_VR)
 
 # The Basis transcoder TU is third-party; don't fail it on our -Werror-ish flags.
 set_source_files_properties("${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
@@ -772,6 +778,7 @@ if (SAILSIM_VR)
       # `webgpu` brings <webgpu/webgpu.h> + WEBGPU_BACKEND_DAWN; `dawn_native` brings
       # dawn::native::d3d12::GetD3D12Device + <dawn/native/D3D12Backend.h>. Add dawn-src/include
       # explicitly in case dawn_native doesn't propagate it as an INTERFACE include dir.
+      target_compile_definitions(sailsim_vr_spike PRIVATE SAILSIM_VR_REAL)   # real bridge, not stubs
       target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader webgpu dawn_native d3d12 dxgi)
       if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
         target_include_directories(sailsim_vr_spike PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
@@ -782,18 +789,17 @@ if (SAILSIM_VR)
       message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, own device)")
     endif()
 
-    # P1: fold the VR bridge into the GAME. Compile vr.cpp into sailsim_native and link the VR deps
-    # (only meaningful on the Dawn backend — VR needs the D3D12 OpenXR binding + Dawn's device).
-    # SAILSIM_HAVE_VR gates the VR code paths in main.cpp.
+    # P1: fold the REAL VR bridge into the GAME (vr.cpp is compiled everywhere — see the main
+    # target — so this branch only switches it from the stubs to the OpenXR implementation and
+    # links the VR deps; Dawn backend only, since VR needs the D3D12 binding + Dawn's device).
     if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN" AND TARGET sailsim_native)
-      target_sources(sailsim_native PRIVATE src/vr.cpp)
       target_link_libraries(sailsim_native PRIVATE openxr_loader dawn_native d3d12 dxgi)
       target_include_directories(sailsim_native PRIVATE "${openxr_SOURCE_DIR}/include")
       if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
         target_include_directories(sailsim_native PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
       endif()
-      target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_VR)
-      message(STATUS "SAILSIM_VR ON — VR bridge folded into sailsim_native (SAILSIM_HAVE_VR)")
+      target_compile_definitions(sailsim_native PRIVATE SAILSIM_VR_REAL)
+      message(STATUS "SAILSIM_VR ON — real VR bridge folded into sailsim_native (SAILSIM_VR_REAL)")
     endif()
   endif()
 

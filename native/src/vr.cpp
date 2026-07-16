@@ -5,7 +5,9 @@
 
 #include "vr.hpp"
 
-#if defined(_WIN32) && defined(WEBGPU_BACKEND_DAWN)
+// SAILSIM_VR_REAL (CMake, Windows+Dawn+SAILSIM_VR only) selects the real OpenXR bridge; every
+// other build compiles the inert stubs at the bottom, so all platforms build the same call sites.
+#if defined(SAILSIM_VR_REAL)
 
 #include <windows.h>
 #include <d3d12.h>
@@ -448,6 +450,54 @@ void destroy(Bridge* b) {
   delete b;
 }
 
+bool headsetPresent() {
+  // Throwaway instance + xrGetSystem — no extensions, no session, no graphics binding, so this
+  // is safe to run repeatedly on a worker thread. xrCreateInstance fails when no runtime is
+  // active; xrGetSystem returns FORM_FACTOR_UNAVAILABLE when the runtime is up but no HMD is.
+  XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
+  std::snprintf(ci.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", "sailsim");
+  ci.applicationInfo.applicationVersion = 1;
+  std::snprintf(ci.applicationInfo.engineName, XR_MAX_ENGINE_NAME_SIZE, "%s", "sailsim");
+  ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
+  XrInstance inst = XR_NULL_HANDLE;
+  if (XR_FAILED(xrCreateInstance(&ci, &inst)) || inst == XR_NULL_HANDLE) return false;
+  XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
+  sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+  XrSystemId sys = XR_NULL_SYSTEM_ID;
+  const bool present = XR_SUCCEEDED(xrGetSystem(inst, &sgi, &sys)) && sys != XR_NULL_SYSTEM_ID;
+  xrDestroyInstance(inst);
+  return present;
+}
+
 }  // namespace vr
 
-#endif  // _WIN32 && WEBGPU_BACKEND_DAWN
+#else  // !SAILSIM_VR_REAL ──────────────────────────────────────────────────────
+
+// Inert stubs: no headset is ever present and create() always fails, so the game's VR code
+// paths compile (and get type-checked) on macOS/Linux/wgpu-native builds but can never run.
+namespace vr {
+
+struct Bridge {};
+
+bool headsetPresent() { return false; }
+Bridge* create(WGPUInstance, WGPUDevice) { return nullptr; }
+void destroy(Bridge*) {}
+void poll(Bridge*, bool& running, bool& exitRequested) { running = false; exitRequested = false; }
+bool lost(Bridge*) { return false; }
+bool beginFrame(Bridge*) { return false; }
+int eyeCount(Bridge*) { return 0; }
+WGPUTextureView eyeTarget(Bridge*, int) { return nullptr; }
+uint32_t eyeWidth(Bridge*, int) { return 0; }
+uint32_t eyeHeight(Bridge*, int) { return 0; }
+WGPUTextureFormat eyeFormat(Bridge*) { return WGPUTextureFormat_RGBA8UnormSrgb; }
+void eyeCamera(Bridge*, int, float pose7[7], float fov4[4]) {
+  pose7[0] = pose7[1] = pose7[2] = pose7[3] = pose7[4] = pose7[5] = 0.0f; pose7[6] = 1.0f;
+  fov4[0] = fov4[1] = fov4[2] = fov4[3] = 0.0f;
+}
+void setMonoLayerAspect(Bridge*, float) {}
+void setEyeSubmitFov(Bridge*, int, float, float) {}
+void endFrame(Bridge*) {}
+
+}  // namespace vr
+
+#endif  // SAILSIM_VR_REAL

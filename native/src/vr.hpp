@@ -1,8 +1,11 @@
 // ── VR bridge (OpenXR ⇄ Dawn-D3D12) ──────────────────────────────────────────
 //
 // The proven P0 bridge, extracted from src/vr_spike.cpp so both the spike and the
-// game can drive it. Windows + Dawn only (VR needs the D3D12 OpenXR binding and
-// Dawn's ID3D12Device). On any other build this header is inert.
+// game can drive it. The REAL implementation (vr.cpp, SAILSIM_VR_REAL) is Windows +
+// Dawn only (VR needs the D3D12 OpenXR binding and Dawn's ID3D12Device); every other
+// build gets inert stubs — headsetPresent() is false and create() is null, so the
+// game's VR code paths compile (and are exercised by the compiler) on every platform
+// but can never activate off Windows.
 //
 // Lifecycle (per frame):
 //   vr::poll(b, running, exit);              // session state machine
@@ -19,14 +22,18 @@
 
 #pragma once
 
-#if defined(_WIN32) && defined(WEBGPU_BACKEND_DAWN)
-
 #include <cstdint>
 #include <webgpu/webgpu.h>
 
 namespace vr {
 
 struct Bridge;   // opaque; defined in vr.cpp
+
+// Lightweight headset probe: a throwaway XrInstance + xrGetSystem(HMD), no session, no
+// graphics binding. Safe to call repeatedly (e.g. every few seconds from a worker thread)
+// to light up an "enter VR" button when a headset/runtime appears. False when there is no
+// active OpenXR runtime, no HMD, or on stub builds.
+bool headsetPresent();
 
 // Create the OpenXR session on the app's Dawn device (extracts its ID3D12Device). Returns null if
 // there's no active runtime / HMD, the device lacks the shared-handle feature, or setup fails.
@@ -70,5 +77,3 @@ void setEyeSubmitFov(Bridge* b, int eye, float halfW, float halfH);
 void endFrame(Bridge* b);
 
 }  // namespace vr
-
-#endif  // _WIN32 && WEBGPU_BACKEND_DAWN

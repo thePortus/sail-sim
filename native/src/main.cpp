@@ -4683,6 +4683,12 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   // 6. Render loop: reflection pass, then sky + ocean + ship.
   std::fprintf(stderr, "[boot] render resources built; entering render loop\n");
   while (!glfwWindowShouldClose(window)) {
+    // VR world-label camera state: the k/m base + projection saved by the camera block each
+    // frame, consumed at the loop top (BEFORE everything else) with the freshly-located head
+    // pose. Declared first so every later block in the loop sees it.
+    static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
+    static bool vrLabelBaseValid = false;
+    (void)vrLabelBase; (void)vrLabelProj; (void)vrLabelBaseValid;
 #ifdef SAILSIM_HAVE_VR
     // VR: pace to the compositor + open per-eye access. vrActive = we have a frame to render+submit.
     bool vrActive = false;
@@ -4744,12 +4750,6 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
     if (frame == 1) std::fprintf(stderr, "[boot] frame 1: top of loop\n");
-    // VR world-label camera state: the k/m base + projection saved by the camera block (per
-    // frame), consumed at the next loop top with the freshly-located head pose. Loop-scope so
-    // both sites (different blocks) see it.
-    static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
-    static bool vrLabelBaseValid = false;
-    (void)vrLabelBase; (void)vrLabelProj; (void)vrLabelBaseValid;
     // Offline VR-HUD layout preview (SAILSIM_VR_PREVIEW=1): jump straight to the sailing HUD so
     // headless screenshots can iterate the cockpit layout without a login or a headset.
     if (frame == 30 && std::getenv("SAILSIM_VR_PREVIEW")) appState = AppState::Sailing;

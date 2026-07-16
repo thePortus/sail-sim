@@ -153,14 +153,27 @@ Developer ID, then rebuild with `-DSAILSIM_MACOS_SIGN_IDENTITY="Developer ID App
 (and add `--options runtime` to the codesign step in `native/CMakeLists.txt`), and run `notarytool` + `stapler` on
 the zip before uploading. A notarized build double-clicks cleanly with no `xattr` step.
 
-**On a Windows PC** (Visual Studio + CMake installed; run in PowerShell). The build drops
-`sailsim_native.exe` **and** `WinSparkle.dll` into the output folder — they must ship together:
+**On a Windows PC** (Visual Studio + CMake installed; run in PowerShell). Windows builds **one unified
+binary**: the Dawn WebGPU backend (D3D12) with OpenXR VR support compiled in — these are the CMake
+defaults on Windows, so no extra flags and no separate VR build tree. The game always launches as the
+normal flat desktop client; when a headset (Meta Link, Virtual Desktop, SteamVR — any OpenXR runtime) is
+detected, a VR button appears in the in-game toolbar and VR is entered/left at runtime, MSFS-style. Notes:
+
+- **Dawn builds from source** — the first configure + build takes a while (subsequent builds are
+  incremental). The signed DXC compiler DLLs Dawn needs at runtime are vendored in-repo
+  (`native/third_party/dxc`) and copied next to the exe automatically.
+- If you have a **stale `build-win` tree from the old wgpu-native/two-tree era, delete it first** — a
+  CMake cache keeps its old backend. (An existing `build-win-vr` tree is already this exact
+  configuration; it keeps working, but new checkouts only need `build-win`.)
+
+The build drops `sailsim_native.exe` **and** `WinSparkle.dll` into the output folder — they must ship
+together:
 
 ``` powershell
 cd native
 cmake -S . -B build-win -DSAILSIM_SERVER_HOST="your.server" -DSAILSIM_SERVER_PORT="443" -DSAILSIM_SERVER_TLS="ON" -DSAILSIM_SERVER_PATH="/api" -DSAILSIM_SPARKLE_FEED_URL_WIN="https://your.server/api/client/appcast-win.xml" -DSAILSIM_WINDOWS_GUI="ON" -DCMAKE_POLICY_VERSION_MINIMUM="3.5" -DSAILSIM_SPARKLE_PUBKEY="<your-public-key>"
 cmake --build build-win --config Release
-# Zip the whole output folder (.exe + WinSparkle.dll):
+# Zip the whole output folder (.exe + WinSparkle.dll + the DXC dlls):
 Compress-Archive -Path build-win\bin\Release\* -DestinationPath SailSim-<ver>-win.zip
 ```
 
@@ -190,13 +203,13 @@ zip and writes the feed:
 # on the Ubuntu host, for each platform you uploaded:
 docker cp /tmp/SailSim-<ver>-mac.zip sail-sim-nodejs:/tmp/
 docker exec -it sail-sim-nodejs \
-  node server/scripts/client-release.js publish \
+  node scripts/client-release.js publish \
     --platform mac --version <ver> --file /tmp/SailSim-<ver>-mac.zip \
     --base-url https://your.server/api/client
 
 docker cp /tmp/SailSim-<ver>-win.zip sail-sim-nodejs:/tmp/
 docker exec -it sail-sim-nodejs \
-  node server/scripts/client-release.js publish \
+  node scripts/client-release.js publish \
     --platform win --version <ver> --file /tmp/SailSim-<ver>-win.zip \
     --base-url https://your.server/api/client
 ```

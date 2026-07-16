@@ -121,17 +121,123 @@ FetchContent_MakeAvailable(stb)
 # (eliemichel/WebGPU-distribution wgpu-static-v0.19.4.1) shipped a webgpu.h whose
 # enum values were out of sync with the lib it bundled, which silently corrupts
 # texture formats. Fetching upstream guarantees header/lib agreement.
-set(SAILSIM_WEBGPU_BACKEND "WGPU" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
+# Windows ships ONE unified binary: Dawn (D3D12) + OpenXR compiled in, flat desktop by default
+# with VR as a runtime toggle (a headset lights up a VR button in the toolbar). So on Windows the
+# defaults are DAWN + SAILSIM_VR=ON — a plain `cmake -S . -B build-win` IS the release config; the
+# old two-tree workflow (wgpu-native build-win + separate build-win-vr) is obsolete. Other
+# platforms keep wgpu-native and VR stays off (vr.cpp compiles inert stubs there regardless).
+if (WIN32)
+  set(_sailsim_backend_default "DAWN")
+  set(_sailsim_vr_default ON)
+else()
+  set(_sailsim_backend_default "WGPU")
+  set(_sailsim_vr_default OFF)
+endif()
+set(SAILSIM_WEBGPU_BACKEND "${_sailsim_backend_default}" CACHE STRING "WebGPU backend: WGPU (prebuilt) or DAWN (source)")
+
+# VR (OpenXR) — ON by default on Windows (see above), opt-in elsewhere. Declared HERE (before the
+# backend fetch) because the VR render bridge needs Dawn built on D3D12 (see native/VR_PLAN.md),
+# which patches the Dawn fetch below. The probe + OpenXR loader are wired at the end of this file.
+option(SAILSIM_VR "Build the OpenXR VR probe + support" ${_sailsim_vr_default})
 
 if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
   # Dawn, from source, via Élie Michel's distribution. NOTE: on Apple Silicon this
   # still needs its vendored fuzzers (libprotobuf-mutator) disabled and an abseil
   # `-msse4.1`-on-arm64 issue resolved — see PORTING.md. Kept wired for later.
+  #
+  # Dawn UNCONDITIONALLY builds libprotobuf-mutator (third_party/CMakeLists.txt:
+  # `if(NOT TARGET libprotobuf-mutator) include(BUILD.cmake)`), a fuzzer-only dep that
+  # needs protobuf we never fetch (→ "google/protobuf/any.pb.h: No such file"). Pre-define
+  # the target as a stub so Dawn's guard skips it (nothing in a non-fuzzer build links it).
+  if (NOT TARGET libprotobuf-mutator)
+    add_library(libprotobuf-mutator INTERFACE)
+  endif()
+
   FetchContent_Declare(webgpu
     GIT_REPOSITORY https://github.com/eliemichel/WebGPU-distribution
     GIT_TAG        dawn-6512
     GIT_SHALLOW    ON)
-  FetchContent_MakeAvailable(webgpu)
+  if (SAILSIM_VR)
+    # ⚠ Build the VR/Dawn variant with CMake 3.x (3.28–3.31), NOT CMake 4.x: enabling D3D12 pulls in
+    # DirectX Shader Compiler (an old LLVM fork, chromium/6512) whose CMake uses `cmake_policy(SET
+    # CMP0051 OLD)` and `cmake_minimum_required(VERSION 2.8.8)` — both removed in CMake 4.0.
+    # `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` only covers the min-version part, not CMP0051. Use cmake 3.31.
+    #
+    # The distribution builds Vulkan-only Dawn on Windows (D3D12/D3D11 OFF). VR wants the D3D12
+    # OpenXR binding (it just takes an existing ID3D12Device — no Vulkan extension-injection). So
+    # populate the distribution, flip its FetchDawn.cmake backend flags to D3D12, then add it.
+    FetchContent_GetProperties(webgpu)
+    if (NOT webgpu_POPULATED)
+      FetchContent_Populate(webgpu)
+    endif()
+    # Patch EVERY configure (idempotent — the REPLACEs no-op once already flipped), so a reused build
+    # dir also gets D3D12, and add the subdir OUTSIDE the populate guard (it must run every configure).
+    set(_fd "${webgpu_SOURCE_DIR}/cmake/FetchDawn.cmake")
+    file(READ "${_fd}" _fdsrc)
+    string(REPLACE "set(DAWN_ENABLE_D3D11 OFF)" "set(DAWN_ENABLE_D3D11 ON)  # VR" _fdsrc "${_fdsrc}")
+    # Enable D3D12 AND build DXC: with DAWN_USE_BUILT_DXC OFF (Dawn's default) the dxc headers
+    # (dxcapi.h/IDxcCompiler3) are never put on the include path and the Windows 10 SDK doesn't ship
+    # them, so the D3D backend fails to compile; ON adds the headers, builds DXC, and links it (our
+    # compute shaders need DXC→DXIL at runtime too).
+    string(REPLACE "set(DAWN_ENABLE_D3D12 OFF)"
+                   "set(DAWN_ENABLE_D3D12 ON)  # VR\n\tset(DAWN_USE_BUILT_DXC ON)  # VR"
+                   _fdsrc "${_fdsrc}")
+    string(REPLACE "set(USE_VULKAN ON)"         "set(USE_VULKAN OFF) # VR"       _fdsrc "${_fdsrc}")
+    file(WRITE "${_fd}" "${_fdsrc}")
+    file(READ "${_fd}" _fdcheck)
+    if (NOT _fdcheck MATCHES "DAWN_ENABLE_D3D12 ON" OR NOT _fdcheck MATCHES "DAWN_USE_BUILT_DXC ON")
+      message(FATAL_ERROR "[vr] FAILED to patch Dawn to D3D12+DXC in ${_fd} — distribution strings changed?")
+    endif()
+    # The distribution's curated dep-fetch list (patch/tools/fetch_dawn_dependencies.py) is Vulkan-only
+    # and omits the DirectX Shader Compiler, so Dawn's D3D backend can't find dxcapi.h (IDxcCompiler3).
+    # Add the D3D deps so the D3D12 backend builds. (Idempotent — guarded on 'third_party/dxc'.)
+    set(_fdeps "${webgpu_SOURCE_DIR}/patch/tools/fetch_dawn_dependencies.py")
+    if (EXISTS "${_fdeps}")
+      file(READ "${_fdeps}" _dsrc)
+      if (NOT _dsrc MATCHES "third_party/dxc")
+        string(REPLACE "'third_party/abseil-cpp',"
+                       "'third_party/abseil-cpp',\n        'third_party/dxc',\n        'third_party/dxheaders',"
+                       _dsrc "${_dsrc}")
+        file(WRITE "${_fdeps}" "${_dsrc}")
+      endif()
+      file(READ "${_fdeps}" _dcheck)
+      if (NOT _dcheck MATCHES "third_party/dxc")
+        message(FATAL_ERROR "[vr] FAILED to add DXC to Dawn's fetch list in ${_fdeps}")
+      endif()
+    else()
+      message(WARNING "[vr] ${_fdeps} not found — DXC dep may be missing; D3D build could fail")
+    endif()
+    message(STATUS "============================================================")
+    message(STATUS "  [vr] Dawn D3D12 patch ACTIVE (D3D12 ON, Vulkan OFF, +DXC dep)")
+    message(STATUS "============================================================")
+    add_subdirectory("${webgpu_SOURCE_DIR}" "${webgpu_BINARY_DIR}")
+    # Dawn links the `dxcompiler` target for DXC, but this old DXC doesn't export its include dir as
+    # INTERFACE, so dawn_native's d3d sources can't find dxcapi.h (→ IDxcCompiler3 undeclared, cascading
+    # DAWN_TRY errors). Add the DXC headers to dawn_native explicitly. Layout: .../dxc/include/dxc/dxcapi.h,
+    # so add both the root (for `<dxc/dxcapi.h>`) and the dxc/ subdir (for `<dxcapi.h>`).
+    if (TARGET dawn_native)
+      set(_dxcinc "${CMAKE_BINARY_DIR}/_deps/dawn-src/third_party/dxc/include")
+      if (EXISTS "${_dxcinc}/dxc/dxcapi.h")
+        target_include_directories(dawn_native PRIVATE "${_dxcinc}" "${_dxcinc}/dxc")
+        message(STATUS "[vr] added DXC headers to dawn_native: ${_dxcinc}")
+      else()
+        message(WARNING "[vr] DXC headers not found at ${_dxcinc}/dxc/dxcapi.h — D3D build may fail")
+      endif()
+      # Dawn's d3d12 code does `#include <d3d12.h>` expecting the modern DirectX-Headers version (newer
+      # enums like D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE that the Win10 19041 SDK lacks), but the dep
+      # isn't wired to dawn_native. Prepend DirectX-Headers so its d3d12.h shadows the SDK's (superset,
+      # designed as a drop-in). include/directx holds d3d12.h; include holds directx/*.
+      set(_dxh "${CMAKE_BINARY_DIR}/_deps/dawn-src/third_party/dxheaders/include")
+      if (EXISTS "${_dxh}/directx/d3d12.h")
+        target_include_directories(dawn_native BEFORE PRIVATE "${_dxh}/directx" "${_dxh}")
+        message(STATUS "[vr] prepended DirectX-Headers to dawn_native: ${_dxh}")
+      else()
+        message(WARNING "[vr] DirectX-Headers not found at ${_dxh}/directx/d3d12.h — d3d12 enums may be missing")
+      endif()
+    endif()
+  else()
+    FetchContent_MakeAvailable(webgpu)
+  endif()
 else()
   # wgpu-native official prebuilt release. Classic-callback webgpu.h (matches
   # src/main.cpp) with the modern surface API.
@@ -280,8 +386,15 @@ function(embed_wgsl SRC VARNAME OUT)
   file(READ "${SRC}" _wgsl_src)
   # MSVC caps a single string literal at 16380 bytes (error C2026). Split the
   # shader into <16 KB raw-string chunks and let adjacent-literal concatenation
-  # rejoin them — no shader contains the )WGSL delimiter, so byte-splitting is
-  # safe (and UTF-8 comment bytes survive raw-string concatenation intact).
+  # rejoin them — no shader contains the )WGSL delimiter.
+  #
+  # ⚠ Split at the last NEWLINE before the limit, never at a raw byte offset: a byte
+  # cut can land MID-UTF-8-SEQUENCE (e.g. an — or … in a comment), making the generated
+  # header invalid UTF-8. MSVC then mis-decodes the source and the runtime WGSL string
+  # carries invalid bytes — Dawn's ShaderModule diagnostics fail to decode them and it
+  # DECLARES THE DEVICE LOST with the GPU healthy ("Device removed reason: S_OK"): the
+  # cause of the D3D12 white-screen / instant-device-loss saga. Newlines are ASCII, so a
+  # newline cut is always a valid UTF-8 boundary.
   string(LENGTH "${_wgsl_src}" _wgsl_len)
   set(_wgsl_body "")
   set(_wgsl_pos 0)
@@ -291,6 +404,11 @@ function(embed_wgsl SRC VARNAME OUT)
       set(_wgsl_take ${_wgsl_remain})
     else()
       set(_wgsl_take 8000)
+      string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_probe)
+      string(FIND "${_wgsl_probe}" "\n" _wgsl_nl REVERSE)
+      if(_wgsl_nl GREATER 0)
+        math(EXPR _wgsl_take "${_wgsl_nl} + 1")   # cut just after the last newline
+      endif()
     endif()
     string(SUBSTRING "${_wgsl_src}" ${_wgsl_pos} ${_wgsl_take} _wgsl_piece)
     string(APPEND _wgsl_body "R\"WGSL(${_wgsl_piece})WGSL\"\n")
@@ -400,8 +518,14 @@ add_executable(sailsim_native
   src/cannon_fx.cpp
   src/prims.cpp
   src/stb_impl.cpp
+  src/vr.cpp
   "${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
 )
+
+# The VR code paths in main.cpp compile on EVERY platform (vr.cpp provides inert stubs when the
+# real OpenXR bridge isn't built) — this is what keeps the mac build honest about VR-touching
+# changes. The real bridge is selected by SAILSIM_VR_REAL in the SAILSIM_VR block below.
+target_compile_definitions(sailsim_native PRIVATE SAILSIM_HAVE_VR)
 
 # The Basis transcoder TU is third-party; don't fail it on our -Werror-ish flags.
 set_source_files_properties("${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.cpp"
@@ -512,6 +636,12 @@ if (MSVC)
   # headers are dodged by not naming identifiers after them — see the sources.)
   target_compile_definitions(sailsim_native PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+  # Emit a PDB even in Release (/Zi + /DEBUG, but keep optimization) so the crash handler
+  # (sailsimCrashHandler) can print function names + file:line for frames in the exe. /OPT:REF,ICF
+  # undo /DEBUG's default of keeping unreferenced code. dbghelp provides SymFromAddr/SymGetLine.
+  target_compile_options(sailsim_native PRIVATE /Zi)
+  target_link_options(sailsim_native PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+  target_link_libraries(sailsim_native PRIVATE dbghelp version)   # version: DXC DLL probe (GetFileVersionInfo)
 else()
   target_compile_options(sailsim_native PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -619,3 +749,122 @@ elseif (WIN32)
 else()
   target_sources(sailsim_native PRIVATE src/updater_stub.cpp)
 endif()
+
+# ── VR (OpenXR) — opt-in, OFF by default ─────────────────────────────────────
+# See native/VR_PLAN.md. Head-tracked stereo via OpenXR; targeting OpenXR once makes
+# Meta Link, Virtual Desktop (VDXR), and SteamVR all work with no runtime-specific code.
+#
+# P0.0: a standalone probe (src/vr_probe.cpp) that brings up an OpenXR instance and reports the
+# runtime, HMD, per-eye resolution, and available graphics-binding extensions. It creates NO session
+# and needs NO graphics API or Dawn, so it builds on any WebGPU backend / OS and links only the OpenXR
+# loader. The real per-eye render bridge (Dawn ↔ D3D12 XR swapchain) needs the Dawn backend built on
+# D3D12 — both are the DEFAULT on Windows (see the WebGPU-backend section, which also applies the
+# Dawn→D3D12 patch), so a plain `cmake -S native -B build-win` builds the unified flat+VR binary.
+if (SAILSIM_VR)
+  # Upstream loader + headers (like wgpu-native, we fetch the source of truth, not a
+  # redistribution). Builds the openxr_loader target; disable its tests/api-layers.
+  set(BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+  set(BUILD_API_LAYERS  OFF CACHE BOOL "" FORCE)
+  set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(openxr
+    GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK
+    GIT_TAG        release-1.1.61
+    GIT_SHALLOW    ON)
+  FetchContent_MakeAvailable(openxr)
+
+  add_executable(sailsim_vr_probe src/vr_probe.cpp)
+  target_link_libraries(sailsim_vr_probe PRIVATE openxr_loader)
+  # openxr_loader usually propagates its include dir; add it explicitly in case it doesn't.
+  target_include_directories(sailsim_vr_probe PRIVATE "${openxr_SOURCE_DIR}/include")
+  message(STATUS "SAILSIM_VR ON — building sailsim_vr_probe (OpenXR ${openxr_SOURCE_DIR})")
+
+  # VR P0.1 increment 1: OpenXR D3D12 render spike (src/vr_spike.cpp). Solid-colour stereo eyes
+  # via a plain D3D12 device — NO Dawn / webgpu / DXC, so it builds in seconds and iterates without
+  # the Dawn rebuild. Windows-only (D3D12). Retires the "does OpenXR D3D12 reach the headset" risk
+  # before we wire Dawn's device (increment 2) + SharedTextureMemory (increment 3).
+  if (WIN32)
+    add_executable(sailsim_vr_spike src/vr_spike.cpp src/vr.cpp)   # vr.cpp: the shared VR bridge module
+    target_include_directories(sailsim_vr_spike PRIVATE "${openxr_SOURCE_DIR}/include")
+    if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN")
+      # Increment 2: link Dawn so the spike can drive OpenXR with Dawn's ID3D12Device.
+      # `webgpu` brings <webgpu/webgpu.h> + WEBGPU_BACKEND_DAWN; `dawn_native` brings
+      # dawn::native::d3d12::GetD3D12Device + <dawn/native/D3D12Backend.h>. Add dawn-src/include
+      # explicitly in case dawn_native doesn't propagate it as an INTERFACE include dir.
+      target_compile_definitions(sailsim_vr_spike PRIVATE SAILSIM_VR_REAL)   # real bridge, not stubs
+      target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader webgpu dawn_native d3d12 dxgi)
+      if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+        target_include_directories(sailsim_vr_spike PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+      endif()
+      message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, DAWN device)")
+    else()
+      target_link_libraries(sailsim_vr_spike PRIVATE openxr_loader d3d12 dxgi)
+      message(STATUS "SAILSIM_VR ON — building sailsim_vr_spike (OpenXR D3D12 render spike, own device)")
+    endif()
+
+    # P1: fold the REAL VR bridge into the GAME (vr.cpp is compiled everywhere — see the main
+    # target — so this branch only switches it from the stubs to the OpenXR implementation and
+    # links the VR deps; Dawn backend only, since VR needs the D3D12 binding + Dawn's device).
+    if (SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN" AND TARGET sailsim_native)
+      target_link_libraries(sailsim_native PRIVATE openxr_loader dawn_native d3d12 dxgi)
+      target_include_directories(sailsim_native PRIVATE "${openxr_SOURCE_DIR}/include")
+      if (EXISTS "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+        target_include_directories(sailsim_native PRIVATE "${CMAKE_BINARY_DIR}/_deps/dawn-src/include")
+      endif()
+      target_compile_definitions(sailsim_native PRIVATE SAILSIM_VR_REAL)
+      message(STATUS "SAILSIM_VR ON — real VR bridge folded into sailsim_native (SAILSIM_VR_REAL)")
+    endif()
+  endif()
+endif()  # SAILSIM_VR
+
+# The DXC runtime DLLs are a DAWN-D3D12 need, not a VR one — key on the backend so a Windows Dawn
+# build can never silently drop to D3D11 (white screen) just because VR was switched off.
+
+  # Dawn's D3D12 backend loads dxcompiler.dll + dxil.dll at RUNTIME (from the exe dir) to compile
+  # WGSL→HLSL→DXIL and to SIGN the DXIL (D3D12 rejects unsigned shaders). It needs a SIGNED release
+  # dxil.dll (>= 1.6); the Windows SDK's (10.0.19041.x) is too old → Dawn prints "DXC dlls were built,
+  # but are not available" and silently falls back to D3D11 (whose DXGI swapchain then no-ops → white
+  # screen). Dawn's own from-source DXC build does NOT produce a usable signed dxil.dll either.
+  #
+  # HISTORY OF PAIN (do not reintroduce): a previous POST_BUILD copied Dawn's BUILT dxil.dll (= the
+  # SDK's 10.0.x) next to the exe on EVERY build, which CLOBBERED any good dxil.dll placed there by
+  # hand — making it impossible to win by copying files. That fallback is deleted. We now:
+  #   1. Find a real release pair (dxil+dxcompiler) automatically, checking, in order:
+  #        a) -DSAILSIM_DXC_DLL_DIR=<dir> override
+  #        b) vendored in-repo:  native/third_party/dxc/bin/x64
+  #        c) the temp extract left by the download helper:  %TEMP%\dxc\bin\x64
+  #   2. Cache whatever we find INTO the repo (third_party/dxc/bin/x64) so it survives TEMP cleanup
+  #      and fresh build dirs (commit it once and every checkout works).
+  #   3. copy_if_different it next to the exe.
+  #   4. If nothing is found we copy NOTHING (never the SDK dll) — a hand-placed dxil.dll next to the
+  #      exe then STICKS across builds.
+  if (WIN32 AND SAILSIM_WEBGPU_BACKEND STREQUAL "DAWN" AND TARGET sailsim_native)
+    set(SAILSIM_DXC_DLL_DIR "" CACHE PATH
+        "Override folder with a release dxcompiler.dll + dxil.dll (~1.8/1.9.x) for Dawn D3D12")
+    set(_dxc_vendored "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/x64")
+    set(_dxc_dll_dir "")
+    foreach(_cand "${SAILSIM_DXC_DLL_DIR}" "${_dxc_vendored}" "$ENV{TEMP}/dxc/bin/x64" "$ENV{TMP}/dxc/bin/x64")
+      if (_cand AND EXISTS "${_cand}/dxil.dll" AND EXISTS "${_cand}/dxcompiler.dll")
+        set(_dxc_dll_dir "${_cand}")
+        break()
+      endif()
+    endforeach()
+    if (_dxc_dll_dir)
+      if (NOT _dxc_dll_dir STREQUAL _dxc_vendored)
+        file(COPY "${_dxc_dll_dir}/dxil.dll" "${_dxc_dll_dir}/dxcompiler.dll" DESTINATION "${_dxc_vendored}")
+        message(STATUS "[vr] cached release DXC DLLs from ${_dxc_dll_dir} into ${_dxc_vendored} (commit them to keep)")
+        set(_dxc_dll_dir "${_dxc_vendored}")
+      endif()
+      add_custom_command(TARGET sailsim_native POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_dxc_dll_dir}/dxcompiler.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_dxc_dll_dir}/dxil.dll" "$<TARGET_FILE_DIR:sailsim_native>"
+        COMMENT "Copying release DXC DLLs (${_dxc_dll_dir}) next to the exe for Dawn D3D12")
+      message(STATUS "[vr] DXC runtime DLLs: ${_dxc_dll_dir}")
+    else()
+      message(WARNING "[vr] No release DXC DLLs found (checked SAILSIM_DXC_DLL_DIR, third_party/dxc/bin/x64, "
+                      "%TEMP%/dxc/bin/x64). Dawn-D3D12 needs a signed dxil.dll >= 1.6 or it drops to D3D11 "
+                      "(white screen). Get one via third_party/dxc/bin/x64/README.md. The build will NOT "
+                      "overwrite a dxil.dll you place next to the exe, so a manual copy there now sticks.")
+    endif()
+  endif()

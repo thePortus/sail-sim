@@ -393,11 +393,16 @@ bool OceanFFT::sanityCheck() {
   while (!st.done) {
 #if defined(WEBGPU_BACKEND_WGPU)
     wgpuDevicePoll(_device, true, nullptr);
+#else
+    wgpuDeviceTick(_device);   // Dawn: pump the event loop so the map callback + submit resolve
 #endif
   }
+  // Guard the mapped pointer: if the map failed (e.g. the copy wasn't complete), GetConstMappedRange
+  // returns null and dereferencing it access-violates. (This is what crashed the Dawn-D3D12 backend
+  // before the tick above was added — the map never resolved.)
   const uint8_t* p = (const uint8_t*)wgpuBufferGetConstMappedRange(rb, 0, bytes);
   bool nonZero = false;
-  for (size_t i = 0; i < bytes && !nonZero; ++i) if (p[i] != 0) nonZero = true;
+  if (p) for (size_t i = 0; i < bytes && !nonZero; ++i) if (p[i] != 0) nonZero = true;
   wgpuBufferUnmap(rb);
   wgpuBufferRelease(rb);
   std::printf("[ocean-fft] displacement sanity: %s\n", nonZero ? "non-zero (waves present)" : "ALL ZERO");
@@ -436,6 +441,8 @@ void OceanFFT::readbackDisplacement() {
   if (_rbBusy) {
 #if defined(WEBGPU_BACKEND_WGPU)
     wgpuDevicePoll(_device, false, nullptr);   // NON-blocking: just pump callbacks
+#else
+    wgpuDeviceTick(_device);                   // Dawn: same, non-blocking event pump
 #endif
     if (_rbReady) {
       const uint16_t* p = (const uint16_t*)wgpuBufferGetConstMappedRange(_readback, 0, bytes);

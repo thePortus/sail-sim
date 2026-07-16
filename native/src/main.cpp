@@ -10,12 +10,31 @@
 // header differs, the two request helpers below and the surface-status check are the
 // only spots likely to need a one-line reconcile — see native/README.md.
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // crash handler (SetUnhandledExceptionFilter) — see sailsimCrashHandler()
+#include <dbghelp.h>   // symbolize the crash backtrace (function names + file:line, if a PDB is present)
+#include <winver.h>    // GetFileVersionInfo — DXC DLL probe (which dxil.dll/dxcompiler.dll loads + its version)
+#endif
+
 #include <webgpu/webgpu.h>
 #if defined(WEBGPU_BACKEND_WGPU)
 #include <webgpu/wgpu.h>   // wgpu-native extensions (e.g. wgpuDevicePoll)
 #endif
+#ifdef SAILSIM_HAVE_VR
+#include "vr.hpp"          // OpenXR ⇄ Dawn-D3D12 bridge (Windows+Dawn; head-tracked stereo)
+#endif
 #include <glfw3webgpu.h>
 #include <GLFW/glfw3.h>
+#if defined(_WIN32) && defined(SAILSIM_HAVE_VR)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // glfwGetWin32Window — VR confines the OS cursor to the window
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -138,6 +157,28 @@ static WGPUDevice requestDeviceSync(WGPUAdapter adapter, const WGPUDeviceDescrip
 static void onDeviceError(WGPUErrorType type, char const* message, void*) {
   std::fprintf(stderr, "[spike] uncaptured device error (%d): %s\n",
                (int)type, message ? message : "(no message)");
+}
+
+#ifdef SAILSIM_HAVE_VR
+// VR virtual-UI mouse transform (window px → virtual-screen px). Applied at the EVENT level via
+// our own GLFW cursor callback: the ImGui GLFW backend queues raw positions from its callback, so
+// transforming anywhere later (e.g. before NewFrame) is clobbered by the event queue — that was
+// the flickering cursor + dead clicks. Updated per frame from the UI box; identity until VR runs.
+static float gVrUiOffX = 0.0f, gVrUiOffY = 0.0f, gVrUiSclX = 1.0f, gVrUiSclY = 1.0f;
+static float gVrUiBoxW = 0.0f, gVrUiBoxH = 0.0f;   // UI box size in window px (cursor confinement)
+static bool  gVrUiActive = false;
+#endif
+
+// Zero-init color attachment with depthSlice handled correctly for BOTH backends. Dawn's
+// webgpu.h has a depthSlice field where 0 means "slice 0 of a 3D attachment" — INVALID for 2D
+// targets (every pass here); it must be WGPU_DEPTH_SLICE_UNDEFINED. wgpu-native v0.19 has no
+// such field (nor the macro), where plain zero-init is correct. Use this for every attachment.
+static inline WGPURenderPassColorAttachment colorAttach0() {
+  WGPURenderPassColorAttachment ca{};
+#ifdef WGPU_DEPTH_SLICE_UNDEFINED
+  ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+#endif
+  return ca;
 }
 
 // Mouse-wheel accumulator (GLFW only delivers scroll via callback, not polling).
@@ -1439,13 +1480,25 @@ static Ocean createOcean(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat c
 
 // Procedural gradient sky drawn as a full-screen triangle (no vertex buffer).
 // Unit vector FROM origin TOWARD the sun for a game hour (0..24) — port of the
-// client's scene.service computeSunDir: a smooth sine arc (sunrise h=6, noon h=12,
-// sunset h=18). The X term is negated so the sun rises in the east (+X) / sets in
-// the west (-X), matching the world's cardinal convention. Drives the sky scatter,
-// sun disc, and (blended with the moon) all scene lighting so they stay consistent.
+// client's scene.service computeSunDir — long SUMMER day: the sun is up from DAY_START
+// to DAY_END (16 h daylight / 8 h night) on a broad, high arc, instead of a symmetric
+// 12/12. Elevation is a sine over the (asymmetric) day + night spans, so it's smooth and
+// CONTINUOUS at sunrise/sunset (both cross the horizon at 0), peaks +1 at midday (~13:00)
+// and dips -1 in the middle of the shorter night. The X term is negated so the sun rises
+// in the east (+X) / sets in the west (-X), matching the world's cardinal convention.
+// Drives the sky scatter, sun disc, and (blended with the moon) all scene lighting —
+// golden hour, fog, dayK etc. all key off the elevation, so they follow automatically.
 static glm::vec3 computeSunDir(float gameHours) {
   const float PI = glm::pi<float>();
-  float elev  = std::sin(((gameHours - 6.0f) / 12.0f) * PI);
+  const float DAY_START = 5.0f, DAY_END = 21.0f;   // sunrise / sunset hour (match the client!)
+  float elev;
+  if (gameHours >= DAY_START && gameHours <= DAY_END) {
+    elev = std::sin(PI * (gameHours - DAY_START) / (DAY_END - DAY_START));   // 0 → +1 → 0, long day
+  } else {
+    const float nightLen = 24.0f - (DAY_END - DAY_START);
+    const float nh = gameHours < DAY_START ? (gameHours + 24.0f - DAY_END) : (gameHours - DAY_END);
+    elev = -std::sin(PI * nh / nightLen);                                    // 0 → -1 → 0, short night
+  }
   float az    = (gameHours / 24.0f) * 2.0f * PI - PI;
   float horiz = std::sqrt(std::max(0.0f, 1.0f - elev * elev));
   return glm::normalize(glm::vec3(-horiz * std::sin(az), elev, horiz * std::cos(az)));
@@ -2277,7 +2330,11 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
                         u.center.z + u.right.y * c.x * size);
   var o : VSOut;
   o.position = u.viewProj * vec4<f32>(world, 1.0);
-  o.uv = vec2<f32>(c.x + 0.5, 0.5 - c.y);
+  // u runs 1->0 along camera-right: the engine's X-MIRRORED projection (proj[0][0] flip) shows
+  // the +right quad edge on the screen LEFT, so the baked atlas cell (authored unmirrored, like
+  // the browser shows it) must be flipped to match — else every ship reads bow-for-stern from
+  // the side (the real hulls pass through the mirror; the baked texture content does not).
+  o.uv = vec2<f32>(0.5 - c.x, 0.5 - c.y);
   return o;
 }
 @fragment
@@ -2380,7 +2437,9 @@ fn vs_main(@builtin(vertex_index) vi : u32, @location(0) inst : vec4<f32>) -> VS
   let world = vec3<f32>(inst.x + u.cam.z * c.x * size, inst.y + ly, inst.z + u.cam.w * c.x * size);
   var o : VSOut;
   o.position = u.viewProj * vec4<f32>(world, 1.0);
-  o.uv = vec2<f32>(c.x + 0.5, 1.0 - c.y);
+  // u flipped for the X-mirrored projection (see the ship impostor) so the baked sprite matches
+  // the near real-geometry buildings it cross-fades with at the LOD band.
+  o.uv = vec2<f32>(0.5 - c.x, 1.0 - c.y);
   o.haze = 1.0 - exp(-pow(d * 0.00009, 2.0));
   return o;
 }
@@ -2499,6 +2558,8 @@ static void captureSurface(WGPUDevice device, WGPUQueue queue, WGPUTexture tex,
   while (!st.done) {
 #if defined(WEBGPU_BACKEND_WGPU)
     wgpuDevicePoll(device, true, nullptr);
+#else
+    wgpuDeviceTick(device);   // Dawn: pump the event loop so the map callback resolves
 #endif
   }
   const uint8_t* mapped = (const uint8_t*)wgpuBufferGetConstMappedRange(rb, 0, bufSize);
@@ -3070,14 +3131,111 @@ static Clouds createClouds(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat
   return c;
 }
 
+#ifdef _WIN32
+// Basename of the module owning a code address (which DLL/exe a frame is in). No DbgHelp/PDB needed —
+// enough to tell whether a crash is inside dxcompiler.dll (a shader DXC choked on) vs the exe
+// (our code or the static-linked dawn_native/tint).
+static const char* sailsimModuleForAddr(void* addr) {
+  static char name[MAX_PATH];
+  HMODULE mod = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         (LPCSTR)addr, &mod) && GetModuleFileNameA(mod, name, MAX_PATH)) {
+    const char* b = name;
+    for (const char* p = name; *p; ++p) { if (*p == '\\' || *p == '/') { b = p + 1; } }
+    return b;
+  }
+  return "?";
+}
+static LONG WINAPI sailsimCrashHandler(EXCEPTION_POINTERS* ep) {
+  HANDLE proc = GetCurrentProcess();
+  SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+  SymInitialize(proc, nullptr, TRUE);   // resolves names from sailsim_native.pdb if it's beside the exe
+  void* fault = ep->ExceptionRecord->ExceptionAddress;
+  std::fprintf(stderr, "\n[crash] exception 0x%08lx at %p in %s\n",
+               (unsigned long)ep->ExceptionRecord->ExceptionCode, fault, sailsimModuleForAddr(fault));
+  void* frames[32];
+  USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
+  char symBuf[sizeof(SYMBOL_INFO) + 512];
+  SYMBOL_INFO* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+  sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+  sym->MaxNameLen = 511;
+  for (USHORT i = 0; i < n; ++i) {
+    const char* mod = sailsimModuleForAddr(frames[i]);
+    DWORD64 disp = 0;
+    if (SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[i]), &disp, sym)) {
+      IMAGEHLP_LINE64 line{};
+      line.SizeOfStruct = sizeof(line);
+      DWORD lineDisp = 0;
+      if (SymGetLineFromAddr64(proc, reinterpret_cast<DWORD64>(frames[i]), &lineDisp, &line)) {
+        std::fprintf(stderr, "[crash]  #%02u %s!%s +0x%llx  (%s:%lu)\n",
+                     i, mod, sym->Name, (unsigned long long)disp, line.FileName, (unsigned long)line.LineNumber);
+      } else {
+        std::fprintf(stderr, "[crash]  #%02u %s!%s +0x%llx\n", i, mod, sym->Name, (unsigned long long)disp);
+      }
+    } else {
+      std::fprintf(stderr, "[crash]  #%02u %p  %s\n", i, frames[i], mod);
+    }
+  }
+  std::fflush(stderr);
+  return EXCEPTION_EXECUTE_HANDLER;   // log, then let the process terminate
+}
+
+// Probe a DXC runtime DLL the way Dawn's D3D12 backend will: LoadLibrary by bare name
+// (so we see the ACTUAL file the loader resolves — a stale C:\Windows\System32 copy would
+// hijack the one next to our exe), then report its on-disk version. Dawn requires
+// dxcompiler.dll + dxil.dll to load AND meet a minimum version; if either fails it prints
+// "DXC dlls were built, but are not available" and silently drops to D3D11 (no swapchain →
+// white screen). This tells us WHICH failure it is: wrong file, or too-old version.
+static void probeDxcDll(const char* name) {
+  HMODULE h = LoadLibraryA(name);
+  if (!h) {
+    std::fprintf(stderr, "[dxc-probe] LoadLibrary(\"%s\") FAILED (GetLastError=%lu)\n",
+                 name, (unsigned long)GetLastError());
+    return;
+  }
+  char path[MAX_PATH] = {0};
+  GetModuleFileNameA(h, path, MAX_PATH);
+  char ver[64] = "unknown";
+  DWORD ignored = 0;
+  DWORD vsz = GetFileVersionInfoSizeA(path, &ignored);
+  if (vsz) {
+    std::vector<char> buf(vsz);
+    if (GetFileVersionInfoA(path, 0, vsz, buf.data())) {
+      VS_FIXEDFILEINFO* ffi = nullptr; UINT ffiLen = 0;
+      if (VerQueryValueA(buf.data(), "\\", (void**)&ffi, &ffiLen) && ffi) {
+        std::snprintf(ver, sizeof(ver), "%u.%u.%u.%u",
+                      (unsigned)HIWORD(ffi->dwFileVersionMS), (unsigned)LOWORD(ffi->dwFileVersionMS),
+                      (unsigned)HIWORD(ffi->dwFileVersionLS), (unsigned)LOWORD(ffi->dwFileVersionLS));
+      }
+    }
+  }
+  std::fprintf(stderr, "[dxc-probe] \"%s\" -> %s  (version %s)\n", name, path, ver);
+  FreeLibrary(h);
+}
+#endif
+
 int main(int argc, char** argv) {
+  // SAILSIM_DIAG=<path>: redirect BOTH streams into a file from inside the app. The Windows
+  // console demonstrably drops whole stretches of output under load (diagnostics vanished from
+  // several captures), so shell-level piping can't be trusted for debugging. This can.
+  if (const char* diagPath = std::getenv("SAILSIM_DIAG")) {
+    if (std::freopen(diagPath, "w", stdout)) {}
+    if (std::freopen(diagPath, "a", stderr)) {}
+  }
   // Flush per line so `[spike] …` progress shows even when piped or killed.
 #ifdef _WIN32
+  SetUnhandledExceptionFilter(sailsimCrashHandler);   // dump the faulting module + backtrace on a hard crash
   // Windows MSVCRT treats _IOLBF as FULL buffering, so a hard crash (access
   // violation) discards a redirected log entirely. Go unbuffered so the last
   // line before a crash actually reaches the file — essential for diagnosing.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::setvbuf(stderr, nullptr, _IONBF, 0);
+#if defined(WEBGPU_BACKEND_DAWN)
+  // Dawn D3D12 loads these two at runtime; show exactly which files resolve + their versions
+  // so a search-order hijack or version-too-old (→ D3D11 fallback → white screen) is obvious.
+  probeDxcDll("dxcompiler.dll");
+  probeDxcDll("dxil.dll");
+#endif
 #else
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 #endif
@@ -3115,6 +3273,20 @@ int main(int argc, char** argv) {
   const char* maxFramesEnv = std::getenv("SAILSIM_MAX_FRAMES");
   const long maxFrames = maxFramesEnv ? std::atol(maxFramesEnv) : 0;
   long frame = 0;
+
+  // VR: flat desktop is ALWAYS the default. When a headset is detected (async OpenXR probe), a
+  // toolbar button appears; clicking it enters head-tracked stereo AT RUNTIME, and a VR-cluster
+  // button (or the runtime ending the session) drops back to flat — MSFS-style. SAILSIM_VR is the
+  // dev harness: enter VR straight from launch (and fail loudly if the bridge can't come up).
+  // The VR code compiles on every platform (vr.cpp stubs off Windows+Dawn); it can only ACTIVATE
+  // where the real bridge exists.
+  const bool vrEnvForced = std::getenv("SAILSIM_VR") != nullptr;
+  bool vrMode = false;   // runtime state — flipped by enterVr()/exitVr() (defined before the loop)
+
+  // VR HUD layout on flat builds: SAILSIM_VR_PREVIEW=1 renders the VR dashboard layout in a
+  // normal window (no headset, no bridge) so it can be iterated via headless screenshots.
+  const bool vrPreview = std::getenv("SAILSIM_VR_PREVIEW") != nullptr;
+  bool vrHudActive = vrPreview;   // == vrMode || vrPreview; kept in sync by enterVr()/exitVr()
 
   // Headless screenshot: SAILSIM_SHOT=out.png renders to a chosen frame (default
   // 240, so the FFT/foam has settled), writes a PNG, and exits.
@@ -3336,12 +3508,60 @@ int main(int argc, char** argv) {
   // 4. Device + queue
   WGPUDeviceDescriptor deviceDesc = {};
   deviceDesc.label = "sailsim-device";
+  // VR needs the DXGI shared-handle features on the device (SharedTextureMemory interop), and VR
+  // can now be entered at RUNTIME — so on Dawn-D3D12 request them up front, unconditionally (don't
+  // gate on wgpuAdapterHasFeature — it reported false for the game's surface-compatible adapter,
+  // so the feature was silently skipped and every shared-texture call failed). If the device
+  // request fails we retry WITHOUT them below and just disable VR. `vrFeats` must outlive
+  // requestDeviceSync. vrDeviceReady gates the headset probe + toolbar VR button.
+  bool vrDeviceReady = false;
+#if defined(WEBGPU_BACKEND_DAWN) && defined(_WIN32)
+  std::vector<WGPUFeatureName> vrFeats;
+  if (adapterProps.backendType == WGPUBackendType_D3D12) {
+    vrFeats.push_back(WGPUFeatureName_SharedTextureMemoryDXGISharedHandle);
+    vrFeats.push_back(WGPUFeatureName_SharedFenceDXGISharedHandle);
+    deviceDesc.requiredFeatureCount = vrFeats.size();
+    deviceDesc.requiredFeatures = vrFeats.data();
+    vrDeviceReady = true;
+    std::printf("[vr] requesting shared-handle device features (VR available at runtime)\n");
+  }
+#endif
+  // Device LOSS does not go through the uncaptured-error callback — without this handler a D3D12
+  // device removal during init is completely silent (the symptom is just null surface textures /
+  // failed shared-texture access later). Dawn's message names the removal reason + failing call.
+  // wgpu-native takes the callback in the device descriptor; Dawn has the setter.
+  auto onDeviceLost = [](WGPUDeviceLostReason reason, char const* message, void*) {
+    std::fprintf(stderr, "[device-LOST] reason=%d: %s\n", (int)reason, message ? message : "(no message)");
+  };
+#if defined(WEBGPU_BACKEND_WGPU)
+  deviceDesc.deviceLostCallback = onDeviceLost;
+#endif
   WGPUDevice device = requestDeviceSync(adapter, &deviceDesc);
+#if defined(WEBGPU_BACKEND_DAWN) && defined(_WIN32)
+  if (!device && vrDeviceReady) {
+    // The adapter refused the shared-handle features — run flat-only rather than not at all.
+    std::fprintf(stderr, "[vr] device rejected shared-handle features — VR disabled, retrying flat\n");
+    vrDeviceReady = false;
+    deviceDesc.requiredFeatureCount = 0;
+    deviceDesc.requiredFeatures = nullptr;
+    device = requestDeviceSync(adapter, &deviceDesc);
+  }
+#endif
   if (!device) return EXIT_FAILURE;
 
   wgpuDeviceSetUncapturedErrorCallback(device, onDeviceError, nullptr);
+#if defined(WEBGPU_BACKEND_DAWN)
+  wgpuDeviceSetDeviceLostCallback(device, onDeviceLost, nullptr);
+#endif
 
   WGPUQueue queue = wgpuDeviceGetQueue(device);
+
+#ifdef SAILSIM_HAVE_VR
+  // The VR bridge is created by enterVr() (defined just before the render loop) whenever the
+  // player clicks the toolbar VR button — or immediately at startup when SAILSIM_VR forces it.
+  vr::Bridge* vrB = nullptr;
+  if (vrEnvForced) std::printf("[vr] SAILSIM_VR set — entering VR at launch (dev harness).\n");
+#endif
 
   // Phase 0 criteria 3-5: prove the ocean-FFT WGSL runs natively and reads back.
   runInitialSpectrumTest(device, queue);
@@ -3350,6 +3570,28 @@ int main(int argc, char** argv) {
   WGPUSurfaceCapabilities caps = {};
   wgpuSurfaceGetCapabilities(surface, adapter, &caps);
   WGPUTextureFormat surfaceFormat = caps.formatCount > 0 ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
+
+  // Dump what the surface actually advertises for this adapter/backend. On Dawn-D3D12
+  // the flip-model swapchain only offers a subset of alpha/present modes, and picking
+  // one it doesn't support makes wgpuSurfaceGetCurrentTexture hand back a null texture
+  // (with a Success status) every frame — a silent white screen. Log it so a bad pick
+  // is obvious instead of invisible.
+  std::fprintf(stderr, "[boot] surface caps: formats=%zu presentModes=%zu alphaModes=%zu\n",
+               (size_t)caps.formatCount, (size_t)caps.presentModeCount, (size_t)caps.alphaModeCount);
+  for (size_t i = 0; i < caps.formatCount; ++i)
+    std::fprintf(stderr, "[boot]   format[%zu]=%d\n", i, (int)caps.formats[i]);
+  for (size_t i = 0; i < caps.alphaModeCount; ++i)
+    std::fprintf(stderr, "[boot]   alphaMode[%zu]=%d\n", i, (int)caps.alphaModes[i]);
+  for (size_t i = 0; i < caps.presentModeCount; ++i)
+    std::fprintf(stderr, "[boot]   presentMode[%zu]=%d\n", i, (int)caps.presentModes[i]);
+
+  // Alpha mode: D3D12 flip-model swapchains reject Auto — prefer Opaque if the surface
+  // lists it, else fall back to whatever it lists first, else Auto (wgpu-native path).
+  WGPUCompositeAlphaMode alphaMode = WGPUCompositeAlphaMode_Auto;
+  for (size_t i = 0; i < caps.alphaModeCount; ++i) {
+    if (caps.alphaModes[i] == WGPUCompositeAlphaMode_Opaque) { alphaMode = WGPUCompositeAlphaMode_Opaque; break; }
+    if (i == 0) alphaMode = caps.alphaModes[i];
+  }
 
   int fbWidth = 0, fbHeight = 0;
   glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
@@ -3361,12 +3603,29 @@ int main(int argc, char** argv) {
   surfaceConfig.width = (uint32_t)fbWidth;
   surfaceConfig.height = (uint32_t)fbHeight;
   surfaceConfig.presentMode = WGPUPresentMode_Fifo;   // vsync
-  surfaceConfig.alphaMode = WGPUCompositeAlphaMode_Auto;
+  surfaceConfig.alphaMode = alphaMode;
   if (shotPath) surfaceConfig.usage |= WGPUTextureUsage_CopySrc;   // allow screenshot readback
+  // While IN VR the window is only a spectator mirror, and a FIFO (vsynced) present would block
+  // the render loop to the MONITOR's refresh — juddering the headset, which paces the loop itself
+  // via xrWaitFrame. Pick the best non-blocking mode now; enterVr()/exitVr() swap it in and out.
+  WGPUPresentMode vrMirrorPresent = WGPUPresentMode_Fifo;
+  for (size_t i = 0; i < caps.presentModeCount; ++i) {
+    if (caps.presentModes[i] == WGPUPresentMode_Immediate) { vrMirrorPresent = WGPUPresentMode_Immediate; break; }
+    if (caps.presentModes[i] == WGPUPresentMode_Mailbox) vrMirrorPresent = WGPUPresentMode_Mailbox;
+  }
+  // Always configure the window swapchain: flat desktop is the default, and while IN VR the
+  // window doubles as the desktop mirror. (The old "window swapchain + XR swapchains remove the
+  // device" belief was a misdiagnosis of the UTF-8 shader-embed device loss, since fixed.)
   wgpuSurfaceConfigure(surface, &surfaceConfig);
 
-  std::printf("[spike] surface configured: %dx%d format=%d — entering render loop\n",
-              fbWidth, fbHeight, (int)surfaceFormat);
+  // Everything below goes to stderr (unbuffered) because the Windows console silently drops
+  // stdout under the asset-load flood. On Dawn, tick once so any surface-configure validation
+  // error lands in onDeviceError NOW (before the flood) instead of being deferred + lost.
+  std::fprintf(stderr, "[boot] surface configured: %dx%d format=%d alphaMode=%d presentMode=%d surface=%p\n",
+               fbWidth, fbHeight, (int)surfaceFormat, (int)alphaMode, (int)surfaceConfig.presentMode, (void*)surface);
+#if defined(WEBGPU_BACKEND_DAWN)
+  wgpuDeviceTick(device);   // flush any surface-configure validation error to onDeviceError now
+#endif
 
   // Vessels are loaded lazily by slug and cached — you and remote players share a
   // hull's geometry (one copy), each drawn as its own instance. The owned hull is
@@ -3526,6 +3785,42 @@ int main(int argc, char** argv) {
   // Procedural audio beds (ocean wash + rain patter) + the music synth.
   // Skipped for headless screenshot runs so CI/tests stay silent.
   settings::Values userCfg = settings::load();
+
+  // ── Fault-hunt (Dawn-D3D12 device removal) ─────────────────────────────────────────────────
+  // The scene render has never executed on D3D12 (the null-surface `continue` short-circuited it),
+  // and running it under VR removes the device. SAILSIM_GFX_MIN forces EVERY optional graphics
+  // feature off so the faulting pass can be bisected WITHOUT rebuilding: start from MIN (device
+  // should survive), then re-enable one feature at a time with the SAILSIM_GFX_<FEATURE>=1 vars
+  // below until the device dies again — that feature owns the fault.
+  if (std::getenv("SAILSIM_GFX_MIN")) {
+    userCfg.gfx.preset = -1;                       // Custom (don't let a preset re-apply anything)
+    userCfg.gfx.aa = 0;              userCfg.gfx.taa = false;         userCfg.gfx.ssaa = 0;
+    userCfg.gfx.shadows = 0;         userCfg.gfx.ssao = false;        userCfg.gfx.dof = false;
+    userCfg.gfx.bloom = false;       userCfg.gfx.reflections = false; userCfg.gfx.ssr = false;
+    userCfg.gfx.fog = false;         userCfg.gfx.volumetric = false;  userCfg.gfx.autoExposure = false;
+    userCfg.gfx.grade = false;       userCfg.gfx.contactShadows = false;
+    userCfg.gfx.lut = false;         userCfg.gfx.hullWetness = false;
+    userCfg.gfx.waterTransparency = false;
+    userCfg.gfx.scatter = 0;
+    std::printf("[gfx] SAILSIM_GFX_MIN — all optional graphics features OFF (D3D12 fault bisect)\n");
+  }
+  // Per-feature re-enables for the bisect (set to 1 to turn a single feature back on).
+  {
+    auto on = [](const char* n) { const char* v = std::getenv(n); return v && *v && *v != '0'; };
+    if (on("SAILSIM_GFX_SSAO"))        userCfg.gfx.ssao = true;
+    if (on("SAILSIM_GFX_DOF"))         userCfg.gfx.dof = true;
+    if (on("SAILSIM_GFX_BLOOM"))       userCfg.gfx.bloom = true;
+    if (on("SAILSIM_GFX_REFL"))        userCfg.gfx.reflections = true;
+    if (on("SAILSIM_GFX_FOG"))         userCfg.gfx.fog = true;
+    if (on("SAILSIM_GFX_GRADE"))       userCfg.gfx.grade = true;
+    if (on("SAILSIM_GFX_LUT"))         userCfg.gfx.lut = true;
+    if (on("SAILSIM_GFX_WETNESS"))     userCfg.gfx.hullWetness = true;
+    if (on("SAILSIM_GFX_WATERTRANS"))  userCfg.gfx.waterTransparency = true;
+    if (on("SAILSIM_GFX_CONTACT"))     userCfg.gfx.contactShadows = true;
+    if (const char* v = std::getenv("SAILSIM_GFX_SHADOWS")) userCfg.gfx.shadows = std::max(0, std::min(4, atoi(v)));
+    if (const char* v = std::getenv("SAILSIM_GFX_SCATTER")) userCfg.gfx.scatter = std::max(0, std::min(4, atoi(v)));
+  }
+
   // AA override for screenshot tests: SAILSIM_AA=<0..2> (0 off, 1 FXAA, 2 SMAA),
   // optional SAILSIM_SSAA=<0..2>.
   if (const char* aaEnv = std::getenv("SAILSIM_AA")) userCfg.gfx.aa = std::max(0, std::min(2, atoi(aaEnv)));
@@ -3537,6 +3832,8 @@ int main(int argc, char** argv) {
   // startup override. Feedback/sharpen/clamp stay env-only (advanced tuning; baked defaults otherwise).
   if (std::getenv("SAILSIM_TAA")) userCfg.gfx.taa = true;
   if (const char* uenv = std::getenv("SAILSIM_TAA_UPSCALE")) userCfg.gfx.taaUpscale = std::clamp((float)atof(uenv), 0.5f, 1.0f);
+  // (VR hard-disables TAA at runtime — see enterVr(): the compositor's per-eye reprojection
+  //  fights TAA's single shared history + jitter. Restored by exitVr().)
   if (std::getenv("SAILSIM_SSR")) userCfg.gfx.ssr = true;   // startup override for screen-space reflections
   if (std::getenv("SAILSIM_NOFOG")) userCfg.gfx.fog = false;   // disable aerial fog
   if (std::getenv("SAILSIM_VOLUMETRIC")) userCfg.gfx.volumetric = true;   // startup override for sun shafts
@@ -3869,7 +4166,7 @@ int main(int argc, char** argv) {
   postFx.lumHistView = lumHistView;
   {  // Seed the history to ~0.2 (mid daylight key) via a one-shot clear.
     WGPUCommandEncoder ce = wgpuDeviceCreateCommandEncoder(device, nullptr);
-    WGPURenderPassColorAttachment ca = {};
+    WGPURenderPassColorAttachment ca = colorAttach0();
     ca.view = lumHistView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
     ca.clearValue = WGPUColor{ 0.2, 0.0, 0.0, 1.0 };
     WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -4192,39 +4489,66 @@ int main(int argc, char** argv) {
   ImGui::CreateContext();
   ImGuiIO& imio = ImGui::GetIO();
   imio.IniFilename = nullptr;   // don't write imgui.ini next to the exe
-  // Embedded fonts, rasterised at the display's content scale for crisp text on
-  // HiDPI; FontGlobalScale then brings them back to logical size. Inter is the
-  // default (body) font; Cinzel is kept for titles (pushed where needed).
-  float uiScaleX = 1.0f, uiScaleY = 1.0f;
-  glfwGetWindowContentScale(window, &uiScaleX, &uiScaleY);
-  if (uiScaleX <= 0.0f) uiScaleX = 1.0f;
-  ImFontConfig fontCfg;
-  fontCfg.FontDataOwnedByAtlas = false;   // static arrays — don't let ImGui free them
-  imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_BODY, (int)UI_FONT_BODY_SIZE,
-                                   18.0f * uiScaleX, &fontCfg);   // default = body
-  // Merge Font Awesome into the body atlas so ICON_FA_* glyphs render inline with
-  // text. Kept a touch smaller + baseline-nudged so icons sit centred on the line.
-  {
+  // Embedded fonts, rasterised at the display's content scale for crisp text on HiDPI;
+  // FontGlobalScale then brings them back to logical size. Inter is the default (body) font;
+  // Cinzel is kept for titles (pushed where needed). REBUILDABLE because entering/leaving VR at
+  // runtime re-rasterizes at the VR factor (crisp glyphs, not a blurry FontGlobalScale upscale —
+  // angular text size is what fails in-headset); auto-resize HUD windows grow with the text.
+  ImFont* fontTitle = nullptr;
+  bool imguiBackendReady = false;   // ImGui_ImplWGPU up → font rebuilds must invalidate its objects
+  auto rebuildFonts = [&](bool vrScale) {
+    float sx = 1.0f, sy = 1.0f;
+    glfwGetWindowContentScale(window, &sx, &sy);
+    if (sx <= 0.0f) sx = 1.0f;
+    float fscale = sx;
+    if (vrScale) {
+      const char* v = std::getenv("SAILSIM_VR_FONT");
+      fscale *= v ? std::clamp((float)std::atof(v), 1.0f, 2.0f) : 1.35f;
+    }
+    ImGuiIO& fio = ImGui::GetIO();
+    fio.Fonts->Clear();
+    ImFontConfig fontCfg;
+    fontCfg.FontDataOwnedByAtlas = false;   // static arrays — don't let ImGui free them
+    fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_BODY, (int)UI_FONT_BODY_SIZE,
+                                    18.0f * fscale, &fontCfg);   // default = body
+    // Merge Font Awesome into the body atlas so ICON_FA_* glyphs render inline with
+    // text. Kept a touch smaller + baseline-nudged so icons sit centred on the line.
     static const ImWchar kIconRange[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
     ImFontConfig icfg;
     icfg.FontDataOwnedByAtlas = false;
     icfg.MergeMode = true;
     icfg.PixelSnapH = true;
-    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * uiScaleX);   // small baseline nudge for inline text icons
-    imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_ICONS, (int)UI_FONT_ICONS_SIZE,
-                                     15.0f * uiScaleX, &icfg, kIconRange);
-  }
-  ImFont* fontTitle = imio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_TITLE, (int)UI_FONT_TITLE_SIZE,
-                                                       30.0f * uiScaleX, &fontCfg);
-  imio.FontGlobalScale = 1.0f / uiScaleX;
+    icfg.GlyphOffset = ImVec2(0.0f, 1.0f * fscale);   // small baseline nudge for inline text icons
+    fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_ICONS, (int)UI_FONT_ICONS_SIZE,
+                                    15.0f * fscale, &icfg, kIconRange);
+    fontTitle = fio.Fonts->AddFontFromMemoryTTF((void*)UI_FONT_TITLE, (int)UI_FONT_TITLE_SIZE,
+                                                30.0f * fscale, &fontCfg);
+    fio.FontGlobalScale = 1.0f / sx;   // undo HiDPI only — the VR factor stays in effect
+    // Drop the backend's font texture + pipeline; the next NewFrame lazily rebuilds them from
+    // the new atlas. Only valid BETWEEN frames — VR toggles apply at the top of the loop.
+    if (imguiBackendReady) ImGui_ImplWGPU_InvalidateDeviceObjects();
+  };
+  rebuildFonts(vrHudActive);
   styleSailSim();
   ImGui_ImplGlfw_InitForOther(window, true);
+  // Replace the backend's cursor callback with one that, while the VR virtual UI screen is live,
+  // feeds ImGui PRE-TRANSFORMED positions (window px → virtual UI screen px; see gVrUi*), and
+  // otherwise defers to the backend's own handler. Installed permanently (VR toggles at runtime);
+  // the game's own input reads the cursor via glfwGetCursorPos directly, so aiming is unaffected.
+  static GLFWcursorposfun prevCursorCb = nullptr;
+  prevCursorCb = glfwSetCursorPosCallback(window, [](GLFWwindow* wnd, double x, double y) {
+    if (gVrUiActive) ImGui::GetIO().AddMousePosEvent(((float)x - gVrUiOffX) * gVrUiSclX,
+                                                     ((float)y - gVrUiOffY) * gVrUiSclY);
+    else if (prevCursorCb) prevCursorCb(wnd, x, y);
+    else ImGui::GetIO().AddMousePosEvent((float)x, (float)y);
+  });
   ImGui_ImplWGPU_InitInfo imguiInit;
   imguiInit.Device = device;
   imguiInit.NumFramesInFlight = 3;
   imguiInit.RenderTargetFormat = surfaceFormat;
   imguiInit.DepthStencilFormat = WGPUTextureFormat_Undefined;   // UI draws in the resolve pass (no depth)
   ImGui_ImplWGPU_Init(&imguiInit);
+  imguiBackendReady = true;
 
   // App state: sign in first, then sail. The ocean scene renders behind the login.
   enum class AppState { Login, Connecting, Sailing };
@@ -4306,13 +4630,286 @@ int main(int argc, char** argv) {
   char ownAnchorSide = 'S';
   bool prevAnchoredEdge = false;
 
+#ifdef SAILSIM_HAVE_VR
+  // ── VR runtime toggle ─────────────────────────────────────────────────────────────────
+  // Flat desktop is the default. A background headset probe (vr::headsetPresent, re-tried while
+  // absent) lights up a toolbar VR button; clicking it calls enterVr() — OpenXR session + the
+  // frame intermediate `vrFrameTex` (window-res, swapchain format) that each eye pass renders
+  // into, blitted per eye into the (sRGB) XR targets and mirrored to the desktop window.
+  // exitVr() (VR-cluster button, or the runtime ending the session) tears it all down again.
+  WGPUTexture vrFrameTex = nullptr; WGPUTextureView vrFrameView = nullptr;
+  WGPURenderPipeline vrBlitPipe = nullptr; WGPUBindGroup vrBlitBind = nullptr;   // eye blit (gamma decode)
+  WGPURenderPipeline vrMirrorPipe = nullptr;                                     // desktop mirror (raw copy)
+  WGPUBindGroupLayout vrBlitBGL = nullptr; WGPUSampler vrBlitSamp = nullptr;
+  bool vrRunning = false, vrExit = false;      // session state
+  bool vrCursorSeeded = false;                 // warp the cursor into the visible HUD once per entry
+  bool vrTaaBefore = false;                    // the player's TAA setting, restored on exit
+  bool vrEnterRequested = false, vrExitRequested = false;   // applied at the top of the loop
+  bool vrHeadsetPresent = false;
+  std::future<bool> vrProbeFuture;
+  double vrNextProbe = 0.0;
+
+  // (Re)create the frame intermediate + its bind group at the CURRENT window size, and keep the
+  // mono-layer aspect in sync. Called on entry and again if the window resizes while in VR.
+  auto buildVrFrameTargets = [&]() {
+    if (vrBlitBind)  { wgpuBindGroupRelease(vrBlitBind);   vrBlitBind = nullptr; }
+    if (vrFrameView) { wgpuTextureViewRelease(vrFrameView); vrFrameView = nullptr; }
+    if (vrFrameTex)  { wgpuTextureRelease(vrFrameTex);      vrFrameTex = nullptr; }
+    WGPUTextureDescriptor td = {};
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    td.dimension = WGPUTextureDimension_2D;
+    td.size = { curW, curH, 1 };
+    td.format = surfaceFormat;   // matches the game's final resolve pipeline; blit converts to eye sRGB
+    td.mipLevelCount = 1; td.sampleCount = 1;
+    vrFrameTex = wgpuDeviceCreateTexture(device, &td);
+    vrFrameView = wgpuTextureCreateView(vrFrameTex, nullptr);
+    WGPUBindGroupEntry bge[2] = {};
+    bge[0].binding = 0; bge[0].textureView = vrFrameView;
+    bge[1].binding = 1; bge[1].sampler = vrBlitSamp;
+    WGPUBindGroupDescriptor bgd = {}; bgd.layout = vrBlitBGL; bgd.entryCount = 2; bgd.entries = bge;
+    vrBlitBind = wgpuDeviceCreateBindGroup(device, &bgd);
+    if (vrB) vr::setMonoLayerAspect(vrB, (float)curW / (float)curH);   // undo the blit's aspect squish
+  };
+
+  auto releaseVrObjects = [&]() {
+    if (vrBlitBind)   { wgpuBindGroupRelease(vrBlitBind);        vrBlitBind = nullptr; }
+    if (vrFrameView)  { wgpuTextureViewRelease(vrFrameView);     vrFrameView = nullptr; }
+    if (vrFrameTex)   { wgpuTextureRelease(vrFrameTex);          vrFrameTex = nullptr; }
+    if (vrBlitPipe)   { wgpuRenderPipelineRelease(vrBlitPipe);   vrBlitPipe = nullptr; }
+    if (vrMirrorPipe) { wgpuRenderPipelineRelease(vrMirrorPipe); vrMirrorPipe = nullptr; }
+    if (vrBlitSamp)   { wgpuSamplerRelease(vrBlitSamp);          vrBlitSamp = nullptr; }
+    if (vrBlitBGL)    { wgpuBindGroupLayoutRelease(vrBlitBGL);   vrBlitBGL = nullptr; }
+  };
+
+  auto enterVr = [&]() -> bool {
+    if (vrMode) return true;
+    vrB = vr::create(instance, device);
+    if (!vrB) { std::fprintf(stderr, "[vr] vr::create failed (runtime/HMD/features?).\n"); return false; }
+
+    // Eye-blit transfer: vrFrameTex holds display-encoded values and the eye is an sRGB target
+    // that re-encodes on write — so decode to linear first. VR compositors disagree about sRGB
+    // handling ("everything looks darker"), so the decode is selectable WITHOUT a rebuild:
+    //   SAILSIM_VR_GAMMA=off   pass the encoded bytes through (compositor already expects encoded)
+    //   SAILSIM_VR_GAMMA=2.2   decode with a plain power curve
+    //   (default)              pow 1.6 — user-tuned in-headset (VDXR + Quest 3) to match flat
+    std::string blitFs;
+    {
+      const char* gv = std::getenv("SAILSIM_VR_GAMMA");
+      if (gv && std::strcmp(gv, "off") == 0) {
+        blitFs = "  return vec4<f32>(c, 1.0);";
+      } else if (gv && std::atof(gv) > 0.0) {
+        char gb[160];
+        std::snprintf(gb, sizeof(gb),
+                      "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(%.4f)), 1.0);", std::atof(gv));
+        blitFs = gb;
+      } else {
+        blitFs = "  return vec4<f32>(pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.6)), 1.0);";
+      }
+    }
+    // fs = the gamma-decoding eye blit; fsRaw = untouched copy for the desktop mirror window
+    // (the window shows the same display-encoded bytes the flat game would).
+    const std::string VR_BLIT_WGSL = std::string(R"(
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSamp: sampler;
+struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VO {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  var o: VO; let xy = p[vi];
+  o.pos = vec4<f32>(xy, 0.0, 1.0);
+  o.uv = vec2<f32>((xy.x + 1.0) * 0.5, (1.0 - xy.y) * 0.5);
+  return o;
+}
+@fragment fn fsRaw(i: VO) -> @location(0) vec4<f32> {
+  return vec4<f32>(textureSample(srcTex, srcSamp, i.uv).rgb, 1.0);
+}
+@fragment fn fs(i: VO) -> @location(0) vec4<f32> {
+  let c = textureSample(srcTex, srcSamp, i.uv).rgb;
+)") + blitFs + "\n}\n";
+    WGPUShaderModule blitMod = makeWGSL(device, VR_BLIT_WGSL.c_str());
+    WGPUBindGroupLayoutEntry bgle[2] = {};
+    bgle[0].binding = 0; bgle[0].visibility = WGPUShaderStage_Fragment;
+    bgle[0].texture.sampleType = WGPUTextureSampleType_Float; bgle[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    bgle[1].binding = 1; bgle[1].visibility = WGPUShaderStage_Fragment;
+    bgle[1].sampler.type = WGPUSamplerBindingType_Filtering;
+    WGPUBindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 2; bgld.entries = bgle;
+    vrBlitBGL = wgpuDeviceCreateBindGroupLayout(device, &bgld);
+    WGPUPipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &vrBlitBGL;
+    WGPUPipelineLayout blitPL = wgpuDeviceCreatePipelineLayout(device, &pld);
+    WGPUColorTargetState cts = {}; cts.format = vr::eyeFormat(vrB); cts.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState fs = {}; fs.module = blitMod; fs.entryPoint = "fs"; fs.targetCount = 1; fs.targets = &cts;
+    WGPURenderPipelineDescriptor rpd = {};
+    rpd.layout = blitPL;
+    rpd.vertex.module = blitMod; rpd.vertex.entryPoint = "vs";
+    rpd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
+    rpd.fragment = &fs;
+    vrBlitPipe = wgpuDeviceCreateRenderPipeline(device, &rpd);
+    // Same shader, raw fragment, window format → the desktop-mirror pipeline.
+    WGPUColorTargetState mcts = {}; mcts.format = surfaceFormat; mcts.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState mfs = {}; mfs.module = blitMod; mfs.entryPoint = "fsRaw"; mfs.targetCount = 1; mfs.targets = &mcts;
+    rpd.fragment = &mfs;
+    vrMirrorPipe = wgpuDeviceCreateRenderPipeline(device, &rpd);
+
+    WGPUSamplerDescriptor smp = {};
+    smp.magFilter = WGPUFilterMode_Linear; smp.minFilter = WGPUFilterMode_Linear;
+    smp.addressModeU = WGPUAddressMode_ClampToEdge; smp.addressModeV = WGPUAddressMode_ClampToEdge;
+    smp.addressModeW = WGPUAddressMode_ClampToEdge; smp.maxAnisotropy = 1;
+    vrBlitSamp = wgpuDeviceCreateSampler(device, &smp);
+    buildVrFrameTargets();
+
+    // The player has a headset on and can't see the desktop — grab keyboard focus outright and
+    // confine the visible cursor to the window (GLFW 3.4 captured mode) so input can't escape.
+    glfwFocusWindow(window);
+#ifdef GLFW_CURSOR_CAPTURED
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_CAPTURED);
+#endif
+    // ImGui's software cursor draws INTO the frame (thus into the eyes) at the exact position
+    // clicks land — the OS cursor is on the desktop and invisible in-headset.
+    ImGui::GetIO().MouseDrawCursor = true;
+    // The compositor's per-eye reprojection fights TAA's single shared history + jitter.
+    vrTaaBefore = userCfg.gfx.taa;
+    userCfg.gfx.taa = false;
+    // Mirror presents must never block the loop on the monitor's vsync — the headset paces us.
+    if (vrMirrorPresent != surfaceConfig.presentMode) {
+      surfaceConfig.presentMode = vrMirrorPresent;
+      wgpuSurfaceConfigure(surface, &surfaceConfig);
+    }
+    vrRunning = false; vrExit = false; vrCursorSeeded = false;
+    vrMode = true; vrHudActive = true;
+    rebuildFonts(true);   // re-rasterize larger for in-headset angular size
+    std::printf("[vr] entered VR — frame intermediate %ux%u, eye fmt %d\n",
+                curW, curH, (int)vr::eyeFormat(vrB));
+    return true;
+  };
+
+  auto exitVr = [&]() {
+    if (!vrMode) return;
+#ifdef _WIN32
+    ClipCursor(nullptr);   // release the cursor confinement
+#endif
+    if (vrB) { vr::destroy(vrB); vrB = nullptr; }   // clean xrDestroySession — VD recovers
+    releaseVrObjects();
+    vrMode = false; vrHudActive = vrPreview;
+    vrRunning = false; vrExit = false;
+    gVrUiActive = false;   // cursor callback + confinement fall back to plain window coords
+    ImGui::GetIO().MouseDrawCursor = false;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    userCfg.gfx.taa = vrTaaBefore;
+    if (surfaceConfig.presentMode != WGPUPresentMode_Fifo) {   // restore vsync for flat play
+      surfaceConfig.presentMode = WGPUPresentMode_Fifo;
+      wgpuSurfaceConfigure(surface, &surfaceConfig);
+    }
+    rebuildFonts(vrPreview);
+    std::fprintf(stderr, "[vr] exited VR — back to the flat desktop\n");
+  };
+
+  // Dev harness: SAILSIM_VR enters VR straight from launch and fails LOUDLY (headless test runs
+  // must not silently continue flat).
+  if (vrEnvForced && !enterVr()) return EXIT_FAILURE;
+#endif
+
   // 6. Render loop: reflection pass, then sky + ocean + ship.
+  std::fprintf(stderr, "[boot] render resources built; entering render loop\n");
   while (!glfwWindowShouldClose(window)) {
+    // VR world-label camera state: the k/m base + projection saved by the camera block each
+    // frame, consumed at the loop top (BEFORE everything else) with the freshly-located head
+    // pose. Declared first so every later block in the loop sees it.
+    static glm::mat4 vrLabelBase(1.0f), vrLabelProj(1.0f);
+    static bool vrLabelBaseValid = false;
+    (void)vrLabelBase; (void)vrLabelProj; (void)vrLabelBaseValid;
+#ifdef SAILSIM_HAVE_VR
+    // Headset presence: an async probe (throwaway XrInstance + xrGetSystem on a worker thread —
+    // never a frame hitch) at startup, re-tried every 10 s while absent. When it lands true the
+    // toolbar's VR button appears (MSFS-style: flat is the default, VR is opted into in-game).
+    if (vrDeviceReady && !vrHeadsetPresent && !vrMode) {
+      if (vrProbeFuture.valid()) {
+        if (vrProbeFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+          vrHeadsetPresent = vrProbeFuture.get();
+          vrProbeFuture = {};
+          if (vrHeadsetPresent) std::fprintf(stderr, "[vr] headset detected — VR button enabled\n");
+        }
+      } else if (glfwGetTime() >= vrNextProbe) {
+        vrNextProbe = glfwGetTime() + 10.0;
+        vrProbeFuture = std::async(std::launch::async, [] { return vr::headsetPresent(); });
+      }
+    }
+    // Apply queued VR toggles between frames only — enter/exit rebuilds the font atlas and the
+    // ImGui backend objects, which must never happen mid-ImGui-frame.
+    if (vrExitRequested)  { vrExitRequested = false; exitVr(); }
+    if (vrEnterRequested) {
+      vrEnterRequested = false;
+      if (!enterVr()) vrHeadsetPresent = false;   // probe again — the runtime/HMD went away
+    }
+
+    // VR: pace to the compositor + open per-eye access. vrActive = we have a frame to render+submit.
+    bool vrActive = false;
+    if (vrMode) {
+      // The player has a headset on and can't see the desktop: never let input escape. Retake
+      // keyboard focus if anything stole it, and confine the OS cursor to the window's client
+      // rect every frame — a click can then never land outside and silently drop focus.
+      if (!glfwGetWindowAttrib(window, GLFW_FOCUSED)) glfwFocusWindow(window);
+#ifdef _WIN32
+      if (HWND hw = glfwGetWin32Window(window)) {
+        RECT rc; GetClientRect(hw, &rc);
+        POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
+        ClientToScreen(hw, &tl); ClientToScreen(hw, &br);
+        // Confine to the VIRTUAL UI SCREEN region (the visible HUD area), not the whole window:
+        // a cursor parked in the window's overscan margins maps outside the headset's view and
+        // "disappears". Fall back to the client rect until the UI box exists.
+        RECT clip{tl.x, tl.y, br.x, br.y};
+        if (gVrUiActive && gVrUiBoxW > 0.0f) {
+          clip.left   = tl.x + (LONG)gVrUiOffX;
+          clip.top    = tl.y + (LONG)gVrUiOffY;
+          clip.right  = tl.x + (LONG)(gVrUiOffX + gVrUiBoxW);
+          clip.bottom = tl.y + (LONG)(gVrUiOffY + gVrUiBoxH);
+        }
+        ClipCursor(&clip);
+      }
+#endif
+      vr::poll(vrB, vrRunning, vrExit);
+      if (vr::lost(vrB)) {
+        // Unrecoverable D3D12 device removal. Exit the loop instead of spinning on a dead
+        // session forever — the clean vr::destroy below releases the XR session so Virtual
+        // Desktop recovers without a reboot, and the process actually exits.
+        std::fprintf(stderr, "[vr] device lost — exiting cleanly (see [device-LOST]/error lines above)\n");
+        break;
+      }
+      if (vrExit) {
+        // The runtime ended the session (headset off, Virtual Desktop closed...): drop back to
+        // the flat desktop game instead of quitting — VR is a mode now, not the process.
+        std::fprintf(stderr, "[vr] runtime ended the session — leaving VR\n");
+        exitVr();
+      } else {
+        if (vrRunning) vrActive = vr::beginFrame(vrB);
+        // World labels: project with THIS frame's freshly-located head pose (the k/m camera base
+        // is one frame old but slow-moving) so town/ship nameplates stay pinned during head
+        // motion — the old one-frame pose lag made them jostle and snap back.
+        if (vrActive && vrLabelBaseValid) {
+          float pa[7], fa[4], pb[7], fb[4];
+          vr::eyeCamera(vrB, 0, pa, fa);
+          vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
+          static const bool nmL = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+          glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
+          const glm::quat qc = nmL ? glm::quat(pa[6], pa[3], pa[4], pa[5])
+                                   : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
+          if (!nmL) pc.x = -pc.x;
+          const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
+          const glm::mat4 camC = glm::inverse(vrLabelBase) * poseC;
+          lastViewProj = vrLabelProj * glm::inverse(camC);
+          lastEye = glm::vec3(camC[3]);
+        }
+      }
+    }
+#endif
     if (vessel.anchored && !prevAnchoredEdge) ownAnchorSide = (std::rand() & 1) ? 'P' : 'S';
     prevAnchoredEdge = vessel.anchored;
     glfwPollEvents();
     if (maxFrames > 0 && frame >= maxFrames) break;
     ++frame;
+    if (frame == 1) std::fprintf(stderr, "[boot] frame 1: top of loop\n");
+    // Offline VR-HUD layout preview (SAILSIM_VR_PREVIEW=1): jump straight to the sailing HUD so
+    // headless screenshots can iterate the cockpit layout without a login or a headset.
+    if (frame == 30 && std::getenv("SAILSIM_VR_PREVIEW")) appState = AppState::Sailing;
 
     // Adaptive resolution (client scene.service): measure real frame time over a
     // ~0.5 s window and nudge adaptiveFactor to hold the target budget — shed 5%
@@ -4347,6 +4944,9 @@ int main(int argc, char** argv) {
         surfaceConfig.width = curW; surfaceConfig.height = curH;
         wgpuSurfaceConfigure(surface, &surfaceConfig);
       }
+#ifdef SAILSIM_HAVE_VR
+      if (vrMode && vrFrameTex) buildVrFrameTargets();   // the VR intermediate + mirror track the window
+#endif
       wgpuTextureViewRelease(depthView);
       wgpuTextureViewRelease(depthReadView);
       wgpuTextureRelease(depthTex);
@@ -4508,8 +5108,90 @@ int main(int argc, char** argv) {
     // ── Dear ImGui frame: login / HUD ─────────────────────────────────────
     ImGui_ImplWGPU_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+#ifdef SAILSIM_HAVE_VR
+    // VR: the frame's pixel space (window-wide) is displayed across the eye's nearly-square FOV,
+    // so UI drawn full-frame appears squished ~2× horizontally — and window-coordinate layout
+    // makes desktop-sized widgets tiny on the virtual screen. Lay the UI out on a 16:9 VIRTUAL
+    // 1920×1080 screen (all HUD anchors use io.DisplaySize; widgets get 2× bigger) drawn into a
+    // centered, aspect-correct viewport at the resolve pass. The mouse is transformed at the
+    // EVENT level (our GLFW cursor callback, see gVrUi*), so ImGui's event queue carries virtual
+    // coordinates natively — no per-frame fighting, cursor and clicks stay consistent.
+    float vrUiOffX = 0.0f, vrUiOffY = 0.0f, vrUiW = 0.0f, vrUiH = 0.0f, vrUiVh = 1080.0f;
+    if (vrMode && vrRunning) {
+      float p7[7], f4[4];
+      vr::eyeCamera(vrB, 0, p7, f4);
+      // The eye's ASYMMETRIC fov, in signed tan units: the physical view extends further down
+      // than up and further outward than inward. The frame is rendered across the symmetric
+      // SUPERSET (see the camera block), so place the UI inside the VISIBLE sub-region: sized
+      // against the visible extents, vertically centered on the true view centre (below the lens
+      // axis), width capped to the binocular overlap so BOTH eyes see all of it.
+      const float tanL = std::tan(f4[0]), tanR = std::tan(f4[1]);          // tanL < 0
+      const float tanU = std::tan(f4[2]), tanD = std::tan(f4[3]);          // tanD < 0
+      const float tanHW = std::max(-tanL, tanR), tanHH = std::max(tanU, -tanD);   // frame mapping (superset)
+      if (tanHW > 0.01f && tanHH > 0.01f) {
+        static const float uiFrac = [] {   // UI height as a fraction of the VISIBLE vertical FOV
+          const char* v = std::getenv("SAILSIM_VR_UI_SIZE");
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.92f;
+        }();
+        static const float uiWFrac = [] {  // UI width as a fraction of the binocular overlap
+          const char* v = std::getenv("SAILSIM_VR_UI_WIDTH");
+          return v ? std::clamp((float)std::atof(v), 0.2f, 0.98f) : 0.92f;
+        }();
+        // The comfortable view is nearly SQUARE, so a fixed 16:9 screen either overflows the
+        // sides (both extremes hard to see) or wastes the vertical. Decouple the two axes:
+        // width fills the binocular overlap (both eyes see all of it), height uses uiFrac of the
+        // visible vertical, and the VIRTUAL screen the UI lays out on takes the matching aspect
+        // (1920 × variable) — undistorted, and bottom rows get real room instead of crushing.
+        // User-tuned fractions (defaults from in-headset iteration: width 0.81 of the overlap felt
+        // right; the vertical needed pulling in much harder, to 0.62 of the visible height).
+        // Live-tunable via SAILSIM_VR_UI_WIDTH / SAILSIM_VR_UI_SIZE — no rebuild.
+        const float angW = 2.0f * std::min(-tanL, tanR) * uiWFrac;
+        const float angH = uiFrac * (tanU - tanD);
+        const float cy = 0.5f * (tanU + tanD);                     // true view centre (below axis)
+        vrUiVh = 1920.0f * (angH / angW);                          // virtual screen height = box aspect
+        vrUiW = angW / (2.0f * tanHW) * (float)curW;
+        vrUiH = angH / (2.0f * tanHH) * (float)curH;
+        vrUiOffX = ((float)curW - vrUiW) * 0.5f;                          // horizontally on-axis (fuses flat)
+        vrUiOffY = (1.0f - cy / tanHH) * 0.5f * (float)curH - vrUiH * 0.5f;   // centred on the visible middle
+        gVrUiOffX = vrUiOffX; gVrUiOffY = vrUiOffY;
+        gVrUiSclX = 1920.0f / vrUiW; gVrUiSclY = vrUiVh / vrUiH;
+        gVrUiBoxW = vrUiW; gVrUiBoxH = vrUiH;
+        gVrUiActive = true;
+        if (!vrCursorSeeded) {   // The OS cursor starts wherever it was on the desktop — often
+          vrCursorSeeded = true; // outside the visible UI. WARP it to the HUD centre and tell
+                                  // ImGui, so the in-headset cursor is visible from frame one.
+                                  // (Reset by enterVr — re-seeds on every VR entry.)
+          glfwSetCursorPos(window, vrUiOffX + vrUiW * 0.5f, vrUiOffY + vrUiH * 0.5f);
+          ImGui::GetIO().AddMousePosEvent(960.0f, vrUiVh * 0.5f);
+        }
+        ImGuiIO& vio = ImGui::GetIO();
+        vio.DisplaySize = ImVec2(1920.0f, vrUiVh);
+        vio.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+      }
+    }
+#endif
     ImGui::NewFrame();
     ImGuiIO& io = ImGui::GetIO();
+    static float vrBarTop = 0.0f;   // VR cockpit bar top (prev frame) — contextual windows stack above it
+    // Edge-anchored HUD placement. Flat: identical to raw io.DisplaySize math. VR: anchors
+    // reference an inset "comfort ring" instead of the true screen edges, pulling corner HUD
+    // (chat, minimap, wind gauge...) toward the readable zone while centered content keeps the
+    // full screen. Ring insets are live-tunable: SAILSIM_VR_HUD_INSET (sides), _TOP, _BOT.
+    auto hudPos = [&](float ax, float ay, float dx, float dy) -> ImVec2 {
+      float x0 = 0.0f, y0 = 0.0f, x1 = io.DisplaySize.x, y1 = io.DisplaySize.y;
+#ifdef SAILSIM_HAVE_VR
+      if (vrMode) {
+        auto envf = [](const char* n, float d) {
+          const char* v = std::getenv(n); return v ? (float)std::atof(v) : d; };
+        static const float inS = std::clamp(envf("SAILSIM_VR_HUD_INSET",     0.10f), 0.0f, 0.35f);
+        static const float inT = std::clamp(envf("SAILSIM_VR_HUD_INSET_TOP", 0.18f), 0.0f, 0.40f);
+        static const float inB = std::clamp(envf("SAILSIM_VR_HUD_INSET_BOT", 0.06f), 0.0f, 0.40f);
+        x0 = io.DisplaySize.x * inS; x1 = io.DisplaySize.x * (1.0f - inS);
+        y0 = io.DisplaySize.y * inT; y1 = io.DisplaySize.y * (1.0f - inB);
+      }
+#endif
+      return ImVec2(x0 + (x1 - x0) * ax + dx, y0 + (y1 - y0) * ay + dy);
+    };
 
     // Resolve an in-flight auth request (posted off-thread so the sea keeps moving).
     if (appState == AppState::Connecting && authFuture.valid() &&
@@ -4655,6 +5337,7 @@ int main(int argc, char** argv) {
       //    fullscreen + hide all HUD/labels for a clean shot), first-person
       //    on-deck (V). Buttons drawn in the toolbar below; keys here. ──
       auto setFullscreen = [&](bool on) {
+        if (vrMode) return;   // VR: glfwSetWindowMonitor stalls the (unused, unpresented) window — disabled
         if (on == isFullscreen) return;
         if (on) {
           glfwGetWindowPos(window, &savedWinX, &savedWinY);
@@ -4668,6 +5351,7 @@ int main(int argc, char** argv) {
         isFullscreen = on;   // the per-frame resize block reconfigures the surface + targets
       };
       auto setPhotoMode = [&](bool on) {
+        if (vrMode) return;   // VR: rides setFullscreen (disabled) and hides the HUD you rely on
         if (on == photoMode) return;
         photoMode = on;
         setFullscreen(on);   // entering also goes fullscreen; leaving drops back (client parity)
@@ -4729,24 +5413,34 @@ int main(int argc, char** argv) {
 
       // ── View-mode toolbar (top-centre): camera views + settings/map, as a
       //    compact icon strip. Hidden in photo mode (clean shot; Esc/F2 exits). ──
-      if (!photoMode) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 12.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+      if (!photoMode && !vrHudActive) {
+        ImGui::SetNextWindowPos(hudPos(0.5f, 0.0f, 0.0f, 12.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
         ImGui::Begin("##viewtools", nullptr,
                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
         if (iconBtn(ICON_FA_PERSON, firstPerson ? "Chase camera (V)" : "First-person on deck (V)", firstPerson))
           enterFirstPerson(!firstPerson);
-        ImGui::SameLine();
-        if (iconBtn(ICON_FA_CAMERA, "Photo mode — hide HUD + fullscreen (F2)", false)) setPhotoMode(true);
-        ImGui::SameLine();
-        if (iconBtn(isFullscreen ? ICON_FA_COMPRESS : ICON_FA_EXPAND,
-                    isFullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)", isFullscreen))
-          setFullscreen(!isFullscreen);
+        if (!vrMode) {   // photo mode + fullscreen are desktop-window features — hidden in VR
+          ImGui::SameLine();
+          if (iconBtn(ICON_FA_CAMERA, "Photo mode — hide HUD + fullscreen (F2)", false)) setPhotoMode(true);
+          ImGui::SameLine();
+          if (iconBtn(isFullscreen ? ICON_FA_COMPRESS : ICON_FA_EXPAND,
+                      isFullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)", isFullscreen))
+            setFullscreen(!isFullscreen);
+        }
         ImGui::SameLine();
         if (iconBtn(ICON_FA_MAP, mapExpanded ? "Close chart" : "Open chart", mapExpanded))
           mapExpanded = !mapExpanded;
         ImGui::SameLine();
         if (iconBtn(ICON_FA_BOXES_STACKED, "Cargo hold (I)", showInventory)) showInventory = !showInventory;
+#ifdef SAILSIM_HAVE_VR
+        // MSFS-style: the VR button only exists once a headset is detected; the game always
+        // launches flat and the player opts into VR from here.
+        if (vrHeadsetPresent && !vrMode) {
+          ImGui::SameLine();
+          if (iconBtn(ICON_FA_VR_CARDBOARD, "Enter VR (headset detected)", false)) vrEnterRequested = true;
+        }
+#endif
         ImGui::SameLine();
         if (iconBtn(ICON_FA_GEAR, "Settings", settingsOpen)) { settingsOpen = !settingsOpen; escMenu = false; }
         ImGui::End();
@@ -5033,8 +5727,9 @@ int main(int argc, char** argv) {
       // Screen rects of HUD controls the tutorial guidance can ring (populated as
       // each is drawn this frame; consumed by the quest-guidance pass at frame end).
       std::map<std::string, ImVec4> guideRects;
+      if (!vrHudActive) {
       // ── Top-left: wind gauge + readouts ──
-      ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
+      ImGui::SetNextWindowPos(hudPos(0.0f, 0.0f, 12.0f, 12.0f), ImGuiCond_Always);
       ImGui::Begin("hud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       ImGui::Text("%s", authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str());
@@ -5159,6 +5854,7 @@ int main(int argc, char** argv) {
       // Log out lives in the Esc menu (gear icon / Esc) — kept out of this panel
       // to reclaim vertical space in the restructured HUD.
       ImGui::End();
+      }   // end flat top-left hud
 
       // ── Top-right: sail status ──
       const char* sailLabel = vessel.anchored ? "ANCHORED"
@@ -5166,7 +5862,8 @@ int main(int argc, char** argv) {
       const ImVec4 sailCol = vessel.anchored ? ImVec4(0.90f, 0.65f, 0.35f, 1.0f)
                            : vessel.sailState == 2 ? ImVec4(0.50f, 0.85f, 0.55f, 1.0f)
                            : vessel.sailState == 1 ? ImVec4(0.90f, 0.82f, 0.45f, 1.0f) : ImVec4(0.65f, 0.68f, 0.72f, 1.0f);
-      ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 12), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+      if (!vrHudActive) {
+      ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
       ImGui::Begin("sailhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       // Icon in the body font (Font Awesome isn't merged into the title face),
@@ -5181,6 +5878,235 @@ int main(int argc, char** argv) {
       { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         guideRects["sails"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }   // tutorial: "set your canvas" ring
       ImGui::End();
+      }   // end flat sailhud
+      // ═══ VR INSTRUMENTS ═══ A ground-up VR HUD: no rectangular panels, no window chrome —
+      // matched circular "glass" instruments on the lower arc of the visible OVAL, plus one line
+      // of floating shadowed status text and three round tool buttons at the bottom apex.
+      // Preview on flat builds: SAILSIM_VR_PREVIEW=1 (+SAILSIM_SHOT).
+      if (vrHudActive) {
+        const float vcx = io.DisplaySize.x * 0.5f, vcy = io.DisplaySize.y * 0.5f;
+        auto arcPt = [&](float angleDeg, float radiusFrac) {
+          const float r = glm::radians(angleDeg);
+          return ImVec2(vcx + vcx * radiusFrac * std::cos(r), vcy - vcy * radiusFrac * std::sin(r));
+        };
+        // Chromeless input window centred on an arc point, sized for a disc of radius R.
+        auto instrWin = [&](const char* name, float angleDeg, float radiusFrac, float R) -> ImVec2 {
+          ImGui::SetNextWindowPos(arcPt(angleDeg, radiusFrac), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSize(ImVec2(R * 2.0f + 10.0f, R * 2.0f + 10.0f));
+          ImGui::Begin(name, nullptr, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize |
+                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar |
+                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus);
+          ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+          return ImVec2(wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f);
+        };
+        const ImU32 kGlass = IM_COL32(10, 18, 28, 195), kRim = IM_COL32(140, 170, 195, 175);
+        const float kInstR = 92.0f;      // shared instrument radius — everything matches
+
+        // ── WIND & COMPASS instrument (lower-left arc). ──
+        {
+          ImVec2 c = instrWin("##vrwind", 214.0f, 0.60f, kInstR);
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          float R = kInstR;
+          dl->PushClipRect(ImVec2(c.x - R - 2.0f, c.y - R - 2.0f), ImVec2(c.x + R + 2.0f, c.y + R + 2.0f), true);
+          dl->AddCircleFilled(c, R, kGlass);
+          dl->AddCircle(c, R, kRim, 64, 2.0f);
+          guideRects["wind"] = ImVec4(c.x - R, c.y - R, R * 2.0f, R * 2.0f);
+          auto dirAt = [&](float deg, float rad) {
+            float rr = glm::radians(deg);
+            return ImVec2(c.x + rad * std::sin(rr), c.y - rad * std::cos(rr));
+          };
+          {  // no-go shading from the real polar
+            float peak = 0.5f;
+            for (const glm::vec2& pt : vrig.polar) peak = std::max(peak, pt.y);
+            float good = std::max(0.01f, 0.7f * peak);
+            const float STEP = 4.0f;
+            for (float ang = rel - 90.0f; ang < rel + 90.0f; ang += STEP) {
+              float offMid = std::fabs((ang + STEP * 0.5f) - rel);
+              float drive  = sail::detail::polarDrive(offMid, vrig);
+              float redF   = glm::clamp((good - drive) / good, 0.0f, 1.0f);
+              if (redF <= 0.02f) continue;
+              dl->AddTriangleFilled(c, dirAt(ang, R - 6.0f), dirAt(ang + STEP, R - 6.0f),
+                                    IM_COL32(210, 70, 60, (int)(redF * 95.0f)));
+            }
+          }
+          {  // rotating compass card
+            const float s = (R - 12.0f) / 36.0f;
+            auto cardPt = [&](float bearingDeg, float radius) {
+              float ar = glm::radians(bearingDeg - headingDeg);
+              return ImVec2(c.x + radius * s * std::sin(ar), c.y - radius * s * std::cos(ar));
+            };
+            dl->AddLine(cardPt(0, 35), cardPt(0, 27), IM_COL32(249, 115, 22, 255), 2.5f * s);
+            dl->AddLine(cardPt(90, 35), cardPt(90, 30), IM_COL32(255, 255, 255, 77), 1.0f * s);
+            dl->AddLine(cardPt(180, 35), cardPt(180, 28), IM_COL32(255, 255, 255, 77), 1.5f * s);
+            dl->AddLine(cardPt(270, 35), cardPt(270, 30), IM_COL32(255, 255, 255, 77), 1.0f * s);
+            for (int ic = 45; ic < 360; ic += 90)
+              dl->AddLine(cardPt((float)ic, 36), cardPt((float)ic, 33), IM_COL32(255, 255, 255, 46), 0.8f * s);
+            auto cardLabel = [&](float bearingDeg, float radius, const char* txt, ImU32 col) {
+              ImVec2 lp = cardPt(bearingDeg, radius);
+              ImVec2 ts = ImGui::CalcTextSize(txt);
+              dl->AddText(ImVec2(lp.x - ts.x * 0.5f, lp.y - ts.y * 0.5f), col, txt);
+            };
+            cardLabel(0, 21, "N", IM_COL32(251, 146, 60, 255));
+            cardLabel(90, 22, "E", IM_COL32(255, 255, 255, 102));
+            cardLabel(180, 23, "S", IM_COL32(255, 255, 255, 102));
+            cardLabel(270, 22, "W", IM_COL32(255, 255, 255, 102));
+          }
+          {  // wind arrow rim -> centre + bow-up ship
+            ImVec2 wt = dirAt(rel, R - 8.0f), wh(c.x + (wt.x - c.x) * 0.34f, c.y + (wt.y - c.y) * 0.34f);
+            dl->AddLine(wt, wh, IM_COL32(90, 180, 240, 255), 3.5f);
+            ImVec2 d(wh.x - wt.x, wh.y - wt.y); float l = std::hypot(d.x, d.y); if (l > 1e-3f) { d.x /= l; d.y /= l; }
+            ImVec2 n(-d.y, d.x);
+            dl->AddTriangleFilled(wh, ImVec2(wh.x - d.x*11 + n.x*7, wh.y - d.y*11 + n.y*7),
+                                  ImVec2(wh.x - d.x*11 - n.x*7, wh.y - d.y*11 - n.y*7), IM_COL32(90, 180, 240, 255));
+            dl->AddTriangleFilled(ImVec2(c.x, c.y - 14), ImVec2(c.x - 9, c.y + 10), ImVec2(c.x + 9, c.y + 10),
+                                  IM_COL32(235, 235, 240, 255));
+          }
+          if (wv.valid) {  // wind speed INSIDE the disc, lower third
+            char wtxt[40]; std::snprintf(wtxt, sizeof(wtxt), "%.0f kn  B%d", wv.windSpeed, wv.beaufort);
+            ImVec2 ts = ImGui::CalcTextSize(wtxt);
+            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y + R * 0.42f), IM_COL32(160, 200, 235, 230), wtxt);
+          }
+          dl->PopClipRect();
+          ImGui::End();
+        }
+
+        // ── SPEED & TRIM instrument (lower-right arc): rim gauge, big number, trim ring. ──
+        {
+          ImVec2 c = instrWin("##vrspeed", 326.0f, 0.60f, kInstR);
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          float R = kInstR;
+          dl->AddCircleFilled(c, R, kGlass);
+          dl->AddCircle(c, R, kRim, 64, 2.0f);
+          // Speed gauge: 135°..405° sweep (screen angles, y-down => clockwise).
+          const float a0 = glm::radians(135.0f), a1 = glm::radians(405.0f);
+          const float vmax = std::max(6.0f, vrig.maxSpeed * 1.15f);
+          const float frac = glm::clamp(shipSpeed / vmax, 0.0f, 1.0f);
+          dl->PathArcTo(c, R - 8.0f, a0, a1, 48);
+          dl->PathStroke(IM_COL32(255, 255, 255, 30), 0, 4.0f);
+          if (frac > 0.01f) {
+            dl->PathArcTo(c, R - 8.0f, a0, a0 + (a1 - a0) * frac, 48);
+            dl->PathStroke(IM_COL32(80, 190, 215, 235), 0, 4.0f);
+          }
+          // Trim ring (inner) while sails are set: sheet fill in trim-quality colour + optimal tick.
+          if (vessel.sailState != 0 && !vessel.anchored) {
+            const float q = vessel.trimQ;
+            const ImU32 qcol = q > 0.75f ? IM_COL32(90, 217, 128, 235)
+                             : q > 0.40f ? IM_COL32(242, 212, 90, 235)
+                                         : IM_COL32(240, 97, 97, 235);
+            const float fill = glm::clamp((vessel.sheetAngleDeg - 5.0f) / 83.0f, 0.0f, 1.0f);
+            const float opt  = glm::clamp((sail::optimalSheetAngle(vessel.driveAngle) - 5.0f) / 83.0f, 0.0f, 1.0f);
+            dl->PathArcTo(c, R - 17.0f, a0, a1, 48);
+            dl->PathStroke(IM_COL32(255, 255, 255, 22), 0, 3.0f);
+            if (fill > 0.01f) {
+              dl->PathArcTo(c, R - 17.0f, a0, a0 + (a1 - a0) * fill, 48);
+              dl->PathStroke(qcol, 0, 3.0f);
+            }
+            const float oa = 135.0f + 270.0f * opt;
+            ImVec2 t0(c.x + (R - 22.0f) * std::cos(glm::radians(oa)), c.y + (R - 22.0f) * std::sin(glm::radians(oa)));
+            ImVec2 t1(c.x + (R - 12.0f) * std::cos(glm::radians(oa)), c.y + (R - 12.0f) * std::sin(glm::radians(oa)));
+            dl->AddLine(t0, t1, IM_COL32(255, 255, 255, 200), 2.0f);
+          }
+          {  // big speed number + unit
+            char st[16]; std::snprintf(st, sizeof(st), "%.1f", shipSpeed);
+            ImGui::PushFont(fontTitle);
+            ImVec2 ts = ImGui::CalcTextSize(st);
+            const float tfs = ImGui::GetFontSize();   // LOGICAL size (raster size breaks on HiDPI)
+            ImDrawList* fl = ImGui::GetWindowDrawList();
+            fl->AddText(fontTitle, tfs, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 1.02f),
+                        IM_COL32(236, 240, 245, 255), st);
+            ImGui::PopFont();
+            ImVec2 us = ImGui::CalcTextSize("knots");
+            dl->AddText(ImVec2(c.x - us.x * 0.5f, c.y + R * 0.06f), IM_COL32(255, 255, 255, 120), "knots");
+          }
+          {  // sail state, inside the disc's lower third
+            const ImU32 scol = ImGui::GetColorU32(sailCol);
+            char sl[32]; std::snprintf(sl, sizeof(sl), "%s %s",
+                                       vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, sailLabel);
+            ImVec2 ts = ImGui::CalcTextSize(sl);
+            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y + R * 0.42f), scol, sl);
+          }
+          { ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            guideRects["sails"] = ImVec4(wp.x, wp.y, ws.x, ws.y); }
+          ImGui::End();
+        }
+
+        // ── Floating status line (bottom apex): shadowed text, NO panel. ──
+        {
+          mp::WaveState wvt = mpClient.wave();
+          double epoch = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+          double wall = std::fmod(epoch + wvt.timeOffsetSec, 1440.0); if (wall < 0) wall += 1440.0;
+          float ghh = (float)(wall / 60.0);
+          if (const char* th = std::getenv("SAILSIM_HOUR")) ghh = (float)std::atof(th);
+          int hrs = (int)ghh, minsv = (int)((ghh - (float)hrs) * 60.0f);
+          int h12 = (hrs % 12) == 0 ? 12 : hrs % 12;
+          mp::TownState ct = mpClient.town();
+          char line[224];
+          if (ct.maxCrew > 0)
+            std::snprintf(line, sizeof(line), "%s      %s %s      " ICON_FA_USERS " %d/%d      "
+                          ICON_FA_TOWER_BROADCAST " %d      %s %d:%02d %s",
+                          authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str(),
+                          vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, vessel.anchored ? "Anchored" : pos,
+                          ct.crew, ct.maxCrew, (int)others.size(),
+                          ghh >= 5.0f && ghh < 21.0f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
+          else
+            std::snprintf(line, sizeof(line), "%s      %s %s      " ICON_FA_TOWER_BROADCAST " %d      %s %d:%02d %s",
+                          authCallsign.empty() ? authUsername.c_str() : authCallsign.c_str(),
+                          vessel.anchored ? ICON_FA_ANCHOR : ICON_FA_SAILBOAT, vessel.anchored ? "Anchored" : pos,
+                          (int)others.size(),
+                          ghh >= 5.0f && ghh < 21.0f ? ICON_FA_SUN : ICON_FA_MOON, h12, minsv, hrs < 12 ? "AM" : "PM");
+          ImDrawList* fdl = ImGui::GetForegroundDrawList();
+          ImVec2 ts = ImGui::CalcTextSize(line);
+          // Sits just ABOVE the round tool cluster (arcPt 270°/0.60, 64 px tall, centre pivot) —
+          // the deep-arc spot (270°/0.86) was too low to read comfortably in-headset.
+          ImVec2 sp = arcPt(270.0f, 0.60f);
+          ImVec2 tp(sp.x - ts.x * 0.5f, sp.y - 32.0f - 12.0f - ts.y);
+          fdl->AddText(ImVec2(tp.x + 1.5f, tp.y + 1.5f), IM_COL32(0, 0, 0, 170), line);
+          fdl->AddText(tp, IM_COL32(222, 230, 238, 235), line);
+          vrBarTop = tp.y - 8.0f;
+        }
+
+        // ── Round tool buttons under the status line (camera, chart, settings — plus exit-VR
+        //    while a real VR session is live). ──
+        {
+          const float nTools = vrMode ? 4.0f : 3.0f;
+          ImGui::SetNextWindowPos(arcPt(270.0f, 0.60f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSize(ImVec2(nTools * 58.0f + 12.0f, 64.0f));
+          ImGui::Begin("##vrtools", nullptr, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize |
+                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
+          auto roundBtn = [&](const char* icon, const char* tip, bool active) -> bool {
+            const float r = 24.0f;
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImVec2 cc(p.x + r, p.y + r);
+            bool clicked = ImGui::InvisibleButton(icon, ImVec2(r * 2.0f, r * 2.0f));
+            const bool hov = ImGui::IsItemHovered();
+            if (hov) ImGui::SetTooltip("%s", tip);
+            ImDrawList* bdl = ImGui::GetWindowDrawList();
+            bdl->AddCircleFilled(cc, r, active ? IM_COL32(38, 118, 133, 220) : kGlass);
+            bdl->AddCircle(cc, r, hov ? IM_COL32(120, 210, 235, 220) : kRim, 40, hov ? 2.5f : 1.5f);
+            ImVec2 is = ImGui::CalcTextSize(icon);
+            bdl->AddText(ImVec2(cc.x - is.x * 0.5f, cc.y - is.y * 0.5f), IM_COL32(226, 232, 240, 240), icon);
+            return clicked;
+          };
+          const bool gunsLive = !tiedUp && (guns.hudState(0) != combat::HudGunState::Stowed ||
+                                            guns.hudState(1) != combat::HudGunState::Stowed);
+          if (!gunsLive) {
+          if (roundBtn(ICON_FA_PERSON, firstPerson ? "Chase camera (V)" : "First-person on deck (V)", firstPerson))
+            enterFirstPerson(!firstPerson);
+          ImGui::SameLine(0.0f, 10.0f);
+          if (roundBtn(ICON_FA_MAP, mapExpanded ? "Close chart (M)" : "Open chart (M)", mapExpanded))
+            mapExpanded = !mapExpanded;
+          ImGui::SameLine(0.0f, 10.0f);
+          if (roundBtn(ICON_FA_GEAR, "Settings", settingsOpen)) { settingsOpen = !settingsOpen; escMenu = false; }
+#ifdef SAILSIM_HAVE_VR
+          if (vrMode) {
+            ImGui::SameLine(0.0f, 10.0f);
+            if (roundBtn(ICON_FA_VR_CARDBOARD, "Exit VR — back to the desktop", true)) vrExitRequested = true;
+          }
+#endif
+          }
+          ImGui::End();
+        }
+      }
 
       // ── Damage panel (top-right, under the sail status): its own window so the
       //    main HUD never collides with the chat panel. ──
@@ -5200,7 +6126,7 @@ int main(int argc, char** argv) {
                          (mastRepairStartT >= 0 && mastRepairArmedMs > 0);
           } }
         if (haveCombat) {
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+          ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -12.0f, 170.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
           ImGui::Begin("damagehud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
       // ── Damage diagram (browser damage HUD): 5 hull zones coloured by the
@@ -5296,8 +6222,76 @@ int main(int argc, char** argv) {
       // than overlapping (an overlap let a gunhud click bring it in front and bury
       // the Dock button). NoBringToFrontOnFocus keeps HUD click order stable too.
       float gunHudTopY = io.DisplaySize.y - 12.0f;   // fallback: bottom edge when the gunhud isn't shown
-      if (!tiedUp) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 12.0f),
+      if (!tiedUp && vrHudActive) {
+        // ── VR GUNS instrument: a circular battery dial (no text table). Port = left half-ring,
+        //    starboard = right; ring colour = state, sweep = reload progress; pip dots = loaded
+        //    guns; centre = ammo type; below = elevation. Shown only while a battery is live —
+        //    the bottom apex belongs to the tool buttons otherwise. ──
+        const combat::HudGunState stP = guns.hudState(0), stS = guns.hudState(1);
+        if (stP != combat::HudGunState::Stowed || stS != combat::HudGunState::Stowed) {
+          const float gcx = io.DisplaySize.x * 0.5f, gcy = io.DisplaySize.y * 0.5f;
+          ImGui::SetNextWindowPos(ImVec2(gcx, gcy + gcy * 0.62f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          ImGui::SetNextWindowSize(ImVec2(206.0f, 206.0f));
+          ImGui::Begin("##vrguns", nullptr, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize |
+                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
+                       ImGuiWindowFlags_NoBringToFrontOnFocus);
+          ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+          ImVec2 c(wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f);
+          const float R = 92.0f;
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          dl->AddCircleFilled(c, R, IM_COL32(10, 18, 28, 195));
+          dl->AddCircle(c, R, IM_COL32(140, 170, 195, 175), 64, 2.0f);
+          auto sideRing = [&](int gside, bool leftHalf, const char* tag) {
+            const combat::HudGunState st = guns.hudState(gside);
+            const ImU32 col = st == combat::HudGunState::Ready ? IM_COL32(102, 242, 115, 245)
+                            : st == combat::HudGunState::Arming ? IM_COL32(242, 217, 102, 245)
+                            : st == combat::HudGunState::Reloading ? IM_COL32(242, 166, 77, 245)
+                                                                   : IM_COL32(153, 163, 178, 130);
+            // Screen-angle half arcs: left 100°..260°, right 280°..440°.
+            const float a0 = glm::radians(leftHalf ? 100.0f : 280.0f);
+            const float a1 = glm::radians(leftHalf ? 260.0f : 440.0f);
+            dl->PathArcTo(c, R - 9.0f, a0, a1, 40);
+            dl->PathStroke(IM_COL32(255, 255, 255, 28), 0, 5.0f);
+            float sweep = 1.0f;
+            if (st == combat::HudGunState::Reloading) sweep = glm::clamp(guns.reloadFrac(gside), 0.02f, 1.0f);
+            dl->PathArcTo(c, R - 9.0f, a0, a0 + (a1 - a0) * sweep, 40);
+            dl->PathStroke(col, 0, 5.0f);
+            // Loaded pips along an inner arc.
+            const int n = guns.gunsPerSide(), loaded = guns.loadedCount(gside);
+            for (int i = 0; i < n; ++i) {
+              const float f = n > 1 ? (float)i / (float)(n - 1) : 0.5f;
+              const float ad = (leftHalf ? 120.0f : 300.0f) + f * 120.0f;
+              ImVec2 pp(c.x + (R - 24.0f) * std::cos(glm::radians(ad)),
+                        c.y + (R - 24.0f) * std::sin(glm::radians(ad)));
+              dl->AddCircleFilled(pp, 4.5f, i < loaded ? IM_COL32(102, 235, 120, 255) : IM_COL32(255, 255, 255, 46));
+            }
+            // Side tag near the ring's inner middle.
+            ImVec2 ts = ImGui::CalcTextSize(tag);
+            ImVec2 tp(c.x + (leftHalf ? -(R - 44.0f) : (R - 44.0f)) - ts.x * 0.5f, c.y - ts.y * 0.5f);
+            dl->AddText(tp, col, tag);
+          };
+          sideRing(0, true, "Z");
+          sideRing(1, false, "C");
+          {
+            const bool isBar = guns.shotType() == combat::ShotKind::Bar;
+            const bool isGrape = guns.shotType() == combat::ShotKind::Grape;
+            char am[40]; std::snprintf(am, sizeof(am), "%s %s",
+                isBar ? ICON_FA_GRIP_LINES : isGrape ? ICON_FA_ELLIPSIS : ICON_FA_CIRCLE,
+                isBar ? "BAR" : isGrape ? "GRAPE" : "ROUND");
+            ImVec2 ts = ImGui::CalcTextSize(am);
+            dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y - 4.0f), IM_COL32(230, 235, 242, 245), am);
+            char el[40]; std::snprintf(el, sizeof(el), ICON_FA_ANGLES_UP " %.0f\u00b0 %s", guns.elevDeg(),
+                guns.elevDeg() >= (combat::kElevHull + combat::kElevMast) * 0.5f ? "masts" : "hull");
+            ImVec2 es = ImGui::CalcTextSize(el);
+            dl->AddText(ImVec2(c.x - es.x * 0.5f, c.y + 4.0f), IM_COL32(190, 200, 212, 220), el);
+          }
+          gunHudTopY = wp.y;
+          ImGui::End();
+        } else {
+          gunHudTopY = vrBarTop;   // no dial: prompts stack above the status line
+        }
+      } else if (!tiedUp) {
+        ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -12.0f),
                                 ImGuiCond_Always, ImVec2(0.5f, 1.0f));
         ImGui::Begin("gunhud", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
@@ -5354,7 +6348,10 @@ int main(int argc, char** argv) {
 
       // ── Salvage toast (bottom-centre, ~6 s). ──
       if (!salvageToast.empty() && t - salvageToastAtT < 6.0) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 90.0f),
+        if (vrHudActive && vrBarTop > 0.0f)
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, vrBarTop - 96.0f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+        else
+        ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -90.0f),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::Begin("salvagetoast", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
@@ -5392,12 +6389,16 @@ int main(int argc, char** argv) {
 
         // Draw the chart + markers into the current window at S px; handles zoom /
         // pan / right-click teleport when expanded. One body for both map sizes.
-        auto drawMap = [&](float S, bool expanded) {
+        auto drawMap = [&](float S, bool expanded, bool circular = false) {
           clampMapView();
           float zoom = expanded ? mapZoom : 1.0f;
           float visW = worldW / zoom, visH = worldH / zoom;
           float vcx = expanded ? mapVCX : (float)(tm.minX + tm.maxX) * 0.5f;
           float vcz = expanded ? mapVCZ : (float)(tm.minZ + tm.maxZ) * 0.5f;
+          if (circular) {   // VR local radar: centred on the ship, fixed span; M opens the full chart
+            visW = visH = 5200.0f;
+            vcx = vessel.x; vcz = vessel.z;
+          }
           float viewMinX = vcx - visW * 0.5f, viewMaxZ = vcz + visH * 0.5f;
 
           ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -5414,9 +6415,15 @@ int main(int argc, char** argv) {
           // Terrain raster: blit the visible sub-rectangle of the baked chart.
           ImVec2 uv0((viewMinX - (float)tm.minX) / worldW, ((float)tm.maxZ - viewMaxZ) / worldH);
           ImVec2 uv1(uv0.x + visW / worldW, uv0.y + visH / worldH);
+          if (circular) {
+            mdl->AddImageRounded((ImTextureID)mapView, p0, ImVec2(p0.x + S, p0.y + S), uv0, uv1,
+                                 IM_COL32(255, 255, 255, 235), S * 0.5f);
+            mdl->AddCircle(ImVec2(p0.x + S * 0.5f, p0.y + S * 0.5f), S * 0.5f,
+                           IM_COL32(140, 170, 195, 175), 64, 2.0f);   // instrument rim
+          } else
           mdl->AddImage((ImTextureID)mapView, p0, ImVec2(p0.x + S, p0.y + S), uv0, uv1);
           // Subtle grid.
-          for (int i = 1; i < 8; ++i) {
+          if (!circular) for (int i = 1; i < 8; ++i) {
             float g = S * (float)i / 8.0f;
             mdl->AddLine(ImVec2(p0.x + g, p0.y), ImVec2(p0.x + g, p0.y + S), IM_COL32(255, 255, 255, 10));
             mdl->AddLine(ImVec2(p0.x, p0.y + g), ImVec2(p0.x + S, p0.y + g), IM_COL32(255, 255, 255, 10));
@@ -5452,6 +6459,7 @@ int main(int argc, char** argv) {
           for (const terrain::Harbor& hb : tm.harbors) {
             ImVec2 hp(wx(hb.x), wz(hb.z));
             if (hp.x < p0.x || hp.x > p0.x + S || hp.y < p0.y || hp.y > p0.y + S) continue;
+            if (circular && std::hypot(hp.x - (p0.x + S * 0.5f), hp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
             mdl->AddCircleFilled(hp, R + 2.0f, IM_COL32(0, 0, 0, 140));
             mdl->AddCircleFilled(hp, R, factionCol(hb.faction));
             mdl->AddCircle(hp, R, IM_COL32(0, 0, 0, 190), 0, 1.3f);
@@ -5475,6 +6483,7 @@ int main(int argc, char** argv) {
             float lanePulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 1.45f);
             for (const mp::LaneHotspot& ln : mpClient.lanes()) {
               ImVec2 lp(wx(ln.x), wz(ln.z));
+              if (circular && std::hypot(lp.x - (p0.x + S * 0.5f), lp.y - (p0.y + S * 0.5f)) > S * 0.5f) continue;
               float worldR = 1600.0f + 1500.0f * ln.w;
               float rPx = std::max(6.0f, worldR / visW * S);
               // Radial glow approximated with concentric fills.
@@ -5502,10 +6511,14 @@ int main(int argc, char** argv) {
           };
           {
             float ds2 = expanded ? 6.0f : 5.0f;
-            for (const mp::MapShip& m : mpClient.merchantsAll())
-              diamond(ImVec2(wx(m.x), wz(m.z)), ds2, IM_COL32(34, 227, 208, 255), IM_COL32(255, 255, 255, 230));
+            for (const mp::MapShip& m : mpClient.merchantsAll()) {
+              ImVec2 mp2(wx(m.x), wz(m.z));
+              if (circular && std::hypot(mp2.x - (p0.x + S * 0.5f), mp2.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
+              diamond(mp2, ds2, IM_COL32(34, 227, 208, 255), IM_COL32(255, 255, 255, 230));
+            }
             for (const mp::MapPirate& pr : mpClient.piratesAll()) {
               ImVec2 pp(wx(pr.x), wz(pr.z));
+              if (circular && std::hypot(pp.x - (p0.x + S * 0.5f), pp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
               if (pr.hunter) diamond(pp, ds2, IM_COL32(207, 217, 230, 255), IM_COL32(51, 80, 110, 255));
               else {
                 diamond(pp, ds2, IM_COL32(200, 30, 42, 255), IM_COL32(0, 0, 0, 217));
@@ -5538,6 +6551,7 @@ int main(int argc, char** argv) {
             if (rp.npc) continue;
             ImVec2 pp(wx(rp.x), wz(rp.z));
             if (pp.x < p0.x || pp.x > p0.x + S || pp.y < p0.y || pp.y > p0.y + S) continue;
+            if (circular && std::hypot(pp.x - (p0.x + S * 0.5f), pp.y - (p0.y + S * 0.5f)) > S * 0.5f - 7.0f) continue;
             if (isSquadMate(rp.id)) {
               const float s = expanded ? 6.0f : 5.0f;
               const ImVec2 d0(pp.x, pp.y - s), d1(pp.x + s, pp.y), d2(pp.x, pp.y + s), d3(pp.x - s, pp.y);
@@ -5669,11 +6683,17 @@ int main(int argc, char** argv) {
           if (!mapExpanded) { mapZoom = 1.0f; mapViewInit = false; }   // closed via title-bar X
         } else {
           const float S = 200.0f;
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, io.DisplaySize.y - 12.0f),
+          if (vrHudActive) {
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.74f * std::cos(glm::radians(352.0f)),
+                                           io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.74f * std::sin(glm::radians(352.0f))),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowBgAlpha(0.0f);   // circular radar draws its own glass — no plate
+          } else
+          ImGui::SetNextWindowPos(hudPos(1.0f, 1.0f, -12.0f, -12.0f),
                                   ImGuiCond_Always, ImVec2(1.0f, 1.0f));
           ImGui::Begin("minimap", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-          drawMap(S, false);
+          drawMap(S, false, vrHudActive);   // VR: circular local radar (M = full chart)
           if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) mapExpanded = true;   // click the chart to expand
           ImGui::End();
         }
@@ -5688,6 +6708,17 @@ int main(int argc, char** argv) {
         auto project = [&](const glm::vec3& w, ImVec2& out) -> bool {
           glm::vec4 c = lastViewProj * glm::vec4(w, 1.0f);
           if (c.w <= 0.1f) return false;
+#ifdef SAILSIM_HAVE_VR
+          if (vrMode && vrUiW > 0.0f) {
+            // VR: lastViewProj is the CENTER-eye camera → project into FRAME pixels, then
+            // inverse-map through the UI box transform so the draw-data transform puts the label
+            // back at that exact frame position — world-anchored instead of riding the HUD.
+            const float fx = (c.x / c.w * 0.5f + 0.5f) * (float)curW;
+            const float fy = (0.5f - c.y / c.w * 0.5f) * (float)curH;
+            out = ImVec2((fx - vrUiOffX) * (1920.0f / vrUiW), (fy - vrUiOffY) * (vrUiVh / vrUiH));
+            return true;
+          }
+#endif
           out = ImVec2((c.x / c.w * 0.5f + 0.5f) * io.DisplaySize.x,
                        (0.5f - c.y / c.w * 0.5f) * io.DisplaySize.y);
           return true;
@@ -5720,8 +6751,15 @@ int main(int argc, char** argv) {
         // wooden banner (distinct silhouettes, mirroring nameplate.ts).
         auto plaque = [&](ImVec2 cpx, float ph, const char* title, const char* sub,
                           ImU32 bg, ImU32 border, bool town) {
+          // VR: the frame spans a much wider angular field, so distance-scaled plates read too
+          // small — scale the whole plaque (plate + border + text together, fit logic intact).
+          static const float vrLabelScale = [] {
+            const char* v = std::getenv("SAILSIM_VR_LABEL_SCALE");
+            return v ? std::clamp((float)std::atof(v), 1.0f, 2.5f) : 1.45f;
+          }();
+          if (vrHudActive) ph *= vrLabelScale;
           if (ph < 9.0f) return;
-          ph = std::min(ph, 170.0f);
+          ph = std::min(ph, vrHudActive ? 235.0f : 170.0f);
           float pw = ph * 3.6f;
           ImVec2 p0(cpx.x - pw * 0.5f, cpx.y - ph * 0.5f), p1(cpx.x + pw * 0.5f, cpx.y + ph * 0.5f);
           float bw = std::max(1.5f, ph * 0.045f);
@@ -5838,7 +6876,7 @@ int main(int argc, char** argv) {
             char lbl[96];
             if (fs.neutralized) std::snprintf(lbl, sizeof(lbl), "%s  -  SILENCED", hb.name.c_str());
             else std::snprintf(lbl, sizeof(lbl), "%s  -  %d/%d guns", hb.name.c_str(), fs.gunsUp, fs.gunsTotal);
-            float ts = std::clamp(bh * 1.35f, 10.0f, 20.0f);
+            float ts = std::clamp(bh * (vrHudActive ? 1.9f : 1.35f), 10.0f, vrHudActive ? 28.0f : 20.0f);
             ImVec2 tsz = ImGui::GetFont()->CalcTextSizeA(ts, 1e9f, 0.0f, lbl);
             ImVec2 tp(cpx.x - tsz.x * 0.5f, a.y - ts - 3.0f);
             wdl->AddText(ImGui::GetFont(), ts, ImVec2(tp.x + 1, tp.y + 1), IM_COL32(6, 10, 16, 230), lbl);
@@ -5848,7 +6886,7 @@ int main(int argc, char** argv) {
       }
 
       // ── Day/night clock (top-centre): 12-h time + a drawn sun/moon (mirrors the Angular HUD clock). ──
-      {
+      if (!vrHudActive) {
         mp::WaveState wvt = mpClient.wave();
         double epoch = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
         double wall = std::fmod(epoch + wvt.timeOffsetSec, 1440.0); if (wall < 0) wall += 1440.0;
@@ -5987,7 +7025,7 @@ int main(int argc, char** argv) {
 
         // ── Quest tracker: the objective checklist (draggable), skip for intro. ──
         if (q.active) {
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 302.0f, 92.0f), ImGuiCond_FirstUseEver);
+          ImGui::SetNextWindowPos(hudPos(1.0f, 0.0f, -302.0f, 92.0f), ImGuiCond_FirstUseEver);
           ImGui::SetNextWindowSizeConstraints(ImVec2(288, 0), ImVec2(288, FLT_MAX));
           ImGui::Begin("Quest##tracker", nullptr,
                        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
@@ -6206,11 +7244,17 @@ int main(int argc, char** argv) {
           return hb.tier == "capital" ? "Governor's Mansion" : "Mayor's House";
         };
 
-        // Dock prompt (bottom-centre) — shown when alongside a pier and not moored/mooring.
+        // Dock prompt — shown when alongside a pier and not moored/mooring. Flat: bottom-centre,
+        // stacked above the gun HUD. VR: dead centre of the view — bottom-stacked prompts sink
+        // below the comfortable gaze and get missed in-headset.
         if (!tiedUp && !docking && dockIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)dockIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
-                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          if (vrHudActive)
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          else
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("dockprompt", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
           char lbl[128];
@@ -6225,11 +7269,16 @@ int main(int argc, char** argv) {
           ImGui::PopFont();
           ImGui::End();
         }
-        // Mooring indicator (bottom-centre) while the hull glides into the berth (client "⚓ Mooring at …").
+        // Mooring indicator while the hull glides into the berth (client "⚓ Mooring at …").
+        // Same placement as the Dock prompt it replaces (VR: centre, flat: bottom-centre).
         if (docking && tiedIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
-                                  ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          if (vrHudActive)
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+          else
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, gunHudTopY - 8.0f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::Begin("mooring", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
           ImGui::PushFont(fontTitle);
@@ -6241,7 +7290,10 @@ int main(int argc, char** argv) {
         // Moored: the town menu (name, faction, description, the four doors, cast off).
         if (tiedUp && tiedIdx >= 0 && terrainR.ready) {
           const terrain::Harbor& hb = terr.manifest().harbors[(size_t)tiedIdx];
-          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 40.0f),
+          if (vrHudActive && vrBarTop > 0.0f)
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, vrBarTop - 10.0f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+          else
+          ImGui::SetNextWindowPos(hudPos(0.5f, 1.0f, 0.0f, -40.0f),
                                   ImGuiCond_Always, ImVec2(0.5f, 1.0f));
           ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_Always);
           ImGui::Begin("dockmenu", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -6721,10 +7773,29 @@ int main(int argc, char** argv) {
 
       // Collapsed: a chat-bubble button (bottom-left) with an unread badge.
       if (!chatOpen) {
-        ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        if (vrHudActive)
+          ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.66f * std::cos(glm::radians(189.0f)),
+                                         io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.66f * std::sin(glm::radians(189.0f))),
+                                  ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        else
+        ImGui::SetNextWindowPos(hudPos(0.0f, 1.0f, 12.0f, -12.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        if (vrHudActive) ImGui::SetNextWindowBgAlpha(0.0f);   // round chip only — no window plate
         ImGui::Begin("##chatbubble", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar);
         const ImVec2 bp = ImGui::GetCursorScreenPos();
+        if (vrHudActive) {   // round glass chip, matching the VR tool buttons
+          const float br = 24.0f;
+          ImVec2 bcc(bp.x + br, bp.y + br);
+          bool bclk = ImGui::InvisibleButton("##vrchatbtn", ImVec2(br * 2.0f, br * 2.0f));
+          const bool bhov = ImGui::IsItemHovered();
+          if (bhov) ImGui::SetTooltip("Chat (Enter)");
+          ImDrawList* bdl0 = ImGui::GetWindowDrawList();
+          bdl0->AddCircleFilled(bcc, br, chatUnread > 0 ? IM_COL32(38, 118, 133, 220) : IM_COL32(10, 18, 28, 195));
+          bdl0->AddCircle(bcc, br, bhov ? IM_COL32(120, 210, 235, 220) : IM_COL32(140, 170, 195, 175), 40, bhov ? 2.5f : 1.5f);
+          ImVec2 bis = ImGui::CalcTextSize(ICON_FA_COMMENT_DOTS);
+          bdl0->AddText(ImVec2(bcc.x - bis.x * 0.5f, bcc.y - bis.y * 0.5f), IM_COL32(226, 232, 240, 240), ICON_FA_COMMENT_DOTS);
+          if (bclk) { chatOpen = true; chatUnread = 0; }
+        } else
         if (iconBtn(ICON_FA_COMMENT_DOTS, "Chat (Enter)", chatUnread > 0)) { chatOpen = true; chatUnread = 0; }
         if (chatUnread > 0) {   // red unread badge, top-right of the bubble
           ImDrawList* bdl = ImGui::GetWindowDrawList();
@@ -6737,7 +7808,12 @@ int main(int argc, char** argv) {
         ImGui::End();
       }
 
-      ImGui::SetNextWindowPos(ImVec2(12.0f, io.DisplaySize.y - 12.0f), ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
+      if (vrHudActive)
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f + io.DisplaySize.x * 0.5f * 0.66f * std::cos(glm::radians(189.0f)),
+                                       io.DisplaySize.y * 0.5f - io.DisplaySize.y * 0.5f * 0.66f * std::sin(glm::radians(189.0f))),
+                                ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
+      else
+      ImGui::SetNextWindowPos(hudPos(0.0f, 1.0f, 12.0f, -12.0f), ImGuiCond_FirstUseEver, ImVec2(0.0f, 1.0f));
       ImGui::SetNextWindowSize(ImVec2(380.0f, 262.0f), ImGuiCond_FirstUseEver);
       ImGui::SetNextWindowSizeConstraints(ImVec2(280.0f, 170.0f), ImVec2(820.0f, 640.0f));
       const bool chatShown = chatOpen;   // Begin() called iff open — End() must match
@@ -6900,6 +7976,33 @@ int main(int argc, char** argv) {
       }
     }
     ImGui::Render();
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrUiW > 0.0f) {
+      // Map the finished UI draw data from the 1920×1080 virtual screen into the centered
+      // on-frame box. A render-pass viewport can NOT do this: imgui_impl_wgpu sets its own
+      // viewport (0,0,DisplaySize) inside RenderDrawData, so transform the VERTICES and SCISSOR
+      // rects directly, then retarget the draw data's DisplaySize to the full frame — the
+      // backend's own viewport/ortho then maps our frame-pixel coordinates 1:1. Done once per
+      // frame (the draw data is reused for both eyes' resolve passes).
+      ImDrawData* dd = ImGui::GetDrawData();
+      const float sx = vrUiW / 1920.0f, sy = vrUiH / vrUiVh;
+      for (int li = 0; li < dd->CmdListsCount; ++li) {
+        ImDrawList* dl = dd->CmdLists[li];
+        for (int vi = 0; vi < dl->VtxBuffer.Size; ++vi) {
+          dl->VtxBuffer[vi].pos.x = dl->VtxBuffer[vi].pos.x * sx + vrUiOffX;
+          dl->VtxBuffer[vi].pos.y = dl->VtxBuffer[vi].pos.y * sy + vrUiOffY;
+        }
+        for (int ci = 0; ci < dl->CmdBuffer.Size; ++ci) {
+          ImDrawCmd& c = dl->CmdBuffer[ci];
+          c.ClipRect.x = c.ClipRect.x * sx + vrUiOffX;
+          c.ClipRect.y = c.ClipRect.y * sy + vrUiOffY;
+          c.ClipRect.z = c.ClipRect.z * sx + vrUiOffX;
+          c.ClipRect.w = c.ClipRect.w * sy + vrUiOffY;
+        }
+      }
+      dd->DisplaySize = ImVec2((float)curW, (float)curH);   // backend viewport/ortho = full frame
+    }
+#endif
 
     // Server pose corrections (browser applyServerCorrection): the sim snaps to
     // the authoritative pose — clamps, collisions, or an admin moving us. The
@@ -7593,7 +8696,14 @@ int main(int argc, char** argv) {
       }
     }
     if (g_scrollAccum != 0.0) {
-      if (camActive && !io.WantCaptureMouse) {
+      // VR: the captured cursor usually rests over the (large) HUD, so WantCaptureMouse would
+      // silently eat every wheel tick — let the wheel always zoom the camera while sailing.
+#ifdef SAILSIM_HAVE_VR
+      const bool wheelZooms = camActive && (vrMode || !io.WantCaptureMouse);
+#else
+      const bool wheelZooms = camActive && !io.WantCaptureMouse;
+#endif
+      if (wheelZooms) {
         camDist *= std::pow(0.9f, (float)g_scrollAccum);   // wheel up -> zoom in
         camDist = glm::clamp(camDist, 4.0f, 80.0f);
       }
@@ -7655,6 +8765,11 @@ int main(int argc, char** argv) {
     glm::vec3 sunDir  = computeSunDir(gameHours);
     if (std::getenv("SAILSIM_NOON")) sunDir = glm::normalize(glm::vec3(0.25f, 0.72f, 0.18f));   // test: force daylight
     if (std::getenv("SAILSIM_SUNLOW")) sunDir = glm::normalize(glm::vec3(0.82f, 0.20f, 0.14f));  // test: low sun, long shadows
+    if (const char* sdv = std::getenv("SAILSIM_SUNDIR")) {   // test: arbitrary sun direction "x,y,z" (screenshot the sky toward any azimuth)
+      float sx = 0, sy = 0, sz = 0;
+      if (std::sscanf(sdv, "%f,%f,%f", &sx, &sy, &sz) == 3 && (sx*sx + sy*sy + sz*sz) > 1e-6f)
+        sunDir = glm::normalize(glm::vec3(sx, sy, sz));
+    }
     const glm::vec3 moonDir = -sunDir;
     const float sunEl = sunDir.y;                                  // -1 midnight .. +1 noon
     const float dayK  = glm::clamp((sunEl + 0.10f) / 0.20f, 0.0f, 1.0f);   // 1 day, 0 night
@@ -7757,13 +8872,65 @@ int main(int argc, char** argv) {
       float groundY = terr.elevation(eye.x, eye.z);
       if (eye.y < groundY + 3.0f) eye.y = groundY + 3.0f;
     }
-    glm::mat4 viewM = glm::lookAt(eye, lookTarget, lookUp);
-    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, 2.0f, 40000.0f);
+    // ── (VR) per-eye render: everything from the camera to the frame submit runs once per eye
+    //    with that eye's view+projection; flat mode is a single iteration. Sim above runs once. ──
+#ifdef SAILSIM_HAVE_VR
+    const int vrEyePasses = (vrMode && vrActive) ? vr::eyeCount(vrB) : 1;
+#else
+    const int vrEyePasses = 1;
+#endif
+    const glm::mat4 kmViewBase = glm::lookAt(eye, lookTarget, lookUp);   // the k/m camera (per-frame base)
+    const glm::vec3 kmEyeBase = eye;
+    WGPUSurfaceTexture surfaceTex = {};
+    WGPUTextureView view = nullptr;   // frame target: window swapchain (flat) / VR intermediate (VR)
+    bool skipFrame = false;           // minimised window: nothing to render this frame
+    for (int vrEye = 0; vrEye < vrEyePasses; ++vrEye) {
+    eye = kmEyeBase;
+    glm::mat4 viewM = kmViewBase;
+    // Near plane: 2 m suits the chase camera (depth-precision tuning), but it slices open any
+    // geometry inside ~2 m in first-person — and in VR you can lean into things. 0.5 m there.
+    const float nearZ = (firstPerson || vrMode) ? 0.5f : 2.0f;
+    glm::mat4 proj  = glm::perspective(glm::radians(55.0f), aspect, nearZ, 40000.0f);
     // Mirror clip-space X: the world uses compass conventions (+X east, +Z north,
     // heading clockwise) like the browser's left-handed Babylon scene, but a
     // right-handed camera puts east on the LEFT — mirroring the coastlines and
     // reversing apparent A/D turn direction. Safe: every pipeline culls None.
     proj[0][0] = -proj[0][0];
+    // Displayed aspect of THIS eye's frame (VR: tanHalfW/tanHalfH — the wide frame is shown
+    // across the near-square FOV, so pixel aspect lies about on-screen shape). 0 = flat mode,
+    // post.wgsl falls back to the resolution aspect. Keeps the telescope lens circular in VR.
+    float vrLensAspect = 0.0f;
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrActive) {
+      // Head-tracked per-eye camera: worldEye = k/m camera ∘ XR eye pose (seated LOCAL space,
+      // meters, y-up — same units/up as the world). The pose passes through the engine's X-mirror
+      // (M·R·M with M = diag(-1,1,1): negate px, and qy/qz of the quaternion) so head yaw/roll and
+      // the IPD eye offset read correctly in the mirrored world. SAILSIM_VR_NOMIRROR=1 composes
+      // the raw pose instead — a no-rebuild A/B for the handedness landmine.
+      float p7[7], f4[4];
+      vr::eyeCamera(vrB, vrEye, p7, f4);
+      static const bool vrNoMirror = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+      const glm::quat q = vrNoMirror ? glm::quat(p7[6], p7[3], p7[4], p7[5])
+                                     : glm::quat(p7[6], p7[3], -p7[4], -p7[5]);
+      const glm::vec3 p = vrNoMirror ? glm::vec3(p7[0], p7[1], p7[2])
+                                     : glm::vec3(-p7[0], p7[1], p7[2]);
+      const glm::mat4 poseM = glm::translate(glm::mat4(1.0f), p) * glm::mat4_cast(q);
+      const glm::mat4 camWorld = glm::inverse(kmViewBase) * poseM;
+      viewM = glm::inverse(camWorld);
+      eye = glm::vec3(camWorld[3]);
+      // Per-eye SYMMETRIC projection covering (superset, max) the eye's asymmetric FOV: downstream
+      // passes (AO, ocean, DOF unproject) assume a centered projection, so keep it centered and
+      // tell the compositor exactly what we rendered. Superset fills the entire physical view
+      // (no black borders); the UI is placed inside the VISIBLE sub-region separately (see the
+      // virtual-UI block), so nothing readable lands in the invisible margins.
+      const float tanHalfW = std::max(-std::tan(f4[0]), std::tan(f4[1]));
+      const float tanHalfH = std::max(std::tan(f4[2]), -std::tan(f4[3]));
+      proj = glm::perspective(2.0f * std::atan(tanHalfH), tanHalfW / tanHalfH, nearZ, 40000.0f);
+      proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
+      vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));
+      vrLensAspect = tanHalfW / tanHalfH;   // the frame's DISPLAYED aspect (telescope roundness)
+    }
+#endif
     glm::mat4 taaCurVP = proj * viewM;   // UNJITTERED view-proj (TAA camera-motion reprojection)
     glm::mat4 volShadowVP(1.0f);   // frame-scope copy of the cascade-0 shadow VP for the volumetric pass
     if (userCfg.gfx.taa) {
@@ -7777,7 +8944,29 @@ int main(int argc, char** argv) {
       proj[2][1] += (2.0f * jy) / (float)rH;
     }
     glm::mat4 viewProj = proj * viewM;   // JITTERED — used for all scene rendering this frame
-    lastViewProj = viewProj; lastEye = eye;   // for next frame's screen-space labels
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode && vrActive) {
+      if (vrEye == 0) {
+        // Save a CENTER (between-the-eyes) camera for next frame's world labels: eye positions
+        // averaged, eye 0's orientation, the same symmetric projection. Labels project through
+        // this into frame pixels and stay anchored over their towns/ships as the head moves.
+        float pa[7], fa[4], pb[7], fb[4];
+        vr::eyeCamera(vrB, 0, pa, fa);
+        vr::eyeCamera(vrB, vr::eyeCount(vrB) > 1 ? 1 : 0, pb, fb);
+        static const bool vrNoMirror2 = std::getenv("SAILSIM_VR_NOMIRROR") != nullptr;
+        glm::vec3 pc(0.5f * (pa[0] + pb[0]), 0.5f * (pa[1] + pb[1]), 0.5f * (pa[2] + pb[2]));
+        const glm::quat qc = vrNoMirror2 ? glm::quat(pa[6], pa[3], pa[4], pa[5])
+                                         : glm::quat(pa[6], pa[3], -pa[4], -pa[5]);
+        if (!vrNoMirror2) pc.x = -pc.x;
+        const glm::mat4 poseC = glm::translate(glm::mat4(1.0f), pc) * glm::mat4_cast(qc);
+        const glm::mat4 camC = glm::inverse(kmViewBase) * poseC;
+        lastViewProj = proj * glm::inverse(camC);   // fallback (first frame); labels re-project fresh
+        lastEye = glm::vec3(camC[3]);
+        vrLabelBase = kmViewBase; vrLabelProj = proj; vrLabelBaseValid = true;
+      }
+    } else
+#endif
+    { lastViewProj = viewProj; lastEye = eye; }   // for next frame's screen-space labels
 
     // Our hull is server-authoritative — adopt the slug from the "wallet" message
     // (unless a CLI/env model override forced one).
@@ -8218,8 +9407,9 @@ int main(int argc, char** argv) {
       float gale = std::max(0.0f, ((swv0.valid ? swv0.windSpeed : 8.0f) - 20.0f) / 8.0f);
       scatter::System::ShipInfo si{ vessel.x, vessel.z, vessel.heading,
                                     vessel.speed * 0.514f, vessel.anchored };
-      scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
-                        [&](float x, float z) { return fftHeight(x, z); });
+      if (vrEye == 0)   // sim advance once per FRAME (not per eye) — both eyes must see identical state
+        scatterSys.update(device, queue, dt, (double)t, si, std::min(1.0f, std::max(wet, gale)),
+                          [&](float x, float z) { return fftHeight(x, z); });
       // Gull cries queued by the flock behaviours -> attenuate by camera
       // distance ((1 - d/320)^2, inaudible skipped), pan by view-space
       // position (client playCry), and hand to the synth.
@@ -8380,8 +9570,8 @@ int main(int argc, char** argv) {
         { teleCX, teleCY, (teleHeld && sailing) ? 0.255f : 0.0f, 5.0f },
         // Auto-exposure: enabled, key (mid-grey target), min & max exposure multipliers.
         { aeOn, 0.20f, 0.45f, 2.2f },
-        // 3D-LUT grade: enabled, blend amount.
-        { lutOn, 0.85f, 0.0f, 0.0f },
+        // 3D-LUT grade: enabled, blend amount; z = the eye's displayed aspect (VR lens roundness).
+        { lutOn, 0.85f, vrLensAspect, 0.0f },
       };
       wgpuQueueWriteBuffer(queue, postFx.postUbuf, 0, postU, sizeof(postU));
       glm::vec4 bp(bloomThreshold, 0.0f, 0.0f, 0.0f);
@@ -8445,7 +9635,7 @@ int main(int argc, char** argv) {
       audioSys.setWeather(std::max(2.0f, aw.valid ? aw.windSpeed : 8.0f));
       audioSys.setRain(sailing ? precipIntensity : 0.0f);
       audioSys.setEnabled(sailing);
-      musicMgr.update();
+      if (vrEye == 0) musicMgr.update();   // advance once per frame, not per eye
       if (!sailing) audioSys.musicSetGain(0.0f);
     }
     const glm::vec4 oceanSun(lightDir, dayK);
@@ -8758,7 +9948,7 @@ int main(int argc, char** argv) {
       WGPUCommandEncoder renc = wgpuDeviceCreateCommandEncoder(device, nullptr);
       {
         // Mirror scene: sky, then the landscape (far ring + near grid), then the ship.
-        WGPURenderPassColorAttachment rc = {};
+        WGPURenderPassColorAttachment rc = colorAttach0();
         rc.view = reflView; rc.loadOp = WGPULoadOp_Clear; rc.storeOp = WGPUStoreOp_Store;
         rc.clearValue = WGPUColor{ 0.55, 0.72, 0.88, 1.0 };
         WGPURenderPassDepthStencilAttachment rd = {};
@@ -8800,7 +9990,7 @@ int main(int argc, char** argv) {
       if (reflFull) {
         // Mirror clouds: ray-march through the mirrored camera into the refl cloud
         // buffer, depth-tested against the mirror scene (load, no write)...
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = reflCloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
         WGPURenderPassDepthStencilAttachment da = {};
@@ -8817,7 +10007,7 @@ int main(int argc, char** argv) {
       }
       if (reflFull) {
         // ...then denoise-composite them onto the mirror (premultiplied blend).
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = reflView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
         WGPURenderPassDepthStencilAttachment da = {};
         da.view = reflDepthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
@@ -9222,16 +10412,51 @@ int main(int argc, char** argv) {
       }
     }
 
-    WGPUSurfaceTexture surfaceTex;
-    wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
-    if (!surfaceTex.texture) continue;  // e.g. minimised / needs reconfigure
-
-    WGPUTextureView view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
+    // Dawn's DXGI (D3D12) swapchain advances on the INSTANCE event loop, not just the device
+    // tick — pump it before acquiring or GetCurrentTexture keeps handing back "success + null".
+#if defined(WEBGPU_BACKEND_DAWN)
+    wgpuInstanceProcessEvents(instance);
+#endif
+    // (surfaceTex / view / skipFrame are declared just above the per-eye loop.)
+#ifdef SAILSIM_HAVE_VR
+    // VR: render the whole frame into the VR intermediate (not the D3D12-broken window surface).
+    if (vrMode) view = vrFrameView;
+#endif
+    if (!view) {
+      wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
+      if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: surfaceTex.texture=%p status=%d\n",
+                                   frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
+      if (!surfaceTex.texture) {
+        // Fallback: reconfigure + pump both the instance events and the device, then retry once.
+        wgpuSurfaceConfigure(surface, &surfaceConfig);
+#if defined(WEBGPU_BACKEND_DAWN)
+        wgpuInstanceProcessEvents(instance);
+        wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+        wgpuDevicePoll(device, false, nullptr);
+#endif
+        wgpuSurfaceGetCurrentTexture(surface, &surfaceTex);
+        if (frame <= 8) std::fprintf(stderr, "[boot] frame %ld: after reconfigure retry, texture=%p status=%d\n",
+                                     frame, (void*)surfaceTex.texture, (int)surfaceTex.status);
+        if (!surfaceTex.texture) {
+          // Still nothing (genuinely minimised / occluded). Pump the backend, leave the per-eye
+          // loop, and skip the whole frame (a bare `continue` would fall into the present block).
+#if defined(WEBGPU_BACKEND_DAWN)
+          wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+          wgpuDevicePoll(device, false, nullptr);
+#endif
+          skipFrame = true;
+        }
+      }
+      if (!skipFrame) view = wgpuTextureCreateView(surfaceTex.texture, nullptr);
+    }
+    if (skipFrame) break;   // out of the per-eye loop; the post-loop guard skips the frame
 
     WGPUCommandEncoderDescriptor encDesc = {};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
 
-    WGPURenderPassColorAttachment colorAttachment = {};
+    WGPURenderPassColorAttachment colorAttachment = colorAttach0();
     colorAttachment.view = sceneView;   // linear HDR scene target; post grades to the swapchain
     colorAttachment.loadOp = WGPULoadOp_Clear;
     colorAttachment.storeOp = WGPUStoreOp_Store;
@@ -9649,7 +10874,7 @@ int main(int argc, char** argv) {
     // ── God-ray occlusion: the sun's brightness where the sky shows, depth-tested
     //    against the scene so terrain/ocean/ships silhouette it into shafts. ──
     if (sailing) {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = grView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -9670,7 +10895,7 @@ int main(int argc, char** argv) {
     if (sailing) {
       float dsz[4] = { (float)curW, (float)curH, cloudDenoiseBypass, 0.0f };
       wgpuQueueWriteBuffer(queue, clouds.denoiseUniform, 0, dsz, sizeof(dsz));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = cloudView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -9688,7 +10913,7 @@ int main(int argc, char** argv) {
 
     // ── Composite pass (into the HDR scene): cloud denoise + god-ray shafts. ──
     if (sailing) {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDepthStencilAttachment da = {};
       da.view = depthView; da.depthLoadOp = WGPULoadOp_Load; da.depthStoreOp = WGPUStoreOp_Store;
@@ -9719,7 +10944,7 @@ int main(int argc, char** argv) {
     //    CoC-scaled gather blur), then bloom (brightpass, blur H, blur V). ──
     if (sailing) {
       auto fullscreen = [&](WGPUTextureView target, WGPURenderPipeline pipe, WGPUBindGroup bind) {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = target; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
         WGPURenderPassDescriptor pd = {};
@@ -9757,7 +10982,7 @@ int main(int argc, char** argv) {
       ce[1].binding = 1; ce[1].textureView = depthReadView;
       WGPUBindGroupDescriptor cbd = {}; cbd.layout = postFx.csBGL; cbd.entryCount = 2; cbd.entries = ce;
       WGPUBindGroup cbind = wgpuDeviceCreateBindGroup(device, &cbd);
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
       WGPURenderPassEncoder cp = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
@@ -9791,7 +11016,7 @@ int main(int argc, char** argv) {
       ve[3].binding = 3; ve[3].sampler = vsh.cmp;
       WGPUBindGroupDescriptor vbd = {}; vbd.layout = postFx.volBGL; vbd.entryCount = 4; vbd.entries = ve;
       WGPUBindGroup vbind = wgpuDeviceCreateBindGroup(device, &vbd);
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = sceneView; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
       WGPURenderPassEncoder vp2 = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
@@ -9820,7 +11045,7 @@ int main(int argc, char** argv) {
       glm::vec3 fc = glm::mix(glm::vec3(0.02f, 0.03f, 0.05f), glm::vec3(0.58f, 0.66f, 0.76f), dayK);
       su.fogCol = glm::vec4(fc, 1.0f);
       wgpuQueueWriteBuffer(queue, postFx.ssrUbuf, 0, &su, sizeof(su));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = ssrView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -9838,7 +11063,7 @@ int main(int argc, char** argv) {
     if (userCfg.gfx.autoExposure && sailing) {
       glm::vec4 lp(0.045f, 0.0015f, 0.0f, 0.0f);   // adaptation rate/frame, min luminance clamp
       wgpuQueueWriteBuffer(queue, postFx.lumUbuf, 0, &lp, sizeof(lp));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = lumDstView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -9860,7 +11085,7 @@ int main(int argc, char** argv) {
     //    is attached READ-ONLY so the post shader can also sample the depth aspect
     //    (full-res CoC) in this same pass. ──
     {
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = ldrView; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDepthStencilAttachment da = {};
@@ -9880,7 +11105,7 @@ int main(int argc, char** argv) {
     //    motion vectors. The resolve reads these to reproject the moving ships (camera-only depth
     //    reproj can't); static geometry stays at the sentinel and uses the depth reprojection. ──
     if (userCfg.gfx.taa && sailing && (!taaMovers.empty() || cannonFx.anyActive())) {
-      WGPURenderPassColorAttachment vca = {};
+      WGPURenderPassColorAttachment vca = colorAttach0();
       vca.view = taaVelView; vca.loadOp = WGPULoadOp_Clear; vca.storeOp = WGPUStoreOp_Store;
       vca.clearValue = WGPUColor{ 99.0, 99.0, 0.0, 0.0 };
       WGPURenderPassDepthStencilAttachment vda = {};
@@ -9919,7 +11144,7 @@ int main(int argc, char** argv) {
       tu.params = glm::vec4(taaSharpen, taaClamp, 0.0f, 0.0f);
       wgpuQueueWriteBuffer(queue, postFx.taaUbuf, 0, &tu, sizeof(tu));
       {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = taaHistView[taaCur]; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
         WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -9932,7 +11157,7 @@ int main(int argc, char** argv) {
       }
       glm::vec4 fu(0.0f, 1.0f / (float)curW, 1.0f / (float)curH, 0.0f);   // fxaa passthrough (x=0)
       wgpuQueueWriteBuffer(queue, postFx.fxaaUbuf, 0, &fu, sizeof(fu));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = view; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       WGPURenderPassDescriptor fpd = {}; fpd.colorAttachmentCount = 1; fpd.colorAttachments = &ca;
@@ -9951,7 +11176,7 @@ int main(int argc, char** argv) {
       glm::vec4 rtm(1.0f / (float)rW, 1.0f / (float)rH, (float)rW, (float)rH);
       wgpuQueueWriteBuffer(queue, postFx.smaaUbuf, 0, &rtm, sizeof(rtm));
       auto smaaPass = [&](WGPUTextureView tgt, WGPURenderPipeline pipe, WGPUBindGroup bind, bool isSwap) {
-        WGPURenderPassColorAttachment ca = {};
+        WGPURenderPassColorAttachment ca = colorAttach0();
         ca.view = tgt; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
         ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, isSwap ? 1.0 : 0.0 };
         WGPURenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
@@ -9969,7 +11194,7 @@ int main(int argc, char** argv) {
     } else {
       glm::vec4 fu(userCfg.gfx.aa >= 1 ? 1.0f : 0.0f, 1.0f / (float)curW, 1.0f / (float)curH, 0.0f);
       wgpuQueueWriteBuffer(queue, postFx.fxaaUbuf, 0, &fu, sizeof(fu));
-      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassColorAttachment ca = colorAttach0();
       ca.view = view; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
       ca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
       // No depth: this pass renders at swapchain res, while the scene depth is at
@@ -9985,11 +11210,30 @@ int main(int argc, char** argv) {
       wgpuRenderPassEncoderRelease(fp);
     }
 
+#ifdef SAILSIM_HAVE_VR
+    // Blit THIS eye's finished frame (vrFrameTex) into its eye target — same encoder, right after
+    // the resolve pass wrote it (Dawn inserts the write→read barrier). Stereo: each per-eye
+    // iteration renders its own view of the frame and blits only its own eye.
+    if (vrActive) {
+      WGPURenderPassColorAttachment eca = colorAttach0();
+      eca.view = vr::eyeTarget(vrB, vrEye);
+      eca.loadOp = WGPULoadOp_Clear; eca.storeOp = WGPUStoreOp_Store;
+      eca.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
+      WGPURenderPassDescriptor erp = {}; erp.colorAttachmentCount = 1; erp.colorAttachments = &eca;
+      WGPURenderPassEncoder ep = wgpuCommandEncoderBeginRenderPass(encoder, &erp);
+      wgpuRenderPassEncoderSetPipeline(ep, vrBlitPipe);
+      wgpuRenderPassEncoderSetBindGroup(ep, 0, vrBlitBind, 0, nullptr);
+      wgpuRenderPassEncoderDraw(ep, 3, 1, 0, 0);
+      wgpuRenderPassEncoderEnd(ep);
+      wgpuRenderPassEncoderRelease(ep);
+    }
+#endif
+
     WGPUCommandBufferDescriptor cmdDesc = {};
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &cmdDesc);
     wgpuQueueSubmit(queue, 1, &cmd);
 
-    if (shotPath && frame == shotFrame) {
+    if (shotPath && frame == shotFrame && surfaceTex.texture) {
       captureSurface(device, queue, surfaceTex.texture, curW, curH, shotPath);
       glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
@@ -9997,11 +11241,57 @@ int main(int argc, char** argv) {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(encoder);
     // (ocean bind groups are cached now — released only on rebuild, not per frame)
-    wgpuTextureViewRelease(view);
+    }   // ── end of the per-eye render loop ──
 
+    if (skipFrame) continue;   // minimised: nothing rendered/submitted this frame
+
+#ifdef SAILSIM_HAVE_VR
+    if (vrMode) {
+      vr::endFrame(vrB);   // EndAccess + copy each eye's RT into the XR image + submit the XR frame
+      // Desktop mirror: blit the frame intermediate (the last-rendered eye) to the window, so the
+      // desktop shows what the player sees instead of a frozen frame. Best-effort — a minimised
+      // window just skips it. SAILSIM_VR_MIRROR=off disables (e.g. to A/B a swapchain conflict).
+      static const bool vrMirrorOff = [] {
+        const char* v = std::getenv("SAILSIM_VR_MIRROR");
+        return v && std::strcmp(v, "off") == 0;
+      }();
+      if (!vrMirrorOff && vrMirrorPipe && vrBlitBind) {
+        WGPUSurfaceTexture mst = {};
+        wgpuSurfaceGetCurrentTexture(surface, &mst);
+        if (mst.texture) {
+          WGPUTextureView mv = wgpuTextureCreateView(mst.texture, nullptr);
+          WGPUCommandEncoderDescriptor med = {};
+          WGPUCommandEncoder menc = wgpuDeviceCreateCommandEncoder(device, &med);
+          WGPURenderPassColorAttachment mca = colorAttach0();
+          mca.view = mv; mca.loadOp = WGPULoadOp_Clear; mca.storeOp = WGPUStoreOp_Store;
+          mca.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+          WGPURenderPassDescriptor mrp = {}; mrp.colorAttachmentCount = 1; mrp.colorAttachments = &mca;
+          WGPURenderPassEncoder mp = wgpuCommandEncoderBeginRenderPass(menc, &mrp);
+          wgpuRenderPassEncoderSetPipeline(mp, vrMirrorPipe);
+          wgpuRenderPassEncoderSetBindGroup(mp, 0, vrBlitBind, 0, nullptr);
+          wgpuRenderPassEncoderDraw(mp, 3, 1, 0, 0);
+          wgpuRenderPassEncoderEnd(mp);
+          wgpuRenderPassEncoderRelease(mp);
+          WGPUCommandBufferDescriptor mcd = {};
+          WGPUCommandBuffer mcb = wgpuCommandEncoderFinish(menc, &mcd);
+          wgpuQueueSubmit(queue, 1, &mcb);
+          wgpuCommandBufferRelease(mcb);
+          wgpuCommandEncoderRelease(menc);
+          wgpuTextureViewRelease(mv);
 #ifndef __EMSCRIPTEN__
-    wgpuSurfacePresent(surface);
+          wgpuSurfacePresent(surface);
 #endif
+        }
+      }
+    } else
+#endif
+    {
+      wgpuTextureViewRelease(view);
+      if (frame <= 5) std::fprintf(stderr, "[boot] frame %ld: presenting\n", frame);
+#ifndef __EMSCRIPTEN__
+      wgpuSurfacePresent(surface);
+#endif
+    }
 
     // Let Dawn/wgpu service their internal work queues each frame.
 #if defined(WEBGPU_BACKEND_DAWN)
@@ -10012,6 +11302,15 @@ int main(int argc, char** argv) {
   }
 
   std::printf("[spike] render loop exited after %ld frames — tearing down cleanly\n", frame);
+
+#ifdef SAILSIM_HAVE_VR
+  // ALWAYS destroy the bridge (xrEndSession/xrDestroySession/xrDestroyInstance): leaving the XR
+  // session open on exit wedges Virtual Desktop's compositor (black headset until a PC reboot).
+  if (vrB) { vr::destroy(vrB); vrB = nullptr; std::fprintf(stderr, "[vr] session destroyed cleanly\n"); }
+#ifdef _WIN32
+  if (vrMode) ClipCursor(nullptr);   // release the cursor confinement
+#endif
+#endif
 
   // 7. Teardown
   wgpuTextureViewRelease(depthView);

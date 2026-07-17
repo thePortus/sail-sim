@@ -309,6 +309,33 @@ struct FishSchool {
   std::vector<FishM> fish;
 };
 
+// ── Town-pad scatter exclusion (client scatter.service getTownPads/inTown port) ──
+// Each harbor town's flat pad rectangle (+6 m margin, like the client) excludes ALL scatter
+// kinds — trees/palms/rocks/drift/grass, near AND far — so towns never disappear under canopy.
+struct TownPad { float cx, cz, hx, hz, s, c, r; };
+static std::vector<TownPad> buildTownPads(const terrain::Terrain* terr) {
+  std::vector<TownPad> pads;
+  if (!terr || !terr->loaded()) return pads;
+  const float M = 6.0f;   // keep scatter this far back from the town edge too (client M)
+  for (const terrain::Harbor& h : terr->manifest().harbors) {
+    if (!h.pad.valid) continue;
+    const float hr = h.pad.rotY * (TAU / 360.0f);
+    const float hx = h.pad.halfX + M, hz = h.pad.halfZ + M;
+    pads.push_back({ h.pad.cx, h.pad.cz, hx, hz, std::sin(hr), std::cos(hr), std::hypot(hx, hz) });
+  }
+  return pads;
+}
+static bool inTownPad(const std::vector<TownPad>& pads, float px, float pz) {
+  for (const TownPad& p : pads) {
+    const float dx = px - p.cx, dz = pz - p.cz;
+    if (dx * dx + dz * dz > p.r * p.r) continue;   // cheap radius reject (usually all of them)
+    const float along  = dx * p.s + dz * p.c;      // along the town's heading axis (halfZ)
+    const float across = dx * p.c - dz * p.s;      // across the frontage (halfX)
+    if (std::fabs(along) <= p.hz && std::fabs(across) <= p.hx) return true;
+  }
+  return false;
+}
+
 struct System::Impl {
   WGPUDevice device = nullptr;
   WGPUQueue queue = nullptr;
@@ -318,6 +345,7 @@ struct System::Impl {
   WGPUTextureView whiteView = nullptr;
   const terrain::Terrain* terr = nullptr;
   bool ready = false;
+  std::vector<TownPad> pads;   // scatter-free town footprints (set with the terrain)
 
   Layer palms, trees, rocks, drift, grass;
   Layer birdsL, dolphinsL, fishL;   // wildlife draw sets (full[] only; instances per frame)
@@ -953,6 +981,9 @@ buildFarLayers(const terrain::Terrain* terr) {
     ++seen;
   };
   auto _t0 = std::chrono::steady_clock::now();
+  // Town pads exclude far impostors too — the near kernels skip them, so a far tree over a town
+  // would pop OUT on approach (and hide the town from sea, which is how the bug was found).
+  const std::vector<TownPad> pads = buildTownPads(terr);
 
   // ── PASS A: FAR FOREST (beech) — dense hillside fill up to the treeline. ──
   // Cap the whole-map walk at ~8M cells (stride up on huge maps), matching the
@@ -985,6 +1016,7 @@ buildFarLayers(const terrain::Terrain* terr) {
       float dens = beechAccept(stand, clearing, sl, y);
       if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) continue;
       if (nearShoreline(px, pz, 6.0f)) continue;
+      if (inTownPad(pads, px, pz)) continue;
       int v = std::min(2, (int)(hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f) * 3.0f));
       float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
       reservoir(out.first[(size_t)v], seenB[(size_t)v],
@@ -1023,6 +1055,7 @@ buildFarLayers(const terrain::Terrain* terr) {
           bool beechOk = hashA <= densB;
           if (!palmOk && !beechOk) continue;
           if (nearShoreline(px, pz, 7.0f)) continue;
+          if (inTownPad(pads, px, pz)) continue;
           float vh = hash2(px * 0.71f + 50.0f, pz * 0.67f - 50.0f);
           int v = std::min(2, (int)(vh * 3.0f));
           if (palmOk) {
@@ -1049,6 +1082,7 @@ buildFarLayers(const terrain::Terrain* terr) {
 
 void System::setTerrain(const terrain::Terrain* terr) {
   p_->terr = terr;
+  p_->pads = buildTownPads(terr);   // town footprints stay scatter-free (near kernels)
   if (terr && !p_->farBuilt && !p_->farFuture.valid())
     p_->farFuture = std::async(std::launch::async, [terr] { return buildFarLayers(terr); });
 }
@@ -1084,6 +1118,7 @@ static void palmKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float dens = sstep(0.48f, 0.80f, stand) * (1.0f - sl * 0.6f) * 0.95f;
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) return;
   if (p->nearShore(px, pz, 7.0f)) return;
+  if (inTownPad(p->pads, px, pz)) return;   // no palms in the fountain
   float s = 0.92f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.16f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
@@ -1102,6 +1137,7 @@ static void treeKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float dens = beechAccept(stand, clearing, sl, y);
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) return;
   if (p->nearShore(px, pz, 6.0f)) return;
+  if (inTownPad(p->pads, px, pz)) return;   // towns stay visible — no beeches over the streets
   float s = 0.9f + hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f) * 0.22f;
   float yaw = hash2(px * 1.13f + 7.0f, pz * 1.07f - 7.0f) * TAU;
   out[variantOf(nv, px, pz)].push_back(compose(yaw, 0, 0, s, s, s, px, y - 0.35f, pz, glm::vec3(1.0f), 1.0f));
@@ -1118,6 +1154,7 @@ static void rockKernel(Impl* p, size_t nv, float px, float pz, std::vector<std::
   float bandMul = 0.45f + 0.55f * beach + 0.6f * upland;
   float dens = (0.004f + 0.085f * sstep(0.60f, 0.82f, clump)) * bandMul * (1.0f - sl * 0.4f);
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) return;
+  if (inTownPad(p->pads, px, pz)) return;
   float r = hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f);
   float base = 0.25f + hash2(px * 6.1f + 9.0f, pz * 6.1f - 9.0f) * 0.4f;
   if (r < 0.05f) base = 1.8f + hash2(px * 2.2f, pz * 2.2f) * 1.7f;
@@ -1141,6 +1178,7 @@ static void driftKernel(Impl* p, size_t nv, float px, float pz, std::vector<std:
   float clump = fbm2(px / 16.0f + 40.0f, pz / 16.0f - 22.0f);
   float dens = (0.004f + 0.07f * sstep(0.60f, 0.82f, clump)) * (1.0f - sl * 0.4f);
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > dens) return;
+  if (inTownPad(p->pads, px, pz)) return;
   float r = hash2(px * 5.3f - 2.0f, pz * 4.7f + 8.0f);
   float s = 0.45f + hash2(px * 6.1f + 9.0f, pz * 6.1f - 9.0f) * 0.25f;
   if (r < 0.15f) s = 1.2f + hash2(px * 2.2f, pz * 2.2f) * 0.6f;
@@ -1185,6 +1223,7 @@ static void grassKernel(Impl* p, size_t nv, float px, float pz, std::vector<std:
   float beachDens = beachRegion * coreD * beachBand * 0.85f;
   float density = std::max(forestDens, beachDens) * alt * (1.0f - sl * 0.7f);
   if (hash2(px * 3.1f + 1.7f, pz * 2.9f - 3.3f) > density) return;
+  if (inTownPad(p->pads, px, pz)) return;   // covers the whole 0.9 m blade burst too
   grassEmit(p, nv, px, pz, y, out);
   const float BURST = 6.0f, BUSH_R = 0.9f;
   int blades = (int)(3.0f + coreD * (BURST - 3.0f));

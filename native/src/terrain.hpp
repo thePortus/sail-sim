@@ -33,6 +33,7 @@ struct Harbor {
   std::string name, faction, tier, variant;   // variant picks the pier GLB (straight/l/t)
   float x = 0, z = 0, heading = 0;
   float padElev = 0;                          // town pad ground elevation (metres)
+  Rect pad;                                   // the town's flat footprint rectangle (scatter exclusion etc.)
   std::vector<Building> buildings;
   std::vector<Street>   streets;              // road network (draped ribbons)
   Rect                  square;               // civic square (valid=false if none)

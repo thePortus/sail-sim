@@ -57,7 +57,14 @@ bool Terrain::load(const std::string& host, int port) {
         auto it = o.find(k);
         return (it != o.end() && it->is_number()) ? it->get<float>() : dflt;
       };
-      if (h.contains("pad") && h["pad"].is_object()) hb.padElev = num(h["pad"], "elev", 0.0f);
+      if (h.contains("pad") && h["pad"].is_object()) {
+        const auto& pd = h["pad"];
+        hb.padElev = num(pd, "elev", 0.0f);
+        hb.pad.cx = num(pd, "cx", 0.0f);       hb.pad.cz = num(pd, "cz", 0.0f);
+        hb.pad.halfX = num(pd, "halfX", 0.0f); hb.pad.halfZ = num(pd, "halfZ", 0.0f);
+        hb.pad.rotY = num(pd, "rotY", 0.0f);
+        hb.pad.valid = hb.pad.halfX > 0.0f && hb.pad.halfZ > 0.0f;
+      }
       if (h.contains("buildings") && h["buildings"].is_array()) {
         for (const auto& b : h["buildings"]) {
           if (!b.is_object()) continue;

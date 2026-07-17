@@ -64,6 +64,7 @@ struct RigSubmesh {
   uint32_t indexOffset = 0;
   uint32_t indexCount = 0;
   int baseColor = -1, normal = -1, metalRough = -1;   // into textures
+  float albedo[3] = { 1, 1, 1 };      // material baseColorFactor (flag-tint gate: only blank white ensigns tint)
   float emissive[3] = { 0, 0, 0 };    // emissiveFactor x KHR emissive strength (lantern glass, windows)
   std::string name;                   // owning NODE name (semantic)
   std::string material;               // glTF material name (e.g. SHIP_FLAG) — flag tint keys off this

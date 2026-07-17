@@ -241,6 +241,7 @@ RiggedData loadGltfRigged(const char* path) {
       sm.indexOffset = indexOffset;
       sm.indexCount = (uint32_t)out.indices.size() - indexOffset;
       sm.baseColor = baseColorTex; sm.normal = normalTex; sm.metalRough = metalRoughTex;
+      sm.albedo[0] = albedo[0]; sm.albedo[1] = albedo[1]; sm.albedo[2] = albedo[2];   // baseColorFactor (flag-tint gate)
       if (prim.material) {   // emissive = factor x KHR strength (lantern glass, cabin windows)
         const float es = prim.material->has_emissive_strength
                        ? prim.material->emissive_strength.emissive_strength : 1.0f;

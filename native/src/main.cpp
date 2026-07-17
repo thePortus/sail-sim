@@ -691,10 +691,17 @@ static Mesh createMesh(WGPUDevice device, WGPUQueue queue, WGPUTextureFormat col
       // by pal.w[31 + kFlagTintSlot] — the per-instance player flag colour (client flag-color.ts parity).
       // Ships pack the flag as a PRIMITIVE with material SHIP_FLAG inside a merged rigging mesh, so key off the
       // material name (client flag-color.ts parity); the node name catches the town/fort ensign submeshes.
+      // BUT the tint REPLACES the material colour, so only a BLANK WHITE panel (a player-tintable ship ensign:
+      // SHIP_FLAG/FR_FLAG carry no baseColorFactor → cgltf defaults to 1,1,1) may be tagged. The harbour
+      // NATIONAL flags (flag_<cc>.glb) paint their design in per-material baseColorFactor with no texture, so
+      // tagging them would swap their authored colours for white → the "grey blank fort flags" bug.
       std::string nm = data.submeshes[si].name + " " + data.submeshes[si].material;
       std::transform(nm.begin(), nm.end(), nm.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-      if (nm.find("flag") != std::string::npos || nm.find("ensign") != std::string::npos ||
-          nm.find("pennant") != std::string::npos || nm.find("burgee") != std::string::npos)
+      const float* fa = data.submeshes[si].albedo;
+      const bool blankWhitePanel = fa[0] > 0.97f && fa[1] > 0.97f && fa[2] > 0.97f;   // no authored flag colour
+      if (blankWhitePanel &&
+          (nm.find("flag") != std::string::npos || nm.find("ensign") != std::string::npos ||
+           nm.find("pennant") != std::string::npos || nm.find("burgee") != std::string::npos))
         infos[si].pad = (infos[si].pad & ~0xFu) | kFlagTintSlot;
     }
     if (deltas.empty()) deltas.assign(3, 0.0f);             // dummy for morph-free meshes

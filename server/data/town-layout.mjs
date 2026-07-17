@@ -42,9 +42,9 @@ export function composeTown(tier, rng) {
   if (tier === 'capital') {
     townhall  = rng() < 0.6 ? 'townhall_governor' : 'townhall_magistrate';
     fountain  = pick(fountains);
-    taverns   = 2 + Math.floor(rng() * 2);            // 2–3
-    dwellings = 22 + Math.floor(rng() * 12);          // 22–33
-    shacks    = 1 + Math.floor(rng() * 3);            // 1–3
+    taverns   = 3 + Math.floor(rng() * 2);            // 3–4
+    dwellings = 30 + Math.floor(rng() * 13);          // 30–42 (fills the widened capital footprint)
+    shacks    = 2 + Math.floor(rng() * 3);            // 2–4
   } else if (tier === 'medium') {
     townhall  = rng() < 0.8 ? (rng() < 0.5 ? 'townhall_magistrate' : 'townhall_governor') : null;
     fountain  = (townhall && rng() < 0.5) ? pick(fountains) : null;
@@ -177,17 +177,21 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
 
   const STREET_W = 5;
   const SPEC = {
-    capital: { depthM: 150, squareD: 20, squareW: 24, maxStreets: 4, targetWidthM: 90 },
+    capital: { depthM: 170, squareD: 24, squareW: 28, maxStreets: 5, targetWidthM: 130 },
     medium:  { depthM: 95,  squareD: 14, squareW: 16, maxStreets: 3, targetWidthM: 58 },
     small:   { depthM: 80,  squareD: 0,  squareW: 0,  maxStreets: 2, targetWidthM: 42 },
   }[tier];
 
-  // Town extends up to ~46 m past the naturally-flat land (the pad flattens the rest), so even tight sites
-  // host a proper number of houses. Layout is ORGANIC: a few WANDERING streets, with houses placed along
-  // both sides at jittered spacing/setback and rotated to face the local street direction (+ a little skew).
+  // Town extends past the naturally-flat land (the pad flattens the rest), so even tight sites host a
+  // proper number of houses. CAPITALS get a much larger artificial-flat apron: with the old shared
+  // +46/+30 allowance a minimum-qualifying capital site clamped down to the same usable footprint as a
+  // well-sited medium town — more buildings, no more ground, so the top tier never READ bigger.
+  // Layout is ORGANIC: a few WANDERING streets, with houses placed along both sides at jittered
+  // spacing/setback and rotated to face the local street direction (+ a little skew).
+  const EXT = tier === 'capital' ? { depth: 90, width: 65 } : { depth: 46, width: 30 };
   const WATERFRONT = 20;                              // band reserved near the pier (clear of the shore/water cell)
-  const usableDepth = Math.max(20, Math.min(SPEC.depthM, site.inlandFlatM + 46) - WATERFRONT - SPEC.squareD - 8);
-  const usableWidth = Math.min(SPEC.targetWidthM, site.flatWidthM + 30);
+  const usableDepth = Math.max(20, Math.min(SPEC.depthM, site.inlandFlatM + EXT.depth) - WATERFRONT - SPEC.squareD - 8);
+  const usableWidth = Math.min(SPEC.targetWidthM, site.flatWidthM + EXT.width);
 
   const buildings = [];
   const placed = [];                                 // {x,z,r} for greedy overlap rejection
@@ -240,7 +244,11 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
     if (wish.fountain) place(wish.fountain, sqF, 0, town.heading);
     place(wish.townhall, sqF + SPEC.squareD / 2 + fp[wish.townhall].d / 2 + 1, 0, town.heading);
   } else if (wish.townhall) {
-    place(wish.townhall, resF1 + 6 + fp[wish.townhall].d / 2, (rng() - 0.5) * 18 + town.heading);
+    // (fixed) the rotation used to be passed as the SIDEWAYS offset `s` — heading degrees read as
+    // metres, flinging small-town townhalls up to ~360 m off-axis and dragging a huge flat pad
+    // (terrain scar) with them. s is a small jitter; the heading goes in the rotation slot.
+    place(wish.townhall, resF1 + 6 + fp[wish.townhall].d / 2, (rng() - 0.5) * 10,
+          (rng() - 0.5) * 18 + town.heading);
   }
 
   // ── Streets: several wandering, roughly-parallel lanes (dense → lots of house frontage), then CONNECTORS

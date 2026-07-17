@@ -8960,6 +8960,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // across the near-square FOV, so pixel aspect lies about on-screen shape). 0 = flat mode,
     // post.wgsl falls back to the resolution aspect. Keeps the telescope lens circular in VR.
     float vrLensAspect = 0.0f;
+    // Lens radius is authored as a fraction of frame height, tuned on the flat 55° camera. The
+    // VR frame spans ~100°+ vertically, so the same fraction reads ~4x larger in-headset (the
+    // "telescope takes most of the view" bug) — scale it to the flat ANGULAR size per eye.
+    float vrLensRScale = 1.0f;
 #ifdef SAILSIM_HAVE_VR
     if (vrMode && vrActive) {
       // Head-tracked per-eye camera: worldEye = k/m camera ∘ XR eye pose (seated LOCAL space,
@@ -8989,6 +8993,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       proj[0][0] = -proj[0][0];   // same clip-space X mirror as the flat camera
       vr::setEyeSubmitFov(vrB, vrEye, std::atan(tanHalfW), std::atan(tanHalfH));
       vrLensAspect = tanHalfW / tanHalfH;   // the frame's DISPLAYED aspect (telescope roundness)
+      vrLensRScale = 0.5206f / tanHalfH;    // tan(27.5°) — flat camera's half-height (telescope size)
     }
 #endif
     glm::mat4 taaCurVP = proj * viewM;   // UNJITTERED view-proj (TAA camera-motion reprojection)
@@ -9626,8 +9631,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         { (isNight ? 4.0f : 12.0f) / 255.0f, isNight ? 0.0f : 1.0f, 0.40f, 0.08f },
         { focusDist, cocK, 0.0f, dofOn },
         { proj[2][2], proj[3][2], ssaoOn, gradeSat },
-        // Telescope lens: centre (uv), radius (0 = off; client RADIUS 0.255), zoom 5x.
-        { teleCX, teleCY, (teleHeld && sailing) ? 0.255f : 0.0f, 5.0f },
+        // Telescope lens: centre (uv), radius (0 = off; client RADIUS 0.255, angular-matched in VR), zoom 5x.
+        { teleCX, teleCY, (teleHeld && sailing) ? 0.255f * vrLensRScale : 0.0f, 5.0f },
         // Auto-exposure: enabled, key (mid-grey target), min & max exposure multipliers.
         { aeOn, 0.20f, 0.45f, 2.2f },
         // 3D-LUT grade: enabled, blend amount; z = the eye's displayed aspect (VR lens roundness).

@@ -168,6 +168,32 @@ export function deriveForts(pad, tier) {
             flag: spec.flag || null, accent: !!spec.accent, guns }];
 }
 
+/**
+ * Faction → street-network pattern (historically grounded — see the Laws of the Indies, and the
+ * planned-grid vs medieval-serpentine split among real 17th-c Caribbean ports):
+ *   spanish → 'plaza'    Plaza Mayor at the town's heart, rectilinear grid ringing it (Laws of the Indies)
+ *   french  → 'bastide'  tighter market-square grid, plaza nearer the waterfront
+ *   dutch   → 'rows'     long blocks PARALLEL to the waterfront + short cross alleys (Willemstad)
+ *   english → 'grid'     planned High-Street port (Port Royal)  …or…
+ *             'organic'  medieval serpentine lanes (Bridgetown) — 50/50 per town
+ * Small towns are always 'organic' hamlets (a shore lane + a winding high street), whoever owns them.
+ */
+const PATTERN_BLOCKS = {           // block pitch (m): depth = inland (f) pitch, width = across (s) pitch
+  plaza:   { bd: 30, bw: 32 },
+  bastide: { bd: 24, bw: 26 },
+  grid:    { bd: 28, bw: 30 },
+  rows:    { bd: 24, bw: 0  },     // rows: no fixed s-pitch — staggered alleys instead
+};
+
+/**
+ * ROADS-FIRST town layout (v3). The street NETWORK is generated first — an arterial skeleton
+ * (waterfront quay road + a main/high street from the pier) filled in by the faction's pattern —
+ * then building LOTS are derived from the street frontage and the roster is placed onto lots,
+ * always facing their street (Parish–Müller pipeline shape: roads → blocks/lots → buildings).
+ * The number of roads emerges from block-pitch targets over the buildable envelope, so a wide
+ * capital genuinely needs (and gets) more streets than a hamlet. Output format is unchanged:
+ * streets as straight segments, buildings, optional square, pad rect (walls/forts derive from it).
+ */
 export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
   const hr = town.heading * Math.PI / 180;
   const fwd = [-Math.sin(hr), -Math.cos(hr)];         // inland (landward)
@@ -177,46 +203,199 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
 
   const STREET_W = 5;
   const SPEC = {
-    capital: { depthM: 170, squareD: 24, squareW: 28, maxStreets: 5, targetWidthM: 130 },
-    medium:  { depthM: 95,  squareD: 14, squareW: 16, maxStreets: 3, targetWidthM: 58 },
-    small:   { depthM: 80,  squareD: 0,  squareW: 0,  maxStreets: 2, targetWidthM: 42 },
+    capital: { depthM: 170, squareD: 24, squareW: 28, targetWidthM: 130 },
+    medium:  { depthM: 95,  squareD: 14, squareW: 16, targetWidthM: 58 },
+    small:   { depthM: 80,  squareD: 0,  squareW: 0,  targetWidthM: 42 },
   }[tier];
-
-  // Town extends past the naturally-flat land (the pad flattens the rest), so even tight sites host a
-  // proper number of houses. CAPITALS get a much larger artificial-flat apron: with the old shared
-  // +46/+30 allowance a minimum-qualifying capital site clamped down to the same usable footprint as a
-  // well-sited medium town — more buildings, no more ground, so the top tier never READ bigger.
-  // Layout is ORGANIC: a few WANDERING streets, with houses placed along both sides at jittered
-  // spacing/setback and rotated to face the local street direction (+ a little skew).
+  // Artificial-flat apron past the naturally-flat land (the pad levels the rest). Capitals get a
+  // much larger one so the top tier actually reads bigger than a well-sited medium town.
   const EXT = tier === 'capital' ? { depth: 90, width: 65 } : { depth: 46, width: 30 };
-  const WATERFRONT = 20;                              // band reserved near the pier (clear of the shore/water cell)
+  const WATERFRONT = 20;                              // band reserved near the pier root
   const usableDepth = Math.max(20, Math.min(SPEC.depthM, site.inlandFlatM + EXT.depth) - WATERFRONT - SPEC.squareD - 8);
   const usableWidth = Math.min(SPEC.targetWidthM, site.flatWidthM + EXT.width);
 
+  // Buildable envelope in the town frame: quay line F0 → inland limit F1, |s| ≤ HW across.
+  const F0 = WATERFRONT - 4;
+  const F1 = F0 + usableDepth + SPEC.squareD + 10;
+  const HW = usableWidth / 2;
+
+  const pattern = tier === 'small' ? 'organic'
+    : town.faction === 'spanish' ? 'plaza'
+    : town.faction === 'french'  ? 'bastide'
+    : town.faction === 'dutch'   ? 'rows'
+    : (rng() < 0.5 ? 'grid' : 'organic');
+
+  // ── STAGE 1+2: the street network — polylines of {f,s} nodes ────────────────────────────────
+  const polylines = [];
+  const allSegs = [];                                 // segment soup (spacing / lot rejection)
+  const pushPoly = (nodes) => {
+    const clean = nodes.filter((n) => Number.isFinite(n.f) && Number.isFinite(n.s));
+    if (clean.length < 2) return;
+    polylines.push(clean);
+    for (let i = 1; i < clean.length; i++) allSegs.push([clean[i - 1], clean[i]]);
+  };
+  const distToStreets = (f, s) => {
+    let best = Infinity;
+    for (const [a, b] of allSegs) {
+      const df = b.f - a.f, ds = b.s - a.s;
+      const len2 = df * df + ds * ds;
+      const t = len2 > 0 ? Math.max(0, Math.min(1, ((f - a.f) * df + (s - a.s) * ds) / len2)) : 0;
+      const d = Math.hypot(f - (a.f + df * t), s - (a.s + ds * t));
+      if (d < best) best = d;
+    }
+    return best;
+  };
+
+  // Plaza (Plaza Mayor / market square): a reserved rectangle the grid RINGS, never crosses.
+  const hasPlaza = !!(wish.townhall && SPEC.squareD > 0 && (pattern === 'plaza' || pattern === 'bastide'));
+  const plazaF = pattern === 'bastide' ? F0 + (F1 - F0) * 0.38 : F0 + (F1 - F0) * 0.52;
+  const plazaHD = SPEC.squareD / 2, plazaHS = SPEC.squareW / 2;
+  const inPlaza = (f, s, m = 0) =>
+    hasPlaza && Math.abs(f - plazaF) < plazaHD + m && Math.abs(s) < plazaHS + m;
+
+  // A gently-jittered street: ~7 m nodes with low-frequency lateral noise pinned at the ends (so
+  // grids read hand-surveyed, not CAD-drawn), split where it would cross the plaza (ring it).
+  const jitterLine = (fa, sa, fb, sb, amp) => {
+    const len = Math.hypot(fb - fa, sb - sa);
+    if (len < 4) return;
+    const n = Math.max(2, Math.ceil(len / 7));
+    const ph = rng() * Math.PI * 2, fr = (0.5 + rng()) * Math.PI;
+    const nf = -(sb - sa) / len, ns = (fb - fa) / len;   // unit normal
+    let run = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const w = Math.sin(ph + fr * t) * amp * Math.sin(Math.PI * t);
+      const f = fa + (fb - fa) * t + nf * w, s = sa + (sb - sa) * t + ns * w;
+      if (inPlaza(f, s, 1)) { pushPoly(run); run = []; continue; }
+      run.push({ f, s });
+    }
+    pushPoly(run);
+  };
+  // Merge near-coincident grid lines, preferring plaza-edge lines (streets leave the plaza corners).
+  const dedupeLines = (arr, minGap) => {
+    arr.sort((a, b) => a.v - b.v);
+    const keep = [];
+    for (const it of arr) {
+      const near = keep.findIndex((k) => Math.abs(k.v - it.v) < minGap);
+      if (near < 0) keep.push(it);
+      else if (it.edge && !keep[near].edge) keep[near] = it;
+    }
+    return keep;
+  };
+
+  if (pattern === 'plaza' || pattern === 'bastide' || pattern === 'grid') {
+    const { bd, bw } = PATTERN_BLOCKS[pattern];
+    // Cross streets (parallel to the waterfront): the quay road at F0, then every ~blockDepth.
+    const fSet = [];
+    for (let f = F0; f <= F1; f += bd + (rng() - 0.5) * 4) fSet.push({ v: f, edge: false });
+    if (hasPlaza) fSet.push({ v: plazaF - plazaHD, edge: true }, { v: plazaF + plazaHD, edge: true });
+    // Longitudinal streets: the main street on axis, then every ~blockWidth outward.
+    const sSet = [{ v: (rng() - 0.5) * 3, edge: false }];
+    for (let s = bw; s <= HW; s += bw + (rng() - 0.5) * 4) {
+      sSet.push({ v: s + (rng() - 0.5) * 3, edge: false });
+      sSet.push({ v: -s + (rng() - 0.5) * 3, edge: false });
+    }
+    if (hasPlaza) sSet.push({ v: plazaHS, edge: true }, { v: -plazaHS, edge: true });
+    for (const k of dedupeLines(fSet, 9)) jitterLine(k.v, -HW, k.v, HW, 0.7 + rng() * 1.2);
+    for (const k of dedupeLines(sSet, 10)) jitterLine(F0, k.v, F1, k.v, 0.7 + rng() * 1.2);
+    jitterLine(3, 0, F0, 0, 0.4);                     // pier spur onto the quay road
+  } else if (pattern === 'rows') {
+    // Long rows parallel to the shore (the quay road is row 0), a main street from the pier, and
+    // short STAGGERED alleys tying adjacent rows together.
+    const { bd } = PATTERN_BLOCKS.rows;
+    const rows = [];
+    for (let f = F0; f <= F1; f += bd + (rng() - 0.5) * 3) rows.push(f);
+    for (const f of rows) jitterLine(f, -HW, f, HW, 1.0 + rng() * 1.5);
+    jitterLine(3, (rng() - 0.5) * 3, F1, (rng() - 0.5) * 6, 1.2);   // main street, pier → inland
+    for (let i = 1; i < rows.length; i++) {
+      const nAlley = Math.max(1, Math.floor(HW / 26));
+      for (let k = 0; k < nAlley; k++) {
+        const s = (rng() - 0.5) * 2 * (HW - 6);
+        if (Math.abs(s) < 9) continue;                // the main street already connects here
+        jitterLine(rows[i - 1], s, rows[i], s, 0.4);
+      }
+    }
+  } else if (tier === 'small') {
+    // ORGANIC HAMLET: shore lane + a winding high street with a couple of GUARANTEED side lanes
+    // (grown with curvature drift, snapping into other lanes on approach — junctions, not crossings).
+    jitterLine(F0, -HW, F0, HW, 1.6 + rng() * 1.6);
+    const grow = (f0, s0, ang0, budget) => {
+      const nodes = [{ f: f0, s: s0 }];
+      let f = f0, s = s0, ang = ang0;
+      const bias = (rng() - 0.5) * 0.14;              // persistent curvature → serpentine
+      for (let i = 0; i < 40; i++) {
+        const step = 7 + rng() * 3;
+        ang += bias + (rng() - 0.5) * 0.22;
+        const nf2 = f + Math.cos(ang) * step, ns2 = s + Math.sin(ang) * step;
+        // Floor at the PIER (f≈1), not the quay line — the high street launches from f=3 and must
+        // cross the quay road; flooring at F0 killed it on its very first step.
+        if (nf2 < 1 || nf2 > F1 || Math.abs(ns2) > HW) break;
+        // Snap into another lane on approach (a junction) — but only once clear of the START, else
+        // the high street dies the moment it CROSSES the quay road it launches from.
+        if (Math.hypot(nf2 - f0, ns2 - s0) > 22 && distToStreets(nf2, ns2) < 9) {
+          nodes.push({ f: nf2, s: ns2 }); break;
+        }
+        nodes.push({ f: nf2, s: ns2 });
+        f = nf2; s = ns2;
+        if (Math.hypot(f - f0, s - s0) > budget) break;
+      }
+      pushPoly(nodes);
+    };
+    grow(3, 0, (rng() - 0.5) * 0.2, F1 - F0 + 24);    // the high street
+    const hs = polylines[polylines.length - 1];       // (last pushed = the high street's inland run)
+    const nb = 2 + (rng() < 0.5 ? 1 : 0);
+    for (let k = 0; k < nb && hs && hs.length > 3; k++) {
+      const i = Math.max(1, Math.min(hs.length - 2,
+        Math.floor((k + 0.5 + (rng() - 0.5) * 0.4) / nb * (hs.length - 2)) + 1));
+      const a = hs[i - 1], b = hs[i + 1], p = hs[i];
+      const along = Math.atan2(b.s - a.s, b.f - a.f);
+      const side = k % 2 === 0 ? 1 : -1;
+      grow(p.f, p.s, along + side * (Math.PI / 2 + (rng() - 0.5) * 0.4), 16 + rng() * 26);
+    }
+  } else {
+    // ORGANIC (medieval serpentine, Bridgetown-style) for medium/capital: a grid WARPED hard and
+    // randomly THINNED — pure tip-growth degenerated on big envelopes (streets pooled at the shore
+    // and never reached inland), while a heavily deformed, dropout'd grid keeps full coverage and
+    // reads properly medieval at this scale: no two lanes parallel, kinked junctions, missing links.
+    const bd = 26, bw = 28;
+    const fSet = [], sSet = [{ v: (rng() - 0.5) * 4, edge: true }];   // keep the high street
+    for (let f = F0; f <= F1; f += bd + (rng() - 0.5) * 8) fSet.push({ v: f, edge: f === F0 });
+    for (let s = bw; s <= HW; s += bw + (rng() - 0.5) * 8) {
+      sSet.push({ v: s + (rng() - 0.5) * 5, edge: false });
+      sSet.push({ v: -s + (rng() - 0.5) * 5, edge: false });
+    }
+    dedupeLines(fSet, 10).forEach((k, i) => {
+      if (i === 0 || rng() > 0.22)                     // dropout — but always keep the quay road
+        jitterLine(k.v, -HW + rng() * 14, k.v, HW - rng() * 14, 3.5 + rng() * 4);
+    });
+    for (const k of dedupeLines(sSet, 11)) {
+      if (k.edge || rng() > 0.22)
+        jitterLine(F0, k.v, F1 - rng() * 18, k.v, 3.5 + rng() * 4);
+    }
+    jitterLine(3, 0, F0, 0, 0.5);                     // pier spur
+  }
+
+  // ── Buildings scaffolding (same primitives as before) ───────────────────────────────────────
   const buildings = [];
-  const placed = [];                                 // {x,z,r} for greedy overlap rejection
+  const placed = [];                                  // {x,z,r} greedy overlap rejection
   let minF = Infinity, maxF = -Infinity, minS = Infinity, maxS = -Infinity;
-  // Town-local direction (df=inland, ds=across) → world heading degrees.
   const localHeading = (df, ds) => dirHeading(fwd[0] * df + rgt[0] * ds, fwd[1] * df + rgt[1] * ds);
   const place = (asset, f, s, rotDeg, inPad = true) => {
     const p = L(f, s);
     buildings.push({ asset, x: p.x, z: p.z, rotY: Math.round(rotDeg) });
     placed.push({ x: p.x, z: p.z, r: Math.hypot(fp[asset].w, fp[asset].d) / 2 + 0.6 });
-    if (!inPad) return;                              // stilt-shacks live at the waterline, outside the flat apron
+    if (!inPad) return;                               // stilt-shacks live at the waterline
     const rr = Math.max(fp[asset].w, fp[asset].d) / 2 + 1;
     minF = Math.min(minF, f - rr); maxF = Math.max(maxF, f + rr);
     minS = Math.min(minS, s - rr); maxS = Math.max(maxS, s + rr);
   };
   const overlaps = (x, z, r) => placed.some((p) => Math.hypot(p.x - x, p.z - z) < p.r + r);
 
-  // Waterfront: shipwright near the pier (on the quay/land).
+  // Waterfront: shipwright near the pier (on the quay).
   const swSide = rng() < 0.5 ? -1 : 1;
   place('shipwright_shack', 16, swSide * 14, town.heading + (rng() - 0.5) * 30);
 
-  // Stilt-shacks: out over the harbour water, off to the side of the pier. Placed SEAWARD of the shore (ff<0,
-  // beyond the raised quay's a-range) so the quay never lifts them onto land, and where the natural seabed is
-  // already water (findHarbors guarantees navigable water seaward). The shack sits at the waterline (client
-  // y=0) — the seabed depth below is hidden underwater. Excluded from the pad.
+  // Stilt-shacks over the harbour water, off to the side of the pier (unchanged; outside the pad).
   let shacksLeft = wish.shacks || 0;
   if (shacksLeft > 0) {
     for (const ff of [-15, -18, -21, -13, -24]) {
@@ -232,68 +411,58 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
     }
   }
 
-  // Civic square (inland end): town hall + fountain. Placed BEFORE the houses so the greedy fill flows around it.
-  const resF0 = WATERFRONT + 6, resF1 = resF0 + usableDepth;
+  // ── Civic anchors ───────────────────────────────────────────────────────────────────────────
   let square = null;
-  if (wish.townhall && SPEC.squareD > 0) {
-    const sqF = resF1 + 6 + SPEC.squareD / 2;
-    const c = L(sqF, 0);
-    square = { cx: c.x, cz: c.z, halfX: +(SPEC.squareW / 2).toFixed(1), halfZ: +(SPEC.squareD / 2).toFixed(1), rotY: Math.round(town.heading) };
-    minF = Math.min(minF, sqF - SPEC.squareD / 2 - 2); maxF = Math.max(maxF, sqF + SPEC.squareD / 2 + 2);
-    minS = Math.min(minS, -SPEC.squareW / 2 - 2);      maxS = Math.max(maxS, SPEC.squareW / 2 + 2);
-    if (wish.fountain) place(wish.fountain, sqF, 0, town.heading);
-    place(wish.townhall, sqF + SPEC.squareD / 2 + fp[wish.townhall].d / 2 + 1, 0, town.heading);
+  if (hasPlaza) {
+    const c = L(plazaF, 0);
+    square = { cx: c.x, cz: c.z, halfX: +plazaHS.toFixed(1), halfZ: +plazaHD.toFixed(1), rotY: Math.round(town.heading) };
+    minF = Math.min(minF, plazaF - plazaHD - 2); maxF = Math.max(maxF, plazaF + plazaHD + 2);
+    minS = Math.min(minS, -plazaHS - 2);         maxS = Math.max(maxS, plazaHS + 2);
+    if (wish.fountain) place(wish.fountain, plazaF, 0, town.heading);
+    // The hall presides from the plaza's INLAND edge, facing the water across the square.
+    place(wish.townhall, plazaF + plazaHD + fp[wish.townhall].d / 2 + 1.5, (rng() - 0.5) * 4, town.heading);
   } else if (wish.townhall) {
-    // (fixed) the rotation used to be passed as the SIDEWAYS offset `s` — heading degrees read as
-    // metres, flinging small-town townhalls up to ~360 m off-axis and dragging a huge flat pad
-    // (terrain scar) with them. s is a small jitter; the heading goes in the rotation slot.
-    place(wish.townhall, resF1 + 6 + fp[wish.townhall].d / 2, (rng() - 0.5) * 10,
-          (rng() - 0.5) * 18 + town.heading);
+    // Grid/rows/organic: the hall closes the inland end of the most-inland CENTRAL street — always
+    // connected to the network (a fixed-depth spot could float far from any road on thin layouts).
+    let bf = -1e9, bs = (rng() - 0.5) * 6;
+    for (const poly of polylines) for (const n of poly)
+      if (Math.abs(n.s) < 14 && n.f > bf) { bf = n.f; bs = n.s; }
+    if (bf < F0) { bf = F1 - 10; bs = 0; }
+    place(wish.townhall, bf + fp[wish.townhall].d / 2 + 3, bs, (rng() - 0.5) * 18 + town.heading);
   }
 
-  // ── Streets: several wandering, roughly-parallel lanes (dense → lots of house frontage), then CONNECTORS
-  //    that tie them into one network (no orphan roads): a cross-street across the front + back of the lanes,
-  //    and a spine joining the lanes to the pier-front and the square. ──
-  const streets = [];
-  const seg = (P, Q) => { const A = L(P.f, P.s), B = L(Q.f, Q.s); streets.push({ x1: A.x, z1: A.z, x2: B.x, z2: B.z, width: STREET_W }); };
-  const nLanes = Math.max(1, Math.min(SPEC.maxStreets, Math.floor(usableWidth / 19)));
-  const lines = [];                                  // sAt functions (house frontage runs along these)
-  const fronts = [], backs = [];                     // lane endpoints, for the cross-connectors
-  for (let k = 0; k < nLanes; k++) {
-    const baseS = nLanes === 1 ? (rng() - 0.5) * 6 : (k / (nLanes - 1) - 0.5) * (usableWidth - 18);
-    const amp = 5 + rng() * 9, ph = rng() * Math.PI * 2, fr = 0.6 + rng() * 1.5, tilt = (rng() - 0.5) * 0.45;
-    const sAt = (f) => baseS + tilt * (f - resF0) + amp * Math.sin(ph + fr * Math.PI * (f - resF0) / Math.max(1, resF1 - resF0));
-    lines.push(sAt);
-    const front = { f: resF0, s: sAt(resF0) }; fronts.push(front);
-    let pcur = front;
-    for (let f = resF0 + 7; f <= resF1; f += 7) { const np = { f, s: sAt(f) }; seg(pcur, np); pcur = np; }
-    backs.push(pcur);
-  }
-  // Connectors: chain the lane fronts together + the lane backs together, then a spine from the front-centre
-  // out to the pier (f≈3) and from the back-centre to the square centre — so the whole town is one network.
-  for (let k = 0; k < nLanes - 1; k++) { seg(fronts[k], fronts[k + 1]); seg(backs[k], backs[k + 1]); }
-  const mid = Math.floor(nLanes / 2);
-  seg({ f: 3, s: 0 }, fronts[mid]);
-  if (square) seg(backs[mid], { f: resF1 + 6 + SPEC.squareD / 2, s: 0 });
-
-  // House candidate lots along both sides of each lane (jittered position/setback, rotated to face the road).
+  // ── STAGE 3: frontage LOTS along every street (both sides), plaza ring first ────────────────
   const cands = [];
-  for (const sAt of lines) {
-    for (let f = resF0 + rng() * 3; f <= resF1; f += 7.5 + rng() * 2.5) {
-      const sc = sAt(f), ds = (sAt(f + 1) - sAt(f - 1)) / 2, tl = Math.hypot(1, ds);
-      const nF = -ds / tl, nS = 1 / tl;
-      for (const side of [-1, 1]) {
-        const setback = STREET_W / 2 + 4.1 + rng() * 1.8;
-        cands.push({
-          f: f + nF * side * setback + (rng() - 0.5) * 1.6,
-          s: sc + nS * side * setback + (rng() - 0.5) * 1.6,
-          rot: localHeading(-nF * side, -nS * side) + (rng() - 0.5) * 28,
-        });
+  for (const poly of polylines) {
+    for (let i = 1; i < poly.length; i++) {
+      const a = poly[i - 1], b = poly[i];
+      const segLen = Math.hypot(b.f - a.f, b.s - a.s);
+      if (segLen < 2) continue;
+      const tf = (b.f - a.f) / segLen, ts = (b.s - a.s) / segLen;
+      // ~1 lot / 8 m of frontage per side (7 m in hamlets — their short lanes must host the roster).
+      const steps = Math.max(1, Math.floor(segLen / (tier === 'small' ? 7 : 8)));
+      for (let k = 0; k < steps; k++) {
+        const t = (k + 0.35 + rng() * 0.3) / steps;
+        const f = a.f + (b.f - a.f) * t, s = a.s + (b.s - a.s) * t;
+        for (const side of [-1, 1]) {
+          const setback = STREET_W / 2 + 3.9 + rng() * 1.7;
+          const lf = f + -ts * side * setback + (rng() - 0.5) * 1.2;
+          const ls = s + tf * side * setback + (rng() - 0.5) * 1.2;
+          if (lf < F0 - 2 || lf > F1 + 6 || Math.abs(ls) > HW + 6) continue;
+          if (inPlaza(lf, ls, 1)) continue;                       // never build ON the plaza
+          if (distToStreets(lf, ls) < STREET_W / 2 + 1.6) continue;   // …or in a road
+          const rot = localHeading(ts * side, -tf * side) + (rng() - 0.5) * 12;   // face the street
+          // Plaza-ring lots first (they frame the square), then fill outward from the pier so the
+          // town is densest at the waterfront and thins inland.
+          const prio = inPlaza(lf, ls, 7) ? 0 : 1;
+          cands.push({ f: lf, s: ls, rot, score: prio * 1e6 + Math.hypot(lf - 3, ls) + rng() * 8 });
+        }
       }
     }
   }
+  cands.sort((a, b) => a.score - b.score);
 
-  // Greedy: drop each wishlist house into the next candidate lot that doesn't overlap anything placed.
+  // ── STAGE 4: the roster fills the lots (taverns first — wishlist order is priority) ─────────
   const houses = wish.houses.slice();
   let hi = 0;
   for (const c of cands) {
@@ -306,7 +475,18 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
     hi++;
   }
 
-  // Pad: the flat rectangle to bake under the whole town (halfZ along heading/inland, halfX across).
+  // ── Output: streets as world segments; pad covers buildings AND the road network ────────────
+  const streets = [];
+  for (const poly of polylines)
+    for (let i = 1; i < poly.length; i++) {
+      const A = L(poly[i - 1].f, poly[i - 1].s), B = L(poly[i].f, poly[i].s);
+      streets.push({ x1: A.x, z1: A.z, x2: B.x, z2: B.z, width: STREET_W });
+    }
+  for (const poly of polylines) for (const n of poly) {
+    minF = Math.min(minF, n.f - 3); maxF = Math.max(maxF, n.f + 3);
+    minS = Math.min(minS, n.s - 3); maxS = Math.max(maxS, n.s + 3);
+  }
+
   const M = 4;
   minF -= M; maxF += M; minS -= M; maxS += M;
   const cF = (minF + maxF) / 2, cS = (minS + maxS) / 2, c = L(cF, cS);
@@ -321,7 +501,7 @@ export function layoutTown(town, site, tier, elevAt, fp, rng, wish) {
 
   const walls = deriveWalls(pad, tier);
   const forts = deriveForts(pad, tier);
-  return { tier, buildings, square, streets, pad, walls, forts };
+  return { tier, buildings, square, streets, pad, walls, forts, pattern };
 }
 
 /**
@@ -370,6 +550,7 @@ export function assignTowns(sites, seed, elevAt, footprints) {
     const wish = composeTown(tier, lr);
     const layout = layoutTown(t, st, tier, elevAt, footprints, lr, wish);
     t.tier = tier;
+    t.pattern = layout.pattern;   // street-network style (plaza/bastide/grid/rows/organic) — informational
     t.pad = layout.pad;
     t.buildings = layout.buildings;
     t.square = layout.square;

@@ -47,6 +47,7 @@ function repPriceMul(standing) {
 
 let loaded = false;               // true ONLY after a SUCCESSFUL manifest load — a failed load is NOT cached, so the
 let lastLoadTry = 0;              // server self-heals (throttled retry) if the manifest appears after boot
+let loadedMtimeMs = 0;            // manifest mtime at the cached load — a change on disk triggers a town re-load
 const LOAD_RETRY_MS = 15000;
 let towns = new Map();            // townId → { id, name, tier, specialty, x, z }
 let markets = new Map();          // townId → { stock: { goodId: qty }, treasury, distress: { goodId: days } }
@@ -61,6 +62,7 @@ function load() {
     const manifestPath = path.join(terrainConfig.outputDir, 'manifest.json');
     // NOT found → leave loaded=false so ensureLoaded() retries (self-heals if the terrain is deployed after boot).
     if (!fs.existsSync(manifestPath)) { console.warn(`[economy] manifest not found at ${manifestPath} — trading disabled (will retry)`); return; }
+    loadedMtimeMs = fs.statSync(manifestPath).mtimeMs;
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     for (const h of (m.harbors || [])) {
       towns.set(h.id, {
@@ -79,10 +81,27 @@ function load() {
   }
 }
 function ensureLoaded() {
-  if (loaded) { return; }
   const now = Date.now();
-  if (now - lastLoadTry < LOAD_RETRY_MS) { return; }   // throttle retries when the manifest is genuinely absent
+  if (now - lastLoadTry < LOAD_RETRY_MS) { return; }   // throttle disk checks/retries (~4/min)
   lastLoadTry = now;
+  if (loaded) {
+    // HOT-RELOAD on a world redeploy: the boot-time town cache lived forever, so replacing the
+    // terrain under a RUNNING server left economy.townAt() checking the OLD world's coordinates —
+    // every dock at a new-world town then failed shipwright/trade with "not_docked" on BOTH
+    // clients until someone restarted node (the live-only not_docked mystery). Re-stat the
+    // manifest (throttled) and re-load the towns when its mtime changes. Markets are keyed by
+    // town id and persist by mapVersion elsewhere; derived profiles are dropped to re-derive.
+    try {
+      const manifestPath = path.join(terrainConfig.outputDir, 'manifest.json');
+      if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).mtimeMs !== loadedMtimeMs) {
+        console.warn('[economy] terrain manifest changed on disk — re-loading town markets');
+        loaded = false;
+        profiles = new Map();
+        load();
+      }
+    } catch { /* transient stat failure — keep the cached towns, retry next window */ }
+    return;
+  }
   load();
 }
 function ensureSeeded() { ensureLoaded(); if (markets.size === 0 && towns.size > 0) seedMarkets(); }

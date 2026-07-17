@@ -7975,6 +7975,66 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         mpClient.sendUpdate(pu, netSeq++);
       }
     }
+
+    // ── Loading screen: cover the world assembling itself after sign-in (terrain fetch, spawn
+    //    placement, last-location restore, hull + impostor streaming, scatter warm-up). Without
+    //    it the player watches an empty sea while islands, props and their own ship pop in.
+    //    Drawn on the FOREGROUND list (above every HUD window). Every gate also resolves on
+    //    failure (offline fetches, missing terrain, dev/CLI hulls) and a 25 s failsafe backs
+    //    them all, so it can never wedge. The offline screenshot/VR-preview harness skips it
+    //    (SAILSIM_NOLOADSCREEN=1 to skip manually).
+    {
+      static const bool loadScreenOff = std::getenv("SAILSIM_NOLOADSCREEN") != nullptr;
+      static const bool loadScreenForce = std::getenv("SAILSIM_LOADSCREEN_TEST") != nullptr;   // show even in preview (layout screenshots)
+      static float loadAlpha = 1.0f;
+      static double loadShownAt = -1.0, loadGatesAt = -1.0;
+      if (appState != AppState::Sailing) {
+        loadAlpha = 1.0f; loadShownAt = -1.0; loadGatesAt = -1.0;   // re-arm for the next sign-in
+      } else if ((loadScreenForce || (!loadScreenOff && !vrPreview)) && loadAlpha > 0.0f) {
+        const double lnow = glfwGetTime();
+        if (loadShownAt < 0.0) loadShownAt = lnow;
+        const bool gTerr  = terrHandled;                                        // islands + spawn placed (or server has none)
+        const bool gShip  = !ownVesselSlug.empty() || ownVesselForced || !mpConnected;   // wallet hull known
+        const bool gLoc   = locResolved || !locFuture.valid();                  // last-location teleport applied (or none pending)
+        const bool gProps = propsUploaded || (propsFetched && !terrReady);      // ship/town impostor atlases live
+        const bool gatesDone = gTerr && gShip && gLoc && gProps;
+        if (gatesDone && loadGatesAt < 0.0) loadGatesAt = lnow;
+        if (!gatesDone) loadGatesAt = -1.0;
+        // Scenery settle: hold a beat after the last gate so the near scatter/harbour patches land.
+        const float settle = loadGatesAt < 0.0 ? 0.0f
+                           : (float)std::clamp((lnow - loadGatesAt) / 1.6, 0.0, 1.0);
+        const bool ready = (gatesDone && settle >= 1.0f) || (lnow - loadShownAt > 25.0);
+        if (ready) loadAlpha = std::max(0.0f, loadAlpha - io.DeltaTime / 0.7f);   // fade to the live scene
+
+        const int ta = (int)(std::clamp(loadAlpha, 0.0f, 1.0f) * 255.0f);
+        ImDrawList* ldl = ImGui::GetForegroundDrawList();
+        const ImVec2 ds = io.DisplaySize;
+        ldl->AddRectFilled(ImVec2(0.0f, 0.0f), ds, IM_COL32(9, 14, 22, ta));
+        ImFont* tf = fontTitle ? fontTitle : ImGui::GetFont();
+        const char* title = "SAIL-SIM";
+        const float tpx = 46.0f;
+        const ImVec2 tsz = tf->CalcTextSizeA(tpx, 1.0e9f, 0.0f, title);
+        ldl->AddText(tf, tpx, ImVec2(ds.x * 0.5f - tsz.x * 0.5f, ds.y * 0.40f - tsz.y * 0.5f),
+                     IM_COL32(222, 210, 178, ta), title);
+        // Step line = the first unfinished gate, with a ticking ellipsis (centres on the bare
+        // text so the dots don't make it shimmy).
+        const char* step = !gTerr  ? "Charting the islands"
+                         : !gShip  ? "Rigging your vessel"
+                         : !gLoc   ? "Recalling your last position"
+                         : !gProps ? "Sighting distant sails"
+                         :           "Setting the scenery";
+        char stepLine[96];
+        std::snprintf(stepLine, sizeof(stepLine), "%s%.*s", step, 1 + (int)std::fmod(lnow * 2.0, 3.0), "...");
+        ldl->AddText(ImVec2(ds.x * 0.5f - ImGui::CalcTextSize(step).x * 0.5f, ds.y * 0.40f + 26.0f),
+                     IM_COL32(168, 184, 202, ta), stepLine);
+        const float p = std::min(1.0f, ((gTerr ? 1 : 0) + (gShip ? 1 : 0) + (gLoc ? 1 : 0) + (gProps ? 1 : 0)) / 5.0f
+                                       + settle / 5.0f);
+        const float bw = ds.x * 0.26f, bh = 6.0f;
+        const ImVec2 b0(ds.x * 0.5f - bw * 0.5f, ds.y * 0.40f + 64.0f);
+        ldl->AddRectFilled(b0, ImVec2(b0.x + bw, b0.y + bh), IM_COL32(28, 40, 54, ta), bh * 0.5f);
+        ldl->AddRectFilled(b0, ImVec2(b0.x + bw * std::max(p, 0.03f), b0.y + bh), IM_COL32(96, 170, 190, ta), bh * 0.5f);
+      }
+    }
     ImGui::Render();
 #ifdef SAILSIM_HAVE_VR
     if (vrMode && vrUiW > 0.0f) {

@@ -87,8 +87,7 @@ FetchContent_MakeAvailable(cgltf)
 
 # ── Basis Universal transcoder (decodes KTX2 / KHR_texture_basisu) ───────────
 # We only need the transcoder (one .cpp), not the encoder/tools — SOURCE_SUBDIR
-# skips its CMakeLists. BASISD_SUPPORT_KTX2_ZSTD=0 drops the zstd dependency
-# (our textures use Basis ETC1S/UASTC supercompression, not zstd).
+# skips its CMakeLists.
 FetchContent_Declare(
   basisu
   GIT_REPOSITORY https://github.com/BinomialLLC/basis_universal
@@ -97,6 +96,25 @@ FetchContent_Declare(
   SOURCE_SUBDIR  do_not_configure
 )
 FetchContent_MakeAvailable(basisu)
+
+# ── zstd (decompression for zstd-supercompressed KTX2) ──────────────────────
+# The frigate bake writes its UASTC ORM/normal maps with zstd supercompression (toktx default);
+# without this the transcoder rejects them, the loader falls back to a WHITE metallic-roughness
+# texture, and glTF's default metallicFactor=1 turns the whole hull into ambient-rejecting metal
+# (the "ship is nearly black at noon" bug). Static lib, programs/tests off.
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC   ON  CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  zstd
+  GIT_REPOSITORY https://github.com/facebook/zstd
+  GIT_TAG        v1.5.6
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  build/cmake
+)
+FetchContent_MakeAvailable(zstd)
 
 # ── stb (single-header PNG writer for headless screenshots) ──────────────────
 FetchContent_Declare(
@@ -534,12 +552,13 @@ set_source_files_properties("${basisu_SOURCE_DIR}/transcoder/basisu_transcoder.c
 # -Wc99-extensions notes for its NEON compound literals); silence it like the transcoder above.
 set_source_files_properties(src/stb_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 set_source_files_properties(src/ktx2.cpp
-  PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=0")
-target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=0)
+  PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=1")
+target_compile_definitions(sailsim_native PRIVATE BASISD_SUPPORT_KTX2_ZSTD=1)
+target_link_libraries(sailsim_native PRIVATE libzstd_static)
 
 target_include_directories(sailsim_native PRIVATE
   "${WGSL_GEN_DIR}" "${cgltf_SOURCE_DIR}" "${basisu_SOURCE_DIR}/transcoder" "${stb_SOURCE_DIR}"
-  "${httplib_SOURCE_DIR}" "${miniaudio_SOURCE_DIR}")
+  "${httplib_SOURCE_DIR}" "${miniaudio_SOURCE_DIR}" "${zstd_SOURCE_DIR}/lib")
 get_filename_component(SAILSIM_SHIP_MODEL_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../server/assets/geometry/merchantman.glb" ABSOLUTE)
 target_compile_definitions(sailsim_native PRIVATE

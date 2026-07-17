@@ -43,7 +43,13 @@ MeshData loadGltfMesh(const char* path) {
     const uint8_t* bytes = (const uint8_t*)bv->buffer->data + bv->offset;
     TextureData td;
     td.srgb = srgb;
-    if (!decodeKtx2ToRGBA(bytes, bv->size, td.width, td.height, td.rgba)) return -1;
+    if (!decodeKtx2ToRGBA(bytes, bv->size, td.width, td.height, td.rgba)) {
+      // Loud on purpose: a failed metallic-roughness decode binds the WHITE fallback, and glTF's
+      // default metallicFactor=1 then renders the submesh as ambient-rejecting metal (near-black).
+      std::fprintf(stderr, "[gltf] KTX2 decode FAILED for texture '%s' (%zu bytes) — submesh falls back to defaults\n",
+                   img->name ? img->name : "(unnamed)", (size_t)bv->size);
+      return -1;
+    }
     out.textures.push_back(std::move(td));
     texPtrs.push_back(tex);
     return (int)out.textures.size() - 1;

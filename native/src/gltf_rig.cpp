@@ -130,12 +130,21 @@ RiggedData loadGltfRigged(const char* path) {
     for (size_t i = 0; i < texPtrs.size(); ++i)
       if (texPtrs[i] == tex) return (int)i;
     const cgltf_image* img = (tex->has_basisu && tex->basisu_image) ? tex->basisu_image : tex->image;
-    if (!img || !img->buffer_view || !img->buffer_view->buffer || !img->buffer_view->buffer->data) return -1;
+    if (!img || !img->buffer_view || !img->buffer_view->buffer || !img->buffer_view->buffer->data) {
+      std::fprintf(stderr, "[rig] texture '%s' has no embedded KTX2 payload — submesh falls back to defaults\n",
+                   img && img->name ? img->name : "(unnamed)");
+      return -1;
+    }
     const cgltf_buffer_view* bv = img->buffer_view;
     TextureData td;
     td.srgb = srgb;
-    if (!decodeKtx2ToRGBA((const uint8_t*)bv->buffer->data + bv->offset, bv->size, td.width, td.height, td.rgba))
+    if (!decodeKtx2ToRGBA((const uint8_t*)bv->buffer->data + bv->offset, bv->size, td.width, td.height, td.rgba)) {
+      // A failed metallic-roughness decode is NOT cosmetic: the white fallback + glTF's default
+      // metallicFactor=1 turns the whole submesh into ambient-rejecting metal (a near-black hull).
+      std::fprintf(stderr, "[rig] KTX2 decode FAILED for texture '%s' (%zu bytes) — submesh falls back to defaults\n",
+                   img->name ? img->name : "(unnamed)", (size_t)bv->size);
       return -1;
+    }
     out.textures.push_back(std::move(td));
     texPtrs.push_back(tex);
     return (int)out.textures.size() - 1;

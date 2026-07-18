@@ -341,9 +341,13 @@ RiggedData makeRiggedCube() {
     m.vertices.insert(m.vertices.end(), { 0, 0, 0, 0, 1, 0, 0, 0 });   // node 0, weight 1
   }
   m.indices = cube.indices;
-  for (const Submesh& sm : cube.submeshes)
-    m.submeshes.push_back({ sm.indexOffset, sm.indexCount, sm.baseColor, sm.normal, sm.metalRough,
-                            { 0, 0, 0 }, sm.name, std::string(), 0, false });
+  for (const Submesh& sm : cube.submeshes) {
+    RigSubmesh rs;   // named fields (not a positional init) so adding a RigSubmesh member never breaks this
+    rs.indexOffset = sm.indexOffset; rs.indexCount = sm.indexCount;
+    rs.baseColor = sm.baseColor; rs.normal = sm.normal; rs.metalRough = sm.metalRough;
+    rs.name = sm.name;
+    m.submeshes.push_back(std::move(rs));
+  }
   m.nodes.push_back({ "root", -1 });
   m.restPalette.assign(1, glm::mat4(1.0f));
   for (int c = 0; c < 3; ++c) { m.bbMin[c] = cube.bbMin[c]; m.bbMax[c] = cube.bbMax[c]; }

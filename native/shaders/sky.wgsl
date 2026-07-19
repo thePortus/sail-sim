@@ -157,7 +157,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     //     low sun. Additive linear HDR; the post grade tonemaps it downstream.
     let sunMu   = max(dot(D, Ds), 0.0);
     let aureole = pow(sunMu, 6.0);
-    color = color + vec3<f32>(1.0, 0.52, 0.22) * (aureole * goldenLow * 0.9);
+    color = color + vec3<f32>(1.0, 0.52, 0.22) * (aureole * goldenLow * 0.62);
     // (B) SEA-MIST BAND — pale low haze hugging the horizon line, cool by day-edge and
     //     warming to amber at full sunset; lifts the waterline behind distant islands.
     let mistBand = smoothstep(0.14, 0.0, abs(D.y));
@@ -216,8 +216,12 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
                       smoothstep(0.0, 0.32, Ds.y));
     let above   = max(0.0, Ds.y);
     let disc    = pow(sunAmt, mix(1500.0, 4200.0, above));   // bigger low in the sky
-    color = color + sunCol * disc * 2.2 * sunFade;
-    color = color + sunCol * pow(sunAmt, 12.0) * 0.10 * sunFade;
+    // Low-sun dimming: a horizon sun is seen through far more atmosphere than a noon sun, so ease the
+    // HDR disc + glow down toward sundown (warmF = 1 at the horizon). Keeps the golden look but stops the
+    // bloom pass blowing the disc out to a blinding white core. Daytime (warmF→0) is unchanged.
+    let sunsetDim = mix(1.0, 0.6, warmF);
+    color = color + sunCol * disc * 2.2 * sunFade * sunsetDim;
+    color = color + sunCol * pow(sunAmt, 12.0) * 0.10 * sunFade * sunsetDim;
 
     return vec4<f32>(color, 1.0);   // sRGB target does gamma
 }

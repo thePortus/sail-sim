@@ -258,9 +258,16 @@ inline Buoy buoyancy(Vessel& v, const Rig& r, float dt,
   // toward the wave surface and rocks at its OWN period instead of low-pass-tracking it — a heavy wide hull
   // rolls slow and ponderous, a light narrow one quick and lively, all emergent from the physics. Sail heel
   // folds into the roll TARGET so a gust eases the boat over with real roll inertia (and both clients match).
-  // pitchTorq/(armFwd2/N) is the least-squares wave slope (rad) along the hull; × gain → target tilt, capped.
-  float pitchTarget = std::clamp(pitchTorq / std::max(1e-3f, armFwd2 / N) * r.pitchGain, -r.maxTilt, r.maxTilt);
-  float rollWave    = std::clamp(rollTorq  / std::max(1e-3f, armRgt2 / N) * r.rollGain,  -r.maxTilt, r.maxTilt);
+  // TRUE least-squares wave slope along the hull (rad) = Σ(h·arm)/Σ(arm²). NO ×N: dividing by (arm²/N)
+  // over-drove the slope 8× — a long hull (frigate) then pitched its bow/stern tens of metres. This slope is
+  // naturally SMALL for a long ship because it bridges multiple wave crests that average out.
+  // The tilt cap is on END DISPLACEMENT, not angle: a fixed max ANGLE throws a 48 m frigate's ends metres up,
+  // so a long hull gets a proportionally smaller max pitch (bow travel ≤ END_CAP_M), a small boat pitches freely.
+  const float END_CAP_M = 1.4f;   // ceiling on vertical travel at the hull ends from wave tilt (m)
+  float maxPitch = std::min(r.maxTilt, END_CAP_M / std::max(1.0f, r.hullHalfLen));
+  float maxRoll  = std::min(r.maxTilt, END_CAP_M / std::max(1.0f, r.hullHalfBeam));
+  float pitchTarget = std::clamp(pitchTorq / std::max(1e-3f, armFwd2) * r.pitchGain, -maxPitch, maxPitch);
+  float rollWave    = std::clamp(rollTorq  / std::max(1e-3f, armRgt2) * r.rollGain,  -maxRoll,  maxRoll);
   float rollTarget  = rollWave + glm::radians(v.heelDeg) * r.heelGain;
 
   // Semi-implicit (symplectic) Euler, sub-stepped so a frame hitch can't blow up the spring (keep ω·h ≲ 0.35).
@@ -276,10 +283,11 @@ inline Buoy buoyancy(Vessel& v, const Rig& r, float dt,
   integrate(v.heaveF, v.heaveV, meanH,       std::max(0.1f, r.heaveOmega), r.heaveZeta);
   integrate(v.pitchF, v.pitchV, pitchTarget, std::max(0.1f, r.pitchOmega), r.pitchZeta);
   integrate(v.rollF,  v.rollV,  rollTarget,  std::max(0.1f, r.rollOmega),  r.rollZeta);
-  // Safety clamp (wave tilt + heel can never dunk the deck); heel itself is already capped at MAX_HEEL in step().
-  const float HARD = r.maxTilt + 0.55f;
-  v.pitchF = std::clamp(v.pitchF, -HARD, HARD);
-  v.rollF  = std::clamp(v.rollF,  -HARD, HARD);
+  // Position clamps: pitch has no heel so cap it tight (its target cap + a little overshoot); roll must leave
+  // room for the steady sail heel (capped at MAX_HEEL=26° in step()) layered on the wave roll.
+  const float pHard = maxPitch * 1.3f, rHard = maxRoll + glm::radians(26.0f) + 0.05f;   // pitch overshoot ∝ cap (no heel); roll leaves heel headroom
+  v.pitchF = std::clamp(v.pitchF, -pHard, pHard);
+  v.rollF  = std::clamp(v.rollF,  -rHard, rHard);
   return { v.heaveF, v.pitchF, v.rollF };
 }
 

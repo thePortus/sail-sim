@@ -150,10 +150,19 @@ export class VesselBuoyancyService {
     const pitchGain = opts?.pitchGain ?? 0.85;
     const rollGain  = opts?.rollGain  ?? 1.05;
     const heelGain  = opts?.heelGain  ?? 0.9;
-    // pitchTorq/(armFwd2/N) is the least-squares wave slope (rad) along the hull; × gain → target tilt, capped.
-    const clampT    = (v: number) => Math.max(-maxTilt, Math.min(maxTilt, v));
-    const pitchTarget = clampT(pitchTorq / (armFwd2 / N) * pitchGain);
-    const rollTarget  = clampT(rollTorq  / (armRgt2 / N) * rollGain) + heelRad * heelGain;
+    // TRUE least-squares wave slope (rad) = Σ(h·arm)/Σ(arm²). NO ×N: dividing by (arm²/N) over-drove it 8× —
+    // a long hull (frigate) then pitched its bow/stern tens of metres. A long ship bridges wave crests so this
+    // slope is naturally small. The cap is on END DISPLACEMENT, not angle: a fixed max ANGLE throws a 48 m
+    // hull's ends metres up, so a long hull gets a smaller max pitch (bow travel ≤ END_CAP_M), a small boat
+    // pitches freely. sl/sb scale HULL_POINTS to the real footprint (see above), so hull dims come from those.
+    const halfLen = (hullHalfLen ?? REF_HALF_LEN);
+    const halfBeam = (hullHalfBeam ?? REF_HALF_BEAM);
+    const END_CAP_M = 1.4;
+    const maxPitch = Math.min(maxTilt, END_CAP_M / Math.max(1, halfLen));
+    const maxRoll  = Math.min(maxTilt, END_CAP_M / Math.max(1, halfBeam));
+    const pitchTarget = Math.max(-maxPitch, Math.min(maxPitch, pitchTorq / Math.max(1e-3, armFwd2) * pitchGain));
+    const rollWave    = Math.max(-maxRoll,  Math.min(maxRoll,  rollTorq  / Math.max(1e-3, armRgt2) * rollGain));
+    const rollTarget  = rollWave + heelRad * heelGain;
 
     // Semi-implicit (symplectic) Euler, sub-stepped so a frame hitch can't blow up the spring (keep ω·h ≲ 0.35).
     const integrate = (x: number, vel: number, target: number, omega: number, zeta: number): [number, number] => {
@@ -172,10 +181,11 @@ export class VesselBuoyancyService {
       Math.max(0.1, opts?.pitchOmega ?? 3.59), opts?.pitchZeta ?? 0.22);
     [this.rollFiltered, this.rollVel] = integrate(this.rollFiltered, this.rollVel, rollTarget,
       Math.max(0.1, opts?.rollOmega ?? 1.69), opts?.rollZeta ?? 0.16);
-    // Safety clamp (wave tilt + heel can never dunk the deck; heel itself is capped upstream at MAX_HEEL).
-    const HARD = maxTilt + 0.55;
-    this.pitchFiltered = Math.max(-HARD, Math.min(HARD, this.pitchFiltered));
-    this.rollFiltered  = Math.max(-HARD, Math.min(HARD, this.rollFiltered));
+    // Position clamps: pitch has no heel → cap tight (target cap + a little overshoot); roll leaves room for
+    // the steady sail heel (capped upstream at MAX_HEEL ≈ 26°) layered on the wave roll.
+    const pHard = maxPitch * 1.3, rHard = maxRoll + (26 * Math.PI / 180) + 0.05;   // pitch overshoot ∝ cap (no heel); roll leaves heel headroom
+    this.pitchFiltered = Math.max(-pHard, Math.min(pHard, this.pitchFiltered));
+    this.rollFiltered  = Math.max(-rHard, Math.min(rHard, this.rollFiltered));
 
     // ── Anti-sink floor ────────────────────────────────────────────────────
     // The smoothed heave always lags the instantaneous wave, and pitch/roll

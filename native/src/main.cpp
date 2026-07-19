@@ -4384,7 +4384,13 @@ int main(int argc, char** argv) {
       r.polar.clear();
       for (const auto& pt : p.polar) r.polar.emplace_back(pt.first, pt.second);
     }
-    if (p.hasBuoyancy) { r.pitchScale = p.pitchScale; r.heaveTau = p.heaveTau; r.tiltTau = p.tiltTau; }
+    if (p.hasBuoyancy) {
+      r.pitchScale = p.pitchScale; r.heaveTau = p.heaveTau; r.tiltTau = p.tiltTau;   // legacy (kept, unused by v3)
+      r.heaveOmega = p.heaveOmega; r.heaveZeta = p.heaveZeta;   // v3 dynamic-buoyancy oscillator params
+      r.pitchOmega = p.pitchOmega; r.pitchZeta = p.pitchZeta; r.pitchGain = p.pitchGain;
+      r.rollOmega  = p.rollOmega;  r.rollZeta  = p.rollZeta;  r.rollGain  = p.rollGain;
+      r.heelGain   = p.heelGain;   r.maxTilt   = p.maxTilt;
+    }
     return r;
   };
   bool prevRaise = false, prevLower = false, prevAnchor = false, prevAutoTrim = false;
@@ -8906,7 +8912,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
           glm::vec3(shipX + swayX, ownBuoy.x - fpMesh.draft, shipZ + swayZ));
       outer = glm::rotate(outer, shipHeading, glm::vec3(0, 1, 0));
       outer = glm::rotate(outer, -ownBuoy.y, glm::vec3(1, 0, 0));
-      outer = glm::rotate(outer, ownBuoy.z + glm::radians(vessel.heelDeg) + shudRoll, glm::vec3(0, 0, 1));
+      outer = glm::rotate(outer, ownBuoy.z + shudRoll, glm::vec3(0, 0, 1));   // roll already includes sail heel (v3)
       eye = glm::vec3(outer * glm::vec4(fpEye, 1.0f));
       // Raw positional shake on the eye (no distance scale — it sits ON the eye).
       if (camTrauma > 1e-3f) {
@@ -9128,8 +9134,8 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
                                     glm::vec3(shipX + swayX, ownBuoy.x - m.draft - cp.ydrop, shipZ + swayZ));
       mm = glm::rotate(mm, shipHeading, glm::vec3(0, 1, 0));
       mm = glm::rotate(mm, -ownBuoy.y + cp.pitch, glm::vec3(1, 0, 0));               // pitch (bow up on +)
-      mm = glm::rotate(mm, ownBuoy.z + glm::radians(vessel.heelDeg) + cp.roll + shudRoll,
-                       glm::vec3(0, 0, 1));                                          // roll + heel + listing + shudder
+      mm = glm::rotate(mm, ownBuoy.z + cp.roll + shudRoll,
+                       glm::vec3(0, 0, 1));                                          // roll (incl. sail heel, v3) + listing + shudder
       mm = glm::rotate(mm, m.bowYaw, glm::vec3(0, 1, 0));
       mm = glm::scale(mm, glm::vec3(m.shipScale));
       mm = glm::translate(mm, -m.keelCenter);

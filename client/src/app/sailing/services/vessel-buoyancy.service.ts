@@ -52,21 +52,9 @@ const HULL_POINTS: { fwd: number; rgt: number }[] = [
   { fwd: -4.5, rgt:  0.0 },   // 7  stern centre
 ];
 
-// Low-pass filter time constant for heave (seconds).
-// 1.5 s gives a long, rolling response that follows the swell envelope without
-// snapping to individual chop crests.  The anti-sink floor catches any lag-
-// induced submersion, so a long tau is safe.
-const HEAVE_TAU = 1.5;
-
-// Pitch/roll sensitivity scale for Voronoi waves.
-// The torque-normalisation formula (pitchTorq / armFwd2) was designed for
-// smooth sinusoidal waves.  Voronoi crests are sharp and tall, so the raw
-// value reaches ≈1.5 rad (90°) in heavy seas — wildly unrealistic.
-// PITCH_SCALE = 0.20 reduces a raw 1.5 rad result to ≈0.30 rad (17°).
-// Lowered to 0.14 for the FFT ocean (taller, real swell drives more tilt than the old
-// procedural model), and hard-capped by MAX_TILT so a big swell can't dunk the deck.
-const PITCH_SCALE = 0.14;
-const MAX_TILT    = 0.20;   // rad (~11.5°) — ceiling on wave-induced pitch/roll
+// Default wave-tilt ceiling (rad, ~11.5°) when the server sends no maxTilt. The v3 oscillator (server-derived
+// natural periods) replaced the old HEAVE_TAU / PITCH_SCALE / PITCH_SMOOTH low-pass constants.
+const MAX_TILT    = 0.20;
 
 // Scaling constants — tuned for "arcade with dramatic feel"
 // Surf/broach now derive from the FFT surface SLOPE (central finite differences of getVisualHeightAt), not the
@@ -74,7 +62,6 @@ const MAX_TILT    = 0.20;   // rad (~11.5°) — ceiling on wave-induced pitch/r
 // real swell nudges rather than throws the boat around ("not overreactive"). Tune these two for surf/broach feel.
 const SURF_SLOPE_GAIN  = 2.5;   // fore-aft slope → speed modifier (clamped to −0.30…+0.20 below)
 const STEER_SLOPE_GAIN = 14;    // cross-slope → broach steering °/s (clamped to ±6 below)
-const PITCH_SMOOTH  = 0.028;  // lerp factor per frame for pitch/roll (lower = smoother)
 const MAX_BEAUFORT  = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +75,10 @@ export class VesselBuoyancyService {
   private heaveFloorFiltered = 0;
   private pitchFiltered      = 0;
   private rollFiltered       = 0;
+  // v3 damped-harmonic-oscillator velocities (heave m/s; pitch/roll rad/s).
+  private heaveVel = 0;
+  private pitchVel = 0;
+  private rollVel  = 0;
 
   /**
    * Evaluate wave-hull interaction for one physics tick.
@@ -100,20 +91,23 @@ export class VesselBuoyancyService {
    */
   update(
     wx: number, wz: number, headingRad: number, t: number, dt: number,
-    opts?: { pitchScale?: number; heaveTau?: number; tiltTau?: number },
+    opts?: {
+      pitchScale?: number; heaveTau?: number; tiltTau?: number;
+      heaveOmega?: number; heaveZeta?: number;
+      pitchOmega?: number; pitchZeta?: number; pitchGain?: number;
+      rollOmega?: number;  rollZeta?: number;  rollGain?: number;
+      heelGain?: number;   maxTilt?: number;
+    },
     hullHalfLen?: number, hullHalfBeam?: number,
+    heelRad = 0,   // signed sail heel (radians) — folded into the roll oscillator target (v3, both clients)
   ): BuoyancyState {
     // Scale the sloop-authored HULL_POINTS template to this vessel's real footprint (1.0 for the sloop).
     const sl = (hullHalfLen  ?? REF_HALF_LEN)  / REF_HALF_LEN;
     const sb = (hullHalfBeam ?? REF_HALF_BEAM) / REF_HALF_BEAM;
     // Per-vessel buoyancy feel (defaults = the generic sloop). heaveTau = how tightly the hull rises/falls
     // with the swell (LOWER = more responsive, rides waves instead of sitting at an average level); tiltTau =
-    // the same for pitch/roll; pitchScale = how much the wave slope tilts it. A small open boat (the pinnace)
-    // wants SHORT taus so its low freeboard stays on top of a wave instead of being swamped by lag.
-    const pitchScale = opts?.pitchScale ?? PITCH_SCALE;
-    const heaveTau   = opts?.heaveTau   ?? HEAVE_TAU;
-    const tiltTau    = opts?.tiltTau;
-
+    // the same for pitch/roll. v3 replaces the legacy pitchScale/heaveTau/tiltTau low-pass with the
+    // server-derived oscillator params read below (opts.heaveOmega/… ); the old fields are ignored.
     const sinH = Math.sin(headingRad);
     const cosH = Math.cos(headingRad);
 
@@ -145,23 +139,43 @@ export class VesselBuoyancyService {
 
     const N = HULL_POINTS.length;
     const meanH     = sumH / N;
-    // pitchScale damps the raw torque-normalised angle for Voronoi crests.
-    const pitchRaw  = pitchTorq / (armFwd2 / N) * pitchScale;
-    const rollRaw   = rollTorq  / (armRgt2 / N) * pitchScale;
 
-    // ── Smooth heave with exponential filter ──────────────────────────────
-    const alpha = 1 - Math.exp(-dt / heaveTau);
-    this.heaveFiltered += (meanH - this.heaveFiltered) * alpha;
+    // ── v3 DYNAMIC BUOYANCY: three damped harmonic oscillators driven by the wave field ──────────────────
+    // The natural periods come from the server (deriveBuoyancy from displacement / waterplane / metacentric
+    // height), so the hull SPRINGS toward the wave and rocks at its OWN period instead of low-pass-tracking
+    // it: a heavy wide hull rolls slow and ponderous, a light narrow one quick and lively, and a small boat
+    // whose natural period matches the chop RESONATES — all emergent from the physics. Sail heel folds into
+    // the roll target so a gust eases the boat over with real roll inertia (matching the native client).
+    const maxTilt   = opts?.maxTilt   ?? MAX_TILT;
+    const pitchGain = opts?.pitchGain ?? 0.85;
+    const rollGain  = opts?.rollGain  ?? 1.05;
+    const heelGain  = opts?.heelGain  ?? 0.9;
+    // pitchTorq/(armFwd2/N) is the least-squares wave slope (rad) along the hull; × gain → target tilt, capped.
+    const clampT    = (v: number) => Math.max(-maxTilt, Math.min(maxTilt, v));
+    const pitchTarget = clampT(pitchTorq / (armFwd2 / N) * pitchGain);
+    const rollTarget  = clampT(rollTorq  / (armRgt2 / N) * rollGain) + heelRad * heelGain;
 
-    // ── Smooth pitch and roll ──────────────────────────────────────────────
-    // A per-vessel time constant (tiltTau) when given — a short one snaps the bow/stern onto the wave slope and
-    // lets gravity drop them back the instant the crest passes; otherwise the framerate-scaled default.
-    const pAlpha = tiltTau != null ? (1 - Math.exp(-dt / tiltTau)) : Math.min(1, PITCH_SMOOTH + dt * 2.5);
-    this.pitchFiltered += (pitchRaw - this.pitchFiltered) * pAlpha;
-    this.rollFiltered  += (rollRaw  - this.rollFiltered)  * pAlpha;
-    // Hard ceiling so even a heavy FFT swell can't tilt the deck into the water.
-    this.pitchFiltered = Math.max(-MAX_TILT, Math.min(MAX_TILT, this.pitchFiltered));
-    this.rollFiltered  = Math.max(-MAX_TILT, Math.min(MAX_TILT, this.rollFiltered));
+    // Semi-implicit (symplectic) Euler, sub-stepped so a frame hitch can't blow up the spring (keep ω·h ≲ 0.35).
+    const integrate = (x: number, vel: number, target: number, omega: number, zeta: number): [number, number] => {
+      const steps = Math.max(1, Math.ceil(dt * omega / 0.35));
+      const h = dt / steps;
+      for (let i = 0; i < steps; i++) {
+        const acc = omega * omega * (target - x) - 2 * zeta * omega * vel;
+        vel += acc * h;
+        x   += vel * h;
+      }
+      return [x, vel];
+    };
+    [this.heaveFiltered, this.heaveVel] = integrate(this.heaveFiltered, this.heaveVel, meanH,
+      Math.max(0.1, opts?.heaveOmega ?? 2.05), opts?.heaveZeta ?? 0.30);
+    [this.pitchFiltered, this.pitchVel] = integrate(this.pitchFiltered, this.pitchVel, pitchTarget,
+      Math.max(0.1, opts?.pitchOmega ?? 3.59), opts?.pitchZeta ?? 0.22);
+    [this.rollFiltered, this.rollVel] = integrate(this.rollFiltered, this.rollVel, rollTarget,
+      Math.max(0.1, opts?.rollOmega ?? 1.69), opts?.rollZeta ?? 0.16);
+    // Safety clamp (wave tilt + heel can never dunk the deck; heel itself is capped upstream at MAX_HEEL).
+    const HARD = maxTilt + 0.55;
+    this.pitchFiltered = Math.max(-HARD, Math.min(HARD, this.pitchFiltered));
+    this.rollFiltered  = Math.max(-HARD, Math.min(HARD, this.rollFiltered));
 
     // ── Anti-sink floor ────────────────────────────────────────────────────
     // The smoothed heave always lags the instantaneous wave, and pitch/roll
@@ -229,5 +243,8 @@ export class VesselBuoyancyService {
     this.heaveFloorFiltered = 0;
     this.pitchFiltered      = 0;
     this.rollFiltered       = 0;
+    this.heaveVel = 0;
+    this.pitchVel = 0;
+    this.rollVel  = 0;
   }
 }

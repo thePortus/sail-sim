@@ -79,6 +79,7 @@ const VESSELS = [
       polar: [[34, 0.42], [55, 0.62], [80, 0.82], [100, 0.92], [125, 0.97], [150, 0.90], [180, 0.80]],
       hullHalfLen:      4.1,
       hullHalfBeam:     1.1,
+      GM:               0.55,      // metacentric height (m) — roll STIFFNESS: low beam but stiff for a small boat → quick lively roll
       buoyancy: { pitchScale: 0.16, heaveTau: 0.45, tiltTau: 0.30 },
     },
     // Helm: near the front of the tiller, just to starboard (starboard = −X here), seated eye height.
@@ -118,6 +119,7 @@ const VESSELS = [
       polar: [[32, 0.46], [45, 0.64], [60, 0.80], [90, 0.93], [120, 1.00], [150, 0.82], [180, 0.66]],
       hullHalfLen:      7.0,
       hullHalfBeam:     2.2,
+      GM:               0.90,      // stiff, lively — a well-ballasted racer; snappier roll than a laden trader
       buoyancy: { pitchScale: 0.14, heaveTau: 1.5, tiltTau: -1 },
     },
     // Helm — just aft of the wheel, on the centreline, standing eye height, looking forward.
@@ -151,6 +153,7 @@ const VESSELS = [
       polar: [[52, 0.38], [72, 0.60], [92, 0.80], [120, 1.00], [150, 0.96], [180, 0.88]],
       hullHalfLen:      15.0,
       hullHalfBeam:     3.6,
+      GM:               0.70,      // tender laden trader — deep heavy hull → slow, ponderous, majestic roll
       buoyancy: { pitchScale: 0.06, heaveTau: 1.1, tiltTau: 0.65 },
     },
     // Helm — at the wheel on the high quarterdeck aft (B_Wheel ≈ model y 7.93), standing eye height, looking
@@ -193,6 +196,7 @@ const VESSELS = [
       polar: [[50, 0.40], [70, 0.62], [90, 0.82], [120, 1.00], [150, 0.95], [180, 0.86]],
       hullHalfLen:      12.0,
       hullHalfBeam:     3.2,
+      GM:               0.85,      // a steady warship — stiffer than the trader, but a deep hull → measured roll
       buoyancy: { pitchScale: 0.07, heaveTau: 1.0, tiltTau: 0.6 },
     },
     // Helm — at the wheel aft (B_Wheel ≈ model 0,5.74,-11.1), standing eye height, looking forward.
@@ -222,7 +226,7 @@ const VESSELS = [
     id: 5, name: 'Frigate (Heavy)', slug: 'frigate_heavy', armament: 'heavy',
     description: 'A 44-gun heavy frigate — a purpose-built man-of-war with a full battery of 24-pounders and spar-deck carronades. The toughest hull and deadliest broadside afloat, fast under her huge press of canvas, but the heaviest ship in the fleet: ponderous to turn and slow to gather way. The apex predator of the sea.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
-    physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50 },
+    physics: { maxSpeed: 10.2, accelerationRate: 0.09, minTackAngle: 50, sailAreaFactor: 0.55, weight: 11000, turnFactor: 0.50, hullHalfLen: 24.0, hullHalfBeam: 5.5, GM: 1.00 },
     firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG, FRIG_CARR),   // 15 long guns + 11 carronades
     zoneHp: { bow: 250, stern: 250, port: 360, starboard: 360, masts: 250 },
@@ -232,7 +236,7 @@ const VESSELS = [
     id: 6, name: 'Frigate (Medium)', slug: 'frigate_medium', armament: 'medium',
     description: 'A frigate on a medium battery — fewer, lighter guns than the heavy, trading some of that crushing broadside for a slightly livelier, cheaper ship. Still the toughest hull and among the fastest afloat, and still ponderous to handle.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
-    physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55 },
+    physics: { maxSpeed: 10.5, accelerationRate: 0.10, minTackAngle: 50, sailAreaFactor: 0.55, weight: 10000, turnFactor: 0.55, hullHalfLen: 24.0, hullHalfBeam: 5.5, GM: 1.02 },
     firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG, FRIG_CARR.slice(1, 9)),   // 15 long guns + 8 carronades
     zoneHp: { bow: 230, stern: 230, port: 320, starboard: 320, masts: 230 },
@@ -242,13 +246,56 @@ const VESSELS = [
     id: 7, name: 'Frigate (Light)', slug: 'frigate_light', armament: 'light',
     description: 'A frigate on a light battery — the least-armed loadout, the fastest and handiest of the three, and the cheapest way onto a frigate\'s deck. A stout, fast hull for a captain who values speed over a full broadside.',
     glb: 'frigate.glb', manifest: 'frigate.manifest.json', importFlipY: false, rightSign: 1,
-    physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60 },
+    physics: { maxSpeed: 10.8, accelerationRate: 0.11, minTackAngle: 50, sailAreaFactor: 0.55, weight: 9000, turnFactor: 0.60, hullHalfLen: 24.0, hullHalfBeam: 5.5, GM: 1.05 },
     firstPersonCam: { x: 0.0, y: 9.0, z: -16.7 },   // helmsman abaft the wheel on the quarterdeck (vessel-local; Y re-snapped to deck)
     cannons: battery(FRIG_LONG.slice(0, 13), FRIG_CARR.slice(2, 8)),   // 13 long guns + 6 carronades
     zoneHp: { bow: 210, stern: 210, port: 280, starboard: 280, masts: 210 },
     crew: 360, cargo: 60, price: 350000, parts: [],
   },
 ];
+
+// ── Dynamic buoyancy derivation (server-authoritative; both clients integrate the same oscillators) ──────────
+// The visible bobbing is a DAMPED HARMONIC OSCILLATOR per axis (heave/pitch/roll), not a place-at-wave-height
+// low-pass. Each axis' NATURAL PERIOD is derived here from the ship's physical properties, so a heavy wide
+// hull genuinely rolls slower/more ponderously than a light narrow one — the "feel" falls out of the physics
+// instead of being hand-tuned per ship. The client runs:  angleʺ = ω²·(waveTarget − angle) − 2ζω·angleʹ.
+//
+//   heave: spring = ρ·g·A_waterplane vs displacement + added mass  →  T = 2π·√((1+a)·draft·Cb / (Cw·g))
+//   roll : restoring moment = Δ·g·GM (metacentric height = roll stiffness) → naval T = 2·C·B / √GM
+//   pitch: same with the (much larger) longitudinal metacentre GML     → T = 2·C·L / √GML  (stiff → fast)
+//
+// GM (per vessel, authored) is the key roll-feel knob: high = stiff/snappy warship, low = tender/slow trader.
+// Everything else derives from weight + hull L/B we already carry. Gains map the sampled wave-face SLOPE (rad)
+// to a target tilt; maxTilt caps it ("dramatic but forgiving"); zeta sets how many times it rocks before
+// settling (low roll zeta → a visible, characterful roll).
+function deriveBuoyancy(phys) {
+  const g = 9.81;
+  const L = 2 * (phys.hullHalfLen  ?? 7.0);
+  const B = 2 * (phys.hullHalfBeam ?? 2.2);
+  const draft = phys.draft ?? Math.max(0.9, 0.45 * B);   // deeper hull → longer heave period
+  const GM  = phys.GM  ?? 0.85;                            // roll metacentric height (m)
+  const GML = phys.GML ?? 1.05 * L;                        // longitudinal metacentre ~ length (pitch is stiff)
+  const Cw = 0.72, Cb = 0.50, addedHeave = 0.7;           // waterplane / block coeffs; heave added-mass fraction
+  const Croll = 0.40, Cpitch = 0.24;                      // roll/pitch period coefficients (naval rule-of-thumb)
+  const Troll  = 2 * Croll  * B / Math.sqrt(GM);
+  const Tpitch = 2 * Cpitch * L / Math.sqrt(GML);
+  const Theave = 2 * Math.PI * Math.sqrt((1 + addedHeave) * draft * Cb / (Cw * g));
+  const w = (T) => +(2 * Math.PI / T).toFixed(3);
+  const b = phys.buoyancy || {};   // an authored buoyancy sub-block may override any derived value
+  return {
+    ...b,   // keep legacy pitchScale/heaveTau/tiltTau (unused by the oscillator, harmless to carry)
+    heaveOmega: b.heaveOmega ?? w(Theave), heaveZeta: b.heaveZeta ?? 0.30,
+    pitchOmega: b.pitchOmega ?? w(Tpitch), pitchZeta: b.pitchZeta ?? 0.22, pitchGain: b.pitchGain ?? 0.85,
+    rollOmega:  b.rollOmega  ?? w(Troll),  rollZeta:  b.rollZeta  ?? 0.16, rollGain:  b.rollGain  ?? 1.05,
+    heelGain:   b.heelGain ?? 0.9,     // wind-heel angle → roll-target contribution (fraction of the heel)
+    maxTilt:    b.maxTilt  ?? 0.24,    // rad cap on wave-induced tilt (~13.7°) — forgiving
+    periods:    { heave: +Theave.toFixed(2), pitch: +Tpitch.toFixed(2), roll: +Troll.toFixed(2) },   // debug/HUD
+  };
+}
+// Enrich every vessel's physics with the derived oscillator block at module load, so every endpoint that
+// emits `physics` (getVesselBySlug / getDefaultVessel) carries it and both clients read the same numbers.
+for (const v of VESSELS) if (v.physics) v.physics.buoyancy = deriveBuoyancy(v.physics);
+exports.deriveBuoyancy = deriveBuoyancy;
 
 /** Look up a vessel definition by slug (defaults to the sloop). Used by the movement validator to
  *  read per-vessel physics (maxSpeed, etc.) when checking the plausibility of a position update. */

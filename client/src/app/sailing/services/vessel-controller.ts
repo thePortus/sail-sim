@@ -85,9 +85,16 @@ export interface VesselRig {
    *   - waterlineY: root-local Y of the waterline plane the footprint is SLICED at (the rig origin is authored
    *                 at the waterline, so 0 is right; nudge ± if the cut sits a touch high/low on the hull). */
   hullCut?: { floorY: number; alongSign: 1 | -1; waterlineY?: number };
-  /** Per-vessel buoyancy feel. pitchScale = how far the wave slope tilts it; heaveTau = vertical-follow time
-   *  constant (LOWER = rides waves more); tiltTau = pitch/roll time constant. See VesselBuoyancyService. */
-  buoyancy?: { pitchScale?: number; heaveTau?: number; tiltTau?: number };
+  /** Per-vessel buoyancy. v3 = damped-harmonic-oscillator params (server deriveBuoyancy): per-axis natural
+   *  frequency (omega, rad/s), damping ratio (zeta), and wave-slope→tilt gain; heelGain folds sail heel into
+   *  the roll target; maxTilt caps wave tilt. Legacy pitchScale/heaveTau/tiltTau kept for back-compat. */
+  buoyancy?: {
+    pitchScale?: number; heaveTau?: number; tiltTau?: number;
+    heaveOmega?: number; heaveZeta?: number;
+    pitchOmega?: number; pitchZeta?: number; pitchGain?: number;
+    rollOmega?: number;  rollZeta?: number;  rollGain?: number;
+    heelGain?: number;   maxTilt?: number;
+  };
   /** Approximate hull half-dimensions (m) for the aground check + wake emitter placement. */
   hullHalfLen: number;
   hullHalfBeam: number;

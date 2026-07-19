@@ -23,7 +23,12 @@ struct Rig {
   float minTackAngle = 32, sailAreaFactor = 0.40f;
   float turnFactor = 1.0f;        // multiplier on the helm turn-rate curve (<1 = turns slower; frigate ~0.5)
   float hullHalfLen = 7.0f, hullHalfBeam = 2.2f;
-  float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // tiltTau<0 => use default smoothing
+  float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // legacy kinematic (unused by the v3 oscillator)
+  // v3 dynamic buoyancy: per-axis damped-harmonic-oscillator params (server deriveBuoyancy). Defaults ≈ sloop.
+  float heaveOmega = 2.05f, heaveZeta = 0.30f;
+  float pitchOmega = 3.59f, pitchZeta = 0.22f, pitchGain = 0.85f;
+  float rollOmega  = 1.69f, rollZeta  = 0.16f, rollGain  = 1.05f;
+  float heelGain   = 0.9f,  maxTilt   = 0.24f;
 };
 
 inline Rig rigForSlug(const std::string& s) {
@@ -70,7 +75,8 @@ struct Vessel {
   int   sailState = 1;
   bool  anchored = false;
   float anchorX = 0, anchorZ = 0;
-  float heaveF = 0, pitchF = 0, rollF = 0;   // filtered buoyancy
+  float heaveF = 0, pitchF = 0, rollF = 0;   // buoyancy oscillator positions (heave m; pitch/roll rad)
+  float heaveV = 0, pitchV = 0, rollV = 0;   // buoyancy oscillator velocities (v3 damped-harmonic state)
   // Sheet (sail trim), player-set: 5 = hauled hard in .. 88 = fully eased.
   float sheetAngleDeg = 30.0f;       // client default (reaching start)
   float trimQ = 1.0f;                // last tick's trim quality 0..1 (for the HUD)
@@ -232,7 +238,7 @@ inline Buoy buoyancy(Vessel& v, const Rig& r, float dt,
                      const std::function<float(float, float)>& waveHeight) {
   static const glm::vec2 HULL[8] = {   // (fwd, rgt) sloop template
     {5.5f,0.0f},{3.5f,-2.0f},{3.5f,2.0f},{0.0f,-2.2f},{0.0f,2.2f},{-3.5f,-2.0f},{-3.5f,2.0f},{-4.5f,0.0f}};
-  const float REF_LEN = 7.0f, REF_BEAM = 2.2f, MAX_TILT = 0.20f;
+  const float REF_LEN = 7.0f, REF_BEAM = 2.2f;
   float sl = r.hullHalfLen / REF_LEN, sb = r.hullHalfBeam / REF_BEAM;
   float sh = std::sin(v.heading), ch = std::cos(v.heading);
 
@@ -247,16 +253,33 @@ inline Buoy buoyancy(Vessel& v, const Rig& r, float dt,
   }
   const int N = 8;
   meanH /= N;
-  float pitchRaw = pitchTorq / std::max(1e-3f, armFwd2 / N) * r.pitchScale;
-  float rollRaw  = rollTorq  / std::max(1e-3f, armRgt2 / N) * r.pitchScale;
-  pitchRaw = std::clamp(pitchRaw, -MAX_TILT, MAX_TILT);
-  rollRaw  = std::clamp(rollRaw,  -MAX_TILT, MAX_TILT);
+  // v3 DYNAMIC BUOYANCY: three damped harmonic oscillators driven by the wave field, with natural periods
+  // set by the server (deriveBuoyancy from displacement / waterplane / metacentric height). The hull SPRINGS
+  // toward the wave surface and rocks at its OWN period instead of low-pass-tracking it — a heavy wide hull
+  // rolls slow and ponderous, a light narrow one quick and lively, all emergent from the physics. Sail heel
+  // folds into the roll TARGET so a gust eases the boat over with real roll inertia (and both clients match).
+  // pitchTorq/(armFwd2/N) is the least-squares wave slope (rad) along the hull; × gain → target tilt, capped.
+  float pitchTarget = std::clamp(pitchTorq / std::max(1e-3f, armFwd2 / N) * r.pitchGain, -r.maxTilt, r.maxTilt);
+  float rollWave    = std::clamp(rollTorq  / std::max(1e-3f, armRgt2 / N) * r.rollGain,  -r.maxTilt, r.maxTilt);
+  float rollTarget  = rollWave + glm::radians(v.heelDeg) * r.heelGain;
 
-  float hAlpha = 1.0f - std::exp(-dt / std::max(0.05f, r.heaveTau));
-  v.heaveF += (meanH - v.heaveF) * hAlpha;
-  float pAlpha = (r.tiltTau > 0.0f) ? (1.0f - std::exp(-dt / r.tiltTau)) : std::min(1.0f, 0.028f + dt * 2.5f);
-  v.pitchF += (pitchRaw - v.pitchF) * pAlpha;
-  v.rollF  += (rollRaw  - v.rollF)  * pAlpha;
+  // Semi-implicit (symplectic) Euler, sub-stepped so a frame hitch can't blow up the spring (keep ω·h ≲ 0.35).
+  auto integrate = [&](float& x, float& vel, float target, float omega, float zeta) {
+    int steps = std::max(1, (int)std::ceil(dt * omega / 0.35f));
+    float h = dt / (float)steps;
+    for (int i = 0; i < steps; ++i) {
+      float acc = omega * omega * (target - x) - 2.0f * zeta * omega * vel;
+      vel += acc * h;
+      x   += vel * h;
+    }
+  };
+  integrate(v.heaveF, v.heaveV, meanH,       std::max(0.1f, r.heaveOmega), r.heaveZeta);
+  integrate(v.pitchF, v.pitchV, pitchTarget, std::max(0.1f, r.pitchOmega), r.pitchZeta);
+  integrate(v.rollF,  v.rollV,  rollTarget,  std::max(0.1f, r.rollOmega),  r.rollZeta);
+  // Safety clamp (wave tilt + heel can never dunk the deck); heel itself is already capped at MAX_HEEL in step().
+  const float HARD = r.maxTilt + 0.55f;
+  v.pitchF = std::clamp(v.pitchF, -HARD, HARD);
+  v.rollF  = std::clamp(v.rollF,  -HARD, HARD);
   return { v.heaveF, v.pitchF, v.rollF };
 }
 

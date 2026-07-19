@@ -477,7 +477,10 @@ export class VesselService {
           trimForgive: p.trimForgive ?? base.sail?.trimForgive,
           leewayK:     p.leewayK      ?? base.sail?.leewayK }
       : base.sail;
-    const buoyancy = (p?.buoyancy && p.buoyancy.tiltTau >= 0) ? p.buoyancy : base.buoyancy;
+    // v3: the server's buoyancy block carries the derived oscillator params (heaveOmega/…/rollGain) for EVERY
+    // vessel — always take it when present (merged over the base so a partial block still fills in), instead of
+    // the old tiltTau<0 sentinel that would drop the sloop's server buoyancy back to the base's legacy values.
+    const buoyancy = p?.buoyancy ? { ...base.buoyancy, ...p.buoyancy } : base.buoyancy;
     return {
       glb:        vessel.glb        ?? base.glb,
       manifest:   vessel.manifest   ?? base.manifest,
@@ -1382,8 +1385,10 @@ export class VesselService {
     // waveHeight() — so the physics height matches the rendered surface exactly. The hull footprint scales to
     // each vessel's real dimensions (hullHalfLen/hullHalfBeam).
     const t    = this.simTime;
+    // v3: fold sail heel into the buoyancy roll oscillator (was applied instantly at render below) so a gust
+    // eases the boat over with real roll inertia, and both clients match. heelAngle is computed just above.
     const buoy = this.buoyancyService.update(this.x, this.z, hr, t, dt, this.rig.buoyancy,
-      this.rig.hullHalfLen, this.rig.hullHalfBeam);
+      this.rig.hullHalfLen, this.rig.hullHalfBeam, heelAngle * Math.PI / 180);
     // Anti-sink floor: gentle 15% correction of any corner that lags below its wave.
     const floorLift    = Math.max(0, buoy.heaveFloor - buoy.heave);
     const heaveApplied = buoy.heave + floorLift * 0.15;
@@ -1517,7 +1522,7 @@ export class VesselService {
     // is free to exceed the buoyancy MAX_TILT clamp. Continues smoothly from the in-combat list.
     const cap = capsizeFor(this.combatService.zones(), hullMax);
 
-    this.root.rotation.z = buoy.rollRad + (heelAngle * Math.PI / 180) + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;
+    this.root.rotation.z = buoy.rollRad + this.recoilRoll + this.hitRoll + this.listRoll + cap.roll * this.sinkEnv;   // buoy.rollRad already includes sail heel (v3)
     this.root.rotation.x = buoy.pitchRad + this.listPitch + cap.pitch * this.sinkEnv + (this.rig.trimPitch ?? 0);
 
     // ── Rigged vessel drive (per-vessel controller via the VesselController interface) ─────────

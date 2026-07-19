@@ -64,7 +64,12 @@ struct VesselPhysics {
   std::vector<std::pair<float, float>> polar;   // [apparentAngleDeg, driveCoeff] breakpoints
   float hullHalfLen = 7.0f, hullHalfBeam = 2.2f;
   bool  hasBuoyancy = false;
-  float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // tiltTau < 0 => client default smoothing
+  float pitchScale = 0.14f, heaveTau = 1.5f, tiltTau = -1.0f;   // legacy kinematic (unused by the oscillator)
+  // v3 dynamic buoyancy: per-axis damped-harmonic-oscillator params (server deriveBuoyancy). Defaults ≈ sloop.
+  float heaveOmega = 2.05f, heaveZeta = 0.30f;
+  float pitchOmega = 3.59f, pitchZeta = 0.22f, pitchGain = 0.85f;
+  float rollOmega  = 1.69f, rollZeta  = 0.16f, rollGain  = 1.05f;
+  float heelGain   = 0.9f,  maxTilt   = 0.24f;
 };
 
 VesselPhysics vesselPhysics(const std::string& host, int port, const std::string& slug,

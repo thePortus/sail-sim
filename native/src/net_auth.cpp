@@ -147,6 +147,13 @@ VesselPhysics vesselPhysics(const std::string& host, int port, const std::string
     r.pitchScale = b.value("pitchScale", r.pitchScale);
     r.heaveTau   = b.value("heaveTau", r.heaveTau);
     r.tiltTau    = b.value("tiltTau", r.tiltTau);
+    // v3 dynamic buoyancy oscillator params (server deriveBuoyancy).
+    r.heaveOmega = b.value("heaveOmega", r.heaveOmega); r.heaveZeta = b.value("heaveZeta", r.heaveZeta);
+    r.pitchOmega = b.value("pitchOmega", r.pitchOmega); r.pitchZeta = b.value("pitchZeta", r.pitchZeta);
+    r.pitchGain  = b.value("pitchGain",  r.pitchGain);
+    r.rollOmega  = b.value("rollOmega",  r.rollOmega);  r.rollZeta  = b.value("rollZeta",  r.rollZeta);
+    r.rollGain   = b.value("rollGain",   r.rollGain);
+    r.heelGain   = b.value("heelGain",   r.heelGain);   r.maxTilt   = b.value("maxTilt",   r.maxTilt);
     r.hasBuoyancy = true;
   }
   r.ok = true;

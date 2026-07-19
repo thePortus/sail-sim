@@ -8,7 +8,9 @@
 #include "gltf_rig.hpp"
 #include "ktx2.hpp"
 
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -22,6 +24,49 @@ glm::mat4 nodeLocal(const RigNode& n) {
   m *= glm::mat4_cast(n.r);
   m = glm::scale(m, n.s);
   return m;
+}
+
+// Synthesize a "Billow" morph for every furlable sail: a smooth wind-filled belly the animation
+// controller drives per frame (see RigMorph::billowAxis). Sails ship as FLAT quads with only a
+// 'Furl' morph — this adds the curve. For each Furl'd canvas submesh we take its LOCAL bounding
+// box, treat the thinnest axis as the sail-plane normal, and push each vertex out along that normal
+// by depth·sin(π·u)·sin(π·v) (u,v = fractional position across the two in-plane axes) → zero at all
+// four edges (bent to spar/luff/foot), deepest mid-sail. Depth ≈ 11% of the chord (a realistic
+// working-sail belly). The controller signs the weight by leeward direction so it curves correctly.
+void synthesizeSailBillow(RiggedData& out) {
+  const size_t stride = kRigFloatsPerVertex;
+  std::vector<RigMorph> add;
+  for (const RigMorph& furl : out.morphs) {
+    if (furl.targetName != "Furl" || furl.submesh < 0) continue;
+    std::string nm = out.submeshes[(size_t)furl.submesh].name;
+    std::transform(nm.begin(), nm.end(), nm.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    if (nm.find("sail") == std::string::npos) continue;                  // canvas nodes are 'Sail_*'
+    if (nm.find("sheet") != std::string::npos || nm.find("gear") != std::string::npos) continue;  // ropes, not canvas
+    const uint32_t vb = furl.vertexBase, vc = furl.vertexCount;
+    if (vc < 4) continue;
+    glm::vec3 lo(1e30f), hi(-1e30f);
+    for (uint32_t j = 0; j < vc; ++j) {
+      const float* vp = &out.vertices[(size_t)(vb + j) * stride];
+      glm::vec3 p(vp[0], vp[1], vp[2]); lo = glm::min(lo, p); hi = glm::max(hi, p);
+    }
+    glm::vec3 ext = hi - lo;
+    int thin = 0; if (ext.y < ext[thin]) thin = 1; if (ext.z < ext[thin]) thin = 2;   // plane normal axis
+    int a1 = (thin + 1) % 3, a2 = (thin + 2) % 3;                                       // in-plane axes
+    const float depth = 0.11f * std::min(ext[a1], ext[a2]);                             // realistic belly (~11% chord)
+    glm::vec3 axis(0.0f); axis[thin] = 1.0f;
+    RigMorph m; m.submesh = furl.submesh; m.target = -1; m.targetName = "Billow";
+    m.vertexBase = vb; m.vertexCount = vc; m.dpos.resize(vc); m.billowAxis = axis;
+    for (uint32_t j = 0; j < vc; ++j) {
+      const float* vp = &out.vertices[(size_t)(vb + j) * stride];
+      float u = ext[a1] > 1e-4f ? (vp[a1] - lo[a1]) / ext[a1] : 0.5f;
+      float v = ext[a2] > 1e-4f ? (vp[a2] - lo[a2]) / ext[a2] : 0.5f;
+      float belly = std::sin(3.14159265f * u) * std::sin(3.14159265f * v);
+      m.dpos[j] = axis * (depth * belly);
+    }
+    add.push_back(std::move(m));
+  }
+  for (auto& m : add) out.morphs.push_back(std::move(m));
+  if (!add.empty()) std::printf("[rig] synthesized %zu sail billow morphs\n", add.size());
 }
 
 }  // namespace
@@ -324,6 +369,7 @@ RiggedData loadGltfRigged(const char* path) {
 
   cgltf_free(data);
   out.ok = !out.vertices.empty() && !out.indices.empty();
+  synthesizeSailBillow(out);
   if (out.ok)
     std::printf("[rig] %s: %zu verts, %zu submeshes, %zu nodes, %zu skins (%u palette), %zu clips, %zu morphs\n",
                 path, out.vertices.size() / kRigFloatsPerVertex, out.submeshes.size(),

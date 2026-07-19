@@ -58,7 +58,9 @@ fn skinLocal(vid : u32, inPos : vec3<f32>, inJoints : vec4<f32>, inWeights : vec
     for (var mi = 0u; mi < subInfo.info.x; mi = mi + 1u) {
         let e = morphTable[subInfo.info.y + mi];
         let wgt = pal.w[e.y >> 2u][e.y & 3u];
-        if (wgt > 0.0001) {
+        // abs(): the synthetic sail-BILLOW morph takes NEGATIVE weights (belly flips to the other
+        // tack); real furl/lid morphs only ever go 0..1 so they are unaffected.
+        if (abs(wgt) > 0.0001) {
             let di = (e.x + (vid - subInfo.info.z)) * 3u;
             p += vec3<f32>(morphDeltas[di], morphDeltas[di + 1u], morphDeltas[di + 2u]) * wgt;
         }

@@ -58,6 +58,11 @@ struct RigMorph {
   std::string targetName;             // from the glTF target_names extras ('Furl', 'Drop_S', …)
   uint32_t vertexBase = 0, vertexCount = 0;
   std::vector<glm::vec3> dpos;
+  // Synthetic sail-BILLOW morph (targetName "Billow"): the +delta pushes the canvas toward this LOCAL
+  // plane-normal axis. The animation controller signs/scales the weight per frame from the wind: weight =
+  // dot(downwind, liveWorldNormal)·pressure·(1−furl), so it billows to leeward, flips by tack, and goes
+  // flat when luffing — one rule for square + fore-and-aft sails. billowAxis == 0 for real glTF morphs.
+  glm::vec3 billowAxis = glm::vec3(0.0f);
 };
 
 struct RigSubmesh {

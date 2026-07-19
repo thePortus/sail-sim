@@ -117,6 +117,14 @@ private:
   float flagW_ = 0;
   bool flagActive_ = false;
 
+  // ── Sail billow: the synthetic 'Billow' morphs (gltf_rig synthesizeSailBillow) driven per frame from
+  //    the wind. weight = dot(downwind, live sail-normal)·pressure·(1−furl)·breathe — bulges to leeward,
+  //    flips by tack, goes flat when luffing. furlIdx = the sibling Furl morph so a struck sail can't billow.
+  struct BillowSail { int morphIdx = -1, furlIdx = -1, node = -1; glm::vec3 axis{0.0f}; float phase = 0.0f; };
+  std::vector<BillowSail> billows_;
+  float windLocalRad_ = 0, windStrength_ = 0, windTime_ = 0;   // stored by idleWind for the billow drive
+  void driveBillow();
+
   // ── Per-rig profile ──
   enum class TrimMode { SloopHybrid, SymmetricLug, SymmetricSquare };
   enum class RudderMode { SloopBone, PinnaceAbsolute, SymmetricClip, SymmetricClipReversed };

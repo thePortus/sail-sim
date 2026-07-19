@@ -74,6 +74,20 @@ Controller::Controller(std::shared_ptr<const RiggedData> rig, const std::string&
   palette_ = rig_->restPalette;
   morphW_.assign(rig_->morphs.size(), 0.0f);
 
+  // ── Sail billow: index each synthetic 'Billow' morph with its sail node + sibling 'Furl' morph. ──
+  for (size_t i = 0; i < rig_->morphs.size(); ++i) {
+    const RigMorph& bm = rig_->morphs[i];
+    if (bm.targetName != "Billow" || bm.submesh < 0) continue;
+    BillowSail bs;
+    bs.morphIdx = (int)i;
+    bs.node = rig_->submeshes[(size_t)bm.submesh].node;
+    bs.axis = bm.billowAxis;
+    bs.phase = (float)billows_.size() * 1.7f;   // desync the gentle breathe across sails
+    for (size_t k = 0; k < rig_->morphs.size(); ++k)   // sibling Furl on the same submesh
+      if (rig_->morphs[k].targetName == "Furl" && rig_->morphs[k].submesh == bm.submesh) { bs.furlIdx = (int)k; break; }
+    billows_.push_back(bs);
+  }
+
   // ── Manifest: sail -> furl morph (+rope morphs in lockstep) ──
   try {
     std::ifstream f(manifestPath);
@@ -271,6 +285,7 @@ void Controller::dropAnchor(char side, float t) {
 
 void Controller::idleWind(float windDirLocalRad, float strength, float t) {
   const float s = glm::clamp(strength, 0.0f, 1.5f);
+  windLocalRad_ = windDirLocalRad; windStrength_ = s; windTime_ = t;   // for the sail billow drive
   flagW_ = glm::clamp((s - 0.02f) / 0.10f, 0.0f, 1.0f);   // limp in dead air
   for (size_t i = 0; i < flags_.size() && i < 4; ++i) {
     const FlagSpec& f = flags_[i];
@@ -531,6 +546,36 @@ void Controller::tickRig(float dt) {
 
   // 6. Palette (the "skeleton.prepare" equivalent).
   recomputePalette();
+
+  // 7. Sail billow — needs the fresh palette (live sail-node world normals).
+  driveBillow();
+}
+
+// Fill each sail's synthetic Billow morph weight from the wind. The morph +delta pushes the canvas
+// along its LOCAL plane-normal (billowAxis); transformed by the live sail-node world matrix that gives
+// the sail's world normal. The belly bulges to LEEWARD, so weight ∝ dot(downwind, worldNormal): the
+// sign flips with the tack (fore-and-aft sails) and with running vs by-the-lee (square sails), and a
+// sail lying edge-on to the wind (luffing) gets dot≈0 → flat. Gated by (1−furl) so a struck sail is
+// flat, and by wind pressure. A gentle breathe keeps set canvas alive.
+void Controller::driveBillow() {
+  if (billows_.empty()) return;
+  // Downwind direction in ship-local space (+Z bow, +X starboard): idleWind's windLocalRad is the
+  // bearing the wind blows TOWARD, ship-relative.
+  const glm::vec3 downwind(std::sin(windLocalRad_), 0.0f, std::cos(windLocalRad_));
+  const float pressure = glm::clamp(windStrength_, 0.0f, 1.2f);   // ~ windSpeed/8, clamped
+  for (const BillowSail& b : billows_) {
+    if (b.morphIdx < 0 || b.node < 0) continue;
+    const glm::mat3 rot(worlds_[(size_t)b.node]);
+    glm::vec3 wn = rot * b.axis;                          // sail-plane world normal
+    wn.y = 0.0f;                                          // billow is a horizontal (leeward) push
+    const float ln = glm::length(wn);
+    if (ln < 1e-4f) { morphW_[(size_t)b.morphIdx] = 0.0f; continue; }
+    wn /= ln;
+    const float furl = b.furlIdx >= 0 ? morphW_[(size_t)b.furlIdx] : 0.0f;   // 0 set .. 1 struck
+    const float lee  = glm::dot(downwind, wn);            // signed: which face is leeward (−1..+1)
+    const float breathe = 1.0f + 0.06f * std::sin(windTime_ * 0.7f + b.phase);
+    morphW_[(size_t)b.morphIdx] = lee * pressure * (1.0f - furl) * breathe;
+  }
 }
 
 }  // namespace vanim

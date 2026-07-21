@@ -557,12 +557,11 @@ async function loadAndSendWallet(id, p, players) {
 function crewStateMsg(pid, p) {
   return JSON.stringify({ type: 'crew_state', playerId: pid, crew: p.crew | 0, maxCrew: p.maxCrew | 0 });
 }
-/** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew, 1.0 fully manned). Mirrors the client's formula;
- *  scales mast-repair speed here (and sail/turn/reload client-side). NPCs (no maxCrew) → 1 (unaffected). */
+/** Crew-efficiency factor (combat-constants crewEfficiency — the single authoritative curve, mirrored by
+ *  both clients): no penalty at/above CREW_KNEE of complement, ramping down to CREW_FLOOR for a skeleton
+ *  crew. Scales gun reload + mast jury-rig here, and sail drive/turn client-side. No maxCrew → 1. */
 function crewFactor(p) {
-  const max = p && p.maxCrew | 0;
-  if (!max || max <= 0) return 1;
-  return 0.5 + 0.5 * Math.max(0, Math.min(1, (p.crew | 0) / max));
+  return combatConst.crewEfficiency(p ? p.crew : 0, p ? p.maxCrew : 0);
 }
 function broadcastCrew(pid, p, players) {
   const m = crewStateMsg(pid, p);

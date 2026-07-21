@@ -26,10 +26,20 @@ export class CombatService {
   readonly maxCrew = signal<number>(0);
   /** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew, 1.0 fully manned). Scales sail speed, turn rate,
    *  and reload time; the server scales mast-repair duration with the same formula. */
+  // Crew-efficiency factor — MIRRORS server combat-constants.crewEfficiency (the authoritative curve;
+  // keep the three constants in lockstep with it and native sail::crewEfficiency). A ship does NOT need
+  // every hand: at/above CREW_KNEE of complement there's no penalty at all. Below that the effect ramps
+  // in and bites harder as the crew thins, bottoming out at CREW_FLOOR so a skeleton crew is crippled
+  // but still limps home. Scales sail drive, helm/turn rate and the gun reload window.
+  private readonly CREW_KNEE  = 0.85;
+  private readonly CREW_FLOOR = 0.33;   // floor: still makes 33% speed / ~3x reload
+  private readonly CREW_EXP   = 1.25;
   readonly crewFactor = computed(() => {
     const max = this.maxCrew();
     if (max <= 0) return 1;
-    return 0.5 + 0.5 * Math.max(0, Math.min(1, this.crew() / max));
+    const r = Math.max(0, Math.min(1, this.crew() / max));
+    if (r >= this.CREW_KNEE) return 1;
+    return this.CREW_FLOOR + (1 - this.CREW_FLOOR) * Math.pow(r / this.CREW_KNEE, this.CREW_EXP);
   });
   /** Apply an authoritative crew count from the server. */
   setCrew(crew: number, maxCrew: number): void {

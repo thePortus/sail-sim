@@ -8133,8 +8133,10 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
               enemies.push_back({ "fort_" + hb.id, ft.x, ft.z, 0.0f, 0.0f });
           }
       mp::TownState cts = mpClient.town();
-      const float crewFactor = cts.maxCrew > 0
-          ? 0.5f + 0.5f * glm::clamp((float)cts.crew / (float)cts.maxCrew, 0.0f, 1.0f) : 1.0f;
+      // Crew efficiency (sail::crewEfficiency — mirrors the server's authoritative curve): no penalty
+      // at/above 85% of complement, ramping to a 33% floor so a skeleton crew still limps to port.
+      // Drives gun reload here; sail drive + helm rate get it via vessel.crewMult (set above the step).
+      const float crewFactor = sail::crewEfficiency(cts.crew, cts.maxCrew);
       // Drop/raise living crew to the server's authoritative count (grape attrition,
       // tavern hires). First call hides the under-fill as reserve, not corpses.
       if (crewDeck && cts.maxCrew > 0) crewDeck->setAliveCount(cts.crew);
@@ -8519,6 +8521,11 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       float seaRough    = glm::clamp((wv.valid ? (float)wv.beaufort : 3.0f) / 8.0f, 0.0f, 1.0f);
       float preX = vessel.x, preZ = vessel.z;   // for the land-collision revert
       helmInput = rudder;
+      // Short-handed: fewer hands to work the sails and the helm (browser vessel.service crewMul parity).
+      // Same authoritative curve the guns/server use; recomputed here since the combat block's copy is
+      // out of scope.
+      { const mp::TownState ctw = mpClient.town();
+        vessel.crewMult = sail::crewEfficiency(ctw.crew, ctw.maxCrew); }
       sail::step(vessel, vrig, dt, windFromDeg, windKn, seaRough, rudder, kTravelScale, sheetDir);
       // Dismasted: the hull only pivots slowly (client MAST_DOWN_TURN_MAX 6 deg/s).
       if (ownMastHealth <= 0.0f) {

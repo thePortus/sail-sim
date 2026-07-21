@@ -84,7 +84,24 @@ struct Vessel {
   // Combat: mast-damage sail-power multiplier (combat.constants mastSpeedMult —
   // 1 intact, floor 0.30 partial, 0 when the rig is down).
   float driveMult = 1.0f;
+  // Crew efficiency (sail::crewEfficiency): short-handed ships make less sail drive AND are slower on
+  // the helm. Set from the server's authoritative crew/maxCrew each frame; 1 = fully manned.
+  float crewMult = 1.0f;
 };
+
+// Crew-efficiency factor — MIRRORS server combat-constants.crewEfficiency (the authoritative curve;
+// keep these three constants in lockstep with it and the client combat.service). A ship does NOT need
+// every hand: at/above kCrewKnee of complement there's no penalty at all. Below that the effect ramps
+// in and bites harder as the crew thins, bottoming out at kCrewFloor so a skeleton crew is crippled but
+// still limps home. Scales sail drive + helm turn rate here; gun reload uses it too (cannon.cpp).
+//   1.00 → 1.00   0.85 → 1.00   0.50 → 0.68   0.25 → 0.48   0.025 (a frigate on a dozen hands) → 0.34
+constexpr float kCrewKnee = 0.85f, kCrewFloor = 0.33f, kCrewExp = 1.25f;
+inline float crewEfficiency(int crew, int maxCrew) {
+  if (maxCrew <= 0) return 1.0f;                     // NPC / unmanned → unaffected
+  const float r = std::clamp((float)crew / (float)maxCrew, 0.0f, 1.0f);
+  if (r >= kCrewKnee) return 1.0f;
+  return kCrewFloor + (1.0f - kCrewFloor) * std::pow(r / kCrewKnee, kCrewExp);
+}
 
 // Ideal sheet angle (deg from centreline) for a wind angle — client table.
 inline float optimalSheetAngle(float a) {
@@ -186,7 +203,8 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
 
   // Force model: a = (thrust - drag)*response/mass.
   float driveC = eff * (1.0f - SPILL_MAX * heelSpill);
-  float thrust = r.forceK * r.sailAreaFactor * driveC * appWind * appWind * v.driveMult;
+  // crewMult: too few hands to work the sails → less drive (browser vessel.service crewMul parity).
+  float thrust = r.forceK * r.sailAreaFactor * driveC * appWind * appWind * v.driveMult * v.crewMult;
   float intoSea = 1.0f - driveAngle / 180.0f;
   // yawRate is RAD/s here, but TURN_SCRUB was tuned against the client's DEG/s yaw — so scrub in degrees, else a
   // hard turn barely bleeds speed (the port's ~57× unit mismatch). Turning now scrubs way like the Angular client.
@@ -200,7 +218,8 @@ inline void step(Vessel& v, const Rig& r, float dt, float windFromDeg, float win
   if (std::fabs(v.speed) < 0.001f) v.speed = 0.0f;
 
   // Steering: helm sets a target yaw the boat eases toward (angular inertia).
-  float maxYaw = detail::turnRate(v.speed, r.maxSpeed) * r.turnFactor * DEG;   // turnFactor: heavy hull turns slower
+  // turnFactor: heavy hull turns slower. crewMult: short-handed → slower on the helm too (browser parity).
+  float maxYaw = detail::turnRate(v.speed, r.maxSpeed) * r.turnFactor * v.crewMult * DEG;
   float targetYaw = (float)rudder * maxYaw;
   v.yawRate += (targetYaw - v.yawRate) * std::min(1.0f, YAW_RESPONSE * dt);
   v.heading = v.heading + v.yawRate * dt;

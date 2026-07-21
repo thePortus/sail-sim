@@ -159,6 +159,29 @@ function mastSpeedMult(h) {
 const MAST_REPAIR_MS   = 60000;   // 60 s base time to jury-rig the mast back up (a demasting should really cost you)
 const MAST_REPAIR_FRAC = 0.5;     // restore to 50 % of max masts HP
 
+// ── Crew efficiency (AUTHORITATIVE — mirrored verbatim by both clients) ───────────────────────────
+// How well a short-handed ship works. A ship does NOT need every hand to perform at 100%: at or above
+// CREW_KNEE of complement there is no penalty at all (the watch below is spare). Under that, effect
+// ramps in and bites harder as the crew thins (CREW_EXP > 1), bottoming out at CREW_FLOOR so a
+// skeleton crew is crippled but can still LIMP TO PORT — it never reaches zero.
+//
+// Scales (all three clients + server): sail drive, helm/turn rate, gun reload time, mast jury-rig time.
+//   1.00 crew → 1.00      0.85 (knee) → 1.00      0.50 → 0.68      0.25 → 0.48
+//   0.025 (a frigate's 480 hands down to a dozen) → 0.34 — serious trouble, still swims home.
+// At the floor a ship still makes 33% of its speed (limps to port) and reloads/repairs ~3x slower.
+// Mirrors: client combat.service crewFactor, native sail::crewEfficiency.
+const CREW_KNEE  = 0.85;   // at/above this fraction of complement → full effectiveness
+const CREW_FLOOR = 0.33;   // hard floor: the worst a ship ever gets (limp home, never dead in the water)
+const CREW_EXP   = 1.25;   // >1 = the penalty accelerates as the crew thins
+/** Crew-efficiency factor in [CREW_FLOOR, 1]. maxCrew <= 0 (NPCs/unmanned) → 1 (unaffected). */
+function crewEfficiency(crew, maxCrew) {
+  const max = maxCrew | 0;
+  if (max <= 0) return 1;
+  const r = Math.max(0, Math.min(1, (crew | 0) / max));
+  if (r >= CREW_KNEE) return 1;
+  return CREW_FLOOR + (1 - CREW_FLOOR) * Math.pow(r / CREW_KNEE, CREW_EXP);
+}
+
 // ── Ballistic simulation ──────────────────────────────────────────────────────
 const SIM_DT        = 0.02;   // integration step (s)
 const SIM_MAX_T     = 6.0;    // give up after this long in flight
@@ -216,6 +239,7 @@ module.exports = {
   SEV_GREEN_MIN, SEV_YELLOW_MIN,
   MAST_DAMAGE_ONSET, MAST_SLOW_FLOOR, mastSpeedMult,
   MAST_REPAIR_MS, MAST_REPAIR_FRAC,
+  CREW_KNEE, CREW_FLOOR, CREW_EXP, crewEfficiency,
   SIM_DT, SIM_MAX_T, SIM_WATER_Y, BROADPHASE_PAD,
   VALID_ORIGIN_RADIUS, VALID_V_MIN, VALID_V_MAX,
   RATE_WINDOW_MS, RATE_MAX_SHOTS, RATE_MIN_GAP_MS,

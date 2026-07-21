@@ -291,12 +291,11 @@ function isHostile(npc, nowMs) {
   return !!(npc.hostileToward && npc.aggroUntil > nowMs);
 }
 
-/** Crew-efficiency factor 0.5..1 (floor 0.5 with no crew) — mirrors the player/server formula; scales the
- *  merchant's sailing + turn when grapeshot has thinned its crew. */
+/** Crew-efficiency factor (combat-constants crewEfficiency — the one authoritative curve): no penalty
+ *  at/above CREW_KNEE of complement, ramping to CREW_FLOOR for a skeleton crew. Scales the merchant's
+ *  sailing + turn when grapeshot has thinned its crew. */
 function crewFactor(npc) {
-  const max = npc.maxCrew | 0;
-  if (!max) return 1;
-  return 0.5 + 0.5 * Math.max(0, Math.min(1, (npc.crew | 0) / max));
+  return Cc.crewEfficiency(npc.crew, npc.maxCrew);
 }
 
 // ── Tactical helm (A2) ────────────────────────────────────────────────────────────────────────────────────

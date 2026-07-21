@@ -1,5 +1,7 @@
 #include "cannon.hpp"
 
+#include "sail_physics.hpp"   // sail::kCrewFloor — the shared crew-efficiency floor
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -287,7 +289,9 @@ void Guns::fireOneCannon(int side, int idx, const ShipPose& vs,
 void Guns::update(float dt, const ShipPose& pose, const std::vector<Enemy>& enemies,
                   float crewFactor, const std::string& myId, std::vector<FireEvent>& outFires) {
   elapsed_ += dt;
-  crewFactor_ = std::clamp(crewFactor, 0.5f, 1.0f);
+  // Floor is the crew-efficiency floor (sail::kCrewFloor), NOT 0.5 — clamping at 0.5 here would have
+  // capped a skeleton crew's reload penalty at 2x and silently undone the curve's low end.
+  crewFactor_ = std::clamp(crewFactor, sail::kCrewFloor, 1.0f);
   enemies_ = enemies;
   pose_ = pose;               // cache for the carronade auto-hold gate (armOrFire has no pose/enemies args)
 

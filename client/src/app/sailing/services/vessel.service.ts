@@ -10,6 +10,7 @@ import { SceneService } from './scene.service';
 import { TerrainService } from './terrain.service';
 import { OceanService }  from './ocean.service';
 import { WetnessPlugin } from './wetness.plugin';
+import { SailBillowPlugin } from './sail-billow.plugin';
 import { bakeHullCutProfile, bakeHullSilhouette, buildHullStencilProxy } from './ocean-fft/hull-cut-mask';
 import { VesselBuoyancyService } from './vessel-buoyancy.service';
 import { VesselAssetCacheService } from './vessel-asset-cache.service';
@@ -1541,6 +1542,11 @@ export class VesselService {
       // the bones about world-up so it's heel-independent).
       const windLocalRad = (((this.currentWind.fromBearingDeg + 180) % 360) - this.heading) * Math.PI / 180;
       this.controller.idleWind(windLocalRad, Math.min(1.2, this.currentWind.speed / 8), this.simTime);
+      // WORLD downwind unit vector for the sail-billow leeward sign (wind is scene-global). Bearing
+      // → (sin, cos): x = East, z = North, matching the seaward-heading convention.
+      const windToRad = ((this.currentWind.fromBearingDeg + 180) % 360) * Math.PI / 180;
+      SailBillowPlugin.wind.dirX = Math.sin(windToRad);
+      SailBillowPlugin.wind.dirZ = Math.cos(windToRad);
 
       // Anchor: lower/raise the dropped side; keep the other stowed.
       this.anchorDeploy += ((this.isAnchored ? 1 : 0) - this.anchorDeploy) * Math.min(1, dt * 2.5);

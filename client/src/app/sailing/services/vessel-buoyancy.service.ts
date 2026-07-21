@@ -149,7 +149,7 @@ export class VesselBuoyancyService {
     const maxTilt   = opts?.maxTilt   ?? MAX_TILT;
     const pitchGain = opts?.pitchGain ?? 0.85;
     const rollGain  = opts?.rollGain  ?? 1.05;
-    const heelGain  = opts?.heelGain  ?? 0.9;
+    const heelGain  = opts?.heelGain  ?? 0.5;   // purely visual lean scale (leeway/spill use the raw heel)
     // TRUE least-squares wave slope (rad) = Σ(h·arm)/Σ(arm²). NO ×N: dividing by (arm²/N) over-drove it 8× —
     // a long hull (frigate) then pitched its bow/stern tens of metres. A long ship bridges wave crests so this
     // slope is naturally small. The cap is on END DISPLACEMENT, not angle: a fixed max ANGLE throws a 48 m

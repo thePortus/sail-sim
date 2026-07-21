@@ -287,7 +287,12 @@ function deriveBuoyancy(phys) {
     heaveOmega: b.heaveOmega ?? w(Theave), heaveZeta: b.heaveZeta ?? 0.30,
     pitchOmega: b.pitchOmega ?? w(Tpitch), pitchZeta: b.pitchZeta ?? 0.22, pitchGain: b.pitchGain ?? 0.85,
     rollOmega:  b.rollOmega  ?? w(Troll),  rollZeta:  b.rollZeta  ?? 0.16, rollGain:  b.rollGain  ?? 1.05,
-    heelGain:   b.heelGain ?? 0.9,     // wind-heel angle → roll-target contribution (fraction of the heel)
+    // Wind-heel → roll-target contribution. PURELY VISUAL: leeway + sail-spill still use the raw heel
+    // angle, so trimming this changes only how far the hull LEANS. 0.5 keeps the lean realistic (a
+    // 10 kn beam reach leans ~5°, a hard blow tops out ~13°) instead of the over-the-top ~23° that
+    // the old 0.9 × the 26° cap produced. The roll oscillator eases it in, so the ship rolls DOWN
+    // onto its new angle over a second or two rather than snapping.
+    heelGain:   b.heelGain ?? 0.5,
     maxTilt:    b.maxTilt  ?? 0.24,    // rad cap on wave-induced tilt (~13.7°) — forgiving
     periods:    { heave: +Theave.toFixed(2), pitch: +Tpitch.toFixed(2), roll: +Troll.toFixed(2) },   // debug/HUD
   };

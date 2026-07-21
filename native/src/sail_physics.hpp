@@ -28,7 +28,7 @@ struct Rig {
   float heaveOmega = 2.05f, heaveZeta = 0.30f;
   float pitchOmega = 3.59f, pitchZeta = 0.22f, pitchGain = 0.85f;
   float rollOmega  = 1.69f, rollZeta  = 0.16f, rollGain  = 1.05f;
-  float heelGain   = 0.9f,  maxTilt   = 0.24f;
+  float heelGain   = 0.5f,  maxTilt   = 0.24f;
 };
 
 inline Rig rigForSlug(const std::string& s) {

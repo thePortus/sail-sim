@@ -5047,6 +5047,11 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     float t = (float)simClock;
     float dt = (float)physDt;
     float waveT = (float)(waveClock * (double)kWaveSpeed);   // wave fields on the real clock
+    // Ease the DISPLAYED weather toward the server snapshot (browser weather.service parity). Every
+    // consumer below reads mpClient.wave(), so wind/sea changes now RAMP instead of the whole sea
+    // state (FFT respectrum, sails, sky, audio) snapping the instant a new snapshot or admin
+    // override lands.
+    mpClient.tickWeather(dt);
 
     // Terrain arrived? Upload its height texture and start the ship near a harbour.
     if (!terrHandled && terrFuture.valid() &&

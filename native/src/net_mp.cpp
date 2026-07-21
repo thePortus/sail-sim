@@ -1,7 +1,9 @@
 #include "net_mp.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 
 #include <ixwebsocket/IXWebSocket.h>
@@ -21,7 +23,9 @@ struct Client::Impl {
   std::string myId;
   std::string ownedShip;
   std::map<std::string, RemotePlayer> players;
-  WaveState wave;
+  WaveState wave;         // raw server snapshot = the TARGET the displayed state eases toward
+  WaveState waveSm;       // smoothed/displayed weather (see Client::tickWeather) — what wave() returns
+  bool waveSmInit = false;   // first snapshot snaps (no ramp up from zero wind)
   std::vector<ChatMessage> chatIn;   // drained by the render loop each frame
   SquadronState squad;               // our current squadron roster (live-read)
   TownState townSt;                  // wallet/crew/market/dock-menu replies
@@ -582,7 +586,39 @@ std::vector<RemotePlayer> Client::players() const {
 
 WaveState Client::wave() const {
   std::lock_guard<std::mutex> lock(p_->mtx);
-  return p_->wave;
+  return p_->waveSm;   // the SMOOTHED weather (tickWeather) — never the raw snapshot
+}
+
+// Ease the displayed weather toward the latest server snapshot (browser weather.service parity:
+// exponential approach, ~40% of the remaining gap per second, plus a small minimum step so it
+// doesn't crawl). Without this a wind change (or an admin override) re-seeded the FFT spectrum in
+// one step and the whole sea state SNAPPED; the browser ramps, so native did too visibly differently.
+// Bearing takes the shortest way around the circle. Call once per frame from the render loop.
+void Client::tickWeather(float dt) {
+  std::lock_guard<std::mutex> lock(p_->mtx);
+  if (!p_->wave.valid) return;
+  if (!p_->waveSmInit) { p_->waveSm = p_->wave; p_->waveSmInit = true; return; }   // first snapshot: snap
+  const WaveState& tgt = p_->wave;
+  WaveState& cur = p_->waveSm;
+  // Discrete/authoritative fields track the target exactly.
+  cur.valid = true; cur.t = tgt.t; cur.timeOffsetSec = tgt.timeOffsetSec; cur.overrideOn = tgt.overrideOn;
+  dt = dt < 0.0f ? 0.0f : (dt > 0.25f ? 0.25f : dt);
+  const float a = 1.0f - std::exp(-0.51f * dt);   // closes ~40% of the remaining gap per second
+  auto ease = [&](float c, float t, float minPerSec) {
+    const float d = t - c;
+    const float step = std::max(minPerSec * dt, std::fabs(d) * a);
+    return std::fabs(d) <= step ? t : c + (d > 0 ? step : -step);
+  };
+  cur.windSpeed  = ease(cur.windSpeed,  tgt.windSpeed,  0.2f);    // kn/s floor (browser: 0.2 per 1 s tick)
+  cur.cloudiness = ease(cur.cloudiness, tgt.cloudiness, 0.01f);
+  // Bearing eases the SHORT way around the circle.
+  const float diff = std::fmod(tgt.windBearing - cur.windBearing + 540.0f, 360.0f) - 180.0f;
+  const float bstep = std::max(0.5f * dt, std::fabs(diff) * a);
+  cur.windBearing = std::fabs(diff) <= bstep ? tgt.windBearing
+                  : std::fmod(cur.windBearing + (diff > 0 ? bstep : -bstep) + 360.0f, 360.0f);
+  // Beaufort follows the SMOOTHED speed (browser weather.service buildWeather), so the sea state,
+  // storminess and cloud targets it drives step gradually instead of jumping with the raw snapshot.
+  cur.beaufort = std::min(12, (int)std::floor(cur.windSpeed / 2.5f));
 }
 
 SquadronState Client::squadron() const {

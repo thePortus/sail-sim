@@ -231,7 +231,10 @@ public:
 
   std::vector<RemotePlayer> players() const;   // copy of everyone but us
   SquadronState squadron() const;              // our squadron roster ("" id = none)
-  WaveState wave() const;
+  WaveState wave() const;                      // SMOOTHED weather (see tickWeather), not the raw snapshot
+  // Ease the displayed weather toward the latest server snapshot (browser weather.service parity).
+  // Call once per frame from the render loop; without it wave() never moves off the first snapshot.
+  void tickWeather(float dt);
   // Latest unconsumed server pose correction (cleared by this call).
   Correction consumeCorrection();
   std::vector<LaneHotspot> lanes() const;      // busiest shipping-lane hotspots (all players)
